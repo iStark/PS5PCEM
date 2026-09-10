@@ -2,6 +2,24 @@
 
 Observed with PPSA26344 and the RTX 3070 Ti; individual build results are dated below.
 
+## Grouped sampled-image lookup preparation on 2026-09-10
+
+A native render-thread sample recorded 5 of 80 observations in
+`prepareSampledImageLookups`. Building indirect texture tables repeatedly
+scanned the mapping array for each instruction/SGPR/dimension group. A retained
+hash index now forms these groups in one pass, preserving first-seen group
+order and candidate insertion order. Small groups keep their existing shader
+path, and the uploaded lookup format and descriptor selection are unchanged.
+
+The grouping test covers interleaved members, all key fields, absent versus
+zero instruction PCs, capacity reuse and reset. Vulkan SDK probes pass for
+4,352 mixed 2D/3D views, smaller indirect tables and the complete smoke, without
+validation or synchronization errors. An isolated planning benchmark with
+32,768 candidates in 128 interleaved groups takes 74,411 us with repeated scans
+and 6,100 us with grouping across eight repetitions. This measures host
+planning only, not game FPS. Production and diagnostic runners build;
+native performance comparison remains pending.
+
 ## Parking contended memory locks on 2026-09-10
 
 Native CPU sampling found several guest workers repeatedly spinning inside

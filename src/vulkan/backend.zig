@@ -22,6 +22,7 @@ const image_alias = @import("image_alias.zig");
 const image_state = @import("image_state.zig");
 const pipeline_compiler = @import("pipeline_compiler.zig");
 const spirv_cache = @import("spirv_cache.zig");
+const sampled_lookup_plan = @import("sampled_lookup_plan.zig");
 
 /// Set to true to enable verbose per-frame GPU debug logging.
 /// Disable for performance — each print is a blocking I/O syscall.
@@ -2551,6 +2552,7 @@ const ComputeResources = struct {
     sampled_image_dimensions: [maximum_sampled_images]rdna2.spirv.SampledImageDimension = undefined,
     sampled_image_mappings: [maximum_compute_sampled_mappings]gpu.ShaderSpirvSampledImageBinding = undefined,
     sampled_image_mapping_count: usize = 0,
+    lookup_plan: sampled_lookup_plan.Plan = .{},
 
     fn init(allocator: std.mem.Allocator) !*ComputeResources {
         const result = try allocator.create(ComputeResources);
@@ -2658,7 +2660,12 @@ const ComputeResources = struct {
         if (renderer.free_compute_resource_count < renderer.free_compute_resources.len) {
             renderer.free_compute_resources[renderer.free_compute_resource_count] = self;
             renderer.free_compute_resource_count += 1;
-        } else renderer.allocator.destroy(self);
+        } else self.destroy(renderer.allocator);
+    }
+
+    fn destroy(self: *ComputeResources, allocator: std.mem.Allocator) void {
+        self.lookup_plan.deinit(allocator);
+        allocator.destroy(self);
     }
 };
 
@@ -3473,7 +3480,7 @@ pub const Renderer = struct {
     fn destroyResourcePools(self: *Renderer) void {
         self.image_scratch.deinit(self.allocator);
         self.checkpoint_scratch.deinit(self.allocator);
-        for (self.free_compute_resources[0..self.free_compute_resource_count]) |resource| self.allocator.destroy(resource);
+        for (self.free_compute_resources[0..self.free_compute_resource_count]) |resource| resource.destroy(self.allocator);
         self.free_compute_resource_count = 0;
         for (self.free_graphics_resources[0..self.free_graphics_resource_count]) |resource| resource.destroy(self.allocator);
         self.free_graphics_resource_count = 0;
@@ -8041,32 +8048,29 @@ pub const Renderer = struct {
         if (self.traceCurrentGraphicsFrame()) std.debug.print("[vulkan dcb] FLAT scene snapshot root=0x{x} regions={d} bytes={d}\n", .{ root, region_count, total });
     }
 
-    fn sameSampledLookup(a: gpu.ShaderSpirvSampledImageBinding, b: gpu.ShaderSpirvSampledImageBinding) bool {
-        return a.resource_sgpr == b.resource_sgpr and a.sampler_sgpr == b.sampler_sgpr and
-            a.instruction_pc == b.instruction_pc and a.dimension == b.dimension;
-    }
-
     fn prepareSampledImageLookups(
         self: *Renderer,
         resources: *ComputeResources,
         mappings: []gpu.ShaderSpirvSampledImageBinding,
     ) anyerror!void {
         const lookup = rdna2.spirv.sampled_lookup;
-        var total_words: usize = 0;
+        if (mappings.len < 64) return;
+        const plan = &resources.lookup_plan;
+        try plan.reset(self.allocator, mappings.len);
         for (mappings, 0..) |binding, index| {
-            if (binding.candidate_words == null) continue;
-            var seen = false;
-            for (mappings[0..index]) |previous| if (sameSampledLookup(previous, binding)) {
-                seen = true;
-                break;
-            };
-            if (seen) continue;
-            var count: usize = 0;
-            for (mappings[index..]) |candidate| if (sameSampledLookup(candidate, binding)) {
-                count += 1;
-            };
-            if (count >= 64) total_words += lookup.capacity(count) * lookup.entry_words;
+            if (binding.candidate_words == null or binding.lookup != null) continue;
+            try plan.add(self.allocator, .{
+                .resource_sgpr = binding.resource_sgpr,
+                .sampler_sgpr = binding.sampler_sgpr,
+                .instruction_pc = binding.instruction_pc,
+                .dimension = @intFromEnum(binding.dimension),
+            }, index);
         }
+        var total_words: usize = 0;
+        for (plan.groups.values()) |group|
+            if (group.count >= 64) {
+                total_words += lookup.capacity(group.count) * lookup.entry_words;
+            };
         if (total_words == 0) return;
         const slot = resources.freeDescriptor() orelse return Error.InvalidStorageDescriptor;
         const upload = try self.allocateDrawUpload(total_words * 4);
@@ -8074,22 +8078,20 @@ pub const Renderer = struct {
         const table = std.mem.bytesAsSlice(u32, @as([]align(4) u8, @alignCast(mapping[@intCast(upload.offset)..][0 .. total_words * 4])));
         @memset(table, 0);
         var cursor: usize = 0;
-        for (mappings, 0..) |binding, index| {
-            if (binding.candidate_words == null or binding.lookup != null) continue;
-            var count: usize = 0;
-            for (mappings[index..]) |candidate| if (sameSampledLookup(candidate, binding)) {
-                count += 1;
-            };
-            if (count < 64) continue;
-            const entries = lookup.capacity(count);
+        for (plan.groups.values()) |members| {
+            if (members.count < 64) continue;
+            const entries = lookup.capacity(members.count);
             const group = table[cursor..][0 .. entries * lookup.entry_words];
             var probes: u32 = 0;
-            for (mappings[index..]) |candidate| if (sameSampledLookup(candidate, binding)) {
+            var index = members.first;
+            while (index != sampled_lookup_plan.end) : (index = plan.next.items[index]) {
+                const candidate = mappings[index];
                 probes = @max(probes, lookup.insert(group, candidate.candidate_words.?, candidate.descriptor_index));
-            };
-            for (mappings[index..]) |*candidate| if (sameSampledLookup(candidate.*, binding)) {
-                candidate.lookup = .{ .descriptor_index = slot, .word_offset = @intCast(cursor), .mask = @intCast(entries - 1), .probes = probes };
-            };
+            }
+            index = members.first;
+            while (index != sampled_lookup_plan.end) : (index = plan.next.items[index]) {
+                mappings[index].lookup = .{ .descriptor_index = slot, .word_offset = @intCast(cursor), .mask = @intCast(entries - 1), .probes = probes };
+            }
             cursor += group.len;
         }
         std.debug.assert(cursor == total_words);
