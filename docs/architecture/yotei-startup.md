@@ -2,6 +2,30 @@
 
 Observed with PPSA26344 and the RTX 3070 Ti; individual build results are dated below.
 
+## Cross-half reads in multi-wave workgroups on 2026-09-10
+
+The remaining empty light list comes from a 16x16 culling workgroup containing
+four guest wave64s. Cross-half READLANE previously used a native subgroup
+shuffle, which returned lane 31 when the shader requested lane 63 on the
+RTX 3070 Ti. The existing workgroup exchange covered only a single wave64.
+
+Multi-wave compute now gives each guest wave separate exchange slots and
+selects one guest block uniformly across the Vulkan workgroup. Waiting waves
+retain their registers and suppress memory side effects. Explicit S_BARRIER
+blocks wait for the other waves; terminated waves continue participating in
+host synchronization without executing more guest instructions. Automatic
+selection is limited to wave64 compute with cross-half constant READLANE,
+whole 64-lane waves, at most 1024 invocations, and no GDS operations.
+
+GPU tests cover independent loops, cross-wave LDS reads after a barrier,
+partial EXEC, cross-half READLANE/READFIRSTLANE and early wave termination in
+128x1 and 16x16 workgroups. These, the existing single-wave, integer FORMAT
+and default smoke probes pass SDK synchronization validation. An immutable
+replay of the captured culling dispatch also passes without validation errors:
+the list at `0x500ae8fe00` changes from zero to 24,336 populated records,
+matching the 208x117 dispatched tiles. Native scene validation is still pending;
+this result establishes corrected light-list computation, not a complete menu.
+
 ## Packed integer light-list stores on 2026-09-10
 
 The material-buffer capture contains the tree's geometry and bark texture,
@@ -21,8 +45,9 @@ validation without VUID or hazard reports.
 An immutable replay of the captured culling dispatch also passes validation.
 The packed list at `0x500a6a6e00` changes from 4,278 nonzero words to 9,084,
 with the fourth component correctly occupying the high byte. The separate
-list at `0x500ae8fe00` remains zero. Native scene validation and investigation
-of that remaining list are still pending.
+list at `0x500ae8fe00` remains zero at this stage; its subsequent cross-half
+read correction is described above. The native run displays the Digital
+Deluxe notice with its text and confirmation icon intact.
 
 ## Inactive records in sampled-image tables on 2026-09-10
 

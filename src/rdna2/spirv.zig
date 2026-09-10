@@ -286,8 +286,8 @@ pub const Options = struct {
     /// this separate from EXEC bookkeeping: graphics shaders commonly restore
     /// EXEC before an export, but an export does not need a subgroup input.
     uses_lane_identity: bool = false,
-    /// A single 64-lane compute wave can synchronize through its workgroup
-    /// when the host subgroup is smaller. Selected for cross-half READLANE.
+    /// Synchronize guest 64-lane compute waves through workgroup memory.
+    /// Multiple waves require a converged dispatcher around divergent blocks.
     wave64_workgroup: bool = false,
     sampled_images: []const SampledImageBinding = &.{},
     storage_images: []const StorageImageBinding = &.{},
@@ -676,6 +676,8 @@ const Builder = struct {
     local_invocation_index: u32 = 0,
     subgroup_local_invocation_id: u32 = 0,
     wave64_workgroup: bool = false,
+    converged_workgroup_dispatch: bool = false,
+    dispatch_active: ?u32 = null,
     synchronize_linear_wave64_lds: bool = false,
     wave_scratch: u32 = 0,
     wave32: bool = false,
@@ -796,6 +798,7 @@ const Builder = struct {
             .local_size = options.local_size,
             .maximum_dispatcher_iterations = options.maximum_dispatcher_iterations,
             .wave64_workgroup = options.wave64_workgroup,
+            .converged_workgroup_dispatch = options.wave64_workgroup and @as(u64, options.local_size[0]) * options.local_size[1] * options.local_size[2] > 64,
             .wave32 = options.wave32,
             .fragment_extent = options.fragment_extent,
             .fragment_inputs = options.fragment_inputs,
@@ -1277,13 +1280,15 @@ const Builder = struct {
             try self.emit(&self.declarations, 59, &.{ array_pointer_type, self.workgroup_memory, 4 }); // OpVariable
         }
         if (options.wave64_workgroup) {
-            if (options.stage != .compute or @as(u64, options.local_size[0]) * options.local_size[1] * options.local_size[2] != 64)
+            const invocations = @as(u64, options.local_size[0]) * options.local_size[1] * options.local_size[2];
+            if (options.stage != .compute or options.wave32 or invocations < 64 or invocations > 1024 or invocations % 64 != 0)
                 return Error.InvalidStageInterface;
             const array_type = self.id();
             const array_pointer = self.id();
             self.wave_word_pointer = self.id();
             self.wave_scratch = self.id();
-            try self.emit(&self.declarations, 28, &.{ array_type, self.bits_type, try self.constant(.bits32, 64) });
+            // One exchange slot per invocation, plus the workgroup scheduler.
+            try self.emit(&self.declarations, 28, &.{ array_type, self.bits_type, try self.constant(.bits32, @intCast(invocations + 1)) });
             try self.emit(&self.declarations, 32, &.{ array_pointer, 4, array_type });
             try self.emit(&self.declarations, 32, &.{ self.wave_word_pointer, 4, self.bits_type });
             try self.emit(&self.declarations, 59, &.{ array_pointer, self.wave_scratch, 4 });
@@ -1671,6 +1676,11 @@ const Builder = struct {
                 try self.emit(&self.body, 169, &.{ self.bits_type, selected, enabled, bits, previous });
                 bits = selected;
             }
+        }
+        if (self.dispatch_active) |active| {
+            const selected = self.id();
+            try self.emit(&self.body, 169, &.{ self.bits_type, selected, active, bits, try self.registerBits(index, 0) });
+            bits = selected;
         }
         self.registers[index] = .{
             .id = bits,
@@ -6972,8 +6982,18 @@ const Builder = struct {
     }
 
     fn wavePointer(self: *Builder, lane: u32) Error!u32 {
+        var index = lane;
+        if (self.converged_workgroup_dispatch) {
+            const invocation = self.id();
+            try self.emit(&self.body, 61, &.{ self.bits_type, invocation, self.local_invocation_index });
+            index = try self.addBits(try self.andBits(invocation, ~@as(u32, 63)), lane);
+        }
+        return self.waveAbsolutePointer(index);
+    }
+
+    fn waveAbsolutePointer(self: *Builder, index: u32) Error!u32 {
         const pointer = self.id();
-        try self.emit(&self.body, 65, &.{ self.wave_word_pointer, pointer, self.wave_scratch, lane });
+        try self.emit(&self.body, 65, &.{ self.wave_word_pointer, pointer, self.wave_scratch, index });
         return pointer;
     }
 
@@ -7092,8 +7112,8 @@ const Builder = struct {
         defer self.writing_lane = false;
         if (self.constantLane(inst.src1)) |index| {
             if (self.findLaneSpill(inst.dst.reg, index)) |spill| {
-                try self.emit(&self.body, 62, &.{ spill.value, value });
-                try self.emit(&self.body, 62, &.{ spill.valid, try self.constant(.bits32, 1) });
+                try self.dispatchStateStore(spill.value, value);
+                try self.dispatchStateStore(spill.valid, try self.constant(.bits32, 1));
             }
         } else try self.invalidateLaneSpills(inst.dst.reg);
         const current = if (registerIndex(inst.dst)) |index|
@@ -7128,7 +7148,7 @@ const Builder = struct {
 
     fn invalidateLaneSpills(self: *Builder, vgpr: u32) Error!void {
         for (self.lane_spills.items) |spill| {
-            if (spill.vgpr == vgpr) try self.emit(&self.body, 62, &.{ spill.valid, try self.constant(.bits32, 0) });
+            if (spill.vgpr == vgpr) try self.dispatchStateStore(spill.valid, try self.constant(.bits32, 0));
         }
     }
 
@@ -7400,6 +7420,15 @@ const Builder = struct {
     /// asked of the lane's own index. Null while the mask is untouched, which is
     /// every lane enabled and needs no test.
     fn laneEnabled(self: *Builder) Error!?u32 {
+        const guest = try self.guestLaneEnabled();
+        const active = self.dispatch_active orelse return guest;
+        const predicate = guest orelse return active;
+        const result = self.id();
+        try self.emit(&self.body, 167, &.{ self.bool_type, result, active, predicate });
+        return result;
+    }
+
+    fn guestLaneEnabled(self: *Builder) Error!?u32 {
         const mask = self.exec_mask orelse return null;
 
         // A Vulkan graphics invocation already represents one live guest
@@ -7498,6 +7527,19 @@ const Builder = struct {
         try self.emit(&self.body, 62, &.{ pointer, value }); // OpStore
         try self.emit(&self.body, 249, &.{merge}); // OpBranch
         try self.emit(&self.body, 248, &.{merge}); // OpLabel
+    }
+
+    /// Private/function state belongs to a guest wave even while another
+    /// wave's block is selected by the converged workgroup dispatcher.
+    fn dispatchStateStore(self: *Builder, pointer: u32, value: u32) Error!void {
+        var selected = value;
+        if (self.dispatch_active) |active| {
+            const previous = self.id();
+            try self.emit(&self.body, 61, &.{ self.bits_type, previous, pointer });
+            selected = self.id();
+            try self.emit(&self.body, 169, &.{ self.bits_type, selected, active, value, previous });
+        }
+        try self.emit(&self.body, 62, &.{ pointer, selected });
     }
 
     fn bufferLoadWords(self: *Builder, inst: instruction.Instruction, count: u8) Error!void {
@@ -9627,11 +9669,11 @@ fn storeMutableControlState(builder: *Builder) Error!void {
     const scc_condition = if (builder.scc != 0) builder.scc else try falseCondition(builder);
     const scc_bits = builder.id();
     try builder.emit(&builder.body, 169, &.{ builder.bits_type, scc_bits, scc_condition, one, zero }); // OpSelect
-    try builder.emit(&builder.body, 62, &.{ builder.mutable_scc_pointer, scc_bits });
+    try builder.dispatchStateStore(builder.mutable_scc_pointer, scc_bits);
     const carry_condition = if (builder.arithmetic_carry != 0) builder.arithmetic_carry else try falseCondition(builder);
     const carry_bits = builder.id();
     try builder.emit(&builder.body, 169, &.{ builder.bits_type, carry_bits, carry_condition, one, zero });
-    try builder.emit(&builder.body, 62, &.{ builder.mutable_carry_pointer, carry_bits });
+    try builder.dispatchStateStore(builder.mutable_carry_pointer, carry_bits);
     const exec_mode_condition = if (builder.exec_mask_is_lane_predicate)
         try builder.isNonZero(one)
     else if (builder.exec_mask_lane_predicate_condition != 0)
@@ -9640,7 +9682,7 @@ fn storeMutableControlState(builder: *Builder) Error!void {
         try falseCondition(builder);
     const exec_mode_bits = builder.id();
     try builder.emit(&builder.body, 169, &.{ builder.bits_type, exec_mode_bits, exec_mode_condition, one, zero });
-    try builder.emit(&builder.body, 62, &.{ builder.mutable_exec_mode_pointer, exec_mode_bits });
+    try builder.dispatchStateStore(builder.mutable_exec_mode_pointer, exec_mode_bits);
 }
 
 /// Lowers reducible natural loops through function-local guest registers. The
@@ -9762,10 +9804,7 @@ const dispatch_sentinel: u32 = 0xffff_ffff;
 
 fn emitDispatchJump(builder: *Builder, after_label: u32, next_index: u32) Error!void {
     try storeMutableControlState(builder);
-    try builder.emit(&builder.body, 62, &.{
-        builder.dispatch_pc_pointer,
-        try builder.constant(.bits32, next_index),
-    });
+    try builder.dispatchStateStore(builder.dispatch_pc_pointer, try builder.constant(.bits32, next_index));
     try builder.emit(&builder.body, 249, &.{after_label}); // OpBranch
 }
 
@@ -9796,7 +9835,7 @@ fn emitDispatchConditional(
         not_taken,
     });
     try storeMutableControlState(builder);
-    try builder.emit(&builder.body, 62, &.{ builder.dispatch_pc_pointer, next });
+    try builder.dispatchStateStore(builder.dispatch_pc_pointer, next);
     try builder.emit(&builder.body, 249, &.{after_label});
 }
 
@@ -9805,6 +9844,39 @@ fn emitDispatchConditional(
 /// Each guest block is a switch case. The next block index lives in a
 /// function-local variable, so back edges, shared merges and VCC/EXEC
 /// divergence do not have to form a reducible loop tree.
+fn selectWorkgroupDispatchPc(builder: *Builder, instructions: []const instruction.Instruction, graph: *const control_flow.Graph, pc: u32) Error!u32 {
+    // All invocations execute the same host block. A guest wave that is ahead
+    // waits with its registers and side effects masked, including after END.
+    // Barrier blocks sort after runnable blocks, so S_BARRIER is released only
+    // once the remaining waves have reached their rendezvous.
+    var candidate = pc;
+    for (graph.blocks.items) |block| {
+        if (instructions[block.first_instruction].opcode != .s_barrier) continue;
+        const at_barrier = builder.id();
+        try builder.emit(&builder.body, 170, &.{ builder.bool_type, at_barrier, pc, try builder.constant(.bits32, block.index) });
+        const selected = builder.id();
+        try builder.emit(&builder.body, 169, &.{ builder.bits_type, selected, at_barrier, try builder.constant(.bits32, block.index | 0x8000_0000), candidate });
+        candidate = selected;
+    }
+    const pointer = try builder.wavePointer(try builder.currentLaneId());
+    try builder.emit(&builder.body, 62, &.{ pointer, candidate });
+    try builder.controlBarrier();
+    const count = builder.local_size[0] * builder.local_size[1] * builder.local_size[2];
+    var selected = try builder.constant(.bits32, dispatch_sentinel);
+    var base: u32 = 0;
+    while (base < count) : (base += 64) {
+        const wave_pc = builder.id();
+        try builder.emit(&builder.body, 61, &.{ builder.bits_type, wave_pc, try builder.waveAbsolutePointer(try builder.constant(.bits32, base)) });
+        const earlier = builder.id();
+        try builder.emit(&builder.body, 176, &.{ builder.bool_type, earlier, wave_pc, selected }); // OpULessThan
+        const minimum = builder.id();
+        try builder.emit(&builder.body, 169, &.{ builder.bits_type, minimum, earlier, wave_pc, selected });
+        selected = minimum;
+    }
+    try builder.controlBarrier();
+    return selected;
+}
+
 fn translateDispatcher(builder: *Builder, instructions: []const instruction.Instruction, graph: *const control_flow.Graph) Error!void {
     if (graph.blocks.items.len == 0) return Error.UnsupportedControlFlow;
     try configureMutableLoopState(builder, instructions);
@@ -9825,11 +9897,15 @@ fn translateDispatcher(builder: *Builder, instructions: []const instruction.Inst
     try builder.emit(&builder.body, 248, &.{header}); // OpLabel
     const pc = builder.id();
     try builder.emit(&builder.body, 61, &.{ builder.bits_type, pc, builder.dispatch_pc_pointer }); // OpLoad
+    const scheduled_pc = if (builder.converged_workgroup_dispatch)
+        try selectWorkgroupDispatchPc(builder, instructions, graph, pc)
+    else
+        pc;
     const pc_done = builder.id();
     try builder.emit(&builder.body, 170, &.{
         builder.bool_type,
         pc_done,
-        pc,
+        scheduled_pc,
         try builder.constant(.bits32, dispatch_sentinel),
     }); // OpIEqual
     // The dispatcher is a correctness fallback for irreducible guest CFGs,
@@ -9844,7 +9920,7 @@ fn translateDispatcher(builder: *Builder, instructions: []const instruction.Inst
         builder.bool_type,
         budget_done,
         iteration,
-        try builder.constant(.bits32, builder.maximum_dispatcher_iterations),
+        try builder.constant(.bits32, builder.maximum_dispatcher_iterations *| (if (builder.converged_workgroup_dispatch) @max(1, builder.local_size[0] * builder.local_size[1] * builder.local_size[2] / 64) else 1)),
     }); // OpUGreaterThanEqual
     const done = builder.id();
     try builder.emit(&builder.body, 166, &.{ builder.bool_type, done, pc_done, budget_done }); // OpLogicalOr
@@ -9852,10 +9928,16 @@ fn translateDispatcher(builder: *Builder, instructions: []const instruction.Inst
     try builder.emit(&builder.body, 250, &.{ done, merge, select }); // OpBranchConditional
 
     try builder.emit(&builder.body, 248, &.{select}); // OpLabel
+    const selected_pc = if (builder.converged_workgroup_dispatch) try builder.andBits(scheduled_pc, 0x7fff_ffff) else scheduled_pc;
+    if (builder.converged_workgroup_dispatch) {
+        const active = builder.id();
+        try builder.emit(&builder.body, 170, &.{ builder.bool_type, active, pc, selected_pc });
+        builder.dispatch_active = active;
+    }
     try builder.emit(&builder.body, 247, &.{ after, 0 }); // OpSelectionMerge
     var switch_args: std.ArrayList(u32) = .empty;
     defer switch_args.deinit(builder.allocator);
-    try switch_args.append(builder.allocator, pc);
+    try switch_args.append(builder.allocator, selected_pc);
     try switch_args.append(builder.allocator, default_label);
     for (labels, 0..) |label, index| {
         try switch_args.append(builder.allocator, @intCast(index));
@@ -9898,6 +9980,7 @@ fn translateDispatcher(builder: *Builder, instructions: []const instruction.Inst
     }
 
     try builder.emit(&builder.body, 248, &.{after}); // OpLabel
+    builder.dispatch_active = null;
     try builder.emit(&builder.body, 249, &.{cont}); // OpBranch
     try builder.emit(&builder.body, 248, &.{cont}); // OpLabel
     const previous_iteration = builder.id();
@@ -10436,7 +10519,8 @@ fn translateInstructions(
     }
     effective.uses_lane_identity = effective.uses_lane_identity or effective.uses_execution_mask or
         (effective.uses_execution_mask and has_predicated_write);
-    if (!effective.wave32 and effective.stage == .compute and @as(u64, effective.local_size[0]) * effective.local_size[1] * effective.local_size[2] == 64 and cross_half_read and !uses_gds) {
+    const invocation_count = @as(u64, effective.local_size[0]) * effective.local_size[1] * effective.local_size[2];
+    if (!effective.wave32 and effective.stage == .compute and invocation_count >= 64 and invocation_count <= 1024 and invocation_count % 64 == 0 and cross_half_read and !uses_gds) {
         effective.wave64_workgroup = true;
         effective.uses_lane_identity = true;
         effective.uses_execution_mask = true;
@@ -10445,9 +10529,11 @@ fn translateInstructions(
     var builder_alive = true;
     defer if (builder_alive) builder.deinit();
     try builder.configureLaneSpills(instructions);
-    var graph = try control_flow.buildInstructions(allocator, instructions);
+    var graph = try control_flow.buildInstructionsWithBarriers(allocator, instructions, builder.converged_workgroup_dispatch);
     defer graph.deinit(allocator);
-    if (graph.blocks.items.len == 1) {
+    if (builder.converged_workgroup_dispatch) {
+        try translateDispatcher(&builder, instructions, &graph);
+    } else if (graph.blocks.items.len == 1) {
         // A single guest wave executes LDS instructions in order. On a
         // 32-lane host it spans two independently scheduled subgroups, so
         // their shared-memory accesses need an explicit rendezvous. A

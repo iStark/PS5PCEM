@@ -2034,6 +2034,131 @@ fn runWave64Probe(allocator: std.mem.Allocator) !void {
     std.debug.print("wave64 passed: lane 63, full masks, carry bits and uniform EXEC branches across workgroup shapes\n", .{});
 }
 
+fn runMultiWave64Probe(allocator: std.mem.Allocator) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{});
+    defer renderer.deinit();
+    var guest = GuestMemory{};
+    _ = renderer.dcbBackend(guest.interface());
+    const code = [_]u32{
+        vop1(1, 1, 256), // Retain the workgroup-local index.
+        0xd760_0008,   257 | (191 << 9), // READLANE s8, v1, 63.
+        vop1(1, 2, 8), 0xe070_2000,
+        0x8000_0201,   0xbf81_0000,
+    };
+    for (code, 0..) |word, index| guest.word(0x100 + index * 4, word);
+    var analysis = try gpu.shader_analysis.decode(allocator, .{ .context = &guest, .read_fn = GuestMemory.read }, 0x100, 32);
+    defer analysis.deinit(allocator);
+    for ([_]u32{ 64, 128, 256 }) |lanes| {
+        var module = try analysis.translateSpirv(allocator, .{
+            .stage = .compute,
+            .local_size = .{ lanes, 1, 1 },
+            .compute_inputs = .{ .local_invocation_id_components = 1 },
+            .storage_buffers = &.{.{ .resource_sgpr = 0, .descriptor_index = 0, .extent_bytes = lanes * 4, .stride = 4 }},
+        });
+        defer module.deinit(allocator);
+        @memset(guest.bytes[0x10000..][0 .. lanes * 4], 0xa5);
+        _ = try renderer.stageGuestStorageBufferAt(0, 0x10000, lanes * 4);
+        _ = try renderer.dispatchSpirv(module.words, .{ 1, 1, 1 });
+        var output: [1024]u8 = undefined;
+        try renderer.readbackGuestStorageBuffer(0x10000, output[0 .. lanes * 4]);
+        for (0..lanes) |lane| {
+            const expected: u32 = @intCast((lane / 64) * 64 + 63);
+            const actual = std.mem.readInt(u32, output[lane * 4 ..][0..4], .little);
+            if (actual != expected) std.debug.print("multi-wave64 lanes={d} lane={d}: expected={d} actual={d}\n", .{ lanes, lane, expected, actual });
+            try std.testing.expectEqual(expected, actual);
+        }
+    }
+    for ([_][3]u32{ .{ 128, 1, 1 }, .{ 16, 16, 1 } }) |shape| try runMultiWave64DivergenceCase(allocator, shape);
+    std.debug.print("multi-wave64 passed: cross-half reads, independent loops, LDS rendezvous, partial EXEC and early wave termination\n", .{});
+}
+
+fn runMultiWave64DivergenceCase(allocator: std.mem.Allocator, shape: [3]u32) !void {
+    const lanes = shape[0] * shape[1];
+    var renderer = try vulkan.Renderer.init(allocator, .{});
+    defer renderer.deinit();
+    var guest = GuestMemory{};
+    _ = renderer.dcbBackend(guest.interface());
+    var code: std.ArrayList(u32) = .empty;
+    defer code.deinit(allocator);
+    try code.appendSlice(allocator, &.{
+        0xd746_0007, 257 | (132 << 9) | (256 << 18), // v7 = local y * 16 + x.
+        (0x16 << 25) | (3 << 17) | (7 << 9) | 134, // v3 = wave index.
+        0xd760_0009, 259 | (128 << 9), // READLANE s9, v3, 0.
+        0x800a_8109, // s10 = wave index + 1.
+        sop1(3, 11, 128),
+    });
+    const loop = code.items.len;
+    try code.appendSlice(allocator, &.{
+        0x800b_810b, // Each wave takes a different number of iterations.
+        0xd760_000c, 263 | (191 << 9), // READLANE inside the divergent loop.
+        0xbf0a_0a0b, // s_cmp_lt_u32 s11, s10.
+    });
+    const back: i16 = @intCast(@as(i64, @intCast(loop)) - @as(i64, @intCast(code.items.len)) - 1);
+    try code.append(allocator, 0xbf85_0000 | @as(u32, @as(u16, @bitCast(back))));
+    try code.appendSlice(allocator, &.{
+        vop1(1, 4, 11),
+        (0x1a << 25) | (5 << 17) | (7 << 9) | 130,
+        0xd834_0000, 0x0000_0405, // LDS[local index] = loop count.
+        0xbf8a_0000,
+        (0x25 << 25) | (6 << 17) | (7 << 9) | 192, // Other wave's index.
+        (0x1b << 25) | (6 << 17) | (6 << 9) | 255,
+        lanes - 1,
+        (0x1a << 25) | (6 << 17) | (6 << 9) | 130,
+        0xd8d8_0000, 0x0400_0006, // LDS read after all waves arrive.
+        0xbf8c_0000,
+    });
+    try code.appendSlice(allocator, &mubuf(0x1c, 0, 4, 7, 0));
+    try code.append(allocator, vop1(1, 2, 12));
+    try code.appendSlice(allocator, &mubuf(0x1c, 4, 2, 7, 0));
+    try code.append(allocator, 0xbf06_8009); // Only wave zero continues.
+    const early_end = code.items.len;
+    try code.append(allocator, 0);
+    try code.appendSlice(allocator, &.{
+        0x7da6_0ea3, // CMPX: guest lanes 35..63.
+        0xbf88_0003, // EXECZ must keep the full guest wave together.
+        vop1(2, 10, 263), // READFIRSTLANE gives 35 despite native subgroup32.
+        0xd760_000c,
+        263 | (191 << 9),
+        sop1(4, 126, 193), // Restore EXEC before writing all lanes.
+        vop1(1, 2, 12),
+        vop1(1, 3, 10),
+    });
+    try code.appendSlice(allocator, &mubuf(0x1c, 8, 2, 7, 0));
+    try code.appendSlice(allocator, &mubuf(0x1c, 12, 3, 7, 0));
+    code.items[early_end] = 0xbf84_0000 | @as(u32, @intCast(code.items.len - early_end - 1));
+    try code.append(allocator, 0xbf81_0000);
+    for (code.items, 0..) |word, index| guest.word(0x100 + index * 4, word);
+    var analysis = try gpu.shader_analysis.decode(allocator, .{ .context = &guest, .read_fn = GuestMemory.read }, 0x100, 128);
+    defer analysis.deinit(allocator);
+    var module = try analysis.translateSpirv(allocator, .{
+        .stage = .compute,
+        .local_size = shape,
+        .compute_inputs = .{ .local_invocation_id_components = 2 },
+        .workgroup_memory_size_bytes = lanes * 4,
+        .storage_buffers = &.{.{ .resource_sgpr = 0, .descriptor_index = 0, .extent_bytes = lanes * 16, .stride = 16 }},
+    });
+    defer module.deinit(allocator);
+    try std.testing.expect(module.used_dispatcher);
+    @memset(guest.bytes[0x10000..][0 .. lanes * 16], 0xa5);
+    _ = try renderer.stageGuestStorageBufferAt(0, 0x10000, lanes * 16);
+    _ = try renderer.dispatchSpirv(module.words, .{ 1, 1, 1 });
+    var output: [4096]u8 = undefined;
+    try renderer.readbackGuestStorageBuffer(0x10000, output[0 .. lanes * 16]);
+    for (0..lanes) |lane| {
+        const expected = [_]u32{
+            @intCast(((lane + 64) % lanes) / 64 + 1),
+            @intCast((lane / 64) * 64 + 63),
+            if (lane < 64) 63 else 0xa5a5_a5a5,
+            if (lane < 64) 35 else 0xa5a5_a5a5,
+        };
+        for (expected, 0..) |value, component| {
+            const actual = std.mem.readInt(u32, output[lane * 16 + component * 4 ..][0..4], .little);
+            if (value != actual) std.debug.print("wave64 divergence shape={any} lane={d} component={d}: expected={d} actual={d}\n", .{ shape, lane, component, value, actual });
+            try std.testing.expectEqual(value, actual);
+        }
+    }
+}
+
 fn runWave64Case(allocator: std.mem.Allocator, local_size: [3]u32) !void {
     var renderer = try vulkan.Renderer.init(allocator, .{});
     defer renderer.deinit();
@@ -6050,6 +6175,10 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--wave64")) {
         try runWave64Probe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--multi-wave64")) {
+        try runMultiWave64Probe(allocator);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--dpp")) {

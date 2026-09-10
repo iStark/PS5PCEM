@@ -305,6 +305,12 @@ pub fn build(allocator: std.mem.Allocator, program: *const instruction.Program) 
 }
 
 pub fn buildInstructions(allocator: std.mem.Allocator, instructions: []const instruction.Instruction) Error!Graph {
+    return buildInstructionsWithBarriers(allocator, instructions, false);
+}
+
+/// Workgroup dispatchers park a guest wave at S_BARRIER until the other
+/// waves arrive, so the barrier must have its own block.
+pub fn buildInstructionsWithBarriers(allocator: std.mem.Allocator, instructions: []const instruction.Instruction, split_barriers: bool) Error!Graph {
     const count = instructions.len;
     var graph = Graph{};
     errdefer graph.deinit(allocator);
@@ -316,6 +322,10 @@ pub fn buildInstructions(allocator: std.mem.Allocator, instructions: []const ins
     leaders[0] = true;
 
     for (instructions, 0..) |inst, index| {
+        if (split_barriers and inst.opcode == .s_barrier) {
+            leaders[index] = true;
+            if (index + 1 < count) leaders[index + 1] = true;
+        }
         if (inst.opcode.isBranch()) {
             const target = instructionIndexAtPc(instructions, inst.branch_target) orelse
                 return Error.InvalidBranchTarget;
