@@ -283,6 +283,11 @@ pub const Options = struct {
     /// interface is unavailable. The backend supplies the active color target.
     fragment_extent: [2]u32 = .{ 1280, 720 },
     fragment_inputs: FragmentInputs = .{},
+    /// Optional host feature for raw per-vertex attributes and manual VINTRP.
+    allow_fragment_barycentric: bool = false,
+    fragment_custom_interpolation_mask: u32 = 0,
+    /// Inferred only for VINTRP MOV inputs which need more than flat shading.
+    fragment_per_vertex_mask: u32 = 0,
     /// VGPR populated from Vulkan's VertexIndex system value before a vertex
     /// shader starts. Other graphics system values remain explicit future
     /// stage-interface work rather than silently receiving zero.
@@ -708,6 +713,10 @@ const Builder = struct {
     color_export_types: [8]ColorExportType,
     packed_color_exports: [8]PackedColorExport,
     parameter_variables: [32]u32 = @splat(0),
+    fragment_per_vertex_mask: u32 = 0,
+    fragment_custom_interpolation_mask: u32 = 0,
+    fragment_scalar_input_pointer: u32 = 0,
+    barycentric_inputs: [2]u32 = .{ 0, 0 },
     vertex_parameter_targets: [32]u32 = @splat(0),
     /// BuiltIn FragCoord (float4) for fragment UV fallback when PARAM interps
     /// are not yet wired from the vertex stage.
@@ -864,6 +873,8 @@ const Builder = struct {
             .wave32 = options.wave32,
             .fragment_extent = options.fragment_extent,
             .fragment_inputs = options.fragment_inputs,
+            .fragment_per_vertex_mask = options.fragment_per_vertex_mask,
+            .fragment_custom_interpolation_mask = options.fragment_custom_interpolation_mask,
             .scalar_specializations = options.scalar_registers,
             .dynamic_scalar_binding = options.dynamic_scalar_binding,
             .zero_unmapped_flat_loads = options.zero_unmapped_flat_loads,
@@ -1001,6 +1012,27 @@ const Builder = struct {
                 try self.emit(&self.declarations, 32, &.{ frag_ptr, 1, self.vector4_type }); // ptr Input
                 try self.emit(&self.declarations, 59, &.{ frag_ptr, self.frag_coord_input, 1 }); // OpVariable
 
+                var per_vertex_pointer: u32 = 0;
+                if (options.fragment_per_vertex_mask != 0) {
+                    const array_type = self.id();
+                    per_vertex_pointer = self.id();
+                    self.fragment_scalar_input_pointer = self.id();
+                    try self.emit(&self.declarations, 28, &.{ array_type, self.vector4_type, try self.constant(.bits32, 3) });
+                    try self.emit(&self.declarations, 32, &.{ per_vertex_pointer, 1, array_type });
+                    try self.emit(&self.declarations, 32, &.{ self.fragment_scalar_input_pointer, 1, self.float_type });
+                    if (self.vector3_type == 0) {
+                        self.vector3_type = self.id();
+                        try self.emit(&self.declarations, 23, &.{ self.vector3_type, self.float_type, 3 });
+                    }
+                    const bary_pointer = self.id();
+                    try self.emit(&self.declarations, 32, &.{ bary_pointer, 1, self.vector3_type });
+                    for (&self.barycentric_inputs, 0..) |*variable, index| {
+                        variable.* = self.id();
+                        try self.emit(&self.annotations, 71, &.{ variable.*, 11, 5286 + @as(u32, @intCast(index)) });
+                        try self.emit(&self.declarations, 59, &.{ bary_pointer, variable.*, 1 });
+                    }
+                }
+
                 for (0..32) |location| {
                     const bit = @as(u32, 1) << @intCast(location);
                     if (options.parameter_mask & bit == 0) continue;
@@ -1015,10 +1047,13 @@ const Builder = struct {
                     else
                         control & 0x1f;
                     try self.emit(&self.annotations, 71, &.{ variable, 30, host_location }); // Location
-                    if (control & 0x400 != 0) {
+                    const per_vertex = options.fragment_per_vertex_mask & bit != 0;
+                    if (per_vertex) {
+                        try self.emit(&self.annotations, 71, &.{ variable, 5285 }); // PerVertexKHR
+                    } else if (control & 0x400 != 0) {
                         try self.emit(&self.annotations, 71, &.{ variable, 14 }); // Flat
                     }
-                    try self.emit(&self.declarations, 59, &.{ frag_ptr, variable, 1 }); // OpVariable
+                    try self.emit(&self.declarations, 59, &.{ if (per_vertex) per_vertex_pointer else frag_ptr, variable, 1 }); // OpVariable
                 }
             },
             .compute => {
@@ -4194,6 +4229,28 @@ const Builder = struct {
             }
         }
         if (self.stage == .fragment) {
+            if (self.fragment_per_vertex_mask != 0) {
+                var next: usize = 0;
+                for (0..8) |input| {
+                    const bit = @as(u16, 1) << @intCast(input);
+                    if (self.fragment_inputs.allocated & bit == 0) continue;
+                    const count: usize = if (input == 3) 3 else if (input < 7) 2 else 1;
+                    if (self.fragment_inputs.enabled & bit != 0 and (input < 3 or (input >= 4 and input <= 6))) {
+                        const bary = self.id();
+                        try self.emit(&self.body, 61, &.{ self.vector3_type, bary, self.barycentric_inputs[@intFromBool(input >= 4)] });
+                        for (0..2) |component| {
+                            const value = self.id();
+                            // Guest I/J weight vertices 1/2; vertex 0 has 1-I-J.
+                            try self.emit(&self.body, 81, &.{ self.float_type, value, bary, @as(u32, @intCast(component + 1)) });
+                            self.registers[128 + next + component] = .{
+                                .id = try self.convert(.{ .id = value, .value_type = .float32 }, .bits32),
+                                .value_type = .bits32,
+                            };
+                        }
+                    }
+                    next += count;
+                }
+            }
             const positions = self.fragment_inputs.positionRegisters();
             var coord: u32 = 0;
             for (positions, 0..) |register, component| {
@@ -5727,6 +5784,14 @@ const Builder = struct {
         return consecutiveRegister(inst.src0, component);
     }
 
+    fn loadVertexParameter(self: *Builder, attribute: u32, component: u32, vertex: u32) Error!u32 {
+        const pointer = self.id();
+        const result = self.id();
+        try self.emit(&self.body, 65, &.{ self.fragment_scalar_input_pointer, pointer, self.parameter_variables[attribute], try self.constant(.bits32, vertex), try self.constant(.bits32, component) });
+        try self.emit(&self.body, 61, &.{ self.float_type, result, pointer });
+        return result;
+    }
+
     fn interpolateParameter(self: *Builder, inst: instruction.Instruction) Error!void {
         if (self.stage != .fragment or inst.src1.kind != .integer_inline_constant) {
             return Error.InvalidStageInterface;
@@ -5740,6 +5805,26 @@ const Builder = struct {
         }
 
         const variable = self.parameter_variables[attribute];
+        if (variable != 0 and self.fragment_per_vertex_mask & (@as(u32, 1) << @intCast(attribute)) != 0) {
+            const base = try self.loadVertexParameter(attribute, component, 0);
+            var value: u32 = undefined;
+            if (inst.opcode == .v_interp_mov_f32) {
+                if (inst.src0.value >= 3) return Error.InvalidStageInterface;
+                value = if (inst.src0.value == 2) base else try self.loadVertexParameter(attribute, component, inst.src0.value + 1);
+                if (inst.src0.value < 2 and self.fragment_custom_interpolation_mask & (@as(u32, 1) << @intCast(attribute)) == 0) {
+                    value = try self.bvhBinary(131, self.float_type, value, base);
+                }
+            } else {
+                const vertex: u32 = if (inst.opcode == .v_interp_p1_f32) 1 else 2;
+                const delta = try self.bvhBinary(131, self.float_type, try self.loadVertexParameter(attribute, component, vertex), base);
+                const weight = try self.source(inst.src0, .float32);
+                const previous = if (vertex == 1) base else try self.source(inst.dst, .float32);
+                value = self.id();
+                try self.emit(&self.body, 12, &.{ self.float_type, value, self.ensureGlslStd450(), 50, delta, weight, previous });
+            }
+            try self.destination(inst.dst, .{ .id = value, .value_type = .float32 });
+            return;
+        }
         const value = if (variable != 0) blk: {
             const vector = self.id();
             try self.emit(&self.body, 61, &.{ self.vector4_type, vector, variable }); // OpLoad
@@ -10792,10 +10877,19 @@ fn assemble(allocator: std.mem.Allocator, builder: *Builder, options: Options) E
     if (builder.uses_image_gather_extended) {
         try appendInstruction(allocator, &words, 17, &.{25}); // OpCapability ImageGatherExtended
     }
+    if (builder.fragment_per_vertex_mask != 0) {
+        try appendInstruction(allocator, &words, 17, &.{5284}); // FragmentBarycentricKHR
+    }
     for (options.storage_images) |binding| {
         if (!storageImageNeedsExtendedFormats(binding.format)) continue;
         try appendInstruction(allocator, &words, 17, &.{49}); // OpCapability StorageImageExtendedFormats
         break;
+    }
+    if (builder.fragment_per_vertex_mask != 0) {
+        const name = "SPV_KHR_fragment_shader_barycentric\x00\x00";
+        var encoded: [name.len / 4]u32 = undefined;
+        for (&encoded, 0..) |*word, index| word.* = std.mem.readInt(u32, name[index * 4 ..][0..4], .little);
+        try appendInstruction(allocator, &words, 10, &encoded);
     }
     if (builder.uses_image_float32_atomic_min_max) {
         try appendInstruction(allocator, &words, 10, &.{
@@ -10850,6 +10944,9 @@ fn assemble(allocator: std.mem.Allocator, builder: *Builder, options: Options) E
     if (builder.vertex_index_input != 0) try entry_point.append(allocator, builder.vertex_index_input);
     if (builder.instance_index_input != 0) try entry_point.append(allocator, builder.instance_index_input);
     if (builder.frag_coord_input != 0) try entry_point.append(allocator, builder.frag_coord_input);
+    for (builder.barycentric_inputs) |variable| if (variable != 0) {
+        try entry_point.append(allocator, variable);
+    };
     if (builder.position_output != 0) try entry_point.append(allocator, builder.position_output);
     for (builder.color_outputs) |color_output| {
         if (color_output != 0) try entry_point.append(allocator, color_output);
@@ -11017,6 +11114,15 @@ fn translateInstructions(
                 effective.parameter_mask |= @as(u32, 1) << @intCast(candidate.export_target - 0x20);
             },
             .fragment => {
+                if (effective.allow_fragment_barycentric and candidate.opcode == .v_interp_mov_f32 and
+                    candidate.src1.kind == .integer_inline_constant and candidate.src1.value < 32)
+                {
+                    const attribute = candidate.src1.value;
+                    const control = if (attribute < effective.fragment_input_controls.len) effective.fragment_input_controls[attribute] else attribute;
+                    const bit = @as(u32, 1) << @intCast(attribute);
+                    if (control & 0x400 == 0 or effective.fragment_custom_interpolation_mask & bit != 0)
+                        effective.fragment_per_vertex_mask |= bit;
+                }
                 if (candidate.opcode == .exp and candidate.export_target < 8) {
                     effective.color_export_mask |= @as(u8, 1) << @intCast(candidate.export_target);
                 }
@@ -11032,6 +11138,7 @@ fn translateInstructions(
             .compute => {},
         }
     }
+    effective.fragment_per_vertex_mask &= effective.parameter_mask;
     effective.uses_lane_identity = effective.uses_lane_identity or effective.uses_execution_mask or
         (effective.uses_execution_mask and has_predicated_write);
     const invocation_count = @as(u64, effective.local_size[0]) * effective.local_size[1] * effective.local_size[2];

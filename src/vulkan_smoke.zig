@@ -4504,6 +4504,109 @@ fn runIntegerColorProbe(allocator: std.mem.Allocator) !void {
     std.debug.print("integer color exports passed: mixed float/integer MRTs, full 32-bit payloads and signed/unsigned packed halfwords\n", .{});
 }
 
+fn runBarycentricProbe(allocator: std.mem.Allocator) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{});
+    defer renderer.deinit();
+    if (!renderer.fragment_barycentric_available) return error.SkipZigTest;
+    var guest = GuestMemory{};
+    var memory = guest.interface();
+    memory.shader_header = struct {
+        fn header(_: ?*anyopaque, program: u64) ?u64 {
+            return if (program == 0x900 or program == 0xa00 or program == 0xb00) 0xe000 else null;
+        }
+    }.header;
+    guest.word(0xe008, 0xe100);
+    guest.word(0xe030, 0xe200);
+    guest.word(0xe050, 1);
+    guest.word(0xe200, 1 << 24); // AGC custom interpolation, raw packed FP16 pairs.
+    const vertex = [_]u32{
+        vop1(6, 1, 261),  vop1(1, 2, 255),  0x3f80_0000,         vop2(4, 3, 1, 2),
+        vop1(1, 4, 255),  0x3f40_0000,      vop2(8, 5, 3, 4),    vop2(8, 6, 3, 3),
+        vop1(1, 7, 255),  0xbfc0_0000,      vop2(8, 6, 6, 7),    vop1(1, 8, 255),
+        0x3f40_0000,      vop2(3, 6, 6, 8), vop1(1, 7, 128),     vop1(1, 8, 242),
+        vop1(1, 9, 255),  0x3e80_0000,      vop2(8, 10, 1, 9),   vop2(3, 12, 10, 9),
+        vop1(1, 11, 255), 0x3e00_0000,      vop2(3, 10, 10, 11), vop2(0x2f, 13, 10, 12),
+        0xf800_0201,      0x0000_000d,      0xf800_08cf,         0x0807_0605,
+        0xbf81_0000,
+    };
+    for (vertex, 0..) |word, i| guest.word(0x700 + i * 4, word);
+    var state = gpu.State{};
+    try state.writeRegister(.shader, gpu.resources.ShaderStage.vertex.programRegisterBase(), 7);
+    try state.writeRegister(.shader, gpu.resources.ShaderStage.vertex.programRegisterBase() + 1, 0);
+    try state.writeRegister(.shader, gpu.resources.ShaderStage.pixel.programRegisterBase() + 1, 0);
+    const context = [_][2]u32{
+        .{ 0x318, 0x20 },                    .{ 0x319, 0 },             .{ 0x31b, 0 },             .{ 0x31c, 10 << 2 }, .{ 0x31d, 0 },
+        .{ 0x390, 0 },                       .{ 0x3b0, (7 << 14) | 7 }, .{ 0x3b8, 1 << 24 },       .{ 0x08e, 0xf },     .{ 0x00c, 0 },
+        .{ 0x00d, 8 | (8 << 16) },           .{ 0x094, 1 << 31 },       .{ 0x095, 8 | (8 << 16) }, .{ 0x1e0, 0 },       .{ 0x200, 0 },
+        .{ 0x202, (0xcc << 16) | (1 << 4) }, .{ 0x204, 0 },             .{ 0x205, 0 },             .{ 0x191, 0x420 },   .{ 0x1b3, 2 },
+        .{ 0x1b4, 0xf8f },
+    };
+    for (context) |entry| try state.writeRegister(.context, entry[0], entry[1]);
+    for ([_]f32{ 4, 4, 4, 4, 1, 0 }, 0..) |value, i|
+        try state.writeRegister(.context, 0x10f + @as(u32, @intCast(i)), @bitCast(value));
+    var executor = gpu.DcbExecutor{ .state = &state, .backend = renderer.dcbBackend(memory), .allocator = allocator };
+    const Mix = struct {
+        fn encode(dst: u8, select: u3, half: u3, negate: u3, sources: [3]u9) [2]u32 {
+            return .{
+                0xcc20_0000 | @as(u32, dst) | (@as(u32, select) << 11) | (@as(u32, half & 4) << 12),
+                @as(u32, sources[0]) | (@as(u32, sources[1]) << 9) | (@as(u32, sources[2]) << 18) |
+                    (@as(u32, half & 3) << 27) | (@as(u32, negate) << 29),
+            };
+        }
+    };
+    for (0..3) |pass| {
+        const basic_fragment = [_]u32{
+            0xc802_0002 | (4 << 18),                          0xc802_0000 | (5 << 18),                          0xc802_0001 | (6 << 18),
+            vop1(0xb, 4, 260),                                vop1(0xb, 5, 261),                                vop1(0xb, 6, 262),
+            vop1(1, 7, 242),
+            // Interpolation inputs occupy v2:v3 after the allocated sample pair.
+                                             if (pass == 0) 0xbf80_0000 else vop2(4, 8, 5, 4), if (pass == 0) 0xbf80_0000 else vop2(4, 9, 6, 4),
+            if (pass == 0) 0xbf80_0000 else vop2(8, 8, 8, 2), if (pass == 0) 0xbf80_0000 else vop2(8, 9, 9, 3), if (pass == 0) 0xbf80_0000 else vop2(3, 4, 4, 8),
+            if (pass == 0) 0xbf80_0000 else vop2(3, 4, 4, 9), if (pass == 0) 0xbf80_0000 else vop1(1, 5, 258),  if (pass == 0) 0xbf80_0000 else vop1(1, 6, 259),
+            0xf800_080f,                                      0x0706_0504,                                      0xbf81_0000,
+        };
+        // The tree material unpacks both halves only after fetching each
+        // vertex, then combines FP16 endpoints with FP32 barycentric weights.
+        const mixed_fragment = [_]u32{
+            0xc802_0002 | (4 << 18), 0xc802_0000 | (5 << 18), 0xc802_0001 | (6 << 18),
+        } ++ Mix.encode(8, 0, 6, 4, .{ 242, 261, 260 }) ++
+            Mix.encode(9, 0, 6, 4, .{ 242, 262, 260 }) ++
+            Mix.encode(10, 6, 6, 4, .{ 242, 261, 260 }) ++
+            Mix.encode(11, 6, 6, 4, .{ 242, 262, 260 }) ++
+            Mix.encode(12, 0, 4, 0, .{ 258, 264, 260 }) ++
+            Mix.encode(13, 4, 4, 0, .{ 258, 266, 260 }) ++ [_]u32{
+            vop2(0x1f, 12, 9, 3), vop2(0x1f, 13, 11, 3), vop1(1, 14, 258), vop1(1, 7, 242),
+            0xf800_080f,          0x070e_0d0c,           0xbf81_0000,
+        };
+        const fragment: []const u32 = if (pass == 2) &mixed_fragment else &basic_fragment;
+        const program: u32 = 0x900 + @as(u32, @intCast(pass)) * 0x100;
+        for (fragment, 0..) |word, i| guest.word(program + i * 4, word);
+        try state.writeRegister(.shader, gpu.resources.ShaderStage.pixel.programRegisterBase(), program >> 8);
+        _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 0 });
+        if (renderer.last_draw_error) |err| return err;
+        try renderer.flushPendingGuestWrites();
+        for (1..6) |y| for (1..7) |x| {
+            const i = (@as(f32, @floatFromInt(y)) + 0.5 - 1) / 6;
+            const j = (@as(f32, @floatFromInt(x)) + 0.5 - 1 - 3 * i) / 6;
+            if (j < 0.03 or 1 - i - j < 0.03) continue;
+            const expected: [3]f32 = switch (pass) {
+                0 => .{ 0.125, 0.375, 0.625 },
+                1 => .{ 0.125 + 0.25 * i + 0.5 * j, i, j },
+                else => .{ 0.125 + 0.25 * i + 0.5 * j, 0.25 + 0.25 * i + 0.5 * j, i },
+            };
+            const pixel = guest.bytes[0x2000 + (y * 8 + x) * 4 ..][0..4];
+            for (expected, 0..) |value, channel| {
+                const want: i32 = @intFromFloat(@round(value * 255));
+                if (@abs(@as(i32, pixel[channel]) - want) > 1) {
+                    std.debug.print("barycentric pass={d} xy={d},{d} channel={d} want={d} got={d}\n", .{ pass, x, y, channel, want, pixel[channel] });
+                    return error.BarycentricMismatch;
+                }
+            }
+        };
+    }
+    std.debug.print("Barycentric probe passed: distinct packed vertex values, both FP16 halves through MIX, manual interpolation and input allocation holes\n", .{});
+}
+
 fn runShaderInterfaceProbe(allocator: std.mem.Allocator) !void {
     var renderer = try vulkan.Renderer.init(allocator, .{});
     defer renderer.deinit();
@@ -6919,6 +7022,10 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--shader-interface")) {
         try runShaderInterfaceProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--barycentric")) {
+        try runBarycentricProbe(allocator);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--streamed-mips")) {

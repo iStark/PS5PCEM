@@ -152,6 +152,7 @@ pub const structure_type_descriptor_set_layout_binding_flags_create_info: u32 = 
 pub const structure_type_physical_device_descriptor_indexing_features: u32 = 1_000_161_001;
 pub const structure_type_physical_device_timeline_semaphore_features: u32 = 1_000_207_000;
 pub const structure_type_physical_device_shader_atomic_float_2_features_ext: u32 = 1_000_273_000;
+pub const structure_type_physical_device_fragment_shader_barycentric_features_khr: u32 = 1_000_203_000;
 pub const structure_type_semaphore_type_create_info: u32 = 1_000_207_002;
 pub const structure_type_timeline_semaphore_submit_info: u32 = 1_000_207_003;
 pub const structure_type_semaphore_wait_info: u32 = 1_000_207_004;
@@ -449,6 +450,12 @@ pub const PhysicalDeviceDescriptorIndexingFeatures = extern struct {
     descriptor_binding_partially_bound: Bool32 = 0,
     descriptor_binding_variable_descriptor_count: Bool32 = 0,
     runtime_descriptor_array: Bool32 = 0,
+};
+
+pub const PhysicalDeviceFragmentShaderBarycentricFeaturesKHR = extern struct {
+    s_type: u32 = structure_type_physical_device_fragment_shader_barycentric_features_khr,
+    p_next: ?*anyopaque = null,
+    fragment_shader_barycentric: Bool32 = 0,
 };
 
 pub const PhysicalDeviceShaderAtomicFloat2FeaturesEXT = extern struct {

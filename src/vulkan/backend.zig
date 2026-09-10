@@ -3197,6 +3197,7 @@ pub const Renderer = struct {
     geometry_shaders_available: bool,
     shader_float64_available: bool,
     image_float32_atomic_min_max_available: bool,
+    fragment_barycentric_available: bool,
     validation_enabled: bool,
     graphics_probe_enabled: bool,
     capture_first_graphics_frame: bool,
@@ -3659,9 +3660,13 @@ pub const Renderer = struct {
             candidate.physical_device,
             "VK_EXT_shader_atomic_float2",
         );
-        var shader_atomic_float2_support = vk.PhysicalDeviceShaderAtomicFloat2FeaturesEXT{};
+        const barycentric_extension = physicalDeviceSupportsExtension(allocator, &instance_functions, candidate.physical_device, "VK_KHR_fragment_shader_barycentric");
+        var barycentric_support = vk.PhysicalDeviceFragmentShaderBarycentricFeaturesKHR{};
+        var shader_atomic_float2_support = vk.PhysicalDeviceShaderAtomicFloat2FeaturesEXT{
+            .p_next = if (barycentric_extension) &barycentric_support else null,
+        };
         var descriptor_indexing_support = vk.PhysicalDeviceDescriptorIndexingFeatures{
-            .p_next = if (shader_atomic_float2_extension) &shader_atomic_float2_support else null,
+            .p_next = if (shader_atomic_float2_extension) &shader_atomic_float2_support else if (barycentric_extension) &barycentric_support else null,
         };
         var timeline_support = vk.PhysicalDeviceTimelineSemaphoreFeatures{
             .p_next = &descriptor_indexing_support,
@@ -3675,6 +3680,7 @@ pub const Renderer = struct {
         const image_float32_atomic_min_max = shader_atomic_float2_extension and
             shader_atomic_float2_support.shader_image_float32_atomic_min_max != 0;
         const supported_features = supported_features_2.features;
+        const fragment_barycentric = barycentric_extension and barycentric_support.fragment_shader_barycentric != 0;
         var enabled_features = vk.PhysicalDeviceFeatures{};
         if (supported_features.values[vk.feature_robust_buffer_access] != 0) {
             enabled_features.values[vk.feature_robust_buffer_access] = vk.true_value;
@@ -3710,11 +3716,15 @@ pub const Renderer = struct {
         if (shader_float64) {
             enabled_features.values[vk.feature_shader_float64] = vk.true_value;
         }
+        var barycentric_enable = vk.PhysicalDeviceFragmentShaderBarycentricFeaturesKHR{
+            .fragment_shader_barycentric = if (fragment_barycentric) vk.true_value else 0,
+        };
         var shader_atomic_float2_enable = vk.PhysicalDeviceShaderAtomicFloat2FeaturesEXT{
+            .p_next = if (fragment_barycentric) &barycentric_enable else null,
             .shader_image_float32_atomic_min_max = if (image_float32_atomic_min_max) vk.true_value else 0,
         };
         var descriptor_indexing_enable = vk.PhysicalDeviceDescriptorIndexingFeatures{
-            .p_next = if (image_float32_atomic_min_max) &shader_atomic_float2_enable else null,
+            .p_next = if (image_float32_atomic_min_max) &shader_atomic_float2_enable else if (fragment_barycentric) &barycentric_enable else null,
             .descriptor_binding_partially_bound = if (descriptor_partially_bound) vk.true_value else 0,
             .shader_sampled_image_array_non_uniform_indexing = if (sampled_image_nonuniform_indexing) vk.true_value else 0,
             .shader_storage_buffer_array_non_uniform_indexing = if (storage_buffer_nonuniform_indexing) vk.true_value else 0,
@@ -3724,6 +3734,8 @@ pub const Renderer = struct {
                 &descriptor_indexing_enable
             else if (image_float32_atomic_min_max)
                 &shader_atomic_float2_enable
+            else if (fragment_barycentric)
+                &barycentric_enable
             else
                 null,
             .timeline_semaphore = vk.true_value,
@@ -3734,7 +3746,7 @@ pub const Renderer = struct {
             candidate.physical_device,
             "VK_NV_device_diagnostic_checkpoints",
         );
-        var device_extension_names: [3][*:0]const u8 = undefined;
+        var device_extension_names: [4][*:0]const u8 = undefined;
         var device_extension_count: u32 = 0;
         if (wants_presentation) {
             device_extension_names[device_extension_count] = "VK_KHR_swapchain";
@@ -3746,6 +3758,10 @@ pub const Renderer = struct {
         }
         if (diagnostic_checkpoints) {
             device_extension_names[device_extension_count] = "VK_NV_device_diagnostic_checkpoints";
+            device_extension_count += 1;
+        }
+        if (fragment_barycentric) {
+            device_extension_names[device_extension_count] = "VK_KHR_fragment_shader_barycentric";
             device_extension_count += 1;
         }
         const device_info = vk.DeviceCreateInfo{
@@ -3992,6 +4008,7 @@ pub const Renderer = struct {
             .geometry_shaders_available = geometry_shaders,
             .shader_float64_available = shader_float64,
             .image_float32_atomic_min_max_available = image_float32_atomic_min_max,
+            .fragment_barycentric_available = fragment_barycentric,
             .validation_enabled = validation_enabled,
             .graphics_probe_enabled = options.enable_graphics_probe,
             .capture_first_graphics_frame = options.capture_first_graphics_frame,
@@ -14584,6 +14601,16 @@ pub const Renderer = struct {
             }
         }
         var fragment_input_controls: [32]u32 = undefined;
+        var fragment_custom_interpolation_mask: u32 = 0;
+        if (fragment_bindings.metadata) |metadata| {
+            if (metadata.input_semantics_address != 0 and metadata.input_semantics_count <= 32) {
+                for (0..metadata.input_semantics_count) |attribute| {
+                    const semantic = reader.readU32(metadata.input_semantics_address + attribute * 4) catch continue;
+                    if (semantic & (1 << 24) != 0 and semantic & (3 << 20) == 0)
+                        fragment_custom_interpolation_mask |= @as(u32, 1) << @intCast(attribute);
+                }
+            }
+        }
         var fragment_input_locations: [32]u8 = undefined;
         for (&fragment_input_locations, 0..) |*location, index| location.* = @intCast(index);
         var mapped_fragment_attribute_mask: u32 = 0;
@@ -15313,6 +15340,8 @@ pub const Renderer = struct {
             .parameter_mask = paired_parameter_mask,
             .fragment_input_controls = &fragment_input_controls,
             .fragment_input_locations = &fragment_input_locations,
+            .allow_fragment_barycentric = self.fragment_barycentric_available,
+            .fragment_custom_interpolation_mask = fragment_custom_interpolation_mask,
             .fragment_inputs = .{
                 .allocated = @truncate(state.readRegister(.context, 0x1b4) orelse 0),
                 .enabled = @truncate(state.readRegister(.context, 0x1b3) orelse 0),
