@@ -6867,9 +6867,11 @@ fn runLargeIndirectImageProbe(allocator: std.mem.Allocator) !void {
     @memcpy(userdata[8..12], &[_]u32{ table, 32 << 16, count, 0 });
     @memcpy(userdata[12..16], &[_]u32{ output, 4 << 16, groups, 0 });
     for (userdata, 0..) |word, index| try state.writeRegister(.shader, compute.userDataBase() + @as(u32, @intCast(index)), word);
-    for (0..2) |relocation| {
+    for (0..3) |relocation| {
         for (0..count) |index| {
-            const texture = if (relocation == 0) index else count - index - 1;
+            // A real material table contains 1320 copies of its fallback T#.
+            // Keep a long run of exact aliases alongside distinct 2D/3D views.
+            const texture = if (relocation == 0) index else if (relocation == 2 and index < 1320) count - 1 else count - index - 1;
             var image = sampledImageDescriptorWords(textures + @as(u32, @intCast(texture)) * 256, 1, 1);
             // A distinct view of the first allocation must still select blue,
             // even though its address word matches another candidate exactly.
@@ -6887,7 +6889,7 @@ fn runLargeIndirectImageProbe(allocator: std.mem.Allocator) !void {
         var pixels: [groups * 4]u8 = undefined;
         try renderer.readbackGuestStorageBuffer(output, &pixels);
         for (0..groups) |index| {
-            const texture = if (index == count) count else if (relocation == 0) index else count - index - 1;
+            const texture = if (index == count) count else if (relocation == 0) index else if (relocation == 2 and index < 1320) count - 1 else count - index - 1;
             const expected: f32 = if (texture == count) 0 else if (texture == count - 1) 128.0 / 255.0 else @as(f32, @floatFromInt(texture % 251 + 1)) / 255.0;
             const actual: f32 = @bitCast(std.mem.readInt(u32, pixels[index * 4 ..][0..4], .little));
             try std.testing.expectApproxEqAbs(expected, actual, 0.00001);
