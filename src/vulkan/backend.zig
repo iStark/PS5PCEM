@@ -3463,6 +3463,7 @@ pub const Renderer = struct {
     image_scratch: @import("scratch_pool.zig").Pool = .{},
     checkpoint_scratch: gpu.resource_checkpoints.Pool = .{},
     uniform_specialization_cache_enabled: bool = true,
+    prepared_program_keys_enabled: bool = true,
     /// Diagnostic switch for comparing the transient and resident upload paths.
     reuse_color_target_transfer: bool = true,
     /// Workers publish new pipelines; the render thread schedules persistence.
@@ -5980,7 +5981,7 @@ pub const Renderer = struct {
             self.updateStorageDescriptorRange(lds_slot.?, spilled_lds.?.handle, 0, bytes);
             resources.occupied[lds_slot.?] = true;
         }
-        const module_lease = self.compute_translations.acquire(self.allocator, &analysis.program, .{
+        const module_lease = self.compute_translations.acquirePrepared(self.allocator, &analysis.program, .{
             .stage = .compute,
             .local_size = local_size,
             .maximum_dispatcher_iterations = if (yotei_environment_lighting) 2048 else if (yotei_atmosphere_multiscatter) 1024 else if (yotei_atmosphere_precompute) 512 else 256,
@@ -6020,7 +6021,7 @@ pub const Renderer = struct {
             .private_memory_size_bytes = if (scene_collision_query) 256 else 0,
             .allow_float64 = self.shader_float64_available,
             .allow_image_float32_atomic_min_max = self.image_float32_atomic_min_max_available,
-        }, analysis.pipeline_options) catch |err| {
+        }, analysis.pipeline_options, if (self.prepared_program_keys_enabled) analysis.translation_key else null) catch |err| {
             self.frame_profile.compute_translate_ns +|= elapsedHostNanoseconds(translate_started);
             if (self.shouldReportComputeShaderFailure(program_address, err)) {
                 std.debug.print(
@@ -9939,6 +9940,7 @@ pub const Renderer = struct {
         analysis.enableScalarDefinitionCache(self.allocator) catch {};
         analysis.enableResourceCheckpoints(self.allocator) catch {};
         analysis.enableUniformSpecializations(self.allocator) catch {};
+        analysis.enableTranslationKey(self.allocator) catch {};
         self.frame_profile.shader_analysis_ns +|= elapsedHostNanoseconds(started);
         self.frame_profile.shader_analysis_misses += 1;
         const replacement = AnalyzedProgram{
@@ -15336,7 +15338,7 @@ pub const Renderer = struct {
         }
 
         const fragment_translate_started = hostTimestampNs();
-        const fragment_lease = self.graphics_translations.acquire(self.allocator, &fragment_analysis.program, .{
+        const fragment_lease = self.graphics_translations.acquirePrepared(self.allocator, &fragment_analysis.program, .{
             .stage = .fragment,
             // FragCoord is measured in visible render-target pixels. Dividing
             // X by the NV12 allocation pitch (2048 for a 1920-wide movie)
@@ -15372,7 +15374,7 @@ pub const Renderer = struct {
                 .value_base = dynamic_scalar_words_per_stage,
             } else null,
             .specialized_scalar_prefix_end = fragment_scalar_end,
-        }, fragment_analysis.pipeline_options) catch |err| {
+        }, fragment_analysis.pipeline_options, if (self.prepared_program_keys_enabled) fragment_analysis.translation_key else null) catch |err| {
             if (self.shouldReportShaderFailure(fragment_address, .pixel, err)) {
                 std.debug.print(
                     "[vulkan dcb] fragment program 0x{x}: {d} instructions, translate={s} scalars={d} end=0x{x}\n",

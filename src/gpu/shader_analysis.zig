@@ -38,6 +38,13 @@ pub const Analysis = struct {
     scalar_definitions: ?*ScalarDefinitionCache = null,
     resource_checkpoints: ?CheckpointPlan = null,
     uniform_specializations: ?*UniformSpecializations = null,
+    translation_key: ?rdna2.cache_key.ProgramKey = null,
+
+    /// Call only after reconstruction, before retaining an immutable analysis.
+    pub fn enableTranslationKey(self: *Analysis, allocator: std.mem.Allocator) !void {
+        if (self.translation_key != null) return;
+        self.translation_key = try rdna2.cache_key.ProgramKey.init(allocator, &self.program, self.pipeline_options);
+    }
 
     pub fn enableUniformSpecializations(self: *Analysis, allocator: std.mem.Allocator) !void {
         if (self.uniform_specializations != null) return;
@@ -63,6 +70,7 @@ pub const Analysis = struct {
     }
 
     pub fn deinit(self: *Analysis, allocator: std.mem.Allocator) void {
+        if (self.translation_key) |key| key.deinit(allocator);
         if (self.uniform_specializations) |cache| {
             cache.deinit(allocator);
             allocator.destroy(cache);
@@ -133,6 +141,7 @@ pub const Analysis = struct {
         if (active_cache != null) {
             value.enableScalarDefinitionCache(allocator) catch {};
             value.enableResourceCheckpoints(allocator) catch {};
+            value.enableTranslationKey(allocator) catch {};
         }
         if (active_cache) |cache| {
             var victim: ?*UniformSpecializations.Entry = null;
@@ -645,9 +654,13 @@ test "analysis owns definitions across moves but not shader replacement or unifo
     var decoded = try decode(std.testing.allocator, memory.reader(), 0, 16);
     try decoded.enableScalarDefinitionCache(std.testing.allocator);
     try decoded.enableResourceCheckpoints(std.testing.allocator);
+    try decoded.enableTranslationKey(std.testing.allocator);
     var moved = decoded;
     defer moved.deinit(std.testing.allocator);
     const cache = moved.scalar_definitions.?;
+    const key_bytes = moved.translation_key.?.bytes;
+    try moved.enableTranslationKey(std.testing.allocator);
+    try std.testing.expectEqual(key_bytes.ptr, moved.translation_key.?.bytes.ptr);
     try moved.enableScalarDefinitionCache(std.testing.allocator);
     try std.testing.expectEqual(cache, moved.scalar_definitions.?);
     const checkpoint_pcs = moved.resource_checkpoints.?.resource;
@@ -672,6 +685,9 @@ test "analysis owns definitions across moves but not shader replacement or unifo
         defer specialized.deinit(std.testing.allocator);
         try std.testing.expect(specialized.scalar_definitions == null);
         try std.testing.expect(specialized.resource_checkpoints == null);
+        try std.testing.expect(specialized.translation_key == null);
+        try specialized.enableTranslationKey(std.testing.allocator);
+        try std.testing.expect(!std.mem.eql(u8, key_bytes, specialized.translation_key.?.bytes));
         try std.testing.expect(!moved.resource_checkpoints.?.matches(specialized.program.instructions.items));
         try specialized.enableResourceCheckpoints(std.testing.allocator);
         try std.testing.expectEqual(@as(usize, if (enabled == 0) 1 else 2), specialized.resource_checkpoints.?.resource.len);
@@ -684,6 +700,8 @@ test "analysis owns definitions across moves but not shader replacement or unifo
     defer replacement.deinit(std.testing.allocator);
     try replacement.enableScalarDefinitionCache(std.testing.allocator);
     try replacement.enableResourceCheckpoints(std.testing.allocator);
+    try replacement.enableTranslationKey(std.testing.allocator);
+    try std.testing.expect(!std.mem.eql(u8, key_bytes, replacement.translation_key.?.bytes));
     try std.testing.expectEqual(@as(usize, 0), replacement.resource_checkpoints.?.resource.len);
     try std.testing.expect(!moved.resource_checkpoints.?.matches(replacement.program.instructions.items));
     try std.testing.expect(replacement.scalar_definitions.? != cache);
@@ -714,6 +732,9 @@ test "uniform specialization reuse rechecks guest values and owns separate stati
         try std.testing.expectEqual(iteration >= 2, lease.reused);
         try std.testing.expectEqual(if (flag == 0) rdna2.Opcode.s_nop else .image_store, lease.analysis.program.instructions.items[5].opcode);
         try std.testing.expect(lease.analysis.resource_checkpoints.?.matches(lease.analysis.program.instructions.items));
+        const fresh_key = try rdna2.cache_key.ProgramKey.init(allocator, &lease.analysis.program, lease.analysis.pipeline_options);
+        defer fresh_key.deinit(allocator);
+        try std.testing.expectEqualSlices(u8, fresh_key.bytes, lease.analysis.translation_key.?.bytes);
         try std.testing.expect(lease.analysis.scalar_definitions.?.matches(lease.analysis.program.instructions.items, &lease.analysis.graph));
         const current = @import("scalar_provenance.zig").evaluateDecodedResourceState(memory.reader(), &bindings, lease.analysis.program.instructions.items);
         try std.testing.expect(current.load_count != 0);

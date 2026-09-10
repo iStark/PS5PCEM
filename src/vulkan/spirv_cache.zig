@@ -88,6 +88,19 @@ pub const Cache = struct {
         options: rdna2.spirv.Options,
         pipeline: rdna2.ir.PipelineOptions,
     ) rdna2.spirv.Error!Lease {
+        return self.acquirePrepared(allocator, program, options, pipeline, null);
+    }
+
+    /// The optional prefix belongs to this exact immutable program and pipeline.
+    /// Cache entries still own and compare the complete canonical key bytes.
+    pub fn acquirePrepared(
+        self: *Cache,
+        allocator: std.mem.Allocator,
+        program: *const rdna2.Program,
+        options: rdna2.spirv.Options,
+        pipeline: rdna2.ir.PipelineOptions,
+        prepared: ?rdna2.cache_key.ProgramKey,
+    ) rdna2.spirv.Error!Lease {
         for (options.storage_buffers) |binding| if (binding.lookup != null) {
             // Invalid duplicate candidates must not alias a previously valid
             // entry after their runtime words are removed from the cache key.
@@ -97,9 +110,13 @@ pub const Cache = struct {
         self.key.clearRetainingCapacity();
         // Include decoded instructions as well as code: NGG reconstruction and
         // uniform branch pruning can change instructions without changing code.
-        try appendValue(&self.key, allocator, program.code);
-        try appendValue(&self.key, allocator, program.instructions.items);
-        try appendValue(&self.key, allocator, pipeline);
+        if (prepared) |prefix| {
+            try self.key.appendSlice(allocator, prefix.bytes);
+        } else {
+            try appendValue(&self.key, allocator, program.code);
+            try appendValue(&self.key, allocator, program.instructions.items);
+            try appendValue(&self.key, allocator, pipeline);
+        }
         var key_options = options;
         key_options.scalar_registers = &.{};
         key_options.storage_buffers = &.{};
@@ -298,94 +315,37 @@ test "dynamic buffer extents share translations while address and format rules r
 
 // Serialize fields, never padding or slice pointers. Keys are compared in full
 // after hashing, so a hash collision cannot select another shader.
-fn appendValue(key: *std.ArrayList(u8), allocator: std.mem.Allocator, value: anytype) std.mem.Allocator.Error!void {
-    // Reserve once for the whole object. Growing/checking the ArrayList for
-    // every field of every decoded instruction costs more than a cache hit.
-    const bytes = try key.addManyAsSlice(allocator, serializedSize(value));
-    var cursor: [*]u8 = bytes.ptr;
-    writeValue(&cursor, value);
-    std.debug.assert(cursor == bytes.ptr + bytes.len);
-}
+const appendValue = rdna2.cache_key.appendValue;
 
-fn fixedSize(comptime T: type) ?usize {
-    return switch (@typeInfo(T)) {
-        .@"struct" => |info| blk: {
-            var size: usize = 0;
-            for (info.fields) |field| size += fixedSize(field.type) orelse break :blk null;
-            break :blk size;
-        },
-        .array => |info| if (fixedSize(info.child)) |size| size * info.len else null,
-        .@"enum" => |info| fixedSize(info.tag_type),
-        .bool => 1,
-        .int, .float => @sizeOf(T),
-        else => null,
-    };
-}
-
-fn serializedSize(value: anytype) usize {
-    if (comptime fixedSize(@TypeOf(value))) |size| return size;
-    return switch (@typeInfo(@TypeOf(value))) {
-        .@"struct" => |info| blk: {
-            var size: usize = 0;
-            inline for (info.fields) |field| size += serializedSize(@field(value, field.name));
-            break :blk size;
-        },
-        .array => blk: {
-            var size: usize = 0;
-            for (value) |element| size += serializedSize(element);
-            break :blk size;
-        },
-        .pointer => |info| switch (info.size) {
-            .slice => blk: {
-                if (comptime fixedSize(info.child)) |size| break :blk @sizeOf(usize) + value.len * size;
-                var size: usize = @sizeOf(usize);
-                for (value) |element| size += serializedSize(element);
-                break :blk size;
-            },
-            .one => serializedSize(value.*),
-            else => @compileError("Unsupported shader cache pointer"),
-        },
-        .optional => if (value) |payload| 1 + serializedSize(payload) else 1,
-        else => unreachable,
-    };
-}
-
-fn writeValue(cursor: *[*]u8, value: anytype) void {
-    const T = @TypeOf(value);
-    switch (@typeInfo(T)) {
-        .@"struct" => |info| inline for (info.fields) |field| {
-            writeValue(cursor, @field(value, field.name));
-        },
-        .array => for (value) |element| writeValue(cursor, element),
-        .pointer => |info| switch (info.size) {
-            .slice => {
-                writeValue(cursor, value.len);
-                for (value) |element| writeValue(cursor, element);
-            },
-            .one => writeValue(cursor, value.*),
-            else => @compileError("Unsupported shader cache pointer"),
-        },
-        .optional => {
-            writeValue(cursor, value != null);
-            if (value) |payload| writeValue(cursor, payload);
-        },
-        .@"enum" => writeValue(cursor, @intFromEnum(value)),
-        .bool => {
-            cursor.*[0] = @intFromBool(value);
-            cursor.* += 1;
-        },
-        .int => |info| {
-            const UInt = std.meta.Int(.unsigned, info.bits);
-            const Storage = std.meta.Int(.unsigned, @sizeOf(T) * 8);
-            const bits: Storage = @as(UInt, @bitCast(value));
-            @memcpy(cursor.*[0..@sizeOf(Storage)], std.mem.asBytes(&bits));
-            cursor.* += @sizeOf(Storage);
-        },
-        .float => {
-            const bits: std.meta.Int(.unsigned, @bitSizeOf(T)) = @bitCast(value);
-            writeValue(cursor, bits);
-        },
-        else => @compileError("Unsupported shader cache value: " ++ @typeName(T)),
+test "prepared program keys match fresh translations across reconstructed instructions and pipeline changes" {
+    const a = std.testing.allocator;
+    var cache = Cache{};
+    defer cache.deinit(a);
+    var program = rdna2.Program{ .code = &.{}, .instructions = .empty };
+    defer program.deinit(a);
+    try program.instructions.appendSlice(a, &.{
+        .{ .pc = 0, .family = .vop1, .opcode = .v_mov_b32, .dst = .{ .kind = .vgpr, .reg = 0 }, .src0 = .{ .kind = .integer_inline_constant, .value = 7 }, .src_count = 1 },
+        .{ .pc = 4, .word_count = 2, .family = .mubuf, .opcode = .buffer_store_dword, .dst = .{ .kind = .vgpr, .reg = 0 }, .src0 = .{ .kind = .vgpr, .reg = 1 }, .src1 = .{ .kind = .sgpr, .reg = 12 }, .src2 = .{ .kind = .integer_inline_constant, .value = 0 }, .src_count = 3 },
+        .{ .pc = 12, .family = .sopp, .opcode = .s_endpgm },
+    });
+    const storage = [_]rdna2.spirv.StorageBufferBinding{.{ .resource_sgpr = 12, .descriptor_index = 0, .extent_bytes = 64 }};
+    const options = rdna2.spirv.Options{ .stage = .compute, .storage_buffers = &storage };
+    for (0..3) |step| {
+        // Reconstructed/pruned instructions can change without any code words.
+        program.instructions.items[0].src0.value = if (step == 0) 7 else 19;
+        const pipeline = rdna2.ir.PipelineOptions{ .enable_typed_ir = step == 2 };
+        const prefix = try rdna2.cache_key.ProgramKey.init(a, &program, pipeline);
+        defer prefix.deinit(a);
+        const cached = try cache.acquirePrepared(a, &program, options, pipeline, prefix);
+        defer cached.release();
+        const ordinary = try cache.acquire(a, &program, options, pipeline);
+        defer ordinary.release();
+        try std.testing.expect(cached.view().words.ptr == ordinary.view().words.ptr);
+        var fresh = try rdna2.translateProgramSpirvWithPipelineOptions(a, &program, options, pipeline);
+        defer fresh.deinit(a);
+        try std.testing.expectEqualSlices(u32, fresh.words, cached.view().words);
+        try std.testing.expectEqual(@as(u64, @intCast(step + 1)), cache.misses);
+        try std.testing.expectEqual(@as(u64, @intCast(step + 1)), cache.hits);
     }
 }
 

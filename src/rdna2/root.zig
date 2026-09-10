@@ -17,6 +17,7 @@ pub const disasm = @import("disasm.zig");
 pub const control_flow = @import("control_flow.zig");
 pub const ir = @import("ir.zig");
 pub const spirv = @import("spirv.zig");
+pub const cache_key = @import("cache_key.zig");
 
 pub const Family = isa.Family;
 pub const Opcode = isa.Opcode;
@@ -77,4 +78,5 @@ test {
     _ = control_flow;
     _ = ir;
     _ = spirv;
+    _ = cache_key;
 }
