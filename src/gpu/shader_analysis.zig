@@ -37,6 +37,14 @@ pub const Analysis = struct {
     pipeline_options: rdna2.ir.PipelineOptions = .{},
     scalar_definitions: ?*ScalarDefinitionCache = null,
     resource_checkpoints: ?CheckpointPlan = null,
+    uniform_specializations: ?*UniformSpecializations = null,
+
+    pub fn enableUniformSpecializations(self: *Analysis, allocator: std.mem.Allocator) !void {
+        if (self.uniform_specializations != null) return;
+        const cache = try allocator.create(UniformSpecializations);
+        cache.* = .{};
+        self.uniform_specializations = cache;
+    }
 
     /// Retain locations only after decoding/reconstruction has finished.
     /// Dispatch-local branch specializations start without the parent's plan.
@@ -55,6 +63,10 @@ pub const Analysis = struct {
     }
 
     pub fn deinit(self: *Analysis, allocator: std.mem.Allocator) void {
+        if (self.uniform_specializations) |cache| {
+            cache.deinit(allocator);
+            allocator.destroy(cache);
+        }
         if (self.resource_checkpoints) |*plan| plan.deinit(allocator);
         if (self.scalar_definitions) |cache| {
             cache.deinit();
@@ -82,6 +94,66 @@ pub const Analysis = struct {
             &self.graph,
         )) orelse return null;
         errdefer instructions.deinit(allocator);
+        return try self.buildUniformSpecialization(allocator, instructions);
+    }
+
+    /// Re-evaluate guest memory on every dispatch; retain only the resulting
+    /// immutable program and its static analysis. Leases protect nested users.
+    pub fn acquireUniformSpecialization(
+        self: *const Analysis,
+        allocator: std.mem.Allocator,
+        reader: shaders.MemoryReader,
+        bindings: *const shaders.StageBindings,
+        use_cache: bool,
+    ) !?UniformSpecializations.Lease {
+        const active_cache = if (use_cache) self.uniform_specializations else null;
+        var instructions = (try @import("scalar_provenance.zig").pruneUniformBranches(
+            allocator,
+            reader,
+            bindings,
+            self.program.instructions.items,
+            &self.graph,
+        )) orelse return null;
+        var instructions_owned = true;
+        defer if (instructions_owned) instructions.deinit(allocator);
+        if (active_cache) |cache| {
+            cache.sequence +%= 1;
+            for (&cache.entries) |*entry| {
+                const value = entry.analysis orelse continue;
+                if (!UniformSpecializations.samePrunedInstructions(value.program.instructions.items, instructions.items)) continue;
+                entry.pins += 1;
+                entry.sequence = cache.sequence;
+                return .{ .analysis = value, .entry = entry, .allocator = allocator, .reused = true };
+            }
+        }
+        const value = try allocator.create(Analysis);
+        errdefer allocator.destroy(value);
+        value.* = try self.buildUniformSpecialization(allocator, instructions);
+        instructions_owned = false;
+        if (active_cache != null) {
+            value.enableScalarDefinitionCache(allocator) catch {};
+            value.enableResourceCheckpoints(allocator) catch {};
+        }
+        if (active_cache) |cache| {
+            var victim: ?*UniformSpecializations.Entry = null;
+            for (&cache.entries) |*entry| {
+                if (entry.pins != 0) continue;
+                if (victim == null or entry.analysis == null or entry.sequence < victim.?.sequence) victim = entry;
+                if (entry.analysis == null) break;
+            }
+            if (victim) |entry| {
+                if (entry.analysis) |old| {
+                    old.deinit(allocator);
+                    allocator.destroy(old);
+                }
+                entry.* = .{ .analysis = value, .pins = 1, .sequence = cache.sequence };
+                return .{ .analysis = value, .entry = entry, .allocator = allocator };
+            }
+        }
+        return .{ .analysis = value, .entry = null, .allocator = allocator };
+    }
+
+    fn buildUniformSpecialization(self: *const Analysis, allocator: std.mem.Allocator, instructions: std.ArrayList(rdna2.Instruction)) !Analysis {
         var code: std.ArrayList(u32) = .empty;
         errdefer code.deinit(allocator);
         try code.appendSlice(allocator, self.code.items);
@@ -245,6 +317,54 @@ pub const Analysis = struct {
             return rdna2.translateSpirv(allocator, &self.program, options);
         }
         return rdna2.translateIrSpirv(allocator, &self.module, options);
+    }
+};
+
+pub const UniformSpecializations = struct {
+    const Entry = struct {
+        analysis: ?*Analysis = null,
+        pins: usize = 0,
+        sequence: u64 = 0,
+    };
+    entries: [4]Entry = @splat(.{}),
+    sequence: u64 = 0,
+
+    pub const Lease = struct {
+        analysis: *Analysis,
+        entry: ?*Entry,
+        allocator: std.mem.Allocator,
+        reused: bool = false,
+
+        pub fn release(self: *Lease) void {
+            if (self.entry) |entry| {
+                std.debug.assert(entry.pins != 0);
+                entry.pins -= 1;
+            } else {
+                self.analysis.deinit(self.allocator);
+                self.allocator.destroy(self.analysis);
+            }
+            self.* = undefined;
+        }
+    };
+
+    fn samePrunedInstructions(a: []const rdna2.Instruction, b: []const rdna2.Instruction) bool {
+        if (a.len != b.len) return false;
+        // This cache belongs to one immutable decoded parent. Pruning only
+        // keeps an instruction, replaces it with makeNop, or changes a proven
+        // conditional branch to s_branch. PC/opcode therefore identify every
+        // rewrite exactly, without comparing the NaN float views of literals.
+        for (a, b) |lhs, rhs| if (lhs.pc != rhs.pc or lhs.opcode != rhs.opcode) return false;
+        return true;
+    }
+
+    fn deinit(self: *UniformSpecializations, allocator: std.mem.Allocator) void {
+        for (&self.entries) |*entry| {
+            std.debug.assert(entry.pins == 0);
+            if (entry.analysis) |value| {
+                value.deinit(allocator);
+                allocator.destroy(value);
+            }
+        }
     }
 };
 
@@ -569,6 +689,90 @@ test "analysis owns definitions across moves but not shader replacement or unifo
     try std.testing.expect(replacement.scalar_definitions.? != cache);
     try std.testing.expectEqual(@as(u32, 0), replacement.scalar_definitions.?.entries.count());
     try std.testing.expect(!cache.matches(replacement.program.instructions.items, &replacement.graph));
+}
+
+test "uniform specialization reuse rechecks guest values and owns separate static plans" {
+    const allocator = std.testing.allocator;
+    var memory = TestMemory{};
+    const code = [_]u32{
+        0xf400_1a80, 125 << 25,   0xbefe_04c1, 0xbf8c_007f,
+        0xbf07_6a80, 0xbf84_0002, 0xf020_0f28, 0x0002_0400,
+        0xbf81_0000,
+    };
+    for (code, 0..) |word, index| memory.word(index * 4, word);
+    var analysis = try decode(allocator, memory.reader(), 0, 16);
+    defer analysis.deinit(allocator);
+    try analysis.enableUniformSpecializations(allocator);
+    var bindings = std.mem.zeroes(shaders.StageBindings);
+    bindings.resource_instruction_budget = 4096;
+    bindings.user_data_count = 2;
+    bindings.user_data[0] = 48;
+    for ([_]u32{ 0, 1, 2, 0, 1 }, 0..) |flag, iteration| {
+        memory.word(48, flag);
+        var lease = (try analysis.acquireUniformSpecialization(allocator, memory.reader(), &bindings, true)).?;
+        defer lease.release();
+        try std.testing.expectEqual(iteration >= 2, lease.reused);
+        try std.testing.expectEqual(if (flag == 0) rdna2.Opcode.s_nop else .image_store, lease.analysis.program.instructions.items[5].opcode);
+        try std.testing.expect(lease.analysis.resource_checkpoints.?.matches(lease.analysis.program.instructions.items));
+        try std.testing.expect(lease.analysis.scalar_definitions.?.matches(lease.analysis.program.instructions.items, &lease.analysis.graph));
+        const current = @import("scalar_provenance.zig").evaluateDecodedResourceState(memory.reader(), &bindings, lease.analysis.program.instructions.items);
+        try std.testing.expect(current.load_count != 0);
+        try std.testing.expectEqual(flag, current.loads[0].values[0]);
+    }
+    bindings.user_data[0] = 0x10000; // An unavailable flag must not reuse a prior decision.
+    try std.testing.expect((try analysis.acquireUniformSpecialization(allocator, memory.reader(), &bindings, true)) == null);
+}
+
+fn checkPinnedUniformSpecializations(allocator: std.mem.Allocator) !void {
+    var memory = TestMemory{};
+    const code = [_]u32{
+        0xbf07_0080, 0xbf84_0001, 0xbe8a_0387, // if s0 != 0: s10 = 7
+        0xbf07_0180, 0xbf84_0001, 0xbe8b_0387, // if s1 != 0: s11 = 7
+        0xbf07_0280, 0xbf84_0001, 0xbe8c_0387, // if s2 != 0: s12 = 7
+        0xbf81_0000,
+    };
+    for (code, 0..) |word, index| memory.word(index * 4, word);
+    var analysis = try decode(allocator, memory.reader(), 0, 16);
+    defer analysis.deinit(allocator);
+    try analysis.enableUniformSpecializations(allocator);
+    var leases: [5]UniformSpecializations.Lease = undefined;
+    var count: usize = 0;
+    defer for (leases[0..count]) |*lease| lease.release();
+    var bindings = std.mem.zeroes(shaders.StageBindings);
+    bindings.user_data_count = 3;
+    for (0..5) |variant| {
+        for (0..3) |bit| bindings.user_data[bit] = @intCast((variant >> @intCast(bit)) & 1);
+        leases[count] = (try analysis.acquireUniformSpecialization(allocator, memory.reader(), &bindings, true)).?;
+        count += 1;
+    }
+    try std.testing.expect(leases[4].entry == null); // All four retained variants are pinned.
+    try std.testing.expectEqual(rdna2.Opcode.s_nop, leases[0].analysis.program.instructions.items[2].opcode);
+    leases[1].release();
+    bindings.user_data[0] = 1;
+    bindings.user_data[1] = 1;
+    bindings.user_data[2] = 1;
+    // Keep deferred cleanup valid even when replacing the lease fails.
+    leases[1] = leases[count - 1];
+    count -= 1;
+    var replacement = (try analysis.acquireUniformSpecialization(allocator, memory.reader(), &bindings, true)).?;
+    defer replacement.release();
+    try std.testing.expect(replacement.entry != null);
+    try std.testing.expectEqual(rdna2.Opcode.s_nop, leases[0].analysis.program.instructions.items[2].opcode);
+}
+
+test "uniform specialization cache protects pinned variants and releases allocation failures" {
+    try checkPinnedUniformSpecializations(std.testing.allocator);
+    // Optional static memoization may deliberately recover from OOM. Exercise
+    // every allocation site while checking ownership on both outcomes.
+    var fail_index: usize = 0;
+    while (true) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        checkPinnedUniformSpecializations(failing.allocator()) catch |err| {
+            if (err != error.OutOfMemory) return err;
+        };
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+        if (!failing.has_induced_failure) break;
+    }
 }
 
 test "covered raster draw permits exports and GS allocation but retains interrupts" {

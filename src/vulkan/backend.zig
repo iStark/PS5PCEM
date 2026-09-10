@@ -3475,6 +3475,7 @@ pub const Renderer = struct {
 
     image_scratch: @import("scratch_pool.zig").Pool = .{},
     checkpoint_scratch: gpu.resource_checkpoints.Pool = .{},
+    uniform_specialization_cache_enabled: bool = true,
     /// Diagnostic switch for comparing the transient and resident upload paths.
     reuse_color_target_transfer: bool = true,
     /// Compilation can finish on worker threads; only the render thread saves.
@@ -5512,9 +5513,9 @@ pub const Renderer = struct {
         // Re-evaluate uniform guards for every dispatch. A disabled output
         // branch may retain a compressed input T# in the same SGPRs; staging
         // that unreachable image_store would reject an otherwise valid kernel.
-        var specialized_analysis = try analysis.specializeUniformBranches(self.allocator, reader, &bindings);
-        defer if (specialized_analysis) |*value| value.deinit(self.allocator);
-        if (specialized_analysis) |*value| analysis = value;
+        var specialized_analysis = try analysis.acquireUniformSpecialization(self.allocator, reader, &bindings, self.uniform_specialization_cache_enabled);
+        defer if (specialized_analysis) |*lease| lease.release();
+        if (specialized_analysis) |lease| analysis = lease.analysis;
         // A decoded `.unsupported` instruction guarantees that SPIR-V
         // translation will fail. Detect it before descriptor/image staging:
         // staging large transient resources for a shader that cannot execute
@@ -9936,6 +9937,7 @@ pub const Renderer = struct {
         // A replacement or eviction destroys it with the decoded analysis.
         analysis.enableScalarDefinitionCache(self.allocator) catch {};
         analysis.enableResourceCheckpoints(self.allocator) catch {};
+        analysis.enableUniformSpecializations(self.allocator) catch {};
         self.frame_profile.shader_analysis_ns +|= elapsedHostNanoseconds(started);
         self.frame_profile.shader_analysis_misses += 1;
         const replacement = AnalyzedProgram{

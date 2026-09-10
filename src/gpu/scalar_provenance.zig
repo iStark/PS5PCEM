@@ -253,8 +253,14 @@ pub fn pruneUniformBranches(
                         if (zero) |value| decisions[block.index] = value == (inst.opcode == .s_cbranch_execz or inst.opcode == .s_cbranch_vccz);
                     },
                     else => {
-                        for (&local.registers, 0..) |*value, index| {
-                            if (clobbers & (@as(u128, 1) << @intCast(index)) != 0) value.* = .{};
+                        // Vector instructions usually leave all SGPRs intact.
+                        // Visit only written registers instead of scanning the
+                        // entire scalar register file for every instruction.
+                        var remaining = clobbers;
+                        while (remaining != 0) {
+                            const index = @ctz(remaining);
+                            local.registers[index] = .{};
+                            remaining &= remaining - 1;
                         }
                         switch (inst.family) {
                             .vop1, .vop2, .vop3, .vop3p, .vopc, .vintrp, .mubuf, .mtbuf, .flat, .ds, .mimg, .exp => {
