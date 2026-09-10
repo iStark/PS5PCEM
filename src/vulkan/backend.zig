@@ -3475,6 +3475,8 @@ pub const Renderer = struct {
     retain_clean_storage_buffers: bool = false,
     /// Diagnostic control for comparing readback waits independently of uploads.
     storage_buffer_read_use_waits: bool = true,
+    /// Diagnostic opt-in while reconstructed NGG winding is being validated.
+    honor_guest_culling: bool = false,
     storage_buffer_cache_budget_bytes: usize = 4 * 1024 * 1024 * 1024,
     device_storage_budget_bytes: usize = 0,
 
@@ -9675,11 +9677,12 @@ pub const Renderer = struct {
         }
         if (render.raster.polygon_mode != 0) return Error.UnsupportedGraphicsState;
         try applyGuestDepthBias(&result, render.raster, if (render.depth_target) |depth| depth.format else 0);
-        // Ignore guest culling on the first host path: attribute fetch and
-        // winding often disagree until NGG export is fully correct, and a
-        // full cull makes every black writeback look identical.
-        result.cull_mode = 0;
-        result.front_face = if (render.raster.clockwise_front_face) 0 else 1;
+        result.cull_mode = @as(u32, @intFromBool(render.raster.cull_front)) |
+            (@as(u32, @intFromBool(render.raster.cull_back)) << 1);
+        // PA_SU_SC_MODE_CNTL.FACE and VkFrontFace use the same encoding.
+        // The signed guest viewport is already applied above; inverting FACE
+        // here reverses both fixed-function culling and the PS face input.
+        result.front_face = @intFromBool(render.raster.clockwise_front_face);
         result.rasterizer_discard = @intFromBool(render.raster.rasterizer_discard);
         return result;
     }
@@ -14405,6 +14408,7 @@ pub const Renderer = struct {
             .{ descriptor.format, descriptor.number_type, target.format.vulkan, target.format.bytes_per_texel },
         );
         var pipeline_state = try guestGraphicsState(&render_state, descriptor);
+        if (!self.honor_guest_culling) pipeline_state.cull_mode = 0;
         try applyColorAttachmentState(&pipeline_state, &render_state, bound_colors[0..bound_color_count]);
         pipeline_state.topology = guestPrimitiveTopology(render_state.primitive_type, draw);
         pipeline_state.rasterization_samples = rasterSampleCount(color_samples) orelse
