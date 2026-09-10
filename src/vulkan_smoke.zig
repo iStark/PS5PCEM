@@ -3167,8 +3167,8 @@ fn runFragmentPositionProbe(allocator: std.mem.Allocator) !void {
     var renderer = try vulkan.Renderer.init(allocator, .{});
     defer renderer.deinit();
     var guest = GuestMemory{};
-    // A covering triangle with clip W=2 and Z=.5. Pixel inputs must contain
-    // window-space XY, reciprocal W=.5 and the selected clip-depth mapping.
+    // A covering triangle with clip W=1, 2 or 4 and Z=.5. SPI supplies
+    // window-space XY and clip W, unlike Vulkan FragCoord.w=1/W.
     const vertex = [_]u32{
         0x34020a81,       0x36040a82,       0x36020282,      0x7e040d02, 0x7e060d01,
         0xd5410001,       0x03ce04f4,       0xd5410002,      0x03ce06f4, vop1(1, 0, 244),
@@ -3197,7 +3197,8 @@ fn runFragmentPositionProbe(allocator: std.mem.Allocator) !void {
         .{ .allocated = 0xf8f, .enabled = 0x902, .first = 10 },
         .{ .allocated = 0xf02, .enabled = 0xf02, .first = 2 },
     };
-    for (0..4) |mode| for (cases, 0..) |case, case_index| {
+    for ([_]u9{ 242, 244, 246 }, [_]f32{ 1, 2, 4 }) |clip_word, clip_w| for (0..4) |mode| for (cases, 0..) |case, case_index| {
+        guest.word(0x700 + 9 * 4, vop1(1, 0, clip_word));
         const negative = mode & 1 != 0;
         const zero_to_one = mode & 2 != 0;
         const first: u9 = 256 + @as(u9, case.first);
@@ -3209,8 +3210,8 @@ fn runFragmentPositionProbe(allocator: std.mem.Allocator) !void {
             vop1(1, 28, 246),          0xbe96047e,              0x7c223800 | @as(u32, first), 0xbf880002,
             vop1(1, case.first, 255),  @bitCast(@as(f32, 1.5)), 0xbefe0416,                   vop1(1, 24, first),
             vop1(1, 25, first + 1),    vop1(1, 26, first + 2),  vop1(1, 27, first + 3),       vop1(1, 28, 255),
-            @bitCast(@as(f32, 0.125)), vop2(8, 24, 24, 28),     vop2(8, 25, 25, 28),          0xf800180f,
-            0x1b1a1918,                0xbf810000,
+            @bitCast(@as(f32, 0.125)), vop2(8, 24, 24, 28),     vop2(8, 25, 25, 28),          vop2(8, 27, 27, 28),
+            0xf800180f,                0x1b1a1918,              0xbf810000,
         };
         for (fragment, 0..) |word, i| guest.word(0x900 + i * 4, word);
         try state.writeRegister(.context, 0x1b4, case.allocated);
@@ -3225,8 +3226,8 @@ fn runFragmentPositionProbe(allocator: std.mem.Allocator) !void {
             const expected = [_]u8{
                 if (x < 4) 48 else @intCast((x * 2 + 1) * 255 / 16),
                 if (case.enabled & 0x200 != 0) @intCast((y * 2 + 1) * 255 / 16) else 0,
-                if (case.enabled & 0x400 != 0) (if (zero_to_one) @as(u8, 64) else 159) else 0,
-                128,
+                if (case.enabled & 0x400 != 0) @intFromFloat((if (zero_to_one) 0.5 / clip_w else 0.5 + 0.25 / clip_w) * 255) else 0,
+                @intFromFloat(clip_w * 255 / 8),
             };
             for (expected, guest.bytes[0x2000 + (y * 8 + x) * 4 ..][0..4], 0..) |want, actual, channel| {
                 if (@abs(@as(i16, actual) - want) > 1) {
@@ -3236,7 +3237,7 @@ fn runFragmentPositionProbe(allocator: std.mem.Allocator) !void {
             }
         };
     };
-    std.debug.print("Fragment position inputs preserve allocation holes, viewport orientation, depth and reciprocal W\n", .{});
+    std.debug.print("Fragment position inputs preserve allocation holes, viewport orientation, depth and clip W\n", .{});
 }
 
 fn runFragmentFaceProbe(allocator: std.mem.Allocator) !void {

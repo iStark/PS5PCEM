@@ -4295,8 +4295,16 @@ const Builder = struct {
                     coord = self.id();
                     try self.emit(&self.body, 61, &.{ self.vector4_type, coord, self.frag_coord_input });
                 }
-                const value = self.id();
+                var value = self.id();
                 try self.emit(&self.body, 81, &.{ self.float_type, value, coord, @intCast(component) });
+                if (component == 3) {
+                    // SPI POS_W is clip W: AMD maps load_frag_coord_w_rcp to
+                    // the hardware frag_pos[3] argument. Vulkan FragCoord.w
+                    // is 1/W, so reconstruct W before seeding the guest VGPR.
+                    const reciprocal = self.id();
+                    try self.emit(&self.body, 136, &.{ self.float_type, reciprocal, try self.constant(.float32, @bitCast(@as(f32, 1))), value });
+                    value = reciprocal;
+                }
                 // Entry register snapshots feed integer OpPhi nodes at CFG
                 // joins, just like the zero and VertexIndex initializers.
                 self.registers[128 + @as(usize, vgpr)] = .{
