@@ -3443,12 +3443,13 @@ fn runResidentTargetReuseAtLimit(allocator: std.mem.Allocator, limit: usize) !vo
     std.debug.print("resident target reuse passed: {d} entries, warm working set, full cache, sampled source, GPU readback, released pins, queued transfer-buffer reseeding\n", .{limit});
 }
 
-fn runQueuedBufferReuseProbe(allocator: std.mem.Allocator, use_waits: bool, retain: bool) !void {
+fn runQueuedBufferReuseProbe(allocator: std.mem.Allocator, use_waits: bool, retain: bool, device_budget: usize) !void {
     var renderer = try vulkan.Renderer.init(allocator, .{
         .enable_timeline_scheduler = true,
         .storage_buffer_use_waits = use_waits,
         .retain_clean_storage_buffers = retain,
         .storage_buffer_cache_budget_bytes = 64 * 16,
+        .device_storage_budget_bytes = device_budget,
     });
     defer renderer.deinit();
     var guest = GuestMemory{};
@@ -3521,7 +3522,7 @@ fn runQueuedBufferReuseProbe(allocator: std.mem.Allocator, use_waits: bool, reta
     _ = try renderer.stageGuestStorageBufferAt(2, 0x2000, 16);
     if (use_waits) {
         try std.testing.expectEqual(submitted_before, renderer.submitted_tick);
-        try std.testing.expectEqual(pending_before, renderer.pending_command_buffers.items.len);
+        try std.testing.expectEqual(pending_before + @as(usize, if (device_budget != 0) 1 else 0), renderer.pending_command_buffers.items.len);
     } else try std.testing.expect(renderer.submitted_tick > submitted_before);
     var independent_result: [16]u8 = undefined;
     try renderer.readbackGuestStorageBuffer(0x2200, &independent_result);
@@ -3610,6 +3611,38 @@ fn runQueuedBufferReuseProbe(allocator: std.mem.Allocator, use_waits: bool, reta
     try renderer.readbackGuestStorageBuffer(large_destination, &rebound_result);
     if (std.mem.readInt(u32, rebound_result[0..4], .little) != 0x1357_2468) return error.LargeComputeShaderMismatch;
     std.debug.print("large headerless compute shader passed: 4203 instructions\n", .{});
+}
+
+fn runDeviceStorageBudgetProbe(allocator: std.mem.Allocator) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true, .device_storage_budget_bytes = 32 });
+    defer renderer.deinit();
+    var guest = GuestMemory{};
+    _ = renderer.dcbBackend(guest.interface());
+    try renderer.probeDeviceStoragePrefix(0x1000);
+    for (1..4) |slot| _ = try renderer.stageGuestStorageBufferAt(@intCast(slot), 0x1000 + slot * 0x100, 16);
+    var local_bytes: u64 = 0;
+    for (renderer.guest_buffers.items) |entry| {
+        if (entry.host_transfer != null) local_bytes += entry.device_local.size;
+    }
+    try std.testing.expectEqual(@as(u64, 32), local_bytes);
+    // Recycle a local allocation into an odd byte view, then grow it beyond
+    // the device budget. Both must use the direct CPU-visible backing.
+    _ = try renderer.stageGuestStorageBufferAt(0, 0x2000, 15);
+    _ = try renderer.stageGuestStorageBufferAt(0, 0x2100, 64);
+    for (renderer.guest_buffers.items) |entry| {
+        if (entry.guest_address == 0x2100) try std.testing.expect(entry.host_transfer == null);
+    }
+    var bytes: [64]u8 = undefined;
+    try renderer.readbackGuestStorageBuffer(0x2100, &bytes);
+    try std.testing.expectEqualSlices(u8, guest.bytes[0x2100..][0..64], &bytes);
+    // Disabling the budget changes recycled backings without disturbing
+    // still-bound descriptor aliases or losing their completed GPU writes.
+    renderer.device_storage_budget_bytes = 0;
+    _ = try renderer.stageGuestStorageBufferAt(1, 0x2200, 16);
+    for (renderer.guest_buffers.items) |entry| {
+        if (entry.guest_address == 0x2200) try std.testing.expect(entry.host_transfer == null);
+    }
+    std.debug.print("device storage transfers passed: partial GPU writeback, retained dirty suffix, budget, odd range, growth and opt-out recycling\n", .{});
 }
 
 fn runGdsAtomicProbe(allocator: std.mem.Allocator) !void {
@@ -4781,7 +4814,7 @@ fn runFlatPointerProbe(allocator: std.mem.Allocator) !void {
 }
 
 fn runCleanBufferRetentionProbe(allocator: std.mem.Allocator) !void {
-    for ([_]bool{ false, true }) |use_waits| try runQueuedBufferReuseProbe(allocator, use_waits, true);
+    for ([_]bool{ false, true }) |use_waits| try runQueuedBufferReuseProbe(allocator, use_waits, true, 0);
     for ([_]bool{ false, true }) |retain| {
         var renderer = try vulkan.Renderer.init(allocator, .{
             .enable_timeline_scheduler = true,
@@ -5909,7 +5942,7 @@ fn runCountedImageLoopProbe(allocator: std.mem.Allocator, uniform_limit: bool) !
     std.debug.print("{s} image loop passed: BC4 images, dynamic SMEM offsets, page crossing and relocation\n", .{if (uniform_limit) "uniform-limit (3, 1, 6)" else "counted (6, null descriptor)"});
 }
 
-fn runBufferContentCacheProbe(allocator: std.mem.Allocator) !void {
+fn runBufferContentCacheProbe(allocator: std.mem.Allocator, device_budget: usize) !void {
     const Memory = SizedGuestMemory(8 * 1024 * 1024);
     const guest = try allocator.create(Memory);
     defer allocator.destroy(guest);
@@ -5919,7 +5952,7 @@ fn runBufferContentCacheProbe(allocator: std.mem.Allocator) !void {
         gpu.parallel_copy.guest_copy_pool.deinit();
         gpu.parallel_copy.guest_copy_pool.participants.store(old_participants, .release);
     }
-    var renderer = try vulkan.Renderer.init(allocator, .{ .defer_small_storage_writes = true, .enable_timeline_scheduler = true });
+    var renderer = try vulkan.Renderer.init(allocator, .{ .defer_small_storage_writes = true, .enable_timeline_scheduler = true, .device_storage_budget_bytes = device_budget });
     defer renderer.deinit();
     var memory = guest.interface();
     memory.fingerprint = Memory.fingerprint;
@@ -6583,7 +6616,7 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--buffer-content-cache")) {
-        try runBufferContentCacheProbe(allocator);
+        try runBufferContentCacheProbe(allocator, 0);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--depth-storage")) {
@@ -6599,6 +6632,19 @@ pub fn main(init: std.process.Init) !void {
         defer renderer.deinit();
         const elapsed = try renderer.probeHostReadback();
         std.debug.print("host readback passed: four 64 MiB reads of GPU-written data verified, CPU reads={d} us\n", .{elapsed / 1000});
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--storage-read-placement")) {
+        var renderer = try vulkan.Renderer.init(allocator, .{});
+        defer renderer.deinit();
+        const elapsed = try renderer.probeStorageReadPlacement();
+        std.debug.print("storage read placement passed: 16 dispatches per placement, 1 GiB input reads; host_cached={d}us device_local={d}us; changed-input sums verified\n", .{ elapsed[0] / 1000, elapsed[1] / 1000 });
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--device-storage")) {
+        for ([_]bool{ false, true }) |use_waits| try runQueuedBufferReuseProbe(allocator, use_waits, false, 64 * 1024 * 1024);
+        try runBufferContentCacheProbe(allocator, 64 * 1024 * 1024);
+        try runDeviceStorageBudgetProbe(allocator);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--persistent-mapping")) {
@@ -6847,7 +6893,7 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--buffer-reuse")) {
-        for ([_]bool{ false, true }) |use_waits| try runQueuedBufferReuseProbe(allocator, use_waits, false);
+        for ([_]bool{ false, true }) |use_waits| try runQueuedBufferReuseProbe(allocator, use_waits, false, 0);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--parallel-copy")) {
@@ -7401,7 +7447,7 @@ pub fn main(init: std.process.Init) !void {
     try runIndexedCopyKernel(allocator, &renderer, &guest, backend);
     try runStorageImageCopyKernel(allocator, &renderer, &guest, backend);
 
-    try runQueuedBufferReuseProbe(allocator, true, false);
+    try runQueuedBufferReuseProbe(allocator, true, false, 0);
 
     var output_buffer: [1024]u8 = undefined;
     var output = std.Io.File.stdout().writer(init.io, &output_buffer);

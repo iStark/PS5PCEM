@@ -242,6 +242,9 @@ pub const Options = struct {
     /// budget is a growth limit; replacing a backing may exceed it temporarily.
     retain_clean_storage_buffers: bool = false,
     storage_buffer_cache_budget_bytes: usize = 4 * 1024 * 1024 * 1024,
+    /// Optional device-local storage backing with a CPU-cached transfer mirror.
+    /// Zero keeps the existing host-visible allocation policy.
+    device_storage_budget_bytes: usize = 0,
     /// Optional Win32 output window. Supplying it enables the required surface
     /// and swapchain extensions and constrains device selection to a queue that
     /// can present to this exact surface.
@@ -933,6 +936,7 @@ const GuestBufferEntry = struct {
     guest_address: u64,
     size: vk.DeviceSize,
     device_local: OwnedBuffer,
+    host_transfer: ?OwnedBuffer = null,
     last_used_sequence: u64,
     /// Pending until the recorded consumer receives a submission timeline tick.
     last_gpu_use: u64 = 0,
@@ -3476,6 +3480,7 @@ pub const Renderer = struct {
     storage_buffer_use_waits: bool = true,
     retain_clean_storage_buffers: bool = false,
     storage_buffer_cache_budget_bytes: usize = 4 * 1024 * 1024 * 1024,
+    device_storage_budget_bytes: usize = 0,
 
     fn destroyResourcePools(self: *Renderer) void {
         self.image_scratch.deinit(self.allocator);
@@ -4025,6 +4030,7 @@ pub const Renderer = struct {
             .storage_buffer_use_waits = options.storage_buffer_use_waits,
             .retain_clean_storage_buffers = options.retain_clean_storage_buffers,
             .storage_buffer_cache_budget_bytes = options.storage_buffer_cache_budget_bytes,
+            .device_storage_budget_bytes = options.device_storage_budget_bytes,
             .window_presentation = window_presentation,
         };
         renderer.image_aliases.enabled = options.enable_canonical_image_aliases;
@@ -4156,6 +4162,7 @@ pub const Renderer = struct {
         self.movie_rgba_scratch.deinit(self.allocator);
         for (self.guest_buffers.items) |entry| {
             self.destroyBuffer(entry.device_local);
+            if (entry.host_transfer) |transfer| self.destroyBuffer(transfer);
         }
         self.guest_buffers.deinit(self.allocator);
         self.draw_upload_cache.deinit(self.allocator);
@@ -4684,6 +4691,78 @@ pub const Renderer = struct {
         return self.stageGuestStorageBufferAt(0, guest_address, size);
     }
 
+    fn storageFitsDeviceBudget(self: *const Renderer, size: usize, replacing: ?usize) bool {
+        // vkCmdCopyBuffer requires a whole number of dwords. Keep odd guest
+        // ranges on the direct host-visible path without widening their views.
+        if (size % 4 != 0 or size > self.device_storage_budget_bytes) return false;
+        var allocated: u64 = 0;
+        for (self.guest_buffers.items, 0..) |entry, index| {
+            if (replacing == index or entry.host_transfer == null) continue;
+            allocated +|= entry.device_local.size;
+        }
+        return allocated <= self.device_storage_budget_bytes - size;
+    }
+
+    const StorageBacking = struct { device: OwnedBuffer, transfer: ?OwnedBuffer = null };
+
+    fn createStorageBacking(self: *Renderer, size: usize, local: bool) Error!StorageBacking {
+        if (!local) return .{ .device = try self.createBufferWithMemoryPreference(
+            size,
+            vk.buffer_usage_storage_buffer_bit,
+            vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit,
+            vk.memory_property_host_cached_bit,
+        ) };
+        const device = try self.createBuffer(size, vk.buffer_usage_storage_buffer_bit | vk.buffer_usage_transfer_src_bit | vk.buffer_usage_transfer_dst_bit, vk.memory_property_device_local_bit);
+        errdefer self.destroyBuffer(device);
+        const transfer = try self.createBufferWithMemoryPreference(size, vk.buffer_usage_transfer_src_bit | vk.buffer_usage_transfer_dst_bit, vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit, vk.memory_property_host_cached_bit);
+        return .{ .device = device, .transfer = transfer };
+    }
+
+    fn uploadStorageBacking(self: *Renderer, entry: *GuestBufferEntry, size: usize) (Error || std.mem.Allocator.Error)!void {
+        const transfer = entry.host_transfer orelse return;
+        errdefer {
+            entry.page_generation = 0;
+            entry.content_hash = null;
+        }
+        const command_buffer = try self.beginOneShot();
+        defer self.releaseOneShot(command_buffer);
+        const before = [_]vk.BufferMemoryBarrier{
+            .{ .source_access_mask = vk.access_memory_read_bit | vk.access_memory_write_bit, .destination_access_mask = vk.access_transfer_write_bit, .buffer = entry.device_local.handle, .offset = 0, .size = size },
+            .{ .source_access_mask = vk.access_host_write_bit, .destination_access_mask = vk.access_transfer_read_bit, .buffer = transfer.handle, .offset = 0, .size = size },
+        };
+        self.device_functions.cmd_pipeline_barrier(command_buffer, vk.pipeline_stage_all_commands_bit | vk.pipeline_stage_host_bit, vk.pipeline_stage_transfer_bit, 0, 0, null, before.len, &before, 0, null);
+        const copy = vk.BufferCopy{ .source_offset = 0, .destination_offset = 0, .size = size };
+        self.device_functions.cmd_copy_buffer(command_buffer, transfer.handle, entry.device_local.handle, 1, @ptrCast(&copy));
+        const ready = vk.BufferMemoryBarrier{ .source_access_mask = vk.access_transfer_write_bit, .destination_access_mask = vk.access_shader_read_bit | vk.access_shader_write_bit, .buffer = entry.device_local.handle, .offset = 0, .size = size };
+        self.device_functions.cmd_pipeline_barrier(command_buffer, vk.pipeline_stage_transfer_bit, vk.pipeline_stage_all_commands_bit, 0, 0, null, 1, @ptrCast(&ready), 0, null);
+        // Protect the CPU mirror even before a shader binds the device copy.
+        entry.last_gpu_use = command_buffer_pending_tick;
+        try self.submitOneShot(command_buffer);
+    }
+
+    fn readStorageBacking(self: *Renderer, entry: *GuestBufferEntry, destination: []u8) (Error || std.mem.Allocator.Error)!void {
+        const transfer = entry.host_transfer orelse return self.readMapped(entry.device_local, destination);
+        if (destination.len == 0) return;
+        if (destination.len > entry.size) return Error.MemoryMapFailed;
+        // A prefix can end between dwords. Copy its containing word only into
+        // the private mirror, then publish exactly the requested guest bytes.
+        const copy_size = std.mem.alignForward(usize, destination.len, 4);
+        const command_buffer = try self.beginOneShot();
+        defer self.releaseOneShot(command_buffer);
+        const before = [_]vk.BufferMemoryBarrier{
+            .{ .source_access_mask = vk.access_memory_write_bit, .destination_access_mask = vk.access_transfer_read_bit, .buffer = entry.device_local.handle, .offset = 0, .size = copy_size },
+            .{ .source_access_mask = vk.access_memory_read_bit | vk.access_memory_write_bit, .destination_access_mask = vk.access_transfer_write_bit, .buffer = transfer.handle, .offset = 0, .size = copy_size },
+        };
+        self.device_functions.cmd_pipeline_barrier(command_buffer, vk.pipeline_stage_all_commands_bit | vk.pipeline_stage_host_bit, vk.pipeline_stage_transfer_bit, 0, 0, null, before.len, &before, 0, null);
+        const copy = vk.BufferCopy{ .source_offset = 0, .destination_offset = 0, .size = copy_size };
+        self.device_functions.cmd_copy_buffer(command_buffer, entry.device_local.handle, transfer.handle, 1, @ptrCast(&copy));
+        const readable = vk.BufferMemoryBarrier{ .source_access_mask = vk.access_transfer_write_bit, .destination_access_mask = vk.access_host_read_bit, .buffer = transfer.handle, .offset = 0, .size = copy_size };
+        self.device_functions.cmd_pipeline_barrier(command_buffer, vk.pipeline_stage_transfer_bit, vk.pipeline_stage_host_bit, 0, 0, null, 1, @ptrCast(&readable), 0, null);
+        entry.last_gpu_use = command_buffer_pending_tick;
+        try self.submitOneShot(command_buffer);
+        try self.readMapped(transfer, destination);
+    }
+
     /// Uploads one exact guest range and publishes it at a stable element of
     /// set 0 / binding 0. Descriptor-array identity is independent from the
     /// allocation cache, so slots can be rebound between dispatches.
@@ -4770,18 +4849,13 @@ pub const Renderer = struct {
 
             if (recycle_index == null) {
                 try self.guest_buffers.ensureUnusedCapacity(self.allocator, 1);
-                const device_local = try self.createBufferWithMemoryPreference(
-                    size,
-                    vk.buffer_usage_storage_buffer_bit,
-                    vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit,
-                    vk.memory_property_host_cached_bit,
-                );
-                errdefer self.destroyBuffer(device_local);
+                const backing = try self.createStorageBacking(size, self.storageFitsDeviceBudget(size, null));
                 self.guest_buffers.appendAssumeCapacity(.{
                     .descriptor_index = descriptor_index,
                     .guest_address = guest_address,
                     .size = size,
-                    .device_local = device_local,
+                    .device_local = backing.device,
+                    .host_transfer = backing.transfer,
                     .last_used_sequence = self.guest_buffer_sequence,
                 });
                 entry_index = self.guest_buffers.items.len - 1;
@@ -4794,17 +4868,15 @@ pub const Renderer = struct {
                     try self.flushGuestStorageBuffer(victim_index);
                 }
                 const victim = &self.guest_buffers.items[victim_index];
-                if (victim.device_local.size < size) {
-                    const replacement_device = try self.createBufferWithMemoryPreference(
-                        size,
-                        vk.buffer_usage_storage_buffer_bit,
-                        vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit,
-                        vk.memory_property_host_cached_bit,
-                    );
-                    errdefer self.destroyBuffer(replacement_device);
+                const local_capacity = if (victim.host_transfer != null) @max(size, @as(usize, @intCast(victim.device_local.size))) else size;
+                const local = size % 4 == 0 and self.storageFitsDeviceBudget(local_capacity, victim_index);
+                if (victim.device_local.size < size or local != (victim.host_transfer != null)) {
+                    const replacement = try self.createStorageBacking(size, local);
                     if (self.trace_resource_failures) std.debug.print("[buffer lifetime] replace handle=0x{x} guest=0x{x} bytes={d} slot={d} with guest=0x{x} bytes={d}\n", .{ victim.device_local.handle, victim.guest_address, victim.size, descriptor_index, guest_address, size });
                     self.destroyBuffer(victim.device_local);
-                    victim.device_local = replacement_device;
+                    if (victim.host_transfer) |transfer| self.destroyBuffer(transfer);
+                    victim.device_local = replacement.device;
+                    victim.host_transfer = replacement.transfer;
                     victim.last_gpu_use = 0;
                 }
                 victim.descriptor_index = descriptor_index;
@@ -4848,7 +4920,7 @@ pub const Renderer = struct {
                     // tick. Changed pages are uncommon; wait only on that path,
                     // while unchanged draws bind the persistent copy directly.
                     if (cache_hit or recycled_entry) try self.waitForStorageBufferHostWrite(entry);
-                    const mapping = try self.mapBufferRange(entry.device_local, 0, size);
+                    const mapping = try self.mapBufferRange(entry.host_transfer orelse entry.device_local, 0, size);
                     defer mapping.release(self);
                     const destination = mapping.bytes.ptr;
                     entry.page_generation = 0;
@@ -4891,6 +4963,7 @@ pub const Renderer = struct {
                             0;
                         if (observed_generation == 0) break;
                     }
+                    try self.uploadStorageBacking(entry, size);
                 } else {
                     self.frame_profile.resident_storage_bytes +%= size;
                     if (source_hash != null) self.frame_profile.content_reused_bytes +%= size;
@@ -4962,13 +5035,14 @@ pub const Renderer = struct {
             // Finish those readers before overwriting either an exact hit or
             // a recycled allocation, also when page tracking is disabled.
             if (cache_hit or recycled_entry) try self.waitForStorageBufferHostWrite(entry);
-            const mapping = try self.mapBufferRange(entry.device_local, 0, size);
+            const mapping = try self.mapBufferRange(entry.host_transfer orelse entry.device_local, 0, size);
             defer mapping.release(self);
             const read_ok = memory.read(memory.context, guest_address, mapping.bytes);
             if (!read_ok) return Error.GuestMemoryReadFailed;
             self.frame_profile.upload_bytes +%= size;
             self.frame_profile.storage_upload_bytes +%= size;
             self.buffer_uploads += 1;
+            try self.uploadStorageBacking(entry, size);
         } else {
             self.frame_profile.resident_storage_bytes +%= size;
         }
@@ -4985,12 +5059,12 @@ pub const Renderer = struct {
         };
     }
 
-    pub fn readbackGuestStorageBuffer(self: *Renderer, guest_address: u64, destination: []u8) Error!void {
+    pub fn readbackGuestStorageBuffer(self: *Renderer, guest_address: u64, destination: []u8) (Error || std.mem.Allocator.Error)!void {
         const entry = for (self.guest_buffers.items) |*candidate| {
             if (candidate.guest_address == guest_address and candidate.size == destination.len) break candidate;
         } else return Error.GuestBufferNotStaged;
         entry.content_hash = null;
-        try self.readMapped(entry.device_local, destination);
+        try self.readStorageBacking(entry, destination);
         self.frame_profile.readback_bytes +%= destination.len;
         self.frame_profile.storage_readback_bytes +%= destination.len;
     }
@@ -5006,7 +5080,7 @@ pub const Renderer = struct {
         var bytes_scratch = try self.image_scratch.acquire(self.allocator, size);
         defer bytes_scratch.release();
         const bytes = bytes_scratch.bytes;
-        try self.readMapped(entry.device_local, bytes);
+        try self.readStorageBacking(entry, bytes);
         const memory = self.guest_memory orelse return Error.GuestMemoryUnavailable;
         if (!memory.write(memory.context, entry.guest_address, bytes)) return Error.GuestMemoryWriteFailed;
         self.frame_profile.readback_bytes +%= size;
@@ -13361,6 +13435,128 @@ pub const Renderer = struct {
         swapRedBlue(&expected);
         try std.testing.expectEqualSlices(u8, &expected, observed[0..8]);
         try std.testing.expectEqualSlices(u8, &pixels, observed[8..16]);
+    }
+
+    /// Exercise GPU-written prefix publication through a cached CPU mirror.
+    /// The caller supplies a writable 16-byte guest range.
+    pub fn probeDeviceStoragePrefix(self: *Renderer, address: u64) anyerror!void {
+        const memory = self.guest_memory orelse return Error.GuestMemoryUnavailable;
+        const seed = [_]u8{0x5a} ** 16;
+        if (!memory.write(memory.context, address, &seed)) return Error.GuestMemoryWriteFailed;
+        _ = try self.stageGuestStorageBufferAt(0, address, seed.len);
+        const index = for (self.guest_buffers.items, 0..) |entry, i| {
+            if (entry.guest_address == address and entry.size == seed.len) break i;
+        } else return Error.GuestBufferNotStaged;
+        const entry = &self.guest_buffers.items[index];
+        try std.testing.expect(entry.host_transfer != null);
+        const source = try self.createBuffer(seed.len, vk.buffer_usage_transfer_src_bit, vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit);
+        defer self.destroyBuffer(source);
+        const pattern = [_]u8{ 0x78, 0x56, 0x34, 0x12 } ** 4;
+        try self.writeMapped(source, &pattern);
+        const command_buffer = try self.beginOneShot();
+        defer self.releaseOneShot(command_buffer);
+        const writable = vk.BufferMemoryBarrier{ .source_access_mask = vk.access_memory_read_bit | vk.access_memory_write_bit, .destination_access_mask = vk.access_transfer_write_bit, .buffer = entry.device_local.handle, .offset = 0, .size = seed.len };
+        self.device_functions.cmd_pipeline_barrier(command_buffer, vk.pipeline_stage_all_commands_bit, vk.pipeline_stage_transfer_bit, 0, 0, null, 1, @ptrCast(&writable), 0, null);
+        const copy = vk.BufferCopy{ .source_offset = 0, .destination_offset = 0, .size = seed.len };
+        self.device_functions.cmd_copy_buffer(command_buffer, source.handle, entry.device_local.handle, 1, @ptrCast(&copy));
+        try self.submitOneShot(command_buffer);
+        entry.gpu_dirty = true;
+        try self.flushGuestStoragePrefix(index, 3);
+        try std.testing.expect(entry.gpu_dirty);
+        var actual: [16]u8 = undefined;
+        if (!memory.read(memory.context, address, &actual)) return Error.GuestMemoryReadFailed;
+        try std.testing.expectEqualSlices(u8, &.{ 0x78, 0x56, 0x34 }, actual[0..3]);
+        try std.testing.expectEqualSlices(u8, seed[3..], actual[3..]);
+        try self.flushGuestStorageBuffer(index);
+        try std.testing.expect(!entry.gpu_dirty);
+        if (!memory.read(memory.context, address, &actual)) return Error.GuestMemoryReadFailed;
+        for (0..4) |word| try std.testing.expectEqual(@as(u32, 0x1234_5678), std.mem.readInt(u32, actual[word * 4 ..][0..4], .little));
+    }
+
+    /// Compare the GPU cost of identical SSBO reads from CPU-cached RAM and
+    /// device-local memory. This diagnostic does not change guest allocation policy.
+    pub fn probeStorageReadPlacement(self: *Renderer) anyerror![2]u64 {
+        const invocations = 256 * 1024;
+        const loads = 64;
+        const source_bytes = invocations * loads * 4;
+        const output_bytes = invocations * 4;
+        const host = try self.createBufferWithMemoryPreference(source_bytes, vk.buffer_usage_storage_buffer_bit | vk.buffer_usage_transfer_src_bit, vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit, vk.memory_property_host_cached_bit);
+        defer self.destroyBuffer(host);
+        const local = try self.createBuffer(source_bytes, vk.buffer_usage_storage_buffer_bit | vk.buffer_usage_transfer_dst_bit, vk.memory_property_device_local_bit);
+        defer self.destroyBuffer(local);
+        const output = try self.createBufferWithMemoryPreference(output_bytes, vk.buffer_usage_storage_buffer_bit, vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit, vk.memory_property_host_cached_bit);
+        defer self.destroyBuffer(output);
+        const source = try self.allocator.alloc(u32, source_bytes / 4);
+        defer self.allocator.free(source);
+        const observed = try self.allocator.alloc(u32, invocations);
+        defer self.allocator.free(observed);
+
+        var program = rdna2.Program{ .code = &.{}, .instructions = .empty };
+        defer program.deinit(self.allocator);
+        try program.instructions.appendSlice(self.allocator, &.{
+            .{ .family = .vop2, .opcode = .v_lshlrev_b32, .dst = .{ .kind = .vgpr, .reg = 1 }, .src0 = .{ .kind = .integer_inline_constant, .value = 6 }, .src1 = .{ .kind = .sgpr, .reg = 0 }, .src_count = 2 },
+            .{ .family = .vop2, .opcode = .v_add_nc_u32, .dst = .{ .kind = .vgpr, .reg = 1 }, .src0 = .{ .kind = .vgpr, .reg = 1 }, .src1 = .{ .kind = .vgpr, .reg = 0 }, .src_count = 2 },
+            .{ .family = .vop1, .opcode = .v_mov_b32, .dst = .{ .kind = .vgpr, .reg = 2 }, .src0 = .{ .kind = .integer_inline_constant, .value = 0 }, .src_count = 1 },
+        });
+        for (0..loads) |load| try program.instructions.appendSlice(self.allocator, &.{
+            .{ .family = .vop2, .opcode = .v_add_nc_u32, .dst = .{ .kind = .vgpr, .reg = 3 }, .src0 = .{ .kind = .vgpr, .reg = 1 }, .src1 = .{ .kind = .literal_constant, .value = @intCast(load * invocations) }, .src_count = 2 },
+            .{ .family = .mubuf, .opcode = .buffer_load_dword, .dst = .{ .kind = .vgpr, .reg = 4 }, .src0 = .{ .kind = .vgpr, .reg = 3 }, .src1 = .{ .kind = .sgpr, .reg = 8 }, .src2 = .{ .kind = .integer_inline_constant, .value = 0 }, .src_count = 3, .index_enable = true, .data_words = 1 },
+            .{ .family = .vop2, .opcode = .v_add_nc_u32, .dst = .{ .kind = .vgpr, .reg = 2 }, .src0 = .{ .kind = .vgpr, .reg = 2 }, .src1 = .{ .kind = .vgpr, .reg = 4 }, .src_count = 2 },
+        });
+        try program.instructions.appendSlice(self.allocator, &.{
+            .{ .family = .mubuf, .opcode = .buffer_store_dword, .dst = .{ .kind = .vgpr, .reg = 2 }, .src0 = .{ .kind = .vgpr, .reg = 1 }, .src1 = .{ .kind = .sgpr, .reg = 12 }, .src2 = .{ .kind = .integer_inline_constant, .value = 0 }, .src_count = 3, .index_enable = true, .data_words = 1 },
+            .{ .family = .sopp, .opcode = .s_endpgm },
+        });
+        for (program.instructions.items, 0..) |*inst, index| inst.pc = @intCast(index * 4);
+        var module = try rdna2.translateProgramSpirv(self.allocator, &program, .{
+            .stage = .compute,
+            .wave32 = true,
+            .local_size = .{ 64, 1, 1 },
+            .compute_inputs = .{ .workgroup_id_sgprs = .{ 0, null, null }, .local_invocation_id_components = 1 },
+            .storage_buffers = &.{
+                .{ .resource_sgpr = 8, .descriptor_index = 0, .stride = 4, .extent_bytes = source_bytes },
+                .{ .resource_sgpr = 12, .descriptor_index = 1, .stride = 4, .extent_bytes = output_bytes },
+            },
+        });
+        defer module.deinit(self.allocator);
+        const pipeline = try self.getComputePipeline(module.words);
+        var elapsed: [2]u64 = .{ 0, 0 };
+        for ([_]usize{ 0, 1, 1, 0 }, 0..) |placement, pass| {
+            for (source, 0..) |*word, index| word.* = @intCast(index * 17 + pass * 101);
+            try self.writeMapped(host, std.mem.sliceAsBytes(source));
+            const upload = try self.beginOneShot();
+            defer self.releaseOneShot(upload);
+            const writable = vk.BufferMemoryBarrier{ .source_access_mask = vk.access_shader_read_bit, .destination_access_mask = vk.access_transfer_write_bit, .buffer = local.handle, .offset = 0, .size = source_bytes };
+            self.device_functions.cmd_pipeline_barrier(upload, vk.pipeline_stage_compute_shader_bit, vk.pipeline_stage_transfer_bit, 0, 0, null, 1, @ptrCast(&writable), 0, null);
+            const copy = vk.BufferCopy{ .source_offset = 0, .destination_offset = 0, .size = source_bytes };
+            self.device_functions.cmd_copy_buffer(upload, host.handle, local.handle, 1, @ptrCast(&copy));
+            const ready = vk.BufferMemoryBarrier{ .source_access_mask = vk.access_transfer_write_bit, .destination_access_mask = vk.access_shader_read_bit, .buffer = local.handle, .offset = 0, .size = source_bytes };
+            self.device_functions.cmd_pipeline_barrier(upload, vk.pipeline_stage_transfer_bit, vk.pipeline_stage_compute_shader_bit, 0, 0, null, 1, @ptrCast(&ready), 0, null);
+            try self.submitOneShot(upload);
+            self.updateStorageDescriptorRange(0, if (placement == 0) host.handle else local.handle, 0, source_bytes);
+            self.updateStorageDescriptorRange(1, output.handle, 0, output_bytes);
+            for (0..9) |iteration| {
+                const start = hostTimestampNs();
+                const command_buffer = try self.beginOneShot();
+                defer self.releaseOneShot(command_buffer);
+                const output_write = vk.BufferMemoryBarrier{ .source_access_mask = vk.access_shader_write_bit, .destination_access_mask = vk.access_shader_write_bit, .buffer = output.handle, .offset = 0, .size = output_bytes };
+                self.device_functions.cmd_pipeline_barrier(command_buffer, vk.pipeline_stage_compute_shader_bit, vk.pipeline_stage_compute_shader_bit, 0, 0, null, 1, @ptrCast(&output_write), 0, null);
+                self.device_functions.cmd_bind_pipeline(command_buffer, vk.pipeline_bind_point_compute, pipeline.pipeline);
+                self.device_functions.cmd_bind_descriptor_sets(command_buffer, vk.pipeline_bind_point_compute, self.compute_pipeline_layout, 0, 1, @ptrCast(&self.descriptor_set), 0, null);
+                self.device_functions.cmd_dispatch(command_buffer, invocations / 64, 1, 1);
+                const readable = vk.BufferMemoryBarrier{ .source_access_mask = vk.access_shader_write_bit, .destination_access_mask = vk.access_host_read_bit, .buffer = output.handle, .offset = 0, .size = output_bytes };
+                self.device_functions.cmd_pipeline_barrier(command_buffer, vk.pipeline_stage_compute_shader_bit, vk.pipeline_stage_host_bit, 0, 0, null, 1, @ptrCast(&readable), 0, null);
+                try self.submitOneShot(command_buffer);
+                if (iteration != 0) elapsed[placement] += elapsedHostNanoseconds(start);
+            }
+            try self.readMapped(output, std.mem.sliceAsBytes(observed));
+            for (observed, 0..) |actual, index| {
+                var expected: u32 = 0;
+                for (0..loads) |load| expected +%= source[index + load * invocations];
+                try std.testing.expectEqual(expected, actual);
+            }
+        }
+        return elapsed;
     }
 
     /// Measure the same GPU-to-host copy path used by image writebacks.

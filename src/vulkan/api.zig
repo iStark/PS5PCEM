@@ -200,6 +200,7 @@ pub const pipeline_stage_early_fragment_tests_bit: Flags = 0x0000_0100;
 pub const pipeline_stage_late_fragment_tests_bit: Flags = 0x0000_0200;
 pub const pipeline_stage_host_bit: Flags = 0x0000_4000;
 pub const pipeline_stage_bottom_of_pipe_bit: Flags = 0x0000_2000;
+pub const pipeline_stage_all_commands_bit: Flags = 0x0001_0000;
 pub const access_shader_read_bit: Flags = 0x0000_0020;
 pub const access_shader_write_bit: Flags = 0x0000_0040;
 pub const access_transfer_read_bit: Flags = 0x0000_0800;
@@ -210,6 +211,8 @@ pub const access_depth_stencil_attachment_read_bit: Flags = 0x0000_0200;
 pub const access_depth_stencil_attachment_write_bit: Flags = 0x0000_0400;
 pub const access_host_read_bit: Flags = 0x0000_2000;
 pub const access_host_write_bit: Flags = 0x0000_4000;
+pub const access_memory_read_bit: Flags = 0x0000_8000;
+pub const access_memory_write_bit: Flags = 0x0001_0000;
 
 pub const physical_device_type_other: u32 = 0;
 pub const physical_device_type_integrated_gpu: u32 = 1;

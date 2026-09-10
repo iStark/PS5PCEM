@@ -2,6 +2,34 @@
 
 Observed with PPSA26344 and the RTX 3070 Ti; individual build results are dated below.
 
+## Optional device-local storage buffers on 2026-09-10
+
+`PS5_GPU_DEVICE_STORAGE_MIB` enables a bounded device-local backing for guest
+storage buffers, with CPU-cached transfer mirrors for uploads and readbacks.
+The default is zero. Descriptor identities, guest range bounds, dirty-range
+publication and the existing 64-entry recycling policy remain in effect.
+Queued copies retain the backing's timeline dependency before it is bound by
+a shader; CPU refresh waits for previous uses of the shared transfer mirror.
+Odd-sized allocations and ranges beyond the device budget use the existing
+host-visible path. Allocation replacement can temporarily exceed the budget
+until older commands release their backing.
+
+SDK probes pass for queued readers, CPU refresh, descriptor migration,
+recycling, growth, bounds, GPU overwrites, byte-prefix publication and budget
+fallback, as well as the complete default smoke. No validation or
+synchronization errors were reported. An isolated 1 GiB SSBO-read workload
+took 43,632 us from CPU-cached host memory and 4,067 us from device-local
+memory, excluding upload copies. That probe ran alongside the native process;
+it establishes a potential transfer benefit, not a game FPS improvement.
+Native performance and visual comparison of this optional path remain pending.
+
+The combined parking-lock, grouped-lookup and translation-lease build reaches
+the complete Deluxe and subsequent bonus notices again. Warm Deluxe frames
+970–974 take 3.59–3.70 seconds with 287–289 draws and 1,240–1,247 executed
+dispatches. Subsequent scene loading creates additional pipelines. These
+observations are not an isolated before/after comparison; full gameplay and
+the 5 FPS target remain unverified.
+
 ## Retained read-only shader translations on 2026-09-10
 
 Compute and fragment cache hits previously copied the complete SPIR-V module
