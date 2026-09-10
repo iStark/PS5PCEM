@@ -22832,9 +22832,48 @@ fn isSceneCollisionQuery(analysis: *const gpu.ShaderAnalysis) bool {
         if (inst.opcode == .image_bvh_intersect_ray) intersections += 1;
         if (inst.opcode == .s_add_i32 and inst.raw_count == 2 and
             inst.raw[0] & 0xff80ffff == 0x8100ff6a and inst.raw[1] == 0x00d40000) stack_limits += 1;
-        if (inst.opcode == .v_med3_i32 and inst.raw_count == 3 and inst.raw[2] == 0x70000000) private_selections += 1;
+        if (inst.opcode == .v_med3_u32 and inst.raw_count == 3 and inst.raw[2] == 0x70000000) private_selections += 1;
     }
     return intersections == 6 and stack_limits == 6 and private_selections == 18;
+}
+
+test "scene collision query shape recognizes decoded unsigned aperture selections" {
+    for ([_]u32{ 0x6ac, 0x6a0 }) |root_pc| {
+        var instructions: [33]gpu.ShaderInstruction = undefined;
+        instructions[0] = try rdna2.decodeInstruction(root_pc, &.{ 0xdc348018, 0x02000002 }, 0);
+        instructions[1] = try rdna2.decodeInstruction(root_pc + 12, &.{ 0xdc308098, 0x047d0002 }, 0);
+        instructions[2] = try rdna2.decodeInstruction(root_pc + 104, &.{ 0xdc348088, 0x0a7d0002 }, 0);
+        for (0..6) |group| {
+            const offset = 3 + group * 5;
+            const pc: u32 = @intCast(0x1000 + group * 0x100);
+            instructions[offset] = try rdna2.decodeInstruction(pc, &.{ 0xf1989f07, 0x00060234, 0x4d4c4f4e, 0x474a4948, 0x00003850 }, 0);
+            instructions[offset + 1] = try rdna2.decodeInstruction(pc + 20, &.{ 0x8134ff6a, 0x00d40000 }, 0);
+            for (0..3) |selection| instructions[offset + 2 + selection] = try rdna2.decodeInstruction(
+                pc + 28 + @as(u32, @intCast(selection)) * 12,
+                &.{ 0xd5590007, 0x04f1fe35, 0x70000000 },
+                0,
+            );
+        }
+        var analysis: gpu.ShaderAnalysis = undefined;
+        analysis.program = .{ .code = &.{}, .instructions = .{ .items = &instructions, .capacity = instructions.len } };
+        try std.testing.expectEqual(gpu.ShaderOpcode.v_med3_u32, instructions[5].opcode);
+        try std.testing.expect(isSceneCollisionQuery(&analysis));
+        const selection = instructions[5];
+        instructions[5].opcode = .v_med3_i32;
+        try std.testing.expect(!isSceneCollisionQuery(&analysis));
+        instructions[5] = selection;
+        instructions[5].raw[2] += 1;
+        try std.testing.expect(!isSceneCollisionQuery(&analysis));
+        instructions[5] = selection;
+        instructions[4].raw[1] += 1;
+        try std.testing.expect(!isSceneCollisionQuery(&analysis));
+        instructions[4].raw[1] -= 1;
+        instructions[0].pc += 4;
+        try std.testing.expect(!isSceneCollisionQuery(&analysis));
+        instructions[0].pc -= 4;
+        instructions[3].opcode = .s_nop;
+        try std.testing.expect(!isSceneCollisionQuery(&analysis));
+    }
 }
 
 fn computeLdsSizeBytes(state: *const gpu.State) u32 {
