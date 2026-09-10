@@ -5500,6 +5500,36 @@ const Builder = struct {
         };
     }
 
+    fn imageResultComponent(self: *Builder, inst: instruction.Instruction, index: u32, value: Value) Error!void {
+        if (!inst.image_sample_flags.d16)
+            return self.destination(try consecutiveRegister(inst.dst, index), value);
+        const dst = try consecutiveRegister(inst.dst, index / 2);
+        const half = if (value.value_type == .float32)
+            try self.packF16Low(value.id)
+        else
+            try self.andBits(try self.convert(value, .bits32), 0xffff);
+        const bits = if (index % 2 == 0) half else blk: {
+            const previous = try self.andBits(try self.source(dst, .bits32), 0xffff);
+            const high = self.id();
+            try self.emit(&self.body, 196, &.{ self.bits_type, high, half, try self.constant(.bits32, 16) });
+            const packed_bits = self.id();
+            try self.emit(&self.body, 197, &.{ self.bits_type, packed_bits, previous, high });
+            break :blk packed_bits;
+        };
+        try self.destination(dst, .{ .id = bits, .value_type = .bits32 });
+    }
+
+    fn imageStoreComponent(self: *Builder, inst: instruction.Instruction, index: u32, value_type: ValueType) Error!u32 {
+        if (!inst.image_sample_flags.d16)
+            return self.source(try consecutiveRegister(inst.dst, index), value_type);
+        var bits = try self.source(try consecutiveRegister(inst.dst, index / 2), .bits32);
+        if (index % 2 != 0) bits = try self.shiftRightBits(bits, 16);
+        if (value_type == .float32) return self.unpackF16Low(bits);
+        if (value_type == .sint32) return self.signExtend16(bits);
+        bits = try self.andBits(bits, 0xffff);
+        return self.convert(.{ .id = bits, .value_type = .bits32 }, value_type);
+    }
+
     fn sampledImageFetch(self: *Builder, inst: instruction.Instruction) Error!void {
         const explicit_mip = inst.opcode_id == 1;
         const coordinate_components: u8 = switch (inst.image_dimension) {
@@ -5559,8 +5589,9 @@ const Builder = struct {
             if (inst.data_mask & bit == 0) continue;
             const value = self.id();
             try self.emit(&self.body, 81, &.{ self.float_type, value, texel, @intCast(component) });
-            try self.destination(
-                try consecutiveRegister(inst.dst, destination_index),
+            try self.imageResultComponent(
+                inst,
+                destination_index,
                 .{ .id = value, .value_type = .float32 },
             );
             destination_index += 1;
@@ -5582,8 +5613,9 @@ const Builder = struct {
                     for (0..4) |component| {
                         const bit = @as(u4, 1) << @intCast(component);
                         if (inst.data_mask & bit == 0) continue;
-                        try self.destination(
-                            try consecutiveRegister(inst.dst, destination_index),
+                        try self.imageResultComponent(
+                            inst,
+                            destination_index,
                             .{ .id = try self.constant(.float32, 0), .value_type = .float32 },
                         );
                         destination_index += 1;
@@ -5637,8 +5669,9 @@ const Builder = struct {
                 }); // OpCompositeExtract
                 break :blk extracted;
             } else try self.storageImageConstant(value_type, selector);
-            try self.destination(
-                try consecutiveRegister(inst.dst, destination_index),
+            try self.imageResultComponent(
+                inst,
+                destination_index,
                 .{ .id = value, .value_type = value_type },
             );
             destination_index += 1;
@@ -5672,7 +5705,7 @@ const Builder = struct {
         for (&shader_values, 0..) |*value, component| {
             const bit = @as(u4, 1) << @intCast(component);
             if (inst.data_mask & bit == 0) continue;
-            value.* = try self.source(try consecutiveRegister(inst.dst, source_index), value_type);
+            value.* = try self.imageStoreComponent(inst, source_index, value_type);
             source_index += 1;
         }
         var physical_values: [4]u32 = undefined;
@@ -6143,8 +6176,9 @@ const Builder = struct {
                     sampled
                 else
                     try self.constant(.float32, 0);
-                try self.destination(
-                    try consecutiveRegister(inst.dst, destination_index),
+                try self.imageResultComponent(
+                    inst,
+                    destination_index,
                     .{ .id = value, .value_type = .float32 },
                 );
                 destination_index += 1;
@@ -6198,8 +6232,9 @@ const Builder = struct {
             if (inst.data_mask & bit == 0) continue;
             const value = self.id();
             try self.emit(&self.body, 81, &.{ self.float_type, value, sampled, @intCast(component) }); // OpCompositeExtract
-            try self.destination(
-                try consecutiveRegister(inst.dst, destination_index),
+            try self.imageResultComponent(
+                inst,
+                destination_index,
                 .{ .id = value, .value_type = .float32 },
             );
             destination_index += 1;
@@ -6349,7 +6384,7 @@ const Builder = struct {
         const arrayed = inst.image_dimension == .dim_2d_array_alt;
         const coordinate_count: u8 = if (arrayed) 3 else 2;
         const flags: u16 = @bitCast(inst.image_sample_flags);
-        const supported_flags = (@as(u16, 1) << 5) | (@as(u16, 1) << 4) | 1;
+        const supported_flags = (@as(u16, 1) << 11) | (@as(u16, 1) << 5) | (@as(u16, 1) << 4) | 1;
         const compare = inst.image_sample_flags.compare;
         const supported_with_compare = supported_flags | (@as(u16, 1) << 3);
         if ((self.stage != .fragment and self.stage != .compute) or
@@ -6520,8 +6555,9 @@ const Builder = struct {
                 }
             }
             for (values, 0..) |value, index| {
-                try self.destination(
-                    try consecutiveRegister(inst.dst, @intCast(index)),
+                try self.imageResultComponent(
+                    inst,
+                    @intCast(index),
                     .{ .id = value, .value_type = .float32 },
                 );
             }
@@ -6553,8 +6589,9 @@ const Builder = struct {
         for (0..4) |index| {
             const value = self.id();
             try self.emit(&self.body, 81, &.{ self.float_type, value, gathered, @intCast(index) }); // OpCompositeExtract
-            try self.destination(
-                try consecutiveRegister(inst.dst, @intCast(index)),
+            try self.imageResultComponent(
+                inst,
+                @intCast(index),
                 .{ .id = value, .value_type = .float32 },
             );
         }

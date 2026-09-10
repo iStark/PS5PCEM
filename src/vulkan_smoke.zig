@@ -2360,6 +2360,95 @@ fn runDppProbe(allocator: std.mem.Allocator) !void {
     std.debug.print("DPP passed: row shifts, rotation, swizzles, masks and both permutation selectors across 64 lanes\n", .{});
 }
 
+fn runImageD16Probe(allocator: std.mem.Allocator) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{});
+    defer renderer.deinit();
+    var guest = GuestMemory{};
+    const backend = renderer.dcbBackend(guest.interface());
+    const stage = gpu.resources.ShaderStage.compute;
+    var state = gpu.State{};
+    try state.writeRegister(.shader, stage.programRegisterBase() + 1, 0);
+    try state.writeRegister(.shader, 0x213, 16 << 1);
+    var image = sampledImageDescriptorWords(0x8000, 1, 1);
+    image[1] = (image[1] & ~(@as(u32, 0x1ff) << 20)) | (77 << 20); // RGBA32_FLOAT
+    for (image, 0..) |word, i| try state.writeRegister(.shader, stage.userDataBase() + @as(u32, @intCast(i)), word);
+    for (0..4) |i| try state.writeRegister(.shader, stage.userDataBase() + 8 + @as(u32, @intCast(i)), 0);
+    for ([_]u32{ 0x10000, 16 << 16, 1, 0 }, 0..) |word, i|
+        try state.writeRegister(.shader, stage.userDataBase() + 12 + @as(u32, @intCast(i)), word);
+    for ([_][4]f32{ .{ 0.375, -0.25, 2, 0.5 }, .{ 1, 0.125, -4, 0.25 } }, 0..) |texel, input_index| {
+        var case_index: u32 = 0;
+        const address: u32 = 0x8000 + @as(u32, @intCast(input_index)) * 0x1000;
+        try state.writeRegister(.shader, stage.userDataBase(), address >> 8);
+        const input: [4]u32 = @bitCast(texel);
+        try std.testing.expect(backend.vtable.write(backend.context, address, std.mem.asBytes(&input)));
+        for (0..3) |operation| for ([_]u4{ 1, 3, 5, 7, 15 }) |mask| for ([_]bool{ false, true }) |d16| {
+            if (operation == 2 and mask != 1) continue; // gather selects one channel
+            const program = 0x100 + case_index * 0x100;
+            case_index += 1;
+            const opcode: u32 = switch (operation) {
+                0 => 0xf09c_0008,
+                1 => 0xf000_0008,
+                else => 0xf11c_0008,
+            };
+            var code: std.ArrayList(u32) = .empty;
+            defer code.deinit(allocator);
+            try code.appendSlice(allocator, &.{ vop1(1, 0, 128), vop1(1, 1, 128) });
+            for (4..8) |reg| try code.appendSlice(allocator, &.{ vop1(1, @intCast(reg), 255), 0xdead_beef });
+            try code.appendSlice(allocator, &.{ opcode | (@as(u32, mask) << 8), 0x0040_0400 | (@as(u32, @intFromBool(d16)) << 31), 0xe078_0000, 0x8003_0400, 0xbf81_0000 });
+            for (code.items, 0..) |word, i| guest.word(program + i * 4, word);
+            try state.writeRegister(.shader, stage.programRegisterBase(), program >> 8);
+            const result = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
+            try std.testing.expect(result.spirv_words != 0);
+            var actual: [4]u32 = undefined;
+            try renderer.readbackGuestStorageBuffer(0x10000, std.mem.asBytes(&actual));
+            var expected: [4]u32 = @splat(0xdead_beef);
+            var index: usize = 0;
+            for (0..4) |component| {
+                if (operation != 2 and mask & (@as(u4, 1) << @intCast(component)) == 0) continue;
+                const value = texel[if (operation == 2) 0 else component];
+                if (d16) {
+                    const half: u32 = @as(u16, @bitCast(@as(f16, @floatCast(value))));
+                    if (index % 2 == 0) expected[index / 2] = half else expected[index / 2] |= half << 16;
+                } else expected[index] = @bitCast(value);
+                index += 1;
+            }
+            std.debug.print("MIMG result case {d}: operation={d} mask={x} d16={} actual={any}\n", .{ case_index, operation, mask, d16, actual });
+            try std.testing.expectEqualSlices(u32, &expected, &actual);
+        };
+    }
+    // Store half components into 32-bit images, including sign extension of
+    // integer data, then inspect the full-width image readback.
+    for ([_]u32{ 77, 75, 76 }, 0..) |format, format_index| {
+        const address: u32 = 0xa000 + @as(u32, @intCast(format_index)) * 0x1000;
+        image[0] = address >> 8;
+        image[1] = (image[1] & ~(@as(u32, 0x1ff) << 20)) | (format << 20);
+        for (image, 0..) |word, i| try state.writeRegister(.shader, stage.userDataBase() + @as(u32, @intCast(i)), word);
+        const inputs: [2]u32 = if (format == 77) .{ 0xb400_3600, 0x3800_4000 } else .{ 0xff01_0123, 0x8000_7fff };
+        const code = [_]u32{
+            vop1(1, 0, 128), vop1(1, 1, 128),
+            vop1(1, 4, 255), inputs[0],
+            vop1(1, 5, 255), inputs[1],
+            0xf020_0f08, 0x8000_0400, // image_store D16, four components from v4:v5
+            0xbf81_0000,
+        };
+        for (code, 0..) |word, i| guest.word(0x7000 + i * 4, word);
+        try state.writeRegister(.shader, stage.programRegisterBase(), 0x70);
+        const result = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
+        try std.testing.expect(result.spirv_words != 0);
+        try renderer.flushPendingGuestWrites();
+        const expected: [4]u32 = switch (format) {
+            77 => @bitCast([4]f32{ 0.375, -0.25, 2, 0.5 }),
+            75 => .{ 0x123, 0xff01, 0x7fff, 0x8000 },
+            else => .{ 0x123, 0xffff_ff01, 0x7fff, 0xffff_8000 },
+        };
+        var actual: [4]u32 = undefined;
+        @memcpy(std.mem.asBytes(&actual), guest.bytes[address..][0..16]);
+        std.debug.print("MIMG D16 store format={d}: actual={any}\n", .{ format, actual });
+        try std.testing.expectEqualSlices(u32, &expected, &actual);
+    }
+    std.debug.print("MIMG D16 passed: sample/load/gather/store, float and integer data, sparse masks, register guards and changed descriptors\n", .{});
+}
+
 fn runPackedFloatProbe(allocator: std.mem.Allocator) !void {
     var renderer = try vulkan.Renderer.init(allocator, .{});
     defer renderer.deinit();
@@ -7430,6 +7519,10 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--packed-floats")) {
         try runPackedFloatProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--image-d16")) {
+        try runImageD16Probe(allocator);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--sdwa")) {

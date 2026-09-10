@@ -120,6 +120,7 @@ pub fn formatInstruction(inst: Instruction, w: *Writer) Writer.Error!void {
         .mimg => {
             try w.print(" dmask:0x{x} dim:{s}", .{ inst.data_mask, @tagName(inst.image_dimension) });
             if (inst.image_sample_flags.a16) try w.writeAll(" a16");
+            if (inst.image_sample_flags.d16) try w.writeAll(" d16");
         },
         .exp => try w.print(" target:{d} en:0x{x}{s}", .{
             inst.export_target,

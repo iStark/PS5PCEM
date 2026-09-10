@@ -101,7 +101,8 @@ pub const ImageSampleFlags = packed struct(u16) {
     coherent_derivative: bool = false,
     gather_horizontal: bool = false,
     adjust: bool = false,
-    _reserved: u5 = 0,
+    d16: bool = false,
+    _reserved: u4 = 0,
 };
 
 /// Opcodes currently understood by the RDNA2 frontend.

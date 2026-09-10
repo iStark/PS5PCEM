@@ -349,6 +349,20 @@ test "comparison gather explicit LOD decodes all captured NSA operands" {
     try std.testing.expectEqual(@as(u8, 5), offset.image_address_components);
 }
 
+test "MIMG D16 packs returned registers independently of address precision" {
+    for ([_]u4{ 1, 3, 5, 7, 15 }) |mask| {
+        const sample = try decodeMimg(0, &.{ 0xf09c_0010 | (@as(u32, mask) << 8), 0x8143_0916 }, 0);
+        try std.testing.expect(sample.image_sample_flags.d16);
+        try std.testing.expect(!sample.image_sample_flags.a16);
+        try std.testing.expectEqual((bitCount4(mask) + 1) / 2, sample.data_words);
+        const full = try decodeMimg(0, &.{ 0xf09c_0010 | (@as(u32, mask) << 8), 0x0143_0916 }, 0);
+        try std.testing.expectEqual(bitCount4(mask), full.data_words);
+    }
+    const gather = try decodeMimg(0, &.{ 0xf11c_0108, 0x8143_0916 }, 0);
+    try std.testing.expectEqual(isa.Opcode.image_gather4, gather.opcode);
+    try std.testing.expectEqual(@as(u8, 2), gather.data_words);
+}
+
 pub fn decodeMimg(pc: u32, code: []const u32, word_index: u32) Error!Instruction {
     if (word_index + 1 >= code.len) return Error.TruncatedInstruction;
     const word0 = code[word_index];
@@ -374,6 +388,12 @@ pub fn decodeMimg(pc: u32, code: []const u32, word_index: u32) Error!Instruction
     inst.image_r128 = (word0 >> 15) & 1 != 0;
     inst.system_coherent = (word0 >> 25) & 1 != 0;
     inst.image_sample_flags.a16 = (word1 >> 30) & 1 != 0;
+    // GFX10 MIMG bit 63 packs two returned/stored 16-bit components per VGPR.
+    // It is independent of A16, which only packs address components.
+    inst.image_sample_flags.d16 = (word1 >> 31) & 1 != 0 and
+        (op == .image_sample or op == .image_gather4 or
+            (op == .image_load and id <= 1) or (op == .image_store and (id == 8 or id == 9)));
+    if (inst.image_sample_flags.d16) inst.data_words = (inst.data_words + 1) / 2;
     if (op == .image_sample) {
         if (id >= 0x20 and id <= 0x3f or (id >= 0xa0 and id <= 0xbe)) {
             const encoded = if (id >= 0xa0) id - 0x80 else id;
