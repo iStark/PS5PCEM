@@ -2,6 +2,22 @@
 
 Observed with PPSA26344 and the RTX 3070 Ti; individual build results are dated below.
 
+## Storage buffer use tracking on 2026-09-10
+
+Overwriting a clean CPU-authored storage buffer previously submitted and waited
+for the entire Vulkan queue. Each cached allocation now records its last GPU
+consumer, including reads. Queued consumers receive a timeline tick on submit;
+host uploads wait for that allocation's tick. Unrelated work remains batched.
+The standalone API retains the global wait because it reuses one descriptor
+set instead of reserving a fresh set for each command.
+
+SDK tests compare both policies with queued readers, recycled allocations,
+descriptor migration, a full cache and exact out-of-bounds behavior. An unrelated
+queued copy now remains unsubmitted during an independent upload, and its output
+still matches. Content invalidation, GPU overwrites and the full GPU smoke pass
+without validation errors or synchronization hazards. The intermediate-flush
+descriptor reservation unit test also passes. Native performance is pending.
+
 ## GPU snapshots of read/write color targets on 2026-09-10
 
 The scene repeatedly samples its G-buffer while writing back to the same
@@ -61,7 +77,12 @@ out-of-range rejection. The isolated writes take 352–627 microseconds with
 scoped maps and 6–7 microseconds with persistent maps. This measures mapping
 overhead, not frame rate. Queued buffer reuse, content-cache invalidation and
 the complete graphics/compute smoke also pass synchronization validation.
-Native frame-rate and scene validation of this change remain pending.
+The native run displays all three bonus notices, the complete wolf brightness
+screen, difficulty selection and experience selection through normal input.
+Stable settings frames take roughly 5.5–6.5 seconds with continuous shader dumps
+disabled. Earlier captures still wrote those dumps, so they do not establish a
+controlled frame-rate comparison. Complete menu and gameplay rendering remain
+unverified.
 
 ## Cross-half reads in multi-wave workgroups on 2026-09-10
 

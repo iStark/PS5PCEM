@@ -235,6 +235,8 @@ pub const Options = struct {
     persistent_depth_passes: bool = true,
     /// Snapshot resident read/write color aliases with a GPU copy.
     gpu_feedback_snapshots: bool = true,
+    /// Wait for the last GPU use of an overwritten storage allocation.
+    storage_buffer_use_waits: bool = true,
     /// Optional Win32 output window. Supplying it enables the required surface
     /// and swapchain extensions and constrains device selection to a queue that
     /// can present to this exact surface.
@@ -926,6 +928,8 @@ const GuestBufferEntry = struct {
     size: vk.DeviceSize,
     device_local: OwnedBuffer,
     last_used_sequence: u64,
+    /// Pending until the recorded consumer receives a submission timeline tick.
+    last_gpu_use: u64 = 0,
     gpu_dirty: bool = false,
     /// Ordered fingerprint of the 16 KiB guest pages copied into device_local.
     /// Zero selects the legacy upload path when tracking is unavailable.
@@ -1947,6 +1951,8 @@ const FrameProfile = struct {
     compute_translation_hits: u64 = 0,
     compute_translation_misses: u64 = 0,
     buffer_fingerprint_ns: u64 = 0,
+    storage_buffer_waits: u64 = 0,
+    storage_buffer_waits_avoided: u64 = 0,
     content_reused_bytes: u64 = 0,
     compute_submit_ns: u64 = 0,
     shader_analysis_hits: u64 = 0,
@@ -3455,6 +3461,7 @@ pub const Renderer = struct {
     persistent_host_mappings: bool = true,
     persistent_depth_passes: bool = true,
     gpu_feedback_snapshots: bool = true,
+    storage_buffer_use_waits: bool = true,
 
     fn destroyResourcePools(self: *Renderer) void {
         self.image_scratch.deinit(self.allocator);
@@ -4001,6 +4008,7 @@ pub const Renderer = struct {
             .persistent_host_mappings = options.persistent_host_mappings,
             .persistent_depth_passes = options.persistent_depth_passes,
             .gpu_feedback_snapshots = options.gpu_feedback_snapshots,
+            .storage_buffer_use_waits = options.storage_buffer_use_waits,
             .window_presentation = window_presentation,
         };
         renderer.image_aliases.enabled = options.enable_canonical_image_aliases;
@@ -4773,6 +4781,7 @@ pub const Renderer = struct {
                     if (self.trace_resource_failures) std.debug.print("[buffer lifetime] replace handle=0x{x} guest=0x{x} bytes={d} slot={d} with guest=0x{x} bytes={d}\n", .{ victim.device_local.handle, victim.guest_address, victim.size, descriptor_index, guest_address, size });
                     self.destroyBuffer(victim.device_local);
                     victim.device_local = replacement_device;
+                    victim.last_gpu_use = 0;
                 }
                 victim.descriptor_index = descriptor_index;
                 victim.guest_address = guest_address;
@@ -4814,7 +4823,7 @@ pub const Renderer = struct {
                     // The backing buffer may still be read by an older timeline
                     // tick. Changed pages are uncommon; wait only on that path,
                     // while unchanged draws bind the persistent copy directly.
-                    if (cache_hit or recycled_entry) try self.waitForSubmittedWork();
+                    if (cache_hit or recycled_entry) try self.waitForStorageBufferHostWrite(entry);
                     const mapping = try self.mapBufferRange(entry.device_local, 0, size);
                     defer mapping.release(self);
                     const destination = mapping.bytes.ptr;
@@ -4928,7 +4937,7 @@ pub const Renderer = struct {
             // queued work: gpu_dirty tracks writes, not outstanding reads.
             // Finish those readers before overwriting either an exact hit or
             // a recycled allocation, also when page tracking is disabled.
-            if (cache_hit or recycled_entry) try self.waitForSubmittedWork();
+            if (cache_hit or recycled_entry) try self.waitForStorageBufferHostWrite(entry);
             const mapping = try self.mapBufferRange(entry.device_local, 0, size);
             defer mapping.release(self);
             const read_ok = memory.read(memory.context, guest_address, mapping.bytes);
@@ -18867,6 +18876,25 @@ pub const Renderer = struct {
         try self.waitForTick(self.submitted_tick);
     }
 
+    fn waitForStorageBufferHostWrite(self: *Renderer, entry: *const GuestBufferEntry) Error!void {
+        if (!self.storage_buffer_use_waits or self.current_descriptor_slot == null) {
+            // The standalone staging API reuses one descriptor set. Updating
+            // that set itself requires completion, even for an unused buffer.
+            self.frame_profile.storage_buffer_waits += 1;
+            return self.waitForSubmittedWork();
+        }
+        // A clean allocation can still have queued readers. Submit those
+        // before a CPU overwrite, but leave unrelated queued work batched.
+        if (entry.last_gpu_use == command_buffer_pending_tick) try self.flushQueuedCommands();
+        std.debug.assert(entry.last_gpu_use != command_buffer_pending_tick);
+        if (entry.last_gpu_use <= self.completed_tick) {
+            self.frame_profile.storage_buffer_waits_avoided += 1;
+            return;
+        }
+        self.frame_profile.storage_buffer_waits += 1;
+        try self.waitForTick(entry.last_gpu_use);
+    }
+
     fn reusableCommandBuffer(self: *Renderer) ?usize {
         for (self.command_buffer_ticks.items, 0..) |tick, index| {
             if (tick != command_buffer_pending_tick and tick <= self.completed_tick) return index;
@@ -18998,6 +19026,13 @@ pub const Renderer = struct {
                 self.descriptor_slot_ticks[descriptor_slot] = command_buffer_pending_tick;
             }
         }
+        // The active descriptor snapshot names every resident storage buffer
+        // available to this command. Mark reads as well as writes: gpu_dirty
+        // alone cannot protect CPU uploads from outstanding shader consumers.
+        for (self.guest_buffers.items) |*entry| {
+            if (std.mem.indexOfScalar(vk.Buffer, &self.active_storage_buffers, entry.device_local.handle) != null)
+                entry.last_gpu_use = command_buffer_pending_tick;
+        }
         self.frame_profile.command_buffers += 1;
         const trace_completion = if (self.trace_gpu_completion_from_frame) |first|
             self.flip_callbacks + 1 >= first
@@ -19059,6 +19094,9 @@ pub const Renderer = struct {
             return Error.QueueSubmissionFailed;
         }
         self.submitted_tick = signal_tick;
+        for (self.guest_buffers.items) |*entry| {
+            if (entry.last_gpu_use == command_buffer_pending_tick) entry.last_gpu_use = signal_tick;
+        }
         for (self.pending_command_slots.items) |slot| {
             self.command_buffer_ticks.items[slot] = signal_tick;
         }
@@ -20391,6 +20429,8 @@ pub const Renderer = struct {
                     profile.dispatches + elided_this_frame + emulated_this_frame,
                 },
             );
+            if (profile.storage_buffer_waits + profile.storage_buffer_waits_avoided != 0)
+                std.debug.print("[gpu buffer waits] flip={d} waits={d} avoided={d}\n", .{ self.flip_callbacks, profile.storage_buffer_waits, profile.storage_buffer_waits_avoided });
             std.debug.print(
                 "[gpu shaders] flip={d} pso_hit={d} pso_miss={d}/{d}ms cpso={d}/{d}/{d}ms compute_ms={d}/{d}/{d}/{d} pso_cache={d} cpso_cache={d} miss_match(state/vs/ps)={d}/{d}/{d} sa_hit={d} sa_miss={d}/{d}ms prov_ms={d} xlat_ms={d} res_ms={d} sampled_ms={d}/{d}/{d}/{d} probe_ms={d} target_create_ms={d}/{d} cxlat={d}/{d}/{d}MiB\n",
                 .{
@@ -27344,6 +27384,8 @@ test "a descriptor reused after an intermediate flush remains reserved by queued
     renderer.timeline_semaphore = 1;
     renderer.submitted_tick = 7;
     renderer.completed_tick = 7;
+    renderer.guest_buffers = .empty;
+    renderer.active_storage_buffers = @splat(0);
     renderer.deferred_vulkan_objects = .empty;
     renderer.pending_command_buffers = .empty;
     defer renderer.pending_command_buffers.deinit(std.testing.allocator);

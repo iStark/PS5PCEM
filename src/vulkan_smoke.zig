@@ -3366,8 +3366,8 @@ fn runResidentTargetReuseAtLimit(allocator: std.mem.Allocator, limit: usize) !vo
     std.debug.print("resident target reuse passed: {d} entries, warm working set, full cache, sampled source, GPU readback, released pins, queued transfer-buffer reseeding\n", .{limit});
 }
 
-fn runQueuedBufferReuseProbe(allocator: std.mem.Allocator) !void {
-    var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true });
+fn runQueuedBufferReuseProbe(allocator: std.mem.Allocator, use_waits: bool) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true, .storage_buffer_use_waits = use_waits });
     defer renderer.deinit();
     var guest = GuestMemory{};
     _ = renderer.dcbBackend(guest.interface());
@@ -3398,18 +3398,56 @@ fn runQueuedBufferReuseProbe(allocator: std.mem.Allocator) !void {
         _ = try renderer.stageGuestStorageBufferAt(1, destination, 16);
         // Keep the read queued, making early CPU overwrites deterministic.
         renderer.draw_batch_active = true;
+        renderer.current_descriptor_slot = 0;
         _ = try renderer.dispatchSpirv(module.words, .{ 1, 1, 1 });
+        // The normal runner reserves a fresh descriptor set for the next draw.
+        renderer.current_descriptor_slot = 1;
+        renderer.descriptor_set = renderer.descriptor_sets[1];
         guest.word(replacement, 0xaabb_ccdd);
         _ = try renderer.stageGuestStorageBufferAt(0, replacement, 16);
         var result: [16]u8 = undefined;
         try renderer.readbackGuestStorageBuffer(destination, &result);
         renderer.draw_batch_active = false;
+        renderer.current_descriptor_slot = null;
+        renderer.descriptor_set = renderer.descriptor_sets[0];
         const actual = std.mem.readInt(u32, result[0..4], .little);
         if (actual != 0x1122_3344) {
             std.debug.print("queued buffer read mismatch (recycle={any}): 0x{x}\n", .{ recycle, actual });
             return error.QueuedBufferInputOverwritten;
         }
     }
+    // Updating an allocation that no queued command uses must not submit an
+    // unrelated copy. The older global wait flushed that copy unconditionally.
+    renderer.draw_batch_active = false;
+    @memset(&renderer.active_storage_buffers, 0);
+    guest.word(0x2000, 0x1122_3344);
+    _ = try renderer.stageGuestStorageBufferAt(2, 0x2000, 16);
+    guest.word(0x2100, 0x5566_7788);
+    guest.word(0x2200, 0);
+    _ = try renderer.stageGuestStorageBufferAt(0, 0x2100, 16);
+    _ = try renderer.stageGuestStorageBufferAt(1, 0x2200, 16);
+    // Slot 2 was prepared but is absent from this command's descriptor snapshot.
+    renderer.active_storage_buffers[2] = 0;
+    renderer.draw_batch_active = true;
+    _ = try renderer.dispatchSpirv(module.words, .{ 1, 1, 1 });
+    const pending_before = renderer.pending_command_buffers.items.len;
+    const submitted_before = renderer.submitted_tick;
+    try std.testing.expect(pending_before != 0);
+    renderer.current_descriptor_slot = 1;
+    renderer.descriptor_set = renderer.descriptor_sets[1];
+    guest.word(0x2000, 0xdead_beef);
+    _ = try renderer.stageGuestStorageBufferAt(2, 0x2000, 16);
+    if (use_waits) {
+        try std.testing.expectEqual(submitted_before, renderer.submitted_tick);
+        try std.testing.expectEqual(pending_before, renderer.pending_command_buffers.items.len);
+    } else try std.testing.expect(renderer.submitted_tick > submitted_before);
+    var independent_result: [16]u8 = undefined;
+    try renderer.readbackGuestStorageBuffer(0x2200, &independent_result);
+    try std.testing.expectEqual(@as(u32, 0x5566_7788), std.mem.readInt(u32, independent_result[0..4], .little));
+    renderer.draw_batch_active = false;
+    renderer.current_descriptor_slot = null;
+    renderer.descriptor_set = renderer.descriptor_sets[0];
+    @memset(&renderer.active_storage_buffers, 0);
     // A cache hit can move an allocation to another descriptor slot. Rebinding
     // its former slot must not overwrite the input still bound at the new one.
     guest.word(0x1500, 0x1234_5678);
@@ -6334,7 +6372,7 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--buffer-reuse")) {
-        try runQueuedBufferReuseProbe(allocator);
+        for ([_]bool{ false, true }) |use_waits| try runQueuedBufferReuseProbe(allocator, use_waits);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--parallel-copy")) {
@@ -6888,7 +6926,7 @@ pub fn main(init: std.process.Init) !void {
     try runIndexedCopyKernel(allocator, &renderer, &guest, backend);
     try runStorageImageCopyKernel(allocator, &renderer, &guest, backend);
 
-    try runQueuedBufferReuseProbe(allocator);
+    try runQueuedBufferReuseProbe(allocator, true);
 
     var output_buffer: [1024]u8 = undefined;
     var output = std.Io.File.stdout().writer(init.io, &output_buffer);
