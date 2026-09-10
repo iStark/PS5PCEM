@@ -2360,6 +2360,51 @@ fn runDppProbe(allocator: std.mem.Allocator) !void {
     std.debug.print("DPP passed: row shifts, rotation, swizzles, masks and both permutation selectors across 64 lanes\n", .{});
 }
 
+fn runImageResinfoProbe(allocator: std.mem.Allocator) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{});
+    defer renderer.deinit();
+    var guest = GuestMemory{};
+    _ = renderer.dcbBackend(guest.interface());
+    const stage = gpu.resources.ShaderStage.compute;
+    var state = gpu.State{};
+    try state.writeRegister(.shader, stage.programRegisterBase() + 1, 0);
+    try state.writeRegister(.shader, 0x213, 13 << 1);
+    for ([_]u32{ 0x10000, 16 << 16, 1, 0 }, 0..) |word, i|
+        try state.writeRegister(.shader, stage.userDataBase() + 8 + @as(u32, @intCast(i)), word);
+    // No sampler is supplied. Each query must bind the T# at its own PC,
+    // including new extents on a previously translated program.
+    for ([_]u32{ 9, 10, 13 }, 0..) |image_type, case| {
+        const dimension: u32 = if (image_type == 9) 1 else if (image_type == 10) 2 else 5;
+        const code = [_]u32{
+            vop1(1, 0, 12), 0xf0380f00 | (dimension << 3), 0x00000400,
+            0xe0780000,     0x80020400,                    0xbf810000,
+        };
+        const program: u32 = 0x100 + @as(u32, @intCast(case)) * 0x100;
+        for (code, 0..) |word, i| guest.word(program + i * 4, word);
+        try state.writeRegister(.shader, stage.programRegisterBase(), program >> 8);
+        for ([_]u32{ 32, 16, 32 }) |width| for (0..2) |base_mip| {
+            var descriptor = sampledImageDescriptorWords(0x4000, width, 8);
+            descriptor[3] = (descriptor[3] & 0x0fffffff) | (image_type << 28) | (2 << 16) | (@as(u32, @intCast(base_mip)) << 12);
+            descriptor[4] = if (image_type == 9) width - 1 else 3;
+            descriptor[5] = 2 << 4;
+            for (descriptor, 0..) |word, i|
+                try state.writeRegister(.shader, stage.userDataBase() + @as(u32, @intCast(i)), word);
+            for (0..3 - base_mip) |mip| {
+                try state.writeRegister(.shader, stage.userDataBase() + 12, @intCast(mip));
+                _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
+                var bytes: [16]u8 = undefined;
+                try renderer.readbackGuestStorageBuffer(0x10000, &bytes);
+                const level = mip + base_mip;
+                const expected = [_]u32{ width >> @intCast(level), @as(u32, 8) >> @intCast(level), if (image_type == 9) 1 else if (image_type == 10) @as(u32, 4) >> @intCast(level) else 4, @intCast(3 - base_mip) };
+                for (expected, 0..) |value, i|
+                    try std.testing.expectEqual(value, std.mem.readInt(u32, bytes[i * 4 ..][0..4], .little));
+            }
+        };
+    }
+    try std.testing.expectEqual(@as(u64, 0), renderer.sampled_image_uploads);
+    std.debug.print("Image resource queries passed: 2D/3D/array mip extents, no sampler and cached descriptor changes\n", .{});
+}
+
 fn runImageD16Probe(allocator: std.mem.Allocator) !void {
     var renderer = try vulkan.Renderer.init(allocator, .{});
     defer renderer.deinit();
@@ -7548,6 +7593,10 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--packed-floats")) {
         try runPackedFloatProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--image-resinfo")) {
+        try runImageResinfoProbe(allocator);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--image-d16")) {

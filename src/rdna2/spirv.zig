@@ -3866,6 +3866,7 @@ const Builder = struct {
         var height = try self.constant(.bits32, 1);
         var depth = try self.constant(.bits32, 1);
         var levels = try self.constant(.bits32, 1);
+        var queried = false;
 
         if (inst.src2.kind == .sgpr) {
             if (self.sampledImageBinding(inst.src1.reg, inst.src2.reg, inst.pc)) |binding| {
@@ -3889,6 +3890,7 @@ const Builder = struct {
                     if (size_type != 0) {
                         const size = self.id();
                         try self.emit(&self.body, 103, &.{ size_type, size, image, lod }); // OpImageQuerySizeLod
+                        queried = true;
                         width = self.id();
                         try self.emit(&self.body, 81, &.{ self.bits_type, width, size, 0 });
                         height = self.id();
@@ -3911,6 +3913,7 @@ const Builder = struct {
             if (size_type != 0) {
                 const size = self.id();
                 try self.emit(&self.body, 104, &.{ size_type, size, image });
+                queried = true;
                 width = self.id();
                 try self.emit(&self.body, 81, &.{ self.bits_type, width, size, 0 });
                 height = self.id();
@@ -3922,7 +3925,10 @@ const Builder = struct {
             }
         }
 
-        const components = [_]u32{ width, height, depth, levels };
+        // A size-only use may have no sampled/storage binding at this PC.
+        // T# contains the dimensions; querying it must not upload the image
+        // or depend on an unrelated sampler (GET_RESINFO has no sampler).
+        const components = if (queried) [_]u32{ width, height, depth, levels } else try self.imageDescriptorResinfo(inst.src1, lod);
         var destination_index: u32 = 0;
         for (components, 0..) |value, component| {
             const bit = @as(u4, 1) << @intCast(component);
@@ -3933,6 +3939,70 @@ const Builder = struct {
             );
             destination_index += 1;
         }
+    }
+
+    fn resinfoField(self: *Builder, word: u32, offset: u32, count: u32) Error!u32 {
+        const result = self.id();
+        try self.emit(&self.body, 203, &.{ self.bits_type, result, word, try self.constant(.bits32, offset), try self.constant(.bits32, count) });
+        return result;
+    }
+
+    fn resinfoBinary(self: *Builder, opcode: u16, a: u32, b: u32) Error!u32 {
+        const result = self.id();
+        try self.emit(&self.body, opcode, &.{ self.bits_type, result, a, b });
+        return result;
+    }
+
+    fn resinfoSelect(self: *Builder, condition: u32, a: u32, b: u32) Error!u32 {
+        const result = self.id();
+        try self.emit(&self.body, 169, &.{ self.bits_type, result, condition, a, b });
+        return result;
+    }
+
+    fn resinfoEqual(self: *Builder, a: u32, value: u32) Error!u32 {
+        const result = self.id();
+        try self.emit(&self.body, 170, &.{ self.bool_type, result, a, try self.constant(.bits32, value) });
+        return result;
+    }
+
+    fn resinfoMipExtent(self: *Builder, size: u32, lod: u32) Error!u32 {
+        const shifted = try self.resinfoBinary(194, size, lod);
+        return self.resinfoSelect(try self.resinfoEqual(shifted, 0), try self.constant(.bits32, 1), shifted);
+    }
+
+    fn imageDescriptorResinfo(self: *Builder, resource: operand.Operand, lod: u32) Error![4]u32 {
+        const word1 = try self.source(try consecutiveRegister(resource, 1), .bits32);
+        const word2 = try self.source(try consecutiveRegister(resource, 2), .bits32);
+        const word3 = try self.source(try consecutiveRegister(resource, 3), .bits32);
+        const word4 = try self.source(try consecutiveRegister(resource, 4), .bits32);
+        const one = try self.constant(.bits32, 1);
+        const zero = try self.constant(.bits32, 0);
+        const image_type = try self.resinfoField(word3, 28, 4);
+        const volume = try self.resinfoEqual(image_type, 10);
+        const multisampled = self.id();
+        try self.emit(&self.body, 174, &.{ self.bool_type, multisampled, image_type, try self.constant(.bits32, 14) }); // UGreaterThanEqual
+        const base = try self.resinfoField(word3, 12, 4);
+        const last = try self.resinfoField(word3, 16, 4);
+        const absolute_lod = try self.resinfoBinary(128, base, lod);
+        const clamped_lod = self.id();
+        try self.emit(&self.body, 12, &.{ self.bits_type, clamped_lod, self.ensureGlslStd450(), 38, absolute_lod, try self.constant(.bits32, 31) }); // UMin
+        const level = try self.resinfoSelect(multisampled, zero, clamped_lod);
+        const width_high = try self.resinfoBinary(196, try self.resinfoField(word2, 0, 14), try self.constant(.bits32, 2));
+        const width = try self.resinfoBinary(128, try self.resinfoBinary(197, width_high, try self.resinfoField(word1, 30, 2)), one);
+        const height = try self.resinfoBinary(128, try self.resinfoField(word2, 14, 16), one);
+        const count = try self.resinfoBinary(128, try self.resinfoField(word4, 0, 13), one);
+        const array_base = try self.resinfoField(word4, 16, 13);
+        const layers = try self.resinfoBinary(130, count, array_base);
+        const is_array = self.id();
+        try self.emit(&self.body, 174, &.{ self.bool_type, is_array, image_type, try self.constant(.bits32, 11) });
+        const array_depth = try self.resinfoSelect(try self.resinfoEqual(image_type, 14), one, layers);
+        const depth = try self.resinfoSelect(volume, try self.resinfoMipExtent(count, level), try self.resinfoSelect(is_array, array_depth, one));
+        const one_d = self.id();
+        try self.emit(&self.body, 166, &.{ self.bool_type, one_d, try self.resinfoEqual(image_type, 8), try self.resinfoEqual(image_type, 12) }); // LogicalOr
+        const invalid_levels = self.id();
+        try self.emit(&self.body, 176, &.{ self.bool_type, invalid_levels, last, base });
+        const levels = try self.resinfoSelect(invalid_levels, one, try self.resinfoBinary(128, try self.resinfoBinary(130, last, base), one));
+        return .{ try self.resinfoMipExtent(width, level), try self.resinfoSelect(one_d, one, try self.resinfoMipExtent(height, level)), depth, try self.resinfoSelect(multisampled, one, levels) };
     }
 
     fn imageGetLod(self: *Builder, inst: instruction.Instruction) Error!void {
