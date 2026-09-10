@@ -2,6 +2,30 @@
 
 Observed with PPSA26344 and the RTX 3070 Ti; individual build results are dated below.
 
+## Runtime buffer descriptor tables on 2026-09-10
+
+Large recovered V# candidate sets now use exact four-word hash tables in a
+runtime SSBO. Changing an address or range no longer changes the translated
+comparison literals. Table capacity and probe limits remain stable across
+relocation; absent candidates retain the existing bounded access behavior.
+Small programs and a dispatch without a free table descriptor keep direct
+comparisons. Cache hits still validate duplicate candidates and table bounds.
+
+Six cache tests and the table collision test pass. SDK probes cover 128
+candidates, mismatches in each descriptor word, unequal buffer ranges,
+relocation, loads, stores and untouched neighbours. The large recovered-table
+case reuses one pipeline across relocated allocations. The full smoke and
+4,352-view image-table suite also pass with clean validation. Both previously
+captured geometry queries retain byte-identical output in immutable replays.
+Those captures use direct bindings, so this change does not shorten them.
+
+The native run advances beyond both geometry queries. Its first new scene
+frame takes about 17 minutes, mostly driver compilation; warmed frame 1409
+still takes 12.6 seconds with 533 draws and 1,321 compute dispatches. Subsequent
+graphics variants continue compiling. The displayed scene remains almost
+black. Live cached modules show several resource layouts for each query;
+their specialization and invalid lighting values remain under investigation.
+
 ## Parking queued submissions on 2026-09-10
 
 The scheduler's execution mutex now parks contending host threads on Windows.

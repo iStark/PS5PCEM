@@ -55,6 +55,8 @@ pub const StorageBufferBinding = struct {
     /// A bounded table may supply several V#s to the same instruction. Match
     /// all four live words before selecting its staged host descriptor.
     candidate_words: ?[4]u32 = null,
+    /// Exact descriptor selection from a runtime table instead of literals.
+    lookup: ?buffer_lookup.Binding = null,
 };
 
 /// Checked guest memory exposed to pointer-form SMEM. Each SSBO starts with
@@ -86,6 +88,7 @@ pub const FlatApertures = struct {
 };
 
 pub const sampled_lookup = @import("sampled_lookup.zig");
+pub const buffer_lookup = @import("buffer_lookup.zig");
 
 pub const SampledImageBinding = struct {
     resource_sgpr: u32,
@@ -641,6 +644,32 @@ fn constantWaveLane(op: operand.Operand) ?u32 {
     };
 }
 
+/// Runtime tables remove descriptor contents from the translation key. Keep
+/// their structural validation available to cache hits as well as translation.
+pub fn validateStorageBufferBindings(bindings: []const StorageBufferBinding, descriptor_count: u32) Error!void {
+    for (bindings, 0..) |binding, index| {
+        if (binding.resource_sgpr >= 128 or binding.descriptor_index >= descriptor_count or binding.index_stride > 3)
+            return Error.InvalidStorageBinding;
+        if (binding.lookup) |lookup| {
+            if (binding.candidate_words == null or binding.resource_sgpr > 124 or
+                lookup.descriptor_index >= descriptor_count or lookup.mask == std.math.maxInt(u32) or
+                !std.math.isPowerOfTwo(lookup.mask + 1) or lookup.probes == 0 or lookup.probes > lookup.mask + 1 or
+                (@as(u64, lookup.word_offset) + (@as(u64, lookup.mask) + 1) * buffer_lookup.entry_words) * 4 > std.math.maxInt(u32))
+                return Error.InvalidStorageBinding;
+        }
+        for (bindings[0..index]) |previous| {
+            if (previous.resource_sgpr != binding.resource_sgpr or previous.instruction_pc != binding.instruction_pc) continue;
+            if (previous.candidate_words == null or binding.candidate_words == null or
+                std.mem.eql(u32, &previous.candidate_words.?, &binding.candidate_words.?) or
+                previous.stride != binding.stride or previous.swizzled != binding.swizzled or
+                previous.index_stride != binding.index_stride or previous.add_thread_id != binding.add_thread_id or
+                previous.unified_format != binding.unified_format or !std.mem.eql(u8, &previous.dst_select, &binding.dst_select) or
+                !std.meta.eql(previous.lookup, binding.lookup))
+                return Error.InvalidStorageBinding;
+        }
+    }
+}
+
 const Builder = struct {
     const LaneSpill = struct { vgpr: u32, lane: u32, value: u32, valid: u32 };
     allocator: std.mem.Allocator,
@@ -1074,26 +1103,7 @@ const Builder = struct {
             if (options.descriptor_array_length == 0) {
                 return Error.InvalidStorageBinding;
             }
-            for (options.storage_buffers, 0..) |binding, index| {
-                if (binding.resource_sgpr >= 128 or
-                    binding.descriptor_index >= options.descriptor_array_length or
-                    binding.index_stride > 3)
-                {
-                    return Error.InvalidStorageBinding;
-                }
-                for (options.storage_buffers[0..index]) |previous| {
-                    if (previous.resource_sgpr == binding.resource_sgpr and
-                        previous.instruction_pc == binding.instruction_pc)
-                    {
-                        if (previous.candidate_words == null or binding.candidate_words == null or
-                            std.mem.eql(u32, &previous.candidate_words.?, &binding.candidate_words.?) or
-                            previous.stride != binding.stride or previous.swizzled != binding.swizzled or
-                            previous.index_stride != binding.index_stride or previous.add_thread_id != binding.add_thread_id or
-                            previous.unified_format != binding.unified_format or !std.mem.eql(u8, &previous.dst_select, &binding.dst_select))
-                            return Error.InvalidStorageBinding;
-                    }
-                }
-            }
+            try validateStorageBufferBindings(options.storage_buffers, options.descriptor_array_length);
             for (options.scalar_memories) |binding| {
                 if (binding.resource_sgpr + 1 >= 128 or binding.descriptor_index >= options.descriptor_array_length)
                     return Error.InvalidStorageBinding;
@@ -5115,7 +5125,7 @@ const Builder = struct {
         return null;
     }
 
-    fn lookupSampledImage(self: *Builder, lookup: sampled_lookup.Binding, actual: [8]u32) Error!u32 {
+    fn lookupDescriptor(self: *Builder, lookup: sampled_lookup.Binding, actual: []const u32) Error!u32 {
         const zero = try self.constant(.bits32, 0);
         const one = try self.constant(.bits32, 1);
         var hash = try self.constant(.bits32, 2166136261);
@@ -5157,7 +5167,7 @@ const Builder = struct {
         try self.emit(&self.body, 248, &.{body});
         const record_byte = self.id();
         const byte = self.id();
-        try self.emit(&self.body, 132, &.{ self.bits_type, record_byte, index, try self.constant(.bits32, sampled_lookup.entry_words * 4) });
+        try self.emit(&self.body, 132, &.{ self.bits_type, record_byte, index, try self.constant(.bits32, @intCast((actual.len + 1) * 4)) });
         try self.emit(&self.body, 128, &.{ self.bits_type, byte, record_byte, try self.constant(.bits32, lookup.word_offset * 4) });
         const address = BufferAddress{ .binding = .{ .resource_sgpr = 0, .descriptor_index = lookup.descriptor_index }, .byte_offset = byte };
         const encoded = self.id();
@@ -5199,7 +5209,7 @@ const Builder = struct {
                 word.* = try self.source(.{ .kind = .sgpr, .reg = binding.resource_sgpr + @as(u32, @intCast(index)) }, .bits32);
             }
             if (binding.lookup) |lookup| {
-                const encoded = try self.lookupSampledImage(lookup, actual);
+                const encoded = try self.lookupDescriptor(lookup, &actual);
                 const zero = try self.constant(.bits32, 0);
                 const matched = self.id();
                 const decoded = self.id();
@@ -7323,7 +7333,15 @@ const Builder = struct {
             for (&actual, 0..) |*word, i| word.* = try self.source(.{ .kind = .sgpr, .reg = binding.resource_sgpr + @as(u32, @intCast(i)) }, .bits32);
             var slot = try self.constant(.bits32, binding.descriptor_index);
             var any_match = try self.constantBool(false);
-            for (self.storage_bindings) |candidate| {
+            if (binding.lookup) |lookup| {
+                const encoded = try self.lookupDescriptor(lookup, &actual);
+                any_match = try self.isNonZero(encoded);
+                const decoded = self.id();
+                try self.emit(&self.body, 130, &.{ self.bits_type, decoded, encoded, try self.constant(.bits32, 1) });
+                const selected = self.id();
+                try self.emit(&self.body, 169, &.{ self.bits_type, selected, any_match, decoded, slot });
+                slot = selected;
+            } else for (self.storage_bindings) |candidate| {
                 if (candidate.resource_sgpr != binding.resource_sgpr or candidate.instruction_pc != binding.instruction_pc) continue;
                 const words = candidate.candidate_words orelse return Error.InvalidStorageBinding;
                 var matches = try self.constantBool(true);

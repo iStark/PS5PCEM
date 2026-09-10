@@ -5365,6 +5365,87 @@ fn runSceneBitsetPointerProbe(allocator: std.mem.Allocator) !void {
 }
 
 fn runBufferTableProbe(allocator: std.mem.Allocator) !void {
+    try runBufferLookupProbe(allocator);
+    try runBufferTableCase(allocator, false);
+    try runBufferTableCase(allocator, true);
+}
+
+fn runBufferLookupProbe(allocator: std.mem.Allocator) !void {
+    const lookup = gpu.shader_analysis.SpirvBufferLookup;
+    const candidates = 128;
+    const rows = candidates + 4;
+    const capacity = comptime lookup.capacity(candidates);
+    var renderer = try vulkan.Renderer.init(allocator, .{});
+    defer renderer.deinit();
+    var guest = GuestMemory{};
+    _ = renderer.dcbBackend(guest.interface());
+    const code = [_]u32{
+        vop1(1, 0, 20), 0xb814_0010, // group index and byte offset into the V# table
+        0xf428_0104, 20 << 25, // s_buffer_load_dwordx4 s4, V#s8, s20
+        vop2Source(0x1b, 1, 131, 0), // source element = group & 3
+        mubuf(0x0c, 0, 5, 1, 4)[0],
+        mubuf(0x0c, 0, 5, 1, 4)[1],
+        mubuf(0x1c, 0, 5, 0, 12)[0],
+        mubuf(0x1c, 0, 5, 0, 12)[1],
+        0xbf81_0000,
+    };
+    for (code, 0..) |word, index| guest.word(0x100 + index * 4, word);
+    var analysis = try gpu.shader_analysis.decode(allocator, .{ .context = &guest, .read_fn = GuestMemory.read }, 0x100, code.len);
+    defer analysis.deinit(allocator);
+    var bindings: [candidates + 2]gpu.ShaderSpirvStorageBufferBinding = undefined;
+    bindings[0] = .{ .resource_sgpr = 8, .descriptor_index = 0 };
+    bindings[1] = .{ .resource_sgpr = 12, .descriptor_index = 3, .stride = 4 };
+    for (bindings[2..], 0..) |*binding, i| binding.* = .{
+        .resource_sgpr = 4,
+        .descriptor_index = @intCast(1 + i % 2),
+        .stride = 4,
+        .candidate_words = .{ @intCast(0x2000 + i * 256), 0x40000, @intCast(2 + i % 2), 0x5204 },
+        .lookup = .{ .descriptor_index = 4, .word_offset = 0, .mask = @intCast(capacity - 1), .probes = @intCast(capacity) },
+    };
+    var module = try analysis.translateSpirv(allocator, .{
+        .stage = .compute,
+        .wave32 = true,
+        .compute_inputs = .{ .workgroup_id_sgprs = .{ 20, null, null } },
+        .storage_buffers = &bindings,
+    });
+    defer module.deinit(allocator);
+    var table: [capacity * lookup.entry_words]u32 = undefined;
+    for (0..2) |pass| {
+        @memset(&table, 0);
+        for (bindings[2..], 0..) |binding, i| {
+            var words = binding.candidate_words.?;
+            for (&words, 0..) |*word, component| word.* ^= @as(u32, @intCast(pass)) << @intCast(20 + component);
+            lookup.insert(&table, words, binding.descriptor_index);
+            for (words, 0..) |word, component| guest.word(0x10000 + i * 16 + component * 4, word);
+        }
+        for (0..4) |mismatch| {
+            for (0..4) |component| {
+                var word = std.mem.readInt(u32, guest.bytes[0x10000 + component * 4 ..][0..4], .little);
+                if (component == mismatch) word ^= 0x80000000;
+                guest.word(0x10000 + (candidates + mismatch) * 16 + component * 4, word);
+            }
+        }
+        for (table, 0..) |word, i| guest.word(0x14000 + i * 4, word);
+        for (0..3) |i| {
+            guest.word(0x12000 + i * 4, @intCast(100 + i + pass * 1000));
+            guest.word(0x13000 + i * 4, @intCast(200 + i + pass * 1000));
+        }
+        for (0..rows) |i| guest.word(0x16000 + i * 4, 0xcccccccc);
+        for ([_][3]u64{ .{ 0, 0x10000, rows * 16 }, .{ 1, 0x12000, 8 }, .{ 2, 0x13000, 12 }, .{ 3, 0x16000, rows * 4 }, .{ 4, 0x14000, table.len * 4 } }) |buffer|
+            _ = try renderer.stageGuestStorageBufferAt(@intCast(buffer[0]), buffer[1], @intCast(buffer[2]));
+        _ = try renderer.dispatchSpirv(module.words, .{ rows, 1, 1 });
+        var output: [rows * 4]u8 = undefined;
+        try renderer.readbackGuestStorageBuffer(0x16000, &output);
+        for (0..rows) |i| {
+            const valid = i < candidates and i % 4 < 2 + i % 2;
+            const expected: u32 = if (valid) @intCast(100 + (i % 2) * 100 + i % 4 + pass * 1000) else 0;
+            try std.testing.expectEqual(expected, std.mem.readInt(u32, output[i * 4 ..][0..4], .little));
+        }
+    }
+    std.debug.print("runtime buffer hash lookup passed: 128 colliding candidates, four-word misses, unequal bounds and table relocation\n", .{});
+}
+
+fn runBufferTableCase(allocator: std.mem.Allocator, large: bool) !void {
     var renderer = try vulkan.Renderer.init(allocator, .{});
     defer renderer.deinit();
     var guest = GuestMemory{};
@@ -5384,7 +5465,12 @@ fn runBufferTableProbe(allocator: std.mem.Allocator) !void {
         mubuf(0x0c, 0, 5, 0, 4)[1],  mubuf(0x1c, 0, 5, 0, 12)[0],
         mubuf(0x1c, 0, 5, 0, 12)[1], 0xbf81_0000,
     };
-    for (code, 0..) |word, index| guest.word(0x100 + index * 4, word);
+    var expanded: std.ArrayList(u32) = .empty;
+    defer expanded.deinit(allocator);
+    try expanded.appendSlice(allocator, code[0 .. code.len - 3]);
+    if (large) for (0..40) |_| try expanded.appendSlice(allocator, &mubuf(0x0c, 0, 5, 0, 4));
+    try expanded.appendSlice(allocator, code[code.len - 3 ..]);
+    for (expanded.items, 0..) |word, index| guest.word(0x100 + index * 4, word);
     var state = gpu.State{};
     try state.writeRegister(.shader, 0x20c, 1);
     try state.writeRegister(.shader, 0x20d, 0);
@@ -5411,7 +5497,11 @@ fn runBufferTableProbe(allocator: std.mem.Allocator) !void {
             try std.testing.expectEqual(if (i % 2 == 1 and i < 6) @as(u32, @intCast(100 + i)) else 0xdeadbeef, std.mem.readInt(u32, guest.bytes[second + i * 4 ..][0..4], .little));
         }
     }
-    std.debug.print("buffer table selection passed: active-lane index, VCC_HI offset, runtime V# reads/writes, unequal bounds, untouched neighbours and relocation\n", .{});
+    if (large) {
+        try std.testing.expectEqual(@as(u64, 1), renderer.pipeline_cache_misses);
+        try std.testing.expectEqual(@as(u64, 1), renderer.pipeline_cache_hits);
+    }
+    std.debug.print("buffer table selection passed (large={any}): active-lane index, VCC_HI offset, runtime V# reads/writes, unequal bounds, untouched neighbours and relocation\n", .{large});
 }
 
 fn runScalarPointerProbe(allocator: std.mem.Allocator) !void {

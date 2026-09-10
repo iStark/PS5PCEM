@@ -8123,6 +8123,55 @@ pub const Renderer = struct {
         if (self.traceCurrentGraphicsFrame()) std.debug.print("[vulkan dcb] FLAT scene snapshot root=0x{x} regions={d} bytes={d}\n", .{ root, region_count, total });
     }
 
+    fn prepareStorageBufferLookups(self: *Renderer, resources: *ComputeResources) anyerror!void {
+        const mappings = resources.mappings[0..resources.mapping_count];
+        // Small shaders retain their direct comparisons. Large dynamic V#
+        // tables otherwise bake streamed addresses into hundreds of sites.
+        if (mappings.len < 64) return;
+        const lookup = rdna2.spirv.buffer_lookup;
+        const plan = &resources.lookup_plan;
+        try plan.reset(self.allocator, mappings.len);
+        for (mappings, 0..) |binding, index| {
+            if (binding.candidate_words == null or binding.lookup != null) continue;
+            try plan.add(self.allocator, .{
+                .resource_sgpr = binding.resource_sgpr,
+                .sampler_sgpr = 0,
+                .instruction_pc = binding.instruction_pc,
+                .dimension = 0,
+            }, index);
+        }
+        var total_words: usize = 0;
+        for (plan.groups.values()) |group| total_words += lookup.capacity(group.count) * lookup.entry_words;
+        if (total_words == 0) return;
+        // Lack of a table slot leaves the existing complete comparison path.
+        const slot = resources.freeDescriptor() orelse return;
+        const upload = try self.allocateDrawUpload(total_words * 4);
+        const mapping = self.draw_upload_mapping orelse return Error.MemoryMapFailed;
+        const table = std.mem.bytesAsSlice(u32, @as([]align(4) u8, @alignCast(mapping[@intCast(upload.offset)..][0 .. total_words * 4])));
+        @memset(table, 0);
+        var cursor: usize = 0;
+        for (plan.groups.values()) |members| {
+            const entries = lookup.capacity(members.count);
+            const group = table[cursor..][0 .. entries * lookup.entry_words];
+            var index = members.first;
+            while (index != sampled_lookup_plan.end) : (index = plan.next.items[index]) {
+                const candidate = mappings[index];
+                lookup.insert(group, candidate.candidate_words.?, candidate.descriptor_index);
+            }
+            index = members.first;
+            while (index != sampled_lookup_plan.end) : (index = plan.next.items[index]) {
+                // Capacity is stable across changing descriptor values. An
+                // empty record terminates a failed probe early in the shader.
+                mappings[index].lookup = .{ .descriptor_index = slot, .word_offset = @intCast(cursor), .mask = @intCast(entries - 1), .probes = @intCast(entries) };
+            }
+            cursor += group.len;
+        }
+        self.updateStorageDescriptorRange(slot, upload.buffer, upload.offset, upload.size);
+        resources.occupied[slot] = true;
+        self.frame_profile.upload_bytes +%= upload.size;
+        self.frame_profile.storage_upload_bytes +%= upload.size;
+    }
+
     fn prepareSampledImageLookups(
         self: *Renderer,
         resources: *ComputeResources,
@@ -8898,6 +8947,7 @@ pub const Renderer = struct {
             result.sampled_image_mappings[0..result.sampled_image_mapping_count],
         );
         try self.prepareSceneFlatMemory(result, bindings, reader, analysis);
+        try self.prepareStorageBufferLookups(result);
         try self.prepareSampledImageLookups(result, result.sampled_image_mappings[0..result.sampled_image_mapping_count]);
         return result;
     }

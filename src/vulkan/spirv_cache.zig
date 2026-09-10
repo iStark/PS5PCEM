@@ -88,6 +88,12 @@ pub const Cache = struct {
         options: rdna2.spirv.Options,
         pipeline: rdna2.ir.PipelineOptions,
     ) rdna2.spirv.Error!Lease {
+        for (options.storage_buffers) |binding| if (binding.lookup != null) {
+            // Invalid duplicate candidates must not alias a previously valid
+            // entry after their runtime words are removed from the cache key.
+            try rdna2.spirv.validateStorageBufferBindings(options.storage_buffers, options.descriptor_array_length);
+            break;
+        };
         self.key.clearRetainingCapacity();
         // Include decoded instructions as well as code: NGG reconstruction and
         // uniform branch pruning can change instructions without changing code.
@@ -106,6 +112,7 @@ pub const Cache = struct {
             // read by translation or its binding validation.
             keyed.extent_bytes = null;
             keyed.use_vertex_index = false;
+            if (keyed.lookup != null) keyed.candidate_words = @splat(0);
             try appendValue(&self.key, allocator, keyed);
         }
         try appendValue(&self.key, allocator, options.scalar_registers.len);
@@ -210,6 +217,48 @@ test "cache lease owns an oversized uncached translation" {
     try std.testing.expectEqual(@as(usize, 0), cache.bytes);
     cache.deinit(a);
     try std.testing.expectEqual(@as(u32, 0x07230203), lease.view().words[0]);
+}
+
+test "runtime buffer lookup changes reuse words and still reject invalid candidates" {
+    const a = std.testing.allocator;
+    var cache = Cache{};
+    defer cache.deinit(a);
+    var program = try rdna2.decodeProgram(a, &.{ 0xe030_2000, 0x8002_0100, 0xbf81_0000 });
+    defer program.deinit(a);
+    const table = rdna2.spirv.buffer_lookup.Binding{ .descriptor_index = 2, .word_offset = 7, .mask = 3, .probes = 4 };
+    var bindings = [_]rdna2.spirv.StorageBufferBinding{
+        .{ .resource_sgpr = 8, .descriptor_index = 0, .stride = 4, .candidate_words = .{ 0x1000, 0x40000, 4, 0x5204 }, .lookup = table },
+        .{ .resource_sgpr = 8, .descriptor_index = 1, .stride = 4, .candidate_words = .{ 0x2000, 0x40000, 8, 0x5204 }, .lookup = table },
+    };
+    const options = rdna2.spirv.Options{ .stage = .compute, .storage_buffers = &bindings, .descriptor_array_length = 3 };
+    const first = try cache.acquire(a, &program, options, .{});
+    defer first.release();
+    for (0..4) |word| {
+        bindings[0].candidate_words.?[word] ^= 0x400;
+        const hit = try cache.acquire(a, &program, options, .{});
+        defer hit.release();
+        try std.testing.expect(first.view().words.ptr == hit.view().words.ptr);
+        var fresh = try rdna2.translateProgramSpirv(a, &program, options);
+        defer fresh.deinit(a);
+        try std.testing.expectEqualSlices(u32, first.view().words, fresh.words);
+    }
+    const saved = bindings[1];
+    bindings[1].candidate_words = bindings[0].candidate_words;
+    try std.testing.expectError(error.InvalidStorageBinding, cache.acquire(a, &program, options, .{}));
+    bindings[1] = saved;
+    bindings[1].lookup = null;
+    try std.testing.expectError(error.InvalidStorageBinding, cache.acquire(a, &program, options, .{}));
+    bindings[1] = saved;
+    bindings[1].lookup.?.probes = 5;
+    try std.testing.expectError(error.InvalidStorageBinding, cache.acquire(a, &program, options, .{}));
+    bindings[1] = saved;
+    bindings[1].lookup.?.mask = std.math.maxInt(u32);
+    try std.testing.expectError(error.InvalidStorageBinding, cache.acquire(a, &program, options, .{}));
+    bindings[1] = saved;
+    bindings[1].lookup.?.word_offset = std.math.maxInt(u32);
+    try std.testing.expectError(error.InvalidStorageBinding, cache.acquire(a, &program, options, .{}));
+    try std.testing.expectEqual(@as(u64, 1), cache.misses);
+    try std.testing.expectEqual(@as(u64, 4), cache.hits);
 }
 
 test "dynamic buffer extents share translations while address and format rules remain keyed" {
