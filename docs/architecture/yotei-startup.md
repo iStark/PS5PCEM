@@ -2,6 +2,23 @@
 
 Observed with PPSA26344 and the RTX 3070 Ti; individual build results are dated below.
 
+## Persistent host-visible buffer mappings on 2026-09-10
+
+A native render-thread sample spends 11 of 80 observations in memory mapping,
+alongside 24 GPU synchronization waits. Coherent host-visible buffer allocations
+now retain their CPU mapping until their Vulkan retirement. Uploads, readbacks
+and image tiling use bounded subranges of that mapping. Existing waits before
+CPU reads and overwrites remain in place, and device-only buffers are not mapped.
+The compatibility option `persistent_host_mappings = false` retains scoped maps.
+
+The SDK probe alternates both modes, writes 512 byte-offset subranges, copies
+the result on the GPU and checks the full readback. Both modes pass, including
+out-of-range rejection. The isolated writes take 352–627 microseconds with
+scoped maps and 6–7 microseconds with persistent maps. This measures mapping
+overhead, not frame rate. Queued buffer reuse, content-cache invalidation and
+the complete graphics/compute smoke also pass synchronization validation.
+Native frame-rate and scene validation of this change remain pending.
+
 ## Cross-half reads in multi-wave workgroups on 2026-09-10
 
 The remaining empty light list comes from a 16x16 culling workgroup containing
@@ -23,8 +40,11 @@ partial EXEC, cross-half READLANE/READFIRSTLANE and early wave termination in
 and default smoke probes pass SDK synchronization validation. An immutable
 replay of the captured culling dispatch also passes without validation errors:
 the list at `0x500ae8fe00` changes from zero to 24,336 populated records,
-matching the 208x117 dispatched tiles. Native scene validation is still pending;
-this result establishes corrected light-list computation, not a complete menu.
+matching the 208x117 dispatched tiles. The next native capture retains the bark
+texture in the tone-mapped tree image, where the preceding build was black.
+The Digital Deluxe, Northern Star and pre-order notices appear through their
+normal fades. The opaque black quad between notices is authored by the guest;
+it has not been bypassed. A complete menu or gameplay scene is not established.
 
 ## Packed integer light-list stores on 2026-09-10
 

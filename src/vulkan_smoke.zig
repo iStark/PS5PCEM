@@ -6108,6 +6108,15 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("host readback passed: four 64 MiB reads of GPU-written data verified, CPU reads={d} us\n", .{elapsed / 1000});
         return;
     }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--persistent-mapping")) {
+        for ([_]bool{ false, true, false, true }) |persistent| {
+            var renderer = try vulkan.Renderer.init(allocator, .{ .persistent_host_mappings = persistent, .enable_timeline_scheduler = true });
+            defer renderer.deinit();
+            const elapsed = try renderer.probeBufferMappings();
+            std.debug.print("buffer mapping passed: persistent={any} 512 subrange writes={d} us, GPU copy and readback verified\n", .{ persistent, elapsed / 1000 });
+        }
+        return;
+    }
     if (args.len == 2 and (std.mem.eql(u8, args[1], "--depth-only") or std.mem.eql(u8, args[1], "--depth-bias"))) {
         var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true });
         defer renderer.deinit();

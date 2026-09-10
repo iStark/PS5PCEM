@@ -228,6 +228,9 @@ pub const Options = struct {
     /// Host memory for decoded compute keys and generated SPIR-V. Allocated
     /// lazily; this does not reserve Vulkan image or buffer memory.
     compute_translation_cache_limit: usize = 256 * 1024 * 1024,
+    /// Keep coherent host-visible allocations mapped until their Vulkan
+    /// retirement. Synchronization before CPU access remains unchanged.
+    persistent_host_mappings: bool = true,
     /// Optional Win32 output window. Supplying it enables the required surface
     /// and swapchain extensions and constrains device selection to a queue that
     /// can present to this exact surface.
@@ -667,6 +670,17 @@ const OwnedBuffer = struct {
     handle: vk.Buffer,
     memory: vk.DeviceMemory,
     size: vk.DeviceSize,
+    mapping: ?[*]u8 = null,
+};
+
+const BufferMapping = struct {
+    memory: vk.DeviceMemory,
+    bytes: []u8,
+    persistent: bool,
+
+    fn release(self: BufferMapping, renderer: *Renderer) void {
+        if (!self.persistent) renderer.device_functions.unmap_memory(renderer.device, self.memory);
+    }
 };
 
 const ColorTargetUpload = struct {
@@ -3429,6 +3443,7 @@ pub const Renderer = struct {
     /// Compilation can finish on worker threads; only the render thread saves.
     pipeline_cache_generation: std.atomic.Value(u64) = .init(0),
     persisted_pipeline_cache_generation: u64 = 0,
+    persistent_host_mappings: bool = true,
 
     fn destroyResourcePools(self: *Renderer) void {
         self.image_scratch.deinit(self.allocator);
@@ -3972,6 +3987,7 @@ pub const Renderer = struct {
             .render_target_cache_limit = @max(1, options.render_target_cache_limit),
             .storage_image_cache_limit = options.storage_image_cache_limit,
             .compute_translations = .{ .maximum_bytes = options.compute_translation_cache_limit },
+            .persistent_host_mappings = options.persistent_host_mappings,
             .window_presentation = window_presentation,
         };
         renderer.image_aliases.enabled = options.enable_canonical_image_aliases;
@@ -3983,18 +3999,10 @@ pub const Renderer = struct {
             vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit,
         );
         errdefer renderer.destroyBuffer(renderer.dynamic_scalar_buffer.?);
-        var scalar_mapping: ?*anyopaque = null;
-        if (device_functions.map_memory(
-            device,
-            renderer.dynamic_scalar_buffer.?.memory,
-            0,
-            descriptor_scalar_ring_bytes,
-            0,
-            &scalar_mapping,
-        ) != vk.success) return Error.MemoryMapFailed;
-        renderer.dynamic_scalar_mapping_base = @ptrCast(@alignCast(scalar_mapping orelse return Error.MemoryMapFailed));
+        const scalar_mapping = try renderer.mapBufferRange(renderer.dynamic_scalar_buffer.?, 0, descriptor_scalar_ring_bytes);
+        renderer.dynamic_scalar_mapping_base = @ptrCast(@alignCast(scalar_mapping.bytes.ptr));
         renderer.dynamic_scalar_mapping = renderer.dynamic_scalar_mapping_base;
-        errdefer device_functions.unmap_memory(device, renderer.dynamic_scalar_buffer.?.memory);
+        errdefer scalar_mapping.release(&renderer);
 
         renderer.draw_upload_buffer = try renderer.createBuffer(
             draw_upload_ring_bytes,
@@ -4002,17 +4010,9 @@ pub const Renderer = struct {
             vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit,
         );
         errdefer renderer.destroyBuffer(renderer.draw_upload_buffer.?);
-        var draw_upload_mapping: ?*anyopaque = null;
-        if (device_functions.map_memory(
-            device,
-            renderer.draw_upload_buffer.?.memory,
-            0,
-            draw_upload_ring_bytes,
-            0,
-            &draw_upload_mapping,
-        ) != vk.success) return Error.MemoryMapFailed;
-        renderer.draw_upload_mapping = @ptrCast(draw_upload_mapping orelse return Error.MemoryMapFailed);
-        errdefer device_functions.unmap_memory(device, renderer.draw_upload_buffer.?.memory);
+        const draw_upload_mapping = try renderer.mapBufferRange(renderer.draw_upload_buffer.?, 0, draw_upload_ring_bytes);
+        renderer.draw_upload_mapping = draw_upload_mapping.bytes.ptr;
+        errdefer draw_upload_mapping.release(&renderer);
 
         for (descriptor_sets, 0..) |set, slot| {
             const scalar_buffer_info = vk.DescriptorBufferInfo{
@@ -4125,11 +4125,11 @@ pub const Renderer = struct {
         if (self.linear_upload_buffer) |buffer| self.destroyBuffer(buffer);
         if (self.magnify_source_image) |image| self.destroyImage(image);
         if (self.draw_upload_buffer) |buffer| {
-            if (self.draw_upload_mapping != null) self.device_functions.unmap_memory(self.device, buffer.memory);
+            if (self.draw_upload_mapping != null and buffer.mapping == null) self.device_functions.unmap_memory(self.device, buffer.memory);
             self.destroyBuffer(buffer);
         }
         if (self.dynamic_scalar_buffer) |buffer| {
-            if (self.dynamic_scalar_mapping_base != null) self.device_functions.unmap_memory(self.device, buffer.memory);
+            if (self.dynamic_scalar_mapping_base != null and buffer.mapping == null) self.device_functions.unmap_memory(self.device, buffer.memory);
             self.destroyBuffer(buffer);
         }
         if (self.gds_buffer) |buffer| self.destroyBuffer(buffer);
@@ -4802,12 +4802,9 @@ pub const Renderer = struct {
                     // tick. Changed pages are uncommon; wait only on that path,
                     // while unchanged draws bind the persistent copy directly.
                     if (cache_hit or recycled_entry) try self.waitForSubmittedWork();
-                    var mapped: ?*anyopaque = null;
-                    if (self.device_functions.map_memory(self.device, entry.device_local.memory, 0, size, 0, &mapped) != vk.success) {
-                        return Error.MemoryMapFailed;
-                    }
-                    defer self.device_functions.unmap_memory(self.device, entry.device_local.memory);
-                    const destination: [*]u8 = @ptrCast(mapped orelse return Error.MemoryMapFailed);
+                    const mapping = try self.mapBufferRange(entry.device_local, 0, size);
+                    defer mapping.release(self);
+                    const destination = mapping.bytes.ptr;
                     entry.page_generation = 0;
                     entry.content_hash = null;
                     var observed_generation = tracked_generation;
@@ -4919,16 +4916,9 @@ pub const Renderer = struct {
             // Finish those readers before overwriting either an exact hit or
             // a recycled allocation, also when page tracking is disabled.
             if (cache_hit or recycled_entry) try self.waitForSubmittedWork();
-            var mapped: ?*anyopaque = null;
-            if (self.device_functions.map_memory(self.device, entry.device_local.memory, 0, size, 0, &mapped) != vk.success) {
-                return Error.MemoryMapFailed;
-            }
-            const destination: [*]u8 = @ptrCast(mapped orelse {
-                self.device_functions.unmap_memory(self.device, entry.device_local.memory);
-                return Error.MemoryMapFailed;
-            });
-            const read_ok = memory.read(memory.context, guest_address, destination[0..size]);
-            self.device_functions.unmap_memory(self.device, entry.device_local.memory);
+            const mapping = try self.mapBufferRange(entry.device_local, 0, size);
+            defer mapping.release(self);
+            const read_ok = memory.read(memory.context, guest_address, mapping.bytes);
             if (!read_ok) return Error.GuestMemoryReadFailed;
             self.frame_profile.upload_bytes +%= size;
             self.frame_profile.storage_upload_bytes +%= size;
@@ -10164,12 +10154,9 @@ pub const Renderer = struct {
             try self.stageInitialColorTarget(target, reader, frame);
             try self.writeMapped(upload.buffer, frame);
         } else {
-            var mapped: ?*anyopaque = null;
-            if (self.device_functions.map_memory(self.device, upload.buffer.memory, 0, bytes, 0, &mapped) != vk.success)
-                return Error.MemoryMapFailed;
-            defer self.device_functions.unmap_memory(self.device, upload.buffer.memory);
-            const frame: [*]u8 = @ptrCast(mapped orelse return Error.MemoryMapFailed);
-            try self.stageInitialColorTarget(target, reader, frame[0..bytes]);
+            const mapping = try self.mapBufferRange(upload.buffer, 0, bytes);
+            defer mapping.release(self);
+            try self.stageInitialColorTarget(target, reader, mapping.bytes);
         }
         self.frame_profile.upload_bytes +%= bytes;
         self.frame_profile.target_upload_bytes +%= bytes;
@@ -13209,6 +13196,50 @@ pub const Renderer = struct {
             for (0..size / 4) |index|
                 try std.testing.expectEqual(@as(u32, 0x13572468), std.mem.readInt(u32, output[index * 4 ..][0..4], .little));
         }
+        return elapsed;
+    }
+
+    /// Repeated CPU subrange access followed by a real GPU copy. This checks
+    /// both mapping modes, byte offsets, retained contents and readback waits.
+    pub fn probeBufferMappings(self: *Renderer) anyerror!u64 {
+        const size = 4 * 1024 * 1024;
+        const source = try self.createBuffer(size, vk.buffer_usage_transfer_src_bit, vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit);
+        defer self.destroyBuffer(source);
+        const destination = try self.createBuffer(size, vk.buffer_usage_transfer_dst_bit, vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit);
+        defer self.destroyBuffer(destination);
+        const expected = try self.allocator.alloc(u8, size);
+        defer self.allocator.free(expected);
+        @memset(expected, 0x5a);
+        try self.writeMapped(source, expected);
+        try std.testing.expectEqual(self.persistent_host_mappings, source.mapping != null);
+        const started = hostTimestampNs();
+        for (0..512) |index| {
+            const offset = (index * 7919 + 3) % (size - 17);
+            var pattern: [17]u8 = @splat(@truncate(index));
+            pattern[0] = @truncate(index >> 8);
+            try self.writeMappedAt(source, offset, &pattern);
+            @memcpy(expected[offset..][0..pattern.len], &pattern);
+        }
+        const elapsed = elapsedHostNanoseconds(started);
+        try std.testing.expectError(Error.MemoryMapFailed, self.mapBufferRange(source, size - 1, 2));
+        try std.testing.expectError(Error.MemoryMapFailed, self.mapBufferRange(source, std.math.maxInt(u64), 1));
+        const command_buffer = try self.beginOneShot();
+        defer self.releaseOneShot(command_buffer);
+        const copy = vk.BufferCopy{ .source_offset = 0, .destination_offset = 0, .size = size };
+        self.device_functions.cmd_copy_buffer(command_buffer, source.handle, destination.handle, 1, @ptrCast(&copy));
+        const barrier = vk.BufferMemoryBarrier{
+            .source_access_mask = vk.access_transfer_write_bit,
+            .destination_access_mask = vk.access_host_read_bit,
+            .buffer = destination.handle,
+            .offset = 0,
+            .size = size,
+        };
+        self.device_functions.cmd_pipeline_barrier(command_buffer, vk.pipeline_stage_transfer_bit, vk.pipeline_stage_host_bit, 0, 0, null, 1, @ptrCast(&barrier), 0, null);
+        try self.submitOneShot(command_buffer);
+        try self.expectMapped(destination, expected);
+        var tail: [17]u8 = undefined;
+        try self.readMappedAt(destination, size - tail.len, &tail);
+        try std.testing.expectEqualSlices(u8, expected[size - tail.len ..], &tail);
         return elapsed;
     }
 
@@ -16303,10 +16334,16 @@ pub const Renderer = struct {
             return Error.MemoryAllocationFailed;
         }
         errdefer self.device_functions.free_memory(self.device, memory, null);
+        var mapping: ?*anyopaque = null;
+        if (self.persistent_host_mappings and properties & vk.memory_property_host_visible_bit != 0) {
+            if (self.device_functions.map_memory(self.device, memory, 0, size, 0, &mapping) != vk.success)
+                return Error.MemoryMapFailed;
+        }
+        errdefer if (mapping != null) self.device_functions.unmap_memory(self.device, memory);
         if (self.device_functions.bind_buffer_memory(self.device, handle, memory, 0) != vk.success) {
             return Error.MemoryBindingFailed;
         }
-        return .{ .handle = handle, .memory = memory, .size = size };
+        return .{ .handle = handle, .memory = memory, .size = size, .mapping = @ptrCast(mapping) };
     }
 
     fn createImageWithExtent(
@@ -16609,13 +16646,9 @@ pub const Renderer = struct {
             return Error.GuestMemoryReadFailed;
         }
         {
-            var mapped: ?*anyopaque = null;
-            if (self.device_functions.map_memory(self.device, snapshot.transfer.memory, 0, snapshot.staging_bytes, 0, &mapped) != vk.success) {
-                return Error.MemoryMapFailed;
-            }
-            defer self.device_functions.unmap_memory(self.device, snapshot.transfer.memory);
-            const source: [*]const u8 = @ptrCast(mapped orelse return Error.MemoryMapFailed);
-            const linear = source[0..snapshot.staging_bytes];
+            const mapping = try self.mapBufferRange(snapshot.transfer, 0, snapshot.staging_bytes);
+            defer mapping.release(self);
+            const linear = mapping.bytes;
             if (self.traceCurrentGraphicsFrame()) {
                 const bytes_per_texel = storageImageBytesPerTexel(snapshot.descriptor.unified_format);
                 const nonzero = countNonzeroTexels(linear, bytes_per_texel);
@@ -18838,6 +18871,7 @@ pub const Renderer = struct {
     fn destroyVulkanObject(self: *Renderer, object: DeferredVulkanObject) void {
         switch (object) {
             .buffer => |buffer| {
+                if (buffer.mapping != null) self.device_functions.unmap_memory(self.device, buffer.memory);
                 self.device_functions.destroy_buffer(self.device, buffer.handle, null);
                 self.device_functions.free_memory(self.device, buffer.memory, null);
             },
@@ -18913,14 +18947,26 @@ pub const Renderer = struct {
         return self.writeMappedAt(buffer, 0, bytes);
     }
 
-    fn writeMappedAt(self: *Renderer, buffer: OwnedBuffer, offset: vk.DeviceSize, bytes: []const u8) Error!void {
+    fn mapBufferRange(self: *Renderer, buffer: OwnedBuffer, offset: vk.DeviceSize, size: usize) Error!BufferMapping {
+        if (size == 0 or offset > buffer.size or size > buffer.size - offset) return Error.MemoryMapFailed;
+        if (buffer.mapping) |base| return .{
+            .memory = buffer.memory,
+            .bytes = base[@intCast(offset)..][0..size],
+            .persistent = true,
+        };
+        // Map from the allocation base even for a byte-aligned subrange;
+        // vkMapMemory's offset alignment is independent of the buffer view.
         var mapped: ?*anyopaque = null;
-        if (self.device_functions.map_memory(self.device, buffer.memory, offset, bytes.len, 0, &mapped) != vk.success) {
+        if (self.device_functions.map_memory(self.device, buffer.memory, 0, buffer.size, 0, &mapped) != vk.success)
             return Error.MemoryMapFailed;
-        }
-        defer self.device_functions.unmap_memory(self.device, buffer.memory);
-        const destination: [*]u8 = @ptrCast(mapped orelse return Error.MemoryMapFailed);
-        @memcpy(destination[0..bytes.len], bytes);
+        const base: [*]u8 = @ptrCast(mapped orelse return Error.MemoryMapFailed);
+        return .{ .memory = buffer.memory, .bytes = base[@intCast(offset)..][0..size], .persistent = false };
+    }
+
+    fn writeMappedAt(self: *Renderer, buffer: OwnedBuffer, offset: vk.DeviceSize, bytes: []const u8) Error!void {
+        const mapping = try self.mapBufferRange(buffer, offset, bytes.len);
+        defer mapping.release(self);
+        @memcpy(mapping.bytes, bytes);
     }
 
     fn writeGraphicsScalarValues(
@@ -18949,13 +18995,9 @@ pub const Renderer = struct {
 
     fn expectMapped(self: *Renderer, buffer: OwnedBuffer, expected: []const u8) Error!void {
         try self.waitForSubmittedWork();
-        var mapped: ?*anyopaque = null;
-        if (self.device_functions.map_memory(self.device, buffer.memory, 0, expected.len, 0, &mapped) != vk.success) {
-            return Error.MemoryMapFailed;
-        }
-        defer self.device_functions.unmap_memory(self.device, buffer.memory);
-        const actual: [*]const u8 = @ptrCast(mapped orelse return Error.MemoryMapFailed);
-        if (!std.mem.eql(u8, actual[0..expected.len], expected)) return Error.ReadbackMismatch;
+        const mapping = try self.mapBufferRange(buffer, 0, expected.len);
+        defer mapping.release(self);
+        if (!std.mem.eql(u8, mapping.bytes, expected)) return Error.ReadbackMismatch;
     }
 
     fn readMapped(self: *Renderer, buffer: OwnedBuffer, destination: []u8) Error!void {
@@ -18964,13 +19006,9 @@ pub const Renderer = struct {
 
     fn readMappedAt(self: *Renderer, buffer: OwnedBuffer, offset: vk.DeviceSize, destination: []u8) Error!void {
         try self.waitForSubmittedWork();
-        var mapped: ?*anyopaque = null;
-        if (self.device_functions.map_memory(self.device, buffer.memory, offset, destination.len, 0, &mapped) != vk.success) {
-            return Error.MemoryMapFailed;
-        }
-        defer self.device_functions.unmap_memory(self.device, buffer.memory);
-        const source: [*]const u8 = @ptrCast(mapped orelse return Error.MemoryMapFailed);
-        @memcpy(destination, source[0..destination.len]);
+        const mapping = try self.mapBufferRange(buffer, offset, destination.len);
+        defer mapping.release(self);
+        @memcpy(destination, mapping.bytes);
     }
 
     fn createSmokeShader(self: *Renderer) Error!vk.ShaderModule {
