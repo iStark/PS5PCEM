@@ -171,7 +171,9 @@ pub fn decodeSop1(pc: u32, code: []const u32, word_index: u32) Error!Instruction
         .word = word,
         .family = .sop1,
         .opcode_id = opcode_id,
-        .opcode = sop1_table[opcode_id],
+        // SWAPPC with a NULL destination discards the return address and is
+        // semantically SETPC. AGC uses it for the LS -> HS continuation.
+        .opcode = if (opcode_id == 0x21 and sdst == 125) .s_setpc_b64 else sop1_table[opcode_id],
     };
     inst.setRawWords(code, word_index, 1);
 
@@ -203,6 +205,18 @@ pub fn decodeSop1(pc: u32, code: []const u32, word_index: u32) Error!Instruction
     inst.src_count = 1;
     try inst.readLiteralOperands(code, word_index);
     return inst;
+}
+
+test "discarded SWAPPC return is a SETPC continuation" {
+    const continuation = try decodeSop1(0x234, &.{0xbefd2106}, 0);
+    try std.testing.expectEqual(Opcode.s_setpc_b64, continuation.opcode);
+    try std.testing.expectEqual(@as(u32, 0x21), continuation.opcode_id);
+    try std.testing.expectEqual(.null, continuation.dst.kind);
+    try std.testing.expectEqual(.sgpr, continuation.src0.kind);
+    try std.testing.expectEqual(@as(u32, 6), continuation.src0.reg);
+    // Keeping a return address requires call/return handling, not this alias.
+    const call = try decodeSop1(0, &.{0xbe802106}, 0);
+    try std.testing.expectEqual(Opcode.unsupported, call.opcode);
 }
 
 pub fn decodeSop2(pc: u32, code: []const u32, word_index: u32) Error!Instruction {
