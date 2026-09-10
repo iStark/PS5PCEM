@@ -48,6 +48,8 @@ pub const PhysicalDevicePropertiesPrefix = extern struct {
         max_descriptor_set_storage_buffers: u32,
         max_descriptor_set_storage_buffers_dynamic: u32,
         max_descriptor_set_sampled_images: u32,
+        graphics_limits: [24]u32,
+        max_compute_shared_memory_size: u32,
     },
 };
 pub const not_ready: Result = 1;

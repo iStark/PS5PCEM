@@ -88,10 +88,14 @@ fn vop1(opcode: u8, destination: u8, source: u9) u32 {
 }
 
 fn vop2(opcode: u8, destination: u8, source0: u8, source1: u8) u32 {
+    return vop2Source(opcode, destination, 256 + @as(u9, source0), source1);
+}
+
+fn vop2Source(opcode: u8, destination: u8, source0: u9, source1: u8) u32 {
     return (@as(u32, opcode) << 25) |
         (@as(u32, destination) << 17) |
         (@as(u32, source1) << 9) |
-        (256 + @as(u32, source0));
+        source0;
 }
 
 fn sop1(opcode: u8, destination: u8, source: u9) u32 {
@@ -1988,6 +1992,68 @@ fn runLdsWaveMemoryProbe(allocator: std.mem.Allocator) !void {
     std.debug.print("LDS wave memory passed: 64 workgroups, cross-half B64 exchange after buffer loads, changed inputs and explicit wave32 barrier\n", .{});
 }
 
+fn runSpilledLdsProbe(allocator: std.mem.Allocator) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{});
+    defer renderer.deinit();
+    const Memory = SizedGuestMemory(1024 * 1024);
+    const guest = try allocator.create(Memory);
+    defer allocator.destroy(guest);
+    guest.* = .{};
+    _ = renderer.dcbBackend(guest.interface());
+    const code = [_]u32{
+        vop1(1, 8, 10), vop2Source(0x1a, 8, 129, 8), vop2Source(0x25, 8, 9, 8),
+        vop2Source(0x1a, 8, 129, 8), vop2Source(0x25, 8, 8, 8), // ((z * 2 + y) * 2 + x)
+        vop2Source(0x1a, 8, 134, 8), vop2Source(0x25, 8, 256, 8),
+        vop2Source(0x1a, 1, 131, 0), vop2Source(0x25, 1, 255, 1),
+        0xfe00,                      vop2Source(0x1d, 2, 160, 0),
+        vop2Source(0x1a, 3, 131, 2), vop2Source(0x25, 3, 255, 3),
+        0xfe00,                      mubuf(0x0d, 0, 4, 8, 0)[0],
+        mubuf(0x0d, 0, 4, 8, 0)[1],  0xd934_0000,
+        0x0000_0401,                 0xbf8a_0000,
+        0xd9d8_0000,                 0x0600_0003,
+        mubuf(0x1d, 0, 6, 8, 4)[0],  mubuf(0x1d, 0, 6, 8, 4)[1],
+        vop1(1, 4, 255),             0x80000000,
+        0xdc34_0000,                 0x0a00_0003, // same LDS bytes through FLAT
+        mubuf(0x1d, 8, 10, 8, 4)[0], mubuf(0x1d, 8, 10, 8, 4)[1],
+        0xbf81_0000,
+    };
+    for (code, 0..) |word, index| guest.word(0x100 + index * 4, word);
+    var analysis = try gpu.shader_analysis.decode(allocator, .{ .context = guest, .read_fn = Memory.read }, 0x100, code.len);
+    defer analysis.deinit(allocator);
+    var module = try analysis.translateSpirv(allocator, .{
+        .stage = .compute,
+        .local_size = .{ 64, 1, 1 },
+        .wave32 = true,
+        .compute_inputs = .{ .local_invocation_id_components = 1, .workgroup_id_sgprs = .{ 8, 9, 10 } },
+        .workgroup_memory_size_bytes = 65536,
+        .workgroup_memory_storage_slot = 2,
+        .flat_apertures = .{ .shared = 0x80000000 },
+        .flat_memories = &.{.{ .descriptor_index = 3, .fault_record_word = 8 }},
+        .storage_buffers = &.{ .{ .resource_sgpr = 0, .descriptor_index = 0, .stride = 8 }, .{ .resource_sgpr = 4, .descriptor_index = 1, .stride = 16 } },
+    });
+    defer module.deinit(allocator);
+    for (0..2) |iteration| {
+        for (0..512 * 2) |index| guest.word(0x10000 + index * 4, @intCast(1 + index + iteration * 100000));
+        _ = try renderer.stageGuestStorageBufferAt(0, 0x10000, 512 * 8);
+        _ = try renderer.stageGuestStorageBufferAt(1, 0x18000, 512 * 16);
+        _ = try renderer.stageGuestStorageBufferAt(2, 0x20000, 8 * 65536);
+        _ = try renderer.stageGuestStorageBufferAt(3, 0xa0000, 48);
+        _ = try renderer.dispatchSpirv(module.words, .{ 2, 2, 2 });
+        var output: [512 * 16]u8 = undefined;
+        try renderer.readbackGuestStorageBuffer(0x18000, &output);
+        for (0..512) |lane| for (0..4) |word| {
+            const expected: u32 = @intCast(1 + (lane ^ 32) * 2 + word % 2 + iteration * 100000);
+            const actual = std.mem.readInt(u32, output[lane * 16 + word * 4 ..][0..4], .little);
+            if (actual != expected) std.debug.print("Spilled LDS iteration={d} lane={d} word={d} expected={x} actual={x}\n", .{ iteration, lane, word, expected, actual });
+            try std.testing.expectEqual(expected, actual);
+        };
+        var fault: [48]u8 = undefined;
+        try renderer.readbackGuestStorageBuffer(0xa0000, &fault);
+        try std.testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, fault[8..12], .little));
+    }
+    std.debug.print("Spilled LDS passed: 64 KiB per group, 2x2x2 isolation, cross-half DS/FLAT exchange, barriers and refreshed inputs\n", .{});
+}
+
 fn runDispatcherBudgetProbe(allocator: std.mem.Allocator) !void {
     var renderer = try vulkan.Renderer.init(allocator, .{});
     defer renderer.deinit();
@@ -2015,16 +2081,27 @@ fn runDispatcherBudgetProbe(allocator: std.mem.Allocator) !void {
         var module = try analysis.translateSpirv(allocator, .{
             .stage = .compute,
             .maximum_dispatcher_iterations = test_case[0],
+            .report_dispatcher_exhaustion = true,
             .storage_buffers = &.{.{ .resource_sgpr = 4, .descriptor_index = 0, .extent_bytes = 4 }},
+            .flat_memories = &.{.{ .descriptor_index = 1, .fault_record_word = 8 }},
         });
         defer module.deinit(allocator);
         try std.testing.expect(module.used_dispatcher);
         guest.word(0x10000, 0);
+        guest.word(0x12008, 0);
         _ = try renderer.stageGuestStorageBufferAt(0, 0x10000, 4);
+        _ = try renderer.stageGuestStorageBufferAt(1, 0x12000, 48);
         _ = try renderer.dispatchSpirv(module.words, .{ 1, 1, 1 });
         var output: [4]u8 = undefined;
         try renderer.readbackGuestStorageBuffer(0x10000, &output);
         try std.testing.expectEqual(test_case[1], std.mem.readInt(u32, &output, .little));
+        var fault: [48]u8 = undefined;
+        try renderer.readbackGuestStorageBuffer(0x12000, &fault);
+        try std.testing.expectEqual(@as(u32, if (test_case[0] == 8) 1 else 0), std.mem.readInt(u32, fault[8..12], .little));
+        if (test_case[0] == 8) {
+            try std.testing.expectEqual(@as(u32, 0xffffffff), std.mem.readInt(u32, fault[32..36], .little));
+            try std.testing.expectEqual(@as(u32, 8), std.mem.readInt(u32, fault[40..44], .little));
+        }
     }
     std.debug.print("dispatcher budgets passed: bounded early exit, 512 complete iterations and pipeline reuse\n", .{});
 }
@@ -4743,6 +4820,134 @@ fn runCleanBufferRetentionProbe(allocator: std.mem.Allocator) !void {
     std.debug.print("Clean buffer retention passed: 96 ranges through one descriptor, refreshed CPU writes, byte-budget recycling\n", .{});
 }
 
+fn runScratchMemoryProbe(allocator: std.mem.Allocator) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true });
+    defer renderer.deinit();
+    var guest = GuestMemory{};
+    _ = renderer.dcbBackend(guest.interface());
+    var code: std.ArrayList(u32) = .empty;
+    defer code.deinit(allocator);
+    try code.appendSlice(allocator, &.{
+        vop1(1, 1, 255), 0xaabbccdd,
+        vop1(1, 2, 128), vop1(1, 3, 255),
+        0x70000000,
+        0xdc74_0000, 0x0000_0002, // FLAT private store x2 from v0:v1
+        0xdc34_4000,     0x107d_0002, // SCRATCH load x2 -> v16:v17
+        vop1(1, 4, 255), 0x11223344,
+        vop1(1, 5, 255), 0x55667788,
+        vop1(1, 2, 136), 0xdc74_4000, 0x007d_0402, // scratch store at 8
+        0xdc34_0000,     0x1200_0002, // FLAT load -> v18:v19
+        vop1(1, 4, 255), 0x01020304,
+        vop1(1, 2, 129),
+        0xdc70_4000,     0x007d_0402, // misaligned store at 1
+        vop1(1, 2, 128), 0xdc34_4000,
+        0x147d_0002,
+        vop1(1, 2, 133), 0xdc30_4ffc,     0x167d_0002, // signed immediate: 5 - 4
+        sop1(3, 6, 136), vop1(1, 2, 128),
+        0xdc30_4000, 0x1706_0002, // scalar offset 8 ignores vector offset 0
+        vop1(1, 2, 140), 0xdc30_4000, 0x187f_0002, // alternate NULL SADDR
+        vop1(1, 2, 144), 0xdc30_4000, 0x197d_0002,
+        0xdc70_4000,     0x007d_0402, // out-of-bounds write must not alias offset 0
+        vop1(1, 2, 128), 0xdc30_4000,
+        0x1a7d_0002,
+        vop1(1, 2, 142), 0xdc30_4000, 0x1b7d_0002, // partially outside dword
+        vop1(1, 2, 136),  0xdc34_4000,      0x027d_0002, // destination overlaps address
+        vop1(1, 28, 258), vop1(1, 29, 259),
+        vop1(1, 2, 140), 0xdc34_4000, 0x1e7d_0002, // x2 crosses allocation end
+    });
+    for (0..4) |group| try code.appendSlice(allocator, &mubuf(0x1e, @intCast(group * 16), @intCast(16 + group * 4), 0, 12));
+    try code.append(allocator, 0xbf81_0000);
+    for (code.items, 0..) |word, index| guest.word(0x100 + index * 4, word);
+    var analysis = try gpu.shader_analysis.decode(allocator, .{ .context = &guest, .read_fn = GuestMemory.read }, 0x100, code.items.len);
+    defer analysis.deinit(allocator);
+    var module = try analysis.translateSpirv(allocator, .{
+        .stage = .compute,
+        .local_size = .{ 32, 1, 1 },
+        .wave32 = true,
+        .compute_inputs = .{ .local_invocation_id_components = 1 },
+        .private_memory_size_bytes = 16,
+        .flat_apertures = .{ .private = 0x70000000 },
+        .storage_buffers = &.{.{ .resource_sgpr = 12, .descriptor_index = 0, .stride = 64 }},
+        .flat_memories = &.{.{ .descriptor_index = 1, .fault_record_word = 8 }},
+    });
+    defer module.deinit(allocator);
+    guest.word(0x12000, 0x1230);
+    guest.word(0x12004, 0x20);
+    guest.word(0x1200c, 4);
+    _ = try renderer.stageGuestStorageBufferAt(0, 0x11000, 32 * 64);
+    _ = try renderer.stageGuestStorageBufferAt(1, 0x12000, 48);
+    _ = try renderer.dispatchSpirv(module.words, .{ 1, 1, 1 });
+    var output: [32 * 64]u8 = undefined;
+    try renderer.readbackGuestStorageBuffer(0x11000, &output);
+    for (0..32) |lane| {
+        const altered: u32 = 0x02030400 | @as(u32, @intCast(lane));
+        const expected = [_]u32{ @intCast(lane), 0xaabbccdd, 0x11223344, 0x55667788, altered, 0xaabbcc01, 0x01020304, 0x11223344, 0x55667788, 0, altered, 0, 0x11223344, 0x55667788, 0x55667788, 0 };
+        for (expected, 0..) |value, word| {
+            const actual = std.mem.readInt(u32, output[lane * 64 + word * 4 ..][0..4], .little);
+            if (actual != value) std.debug.print("SCRATCH lane={d} word={d} expected={x} actual={x}\n", .{ lane, word, value, actual });
+            try std.testing.expectEqual(value, actual);
+        }
+    }
+    var header: [48]u8 = undefined;
+    try renderer.readbackGuestStorageBuffer(0x12000, &header);
+    try std.testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, header[8..12], .little));
+    std.debug.print("SCRATCH passed: FLAT aliasing, lane isolation, scalar/vector offsets, signed offsets, misalignment, overlapping destinations and bounds\n", .{});
+}
+
+fn runUnboundSnapshotProbe(allocator: std.mem.Allocator) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true });
+    defer renderer.deinit();
+    var guest = GuestMemory{};
+    _ = renderer.dcbBackend(guest.interface());
+    const code = [_]u32{
+        sop1(3, 0, 255), 0x1000, sop1(3, 1, 255), 0x20,
+        0xf408_0200,                0xfa00_0000, // runtime V# s8 <- pointer s0
+        mubuf(0x0d, 0, 2, 0, 8)[0], mubuf(0x0d, 0, 2, 0, 8)[1],
+        sop1(3, 106, 134), // VCC is a scalar byte offset of 6, aligned to 4 by SMEM
+        0xf424_0504,                 106 << 25, // s_buffer_load_dwordx2 s20, V#s8, VCC
+        vop1(1, 4, 20),              vop1(1, 5, 21),
+        mubuf(0x1e, 0, 2, 0, 12)[0], mubuf(0x1e, 0, 2, 0, 12)[1],
+        0xbf81_0000,
+    };
+    for (code, 0..) |word, index| guest.word(0x100 + index * 4, word);
+    var analysis = try gpu.shader_analysis.decode(allocator, .{ .context = &guest, .read_fn = GuestMemory.read }, 0x100, code.len);
+    defer analysis.deinit(allocator);
+    var module = try analysis.translateSpirv(allocator, .{
+        .stage = .compute,
+        .local_size = .{ 8, 1, 1 },
+        .wave32 = true,
+        .compute_inputs = .{ .local_invocation_id_components = 1 },
+        .snapshot_unbound_reads = true,
+        .storage_buffers = &.{.{ .resource_sgpr = 12, .descriptor_index = 0, .stride = 16 }},
+        .flat_memories = &.{.{ .descriptor_index = 1, .fault_record_word = 132 }},
+    });
+    defer module.deinit(allocator);
+    guest.word(0x12000, 0x1000);
+    guest.word(0x12004, 0x20);
+    guest.word(0x1200c, 512);
+    for ([_]u32{ 0x1080, 0x80020, 4, 0x16204 }, 0..) |word, index| guest.word(0x12010 + index * 4, word);
+    for (0..8) |index| guest.word(0x12090 + index * 4, @intCast(0xabc00000 + index));
+    for (0..2) |missing| {
+        guest.word(0x12004, if (missing == 0) 0x20 else 0x21);
+        guest.word(0x12008, 0);
+        _ = try renderer.stageGuestStorageBufferAt(0, 0x11000, 8 * 16);
+        _ = try renderer.stageGuestStorageBufferAt(1, 0x12000, 544);
+        _ = try renderer.dispatchSpirv(module.words, .{ 1, 1, 1 });
+        var output: [8 * 16]u8 = undefined;
+        try renderer.readbackGuestStorageBuffer(0x11000, &output);
+        for (0..8) |lane| for (0..4) |word| {
+            const expected: u32 = if (missing != 0 or (word < 2 and lane >= 4)) 0 else if (word < 2) @intCast(0xabc00000 + lane * 2 + word) else @intCast(0xabc00001 + word - 2);
+            const actual = std.mem.readInt(u32, output[lane * 16 + word * 4 ..][0..4], .little);
+            if (actual != expected) std.debug.print("snapshot case={d} lane={d} word={d} expected={x} actual={x}\n", .{ missing, lane, word, expected, actual });
+            try std.testing.expectEqual(expected, actual);
+        };
+        var header: [544]u8 = undefined;
+        try renderer.readbackGuestStorageBuffer(0x12000, &header);
+        try std.testing.expectEqual(@as(u32, if (missing == 0) 0 else 32), std.mem.readInt(u32, header[8..12], .little));
+    }
+    std.debug.print("Unbound snapshot reads passed: runtime SMEM descriptor, indexed MUBUF, scalar VCC offsets, bounds and missing-pointer faults\n", .{});
+}
+
 fn runBvhIntersectionProbe(allocator: std.mem.Allocator) !void {
     var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true });
     defer renderer.deinit();
@@ -6313,6 +6518,10 @@ pub fn main(init: std.process.Init) !void {
         try runDispatcherBudgetProbe(allocator);
         return;
     }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--spilled-lds")) {
+        try runSpilledLdsProbe(allocator);
+        return;
+    }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--workgroup-image-table")) {
         try runWorkgroupImageTableProbe(allocator);
         return;
@@ -6548,6 +6757,14 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--clean-buffer-retention")) {
         try runCleanBufferRetentionProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--scratch-memory")) {
+        try runScratchMemoryProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--unbound-snapshots")) {
+        try runUnboundSnapshotProbe(allocator);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--bvh-intersections")) {

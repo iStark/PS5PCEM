@@ -259,6 +259,7 @@ pub const DeviceInfo = struct {
     device_id: u32,
     device_type: u32,
     sampled_image_capacity: u32 = 64,
+    max_compute_shared_memory_size: u32 = 32768,
 
     pub fn name(self: *const DeviceInfo) []const u8 {
         return self.name_bytes[0..self.name_length];
@@ -5858,10 +5859,28 @@ pub const Renderer = struct {
             programHasRawInstruction(analysis, 0x28, &.{ 0xf000_0308, 0x0001_0500 }) and
             programHasRawInstruction(analysis, 0x6e4, &.{ 0xe034_2000, 0x8005_181d }) and
             programHasRawInstruction(analysis, 0x764, &.{ 0xdc30_8000, 0x197d_0018 });
+        const scene_collision_query = isSceneCollisionQuery(analysis) and resources.flat_memory_count != 0;
+        const lds_bytes = computeLdsSizeBytes(state);
+        var spilled_lds: ?OwnedBuffer = null;
+        defer if (spilled_lds) |buffer| self.destroyBuffer(buffer);
+        var lds_slot: ?u32 = null;
+        // Wave64 emulation additionally reserves one exchange word per lane
+        // and a scheduler word. Keep large guest LDS in isolated SSBO slices.
+        if (scene_collision_query and lds_bytes + (local_size[0] * local_size[1] * local_size[2] + 1) * 4 > self.device_info.max_compute_shared_memory_size) {
+            const groups = std.math.mul(u64, group_count[0], group_count[1]) catch return Error.GuestBufferTooLarge;
+            const total_groups = std.math.mul(u64, groups, group_count[2]) catch return Error.GuestBufferTooLarge;
+            const bytes = std.math.mul(u64, total_groups, lds_bytes) catch return Error.GuestBufferTooLarge;
+            if (bytes == 0 or bytes > 16 * 1024 * 1024) return Error.GuestBufferTooLarge;
+            lds_slot = resources.freeDescriptor() orelse return Error.InvalidStorageDescriptor;
+            spilled_lds = try self.createBuffer(bytes, vk.buffer_usage_storage_buffer_bit, vk.memory_property_device_local_bit);
+            self.updateStorageDescriptorRange(lds_slot.?, spilled_lds.?.handle, 0, bytes);
+            resources.occupied[lds_slot.?] = true;
+        }
         var module = self.compute_translations.translate(self.allocator, &analysis.program, .{
             .stage = .compute,
             .local_size = local_size,
             .maximum_dispatcher_iterations = if (yotei_environment_lighting) 2048 else if (yotei_atmosphere_multiscatter) 1024 else if (yotei_atmosphere_precompute) 512 else 256,
+            .report_dispatcher_exhaustion = scene_collision_query,
             .wave32 = initiator & (1 << 15) != 0,
             .storage_buffers = resources.mappings[0..resources.mapping_count],
             .sampled_images = resources.sampled_image_mappings[0..resources.sampled_image_mapping_count],
@@ -5880,7 +5899,8 @@ pub const Renderer = struct {
                 .threadgroup_size_sgpr = system_registers.threadgroup_size_sgpr,
                 .local_invocation_id_components = system_registers.local_invocation_id_components,
             },
-            .workgroup_memory_size_bytes = computeLdsSizeBytes(state),
+            .workgroup_memory_size_bytes = lds_bytes,
+            .workgroup_memory_storage_slot = lds_slot,
             .gds_storage = uses_gds,
             .descriptor_array_length = maximum_storage_descriptors,
             .scalar_memories = resources.scalar_memories[0..resources.scalar_memory_count],
@@ -5888,6 +5908,12 @@ pub const Renderer = struct {
             .specialized_scalar_prefix_end = resources.specialized_scalar_prefix_end,
             .zero_unmapped_flat_loads = yotei_empty_cluster_flat_read,
             .flat_memories = resources.flat_memories[0..resources.flat_memory_count],
+            .bvh_intersection_mode1 = scene_collision_query,
+            .snapshot_unbound_reads = scene_collision_query,
+            .flat_apertures = if (scene_collision_query) .{ .shared = 0x8000_0000, .private = 0x7000_0000 } else .{},
+            // These traversal kernels spill beyond 15 LDS stack entries into
+            // a private stack bounded at byte 0xd4, rounded to a 256-byte slot.
+            .private_memory_size_bytes = if (scene_collision_query) 256 else 0,
             .allow_float64 = self.shader_float64_available,
             .allow_image_float32_atomic_min_max = self.image_float32_atomic_min_max_available,
         }, analysis.pipeline_options) catch |err| {
@@ -7887,8 +7913,10 @@ pub const Renderer = struct {
             programHasRawInstruction(analysis, 0x4ba0, &.{ 0xdc38_8788, 0x476a_0034 });
         if (!matches and !bitsets and !shadows) return;
         const Region = struct { address: u64, size: usize };
-        var regions: [33]Region = undefined;
+        var regions: [maximum_storage_descriptors]Region = undefined;
         var region_count: usize = 1;
+        const query_bvh = isSceneCollisionQuery(analysis);
+        if (query_bvh and !self.storage_buffer_nonuniform_indexing) return rdna2.spirv.Error.UnsupportedBufferAddressing;
         const root = @as(u64, bindings.user_data[0]) | (@as(u64, bindings.user_data[1] & 0xffff) << 32);
         try self.flushGuestStorageRange(root, if (shadows) 8 else if (bitsets) 232 else 1024);
         if (shadows) {
@@ -7942,11 +7970,36 @@ pub const Renderer = struct {
                 const objects = try reader.readU32(header + 152);
                 if (descriptor.stride != 168 or descriptor.swizzle_enabled or descriptor.add_thread_id or
                     objects > descriptor.record_count or descriptor.size_bytes > 8 * 1024 * 1024) return Error.InvalidStorageDescriptor;
+                if (region_count == regions.len) return Error.InvalidStorageDescriptor;
                 regions[region_count] = .{ .address = header, .size = 160 };
                 region_count += 1;
                 if (descriptor.size_bytes != 0) {
+                    if (region_count == regions.len) return Error.InvalidStorageDescriptor;
                     regions[region_count] = .{ .address = descriptor.address, .size = @intCast(descriptor.size_bytes) };
                     region_count += 1;
+                }
+                if (query_bvh) {
+                    try self.flushGuestStorageRange(descriptor.address, @intCast(descriptor.size_bytes));
+                    for (0..objects) |object| {
+                        const record = descriptor.address + object * 168;
+                        if (try reader.readU32(record) != 3) continue;
+                        const address = try reader.readU64(record + 160);
+                        if (address == 0 or address & 255 != 0) return Error.InvalidStorageDescriptor;
+                        var present = false;
+                        for (regions[0..region_count]) |region| if (region.address == address) {
+                            present = true;
+                            break;
+                        };
+                        if (present) continue;
+                        try self.flushGuestStorageRange(address, 256);
+                        if (try reader.readU64(address) != 0x4c48_5642_5f52_5350 or try reader.readU32(address + 252) != 10)
+                            return Error.InvalidStorageDescriptor;
+                        const bytes = try reader.readU32(address + 16);
+                        if (bytes < 256 or bytes > 8 * 1024 * 1024) return Error.GuestBufferTooLarge;
+                        if (region_count == regions.len) return Error.InvalidStorageDescriptor;
+                        regions[region_count] = .{ .address = address, .size = bytes };
+                        region_count += 1;
+                    }
                 }
             }
         }
@@ -22762,6 +22815,26 @@ fn dispatchGroupCounts(dimensions: [3]u32, local_size: [3]u32, initiator: u32) [
     return result;
 }
 
+fn isSceneCollisionQuery(analysis: *const gpu.ShaderAnalysis) bool {
+    var root_shape = false;
+    for ([_]u32{ 0x6ac, 0x6a0 }) |pc| {
+        if (programHasRawInstruction(analysis, pc, &.{ 0xdc34_8018, 0x0200_0002 }) and
+            programHasRawInstruction(analysis, pc + 12, &.{ 0xdc30_8098, 0x047d_0002 }) and
+            programHasRawInstruction(analysis, pc + 104, &.{ 0xdc34_8088, 0x0a7d_0002 })) root_shape = true;
+    }
+    if (!root_shape) return false;
+    var intersections: usize = 0;
+    var stack_limits: usize = 0;
+    var private_selections: usize = 0;
+    for (analysis.program.instructions.items) |inst| {
+        if (inst.opcode == .image_bvh_intersect_ray) intersections += 1;
+        if (inst.opcode == .s_add_i32 and inst.raw_count == 2 and
+            inst.raw[0] & 0xff80ffff == 0x8100ff6a and inst.raw[1] == 0x00d40000) stack_limits += 1;
+        if (inst.opcode == .v_med3_i32 and inst.raw_count == 3 and inst.raw[2] == 0x70000000) private_selections += 1;
+    }
+    return intersections == 6 and stack_limits == 6 and private_selections == 18;
+}
+
 fn computeLdsSizeBytes(state: *const gpu.State) u32 {
     const rsrc2 = state.readRegister(.shader, 0x213) orelse return 0;
     const blocks = (rsrc2 >> 15) & 0x1ff;
@@ -25973,6 +26046,7 @@ fn choosePhysicalDevice(
         };
         const properties: *const vk.PhysicalDevicePropertiesPrefix = @ptrCast(@alignCast(&raw_properties));
         const limits = properties.limits;
+        info.max_compute_shared_memory_size = limits.max_compute_shared_memory_size;
         const other_descriptors = maximum_storage_descriptors + maximum_storage_images + 2;
         info.sampled_image_capacity = @min(
             maximum_sampled_images,

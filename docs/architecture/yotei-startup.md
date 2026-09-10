@@ -2,6 +2,32 @@
 
 Observed with PPSA26344 and the RTX 3070 Ti; individual build results are dated below.
 
+## Bounded scene-query replay on 2026-09-10
+
+Both captured collision kernels (`0x8000173b00`, 1,024 local invocations, and
+`0x800014e300`, 512) now execute their original instruction streams against
+dispatch-boundary snapshots. Their captured object records select three
+immutable `PSR_BVHL` assets; only those assets were added to the replay inputs,
+with repeated reads and captured overlaps checked. No live-memory fallback or
+shader replacement is used. Runtime SMEM/MUBUF reads can resolve through these
+bounded snapshots, and SCRATCH loads/stores share the private stack used by FLAT.
+An optional fault record distinguishes exhausted dispatcher budgets from
+completed kernels instead of silently accepting partial execution.
+
+Validation exposed a host limit that an ordinary run had missed: the first
+kernel requested 66,052 bytes of Workgroup storage including wave emulation,
+above this device's 49,152-byte limit. Recognized queries now spill guest LDS to
+an isolated SSBO slice per workgroup when necessary. Barriers include
+`UniformMemory` for the spilled storage, as required by the
+[Vulkan memory model](https://docs.vulkan.org/spec/latest/appendices/memorymodel.html).
+
+Both immutable replays pass Vulkan SDK validation without missing-memory faults
+or exhausted dispatcher budgets. The first kernel's six output ranges match
+the pre-spill replay byte for byte. Separate probes check 64 KiB LDS across a
+2x2x2 dispatch, cross-half DS/FLAT exchange, changed inputs, SCRATCH alignment,
+bounds and overlapping destinations. These are shader execution results;
+native menu/gameplay rendering and 5 FPS remain unverified.
+
 ## Opt-in BVH intersection lowering on 2026-09-10
 
 The SPIR-V translator can now execute the 32-bit, non-A16
@@ -16,9 +42,9 @@ The Vulkan SDK probe checks known triangle distances and barycentrics from both
 sides, misses, both box formats, sorted children, reserved nodes, bounds and
 missing-memory fault counts. The default renderer, FLAT aperture and scene-table
 probes also pass without validation errors. BVH64, A16 and triangle return mode 0
-remain unsupported. The feature is opt-in and is not yet connected to the full
-native collision-query resource and stack setup, so this is not a menu or
-gameplay milestone.
+remain unsupported. The original foundation was opt-in; the bounded query
+integration described above supplies the required resource and stack setup.
+This alone is not a menu or gameplay milestone.
 
 ## Optional clean-buffer retention on 2026-09-10
 
@@ -30,8 +56,12 @@ Backing growth can temporarily exceed the byte budget.
 
 SDK probes verify 96 ranges through one slot, refreshed CPU writes, recycling at
 the byte budget, queued reads, descriptor migration and exact buffer bounds.
-The feature remains disabled by default pending a native performance comparison;
-no additional FPS improvement is claimed from these synthetic tests.
+The feature remains disabled by default. A native A/B attempt on the Deluxe
+Bonus screen exposed a regression: enabling retention at frame 984 removed the
+interface and reduced both draws and dispatches. Disabling it at frame 1006 did
+not restore the existing process; that process was stopped. The lower frame
+time is therefore not a valid performance improvement. Retained-buffer
+coherence needs further investigation despite the passing synthetic probes.
 
 ## Native optimization comparison and FLAT apertures on 2026-09-10
 
