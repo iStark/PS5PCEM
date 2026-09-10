@@ -38,6 +38,18 @@ and rendering validation of this change remain pending.
 
 ## Bounded scene-query replay on 2026-09-10
 
+The first native integration run reaches both bonus notices, brightness,
+difficulty and experience selection, then stops advancing at frame 1341.
+The captured shaders are byte-identical to the earlier replays. A subsequently
+added shape check incorrectly required signed `V_MED3_I32` for their 18 aperture
+selections; the decoded instructions are unsigned `V_MED3_U32`. This kept BVH
+translation disabled in the integrated runner despite the earlier replay result.
+The guard now checks the actual unsigned form. A regression test decodes the
+captured instruction forms for both root layouts and rejects near matches.
+Both new dispatch-boundary snapshots, supplemented only with their selected
+immutable BVHL assets, execute with clean SDK validation. Native validation
+after this guard correction is still pending.
+
 Both captured collision kernels (`0x8000173b00`, 1,024 local invocations, and
 `0x800014e300`, 512) now execute their original instruction streams against
 dispatch-boundary snapshots. Their captured object records select three
