@@ -231,6 +231,8 @@ pub const Options = struct {
     /// Keep coherent host-visible allocations mapped until their Vulkan
     /// retirement. Synchronization before CPU access remains unchanged.
     persistent_host_mappings: bool = true,
+    /// Reuse attachment-only passes for draws with no guest color target.
+    persistent_depth_passes: bool = true,
     /// Optional Win32 output window. Supplying it enables the required surface
     /// and swapchain extensions and constrains device selection to a queue that
     /// can present to this exact surface.
@@ -3444,6 +3446,7 @@ pub const Renderer = struct {
     pipeline_cache_generation: std.atomic.Value(u64) = .init(0),
     persisted_pipeline_cache_generation: u64 = 0,
     persistent_host_mappings: bool = true,
+    persistent_depth_passes: bool = true,
 
     fn destroyResourcePools(self: *Renderer) void {
         self.image_scratch.deinit(self.allocator);
@@ -3988,6 +3991,7 @@ pub const Renderer = struct {
             .storage_image_cache_limit = options.storage_image_cache_limit,
             .compute_translations = .{ .maximum_bytes = options.compute_translation_cache_limit },
             .persistent_host_mappings = options.persistent_host_mappings,
+            .persistent_depth_passes = options.persistent_depth_passes,
             .window_presentation = window_presentation,
         };
         renderer.image_aliases.enabled = options.enable_canonical_image_aliases;
@@ -9019,7 +9023,7 @@ pub const Renderer = struct {
         preserve_color: bool,
         samples: u32,
     ) Error!vk.RenderPass {
-        if (color_formats.len == 0 or color_formats.len > gpu.resources.color_target_count) {
+        if ((color_formats.len == 0 and depth_format == 0) or color_formats.len > gpu.resources.color_target_count) {
             return Error.UnsupportedGraphicsState;
         }
         var attachments: [gpu.resources.color_target_count + 1]vk.AttachmentDescription = undefined;
@@ -9551,7 +9555,7 @@ pub const Renderer = struct {
         };
         var blend_attachments: [gpu.resources.color_target_count]vk.PipelineColorBlendAttachmentState = undefined;
         const blend_count = @min(pipeline_state.color_attachment_count, gpu.resources.color_target_count);
-        if (blend_count == 0) return Error.UnsupportedGraphicsState;
+        if (blend_count == 0 and pipeline_state.depth_attachment_format == 0) return Error.UnsupportedGraphicsState;
         for (0..blend_count) |slot| {
             blend_attachments[slot] = .{
                 .blend_enable = pipeline_state.blend_enables[slot],
@@ -12480,6 +12484,97 @@ pub const Renderer = struct {
         }
     }
 
+    fn drawPersistentDepthShaders(
+        self: *Renderer,
+        vertex_words: []const u32,
+        fragment_words: []const u32,
+        vertex_scalars: []const gpu.ShaderSpirvScalarRegister,
+        fragment_scalars: []const gpu.ShaderSpirvScalarRegister,
+        pipeline_state: GraphicsPipelineState,
+        depth: GuestDepthTarget,
+        depth_clear_requested: bool,
+        bind_graphics_descriptors: bool,
+        draw: GuestDraw,
+    ) anyerror!void {
+        const depth_index = try self.acquireDepthTarget(depth);
+        const pass = try self.acquireColorPass(
+            @splat(0),
+            @splat(0),
+            0,
+            self.depth_targets.items[depth_index].view,
+            depth.format,
+            vk.sample_count_1_bit,
+            depth.width,
+            depth.height,
+        );
+        var state = pipeline_state;
+        state.color_attachment_count = 0;
+        state.color_attachment_formats = @splat(0);
+        state.color_write_masks = @splat(0);
+        const pipeline = try self.getGraphicsPipeline(pass.render_pass, state, vertex_words, fragment_words);
+        try self.writeGraphicsScalarValues(vertex_scalars, fragment_scalars);
+
+        // Reserve before recording commands: a ring wrap may submit and wait.
+        // The descriptor batch retains the slice until its timeline tick ends.
+        var indices: ?DrawUploadSlice = null;
+        var transient_indices: ?OwnedBuffer = null;
+        defer if (transient_indices) |buffer| self.destroyBuffer(buffer);
+        if (draw.index_count) |count| {
+            if (count != 0) {
+                const bytes = std.math.mul(usize, count, if (draw.index_uint32) 4 else 2) catch return Error.GuestBufferTooLarge;
+                if (bytes > maximum_frame_bytes) return Error.GuestBufferTooLarge;
+                const memory = self.guest_memory orelse return Error.GuestMemoryUnavailable;
+                var available_offset = self.draw_upload_offset;
+                if (reserveAlignedRange(&available_offset, draw_upload_ring_bytes, bytes, draw_upload_alignment) != null) {
+                    indices = try self.allocateDrawUpload(bytes);
+                    const mapping = self.draw_upload_mapping orelse return Error.MemoryMapFailed;
+                    if (!memory.read(memory.context, draw.index_address, mapping[@intCast(indices.?.offset)..][0..bytes])) return Error.GuestMemoryReadFailed;
+                } else {
+                    // A wrap could overwrite storage/scalar snapshots already
+                    // bound for this not-yet-recorded draw. Keep them intact.
+                    const buffer = try self.createBuffer(bytes, vk.buffer_usage_index_buffer_bit, vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit);
+                    transient_indices = buffer;
+                    const mapping = try self.mapBufferRange(buffer, 0, bytes);
+                    defer mapping.release(self);
+                    if (!memory.read(memory.context, draw.index_address, mapping.bytes)) return Error.GuestMemoryReadFailed;
+                    indices = .{ .buffer = buffer.handle, .offset = 0, .size = bytes };
+                }
+                self.frame_profile.upload_bytes +|= bytes;
+                self.frame_profile.index_upload_bytes +|= bytes;
+            }
+        }
+
+        const command_buffer = try self.beginOneShot();
+        defer self.releaseOneShot(command_buffer);
+        try self.prepareDepthAttachment(command_buffer, depth_index, depth_clear_requested);
+        const begin = vk.RenderPassBeginInfo{
+            .render_pass = pass.render_pass,
+            .framebuffer = pass.framebuffer,
+            .render_area = .{ .offset = .{ .x = 0, .y = 0 }, .extent = .{ .width = state.width, .height = state.height } },
+            .clear_value_count = 0,
+            .clear_values = undefined,
+        };
+        self.device_functions.cmd_begin_render_pass(command_buffer, &begin, vk.subpass_contents_inline);
+        self.device_functions.cmd_bind_pipeline(command_buffer, vk.pipeline_bind_point_graphics, pipeline);
+        if (bind_graphics_descriptors or vertex_scalars.len != 0 or fragment_scalars.len != 0) {
+            self.device_functions.cmd_bind_descriptor_sets(command_buffer, vk.pipeline_bind_point_graphics, self.compute_pipeline_layout, 0, 1, @ptrCast(&self.descriptor_set), 0, null);
+        }
+        if (draw.index_count) |count| {
+            if (indices) |upload| {
+                self.device_functions.cmd_bind_index_buffer(command_buffer, upload.buffer, upload.offset, if (draw.index_uint32) vk.index_type_uint32 else vk.index_type_uint16);
+                self.device_functions.cmd_draw_indexed(command_buffer, count, draw.instance_count, 0, draw.vertex_offset, draw.first_instance);
+            }
+        } else if (draw.vertex_count != 0) {
+            self.device_functions.cmd_draw(command_buffer, draw.vertex_count, draw.instance_count, draw.first_vertex, draw.first_instance);
+        }
+        self.device_functions.cmd_end_render_pass(command_buffer);
+        try self.submitOneShot(command_buffer);
+        const cached = &self.depth_targets.items[depth_index];
+        cached.gpu_generation +%= 1;
+        _ = self.image_aliases.markWrite(cached.alias_token);
+        if (cached.stencil_alias_token) |token| _ = self.image_aliases.markWrite(token);
+    }
+
     fn drawGraphicsShaders(
         self: *Renderer,
         vertex_words: []const u32,
@@ -12509,6 +12604,14 @@ pub const Renderer = struct {
                 bind_graphics_descriptors,
                 draw,
             );
+        }
+        if (depth) |plane| {
+            if (self.persistent_depth_passes and !validate_diagnostic_color and
+                pipeline_state.rasterization_samples == vk.sample_count_1_bit and
+                pipeline_state.width <= plane.width and pipeline_state.height <= plane.height)
+            {
+                return self.drawPersistentDepthShaders(vertex_words, fragment_words, vertex_scalars, fragment_scalars, pipeline_state, plane, depth_clear_requested, bind_graphics_descriptors, draw);
+            }
         }
         const width = pipeline_state.width;
         const height = pipeline_state.height;
@@ -13285,6 +13388,79 @@ pub const Renderer = struct {
         const cached = self.depth_targets.items[index];
         try std.testing.expectEqual(@as(u64, 2), cached.gpu_generation);
         return self.readDepthProbeValues(index, false);
+    }
+
+    pub fn probeDepthPassCache(self: *Renderer) anyerror!void {
+        const IndexMemory = struct {
+            fn read(_: ?*anyopaque, address: u64, bytes: []u8) bool {
+                if (address != 0x8000 or bytes.len != 6) return false;
+                @memcpy(bytes, &[_]u8{ 0, 0, 1, 0, 2, 0 });
+                return true;
+            }
+            fn write(_: ?*anyopaque, _: u64, _: []const u8) bool {
+                return false;
+            }
+        };
+        const previous_memory = self.guest_memory;
+        defer self.guest_memory = previous_memory;
+        self.guest_memory = .{ .context = null, .read = IndexMemory.read, .write = IndexMemory.write };
+        const target = GuestDepthTarget{
+            .address = 0x1000,
+            .allocation_bytes = 4096,
+            .stencil_address = 0x3000,
+            .stencil_allocation_bytes = 1024,
+            .width = 32,
+            .height = 32,
+            .guest_format = 3,
+            .format = vk.format_d32_sfloat_s8_uint,
+            .has_stencil = true,
+            .tile_mode = .linear,
+            .base_array_slice = 0,
+            .mip_level = 0,
+            .clear_depth = 1,
+            .clear_stencil = 0xc3,
+        };
+        var state = GraphicsPipelineState.default(32, 32);
+        state.color_write_masks = @splat(0);
+        state.depth_attachment_format = target.format;
+        state.depth_test_enable = 1;
+        state.depth_write_enable = 1;
+        state.depth_compare_operation = 1;
+        state.stencil_test_enable = 1;
+        state.stencil_front_compare = 7;
+        state.stencil_back_compare = 7;
+        state.stencil_front_pass = vk.stencil_op_replace;
+        state.stencil_back_pass = vk.stencil_op_replace;
+        state.stencil_front_reference = 0x35;
+        state.stencil_back_reference = 0x35;
+        state.stencil_front_write_mask = 0x3f;
+        state.stencil_back_write_mask = 0x3f;
+        const index = try self.acquireDepthTarget(target);
+        for ([_]u32{ 3, 3, 0 }, 0..) |count, pass_index| {
+            try self.beginFrameDraw();
+            if (pass_index == 1) {
+                try self.waitForSubmittedWork();
+                self.draw_upload_mapping.?[0] = 0x7b;
+                self.draw_upload_offset = draw_upload_ring_bytes - 2;
+            }
+            try self.drawGraphicsShaders(&graphics_probe_vertex_spirv, &graphics_probe_fragment_spirv, &.{}, &.{}, state, null, &.{}, target, false, false, false, .{ .index_address = 0x8000, .index_count = count, .index_uint32 = false });
+            if (pass_index == 1) try std.testing.expectEqual(@as(u8, 0x7b), self.draw_upload_mapping.?[0]);
+        }
+        try std.testing.expectEqual([2]f32{ 1, 0 }, try self.readDepthProbeValues(index, false));
+        try std.testing.expectEqual([2]u8{ 0xc3, 0xf5 }, try self.readDepthProbeValues(index, true));
+        // Reusing the same attachment at a smaller render area must not create
+        // a smaller cached framebuffer or lose its untouched depth/stencil.
+        state.width = 16;
+        state.height = 16;
+        state.scissor_width = 16;
+        state.scissor_height = 16;
+        try self.beginFrameDraw();
+        try self.drawGraphicsShaders(&graphics_probe_vertex_spirv, &graphics_probe_fragment_spirv, &.{}, &.{}, state, null, &.{}, target, false, false, false, .{ .vertex_count = 0 });
+        try std.testing.expectEqual([2]u8{ 0xc3, 0xf5 }, try self.readDepthProbeValues(index, true));
+        if (self.persistent_depth_passes) {
+            try std.testing.expectEqual(@as(usize, 1), self.color_passes.items.len);
+            try std.testing.expectEqual(@as(u8, 0), self.color_passes.items[0].color_count);
+        }
     }
 
     pub fn probeDepthStencilClear(self: *Renderer, value: f32, stencil: u8) anyerror!void {

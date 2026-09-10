@@ -6117,6 +6117,15 @@ pub fn main(init: std.process.Init) !void {
         }
         return;
     }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--depth-pass-cache")) {
+        for ([_]bool{ false, true }) |persistent| {
+            var renderer = try vulkan.Renderer.init(allocator, .{ .persistent_depth_passes = persistent, .enable_timeline_scheduler = true });
+            defer renderer.deinit();
+            try renderer.probeDepthPassCache();
+            std.debug.print("depth pass cache passed: persistent={any}, indexed depth/stencil, empty draw and smaller render area\n", .{persistent});
+        }
+        return;
+    }
     if (args.len == 2 and (std.mem.eql(u8, args[1], "--depth-only") or std.mem.eql(u8, args[1], "--depth-bias"))) {
         var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true });
         defer renderer.deinit();

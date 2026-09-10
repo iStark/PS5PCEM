@@ -2,6 +2,28 @@
 
 Observed with PPSA26344 and the RTX 3070 Ti; individual build results are dated below.
 
+## Cached depth-only passes on 2026-09-10
+
+Depth-only guest draws used the transient graphics path: each shadow draw
+created and freed a private RGBA image, image view, render pass, framebuffer
+and index buffer. Color writes and color readback were already disabled, so
+these allocations did not contribute to the guest frame.
+
+Single-sample depth-only draws now use a cached pass with the actual depth/
+stencil attachment and zero color attachments. Their indices use the existing
+upload arena when it has room. If wrapping would overwrite resources already
+prepared for the current draw, a transient index allocation preserves them.
+Guest shaders, depth/stencil operations, clear requests and write generations
+are unchanged. Diagnostic color probes retain the previous path.
+
+The SDK comparison verifies indexed depth and masked stencil writes in both
+paths, empty draws, a full upload arena and a smaller render area reusing the
+same attachment. Existing depth, depth-bias and complete GPU smoke tests pass.
+There are no validation errors or synchronization hazards. The synthetic
+fragment shader intentionally exports an unused color and produces the
+expected `ShaderOutputNotConsumed` warning on the zero-color pass. Native
+performance and scene validation remain pending.
+
 ## Persistent host-visible buffer mappings on 2026-09-10
 
 A native render-thread sample spends 11 of 80 observations in memory mapping,
