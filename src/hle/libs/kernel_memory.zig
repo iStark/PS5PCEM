@@ -37,23 +37,9 @@ pub const PoolError = error{
     NotReserved,
 } || std.mem.Allocator.Error;
 
-/// A spin lock over the pool.
-///
-/// `std.atomic.Mutex` offers only `tryLock`, and `std.Io.Mutex` needs an `Io`
-/// instance that this layer does not have. Spinning is acceptable here because
-/// the critical sections are a few list operations and memory reservation is
-/// rare — titles do it during startup, not per frame.
-const Lock = struct {
-    inner: std.atomic.Mutex = .unlocked,
-
-    fn lock(self: *Lock) void {
-        while (!self.inner.tryLock()) std.atomic.spinLoopHint();
-    }
-
-    fn unlock(self: *Lock) void {
-        self.inner.unlock();
-    }
-};
+/// Pool operations hold this across host mapping calls. Readability checks
+/// must wait for those changes, but should not burn CPU cores while waiting.
+const Lock = memory.HostMutex;
 
 /// Physical memory is handed out in 16 KiB units.
 pub const page_size: u64 = 16 * 1024;

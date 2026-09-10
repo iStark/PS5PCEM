@@ -2,6 +2,22 @@
 
 Observed with PPSA26344 and the RTX 3070 Ti; individual build results are dated below.
 
+## Parking contended memory locks on 2026-09-10
+
+Native CPU sampling found several guest workers repeatedly spinning inside
+`isGuestRangeAccessible`. One captured thread context confirms contention on
+the pool lock, followed by the address-space lock. These checks run alongside
+mapping and protection operations that can hold the locks for longer than a
+short list update.
+
+On Windows, the pool, address-space and GPU page-tracker locks now use an
+exclusive SRW lock, allowing contenders to sleep. Their protected operations
+and lock order are unchanged; other platforms retain the existing atomic lock.
+All 11 memory tests and 32 kernel-memory tests pass, including a contended
+update/wakeup check, mapping protection, shared mappings and CPU write tracking.
+The production and diagnostic runners build successfully. Native frame-time
+and rendering validation of this change remain pending.
+
 ## Bounded scene-query replay on 2026-09-10
 
 Both captured collision kernels (`0x8000173b00`, 1,024 local invocations, and

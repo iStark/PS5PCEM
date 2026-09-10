@@ -18,6 +18,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 pub const SharedBacking = @import("backing_store.zig").SharedBacking;
+pub const HostMutex = @import("host_mutex.zig").Mutex;
 
 const windows_mem_free: u32 = 0x0001_0000;
 const windows_mem_commit: u32 = 0x0000_1000;
@@ -313,20 +314,9 @@ pub const Error = error{
 
 /// A small lock for the address-space interval table.
 ///
-/// Mapping operations are rare and their critical sections are short. An
-/// atomic lock keeps this low-level module independent of an `std.Io` instance,
-/// which the general-purpose mutex in Zig 0.16 requires.
-const Lock = struct {
-    inner: std.atomic.Mutex = .unlocked,
-
-    fn lock(self: *Lock) void {
-        while (!self.inner.tryLock()) std.atomic.spinLoopHint();
-    }
-
-    fn unlock(self: *Lock) void {
-        self.inner.unlock();
-    }
-};
+/// Mapping and page-tracker operations retain exclusive access. Contenders
+/// park during long host commits/protection changes without requiring std.Io.
+const Lock = HostMutex;
 
 const TrackedGpuPage = struct {
     generation: u64,
