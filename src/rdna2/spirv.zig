@@ -7611,6 +7611,43 @@ const Builder = struct {
         }
     }
 
+    fn bufferStoreFormat(self: *Builder, inst: instruction.Instruction, count: u8) Error!void {
+        if (!try self.hasBufferStorage(inst)) return;
+        const binding = self.storageBinding(inst.src1.reg, inst.pc) orelse return Error.InvalidStorageBinding;
+        const format = decodeBufferUnifiedFormat(binding.unified_format) orelse return self.bufferStoreWords(inst, count);
+        // Preserve the existing path for float/normalized formats. Integer
+        // FORMAT stores use the descriptor's component widths, not one dword
+        // per VGPR. In particular, four R8_UINT components occupy one word.
+        if (format.number != 4 and format.number != 5) return self.bufferStoreWords(inst, count);
+        var components: u8 = 0;
+        for (0..count) |component| {
+            const layout = bufferComponentLayout(format.data, @intCast(component)) orelse break;
+            if (layout.bit_offset != 0 or
+                (layout.bit_count != 8 and layout.bit_count != 16 and layout.bit_count != 32))
+                return self.bufferStoreWords(inst, count);
+            components += 1;
+        }
+        if (components == 0) return self.bufferStoreWords(inst, count);
+        const address = try self.bufferAddress(inst);
+        for (0..components) |component| {
+            const layout = bufferComponentLayout(format.data, @intCast(component)).?;
+            const value = try self.source(try consecutiveRegister(inst.dst, @intCast(component)), .bits32);
+            if (layout.bit_count == 32) {
+                try self.storeBufferWord(try self.bufferAddressAdd(address, layout.byte_offset), 0, value);
+            } else {
+                // Adjacent byte/halfword records can share a host SSBO word.
+                // Reuse masked atomic writes so concurrent lanes preserve
+                // each other's components and the surrounding bytes.
+                for (0..layout.bit_count / 8) |byte| {
+                    try self.storeBufferByte(
+                        try self.bufferAddressAdd(address, @as(u32, layout.byte_offset) + @as(u32, @intCast(byte))),
+                        try self.shiftRightBits(value, @intCast(byte * 8)),
+                    );
+                }
+            }
+        }
+    }
+
     fn bufferStoreFormatD16(self: *Builder, inst: instruction.Instruction, count: u8) Error!void {
         if (!try self.hasBufferStorage(inst)) return;
         const binding = self.storageBinding(inst.src1.reg, inst.pc) orelse return Error.InvalidStorageBinding;
@@ -8957,22 +8994,22 @@ const Builder = struct {
             .buffer_store_format_d16_xy => try self.bufferStoreFormatD16(inst, 2),
             .buffer_store_format_d16_xyz => try self.bufferStoreFormatD16(inst, 3),
             .buffer_store_format_d16_xyzw => try self.bufferStoreFormatD16(inst, 4),
-            .buffer_store_dword,
+            .buffer_store_dword => try self.bufferStoreWords(inst, 1),
             .buffer_store_format_x,
             .tbuffer_store_format_x,
-            => try self.bufferStoreWords(inst, 1),
-            .buffer_store_dwordx2,
+            => try self.bufferStoreFormat(inst, 1),
+            .buffer_store_dwordx2 => try self.bufferStoreWords(inst, 2),
             .buffer_store_format_xy,
             .tbuffer_store_format_xy,
-            => try self.bufferStoreWords(inst, 2),
-            .buffer_store_dwordx3,
+            => try self.bufferStoreFormat(inst, 2),
+            .buffer_store_dwordx3 => try self.bufferStoreWords(inst, 3),
             .buffer_store_format_xyz,
             .tbuffer_store_format_xyz,
-            => try self.bufferStoreWords(inst, 3),
-            .buffer_store_dwordx4,
+            => try self.bufferStoreFormat(inst, 3),
+            .buffer_store_dwordx4 => try self.bufferStoreWords(inst, 4),
             .buffer_store_format_xyzw,
             .tbuffer_store_format_xyzw,
-            => try self.bufferStoreWords(inst, 4),
+            => try self.bufferStoreFormat(inst, 4),
             .buffer_atomic_swap => try self.bufferAtomic(inst, 229), // OpAtomicExchange
             .buffer_atomic_add => try self.bufferAtomic(inst, 234), // OpAtomicIAdd
             .buffer_atomic_sub => try self.bufferAtomic(inst, 235), // OpAtomicISub

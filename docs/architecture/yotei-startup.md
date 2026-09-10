@@ -2,6 +2,28 @@
 
 Observed with PPSA26344 and the RTX 3070 Ti; individual build results are dated below.
 
+## Packed integer light-list stores on 2026-09-10
+
+The material-buffer capture contains the tree's geometry and bark texture,
+but direct lighting contributes little to the HDR image. Kernel `0x800036e100`
+writes light lists with `BUFFER_STORE_FORMAT_X/XY/XYZW`: its descriptors include
+R8, R16 and R8G8B8A8 integer records. The translator previously wrote one
+32-bit word per source VGPR, overwriting adjacent packed records.
+
+Byte-aligned integer FORMAT stores now use the descriptor's component widths.
+Masked atomic byte writes preserve neighboring records written by other lanes;
+raw dword and existing float/normalized paths retain their previous behavior.
+The GPU probe covers unsigned and signed byte records, adjacent halfwords,
+four-component records, R32, inactive EXEC and descriptor bounds. It and the
+existing packed-buffer and default smoke probes pass SDK synchronization
+validation without VUID or hazard reports.
+
+An immutable replay of the captured culling dispatch also passes validation.
+The packed list at `0x500a6a6e00` changes from 4,278 nonzero words to 9,084,
+with the fourth component correctly occupying the high byte. The separate
+list at `0x500ae8fe00` remains zero. Native scene validation and investigation
+of that remaining list are still pending.
+
 ## Inactive records in sampled-image tables on 2026-09-10
 
 The next native run passes the earlier completion stall, displays the loading
@@ -27,8 +49,14 @@ The GPU probe covers inactive invalid records, active null and out-of-bounds
 tuples, active invalid rejection, relocation and counter reset after failure.
 It, the existing shifted-table and FLAT-pointer probes, and the default smoke
 pass SDK synchronization validation without VUID or synchronization hazards.
-Native execution with the new check is pending; a normal scene is not yet
-confirmed.
+The subsequent native run executes the guarded kernel at frame 901 without
+an active-image fault. Its frame-944 atmosphere volume and an immutable replay
+of the main lighting pass contain no nonfinite colors. The earlier run's
+atmosphere volume contained NaNs which spread into sky and HDR lighting;
+these captures are from different points in loading, not an FPS comparison.
+The loading spinner and Digital Deluxe notice are visible. After acknowledging
+the notice, this run continues submitting frames but its window remains black;
+a normal scene and the following setup screens are not yet confirmed.
 
 ## Shadow-record GLOBAL reads on 2026-09-10
 

@@ -3530,6 +3530,66 @@ fn runGdsMemoryProbe(allocator: std.mem.Allocator) !void {
     std.debug.print("GDS memory passed: persistent word pairs, low/high EXEC, per-word segment bounds, address wrap and physical bounds\n", .{});
 }
 
+fn runIntegerFormatStoreProbe(allocator: std.mem.Allocator) !void {
+    var guest = GuestMemory{};
+    var renderer = try vulkan.Renderer.init(allocator, .{});
+    defer renderer.deinit();
+    _ = renderer.dcbBackend(guest.interface());
+    const cases = [_]struct { format: u32, width: u8, components: u8 }{
+        .{ .format = 5, .width = 1, .components = 1 }, // R8_UINT
+        .{ .format = 18, .width = 1, .components = 2 }, // R8G8_UINT
+        .{ .format = 60, .width = 1, .components = 4 }, // R8G8B8A8_UINT light counts
+        .{ .format = 6, .width = 1, .components = 1 },
+        .{ .format = 19, .width = 1, .components = 2 },
+        .{ .format = 61, .width = 1, .components = 4 },
+        .{ .format = 11, .width = 2, .components = 1 }, // R16_UINT light indices
+        .{ .format = 12, .width = 2, .components = 1 },
+        .{ .format = 20, .width = 4, .components = 1 }, // unchanged R32_UINT
+    };
+    const stage = gpu.resources.ShaderStage.compute;
+    for (cases, 0..) |case, case_index| {
+        for ([_]bool{ false, true }, 0..) |inactive, phase| {
+            const code_address: u32 = 0x100 + @as(u32, @intCast(case_index * 2 + phase)) * 0x100;
+            const target: u32 = 0x4000 + @as(u32, @intCast(case_index * 2 + phase)) * 0x400;
+            const stride: u32 = @as(u32, case.width) * case.components;
+            const length: usize = 60 * stride;
+            @memset(guest.bytes[target..][0..length], 0xa5);
+            var code: std.ArrayList(u32) = .empty;
+            defer code.deinit(allocator);
+            const signed = case.format == 6 or case.format == 19 or case.format == 61 or case.format == 12;
+            // Each lane has its own first component. The other components
+            // distinguish a packed record from repeated scalar stores.
+            try code.append(allocator, vop1(1, 1, 256));
+            for ([_]u32{ if (signed) 0xffff_ffff else 7, if (signed) 0xffff_fffe else 11, if (signed) 0xffff_fffd else 13 }, 0..) |value, index| {
+                try code.appendSlice(allocator, &.{ vop1(1, @intCast(index + 2), 255), value });
+            }
+            if (inactive) try code.append(allocator, 0xbefe_0480); // EXEC = 0
+            try code.appendSlice(allocator, &mubuf(@as(u7, 4) + @as(u7, @intCast(case.components - 1)), 0, 1, 0, 0));
+            try code.append(allocator, 0xbf81_0000);
+            for (code.items, 0..) |word, index| guest.word(code_address + index * 4, word);
+            var state = gpu.State{};
+            try state.writeRegister(.shader, stage.programRegisterBase(), code_address >> 8);
+            try state.writeRegister(.shader, stage.programRegisterBase() + 1, 0);
+            try state.writeRegister(.shader, 0x213, 4 << 1);
+            const descriptor = [_]u32{ target, stride << 16, 60, (case.format << 12) | 4 | (5 << 3) | (6 << 6) | (7 << 9) };
+            for (descriptor, 0..) |word, index| try state.writeRegister(.shader, stage.userDataBase() + @as(u32, @intCast(index)), word);
+            // Four extra lanes exercise the descriptor boundary. Sixty
+            // adjacent records exercise byte/halfword sharing in one SSBO.
+            _ = try renderer.dispatchRdna2State(&state, .{ 64, 1, 1 }, .{ 1, 1, 1 });
+            var result: [240]u8 = undefined;
+            try renderer.readbackGuestStorageBuffer(target, result[0..length]);
+            for (0..60) |lane| {
+                const values = [_]u32{ @intCast(lane), if (signed) 0xffff_ffff else 7, if (signed) 0xffff_fffe else 11, if (signed) 0xffff_fffd else 13 };
+                for (0..case.components) |component| for (0..case.width) |byte| {
+                    const expected: u8 = if (inactive) 0xa5 else @truncate(values[component] >> @as(u5, @intCast(byte * 8)));
+                    try std.testing.expectEqual(expected, result[lane * stride + component * case.width + byte]);
+                };
+            }
+        }
+    }
+    std.debug.print("integer format stores passed: packed byte/halfword records, signed components, R32, EXEC and bounds\n", .{});
+}
+
 fn runPackedBufferProbe(allocator: std.mem.Allocator) !void {
     var renderer = try vulkan.Renderer.init(allocator, .{});
     defer renderer.deinit();
@@ -5874,6 +5934,10 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--inactive-image-tables")) {
         try runInactiveImageTableProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--integer-format-stores")) {
+        try runIntegerFormatStoreProbe(allocator);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--save-exec")) {
