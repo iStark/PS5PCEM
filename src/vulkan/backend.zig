@@ -10696,13 +10696,23 @@ pub const Renderer = struct {
         usage: image_state.Usage,
     ) Error!void {
         var transitions: [256]image_state.Transition = undefined;
+        var allocated: ?[]image_state.Transition = null;
+        defer if (allocated) |memory| self.allocator.free(memory);
+        var output: []image_state.Transition = &transitions;
         const count = self.image_states.transition(
             image,
             image_state.SubresourceRange.fromVulkan(range),
             usage,
-            &transitions,
-        ) catch return Error.UnsupportedGraphicsState;
-        for (transitions[0..count]) |*transition| {
+            output,
+        ) catch |err| retry: {
+            if (err != error.TransitionCapacityExceeded) return Error.UnsupportedGraphicsState;
+            const mip_layers = std.math.mul(usize, range.level_count, range.layer_count) catch return Error.UnsupportedGraphicsState;
+            const capacity = std.math.mul(usize, mip_layers, @popCount(range.aspect_mask)) catch return Error.UnsupportedGraphicsState;
+            allocated = self.allocator.alloc(image_state.Transition, capacity) catch return Error.MemoryAllocationFailed;
+            output = allocated.?;
+            break :retry self.image_states.transition(image, image_state.SubresourceRange.fromVulkan(range), usage, output) catch return Error.UnsupportedGraphicsState;
+        };
+        for (output[0..count]) |*transition| {
             self.device_functions.cmd_pipeline_barrier(
                 command_buffer,
                 transition.source_stages,
@@ -19948,6 +19958,29 @@ pub const Renderer = struct {
         level_index = 0;
         while (level_index < plan.level_count) : (level_index += 1) {
             const view = try plan.view(level_index);
+            // Every mip dispatch binds the whole destination buffer. Keep its
+            // shader writes ordered before reusing that storage descriptor.
+            if (level_index != 0) {
+                const mip_barrier = vk.BufferMemoryBarrier{
+                    .source_access_mask = vk.access_shader_write_bit,
+                    .destination_access_mask = vk.access_shader_write_bit,
+                    .buffer = dst.handle,
+                    .offset = 0,
+                    .size = dst.size,
+                };
+                self.device_functions.cmd_pipeline_barrier(
+                    command_buffer,
+                    vk.pipeline_stage_compute_shader_bit,
+                    vk.pipeline_stage_compute_shader_bit,
+                    0,
+                    0,
+                    null,
+                    1,
+                    @ptrCast(&mip_barrier),
+                    0,
+                    null,
+                );
+            }
             var detile = try view.computePlan(0, cursor);
             self.device_functions.cmd_push_constants(
                 command_buffer,

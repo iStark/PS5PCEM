@@ -124,6 +124,12 @@ const Cell = struct {
     mip_level: u32,
     array_layer: u32,
     usage: Usage = undefined_usage,
+
+    fn matches(self: Cell, image: vk.Image, range: SubresourceRange) bool {
+        return self.image == image and range.aspect_mask & self.aspect != 0 and
+            self.mip_level >= range.base_mip_level and self.mip_level - range.base_mip_level < range.level_count and
+            self.array_layer >= range.base_array_layer and self.array_layer - range.base_array_layer < range.layer_count;
+    }
 };
 
 pub const Transition = struct {
@@ -215,6 +221,42 @@ pub const Tracker = struct {
     ) Error!usize {
         if (!range.valid()) return Error.InvalidSubresourceRange;
         var matched = false;
+        // Uploads transition whole cube arrays (hundreds of mip/face cells).
+        // A complete range with identical prior usage needs only one barrier.
+        // Check coverage before grouping, and preserve failure atomicity.
+        var uniform: ?Usage = null;
+        var same_usage = true;
+        var covered: u64 = 0;
+        for (self.cells.items) |cell| {
+            if (!cell.matches(image, range)) continue;
+            covered += 1;
+            if (uniform) |previous| {
+                same_usage = same_usage and previous.eql(cell.usage);
+            } else uniform = cell.usage;
+        }
+        const mip_layers = @as(u64, range.level_count) * range.layer_count;
+        const expected = std.math.mul(u64, mip_layers, @popCount(range.aspect_mask)) catch 0;
+        if (same_usage and covered != 0 and covered == expected) {
+            const previous = uniform.?;
+            if (self.optimize_barriers and previous.eql(next) and previous.readOnly()) return 0;
+            if (output.len == 0) return Error.TransitionCapacityExceeded;
+            output[0] = .{
+                .source_stages = previous.stages,
+                .destination_stages = next.stages,
+                .barrier = .{
+                    .source_access_mask = previous.access,
+                    .destination_access_mask = next.access,
+                    .old_layout = previous.layout,
+                    .new_layout = next.layout,
+                    .image = image,
+                    .subresource_range = range.toVulkan(),
+                },
+            };
+            for (self.cells.items) |*cell| if (cell.matches(image, range)) {
+                cell.usage = next;
+            };
+            return 1;
+        }
         var required: usize = 0;
         for (self.cells.items, 0..) |cell, cell_index| {
             if (cell.image != image or range.aspect_mask & cell.aspect == 0 or
@@ -421,6 +463,7 @@ test "capacity failure does not partially commit subresource state" {
         .level_count = 2,
     });
     var too_small: [1]Transition = undefined;
+    _ = try tracker.transition(17, .{ .aspect_mask = vk.image_aspect_color_bit, .base_mip_level = 1 }, shader_read_usage, &too_small);
     try std.testing.expectError(Error.TransitionCapacityExceeded, tracker.transition(
         17,
         .{ .aspect_mask = vk.image_aspect_color_bit, .level_count = 2 },
@@ -428,5 +471,34 @@ test "capacity failure does not partially commit subresource state" {
         &too_small,
     ));
     try std.testing.expect(tracker.current(17, vk.image_aspect_color_bit, 0, 0).?.eql(undefined_usage));
-    try std.testing.expect(tracker.current(17, vk.image_aspect_color_bit, 1, 0).?.eql(undefined_usage));
+    try std.testing.expect(tracker.current(17, vk.image_aspect_color_bit, 1, 0).?.eql(shader_read_usage));
+}
+
+test "large uniform cube arrays share barriers without losing per-face state" {
+    var tracker = Tracker{};
+    defer tracker.deinit(std.testing.allocator);
+    const range = SubresourceRange{ .aspect_mask = vk.image_aspect_color_bit, .level_count = 6, .layer_count = 102 };
+    try tracker.registerImage(std.testing.allocator, 19, range);
+    try std.testing.expectError(Error.TransitionCapacityExceeded, tracker.transition(19, range, transfer_destination_usage, &.{}));
+    var output: [612]Transition = undefined;
+    try std.testing.expectEqual(@as(usize, 1), try tracker.transition(19, range, transfer_destination_usage, output[0..1]));
+    try std.testing.expectEqual(vk.image_layout_undefined, output[0].barrier.old_layout);
+    try std.testing.expectEqual(range.toVulkan(), output[0].barrier.subresource_range);
+    try std.testing.expectEqual(@as(usize, 1), try tracker.transition(19, range, shader_read_usage, output[0..1]));
+    try std.testing.expectEqual(vk.access_transfer_write_bit, output[0].barrier.source_access_mask);
+    try std.testing.expectEqual(@as(usize, 0), try tracker.transition(19, range, shader_read_usage, &.{}));
+    // A later writer changes one face/mip only. A whole-range read must keep
+    // that write dependency and leave the other 611 cells in their old usage.
+    _ = try tracker.transition(19, .{ .aspect_mask = vk.image_aspect_color_bit, .base_mip_level = 4, .base_array_layer = 99 }, storage_usage, output[0..1]);
+    try std.testing.expectEqual(@as(usize, 1), try tracker.transition(19, range, shader_read_usage, output[0..1]));
+    try std.testing.expectEqual(@as(u32, 99), output[0].barrier.subresource_range.base_array_layer);
+    try std.testing.expectEqual(@as(u32, 4), output[0].barrier.subresource_range.base_mip_level);
+    try std.testing.expectEqual(vk.image_layout_general, output[0].barrier.old_layout);
+    // With mixed layouts and retained read barriers the fallback still needs
+    // every cell; insufficient space must not partially update the tracker.
+    tracker.optimize_barriers = false;
+    _ = try tracker.transition(19, .{ .aspect_mask = vk.image_aspect_color_bit, .base_array_layer = 1 }, storage_usage, output[0..1]);
+    try std.testing.expectError(Error.TransitionCapacityExceeded, tracker.transition(19, range, transfer_source_usage, output[0..256]));
+    try std.testing.expectEqual(storage_usage, tracker.current(19, vk.image_aspect_color_bit, 0, 1).?);
+    try std.testing.expectEqual(@as(usize, 612), try tracker.transition(19, range, transfer_source_usage, &output));
 }
