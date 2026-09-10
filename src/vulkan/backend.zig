@@ -18888,14 +18888,8 @@ pub const Renderer = struct {
                 try layout.?.detile(tiled, linear);
             }
         }
-        // Mapped but never-written depth allocations read as zero, which is the
-        // near plane. Hardware clears depth to 1.0; treating those zeroes as
-        // unbacked far depth lets later compute (Yotei's cubemap filter)
-        // consume the colour cube that was actually rasterized.
-        if (source_available and descriptor.tile_mode == .depth and !containsNonzeroByte(linear)) {
-            fillUnbackedDepthSample(descriptor.unified_format, linear);
-            source_available = false;
-        }
+        // Zero is a valid authored depth value (including a reversed-Z clear).
+        // Only a failed memory read is unbacked; never infer that from texels.
         if (!source_available and !self.reported_unbacked_depth_sample) {
             self.reported_unbacked_depth_sample = true;
             std.debug.print(
