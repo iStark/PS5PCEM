@@ -5,6 +5,8 @@
 const std = @import("std");
 const rdna2 = @import("rdna2");
 
+pub var reuse_program_hash_state = std.atomic.Value(bool).init(true);
+
 const SharedModule = struct {
     allocator: std.mem.Allocator,
     module: rdna2.spirv.Module,
@@ -48,6 +50,8 @@ const Entry = struct {
     hash: u64,
     shared: *SharedModule,
     sequence: u64,
+    program_identity: u64 = 0,
+    program_prefix_length: usize = 0,
 };
 
 pub const Cache = struct {
@@ -108,14 +112,17 @@ pub const Cache = struct {
             break;
         };
         self.key.clearRetainingCapacity();
+        const borrowed = if (reuse_program_hash_state.load(.monotonic)) prepared else null;
         // Include decoded instructions as well as code: NGG reconstruction and
         // uniform branch pruning can change instructions without changing code.
-        if (prepared) |prefix| {
-            try self.key.appendSlice(allocator, prefix.bytes);
-        } else {
-            try appendValue(&self.key, allocator, program.code);
-            try appendValue(&self.key, allocator, program.instructions.items);
-            try appendValue(&self.key, allocator, pipeline);
+        if (borrowed == null) {
+            if (prepared) |prefix| {
+                try self.key.appendSlice(allocator, prefix.bytes);
+            } else {
+                try appendValue(&self.key, allocator, program.code);
+                try appendValue(&self.key, allocator, program.instructions.items);
+                try appendValue(&self.key, allocator, pipeline);
+            }
         }
         var key_options = options;
         key_options.scalar_registers = &.{};
@@ -141,9 +148,28 @@ pub const Cache = struct {
             try appendValue(&self.key, allocator, keyed);
         }
         self.sequence +%= 1;
-        const hash = std.hash.Wyhash.hash(0, self.key.items);
+        const prefix_length = if (borrowed) |prefix| prefix.bytes.len else 0;
+        const key_length = prefix_length + self.key.items.len;
+        const hash = if (borrowed) |prefix| hash: {
+            var state = prefix.hash_state;
+            state.update(self.key.items);
+            break :hash state.final();
+        } else std.hash.Wyhash.hash(0, self.key.items);
         for (self.entries.items) |*entry| {
-            if (entry.hash != hash or !std.mem.eql(u8, entry.key, self.key.items)) continue;
+            if (entry.hash != hash or entry.key.len != key_length or
+                !std.mem.eql(u8, entry.key[prefix_length..], self.key.items)) continue;
+            if (borrowed) |prefix| {
+                // Entries own the full canonical bytes. A lifetime-unique ID
+                // proves an already checked immutable prefix without retaining
+                // its pointer. Independent owners still compare their content.
+                if (prefix.identity == 0 or entry.program_identity != prefix.identity or
+                    entry.program_prefix_length != prefix_length)
+                {
+                    if (!std.mem.eql(u8, entry.key[0..prefix_length], prefix.bytes)) continue;
+                    entry.program_identity = prefix.identity;
+                    entry.program_prefix_length = prefix_length;
+                }
+            }
             entry.sequence = self.sequence;
             self.hits += 1;
             entry.shared.references += 1;
@@ -157,7 +183,7 @@ pub const Cache = struct {
             .module = try rdna2.translateProgramSpirvWithPipelineOptions(allocator, program, options, pipeline),
         };
         errdefer shared.module.deinit(allocator);
-        const size = self.key.items.len + shared.module.words.len * @sizeOf(u32);
+        const size = key_length + shared.module.words.len * @sizeOf(u32);
         if (size > self.maximum_bytes) return .{ .shared = shared };
         while (self.entries.items.len != 0 and
             (self.bytes + size > self.maximum_bytes or self.entries.items.len >= 1024))
@@ -171,9 +197,18 @@ pub const Cache = struct {
             allocator.free(victim.key);
             victim.shared.release();
         }
-        const key = try allocator.dupe(u8, self.key.items);
+        const key = try allocator.alloc(u8, key_length);
         errdefer allocator.free(key);
-        try self.entries.append(allocator, .{ .key = key, .hash = hash, .shared = shared, .sequence = self.sequence });
+        if (borrowed) |prefix| @memcpy(key[0..prefix_length], prefix.bytes);
+        @memcpy(key[prefix_length..], self.key.items);
+        try self.entries.append(allocator, .{
+            .key = key,
+            .hash = hash,
+            .shared = shared,
+            .sequence = self.sequence,
+            .program_identity = if (borrowed) |prefix| prefix.identity else 0,
+            .program_prefix_length = prefix_length,
+        });
         shared.references += 1; // The cache and the returned lease each own a reference.
         self.bytes += size;
         return .{ .shared = shared };
@@ -313,9 +348,64 @@ test "dynamic buffer extents share translations while address and format rules r
     try std.testing.expectError(error.InvalidStorageBinding, cache.acquire(a, &program, options, .{}));
 }
 
-// Serialize fields, never padding or slice pointers. Keys are compared in full
-// after hashing, so a hash collision cannot select another shader.
+// Serialize fields, never padding or slice pointers. Hash matches require the
+// canonical content; immutable lifetime IDs only reuse a checked prefix.
 const appendValue = rdna2.cache_key.appendValue;
+
+test "prepared key reuse survives owner destruction and verifies hash collisions" {
+    const a = std.testing.allocator;
+    var cache = Cache{};
+    defer cache.deinit(a);
+    var program = try rdna2.decodeProgram(a, &.{ 0xbf800000, 0xbf810000 });
+    defer program.deinit(a);
+    const options = rdna2.spirv.Options{ .stage = .compute };
+    var original_hash: std.hash.Wyhash = undefined;
+    var original_identity: u64 = 0;
+    {
+        const key = try rdna2.cache_key.ProgramKey.init(a, &program, .{});
+        defer key.deinit(a);
+        original_hash = key.hash_state;
+        original_identity = key.identity;
+        const lease = try cache.acquirePrepared(a, &program, options, .{}, key);
+        lease.release();
+    }
+    // A new equal owner may occupy the same allocator address; cache entries
+    // keep their own bytes and must not dereference the destroyed prefix.
+    const equal = try rdna2.cache_key.ProgramKey.init(a, &program, .{});
+    defer equal.deinit(a);
+    try std.testing.expect(equal.identity != original_identity);
+    for ([_]bool{ true, false, true }) |reuse| {
+        const previous = reuse_program_hash_state.swap(reuse, .monotonic);
+        defer reuse_program_hash_state.store(previous, .monotonic);
+        const lease = try cache.acquirePrepared(a, &program, options, .{}, equal);
+        lease.release();
+    }
+    try std.testing.expectEqual(@as(u64, 1), cache.misses);
+    const pipeline = rdna2.ir.PipelineOptions{ .enable_typed_ir = false };
+    var different = try rdna2.cache_key.ProgramKey.init(a, &program, pipeline);
+    defer different.deinit(a);
+    try std.testing.expectEqual(equal.bytes.len, different.bytes.len);
+    try std.testing.expect(!std.mem.eql(u8, equal.bytes, different.bytes));
+    // Deliberately synthesize a hash collision with an equal-length prefix.
+    different.hash_state = original_hash;
+    const collision = try cache.acquirePrepared(a, &program, options, pipeline, different);
+    defer collision.release();
+    try std.testing.expectEqual(@as(u64, 2), cache.misses);
+    try std.testing.expectEqual(@as(usize, 2), cache.entries.items.len);
+    try std.testing.expectEqual(cache.entries.items[0].hash, cache.entries.items[1].hash);
+    var fresh = try rdna2.translateProgramSpirvWithPipelineOptions(a, &program, options, pipeline);
+    defer fresh.deinit(a);
+    try std.testing.expectEqualSlices(u32, fresh.words, collision.view().words);
+    // Even for an already verified identity, a suffix collision cannot hit.
+    const changed = rdna2.spirv.Options{ .stage = .compute, .local_size = .{ 2, 1, 1 } };
+    const changed_lease = try cache.acquirePrepared(a, &program, changed, pipeline, different);
+    defer changed_lease.release();
+    cache.entries.items[1].hash = cache.entries.items[2].hash;
+    const again = try cache.acquirePrepared(a, &program, changed, pipeline, different);
+    defer again.release();
+    try std.testing.expect(again.view().words.ptr == changed_lease.view().words.ptr);
+    try std.testing.expect(again.view().words.ptr != collision.view().words.ptr);
+}
 
 test "prepared program keys match fresh translations across reconstructed instructions and pipeline changes" {
     const a = std.testing.allocator;

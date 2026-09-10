@@ -6,11 +6,25 @@ const std = @import("std");
 const Program = @import("instruction.zig").Program;
 const PipelineOptions = @import("ir.zig").PipelineOptions;
 
+var next_identity = std.atomic.Value(u64).init(1);
+
+fn allocateIdentity(counter: *std.atomic.Value(u64)) u64 {
+    var value = counter.load(.monotonic);
+    while (value != std.math.maxInt(u64)) {
+        if (counter.cmpxchgWeak(value, value + 1, .monotonic, .monotonic)) |actual| {
+            value = actual;
+        } else return value;
+    }
+    return 0; // Saturation disables identity reuse instead of wrapping.
+}
+
 /// Owned prefix for a program that will remain immutable until destruction.
 /// Reconstructed or specialized instructions require a separate prefix, even
 /// when the original code words are unchanged.
 pub const ProgramKey = struct {
     bytes: []u8,
+    hash_state: std.hash.Wyhash,
+    identity: u64,
 
     pub fn init(allocator: std.mem.Allocator, program: *const Program, pipeline: PipelineOptions) !ProgramKey {
         var bytes: std.ArrayList(u8) = .empty;
@@ -18,13 +32,45 @@ pub const ProgramKey = struct {
         try appendValue(&bytes, allocator, program.code);
         try appendValue(&bytes, allocator, program.instructions.items);
         try appendValue(&bytes, allocator, pipeline);
-        return .{ .bytes = try bytes.toOwnedSlice(allocator) };
+        var hash_state = std.hash.Wyhash.init(0);
+        hash_state.update(bytes.items);
+        const owned = try bytes.toOwnedSlice(allocator);
+        return .{ .bytes = owned, .hash_state = hash_state, .identity = allocateIdentity(&next_identity) };
     }
 
     pub fn deinit(self: ProgramKey, allocator: std.mem.Allocator) void {
         allocator.free(self.bytes);
     }
 };
+
+test "immutable program identities saturate instead of aliasing old owners" {
+    var counter = std.atomic.Value(u64).init(std.math.maxInt(u64) - 1);
+    try std.testing.expectEqual(std.math.maxInt(u64) - 1, allocateIdentity(&counter));
+    try std.testing.expectEqual(@as(u64, 0), allocateIdentity(&counter));
+    try std.testing.expectEqual(@as(u64, 0), allocateIdentity(&counter));
+}
+
+test "prepared hash state matches the full canonical key across chunk boundaries" {
+    var code: [64]u32 = undefined;
+    for (&code, 0..) |*word, i| word.* = @intCast(i * 137);
+    var suffix: [97]u8 = undefined;
+    for (&suffix, 0..) |*byte, i| byte.* = @truncate(i * 29);
+    for (0..code.len) |length| {
+        const program = Program{ .code = code[0..length], .instructions = .empty };
+        const key = try ProgramKey.init(std.testing.allocator, &program, .{});
+        defer key.deinit(std.testing.allocator);
+        var full: std.ArrayList(u8) = .empty;
+        defer full.deinit(std.testing.allocator);
+        try full.appendSlice(std.testing.allocator, key.bytes);
+        for (0..suffix.len) |count| {
+            full.shrinkRetainingCapacity(key.bytes.len);
+            try full.appendSlice(std.testing.allocator, suffix[0..count]);
+            var state = key.hash_state;
+            state.update(suffix[0..count]);
+            try std.testing.expectEqual(std.hash.Wyhash.hash(0, full.items), state.final());
+        }
+    }
+}
 
 pub fn appendValue(key: *std.ArrayList(u8), allocator: std.mem.Allocator, value: anytype) std.mem.Allocator.Error!void {
     // Reserve once for the whole object. Growing/checking the ArrayList for
