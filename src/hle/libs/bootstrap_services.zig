@@ -3330,7 +3330,7 @@ fn agcFuseShaderHalves(
 fn agcCreatePrimState(
     cx_registers: ?[*]ShaderRegister,
     uc_registers: ?[*]ShaderRegister,
-    _: ?*const anyopaque,
+    hull_shader: ?*const anyopaque,
     geometry_shader: ?*const anyopaque,
     primitive_type: u32,
     _: u64,
@@ -3343,14 +3343,32 @@ fn agcCreatePrimState(
     if (specials_address == 0 or !accessible(specials_address, 0x30)) return invalid_argument;
     const specials: [*]align(1) const ShaderRegister = @ptrFromInt(specials_address);
 
+    // The fused hull half contributes LS/HS enable bits and the vertex input
+    // layout. Dropping it leaves a domain shader bound with tessellation off.
+    const hull_specials: ?[*]align(1) const ShaderRegister = if (hull_shader) |hull| blk: {
+        const address = @intFromPtr(hull);
+        if (!accessible(address, shader_structure_size)) return errno.KernelError.efault.raw();
+        if (@as([*]const u8, @ptrFromInt(address))[shader_type_offset] != 3) return invalid_argument;
+        const special_address = readGuestU64(address + shader_specials_offset);
+        if (special_address == 0 or !accessible(special_address, 0x30)) return invalid_argument;
+        break :blk @ptrFromInt(special_address);
+    } else null;
+
     if (cx_registers) |cx| {
         cx[0] = specials[1]; // VGT_SHADER_STAGES_EN at +0x08
         cx[1] = specials[4]; // VGT_GS_OUT_PRIM_TYPE at +0x20
+        if (hull_specials) |hs| {
+            cx[0].value |= hs[1].value;
+            // An active GS owns its output topology. Otherwise the hull
+            // shader selects the tessellator's point/line/triangle output.
+            if (cx[0].value & 0x20 == 0) cx[1] = hs[4];
+        }
     }
     if (uc_registers) |uc| {
         uc[0] = specials[0]; // GE_CNTL at +0x00
         uc[1] = specials[5]; // GE_USER_VGPR_EN at +0x28
         uc[2] = .{ .offset = 0x242, .value = primitive_type };
+        if (hull_specials) |hs| uc[1] = hs[5];
     }
     return errno.ok;
 }
@@ -4238,6 +4256,53 @@ test "shader creation relocates its header and builds primitive state" {
     for (uc[3..]) |entry| {
         try std.testing.expectEqual(ShaderRegister{ .offset = 0xdead_beef, .value = 0xdead_beef }, entry);
     }
+}
+
+test "AGC primitive state preserves fused hull stages and tessellator input layout" {
+    var gs: [shader_structure_size]u8 align(8) = @splat(0);
+    var hs: [shader_structure_size]u8 align(8) = @splat(0);
+    hs[shader_type_offset] = 3;
+    var gs_specials = [_]ShaderRegister{
+        .{ .offset = 0x25b, .value = 0x12345 },
+        .{ .offset = 0x2d5, .value = 0x0200_2008 }, // NGG domain shader
+        .{ .offset = 0, .value = 0 },
+        .{ .offset = 0, .value = 0 },
+        .{ .offset = 0x29b, .value = 0 },
+        .{ .offset = 0x25c, .value = 0x11 },
+    };
+    var hs_specials = gs_specials;
+    hs_specials[1].value = 0x0020_0005; // LS + HS + HS_W32_EN
+    hs_specials[4].value = 2; // triangles produced by the tessellator
+    hs_specials[5].value = 0x22;
+    writeGuestU64(@intFromPtr(&gs) + shader_specials_offset, @intFromPtr(&gs_specials));
+    writeGuestU64(@intFromPtr(&hs) + shader_specials_offset, @intFromPtr(&hs_specials));
+    const sentinel = ShaderRegister{ .offset = 0xdead_beef, .value = 0xdead_beef };
+    var cx: [3]ShaderRegister = @splat(sentinel);
+    var uc: [4]ShaderRegister = @splat(sentinel);
+    try std.testing.expectEqual(errno.ok, agcCreatePrimState(&cx, &uc, &hs, &gs, 9, 0));
+    try std.testing.expectEqual(ShaderRegister{ .offset = 0x2d5, .value = 0x0220_200d }, cx[0]);
+    try std.testing.expectEqual(ShaderRegister{ .offset = 0x29b, .value = 2 }, cx[1]);
+    try std.testing.expectEqual(gs_specials[0], uc[0]);
+    try std.testing.expectEqual(ShaderRegister{ .offset = 0x25c, .value = 0x22 }, uc[1]);
+    try std.testing.expectEqual(ShaderRegister{ .offset = 0x242, .value = 9 }, uc[2]);
+    try std.testing.expectEqual(sentinel, cx[2]);
+    try std.testing.expectEqual(sentinel, uc[3]);
+
+    // With a geometry stage after TES, its output topology takes precedence.
+    gs_specials[1].value |= 0x20;
+    gs_specials[4].value = 1;
+    try std.testing.expectEqual(errno.ok, agcCreatePrimState(&cx, null, &hs, &gs, 9, 0));
+    try std.testing.expectEqual(@as(u32, 0x0220_202d), cx[0].value);
+    try std.testing.expectEqual(gs_specials[4], cx[1]);
+    try std.testing.expectEqual(errno.ok, agcCreatePrimState(null, &uc, &hs, &gs, 9, 0));
+    try std.testing.expectEqual(hs_specials[5], uc[1]);
+
+    cx = @splat(sentinel);
+    uc = @splat(sentinel);
+    hs[shader_type_offset] = 2;
+    try std.testing.expectEqual(invalid_argument, agcCreatePrimState(&cx, &uc, &hs, &gs, 9, 0));
+    for (cx) |entry| try std.testing.expectEqual(sentinel, entry);
+    for (uc) |entry| try std.testing.expectEqual(sentinel, entry);
 }
 
 test "AGC interpolant mapping initializes all entries and matches shader semantics" {
