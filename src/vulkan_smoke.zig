@@ -4698,6 +4698,78 @@ fn runFlatPointerProbe(allocator: std.mem.Allocator) !void {
     std.debug.print("FLAT pointers passed: absolute/SGPR/VCC bases, signed offsets, overlapping destinations, unaligned reads, 4-GiB carry, relocation, repeated loop reads and fault counts\n", .{});
 }
 
+fn runFlatApertureProbe(allocator: std.mem.Allocator) !void {
+    for (0..4) |failure| {
+        var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true });
+        defer renderer.deinit();
+        var guest = GuestMemory{};
+        _ = renderer.dcbBackend(guest.interface());
+        const code = [_]u32{
+            0x3402_0082, // v1 = local ID * 4
+            0xd834_0000, 0x0000_0001, // DS write [v1] = local ID
+            0xbf8a_0000, // barrier before a different lane reads
+            0x3a04_00bf, // v2 = local ID XOR 63
+            0x3404_0482,
+            vop1(1, 3, 255),
+            0x8000_0000,
+            0xdc30_0000,     0x0800_0002, // LDS FLAT load -> v8
+            vop1(1, 2, 257),
+            0xdc70_0100, 0x0000_0002, // FLAT store [v2:v3+256] = v0
+            0xd8d8_0100,     0x0900_0001, // DS read same address -> v9
+            vop1(1, 2, 128), vop1(1, 3, 255),
+            0x7000_0000,
+            0xdc70_0000, 0x0000_0002, // private store; all lanes use offset 0
+            0xbf8a_0000,
+            0xdc30_0000,     0x0a00_0002, // private load -> v10
+            vop1(1, 2, 255), if (failure == 1) 512 else if (failure == 2) 16 else 0x1230,
+            vop1(1, 3, 255), if (failure == 1) 0x8000_0000 else if (failure == 2) 0x7000_0000 else if (failure == 3) 0x9000_0000 else 0x20,
+            0xdc30_0000,                 0x0b00_0002, // global snapshot or deliberately unmapped load
+            mubuf(0x1e, 0, 8, 0, 12)[0], mubuf(0x1e, 0, 8, 0, 12)[1],
+            0xbf81_0000,
+        };
+        for (code, 0..) |word, index| guest.word(0x100 + index * 4, word);
+        var analysis = try gpu.shader_analysis.decode(allocator, .{ .context = &guest, .read_fn = GuestMemory.read }, 0x100, code.len);
+        defer analysis.deinit(allocator);
+        var module = try analysis.translateSpirv(allocator, .{
+            .stage = .compute,
+            .local_size = .{ 64, 1, 1 },
+            .wave32 = true,
+            .compute_inputs = .{ .local_invocation_id_components = 1 },
+            .workgroup_memory_size_bytes = 512,
+            .private_memory_size_bytes = 16,
+            .flat_apertures = .{ .shared = 0x8000_0000, .private = 0x7000_0000 },
+            .storage_buffers = &.{.{ .resource_sgpr = 12, .descriptor_index = 0, .stride = 16 }},
+            .flat_memories = &.{.{ .descriptor_index = 1, .fault_record_word = 8 }},
+        });
+        defer module.deinit(allocator);
+        guest.word(0x12000, 0x1230);
+        guest.word(0x12004, 0x20);
+        guest.word(0x12008, 0);
+        guest.word(0x1200c, 4);
+        guest.word(0x12010, 0xaabb_ccdd);
+        _ = try renderer.stageGuestStorageBufferAt(0, 0x11000, 64 * 16);
+        _ = try renderer.stageGuestStorageBufferAt(1, 0x12000, 48);
+        _ = try renderer.dispatchSpirv(module.words, .{ 1, 1, 1 });
+        var output: [64 * 16]u8 = undefined;
+        try renderer.readbackGuestStorageBuffer(0x11000, &output);
+        for (0..64) |lane| {
+            const expected = [_]u32{ @intCast(lane ^ 63), @intCast(lane), @intCast(lane), if (failure == 0) 0xaabb_ccdd else 0 };
+            for (expected, 0..) |value, word| {
+                const actual = std.mem.readInt(u32, output[lane * 16 + word * 4 ..][0..4], .little);
+                if (actual != value) std.debug.print("FLAT aperture case={d} lane={d} word={d} expected={x} actual={x}\n", .{ failure, lane, word, value, actual });
+                try std.testing.expectEqual(value, actual);
+            }
+        }
+        var header: [48]u8 = undefined;
+        try renderer.readbackGuestStorageBuffer(0x12000, &header);
+        try std.testing.expectEqual(@as(u32, if (failure == 3) 64 else 0), std.mem.readInt(u32, header[8..12], .little));
+        if (failure == 3) {
+            try std.testing.expectEqual(@as(u32, if (failure == 1) 0x8000_0000 else if (failure == 2) 0x7000_0000 else 0x9000_0000), std.mem.readInt(u32, header[40..44], .little));
+        }
+    }
+    std.debug.print("FLAT apertures passed: DS/FLAT aliasing across lanes, private isolation, global snapshots and precise unmapped aperture faults\n", .{});
+}
+
 fn runSceneFlatPointerProbe(allocator: std.mem.Allocator) !void {
     for (0..4) |variant| {
         const scene_bounds = variant == 1;
@@ -6309,6 +6381,10 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--flat-pointers")) {
         try runFlatPointerProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--flat-apertures")) {
+        try runFlatApertureProbe(allocator);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--scene-flat-pointers")) {

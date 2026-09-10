@@ -77,6 +77,14 @@ pub const FlatMemoryBinding = struct {
     fault_record_word: ?u32 = null,
 };
 
+/// High address words of the GPU's 4 GiB LDS/private FLAT apertures.
+/// Keep these explicit: global pointers must retain all 64 address bits until
+/// aperture selection, and an unknown address must still report a fault.
+pub const FlatApertures = struct {
+    shared: ?u32 = null,
+    private: ?u32 = null,
+};
+
 pub const sampled_lookup = @import("sampled_lookup.zig");
 
 pub const SampledImageBinding = struct {
@@ -279,6 +287,7 @@ pub const Options = struct {
     storage_buffers: []const StorageBufferBinding = &.{},
     scalar_memories: []const ScalarMemoryBinding = &.{},
     flat_memories: []const FlatMemoryBinding = &.{},
+    flat_apertures: FlatApertures = .{},
     /// Whether the program narrows the execution mask, and so needs to know
     /// which stores are active. Decided from the program by `translate`.
     uses_execution_mask: bool = false,
@@ -666,6 +675,7 @@ const Builder = struct {
     storage_bindings: []const StorageBufferBinding,
     scalar_memory_bindings: []const ScalarMemoryBinding,
     flat_memory_bindings: []const FlatMemoryBinding,
+    flat_apertures: FlatApertures,
     flat_memory_headers: std.ArrayList([3]u32) = .empty,
     sampled_bindings: []const SampledImageBinding,
     storage_image_bindings: []const StorageImageBinding,
@@ -791,6 +801,7 @@ const Builder = struct {
             .storage_bindings = options.storage_buffers,
             .scalar_memory_bindings = options.scalar_memories,
             .flat_memory_bindings = options.flat_memories,
+            .flat_apertures = options.flat_apertures,
             .sampled_bindings = options.sampled_images,
             .storage_image_bindings = options.storage_images,
             .ngg_lds_exports = options.ngg_lds_exports,
@@ -1294,7 +1305,6 @@ const Builder = struct {
             try self.emit(&self.declarations, 59, &.{ array_pointer, self.wave_scratch, 4 });
         }
         if (options.private_memory_size_bytes != 0) {
-            if (options.stage == .compute) return Error.InvalidStageInterface;
             const words = std.math.divCeil(u32, options.private_memory_size_bytes, 4) catch
                 return Error.InvalidStageInterface;
             if (words == 0) return Error.InvalidStageInterface;
@@ -7773,6 +7783,77 @@ const Builder = struct {
         try self.bufferLoadWords(asBufferFromFlat(inst), count);
     }
 
+    /// Preserve aperture bits; SMEM's descriptor-pointer masking does not
+    /// apply to an absolute FLAT address.
+    fn addFlatPointerOffset(self: *Builder, pointer: [2]u32, offset: u32) Error![2]u32 {
+        // Existing snapshot users pass descriptor-derived 48-bit pointers.
+        // Aperture-aware programs retain the full high word for selection.
+        if (self.flat_apertures.shared == null and self.flat_apertures.private == null)
+            return self.addPointerOffset(pointer, offset);
+        const low = try self.addBits(pointer[0], offset);
+        const carry = self.id();
+        try self.emit(&self.body, 176, &.{ self.bool_type, carry, low, pointer[0] });
+        const carry_word = self.id();
+        try self.emit(&self.body, 169, &.{ self.bits_type, carry_word, carry, try self.constant(.bits32, 1), try self.constant(.bits32, 0) });
+        return .{ low, try self.addBits(pointer[1], carry_word) };
+    }
+
+    fn recordFlatFault(self: *Builder, inst: instruction.Instruction, address: [2]u32, word: u32, found: u32) Error!void {
+        if (self.flat_memory_bindings.len == 0) return Error.UnsupportedBufferAddressing;
+        const zero = try self.constant(.bits32, 0);
+        const missing = self.id();
+        try self.emit(&self.body, 168, &.{ self.bool_type, missing, found });
+        const predicate = (try self.writePredicate(missing)).?;
+        const taken = self.id();
+        const merge = self.id();
+        try self.emit(&self.body, 247, &.{ merge, 0 });
+        try self.emit(&self.body, 250, &.{ predicate, taken, merge });
+        try self.emit(&self.body, 248, &.{taken});
+        const fault = BufferAddress{ .binding = .{ .resource_sgpr = 0, .descriptor_index = self.flat_memory_bindings[0].descriptor_index }, .byte_offset = zero };
+        const previous_faults = self.id();
+        try self.emit(&self.body, 234, &.{ self.bits_type, previous_faults, try self.bufferWordPointer(fault, 2), try self.constant(.bits32, 1), zero, try self.constant(.bits32, 1) });
+        if (self.flat_memory_bindings[0].fault_record_word) |record| {
+            const first = self.id();
+            try self.emit(&self.body, 170, &.{ self.bool_type, first, previous_faults, zero });
+            const record_block = self.id();
+            const record_merge = self.id();
+            try self.emit(&self.body, 247, &.{ record_merge, 0 });
+            try self.emit(&self.body, 250, &.{ first, record_block, record_merge });
+            try self.emit(&self.body, 248, &.{record_block});
+            const details = [_]u32{ try self.constant(.bits32, inst.pc), address[0], address[1], try self.constant(.bits32, word) };
+            for (details, 0..) |value, component|
+                try self.emit(&self.body, 62, &.{ try self.bufferWordPointer(fault, record + @as(u32, @intCast(component))), value });
+            try self.emit(&self.body, 249, &.{record_merge});
+            try self.emit(&self.body, 248, &.{record_merge});
+        }
+        try self.emit(&self.body, 249, &.{merge});
+        try self.emit(&self.body, 248, &.{merge});
+    }
+
+    fn absoluteFlatStoreWords(self: *Builder, inst: instruction.Instruction, count: u8) Error!void {
+        if (inst.memory_segment != 0 or inst.src1.kind != .vgpr or count > 4 or
+            (self.flat_apertures.shared == null and self.flat_apertures.private == null)) return Error.UnsupportedBufferAddressing;
+        var address = try self.addFlatPointerOffset(try self.sourcePair(inst.src0), try self.constant(.bits32, @bitCast(inst.memory_offset)));
+        if (inst.memory_offset < 0) address[1] = try self.addBits(address[1], try self.constant(.bits32, 0xffff_ffff));
+        for (0..count) |word| {
+            const at = try self.addFlatPointerOffset(address, try self.constant(.bits32, @intCast(word * 4)));
+            const value = try self.source(try consecutiveRegister(inst.dst, @intCast(word)), .bits32);
+            var found = try self.constantBool(false);
+            for ([_]?u32{ self.flat_apertures.shared, self.flat_apertures.private }, 0..) |aperture, space| {
+                const high = aperture orelse continue;
+                const access = if (space == 0) try self.workgroupAccess(at[0]) else try self.privateAccess(at[0]);
+                const matches = self.id();
+                try self.emit(&self.body, 170, &.{ self.bool_type, matches, at[1], try self.constant(.bits32, high) });
+                const valid = try self.logicalAndValue(matches, access.in_range);
+                try self.guardedStore((try self.writePredicate(valid)).?, access.pointer, value);
+                const either = self.id();
+                try self.emit(&self.body, 166, &.{ self.bool_type, either, found, matches });
+                found = either;
+            }
+            try self.recordFlatFault(inst, at, @intCast(word), found);
+        }
+    }
+
     fn absoluteFlatLoadWords(self: *Builder, inst: instruction.Instruction, count: u8) Error!void {
         if (inst.memory_segment != 0 and inst.memory_segment != 2) return Error.UnsupportedBufferAddressing;
         if (inst.raw[0] & (1 << 13) != 0 or count > 4) return Error.UnsupportedBufferAddressing; // LDS destination
@@ -7783,13 +7864,16 @@ const Builder = struct {
             try self.sourcePair(inst.src0)
         else
             return Error.UnsupportedBufferAddressing;
-        pointer = try self.addPointerOffset(pointer, try self.constant(.bits32, @bitCast(inst.memory_offset)));
-        if (inst.memory_offset < 0)
-            pointer[1] = try self.andBits(try self.addBits(pointer[1], try self.constant(.bits32, 0xffff_ffff)), 0xffff);
+        pointer = try self.addFlatPointerOffset(pointer, try self.constant(.bits32, @bitCast(inst.memory_offset)));
+        if (inst.memory_offset < 0) {
+            pointer[1] = try self.addBits(pointer[1], try self.constant(.bits32, 0xffff_ffff));
+            if (self.flat_apertures.shared == null and self.flat_apertures.private == null)
+                pointer[1] = try self.andBits(pointer[1], 0xffff);
+        }
         var values: [4]u32 = @splat(zero);
         // Capture the address before writing any overlapping destination VGPR.
         for (0..count) |word| {
-            const address = try self.addPointerOffset(pointer, try self.constant(.bits32, @intCast(word * 4)));
+            const address = try self.addFlatPointerOffset(pointer, try self.constant(.bits32, @intCast(word * 4)));
             var found = self.id();
             try self.emit(&self.body, 171, &.{ self.bool_type, found, zero, zero });
             for (self.flat_memory_bindings, self.flat_memory_headers.items) |region, header| {
@@ -7832,33 +7916,25 @@ const Builder = struct {
                 try self.emit(&self.body, 166, &.{ self.bool_type, either, found, valid });
                 found = either;
             }
-            const missing = self.id();
-            try self.emit(&self.body, 168, &.{ self.bool_type, missing, found });
-            const predicate = (try self.writePredicate(missing)).?;
-            const taken = self.id();
-            const merge = self.id();
-            try self.emit(&self.body, 247, &.{ merge, 0 });
-            try self.emit(&self.body, 250, &.{ predicate, taken, merge });
-            try self.emit(&self.body, 248, &.{taken});
-            const fault = BufferAddress{ .binding = .{ .resource_sgpr = 0, .descriptor_index = self.flat_memory_bindings[0].descriptor_index }, .byte_offset = zero };
-            const previous_faults = self.id();
-            try self.emit(&self.body, 234, &.{ self.bits_type, previous_faults, try self.bufferWordPointer(fault, 2), try self.constant(.bits32, 1), zero, try self.constant(.bits32, 1) });
-            if (self.flat_memory_bindings[0].fault_record_word) |record| {
-                const first = self.id();
-                try self.emit(&self.body, 170, &.{ self.bool_type, first, previous_faults, zero });
-                const record_block = self.id();
-                const record_merge = self.id();
-                try self.emit(&self.body, 247, &.{ record_merge, 0 });
-                try self.emit(&self.body, 250, &.{ first, record_block, record_merge });
-                try self.emit(&self.body, 248, &.{record_block});
-                const details = [_]u32{ try self.constant(.bits32, inst.pc), address[0], address[1], try self.constant(.bits32, @intCast(word)) };
-                for (details, 0..) |value, component|
-                    try self.emit(&self.body, 62, &.{ try self.bufferWordPointer(fault, record + @as(u32, @intCast(component))), value });
-                try self.emit(&self.body, 249, &.{record_merge});
-                try self.emit(&self.body, 248, &.{record_merge});
+            for ([_]?u32{ self.flat_apertures.shared, self.flat_apertures.private }, 0..) |aperture, space| {
+                const high = aperture orelse continue;
+                if (inst.memory_segment != 0) continue; // GLOBAL cannot address LDS or scratch.
+                const access = if (space == 0) try self.workgroupAccess(address[0]) else try self.privateAccess(address[0]);
+                const matches = self.id();
+                try self.emit(&self.body, 170, &.{ self.bool_type, matches, address[1], try self.constant(.bits32, high) });
+                const valid = try self.logicalAndValue(matches, access.in_range);
+                const loaded = self.id();
+                try self.emit(&self.body, 61, &.{ self.bits_type, loaded, access.pointer });
+                const bounded = self.id();
+                try self.emit(&self.body, 169, &.{ self.bits_type, bounded, valid, loaded, zero });
+                const selected = self.id();
+                try self.emit(&self.body, 169, &.{ self.bits_type, selected, matches, bounded, values[word] });
+                values[word] = selected;
+                const either = self.id();
+                try self.emit(&self.body, 166, &.{ self.bool_type, either, found, matches });
+                found = either;
             }
-            try self.emit(&self.body, 249, &.{merge});
-            try self.emit(&self.body, 248, &.{merge});
+            try self.recordFlatFault(inst, address, @intCast(word), found);
         }
         for (values[0..count], 0..) |value, word|
             try self.destination(try consecutiveRegister(inst.dst, @intCast(word)), .{ .id = value, .value_type = .bits32 });
@@ -7901,7 +7977,7 @@ const Builder = struct {
     }
 
     fn flatStoreWords(self: *Builder, inst: instruction.Instruction, count: u8) Error!void {
-        if (self.flat_memory_bindings.len != 0) return Error.UnsupportedBufferAddressing;
+        if (self.flat_memory_bindings.len != 0) return self.absoluteFlatStoreWords(inst, count);
         try self.bufferStoreWords(asBufferFromFlat(inst), count);
     }
 

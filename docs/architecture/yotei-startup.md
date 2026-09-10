@@ -2,6 +2,33 @@
 
 Observed with PPSA26344 and the RTX 3070 Ti; individual build results are dated below.
 
+## Native optimization comparison and FLAT apertures on 2026-09-10
+
+On the same fully visible Deluxe Bonus screen, the combined depth-pass cache,
+GPU feedback copies and per-buffer consumer waits reduce the median frame
+from 5.75 s (frames 965–970, paths disabled) to 3.75 s (frames 973–980,
+paths restored): about 1.53 times faster, or 0.27 FPS. Both intervals contain
+roughly 280 draws and 1,060 dispatches. Persistent mappings stay enabled in
+both intervals. The shader/capture dumps are disabled during this comparison.
+The live test records its toggles in `storage-optimizations-live-ab.json`.
+
+Frame 940 shows bark, branches and fire after tone mapping, beneath the bonus
+window's opaque background. Bonuses and the complete brightness screen remain
+visible. This run subsequently stops at frame 1188 after `ScreamWorker1`
+asserts on a non-finite curve input; it does not establish a rendered menu or
+gameplay. Five FPS remains unachieved.
+
+The translator now has explicit, opt-in FLAT LDS/private aperture addresses.
+It preserves aperture bits, shares LDS storage with DS instructions and gives
+each compute invocation private scratch. Known out-of-range LDS/private reads
+return zero and writes are discarded; unknown absolute addresses retain fault
+reporting. The existing descriptor-derived 48-bit snapshot path is unchanged.
+The SDK probe checks cross-lane DS/FLAT aliasing, private isolation, global
+reads, bounds and unknown-aperture faults. The original absolute-pointer and
+scene-pointer probes also pass without validation or synchronization errors.
+The apertures are not yet enabled for the complete collision-query kernels;
+their BVH lowering and resource bindings still need implementation.
+
 ## Collision-query object tables on 2026-09-10
 
 After the experience setting, two collision-query kernels also walk the
