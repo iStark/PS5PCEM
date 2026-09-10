@@ -2667,6 +2667,52 @@ fn runImageScratchProbe(allocator: std.mem.Allocator) !void {
     std.debug.print("image scratch passed: alternating pooled/unpooled extents, linear/RB+ padding, native updates, partial GPU writes and failed-write retry\n", .{});
 }
 
+fn runZeroDepthSampleProbe(allocator: std.mem.Allocator) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{});
+    defer renderer.deinit();
+    var guest = SizedGuestMemory(262144){};
+    const backend = renderer.dcbBackend(guest.interface());
+    const code = [_]u32{
+        vop1(1, 0, 255), 0x3f000000,
+        vop1(1, 1, 255), 0x3f000000,
+        0xf09c_010a, 0x0040_0200, 0x0000_0001, // Sample depth with s8 sampler.
+        0xe070_0000, 0x8003_0200, 0xbf81_0000,
+    };
+    for (code, 0..) |word, index| guest.word(0x100 + index * 4, word);
+    var state = gpu.State{};
+    try state.writeRegister(.shader, 0x20c, 1);
+    try state.writeRegister(.shader, 0x20d, 0);
+    try state.writeRegister(.shader, 0x213, 16 << 1);
+    for ([_]u16{ 7, 22 }) |format| {
+        var image = sampledImageDescriptorWords(0x10000, 32, 32);
+        image[1] = (image[1] & ~@as(u32, 0x1ff00000)) | (@as(u32, format) << 20);
+        image[3] |= @as(u32, @intFromEnum(gpu.resources.TileMode.depth)) << 20;
+        const view = try (try gpu.TextureLayout.fromImage(try gpu.resources.decodeImageDescriptor(&image))).subresource(0, 0, 1);
+        const userdata = image ++ [_]u32{ 0, 0, 0, 0, 0x8000, 4 << 16, 1, 0 };
+        for (userdata, 0..) |word, index| try state.writeRegister(.shader, @intCast(0x240 + index), word);
+        for ([_]u32{ 0, 1, 0 }) |value| {
+            @memset(guest.bytes[0x10000..0x30000], 0);
+            for (0..32) |y| for (0..32) |x| {
+                const offset: usize = 0x10000 + @as(usize, @intCast(try view.sourceByteOffset(@intCast(x), @intCast(y), 0, 0)));
+                if (format == 7) {
+                    std.mem.writeInt(u16, guest.bytes[offset..][0..2], if (value == 0) 0 else 65535, .little);
+                } else guest.word(offset, if (value == 0) 0 else 0x3f800000);
+            };
+            // Publish the authored texture update through the renderer boundary.
+            const authored = try allocator.dupe(u8, guest.bytes[0x10000..0x30000]);
+            defer allocator.free(authored);
+            try std.testing.expect(backend.vtable.write(backend.context, 0x10000, authored));
+            guest.word(0x8000, 0xdeadbeef);
+            const report = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
+            try std.testing.expect(report.spirv_words != 0);
+            var output: [4]u8 = undefined;
+            try renderer.readbackGuestStorageBuffer(0x8000, &output);
+            try std.testing.expectEqual(@as(u32, if (value == 0) 0 else 0x3f800000), std.mem.readInt(u32, &output, .little));
+        }
+    }
+    std.debug.print("zero depth samples passed: D16/D32 tiled uploads, zero/one/zero updates and cached views without resident attachments\n", .{});
+}
+
 fn runDepthStorageProbe(allocator: std.mem.Allocator) !void {
     var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true });
     defer renderer.deinit();
@@ -7234,6 +7280,10 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--buffer-content-cache")) {
         try runBufferContentCacheProbe(allocator, 0);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--zero-depth-samples")) {
+        try runZeroDepthSampleProbe(allocator);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--depth-storage")) {
