@@ -7842,6 +7842,13 @@ pub const Renderer = struct {
         if (programHasRawInstruction(analysis, 0x65c, &.{ 0xdc34_8018, 0x0000_0000 }) and
             programHasRawInstruction(analysis, 0x668, &.{ 0xdc30_8098, 0x027d_0000 }) and
             programHasRawInstruction(analysis, 0x6c4, &.{ 0xdc34_8088, 0x087d_0000 })) matches = true;
+        // Collision-query variants use the same bounded object table through
+        // v2:v3, before their analytic or BVH intersection work.
+        for ([_]u32{ 0x6ac, 0x6a0 }) |pc| {
+            if (programHasRawInstruction(analysis, pc, &.{ 0xdc34_8018, 0x0200_0002 }) and
+                programHasRawInstruction(analysis, pc + 12, &.{ 0xdc30_8098, 0x047d_0002 }) and
+                programHasRawInstruction(analysis, pc + 104, &.{ 0xdc34_8088, 0x0a7d_0002 })) matches = true;
+        }
         // The hierarchy kernel selects one of nine V# bitsets at root+56,
         // then strips the V# stride from the high pointer word before FLAT.
         // Its finest level contains 4^8 bits; retain each level's actual

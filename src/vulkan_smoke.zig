@@ -4699,7 +4699,8 @@ fn runFlatPointerProbe(allocator: std.mem.Allocator) !void {
 }
 
 fn runSceneFlatPointerProbe(allocator: std.mem.Allocator) !void {
-    for ([_]bool{ false, true }) |scene_bounds| {
+    for (0..4) |variant| {
+        const scene_bounds = variant == 1;
         var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true });
         defer renderer.deinit();
         var guest = GuestMemory{};
@@ -4725,6 +4726,16 @@ fn runSceneFlatPointerProbe(allocator: std.mem.Allocator) !void {
             code[0x6c8 / 4] = 0x087d_0000;
             code[0x6cc / 4] = vop1(1, 14, 264);
             code[0x6d0 / 4] = vop1(1, 15, 265);
+        }
+        if (variant >= 2) {
+            @memset(code[0x3ad4 / 4 .. 0x3b44 / 4], 0xbf80_0000);
+            code[0] = vop1(1, 2, 128);
+            const pc: usize = if (variant == 2) 0x6ac else 0x6a0;
+            @memcpy(code[pc / 4 ..][0..2], &[_]u32{ 0xdc34_8018, 0x0200_0002 });
+            @memcpy(code[(pc + 12) / 4 ..][0..2], &[_]u32{ 0xdc30_8098, 0x047d_0002 });
+            @memcpy(code[(pc + 104) / 4 ..][0..2], &[_]u32{ 0xdc34_8088, 0x0a7d_0002 });
+            code[(pc + 112) / 4] = vop1(1, 14, 266);
+            code[(pc + 116) / 4] = vop1(1, 15, 267);
         }
         // The real culling shaders form 64-bit record addresses with VOP3B
         // carry-out followed by VOP2 ADDC. A stale VCC must not add 4 GiB.

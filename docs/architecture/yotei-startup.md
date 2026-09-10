@@ -2,6 +2,18 @@
 
 Observed with PPSA26344 and the RTX 3070 Ti; individual build results are dated below.
 
+## Collision-query object tables on 2026-09-10
+
+After the experience setting, two collision-query kernels also walk the
+root/header/168-byte scene-object table. Their two instruction layouts now
+use the existing bounded FLAT snapshots. The SDK pointer probe verifies both
+layouts, nested pointers, carry propagation and out-of-range fault reporting.
+It passes without validation errors or synchronization hazards.
+
+This removes the first addressing refusal in these kernels. Their BVH ray
+intersection and FLAT traversal-stack operations still require support;
+this change does not establish a working menu or gameplay.
+
 ## Storage buffer use tracking on 2026-09-10
 
 Overwriting a clean CPU-authored storage buffer previously submitted and waited
