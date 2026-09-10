@@ -8,6 +8,10 @@ const Instruction = rdna2.Instruction;
 const Graph = rdna2.control_flow.Graph;
 const maximum_blocks = 1024;
 
+/// Only immutable shader queries use this cache. Guest-dependent limits and
+/// descriptor contents remain dispatch-local. Also permits a native A/B run.
+pub var static_query_cache_enabled = std.atomic.Value(bool).init(true);
+
 const Location = struct { register: u32, lane: ?u32 = null };
 pub const Definition = struct { instruction: usize, component: u32 };
 
@@ -221,7 +225,9 @@ fn uniqueScalarDefinition(definitions: ReachingDefinitions) ?ScalarDefinition {
 /// Only static writers (including ambiguity) are retained, never guest data.
 pub const ScalarDefinitionCache = struct {
     const Key = struct { before: usize, register: u32 };
+    const LaneKey = struct { before: usize, register: u32, scalar: bool };
     pub const maximum_entries = 4096;
+    pub const maximum_index_queries = 1024;
     allocator: std.mem.Allocator,
     instructions: []const Instruction,
     graph: Graph,
@@ -229,6 +235,9 @@ pub const ScalarDefinitionCache = struct {
     reachable: ?[maximum_blocks]bool = undefined,
     reachability_ready: bool = false,
     allocation_failed: bool = false,
+    bounds: std.AutoHashMapUnmanaged(Key, ?u32) = .empty,
+    lanes: std.AutoHashMapUnmanaged(LaneKey, ?LaneDefinitions) = .empty,
+    index_allocation_failed: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, instructions: []const Instruction, graph: *const Graph) ScalarDefinitionCache {
         return .{ .allocator = allocator, .instructions = instructions, .graph = graph.* };
@@ -236,6 +245,37 @@ pub const ScalarDefinitionCache = struct {
 
     pub fn deinit(self: *ScalarDefinitionCache) void {
         self.entries.deinit(self.allocator);
+        self.bounds.deinit(self.allocator);
+        self.lanes.deinit(self.allocator);
+    }
+
+    pub fn indexUpperBound(self: *ScalarDefinitionCache, before: usize, register: u32) ?u32 {
+        if (!static_query_cache_enabled.load(.monotonic)) return scalarUpperBound(self.instructions, &self.graph, before, register);
+        const key = Key{ .before = before, .register = register };
+        if (self.bounds.get(key)) |value| return value;
+        const value = scalarUpperBound(self.instructions, &self.graph, before, register);
+        if (!self.index_allocation_failed and self.bounds.count() < maximum_index_queries) {
+            self.bounds.put(self.allocator, key, value) catch {
+                self.index_allocation_failed = true;
+            };
+        }
+        return value;
+    }
+
+    pub fn indexLaneDefinitions(self: *ScalarDefinitionCache, before: usize, register: u32, scalar: bool) ?LaneDefinitions {
+        const enabled = static_query_cache_enabled.load(.monotonic);
+        const key = LaneKey{ .before = before, .register = register, .scalar = scalar };
+        if (enabled) if (self.lanes.get(key)) |value| return value;
+        const value = if (scalar)
+            scalarLaneDefinitions(self.instructions, &self.graph, before, register, 0)
+        else
+            vectorLaneDefinitions(self.instructions, &self.graph, before, register);
+        if (enabled and !self.index_allocation_failed and self.lanes.count() < maximum_index_queries) {
+            self.lanes.put(self.allocator, key, value) catch {
+                self.index_allocation_failed = true;
+            };
+        }
+        return value;
     }
 
     /// A dispatch-local specialization or fetch expansion must not use the
@@ -388,6 +428,79 @@ test "persistent scalar definitions remain bounded and tolerate allocation failu
     }
     try std.testing.expect(fallback.allocation_failed);
     try std.testing.expectEqual(@as(u32, 0), fallback.entries.count());
+}
+
+fn expectSameLaneDefinitions(expected: ?LaneDefinitions, actual: ?LaneDefinitions) !void {
+    try std.testing.expectEqual(expected == null, actual == null);
+    if (expected) |want| {
+        try std.testing.expectEqual(want.count, actual.?.count);
+        try std.testing.expectEqualDeep(want.items[0..want.count], actual.?.items[0..actual.?.count]);
+    }
+}
+
+test "static index query cache preserves masked alternatives, unknowns and register banks" {
+    const instructions = [_]Instruction{
+        .{ .pc = 0, .opcode = .s_mov_b64, .dst = .{ .kind = .sgpr, .reg = 8 }, .src0 = .{ .kind = .exec_lo } },
+        .{ .pc = 4, .opcode = .v_mov_b32, .dst = .{ .kind = .vgpr, .reg = 15 }, .src0 = .{ .kind = .integer_inline_constant, .value = 7 } },
+        .{ .pc = 8, .opcode = .s_and_saveexec_b64, .dst = .{ .kind = .sgpr, .reg = 10 }, .src0 = .{ .kind = .integer_inline_constant, .value = 1 } },
+        .{ .pc = 12, .opcode = .s_cbranch_execz, .branch_target = 20 },
+        .{ .pc = 16, .opcode = .v_mov_b32, .dst = .{ .kind = .vgpr, .reg = 15 }, .src0 = .{ .kind = .integer_inline_constant, .value = 31 } },
+        .{ .pc = 20, .opcode = .s_mov_b64, .dst = .{ .kind = .exec_lo }, .src0 = .{ .kind = .sgpr, .reg = 8 } },
+        .{ .pc = 24, .opcode = .v_readfirstlane_b32, .dst = .{ .kind = .sgpr, .reg = 20 }, .src0 = .{ .kind = .vgpr, .reg = 15 } },
+        .{ .pc = 28, .opcode = .s_endpgm },
+    };
+    var graph = try rdna2.control_flow.buildInstructions(std.testing.allocator, &instructions);
+    defer graph.deinit(std.testing.allocator);
+    var cache = ScalarDefinitionCache.init(std.testing.allocator, &instructions, &graph);
+    defer cache.deinit();
+    try std.testing.expectEqual(@as(?u32, 32), cache.indexUpperBound(7, 20));
+    try std.testing.expectEqual(@as(usize, 2), cache.indexLaneDefinitions(7, 20, true).?.count);
+    try std.testing.expectEqual(null, cache.indexLaneDefinitions(7, 20, false));
+    for (0..3) |_| for (0..instructions.len) |before| for (0..32) |register| {
+        const reg: u32 = @intCast(register);
+        try std.testing.expectEqual(scalarUpperBound(&instructions, &graph, before, reg), cache.indexUpperBound(before, reg));
+        try expectSameLaneDefinitions(scalarLaneDefinitions(&instructions, &graph, before, reg, 0), cache.indexLaneDefinitions(before, reg, true));
+        try expectSameLaneDefinitions(vectorLaneDefinitions(&instructions, &graph, before, reg), cache.indexLaneDefinitions(before, reg, false));
+    };
+    try std.testing.expect(cache.bounds.count() > 0 and cache.lanes.count() > 0);
+    const previous = static_query_cache_enabled.swap(false, .monotonic);
+    defer static_query_cache_enabled.store(previous, .monotonic);
+    try std.testing.expectEqual(@as(?u32, 32), cache.indexUpperBound(7, 20));
+    try std.testing.expectEqual(@as(usize, 2), cache.indexLaneDefinitions(7, 20, true).?.count);
+}
+
+test "static index query cache is bounded and survives every map allocation failure" {
+    const instructions = [_]Instruction{
+        .{ .pc = 0, .opcode = .v_mov_b32, .dst = .{ .kind = .vgpr, .reg = 15 }, .src0 = .{ .kind = .integer_inline_constant, .value = 7 } },
+        .{ .pc = 4, .opcode = .v_readfirstlane_b32, .dst = .{ .kind = .sgpr, .reg = 20 }, .src0 = .{ .kind = .vgpr, .reg = 15 } },
+        .{ .pc = 8, .opcode = .s_endpgm },
+    };
+    var graph = try rdna2.control_flow.buildInstructions(std.testing.allocator, &instructions);
+    defer graph.deinit(std.testing.allocator);
+    // Both maps grow several times. Each allocation failure retains the
+    // uncached answer, including later queries after the first failed growth.
+    for (0..14) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        var cache = ScalarDefinitionCache.init(failing.allocator(), &instructions, &graph);
+        defer cache.deinit();
+        for (0..128) |register| {
+            const reg: u32 = @intCast(register);
+            try std.testing.expectEqual(scalarUpperBound(&instructions, &graph, 2, reg), cache.indexUpperBound(2, reg));
+            try expectSameLaneDefinitions(scalarLaneDefinitions(&instructions, &graph, 2, reg, 0), cache.indexLaneDefinitions(2, reg, true));
+            try expectSameLaneDefinitions(vectorLaneDefinitions(&instructions, &graph, 2, reg), cache.indexLaneDefinitions(2, reg, false));
+        }
+        try std.testing.expectEqual(@as(?u32, 8), cache.indexUpperBound(2, 20));
+        try std.testing.expectEqual(@as(usize, 1), cache.indexLaneDefinitions(2, 20, true).?.count);
+    }
+    var cache = ScalarDefinitionCache.init(std.testing.allocator, &instructions, &graph);
+    defer cache.deinit();
+    for (0..ScalarDefinitionCache.maximum_index_queries + 16) |register| {
+        _ = cache.indexUpperBound(2, @intCast(register));
+        _ = cache.indexLaneDefinitions(2, @intCast(register), true);
+    }
+    try std.testing.expectEqual(ScalarDefinitionCache.maximum_index_queries, cache.bounds.count());
+    try std.testing.expectEqual(ScalarDefinitionCache.maximum_index_queries, cache.lanes.count());
+    try std.testing.expectEqual(@as(?u32, 8), cache.indexUpperBound(2, 20));
 }
 
 const MaskProof = struct {

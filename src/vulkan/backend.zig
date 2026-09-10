@@ -25253,7 +25253,7 @@ fn scalarPointerTablePlan(
     };
     const source = gpu.scalar_provenance.scalarRegisterIndex(multiply.src0) orelse return null;
     var resolver = gpu.scalar_resources.Resolver{ .bindings = bindings, .reader = reader, .instructions = instructions, .graph = &analysis.graph, .snapshot = scalar, .definition_cache = analysis.scalar_definitions };
-    const count = gpu.index_bounds.scalarUpperBound(instructions, &analysis.graph, multiply_index, @intCast(source)) orelse bound: {
+    const count = analysis.scalarIndexUpperBound(multiply_index, @intCast(source)) orelse bound: {
         const limit = gpu.index_bounds.scalarGuardedLoopLimit(instructions, &analysis.graph, multiply_index, @intCast(source)) orelse return null;
         const value = if (gpu.scalar_provenance.scalarRegisterIndex(limit.operand)) |register| value: {
             var word: [1]u32 = undefined;
@@ -25329,8 +25329,7 @@ fn typedImageIndexRange(
     before: usize,
     register: u32,
 ) ?TypedIndexRange {
-    const instructions = analysis.program.instructions.items;
-    const definitions = gpu.index_bounds.scalarLaneDefinitions(instructions, &analysis.graph, before, register, 0) orelse return null;
+    const definitions = analysis.indexLaneDefinitions(before, register, true) orelse return null;
     var remaining: u32 = 64;
     return typedDefinitionsIndexRange(bindings, reader, analysis, scalar, definitions, &remaining);
 }
@@ -25366,7 +25365,7 @@ fn typedIndexOperandRange(
         return if (op.value < 65536) .{ .positive_limit = op.value + 1 } else null;
     }
     if (op.kind != .vgpr) return null;
-    const definitions = gpu.index_bounds.vectorLaneDefinitions(analysis.program.instructions.items, &analysis.graph, before, op.reg) orelse return null;
+    const definitions = analysis.indexLaneDefinitions(before, op.reg, false) orelse return null;
     return typedDefinitionsIndexRange(bindings, reader, analysis, scalar, definitions, remaining);
 }
 
@@ -25498,7 +25497,7 @@ fn resolveBufferTablePlan(
         stride = if (inst.opcode == .s_lshl_b32) @as(u32, 1) << @as(u5, @truncate(factor)) else factor;
         if (gpu.scalar_provenance.scalarRegisterIndex(inst.src0)) |source_register| {
             index_register = @intCast(source_register);
-            index_bound = gpu.index_bounds.scalarUpperBound(instructions, &analysis.graph, index, @intCast(source_register));
+            index_bound = analysis.scalarIndexUpperBound(index, @intCast(source_register));
             if (bindings) |inputs| if (inputs.compute_dispatch) |dispatch| {
                 var entries: [3]gpu.index_bounds.EntryBound = undefined;
                 var entry_count: usize = 0;

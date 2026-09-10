@@ -69,6 +69,25 @@ pub const Analysis = struct {
         self.scalar_definitions = cache;
     }
 
+    pub fn scalarIndexUpperBound(self: *const Analysis, before: usize, register: u32) ?u32 {
+        const instructions = self.program.instructions.items;
+        if (self.scalar_definitions) |cache| {
+            if (cache.matches(instructions, &self.graph)) return cache.indexUpperBound(before, register);
+        }
+        return @import("index_bounds.zig").scalarUpperBound(instructions, &self.graph, before, register);
+    }
+
+    pub fn indexLaneDefinitions(self: *const Analysis, before: usize, register: u32, scalar: bool) ?@import("index_bounds.zig").LaneDefinitions {
+        const instructions = self.program.instructions.items;
+        if (self.scalar_definitions) |cache| {
+            if (cache.matches(instructions, &self.graph)) return cache.indexLaneDefinitions(before, register, scalar);
+        }
+        return if (scalar)
+            @import("index_bounds.zig").scalarLaneDefinitions(instructions, &self.graph, before, register, 0)
+        else
+            @import("index_bounds.zig").vectorLaneDefinitions(instructions, &self.graph, before, register);
+    }
+
     pub fn deinit(self: *Analysis, allocator: std.mem.Allocator) void {
         if (self.translation_key) |key| key.deinit(allocator);
         if (self.uniform_specializations) |cache| {
@@ -675,6 +694,9 @@ test "analysis owns definitions across moves but not shader replacement or unifo
     };
     _ = batch.lookup(6, 106);
     try std.testing.expect(cache.entries.count() > 0);
+    _ = moved.scalarIndexUpperBound(6, 106);
+    _ = moved.indexLaneDefinitions(6, 106, true);
+    try std.testing.expect(cache.bounds.count() > 0 and cache.lanes.count() > 0);
 
     var bindings = std.mem.zeroes(shaders.StageBindings);
     bindings.user_data_count = 2;
@@ -706,6 +728,8 @@ test "analysis owns definitions across moves but not shader replacement or unifo
     try std.testing.expect(!moved.resource_checkpoints.?.matches(replacement.program.instructions.items));
     try std.testing.expect(replacement.scalar_definitions.? != cache);
     try std.testing.expectEqual(@as(u32, 0), replacement.scalar_definitions.?.entries.count());
+    try std.testing.expectEqual(@as(u32, 0), replacement.scalar_definitions.?.bounds.count());
+    try std.testing.expectEqual(@as(u32, 0), replacement.scalar_definitions.?.lanes.count());
     try std.testing.expect(!cache.matches(replacement.program.instructions.items, &replacement.graph));
 }
 
