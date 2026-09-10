@@ -23490,6 +23490,19 @@ fn convertR11G11B10ToRgba8(source: []const u8, destination: []u8) void {
 fn convertA2B10G10R10ToRgba8(source: []const u8, destination: []u8) void {
     if (source.len != destination.len or source.len % 4 != 0) return;
     var offset: usize = 0;
+    const Words = @Vector(8, u32);
+    while (source.len - offset >= 32) : (offset += 32) {
+        var words: Words = std.mem.bytesToValue([8]u32, source[offset..][0..32]);
+        if (@import("builtin").target.cpu.arch.endian() == .big) words = @byteSwap(words);
+        const red = ((words & @as(Words, @splat(1023))) * @as(Words, @splat(255)) + @as(Words, @splat(511))) / @as(Words, @splat(1023));
+        const green = (((words >> @splat(10)) & @as(Words, @splat(1023))) * @as(Words, @splat(255)) + @as(Words, @splat(511))) / @as(Words, @splat(1023));
+        const blue = (((words >> @splat(20)) & @as(Words, @splat(1023))) * @as(Words, @splat(255)) + @as(Words, @splat(511))) / @as(Words, @splat(1023));
+        const alpha = (words >> @splat(30)) * @as(Words, @splat(85));
+        var rgba = red | (green << @splat(8)) | (blue << @splat(16)) | (alpha << @splat(24));
+        if (@import("builtin").target.cpu.arch.endian() == .big) rgba = @byteSwap(rgba);
+        const bytes: [32]u8 = @bitCast(rgba);
+        @memcpy(destination[offset..][0..32], &bytes);
+    }
     while (offset < source.len) : (offset += 4) {
         const word = std.mem.readInt(u32, source[offset..][0..4], .little);
         destination[offset] = @intCast(((word & 0x3ff) * 255 + 511) / 1023);
@@ -29083,6 +29096,36 @@ test "A2B10G10R10 UNORM presentation conversion preserves RGBA channels" {
     try std.testing.expectEqualSlices(u8, &.{ 0, 255, 0, 0 }, rgba[8..12]);
     try std.testing.expectEqualSlices(u8, &.{ 0, 0, 255, 0 }, rgba[12..16]);
     try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 255 }, rgba[16..20]);
+}
+
+test "A2B10G10R10 conversion covers all channel values, unaligned tails and in-place output" {
+    const count = 4096 + 7;
+    var source: [count * 4 + 1]u8 = undefined;
+    var destination: [count * 4 + 3]u8 = @splat(0x5a);
+    var expected: [count * 4]u8 = undefined;
+    for (0..count) |i| {
+        const red: u32 = @intCast(i % 1024);
+        const green: u32 = @intCast((i * 37) % 1024);
+        const blue: u32 = @intCast(1023 - i % 1024);
+        const alpha: u32 = @intCast((i / 1024) % 4);
+        std.mem.writeInt(u32, source[1 + i * 4 ..][0..4], red | (green << 10) | (blue << 20) | (alpha << 30), .little);
+        for ([_]u32{ red, green, blue, alpha }, 0..) |value, channel| {
+            const maximum: f64 = if (channel == 3) 3 else 1023;
+            expected[i * 4 + channel] = @intFromFloat(@round(@as(f64, @floatFromInt(value)) * 255 / maximum));
+        }
+    }
+    convertA2B10G10R10ToRgba8(source[1..], destination[2 .. 2 + count * 4]);
+    try std.testing.expectEqualSlices(u8, &expected, destination[2 .. 2 + count * 4]);
+    try std.testing.expectEqualSlices(u8, &.{ 0x5a, 0x5a }, destination[0..2]);
+    try std.testing.expectEqual(@as(u8, 0x5a), destination[destination.len - 1]);
+    // Check every remainder around the vector boundary, including no pixels.
+    for (0..18) |length| {
+        var in_place: [18 * 4 + 1]u8 = undefined;
+        @memcpy(in_place[1..], source[1 .. 1 + 18 * 4]);
+        convertA2B10G10R10ToRgba8(in_place[1 .. 1 + length * 4], in_place[1 .. 1 + length * 4]);
+        try std.testing.expectEqualSlices(u8, expected[0 .. length * 4], in_place[1 .. 1 + length * 4]);
+        try std.testing.expectEqualSlices(u8, source[1 + length * 4 .. 1 + 18 * 4], in_place[1 + length * 4 ..]);
+    }
 }
 
 test "opaque RGBA8 black is not an A2B10 view of the same bytes" {
