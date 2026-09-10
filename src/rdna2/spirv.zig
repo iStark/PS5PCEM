@@ -501,26 +501,28 @@ fn bufferComponentLayout(data_format: u8, component: u8) ?BufferComponentLayout 
             1 => .{ .byte_offset = 2, .bit_count = 16 },
             else => null,
         },
-        6 => switch (component) {
+        // AMD packed format names list the most significant field first.
+        // For example 2_10_10_10 stores X/Y/Z in bits 0/10/20 and W in 30.
+        7 => switch (component) {
             0 => .{ .byte_offset = 0, .bit_offset = 0, .bit_count = 10 },
             1 => .{ .byte_offset = 0, .bit_offset = 10, .bit_count = 11 },
             2 => .{ .byte_offset = 0, .bit_offset = 21, .bit_count = 11 },
             else => null,
         },
-        7 => switch (component) {
+        6 => switch (component) {
             0 => .{ .byte_offset = 0, .bit_offset = 0, .bit_count = 11 },
             1 => .{ .byte_offset = 0, .bit_offset = 11, .bit_count = 11 },
             2 => .{ .byte_offset = 0, .bit_offset = 22, .bit_count = 10 },
             else => null,
         },
-        8 => switch (component) {
+        9 => switch (component) {
             0 => .{ .byte_offset = 0, .bit_offset = 0, .bit_count = 10 },
             1 => .{ .byte_offset = 0, .bit_offset = 10, .bit_count = 10 },
             2 => .{ .byte_offset = 0, .bit_offset = 20, .bit_count = 10 },
             3 => .{ .byte_offset = 0, .bit_offset = 30, .bit_count = 2 },
             else => null,
         },
-        9 => switch (component) {
+        8 => switch (component) {
             0 => .{ .byte_offset = 0, .bit_offset = 0, .bit_count = 2 },
             1 => .{ .byte_offset = 0, .bit_offset = 2, .bit_count = 10 },
             2 => .{ .byte_offset = 0, .bit_offset = 12, .bit_count = 10 },
@@ -13677,7 +13679,7 @@ test "GFX10 unified buffer formats expose packed component layouts" {
     );
     try std.testing.expectEqual(
         BufferComponentLayout{ .byte_offset = 0, .bit_offset = 30, .bit_count = 2 },
-        bufferComponentLayout(8, 3).?,
+        bufferComponentLayout(9, 3).?,
     );
     try std.testing.expect(bufferComponentLayout(5, 2) == null);
     try std.testing.expect(decodeBufferUnifiedFormat(47) == null);

@@ -3918,6 +3918,47 @@ fn runIntegerFormatStoreProbe(allocator: std.mem.Allocator) !void {
     std.debug.print("integer format stores passed: packed byte/halfword records, signed components, R32, EXEC and bounds\n", .{});
 }
 
+fn runPackedChannelOrderProbe(allocator: std.mem.Allocator) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{});
+    defer renderer.deinit();
+    var guest = GuestMemory{};
+    _ = renderer.dcbBackend(guest.interface());
+    const code = [_]u32{ 0xe00c_0000, 0x8000_0400, 0xe078_0000, 0x8001_0400, 0xbf81_0000 };
+    for (code, 0..) |word, i| guest.word(0x100 + i * 4, word);
+    var state = gpu.State{};
+    const compute = gpu.resources.ShaderStage.compute;
+    try state.writeRegister(.shader, compute.programRegisterBase(), 1);
+    try state.writeRegister(.shader, compute.programRegisterBase() + 1, 0);
+    try state.writeRegister(.shader, 0x213, 8 << 1);
+    // Independent packed words, including a captured tree normal. The two
+    // 10-bit layouts and both mini-float layouts must not exchange channels.
+    const cases = [_]struct { format: u32, bits: u32, expected: [4]f32 }{
+        .{ .format = 51, .bits = 0x3df8_74a2, .expected = .{ 162.0 / 511.0, -483.0 / 511.0, -33.0 / 511.0, 0 } },
+        .{ .format = 51, .bits = (2 << 30) | (511 << 20) | (1023 << 10) | 512, .expected = .{ -1, -1.0 / 511.0, 1, -1 } },
+        .{ .format = 50, .bits = (3 << 30) | (512 << 20) | (256 << 10) | 1023, .expected = .{ 1, 256.0 / 1023.0, 512.0 / 1023.0, 1 } },
+        .{ .format = 45, .bits = (511 << 22) | (1023 << 12) | (512 << 2) | 2, .expected = .{ -1, -1, -1.0 / 511.0, 1 } },
+        .{ .format = 44, .bits = (512 << 22) | (256 << 12) | (1023 << 2) | 3, .expected = .{ 1, 1, 256.0 / 1023.0, 512.0 / 1023.0 } },
+        .{ .format = 36, .bits = (0x200 << 22) | (0x3c0 << 11) | 0x380, .expected = .{ 0.5, 1, 2, 1 } },
+        .{ .format = 43, .bits = (0x400 << 21) | (0x3c0 << 10) | 0x1c0, .expected = .{ 0.5, 1, 2, 1 } },
+    };
+    for (cases, 0..) |case, index| {
+        const source: u32 = 0x4000 + @as(u32, @intCast(index)) * 0x100;
+        const destination = source + 0x1000;
+        guest.word(source, case.bits);
+        for ([_]u32{ source, 0, 4, (case.format << 12) | 4 | (5 << 3) | (6 << 6) | (7 << 9), destination, 0, 16, 0 }, 0..) |word, i|
+            try state.writeRegister(.shader, compute.userDataBase() + @as(u32, @intCast(i)), word);
+        _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
+        var output: [16]u8 = undefined;
+        try renderer.readbackGuestStorageBuffer(destination, &output);
+        for (case.expected, 0..) |expected, channel| {
+            const actual: f32 = @bitCast(std.mem.readInt(u32, output[channel * 4 ..][0..4], .little));
+            if (@abs(expected - actual) > 0.00001) std.debug.print("packed format={d} channel={d} expected={d} actual={d}\n", .{ case.format, channel, expected, actual });
+            try std.testing.expectApproxEqAbs(expected, actual, 0.00001);
+        }
+    }
+    std.debug.print("Packed channel order passed: tree SNORM normals, signed endpoints, UNORM and both mini-float layouts\n", .{});
+}
+
 fn runPackedBufferProbe(allocator: std.mem.Allocator) !void {
     var renderer = try vulkan.Renderer.init(allocator, .{});
     defer renderer.deinit();
@@ -7162,6 +7203,10 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--packed-buffer")) {
         try runPackedBufferProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--packed-channel-order")) {
+        try runPackedChannelOrderProbe(allocator);
         return;
     }
     if (args.len == 1) {
