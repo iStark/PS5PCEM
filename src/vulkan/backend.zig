@@ -237,6 +237,10 @@ pub const Options = struct {
     gpu_feedback_snapshots: bool = true,
     /// Wait for the last GPU use of an overwritten storage allocation.
     storage_buffer_use_waits: bool = true,
+    /// Retain clean ranges by address across descriptor-slot changes. The
+    /// budget is a growth limit; replacing a backing may exceed it temporarily.
+    retain_clean_storage_buffers: bool = false,
+    storage_buffer_cache_budget_bytes: usize = 4 * 1024 * 1024 * 1024,
     /// Optional Win32 output window. Supplying it enables the required surface
     /// and swapchain extensions and constrains device selection to a queue that
     /// can present to this exact surface.
@@ -3462,6 +3466,8 @@ pub const Renderer = struct {
     persistent_depth_passes: bool = true,
     gpu_feedback_snapshots: bool = true,
     storage_buffer_use_waits: bool = true,
+    retain_clean_storage_buffers: bool = false,
+    storage_buffer_cache_budget_bytes: usize = 4 * 1024 * 1024 * 1024,
 
     fn destroyResourcePools(self: *Renderer) void {
         self.image_scratch.deinit(self.allocator);
@@ -4009,6 +4015,8 @@ pub const Renderer = struct {
             .persistent_depth_passes = options.persistent_depth_passes,
             .gpu_feedback_snapshots = options.gpu_feedback_snapshots,
             .storage_buffer_use_waits = options.storage_buffer_use_waits,
+            .retain_clean_storage_buffers = options.retain_clean_storage_buffers,
+            .storage_buffer_cache_budget_bytes = options.storage_buffer_cache_budget_bytes,
             .window_presentation = window_presentation,
         };
         renderer.image_aliases.enabled = options.enable_canonical_image_aliases;
@@ -4695,12 +4703,20 @@ pub const Renderer = struct {
         }
         const cache_hit = entry_index != null;
         if (entry_index == null) {
+            var cache_full = self.guest_buffers.items.len >= maximum_guest_buffers;
+            if (self.retain_clean_storage_buffers) {
+                var allocated: usize = 0;
+                for (self.guest_buffers.items) |entry| allocated +|= @intCast(entry.device_local.size);
+                cache_full = self.guest_buffers.items.len >= 512 or
+                    allocated +| size > self.storage_buffer_cache_budget_bytes;
+            }
             // Prefer the former allocation of this slot, unless another slot
             // in the current descriptor set still names it. Cache hits can
             // move a range between slots without transferring its ownership.
             var recycle_index: ?usize = null;
             for (self.guest_buffers.items, 0..) |entry, index| {
-                if (entry.descriptor_index == descriptor_index and
+                if ((!self.retain_clean_storage_buffers or cache_full) and
+                    entry.descriptor_index == descriptor_index and
                     !self.storageBufferBoundElsewhere(entry.device_local.handle, descriptor_index))
                 {
                     recycle_index = index;
@@ -4717,7 +4733,7 @@ pub const Renderer = struct {
             if (recycle_index) |index| {
                 if (self.guest_buffers.items[index].gpu_dirty) {
                     recycle_index = null;
-                    if (self.guest_buffers.items.len >= maximum_guest_buffers) {
+                    if (cache_full) {
                         var oldest_clean: u64 = std.math.maxInt(u64);
                         for (self.guest_buffers.items, 0..) |entry, candidate_index| {
                             if (!entry.gpu_dirty and entry.last_used_sequence < oldest_clean and
@@ -4730,7 +4746,7 @@ pub const Renderer = struct {
                     }
                 }
             }
-            if (recycle_index == null and self.guest_buffers.items.len >= maximum_guest_buffers) {
+            if (recycle_index == null and cache_full) {
                 var oldest_index: ?usize = null;
                 var oldest: u64 = std.math.maxInt(u64);
                 for (self.guest_buffers.items, 0..) |entry, index| {

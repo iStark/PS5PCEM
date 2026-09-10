@@ -2,6 +2,19 @@
 
 Observed with PPSA26344 and the RTX 3070 Ti; individual build results are dated below.
 
+## Optional clean-buffer retention on 2026-09-10
+
+An opt-in storage cache retains clean guest ranges by address when descriptor
+slots change. Its growth budget is 4 GiB with at most 512 allocations; descriptor
+sets still use the existing slot limit. Once full, it recycles allocations while
+preserving live descriptor references and waiting for queued consumers.
+Backing growth can temporarily exceed the byte budget.
+
+SDK probes verify 96 ranges through one slot, refreshed CPU writes, recycling at
+the byte budget, queued reads, descriptor migration and exact buffer bounds.
+The feature remains disabled by default pending a native performance comparison;
+no additional FPS improvement is claimed from these synthetic tests.
+
 ## Native optimization comparison and FLAT apertures on 2026-09-10
 
 On the same fully visible Deluxe Bonus screen, the combined depth-pass cache,

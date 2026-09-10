@@ -3366,8 +3366,13 @@ fn runResidentTargetReuseAtLimit(allocator: std.mem.Allocator, limit: usize) !vo
     std.debug.print("resident target reuse passed: {d} entries, warm working set, full cache, sampled source, GPU readback, released pins, queued transfer-buffer reseeding\n", .{limit});
 }
 
-fn runQueuedBufferReuseProbe(allocator: std.mem.Allocator, use_waits: bool) !void {
-    var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true, .storage_buffer_use_waits = use_waits });
+fn runQueuedBufferReuseProbe(allocator: std.mem.Allocator, use_waits: bool, retain: bool) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{
+        .enable_timeline_scheduler = true,
+        .storage_buffer_use_waits = use_waits,
+        .retain_clean_storage_buffers = retain,
+        .storage_buffer_cache_budget_bytes = 64 * 16,
+    });
     defer renderer.deinit();
     var guest = GuestMemory{};
     _ = renderer.dcbBackend(guest.interface());
@@ -4696,6 +4701,46 @@ fn runFlatPointerProbe(allocator: std.mem.Allocator) !void {
         }
     };
     std.debug.print("FLAT pointers passed: absolute/SGPR/VCC bases, signed offsets, overlapping destinations, unaligned reads, 4-GiB carry, relocation, repeated loop reads and fault counts\n", .{});
+}
+
+fn runCleanBufferRetentionProbe(allocator: std.mem.Allocator) !void {
+    for ([_]bool{ false, true }) |use_waits| try runQueuedBufferReuseProbe(allocator, use_waits, true);
+    for ([_]bool{ false, true }) |retain| {
+        var renderer = try vulkan.Renderer.init(allocator, .{
+            .enable_timeline_scheduler = true,
+            .retain_clean_storage_buffers = retain,
+            .storage_buffer_cache_budget_bytes = 128 * 16,
+        });
+        defer renderer.deinit();
+        var guest = GuestMemory{};
+        _ = renderer.dcbBackend(guest.interface());
+        var handles: [96]u64 = undefined;
+        for (&handles, 0..) |*handle, index| {
+            const address = 0x10000 + index * 16;
+            guest.word(address, @intCast(0x1234 + index));
+            handle.* = (try renderer.stageGuestStorageBufferAt(0, address, 16)).buffer;
+        }
+        const misses = renderer.buffer_cache_misses;
+        for (handles, 0..) |handle, index| {
+            const address = 0x10000 + index * 16;
+            const buffer = try renderer.stageGuestStorageBufferAt(0, address, 16);
+            if (retain) try std.testing.expectEqual(handle, buffer.buffer);
+            var actual: [16]u8 = undefined;
+            try renderer.readbackGuestStorageBuffer(address, &actual);
+            try std.testing.expectEqual(@as(u32, @intCast(0x1234 + index)), std.mem.readInt(u32, actual[0..4], .little));
+        }
+        try std.testing.expectEqual(@as(u64, if (retain) 0 else 96), renderer.buffer_cache_misses - misses);
+        // A changed source must refresh even when the allocation is retained.
+        guest.word(0x10000, 0xaabb_ccdd);
+        _ = try renderer.stageGuestStorageBufferAt(0, 0x10000, 16);
+        var changed: [16]u8 = undefined;
+        try renderer.readbackGuestStorageBuffer(0x10000, &changed);
+        try std.testing.expectEqual(@as(u32, 0xaabb_ccdd), std.mem.readInt(u32, changed[0..4], .little));
+        // Once the byte budget is full, changing the slot keeps recycling.
+        for (96..256) |index| _ = try renderer.stageGuestStorageBufferAt(0, 0x10000 + index * 16, 16);
+        if (retain) try std.testing.expectEqual(@as(usize, 128), renderer.guest_buffers.items.len);
+    }
+    std.debug.print("Clean buffer retention passed: 96 ranges through one descriptor, refreshed CPU writes, byte-budget recycling\n", .{});
 }
 
 fn runFlatApertureProbe(allocator: std.mem.Allocator) !void {
@@ -6383,6 +6428,10 @@ pub fn main(init: std.process.Init) !void {
         try runFlatPointerProbe(allocator);
         return;
     }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--clean-buffer-retention")) {
+        try runCleanBufferRetentionProbe(allocator);
+        return;
+    }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--flat-apertures")) {
         try runFlatApertureProbe(allocator);
         return;
@@ -6459,7 +6508,7 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--buffer-reuse")) {
-        for ([_]bool{ false, true }) |use_waits| try runQueuedBufferReuseProbe(allocator, use_waits);
+        for ([_]bool{ false, true }) |use_waits| try runQueuedBufferReuseProbe(allocator, use_waits, false);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--parallel-copy")) {
@@ -7013,7 +7062,7 @@ pub fn main(init: std.process.Init) !void {
     try runIndexedCopyKernel(allocator, &renderer, &guest, backend);
     try runStorageImageCopyKernel(allocator, &renderer, &guest, backend);
 
-    try runQueuedBufferReuseProbe(allocator, true);
+    try runQueuedBufferReuseProbe(allocator, true, false);
 
     var output_buffer: [1024]u8 = undefined;
     var output = std.Io.File.stdout().writer(init.io, &output_buffer);
