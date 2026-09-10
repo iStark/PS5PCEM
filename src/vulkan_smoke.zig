@@ -2360,6 +2360,92 @@ fn runDppProbe(allocator: std.mem.Allocator) !void {
     std.debug.print("DPP passed: row shifts, rotation, swizzles, masks and both permutation selectors across 64 lanes\n", .{});
 }
 
+fn runDeferredShaderMetadataProbe(allocator: std.mem.Allocator) !void {
+    for ([_]bool{ false, true }) |deferred| {
+        var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true, .defer_small_storage_writes = deferred });
+        defer renderer.deinit();
+        var guest = GuestMemory{};
+        _ = renderer.dcbBackend(guest.interface());
+        // One GPU dispatch generates a V# inside a small output buffer. The
+        // following dispatch loads it with SMEM before using the resource.
+        const producer = [_]u32{
+            vop1(1, 0, 4), vop1(1, 1, 5), vop1(1, 2, 6), vop1(1, 3, 7),
+            0xe0780010,    0x80000000,    0xbf810000,
+        };
+        const consumer = [_]u32{
+            0xf4080200, (125 << 25) | 16, // s8:s11 = generated descriptor at root+16
+            0xe0300000, 0x80020000, // load through V#s8
+            0xe0700000, 0x80010000, // store through V#s4
+            0xbf810000,
+        };
+        for (producer, 0..) |word, i| guest.word(0x100 + i * 4, word);
+        for (consumer, 0..) |word, i| guest.word(0x200 + i * 4, word);
+        guest.word(0x6000, 0x12345678);
+        var state = gpu.State{};
+        const stage = gpu.resources.ShaderStage.compute;
+        try state.writeRegister(.shader, stage.programRegisterBase(), 1);
+        try state.writeRegister(.shader, stage.programRegisterBase() + 1, 0);
+        try state.writeRegister(.shader, 0x213, 8 << 1);
+        for ([_]u32{ 0x1000, 0, 32, 0, 0x6000, 0, 4, 0 }, 0..) |word, i|
+            try state.writeRegister(.shader, stage.userDataBase() + @as(u32, @intCast(i)), word);
+        _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
+        try std.testing.expectEqual(@as(u32, if (deferred) 0 else 0x6000), std.mem.readInt(u32, guest.bytes[0x1010..][0..4], .little));
+        try state.writeRegister(.shader, stage.programRegisterBase(), 2);
+        for ([_]u32{ 0x1000, 0, 0, 0, 0x3000, 0, 4, 0 }, 0..) |word, i|
+            try state.writeRegister(.shader, stage.userDataBase() + @as(u32, @intCast(i)), word);
+        _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
+        var output: [4]u8 = undefined;
+        try renderer.readbackGuestStorageBuffer(0x3000, &output);
+        const actual = std.mem.readInt(u32, &output, .little);
+        if (actual != 0x12345678) {
+            std.debug.print("GPU-generated shader metadata mismatch deferred={any}: expected=0x12345678 actual=0x{x}\n", .{ deferred, actual });
+            return error.DeferredShaderMetadataMismatch;
+        }
+        // Generate a different descriptor before a graphics draw. Reading
+        // the previous CPU copy would bind the black source instead of red.
+        guest.word(0x6000, 0);
+        guest.word(0x6100, 0x3f800000);
+        try state.writeRegister(.shader, stage.programRegisterBase(), 1);
+        for ([_]u32{ 0x1000, 0, 32, 0, 0x6100, 0, 4, 0 }, 0..) |word, i|
+            try state.writeRegister(.shader, stage.userDataBase() + @as(u32, @intCast(i)), word);
+        _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
+        const vertex = [_]u32{
+            0x34020a81,      0x36040a82, 0x36020282, 0x7e040d02, 0x7e060d01,
+            0xd5410001,      0x03ce04f4, 0xd5410002, 0x03ce06f4, vop1(1, 0, 242),
+            vop1(1, 3, 240), 0xf80008cf, 0x00030102, 0xbf810000,
+        };
+        const fragment = [_]u32{
+            0xf4080200,      (125 << 25) | 16, 0xe0300000, 0x80020000,
+            vop1(1, 1, 128), vop1(1, 2, 242),  0xf800180f, 0x02010100,
+            0xbf810000,
+        };
+        for (vertex, 0..) |word, i| guest.word(0x700 + i * 4, word);
+        for (fragment, 0..) |word, i| guest.word(0x900 + i * 4, word);
+        for ([_]gpu.resources.ShaderStage{ .vertex, .pixel }, [_]u32{ 7, 9 }) |graphics_stage, program| {
+            try state.writeRegister(.shader, graphics_stage.programRegisterBase(), program);
+            try state.writeRegister(.shader, graphics_stage.programRegisterBase() + 1, 0);
+        }
+        try state.writeRegister(.shader, 0xb, 2 << 1);
+        try state.writeRegister(.shader, gpu.resources.ShaderStage.pixel.userDataBase(), 0x1000);
+        try state.writeRegister(.shader, gpu.resources.ShaderStage.pixel.userDataBase() + 1, 0);
+        const context = [_][2]u32{
+            .{ 0x318, 0x20 },                    .{ 0x319, 0 },             .{ 0x31b, 0 },             .{ 0x31c, 10 << 2 }, .{ 0x31d, 0 },
+            .{ 0x390, 0 },                       .{ 0x3b0, (7 << 14) | 7 }, .{ 0x3b8, 1 << 24 },       .{ 0x08e, 0xf },     .{ 0x00c, 0 },
+            .{ 0x00d, 8 | (8 << 16) },           .{ 0x094, 1 << 31 },       .{ 0x095, 8 | (8 << 16) }, .{ 0x1e0, 0 },       .{ 0x200, 0 },
+            .{ 0x202, (0xcc << 16) | (1 << 4) }, .{ 0x204, 0 },             .{ 0x205, 0 },
+        };
+        for (context) |entry| try state.writeRegister(.context, entry[0], entry[1]);
+        for ([_]f32{ 4, 4, -4, 4, 1, 0 }, 0..) |value, i|
+            try state.writeRegister(.context, 0x10f + @as(u32, @intCast(i)), @bitCast(value));
+        var executor = gpu.DcbExecutor{ .state = &state, .backend = renderer.dcbBackend(guest.interface()), .allocator = allocator };
+        _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 0 });
+        if (renderer.last_draw_error) |err| return err;
+        try renderer.flushPendingGuestWrites();
+        for (0..64) |pixel| try std.testing.expectEqual(@as(u32, 0xff0000ff), std.mem.readInt(u32, guest.bytes[0x2000 + pixel * 4 ..][0..4], .little));
+    }
+    std.debug.print("GPU-generated shader metadata passed: interior descriptor reads before dependent compute and graphics, eager and deferred writes\n", .{});
+}
+
 fn runDeferredReleaseProbe(allocator: std.mem.Allocator) !void {
     const Audit = struct {
         guest: SizedGuestMemory(512 * 1024) = .{},
@@ -7518,6 +7604,10 @@ pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(allocator);
     if (args.len == 2 and std.mem.eql(u8, args[1], "--fragment-first-active")) {
         try runFragmentFirstActiveLaneProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--deferred-shader-metadata")) {
+        try runDeferredShaderMetadataProbe(allocator);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--tessellation-inputs")) {

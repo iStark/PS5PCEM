@@ -5264,9 +5264,23 @@ pub const Renderer = struct {
     /// stages every declared buffer table entry into the fixed Vulkan array,
     /// maps each executable MUBUF V# to its array element, then writes modified
     /// storage ranges back to guest memory after the synchronous submission.
-    fn readDispatchShaderMemory(context: ?*anyopaque, address: u64, bytes: []u8) bool {
+    fn readShaderMemory(context: ?*anyopaque, address: u64, bytes: []u8) bool {
         const self: *Renderer = @ptrCast(@alignCast(context.?));
         const memory = self.guest_memory orelse return false;
+        // Scalar resource discovery runs on the host. A preceding dispatch
+        // may have generated the descriptor it is about to read, including
+        // a field inside a small buffer rather than its exact base address.
+        if (self.defer_small_storage_writes_enabled and bytes.len != 0) {
+            for (self.guest_buffers.items, 0..) |entry, index| {
+                if (!entry.gpu_dirty or entry.size >= deferred_storage_write_min_bytes or
+                    !byteRangesOverlap(address, bytes.len, entry.guest_address, entry.size)) continue;
+                self.flushGuestStorageBuffer(index) catch |err| {
+                    self.last_sync_error = err;
+                    self.last_shader_read_failure = .{ .address = address, .size = bytes.len, .caller = @returnAddress() };
+                    return false;
+                };
+            }
+        }
         const success = memory.read(memory.context, address, bytes);
         if (!success and self.trace_resource_failures) self.last_shader_read_failure = .{
             .address = address,
@@ -5294,7 +5308,7 @@ pub const Renderer = struct {
     ) anyerror!DispatchReport {
         const memory = self.guest_memory orelse return Error.GuestMemoryUnavailable;
         self.last_shader_read_failure = null;
-        const reader = gpu.ShaderMemoryReader{ .context = self, .read_fn = readDispatchShaderMemory };
+        const reader = gpu.ShaderMemoryReader{ .context = self, .read_fn = readShaderMemory };
         const program_address = gpu.resources.ShaderStage.compute.programAddress(state) orelse {
             return Error.MissingComputeProgram;
         };
@@ -14751,7 +14765,7 @@ pub const Renderer = struct {
                 },
             );
         }
-        const reader = gpu.ShaderMemoryReader{ .context = memory.context, .read_fn = memory.read };
+        const reader = gpu.ShaderMemoryReader{ .context = self, .read_fn = readShaderMemory };
         const vertex_header = if (memory.shader_header) |resolve|
             resolve(memory.context, vertex_address)
         else
