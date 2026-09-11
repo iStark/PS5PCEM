@@ -70,6 +70,17 @@ probe. This lets glyph uploads at unchanged guest addresses invalidate their
 sampled-image cache entries without weakening the bounded path for large game
 textures.
 
+Uploaded textures share one Vulkan allocation across channel swizzles and
+byte-identical linear/sRGB views (RGBA8 and BC1/2/3/7). Each view preserves its
+format, sampler and complete mip range. Replacing or evicting the image retires
+all of its views with the existing submission fence. Explicit guest writes
+invalidate overlapping sampled copies even when the sparse content probe only
+sees unchanged padding; canonical image tracking also advances their epoch.
+
+The decoded shader cache holds 1,024 programs. Yotei's opening cinematic
+exceeds the former 512-entry limit and otherwise repeatedly rebuilds shader
+analysis and resource checkpoints within each frame.
+
 Graphics draws record until a real guest ordering packet, compute/readback
 dependency, or VideoOut flip closes the batch. Each draw binds
 an immutable descriptor set and scalar slice; read-only guest buffers and index

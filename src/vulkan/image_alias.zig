@@ -257,7 +257,49 @@ pub const Manager = struct {
             if (candidate.range.overlaps(range)) candidate.authority = 0;
         }
     }
+
+    /// An explicit guest write changes content, whereas publishGuest only
+    /// copies an existing GPU generation back to its guest backing store.
+    pub fn markGuestWrite(self: *Manager, range: Range) void {
+        if (!self.enabled) return;
+        var generation: ?u64 = null;
+        for (self.entries.items) |*candidate| {
+            if (!candidate.range.overlaps(range)) continue;
+            if (generation == null) {
+                generation = self.next_generation;
+                self.next_generation +%= 1;
+                if (self.next_generation == 0) self.next_generation = 1;
+            }
+            candidate.generation = generation.?;
+            candidate.authority = 0;
+        }
+    }
 };
+
+test "explicit guest writes invalidate overlapping images without a resident writer" {
+    var manager = Manager{};
+    defer manager.deinit(std.testing.allocator);
+    const signature = Signature{ .format = 37, .width = 32, .height = 32 };
+    const a = try manager.register(std.testing.allocator, .sampled_image, .{ .address = 0x1000, .size = 0x2000 }, signature);
+    const b = try manager.register(std.testing.allocator, .storage_image, .{ .address = 0x2000, .size = 0x2000 }, signature);
+    const other = try manager.register(std.testing.allocator, .sampled_image, .{ .address = 0x8000, .size = 0x1000 }, signature);
+    _ = manager.markWrite(a);
+    _ = manager.markSynchronized(b);
+    const previous = manager.entry(a).?.generation;
+    manager.markGuestWrite(.{ .address = 0x2400, .size = 4 });
+    for ([_]Token{ a, b }) |token| {
+        const resolve = manager.resolve(token).?;
+        try std.testing.expectEqual(@as(Token, 0), resolve.source);
+        try std.testing.expect(!resolve.direct);
+        try std.testing.expect(resolve.generation > previous);
+    }
+    try std.testing.expectEqual(@as(?Resolve, null), manager.resolve(other));
+    _ = manager.markSynchronized(a);
+    try std.testing.expectEqual(@as(?Resolve, null), manager.resolve(a));
+    const next = manager.next_generation;
+    manager.markGuestWrite(.{ .address = 0xb000, .size = 4 });
+    try std.testing.expectEqual(next, manager.next_generation);
+}
 
 const test_signature = Signature{
     .format = 37,

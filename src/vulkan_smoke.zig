@@ -3150,6 +3150,95 @@ fn runSampledDccClearProbe(allocator: std.mem.Allocator) !void {
     std.debug.print("sampled DCC clears passed: RGBA8/RGBA16F fixed clears, alpha placement, metadata-only updates, cache hits and raw fallback\n", .{});
 }
 
+fn runSampledViewReuseProbe(allocator: std.mem.Allocator) !void {
+    try runSampledViewReuseCase(allocator, false);
+    try runSampledViewReuseCase(allocator, true);
+}
+
+fn runSampledViewReuseCase(allocator: std.mem.Allocator, canonical_aliases: bool) !void {
+    const Memory = SizedGuestMemory(2 * 1024 * 1024);
+    const guest = try allocator.create(Memory);
+    defer allocator.destroy(guest);
+    guest.* = .{};
+    var renderer = try vulkan.Renderer.init(allocator, .{ .enable_canonical_image_aliases = canonical_aliases });
+    defer renderer.deinit();
+    const backend = renderer.dcbBackend(guest.interface());
+    const code = [_]u32{
+        vop1(1, 0, 255), 0x3e80_0000, vop1(1, 1, 255), 0x3f40_0000,
+        0xf09c_0f0a,     0x0040_0200, 1,               0xe078_0000,
+        0x8003_0200,     0xbf81_0000,
+    };
+    for (code, 0..) |word, i| guest.word(0x100 + i * 4, word);
+    var state = gpu.State{};
+    const compute = gpu.resources.ShaderStage.compute;
+    try state.writeRegister(.shader, compute.programRegisterBase(), 1);
+    try state.writeRegister(.shader, compute.programRegisterBase() + 1, 0);
+    try state.writeRegister(.shader, 0x213, 16 << 1);
+    for ([_]u16{ 56, 169, 173 }, 0..) |format, format_index| {
+        const source: u32 = @intCast(0x20000 + format_index * 0x40000);
+        var words = sampledImageDescriptorWords(source, 32, 32);
+        words[1] = (words[1] & ~@as(u32, 0x1ff00000)) | (@as(u32, format) << 20);
+        words[3] |= (2 << 16) | (@as(u32, @intFromEnum(gpu.resources.TileMode.standard_4kb)) << 20);
+        words[5] = 2 << 4;
+        const texture = try gpu.TextureLayout.fromImage(try gpu.resources.decodeImageDescriptor(&words));
+        for (0..2) |revision| {
+            // Distinct mip colours expose views accidentally restricted to LOD 0.
+            for (0..3) |lod| {
+                const view = try texture.subresource(@intCast(lod), 0, 1);
+                const extent: u32 = @as(u32, 32) >> @as(u5, @intCast(lod));
+                const elements = if (format == 56) extent else extent / 4;
+                for (0..elements) |y| for (0..elements) |x| {
+                    const offset: usize = source + @as(usize, @intCast(try view.sourceByteOffset(@intCast(x), @intCast(y), 0, 0)));
+                    if (format == 56) {
+                        @memcpy(guest.bytes[offset..][0..4], &[_]u8{ @intCast(32 + revision * 32 + lod * 32), 128, 192, 255 });
+                    } else {
+                        const color_offset = offset + @as(usize, if (format == 173) 8 else 0);
+                        if (format == 173) @memcpy(guest.bytes[offset..][0..8], &[_]u8{ 255, 255, 0, 0, 0, 0, 0, 0 });
+                        const rgb565: u16 = (@as(u16, @intCast(4 + revision * 4 + lod * 4)) << 11) | (32 << 5) | 24;
+                        std.mem.writeInt(u16, guest.bytes[color_offset..][0..2], rgb565, .little);
+                        std.mem.writeInt(u16, guest.bytes[color_offset + 2 ..][0..2], rgb565, .little);
+                        @memset(guest.bytes[color_offset + 4 ..][0..4], 0);
+                    }
+                };
+            }
+            const authored = try allocator.dupe(u8, guest.bytes[source..][0..@intCast(texture.required_source_bytes)]);
+            defer allocator.free(authored);
+            try std.testing.expect(backend.vtable.write(backend.context, source, authored));
+            const before_uploads = renderer.sampled_image_uploads;
+            for (0..8) |variant| {
+                var image = words;
+                const srgb = variant % 3 != 0;
+                const swap = variant >= 3;
+                const lod: u32 = if (variant >= 6) 2 else 0;
+                if (variant % 3 == 2) image[1] = (image[1] & ~@as(u32, 0x1ff00000)) | (@as(u32, if (format == 56) 130 else format + 1) << 20);
+                if (swap) image[3] = (image[3] & ~@as(u32, 0xfff)) | 6 | (5 << 3) | (4 << 6) | (7 << 9);
+                const sampler = [_]u32{ if (variant % 3 == 1) 1 << 20 else 0, (lod * 256) | ((lod * 256) << 12), 0, 0 };
+                const userdata = image ++ sampler ++ [_]u32{ 0x10000, 16 << 16, 1, 0 };
+                for (userdata, 0..) |word, i| try state.writeRegister(.shader, compute.userDataBase() + @as(u32, @intCast(i)), word);
+                _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
+                var output: [16]u8 = undefined;
+                try renderer.readbackGuestStorageBuffer(0x10000, &output);
+                const r: f32 = if (format == 56) @as(f32, @floatFromInt(32 + revision * 32 + lod * 32)) / 255.0 else @as(f32, @floatFromInt(4 + revision * 4 + lod * 4)) / 31.0;
+                const rgb: [3]f32 = if (format == 56) .{ r, 128.0 / 255.0, 192.0 / 255.0 } else .{ r, 32.0 / 63.0, 24.0 / 31.0 };
+                for (0..4) |channel| {
+                    var expected: f32 = if (channel == 3) 1 else rgb[if (swap) 2 - channel else channel];
+                    if (srgb and channel != 3) expected = if (expected <= 0.04045) expected / 12.92 else std.math.pow(f32, (expected + 0.055) / 1.055, 2.4);
+                    const actual: f32 = @bitCast(std.mem.readInt(u32, output[channel * 4 ..][0..4], .little));
+                    std.testing.expectApproxEqAbs(expected, actual, 0.008) catch |err| {
+                        std.debug.print("sampled view mismatch format={d} revision={d} variant={d} channel={d}\n", .{ format, revision, variant, channel });
+                        std.debug.print("source head={any} bytes={d} uploads={d}->{d} probes={d}\n", .{ guest.bytes[source..][0..8].*, texture.required_source_bytes, before_uploads, renderer.sampled_image_uploads, renderer.texture_probe_count });
+                        for (renderer.sampled_image_cache.items) |cached| std.debug.print("cached @0x{x} hash={x} generation={d}\n", .{ cached.guest_address, cached.content_hash, cached.source_generation });
+                        return err;
+                    };
+                }
+                try std.testing.expectEqual(before_uploads + 1, renderer.sampled_image_uploads);
+                try std.testing.expectEqual(format_index + 1, renderer.sampled_image_cache.items.len);
+            }
+        }
+    }
+    std.debug.print("sampled view reuse passed: RGBA8/BC1/BC3 linear/sRGB, channel swizzles, mip selection, CPU updates and one allocation per source\n", .{});
+}
+
 fn runSampledScratchProbe(allocator: std.mem.Allocator) !void {
     const Memory = SizedGuestMemory(8 * 1024 * 1024);
     const guest = try allocator.create(Memory);
@@ -8484,6 +8573,10 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--sampled-dcc-clears")) {
         try runSampledDccClearProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--sampled-view-reuse")) {
+        try runSampledViewReuseProbe(allocator);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--sampled-scratch")) {

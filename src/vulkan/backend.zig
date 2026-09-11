@@ -819,7 +819,9 @@ const maximum_compute_pipelines = 2048;
 /// per program and this can come back down.
 const maximum_graphics_pipelines = 8192;
 /// Distinct guest shader programs kept in decoded form.
-const maximum_analyzed_programs = 512;
+// Yotei's opening scene uses more than 512 programs in a single frame. Keep
+// that working set so shader decoding and resource checkpoints survive reuse.
+const maximum_analyzed_programs = 1024;
 /// Shader headers put an exact bound around modern generated programs. Keep a
 /// bounded fallback for headerless captures: Yotei's scene compute programs
 /// exceed 4096 instructions even when no AGC header was recovered. Registered
@@ -3108,6 +3110,8 @@ fn sampledImageDimensionForInstruction(
 const CachedSampledImage = struct {
     alias_token: image_alias.Token,
     guest_address: u64,
+    guest_bytes: usize,
+    content_valid: bool = true,
     width: u32,
     height: u32,
     depth: u32,
@@ -3119,6 +3123,7 @@ const CachedSampledImage = struct {
     mip_levels: u8,
     state_hash: u64,
     image_state_hash: u64,
+    upload_state_hash: u64,
     source_generation: u64,
     content_hash: u64,
     image: OwnedImage,
@@ -3139,6 +3144,7 @@ const CachedResidentImageView = struct {
     components: vk.ComponentMapping,
     aspect_mask: vk.Flags,
     layer_count: u32,
+    level_count: u32,
     view: vk.ImageView,
 };
 
@@ -18971,6 +18977,7 @@ pub const Renderer = struct {
             descriptor,
             sampler_descriptor.force_srgb,
         ) ^ feedback_snapshot_salt;
+        const upload_state_hash = sampledImageUploadStateHash(descriptor) ^ feedback_snapshot_salt;
         // Unity grows this R8 font atlas a few glyphs at a time. Without page
         // tracking, the normal sparse content probe can miss those localized
         // writes and retain a Vulkan image whose newly allocated rectangles
@@ -19018,7 +19025,7 @@ pub const Renderer = struct {
         var exact_candidates = self.sampled_image_index.candidates(self.sampled_image_cache.items, descriptor.address);
         while (exact_candidates.next()) |index| {
             const item = &self.sampled_image_cache.items[index];
-            if (item.guest_address != descriptor.address or
+            if (!item.content_valid or item.guest_address != descriptor.address or
                 item.width != descriptor.width or
                 item.height != descriptor.height or
                 item.depth != descriptor.depth_or_layers or
@@ -19039,14 +19046,13 @@ pub const Renderer = struct {
             self.frame_profile.texture_hits +|= 1;
             return .{ .image = item.image, .view = item.view, .sampler = item.sampler };
         }
-        // Sampler wrap/filter state does not change the uploaded texels or the
-        // image view. Reuse an identical resident image with a separately
-        // cached sampler instead of detiling and uploading the same allocation
-        // again whenever a shader selects another S# descriptor.
+        // Sampler state, channel selectors and linear/sRGB interpretation do
+        // not change the uploaded bytes. Keep one allocation and expose the
+        // requested interpretation through a separately cached image view.
         var view_candidates = self.sampled_image_index.candidates(self.sampled_image_cache.items, descriptor.address);
         while (view_candidates.next()) |index| {
             const item = &self.sampled_image_cache.items[index];
-            if (item.guest_address != descriptor.address or
+            if (!item.content_valid or item.guest_address != descriptor.address or
                 item.width != descriptor.width or
                 item.height != descriptor.height or
                 item.depth != descriptor.depth_or_layers or
@@ -19056,7 +19062,7 @@ pub const Renderer = struct {
                 item.base_level != descriptor.base_level or
                 item.last_level != descriptor.last_level or
                 item.mip_levels != (if (mip_plan) |plan| plan.level_count else 1) or
-                item.image_state_hash != image_state_hash or
+                item.upload_state_hash != upload_state_hash or
                 item.source_generation != early_source_generation or
                 item.content_hash != early_content_hash)
             {
@@ -19067,7 +19073,20 @@ pub const Renderer = struct {
             self.frame_profile.texture_hits +|= 1;
             return .{
                 .image = item.image,
-                .view = item.view,
+                .view = if (item.image_state_hash == image_state_hash) item.view else try self.residentImageViewLevels(
+                    item.image.handle,
+                    switch (dimension) {
+                        .two_d => vk.image_view_type_2d,
+                        .three_d => vk.image_view_type_3d,
+                        .cube => vk.image_view_type_cube_array,
+                        .two_d_array => vk.image_view_type_2d_array,
+                    },
+                    image_format,
+                    try sampledImageComponents(descriptor.dst_select),
+                    vk.image_aspect_color_bit,
+                    if (is_cube or is_2d_array) available_layers else 1,
+                    item.mip_levels,
+                ),
                 .sampler = try self.residentSampler(sampler_descriptor),
             };
         }
@@ -19118,7 +19137,7 @@ pub const Renderer = struct {
         var uploaded_candidates = self.sampled_image_index.candidates(self.sampled_image_cache.items, descriptor.address);
         while (uploaded_candidates.next()) |idx| {
             const item = &self.sampled_image_cache.items[idx];
-            if (item.guest_address == descriptor.address and
+            if (item.content_valid and item.guest_address == descriptor.address and
                 item.width == descriptor.width and
                 item.height == descriptor.height and
                 item.depth == descriptor.depth_or_layers and
@@ -19411,7 +19430,8 @@ pub const Renderer = struct {
             image_depth,
             upload_layers,
             if (is_3d) vk.image_type_3d else vk.image_type_2d,
-            if (is_cube) vk.image_create_cube_compatible_bit else 0,
+            @as(vk.Flags, if (is_cube) vk.image_create_cube_compatible_bit else 0) |
+                (if (sampledImageHasSrgbPair(descriptor.unified_format)) vk.image_create_mutable_format_bit else 0),
             image_format,
             vk.image_usage_transfer_dst_bit | vk.image_usage_sampled_bit,
             vk.sample_count_1_bit,
@@ -19517,6 +19537,17 @@ pub const Renderer = struct {
         const sampler = try self.residentSampler(sampler_descriptor);
         self.sampled_image_uploads += 1;
 
+        // Preserve the content epoch while retiring the old allocation, even
+        // when it was the only registered representation of this source.
+        const alias_token = try self.image_aliases.register(
+            self.allocator,
+            .sampled_image,
+            aliasRange(descriptor.address, probe_span),
+            descriptorAliasSignature(descriptor, image_format, @intCast(mip_levels)),
+        );
+        errdefer self.image_aliases.unregister(alias_token);
+        _ = self.image_aliases.markSynchronized(alias_token);
+
         // A streamed/video texture keeps one allocation per guest surface, not
         // one allocation per content hash. Superseded views/images may still
         // be referenced by recorded draws, so their destruction is deferred
@@ -19535,11 +19566,12 @@ pub const Renderer = struct {
                 stale.tile_mode != @intFromEnum(descriptor.tile_mode) or
                 stale.base_level != descriptor.base_level or
                 stale.last_level != descriptor.last_level or
-                stale.state_hash != state_hash)
+                stale.upload_state_hash != upload_state_hash)
             {
                 continue;
             }
             self.destroyImageView(stale.view);
+            self.invalidateResidentImageViews(stale.image.handle);
             self.image_states.forgetImage(stale.image.handle);
             self.destroyImage(stale.image);
             self.image_aliases.unregister(stale.alias_token);
@@ -19558,23 +19590,17 @@ pub const Renderer = struct {
             self.frame_profile.texture_evictions +|= 1;
             const evicted = self.sampled_image_cache.items[oldest_idx];
             self.destroyImageView(evicted.view);
+            self.invalidateResidentImageViews(evicted.image.handle);
             self.image_states.forgetImage(evicted.image.handle);
             self.destroyImage(evicted.image);
             self.image_aliases.unregister(evicted.alias_token);
             _ = self.sampled_image_cache.orderedRemove(oldest_idx);
         }
 
-        const alias_token = try self.image_aliases.register(
-            self.allocator,
-            .sampled_image,
-            aliasRange(descriptor.address, probe_span),
-            descriptorAliasSignature(descriptor, image_format, @intCast(mip_levels)),
-        );
-        errdefer self.image_aliases.unregister(alias_token);
-        _ = self.image_aliases.markSynchronized(alias_token);
         try self.sampled_image_cache.append(self.allocator, .{
             .alias_token = alias_token,
             .guest_address = descriptor.address,
+            .guest_bytes = probe_span,
             .width = descriptor.width,
             .height = descriptor.height,
             .depth = descriptor.depth_or_layers,
@@ -19586,6 +19612,7 @@ pub const Renderer = struct {
             .mip_levels = @intCast(mip_levels),
             .state_hash = state_hash,
             .image_state_hash = image_state_hash,
+            .upload_state_hash = upload_state_hash,
             .source_generation = source_generation,
             .content_hash = content_hash,
             .image = image,
@@ -19676,10 +19703,24 @@ pub const Renderer = struct {
         aspect_mask: vk.Flags,
         layer_count: u32,
     ) anyerror!vk.ImageView {
+        return self.residentImageViewLevels(image, view_type, format, components, aspect_mask, layer_count, 1);
+    }
+
+    fn residentImageViewLevels(
+        self: *Renderer,
+        image: vk.Image,
+        view_type: u32,
+        format: u32,
+        components: vk.ComponentMapping,
+        aspect_mask: vk.Flags,
+        layer_count: u32,
+        level_count: u32,
+    ) anyerror!vk.ImageView {
         for (self.resident_image_views.items) |cached| {
             if (cached.image == image and cached.view_type == view_type and
                 cached.format == format and cached.aspect_mask == aspect_mask and
                 cached.layer_count == layer_count and
+                cached.level_count == level_count and
                 std.meta.eql(cached.components, components))
             {
                 return cached.view;
@@ -19690,7 +19731,7 @@ pub const Renderer = struct {
             .view_type = view_type,
             .format = format,
             .components = components,
-            .subresource_range = .{ .aspect_mask = aspect_mask, .layer_count = layer_count },
+            .subresource_range = .{ .aspect_mask = aspect_mask, .layer_count = layer_count, .level_count = level_count },
         };
         var view: vk.ImageView = 0;
         if (self.device_functions.create_image_view(self.device, &info, null, &view) != vk.success) {
@@ -19704,6 +19745,7 @@ pub const Renderer = struct {
             .components = components,
             .aspect_mask = aspect_mask,
             .layer_count = layer_count,
+            .level_count = level_count,
             .view = view,
         });
         return view;
@@ -20654,6 +20696,13 @@ pub const Renderer = struct {
         self.prepareHtileWrite(address, bytes.len);
         const memory = self.guest_memory orelse return false;
         if (!memory.write(memory.context, address, bytes)) return false;
+        self.image_aliases.markGuestWrite(aliasRange(address, bytes.len));
+        // Explicit writes are stronger evidence than the sparse content
+        // probe, which can miss pixels behind tiled mip-tail padding. This
+        // invalidation also applies when canonical image aliases are disabled.
+        for (self.sampled_image_cache.items) |*cached| {
+            if (byteRangesOverlap(address, bytes.len, cached.guest_address, cached.guest_bytes)) cached.content_valid = false;
+        }
         for (self.storage_image_cache.items) |*cached| {
             if (!cached.valid or cached.gpu_dirty or
                 !byteRangesOverlap(address, bytes.len, cached.descriptor.address, cached.allocation_bytes)) continue;
@@ -24741,6 +24790,33 @@ fn sampledImageStateHash(
         @bitCast(sampler.lod_bias),
     };
     return std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(&words));
+}
+
+fn sampledImageLinearFormat(format: u16) u16 {
+    return switch (format) {
+        130 => 56,
+        170 => 169,
+        172 => 171,
+        174 => 173,
+        182 => 181,
+        else => format,
+    };
+}
+
+fn sampledImageHasSrgbPair(format: u16) bool {
+    return switch (sampledImageLinearFormat(format)) {
+        56, 169, 171, 173, 181 => true,
+        else => false,
+    };
+}
+
+fn sampledImageUploadStateHash(descriptor: gpu.resources.ImageDescriptor) u64 {
+    var storage_descriptor = descriptor;
+    // Only byte-identical linear/sRGB pairs share storage. Signed, unsigned
+    // and floating-point formats retain their own decoding and allocation.
+    storage_descriptor.unified_format = sampledImageLinearFormat(descriptor.unified_format);
+    storage_descriptor.dst_select = .{ 4, 5, 6, 7 };
+    return sampledImageViewStateHash(storage_descriptor, false);
 }
 
 fn sampledImageViewStateHash(
