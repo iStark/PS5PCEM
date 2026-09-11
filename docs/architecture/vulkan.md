@@ -14,7 +14,7 @@ The renderer owns instance/device lifetime, the selected queue, a transient
 command pool with reusable frame command buffers and one lifetime timeline semaphore,
 host/device memory-type selection, one descriptor layout with 64 storage
 buffers, separate 64-entry 2D and 3D combined sampled-image arrays, typed
-storage images, a 256-set descriptor/scalar ring, a persistently mapped 128 MiB
+storage images, a 512-set descriptor/scalar ring, a persistently mapped 128 MiB
 read-only/index upload arena, its pool, persistent guest render targets, and
 image/view/sampler/render-pass/framebuffer creation. It also owns bounded
 LRU compute and graphics-pipeline caches plus a 1,024-entry sampled-image LRU.
@@ -38,6 +38,23 @@ back only the requested prefix, while eviction materializes the complete dirty
 range. Small buffers retain eager visibility. This removes the former
 multi-megabyte upload/readback cycle from every dispatch while keeping cache and
 descriptor-set growth bounded.
+
+`PS5_GPU_HOST_IMPORT=1` enables an experimental Windows path using
+`VK_EXT_external_memory_host` when page tracking is disabled. Storage ranges
+of at least 64 KiB can directly reference coherent guest RAM through an
+independent shared-section view. The renderer checks the physical identity on
+each binding, so remapping a guest address cannot redirect pending GPU writes
+into its replacement pages. A bounded pool retains up to 128 imported
+allocations and 512 MiB of views; buffers sharing a physical range reuse the
+allocation, and GPU retirement controls its lifetime. Unsupported ranges and
+allocation failures use ordinary staging. This is disabled by default:
+reduced copying has not yet produced a net FPS gain in the Yotei menu test.
+
+GDS counters use one persistent 64 KiB buffer shared by successive compute
+dispatches. GPU barriers preserve their ordering; DMA, emulated CPU kernels,
+and diagnostic reads synchronize the host shadow when needed. Partial CPU
+writes preserve preceding GPU updates. The buffer prefers coherent cached
+host memory and has a fixed binding in every descriptor-ring slot.
 
 Guest-memory cache identity is generation-based when the embedding enables
 `PS5_GPU_PAGE_TRACKER=1`. The first GPU observation then arms each writable

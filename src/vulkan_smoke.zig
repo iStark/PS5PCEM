@@ -7425,6 +7425,133 @@ fn runCountedImageLoopProbe(allocator: std.mem.Allocator, uniform_limit: bool) !
     std.debug.print("{s} image loop passed: BC4 images, dynamic SMEM offsets, page crossing and relocation\n", .{if (uniform_limit) "uniform-limit (3, 1, 6)" else "counted (6, null descriptor)"});
 }
 
+fn runHostImportProbe(allocator: std.mem.Allocator, retain: bool) !void {
+    const Memory = struct {
+        bytes: []u8,
+        relocated: bool = false,
+        relocated_output: bool = false,
+        decline: bool = false,
+        publications: usize = 0,
+        var active_views: usize = 0;
+        fn selfFrom(context: ?*anyopaque) *@This() {
+            return @ptrCast(@alignCast(context.?));
+        }
+        fn offset(self: *@This(), address: u64) usize {
+            if (address >= 0x40000 and address < 0x50000 and self.relocated_output) return @intCast(address + 0x60000);
+            if (address >= 0x10000 and address < 0x20000 and self.relocated) return @intCast(address + 0x70000);
+            if (address >= 0x50000 and address < 0x60000) return @intCast(address - 0x40000);
+            return @intCast(address);
+        }
+        fn read(context: ?*anyopaque, address: u64, bytes: []u8) bool {
+            const self = selfFrom(context);
+            const at = self.offset(address);
+            if (at > self.bytes.len or bytes.len > self.bytes.len - at) return false;
+            @memcpy(bytes, self.bytes[at..][0..bytes.len]);
+            return true;
+        }
+        fn write(context: ?*anyopaque, address: u64, bytes: []const u8) bool {
+            const self = selfFrom(context);
+            const at = self.offset(address);
+            if (at > self.bytes.len or bytes.len > self.bytes.len - at) return false;
+            @memcpy(self.bytes[at..][0..bytes.len], bytes);
+            return true;
+        }
+        fn identity(context: ?*anyopaque, address: u64, size: usize) ?u64 {
+            const self = selfFrom(context);
+            const at = self.offset(address);
+            if (self.decline or at % 4096 != 0 or at > self.bytes.len or size > self.bytes.len - at) return null;
+            return at;
+        }
+        fn acquire(context: ?*anyopaque, address: u64, size: usize, expected: u64) ?vulkan.GuestMemory.HostMapping {
+            const self = selfFrom(context);
+            const at = identity(context, address, size) orelse return null;
+            if (at != expected) return null;
+            active_views += 1;
+            return .{ .bytes = self.bytes[@intCast(at)..][0..std.mem.alignForward(usize, size, 4096)], .offset = 0, .identity = at, .release = release };
+        }
+        fn release(_: []u8) void {
+            active_views -= 1;
+        }
+        fn publish(context: ?*anyopaque, _: u64, _: usize) bool {
+            selfFrom(context).publications += 1;
+            return true;
+        }
+        fn word(self: *@This(), address: u64, value: u32) void {
+            std.mem.writeInt(u32, self.bytes[self.offset(address)..][0..4], value, .little);
+        }
+    };
+    const bytes = try std.heap.page_allocator.alloc(u8, 12 * 1024 * 1024);
+    defer std.heap.page_allocator.free(bytes);
+    @memset(bytes, 0x5a);
+    var guest = Memory{ .bytes = bytes };
+    {
+        var renderer = try vulkan.Renderer.init(allocator, .{ .enable_host_import = true, .defer_small_storage_writes = true, .enable_timeline_scheduler = true });
+        defer renderer.deinit();
+        renderer.retain_clean_storage_buffers = retain;
+        renderer.storage_buffer_cache_budget_bytes = 512 * 1024 * 1024;
+        try std.testing.expect(renderer.host_import_properties != null);
+        _ = renderer.dcbBackend(.{ .context = &guest, .read = Memory.read, .write = Memory.write, .host_source = .{ .context = &guest, .identity = Memory.identity, .acquire = Memory.acquire, .publish = Memory.publish } });
+        const code = [_]u32{ vop1(1, 0, 8), 0xe030_1000, 0x8000_0100, 0xbf8c_0f70, 0xe070_1000, 0x8001_0100, 0xbf81_0000 };
+        for (code, 0..) |word, i| guest.word(0x100 + i * 4, word);
+        var state = gpu.State{};
+        const compute = gpu.resources.ShaderStage.compute;
+        try state.writeRegister(.shader, compute.programRegisterBase(), 1);
+        try state.writeRegister(.shader, compute.programRegisterBase() + 1, 0);
+        try state.writeRegister(.shader, 0x213, 9 << 1);
+        const userdata = [_]u32{ 0x10000, 4 << 16, 16384, 0, 0x40000, 4 << 16, 16384, 0, 65532 };
+        for (userdata, 0..) |word, i| try state.writeRegister(.shader, compute.userDataBase() + @as(u32, @intCast(i)), word);
+        for (0..5) |pass| {
+            if (pass == 2) guest.relocated = true;
+            const source: u32 = if (pass == 3) 0x50000 else 0x10000;
+            const expected = 0x12340000 + @as(u32, @intCast(pass));
+            guest.word(source + 65532, expected);
+            try state.writeRegister(.shader, compute.userDataBase(), source);
+            _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
+            try renderer.flushPendingGuestWrites();
+            try std.testing.expectEqual(expected, std.mem.readInt(u32, bytes[0x4fffc..][0..4], .little));
+            for (bytes[0x40000..0x4fffc]) |byte| try std.testing.expectEqual(@as(u8, 0x5a), byte);
+            try std.testing.expectEqual(@as(u64, 0), renderer.frame_profile.storage_upload_bytes);
+            try std.testing.expectEqual(@as(u64, 0), renderer.frame_profile.storage_readback_bytes);
+        }
+        try std.testing.expect(guest.publications >= 5);
+        // Different guest aliases of the original source share one import.
+        try std.testing.expectEqual(@as(usize, 3), Memory.active_views);
+        // Remap a dirty output while its old allocation is still referenced by
+        // submitted work. Retiring it must finish the old physical write and
+        // leave the replacement pages untouched until their own dispatch.
+        guest.word(0x1fffc, 0xabcdef01);
+        _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
+        guest.relocated_output = true;
+        _ = try renderer.stageGuestStorageBufferAt(1, 0x40000, 65536);
+        try std.testing.expectEqual(@as(u32, 0xabcdef01), std.mem.readInt(u32, bytes[0x4fffc..][0..4], .little));
+        for (bytes[0xa0000..0xb0000]) |byte| try std.testing.expectEqual(@as(u8, 0x5a), byte);
+        guest.word(0x1fffc, 0xabcdef02);
+        _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
+        try renderer.flushPendingGuestWrites();
+        try std.testing.expectEqual(@as(u32, 0xabcdef02), std.mem.readInt(u32, bytes[0xafffc..][0..4], .little));
+        try std.testing.expectEqual(@as(u64, 0), renderer.frame_profile.storage_upload_bytes);
+        try std.testing.expectEqual(@as(u64, 0), renderer.frame_profile.storage_readback_bytes);
+        // Declined imports must still use the normal coherent copy path.
+        guest.decline = true;
+        guest.word(0x10000 + 65532, 0x98765432);
+        _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
+        try renderer.flushPendingGuestWrites();
+        try std.testing.expectEqual(@as(u32, 0x98765432), std.mem.readInt(u32, bytes[0xafffc..][0..4], .little));
+        try std.testing.expect(renderer.frame_profile.storage_upload_bytes >= 65536);
+        guest.decline = false;
+        for (0..132) |i| {
+            _ = try renderer.stageGuestStorageBufferAt(0, 0x100000 + i * 65536, 65536);
+        }
+        // Cache pressure can retire idle imports, but buffers retaining a
+        // memory object must keep its mapping alive. A full live pool falls
+        // back to ordinary staging instead of releasing referenced pages.
+        try std.testing.expectEqual(@as(usize, 128), Memory.active_views);
+        try std.testing.expectEqual(@as(usize, 128), renderer.imported_allocations.items.len);
+    }
+    try std.testing.expectEqual(@as(usize, 0), Memory.active_views);
+    std.debug.print("host import passed: native CPU edits, GPU partial writes, aliasing, VA remap, coherent publication, fallback and retained-view cleanup\n", .{});
+}
+
 fn runBufferContentCacheProbe(allocator: std.mem.Allocator, device_budget: usize) !void {
     const Memory = SizedGuestMemory(8 * 1024 * 1024);
     const guest = try allocator.create(Memory);
@@ -8345,6 +8472,14 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--storage-reuse")) {
         try runStorageImageReuseProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--host-import")) {
+        try runHostImportProbe(allocator, false);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--host-import-retain")) {
+        try runHostImportProbe(allocator, true);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--sampled-dcc-clears")) {

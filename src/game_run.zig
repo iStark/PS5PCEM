@@ -13,6 +13,11 @@ const vulkan = @import("vulkan");
 const window = @import("window");
 const display_mode = @import("display_mode.zig");
 
+fn acquireHostMemory(context: ?*anyopaque, address: u64, size: usize, identity: u64) ?vulkan.GuestMemory.HostMapping {
+    const view = runtime.firmware.libs.agc_submit.pinDirectMemory(context, address, size, identity) orelse return null;
+    return .{ .bytes = view.bytes, .offset = view.offset, .identity = identity, .release = runtime.firmware.libs.agc_submit.releaseDirectMemory };
+}
+
 comptime {
     @import("host_memory.zig").exportRuntime();
 }
@@ -598,6 +603,8 @@ fn run(init: std.process.Init) !bool {
     const enable_automatic_deferred_storage_writes = defer_small_storage_writes;
     const enable_gpu_page_tracker = enable_gpu_experimental or
         (init.minimal.environ.containsUnempty(allocator, "PS5_GPU_PAGE_TRACKER") catch false);
+    const enable_host_import = !enable_gpu_page_tracker and builtin.os.tag == .windows and
+        (init.minimal.environ.containsUnempty(allocator, "PS5_GPU_HOST_IMPORT") catch false);
     // Yotei repeatedly binds multi-megabyte material buffers whose contents
     // remain unchanged. Full-range parallel fingerprints retain their upload.
     // An explicit 0 restores unconditional uploads for comparison.
@@ -674,6 +681,7 @@ fn run(init: std.process.Init) !bool {
             .storage_image_cache_limit = storage_image_cache_mib * 1024 * 1024,
             .compute_translation_cache_limit = compute_translation_cache_mib * 1024 * 1024,
             .device_storage_budget_bytes = device_storage_mib * 1024 * 1024,
+            .enable_host_import = enable_host_import,
             .native_window = .{
                 .instance = native.instance,
                 .window = native.window,
@@ -701,6 +709,12 @@ fn run(init: std.process.Init) !bool {
         const address_space = &emu.address_space.?;
         if (enable_gpu_page_tracker) address_space.enableGpuMemoryTracking();
         const guest_memory = vulkan.GuestMemory{
+            .host_source = if (enable_host_import) .{
+                .context = address_space,
+                .identity = runtime.firmware.libs.agc_submit.directMemoryIdentity,
+                .acquire = acquireHostMemory,
+                .publish = runtime.firmware.libs.agc_submit.publishDirectMemory,
+            } else null,
             .context = if (enable_gpu_page_tracker) address_space else null,
             .read = runtime.firmware.libs.agc_submit.readGuestMemory,
             .write = runtime.firmware.libs.agc_submit.writeGuestMemory,

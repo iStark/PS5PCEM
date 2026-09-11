@@ -885,6 +885,34 @@ pub fn fingerprintGuestMemory(_: ?*anyopaque, address: u64, size: usize) ?u64 {
     return gpu.parallel_copy.fingerprint(source[0..size]);
 }
 
+pub fn directMemoryIdentity(context: ?*anyopaque, address: u64, size: usize) ?u64 {
+    const space = addressSpaceFromContext(context) orelse return null;
+    const resolved = resolveGuestMemoryAddress(address, size) orelse return null;
+    return space.directMemoryOffset(resolved, size);
+}
+
+pub fn pinDirectMemory(context: ?*anyopaque, address: u64, size: usize, identity: u64) ?guest_address_space.SharedView {
+    const space = addressSpaceFromContext(context) orelse return null;
+    const resolved = resolveGuestMemoryAddress(address, size) orelse return null;
+    return space.pinDirectMemory(resolved, size, identity);
+}
+
+pub fn releaseDirectMemory(bytes: []u8) void {
+    (guest_address_space.SharedView{ .bytes = bytes, .offset = 0 }).deinit();
+}
+
+/// The GPU has already written a coherent independent alias of these pages.
+/// Preserve HLE completion/alias notification without copying the bytes again.
+pub fn publishDirectMemory(context: ?*anyopaque, address: u64, size: usize) bool {
+    const resolved = resolveGuestMemoryAddress(address, size) orelse return false;
+    if (addressSpaceFromContext(context)) |space| space.notifyGuestWrite(resolved, size);
+    const bytes = @as([*]const u8, @ptrFromInt(resolved))[0..size];
+    if (resolved != address) kernel_runtime.wakeSyncAddress(resolved, std.math.maxInt(usize));
+    mirrorLabelWrite(address, bytes);
+    if (resolved != address) mirrorLabelWrite(resolved, bytes);
+    return true;
+}
+
 pub fn writeGuestMemory(context: ?*anyopaque, address: u64, bytes: []const u8) bool {
     if (video_out.writeLabelMemory(address, bytes)) return true;
     // Fence/write-data packets only publish one or two words. Reject those

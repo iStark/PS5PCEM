@@ -146,6 +146,8 @@ pub const Options = struct {
     /// Disabled by default because a 4K target costs roughly 32 MiB of PCIe
     /// traffic and a queue synchronization.
     capture_first_graphics_frame: bool = false,
+    /// Experimental direct access to independently retained guest RAM views.
+    enable_host_import: bool = false,
     /// Expensive per-draw readback and PPM capture for one selected guest
     /// frame. Kept opt-in because a busy 4K frame can transfer several GiB.
     trace_graphics_frame: ?u64 = null,
@@ -373,7 +375,10 @@ pub const DispatchReport = struct {
     spirv_words: usize,
 };
 
+const external_host = @import("external_host.zig");
 pub const GuestMemory = struct {
+    pub const HostMapping = external_host.Mapping;
+    pub const HostSource = external_host.Source;
     context: ?*anyopaque,
     read: *const fn (?*anyopaque, u64, []u8) bool,
     write: *const fn (?*anyopaque, u64, []const u8) bool,
@@ -391,6 +396,7 @@ pub const GuestMemory = struct {
     /// Optional AGC registry lookup. A renderer embedding can expose relocated
     /// shader headers without coupling the API-neutral GPU module back to HLE.
     shader_header: ?*const fn (?*anyopaque, u64) ?u64 = null,
+    host_source: ?HostSource = null,
 };
 
 const WindowsLibrary = struct {
@@ -688,6 +694,17 @@ const OwnedBuffer = struct {
     memory: vk.DeviceMemory,
     size: vk.DeviceSize,
     mapping: ?[*]u8 = null,
+    host_mapping: ?external_host.Mapping = null,
+    imported_allocation: ?*ImportedAllocation = null,
+};
+
+const ImportedAllocation = struct {
+    memory: vk.DeviceMemory,
+    memory_type: u32,
+    view: external_host.Mapping,
+    source_context: ?*anyopaque,
+    references: usize = 1,
+    last_used_sequence: u64,
 };
 
 const BufferMapping = struct {
@@ -3248,6 +3265,13 @@ pub const Renderer = struct {
     driver_pipeline_cache: vk.PipelineCache,
     pipeline_compile_queue: pipeline_compiler.Queue = .{},
     memory_properties: vk.PhysicalDeviceMemoryProperties,
+    host_import_properties: ?external_host.GetPointerProperties = null,
+    host_import_alignment: u64 = 0,
+    imported_allocations: std.ArrayList(*ImportedAllocation) = .empty,
+    host_import_allocation_limit: usize = 128,
+    host_import_budget_bytes: usize = 512 * 1024 * 1024,
+    host_import_pool_hits: u64 = 0,
+    host_import_pool_misses: u64 = 0,
     loader_api_version: u32,
     device_info: DeviceInfo,
     geometry_shaders_available: bool,
@@ -3818,8 +3842,24 @@ pub const Renderer = struct {
             candidate.physical_device,
             "VK_NV_device_diagnostic_checkpoints",
         );
-        var device_extension_names: [4][*:0]const u8 = undefined;
+        const host_import = options.enable_host_import and physicalDeviceSupportsExtension(
+            allocator,
+            &instance_functions,
+            candidate.physical_device,
+            "VK_EXT_external_memory_host",
+        );
+        var host_properties = external_host.HostProperties{};
+        if (host_import) {
+            const get_properties = try loader.instance(instance_handle, external_host.GetProperties2, "vkGetPhysicalDeviceProperties2");
+            var properties = external_host.Properties2{ .p_next = &host_properties };
+            get_properties(candidate.physical_device, &properties);
+        }
+        var device_extension_names: [5][*:0]const u8 = undefined;
         var device_extension_count: u32 = 0;
+        if (host_import) {
+            device_extension_names[device_extension_count] = "VK_EXT_external_memory_host";
+            device_extension_count += 1;
+        }
         if (wants_presentation) {
             device_extension_names[device_extension_count] = "VK_KHR_swapchain";
             device_extension_count += 1;
@@ -4082,6 +4122,11 @@ pub const Renderer = struct {
             .compute_pipeline_layout = compute_pipeline_layout,
             .driver_pipeline_cache = driver_pipeline_cache,
             .memory_properties = memory_properties,
+            .host_import_alignment = host_properties.alignment,
+            .host_import_properties = if (host_import)
+                @ptrCast(instance_functions.get_device_proc_addr(device, "vkGetMemoryHostPointerPropertiesEXT"))
+            else
+                null,
             .loader_api_version = loader_api_version,
             .device_info = candidate.info,
             .geometry_shaders_available = geometry_shaders,
@@ -4265,6 +4310,8 @@ pub const Renderer = struct {
             if (entry.host_transfer) |transfer| self.destroyBuffer(transfer);
         }
         self.guest_buffers.deinit(self.allocator);
+        for (self.imported_allocations.items) |allocation| self.releaseImportedAllocation(allocation);
+        self.imported_allocations.deinit(self.allocator);
         self.draw_upload_cache.deinit(self.allocator);
         if (self.linear_upload_buffer) |buffer| self.destroyBuffer(buffer);
         if (self.magnify_source_image) |image| self.destroyImage(image);
@@ -4805,7 +4852,99 @@ pub const Renderer = struct {
 
     const StorageBacking = struct { device: OwnedBuffer, transfer: ?OwnedBuffer = null };
 
-    fn createStorageBacking(self: *Renderer, size: usize, local: bool) Error!StorageBacking {
+    fn releaseImportedAllocation(self: *Renderer, allocation: *ImportedAllocation) void {
+        allocation.references -= 1;
+        if (allocation.references != 0) return;
+        self.device_functions.free_memory(self.device, allocation.memory, null);
+        allocation.view.release(allocation.view.bytes);
+        self.allocator.destroy(allocation);
+    }
+
+    fn reserveImportedAllocation(self: *Renderer, bytes: usize) bool {
+        const budget = self.host_import_budget_bytes;
+        if (bytes > budget) return false;
+        while (true) {
+            var used: usize = 0;
+            var oldest: ?usize = null;
+            var sequence: u64 = std.math.maxInt(u64);
+            for (self.imported_allocations.items, 0..) |allocation, i| {
+                used +|= allocation.view.bytes.len;
+                // The cache owns one reference; live and deferred VkBuffers
+                // retain their own references until their last GPU use ends.
+                if (allocation.references == 1 and allocation.last_used_sequence < sequence) {
+                    oldest = i;
+                    sequence = allocation.last_used_sequence;
+                }
+            }
+            if (self.imported_allocations.items.len < self.host_import_allocation_limit and used <= budget - bytes) return true;
+            const victim = oldest orelse return false;
+            self.releaseImportedAllocation(self.imported_allocations.swapRemove(victim));
+        }
+    }
+
+    fn tryImportStorageBacking(self: *Renderer, address: u64, size: usize, identity: u64) ?OwnedBuffer {
+        const get_properties = self.host_import_properties orelse return null;
+        const source = (self.guest_memory orelse return null).host_source orelse return null;
+        const external_info = external_host.BufferInfo{};
+        const buffer_info = vk.BufferCreateInfo{ .p_next = &external_info, .size = size, .usage = vk.buffer_usage_storage_buffer_bit };
+        var handle: vk.Buffer = 0;
+        if (self.device_functions.create_buffer(self.device, &buffer_info, null, &handle) != vk.success) return null;
+        var retained = false;
+        defer if (!retained) self.device_functions.destroy_buffer(self.device, handle, null);
+        var requirements: vk.MemoryRequirements = undefined;
+        self.device_functions.get_buffer_memory_requirements(self.device, handle, &requirements);
+        var selected: ?*ImportedAllocation = null;
+        var memory_offset: usize = 0;
+        for (self.imported_allocations.items) |allocation| {
+            if (allocation.source_context != source.context) continue;
+            const physical_start = allocation.view.identity - allocation.view.offset;
+            if (identity < physical_start) continue;
+            const offset = std.math.cast(usize, identity - physical_start) orelse continue;
+            if (offset > allocation.view.bytes.len or requirements.size > allocation.view.bytes.len - offset or
+                offset % requirements.alignment != 0 or requirements.memory_type_bits & (@as(u32, 1) << @intCast(allocation.memory_type)) == 0) continue;
+            selected = allocation;
+            memory_offset = offset;
+            break;
+        }
+        if (selected == null) {
+            self.host_import_pool_misses += 1;
+            const view = source.acquire(source.context, address, size, identity) orelse return null;
+            var cached = false;
+            defer if (!cached) view.release(view.bytes);
+            const alignment = self.host_import_alignment;
+            if (alignment == 0 or @intFromPtr(view.bytes.ptr) % alignment != 0 or view.bytes.len % alignment != 0 or view.identity < view.offset) return null;
+            if (view.offset > view.bytes.len or requirements.size > view.bytes.len - view.offset or view.offset % requirements.alignment != 0) return null;
+            if (!self.reserveImportedAllocation(view.bytes.len)) return null;
+            var properties = external_host.PointerProperties{};
+            if (get_properties(self.device, external_host.handle_type, view.bytes.ptr, &properties) != vk.success) return null;
+            const memory_type = findBufferMemoryTypeIn(self.memory_properties, properties.memory_type_bits & requirements.memory_type_bits, vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit, vk.buffer_usage_storage_buffer_bit, vk.memory_property_host_cached_bit) orelse return null;
+            const import_info = external_host.ImportInfo{ .pointer = view.bytes.ptr };
+            const allocate_info = vk.MemoryAllocateInfo{ .p_next = &import_info, .allocation_size = view.bytes.len, .memory_type_index = memory_type };
+            var memory: vk.DeviceMemory = 0;
+            if (self.device_functions.allocate_memory(self.device, &allocate_info, null, &memory) != vk.success) return null;
+            defer if (!cached) self.device_functions.free_memory(self.device, memory, null);
+            const allocation = self.allocator.create(ImportedAllocation) catch return null;
+            defer if (!cached) self.allocator.destroy(allocation);
+            allocation.* = .{ .memory = memory, .memory_type = memory_type, .view = view, .source_context = source.context, .last_used_sequence = self.guest_buffer_sequence };
+            self.imported_allocations.append(self.allocator, allocation) catch return null;
+            cached = true;
+            selected = allocation;
+            memory_offset = view.offset;
+        } else {
+            self.host_import_pool_hits += 1;
+        }
+        const allocation = selected.?;
+        if (self.device_functions.bind_buffer_memory(self.device, handle, allocation.memory, memory_offset) != vk.success) return null;
+        allocation.references += 1;
+        allocation.last_used_sequence = self.guest_buffer_sequence;
+        retained = true;
+        return .{ .handle = handle, .memory = allocation.memory, .size = size, .mapping = allocation.view.bytes.ptr + memory_offset, .imported_allocation = allocation, .host_mapping = .{ .bytes = allocation.view.bytes, .offset = memory_offset, .identity = identity, .release = allocation.view.release } };
+    }
+
+    fn createStorageBacking(self: *Renderer, size: usize, local: bool, address: u64, host_identity: ?u64) Error!StorageBacking {
+        if (host_identity) |identity| {
+            if (self.tryImportStorageBacking(address, size, identity)) |buffer| return .{ .device = buffer };
+        }
         if (!local) return .{ .device = try self.createBufferWithMemoryPreference(
             size,
             vk.buffer_usage_storage_buffer_bit,
@@ -4908,10 +5047,32 @@ pub const Renderer = struct {
         }
         self.guest_buffer_sequence +%= 1;
 
+        const host_identity = if (self.host_import_properties != null and size >= 64 * 1024)
+            if (memory.host_source) |source| source.identity(source.context, guest_address, size) else null
+        else
+            null;
+
         var entry_index: ?usize = null;
         var recycled_entry = false;
         for (self.guest_buffers.items, 0..) |entry, index| {
             if (entry.guest_address == guest_address and entry.size == size) {
+                if (entry.device_local.host_mapping) |view| {
+                    if (host_identity == null or view.identity != host_identity.?) {
+                        // Keep one cache entry per guest range: publication and
+                        // readback lookups must never find its retired identity.
+                        try self.flushGuestStorageBuffer(index);
+                        const replacement = try self.createStorageBacking(size, self.storageFitsDeviceBudget(size, index), guest_address, host_identity);
+                        const changed = &self.guest_buffers.items[index];
+                        self.destroyBuffer(changed.device_local);
+                        changed.device_local = replacement.device;
+                        changed.host_transfer = replacement.transfer;
+                        changed.last_gpu_use = 0;
+                        changed.gpu_dirty = false;
+                        changed.page_generation = 0;
+                        changed.content_hash = null;
+                        recycled_entry = true;
+                    }
+                }
                 entry_index = index;
                 break;
             }
@@ -4931,6 +5092,7 @@ pub const Renderer = struct {
             var recycle_index: ?usize = null;
             for (self.guest_buffers.items, 0..) |entry, index| {
                 if ((!self.retain_clean_storage_buffers or cache_full) and
+                    (entry.device_local.host_mapping == null or cache_full) and
                     entry.descriptor_index == descriptor_index and
                     !self.storageBufferBoundElsewhere(entry.device_local.handle, descriptor_index))
                 {
@@ -4977,7 +5139,7 @@ pub const Renderer = struct {
 
             if (recycle_index == null) {
                 try self.guest_buffers.ensureUnusedCapacity(self.allocator, 1);
-                const backing = try self.createStorageBacking(size, self.storageFitsDeviceBudget(size, null));
+                const backing = try self.createStorageBacking(size, self.storageFitsDeviceBudget(size, null), guest_address, host_identity);
                 self.guest_buffers.appendAssumeCapacity(.{
                     .descriptor_index = descriptor_index,
                     .guest_address = guest_address,
@@ -4998,8 +5160,8 @@ pub const Renderer = struct {
                 const victim = &self.guest_buffers.items[victim_index];
                 const local_capacity = if (victim.host_transfer != null) @max(size, @as(usize, @intCast(victim.device_local.size))) else size;
                 const local = size % 4 == 0 and self.storageFitsDeviceBudget(local_capacity, victim_index);
-                if (victim.device_local.size < size or local != (victim.host_transfer != null)) {
-                    const replacement = try self.createStorageBacking(size, local);
+                if (victim.device_local.host_mapping != null or host_identity != null or victim.device_local.size < size or local != (victim.host_transfer != null)) {
+                    const replacement = try self.createStorageBacking(size, local, guest_address, host_identity);
                     if (self.trace_resource_failures) std.debug.print("[buffer lifetime] replace handle=0x{x} guest=0x{x} bytes={d} slot={d} with guest=0x{x} bytes={d}\n", .{ victim.device_local.handle, victim.guest_address, victim.size, descriptor_index, guest_address, size });
                     self.destroyBuffer(victim.device_local);
                     if (victim.host_transfer) |transfer| self.destroyBuffer(transfer);
@@ -5024,6 +5186,13 @@ pub const Renderer = struct {
 
         const entry = &self.guest_buffers.items[entry_index.?];
         entry.last_used_sequence = self.guest_buffer_sequence;
+        if (entry.device_local.host_mapping != null) {
+            try self.flushGuestStorageImageRange(guest_address, size);
+            self.frame_profile.resident_storage_bytes +%= size;
+            self.updateStorageDescriptorRange(descriptor_index, entry.device_local.handle, 0, size);
+            self.active_descriptor_set = self.descriptor_set;
+            return .{ .buffer = entry.device_local.handle, .descriptor_set = self.descriptor_set, .descriptor_index = descriptor_index, .size = size, .allocation_cache_hit = cache_hit };
+        }
         if (!entry.gpu_dirty) {
             try self.flushGuestStorageImageRange(guest_address, size);
             const tracked_generation = if (memory.track_gpu_read) |track|
@@ -5205,6 +5374,17 @@ pub const Renderer = struct {
         const entry_size = std.math.cast(usize, entry.size) orelse return Error.GuestBufferTooLarge;
         const size = @min(requested_size, entry_size);
         if (size == 0) return;
+        if (entry.device_local.host_mapping) |view| {
+            try self.waitForStorageBufferUse(entry);
+            const source = self.guest_memory.?.host_source.?;
+            // An old VA can now name different physical pages. The imported
+            // alias owns the original result; never copy it into the new VA.
+            if (source.identity(source.context, entry.guest_address, entry_size) == view.identity) {
+                if (!source.publish(source.context, entry.guest_address, size)) return Error.GuestMemoryWriteFailed;
+            }
+            if (size == entry_size) entry.gpu_dirty = false;
+            return;
+        }
         const mapping = try self.mapStorageReadback(entry, size);
         defer mapping.release(self);
         const memory = self.guest_memory orelse return Error.GuestMemoryUnavailable;
@@ -19997,9 +20177,14 @@ pub const Renderer = struct {
     fn destroyVulkanObject(self: *Renderer, object: DeferredVulkanObject) void {
         switch (object) {
             .buffer => |buffer| {
-                if (buffer.mapping != null) self.device_functions.unmap_memory(self.device, buffer.memory);
+                if (buffer.mapping != null and buffer.host_mapping == null) self.device_functions.unmap_memory(self.device, buffer.memory);
                 self.device_functions.destroy_buffer(self.device, buffer.handle, null);
-                self.device_functions.free_memory(self.device, buffer.memory, null);
+                if (buffer.imported_allocation) |allocation| {
+                    self.releaseImportedAllocation(allocation);
+                } else {
+                    self.device_functions.free_memory(self.device, buffer.memory, null);
+                    if (buffer.host_mapping) |view| view.release(view.bytes);
+                }
             },
             .image => |image| {
                 self.device_functions.destroy_image(self.device, image.handle, null);
