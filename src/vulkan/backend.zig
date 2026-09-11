@@ -4971,6 +4971,49 @@ pub const Renderer = struct {
         return .{ .device = device, .transfer = transfer };
     }
 
+    fn trimGuestBufferCache(self: *Renderer, incoming_size: usize, replacing_slot: u32) anyerror!void {
+        var reclaimed = false;
+        var allocated: u64 = 0;
+        for (self.guest_buffers.items) |entry| {
+            allocated +|= entry.device_local.size;
+            if (entry.host_transfer) |transfer| allocated +|= transfer.size;
+        }
+        const budget = self.storage_buffer_cache_budget_bytes;
+        while (allocated +| incoming_size > budget) {
+            var oldest: u64 = std.math.maxInt(u64);
+            var victim_index: ?usize = null;
+            for (self.guest_buffers.items, 0..) |entry, index| {
+                // Previously prepared bindings belong to the current draw or
+                // dispatch. A cache budget must never invalidate those inputs.
+                if (entry.last_used_sequence < oldest and
+                    !self.storageBufferBoundElsewhere(entry.device_local.handle, replacing_slot))
+                {
+                    oldest = entry.last_used_sequence;
+                    victim_index = index;
+                }
+            }
+            const index = victim_index orelse break;
+            try self.flushGuestStorageBuffer(index);
+            // Complete pending snapshots before reclaiming their allocation.
+            try self.waitForStorageBufferUse(&self.guest_buffers.items[index]);
+            const entry = self.guest_buffers.items[index];
+            self.destroyBuffer(entry.device_local);
+            allocated -|= entry.device_local.size;
+            if (entry.host_transfer) |transfer| {
+                self.destroyBuffer(transfer);
+                allocated -|= transfer.size;
+            }
+            if (self.active_storage_buffers[replacing_slot] == entry.device_local.handle)
+                self.active_storage_buffers[replacing_slot] = 0;
+            self.guest_buffer_address_index.invalidate();
+            _ = self.guest_buffers.swapRemove(index);
+            reclaimed = true;
+        }
+        // Retired objects may share a timeline tick with unrelated queued
+        // commands. Reclaim their memory before requesting the replacement.
+        if (reclaimed) try self.waitForSubmittedWork();
+    }
+
     fn uploadStorageBacking(self: *Renderer, entry: *GuestBufferEntry, size: usize) (Error || std.mem.Allocator.Error)!void {
         const transfer = entry.host_transfer orelse return;
         errdefer {
@@ -5095,13 +5138,16 @@ pub const Renderer = struct {
         }
         const cache_hit = entry_index != null;
         if (entry_index == null) {
-            var cache_full = self.guest_buffers.items.len >= maximum_guest_buffers;
-            if (self.retain_clean_storage_buffers) {
-                var allocated: usize = 0;
-                for (self.guest_buffers.items) |entry| allocated +|= @intCast(entry.device_local.size);
-                cache_full = self.guest_buffers.items.len >= 512 or
-                    allocated +| size > self.storage_buffer_cache_budget_bytes;
-            }
+            // Capacity reuse can leave a tiny guest range backed by a much
+            // larger old allocation. Account for the actual buffers in both
+            // cache modes, including the optional device-transfer mirror.
+            const incoming_bytes = size * @as(usize, if (size % 4 == 0 and size <= self.device_storage_budget_bytes) 2 else 1);
+            try self.trimGuestBufferCache(incoming_bytes, descriptor_index);
+            // Trimming already removed every eligible victim under byte
+            // pressure. The current dispatch may itself need more than the
+            // budget; allow its required bindings to exceed that soft limit.
+            const cache_full = self.guest_buffers.items.len >=
+                @as(usize, if (self.retain_clean_storage_buffers) 512 else maximum_guest_buffers);
             // Prefer the former allocation of this slot, unless another slot
             // in the current descriptor set still names it. Cache hits can
             // move a range between slots without transferring its ownership.

@@ -230,6 +230,14 @@ guest address. `SetFlip` resolves its registered VideoOut slot and sends the
 matching address and dimensions to the presentation path; diagnostic captures
 can still request a CPU-visible linear frame explicitly.
 
+The storage-buffer cache applies its byte budget in both retention modes.
+Accounting includes retained allocation capacity and any transfer mirror,
+so recycling a large allocation for a small range cannot hide its memory cost.
+Trimming publishes pending GPU writes and retires old buffers after their
+consumers finish. Bindings already prepared for the current draw or dispatch
+remain protected; their required working set may exceed the soft budget.
+`vulkan-smoke --buffer-cache-budget` covers these cases with queued GPU writes.
+
 Compact `[gpu frame]` diagnostics report frame time, draw/dispatch/submit counts,
 fence wait time, categorized upload/readback volume, GPU-resident storage,
 draw/dispatch/materialization time, render-target hits, and current buffer and

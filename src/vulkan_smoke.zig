@@ -6392,6 +6392,77 @@ fn runCleanBufferRetentionProbe(allocator: std.mem.Allocator) !void {
     std.debug.print("Clean buffer retention passed: 96 ranges through one descriptor, refreshed CPU writes, byte-budget recycling\n", .{});
 }
 
+fn runBufferCacheBudgetProbe(allocator: std.mem.Allocator) !void {
+    for ([_]bool{ false, true }) |retain| {
+        for ([_]bool{ false, true }) |local| {
+            var renderer = try vulkan.Renderer.init(allocator, .{
+                .enable_timeline_scheduler = true,
+                .retain_clean_storage_buffers = retain,
+                .storage_buffer_cache_budget_bytes = 8192,
+                .device_storage_budget_bytes = if (local) 8192 else 0,
+            });
+            defer renderer.deinit();
+            var guest = GuestMemory{};
+            _ = renderer.dcbBackend(guest.interface());
+            const code = [_]u32{ 0xe0300000, 0x80020000, 0xe0700000, 0x80030000, 0xbf810000 };
+            for (code, 0..) |word, i| guest.word(0x100 + i * 4, word);
+            var analysis = try gpu.shader_analysis.decode(allocator, .{ .context = &guest, .read_fn = GuestMemory.read }, 0x100, code.len);
+            defer analysis.deinit(allocator);
+            var module = try analysis.translateSpirv(allocator, .{
+                .stage = .compute,
+                .local_size = .{ 1, 1, 1 },
+                .storage_buffers = &.{
+                    .{ .resource_sgpr = 8, .descriptor_index = 0, .extent_bytes = 512 },
+                    .{ .resource_sgpr = 12, .descriptor_index = 1, .extent_bytes = 512 },
+                },
+            });
+            defer module.deinit(allocator);
+            guest.word(0x1000, 0x12345678);
+            guest.word(0x3000, 0xabcdef01);
+            _ = try renderer.stageGuestStorageBufferAt(0, 0x1000, 512);
+            _ = try renderer.stageGuestStorageBufferAt(1, 0x2000, 512);
+            const protected = try renderer.stageGuestStorageBufferAt(2, 0x3000, 512);
+            renderer.draw_batch_active = true;
+            renderer.current_descriptor_slot = 0;
+            _ = try renderer.dispatchSpirv(module.words, .{ 1, 1, 1 });
+            for (renderer.guest_buffers.items) |*entry|
+                if (entry.guest_address == 0x2000) {
+                    entry.gpu_dirty = true;
+                };
+            renderer.current_descriptor_slot = 1;
+            renderer.descriptor_set = renderer.descriptor_sets[1];
+            renderer.active_storage_buffers[0] = 0;
+            renderer.active_storage_buffers[1] = 0;
+            // Recycling 512 bytes for a 16-byte range keeps its old capacity
+            // in the default mode. The subsequent trim must count that space.
+            _ = try renderer.stageGuestStorageBufferAt(0, 0x4000, 16);
+            renderer.active_storage_buffers[0] = 0;
+            renderer.storage_buffer_cache_budget_bytes = if (local) 1200 else 600;
+            guest.word(0x5000, 0x87654321);
+            _ = try renderer.stageGuestStorageBufferAt(0, 0x5000, 16);
+            try std.testing.expectEqual(@as(u32, 0x12345678), std.mem.readInt(u32, guest.bytes[0x2000..][0..4], .little));
+            var allocated: u64 = 0;
+            var found_protected = false;
+            for (renderer.guest_buffers.items) |entry| {
+                allocated += entry.device_local.size;
+                if (entry.host_transfer) |transfer| allocated += transfer.size;
+                if (entry.guest_address == 0x3000) {
+                    found_protected = true;
+                    try std.testing.expectEqual(protected.buffer, entry.device_local.handle);
+                }
+            }
+            try std.testing.expect(found_protected);
+            try std.testing.expect(allocated <= renderer.storage_buffer_cache_budget_bytes);
+            var actual: [16]u8 = undefined;
+            try renderer.readbackGuestStorageBuffer(0x5000, &actual);
+            try std.testing.expectEqual(@as(u32, 0x87654321), std.mem.readInt(u32, actual[0..4], .little));
+            renderer.draw_batch_active = false;
+            renderer.current_descriptor_slot = null;
+        }
+    }
+    std.debug.print("buffer cache budget passed: oversized capacity, both retention modes, transfer mirrors, pending GPU writes and protected bindings\n", .{});
+}
+
 fn runScratchMemoryProbe(allocator: std.mem.Allocator) !void {
     var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true });
     defer renderer.deinit();
@@ -8808,6 +8879,10 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--clean-buffer-retention")) {
         try runCleanBufferRetentionProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--buffer-cache-budget")) {
+        try runBufferCacheBudgetProbe(allocator);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--scratch-memory")) {
