@@ -4341,6 +4341,24 @@ fn runQueuedBufferReuseProbe(allocator: std.mem.Allocator, use_waits: bool, reta
     try renderer.readbackGuestStorageBuffer(large_destination, &rebound_result);
     if (std.mem.readInt(u32, rebound_result[0..4], .little) != 0x1357_2468) return error.LargeComputeShaderMismatch;
     std.debug.print("large headerless compute shader passed: 4203 instructions\n", .{});
+
+    const pipeline_count = renderer.compute_pipelines.items.len;
+    for ([_]u32{ 0x2468_1357, 0x789a_bcde, 0xdead_beef, 0x7654_3210 }, 0..) |value, pass| {
+        if (pass != 0) {
+            // The pipeline outlives its translation-cache entry. Recreating
+            // identical words must reuse it and release the old module owner.
+            renderer.compute_translations.deinit(allocator);
+            if (pass > 1) renderer.compute_translations.maximum_bytes = 0;
+        }
+        guest.word(large_source, value);
+        const hits = renderer.pipeline_cache_hits;
+        _ = try executor.execute(&stream);
+        try std.testing.expectEqual(hits + 1, renderer.pipeline_cache_hits);
+        try std.testing.expectEqual(pipeline_count, renderer.compute_pipelines.items.len);
+        try renderer.readbackGuestStorageBuffer(large_destination, &rebound_result);
+        try std.testing.expectEqual(value, std.mem.readInt(u32, rebound_result[0..4], .little));
+    }
+    std.debug.print("compute module lifetime passed: cached/uncached translations, eviction, pipeline reuse and changing input bytes\n", .{});
 }
 
 fn runDeviceStorageBudgetProbe(allocator: std.mem.Allocator) !void {

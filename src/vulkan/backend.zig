@@ -994,10 +994,15 @@ const GuestBufferEntry = struct {
 
 const ComputePipelineEntry = struct {
     hash: u64,
-    words: []u32,
+    words: []const u32,
+    module: ?spirv_cache.Lease = null,
     shader: vk.ShaderModule,
     pipeline: vk.Pipeline,
     last_used_sequence: u64,
+
+    fn releaseWords(self: ComputePipelineEntry, allocator: std.mem.Allocator) void {
+        if (self.module) |module| module.release() else allocator.free(self.words);
+    }
 };
 
 const GraphicsPipelineEntry = struct {
@@ -4231,7 +4236,7 @@ pub const Renderer = struct {
         for (self.compute_pipelines.items) |entry| {
             self.device_functions.destroy_pipeline(self.device, entry.pipeline, null);
             self.device_functions.destroy_shader_module(self.device, entry.shader, null);
-            self.allocator.free(entry.words);
+            entry.releaseWords(self.allocator);
         }
         self.compute_pipelines.deinit(self.allocator);
         for (self.graphics_pipelines.items) |entry| {
@@ -5229,7 +5234,11 @@ pub const Renderer = struct {
     }
 
     pub fn dispatchSpirv(self: *Renderer, words: []const u32, group_count: [3]u32) (Error || std.mem.Allocator.Error)!DispatchReport {
-        const lookup = try self.getComputePipeline(words);
+        return self.dispatchSpirvWithModule(words, group_count, null);
+    }
+
+    fn dispatchSpirvWithModule(self: *Renderer, words: []const u32, group_count: [3]u32, module: ?spirv_cache.Lease) (Error || std.mem.Allocator.Error)!DispatchReport {
+        const lookup = try self.getComputePipeline(words, module);
         const command_buffer = try self.beginOneShot();
         defer self.releaseOneShot(command_buffer);
         self.device_functions.cmd_bind_pipeline(command_buffer, vk.pipeline_bind_point_compute, lookup.pipeline);
@@ -6221,7 +6230,7 @@ pub const Renderer = struct {
         }
         const submit_started = hostTimestampNs();
         try self.prepareStorageImageAccess(resources);
-        const report = try self.dispatchSpirv(module.words, group_count);
+        const report = try self.dispatchSpirvWithModule(module.words, group_count, module_lease);
         if (resources.sampled_image_fault) |fault| {
             const command_buffer = try self.beginOneShot();
             defer self.releaseOneShot(command_buffer);
@@ -9136,11 +9145,30 @@ pub const Renderer = struct {
         }
     }
 
-    fn getComputePipeline(self: *Renderer, words: []const u32) (Error || std.mem.Allocator.Error)!PipelineLookup {
+    fn getComputePipeline(self: *Renderer, words: []const u32, module: ?spirv_cache.Lease) (Error || std.mem.Allocator.Error)!PipelineLookup {
         self.compute_pipeline_sequence +%= 1;
+        // The pipeline holds a reference, so an immutable translation cannot
+        // be freed and replaced at the same address while this entry exists.
+        // Raw caller-owned words still use the full content check below.
+        if (module) |current| {
+            for (self.compute_pipelines.items) |*entry| {
+                const retained = entry.module orelse continue;
+                if (!retained.sameModule(current)) continue;
+                self.pipeline_cache_hits += 1;
+                self.frame_profile.compute_pipeline_hits += 1;
+                entry.last_used_sequence = self.compute_pipeline_sequence;
+                return .{ .pipeline = entry.pipeline, .cache_hit = true };
+            }
+        }
         const hash = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(words));
         for (self.compute_pipelines.items) |*entry| {
             if (entry.hash == hash and std.mem.eql(u32, entry.words, words)) {
+                if (module) |current| {
+                    const retained = current.retain();
+                    entry.releaseWords(self.allocator);
+                    entry.module = retained;
+                    entry.words = retained.view().words;
+                }
                 self.pipeline_cache_hits += 1;
                 self.frame_profile.compute_pipeline_hits += 1;
                 entry.last_used_sequence = self.compute_pipeline_sequence;
@@ -9160,22 +9188,25 @@ pub const Renderer = struct {
         } else {
             ComputePipelineCompileJob.run(&work.job);
         }
-        const owned_words = self.allocator.dupe(u32, words) catch |err| {
+        const owned_words: []const u32 = if (module != null) words else self.allocator.dupe(u32, words) catch |err| {
             if (asynchronous) work.job.wait();
             if (work.pipeline != 0) self.device_functions.destroy_pipeline(self.device, work.pipeline, null);
             if (work.shader != 0) self.device_functions.destroy_shader_module(self.device, work.shader, null);
             return err;
         };
-        errdefer self.allocator.free(owned_words);
+        errdefer if (module == null) self.allocator.free(owned_words);
         if (asynchronous) work.job.wait();
         if (work.failure) |failure| return failure;
         const shader = work.shader;
         const pipeline = work.pipeline;
         errdefer self.destroyPipeline(pipeline);
         errdefer self.destroyShaderModule(shader);
+        const retained = if (module) |current| current.retain() else null;
+        errdefer if (retained) |current| current.release();
         const replacement = ComputePipelineEntry{
             .hash = hash,
             .words = owned_words,
+            .module = retained,
             .shader = shader,
             .pipeline = pipeline,
             .last_used_sequence = self.compute_pipeline_sequence,
@@ -9196,7 +9227,7 @@ pub const Renderer = struct {
             const evicted = self.compute_pipelines.items[oldest_index];
             self.destroyPipeline(evicted.pipeline);
             self.destroyShaderModule(evicted.shader);
-            self.allocator.free(evicted.words);
+            evicted.releaseWords(self.allocator);
             self.compute_pipelines.items[oldest_index] = replacement;
         }
         self.pipeline_cache_misses += 1;
@@ -13769,7 +13800,7 @@ pub const Renderer = struct {
             },
         });
         defer module.deinit(self.allocator);
-        const pipeline = try self.getComputePipeline(module.words);
+        const pipeline = try self.getComputePipeline(module.words, null);
         var elapsed: [2]u64 = .{ 0, 0 };
         for ([_]usize{ 0, 1, 1, 0 }, 0..) |placement, pass| {
             for (source, 0..) |*word, index| word.* = @intCast(index * 17 + pass * 101);

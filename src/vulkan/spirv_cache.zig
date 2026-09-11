@@ -53,6 +53,16 @@ pub const Lease = struct {
     pub fn release(self: Lease) void {
         self.shared.release();
     }
+
+    /// Independent owners can retain the immutable module without copying it.
+    pub fn retain(self: Lease) Lease {
+        self.shared.references += 1;
+        return self;
+    }
+
+    pub fn sameModule(self: Lease, other: Lease) bool {
+        return self.shared == other.shared;
+    }
 };
 
 const Entry = struct {
@@ -281,6 +291,18 @@ test "owned translation leases preserve words and release them on allocation fai
     const failed_words = try f.dupe(u32, &.{ 0x07230203, 29 });
     try std.testing.expectError(error.OutOfMemory, Lease.fromOwned(f, .{ .words = failed_words }));
     try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+}
+
+test "retained translation owns immutable words after the original lease releases" {
+    const a = std.testing.allocator;
+    const words = try a.dupe(u32, &.{ 0x07230203, 17, 23 });
+    const original = try Lease.fromOwned(a, .{ .words = words });
+    const retained = original.retain();
+    defer retained.release();
+    try std.testing.expect(original.sameModule(retained));
+    original.release();
+    try std.testing.expect(retained.view().words.ptr == words.ptr);
+    try std.testing.expectEqualSlices(u32, &.{ 0x07230203, 17, 23 }, retained.view().words);
 }
 
 test "cache lease owns an oversized uncached translation" {
