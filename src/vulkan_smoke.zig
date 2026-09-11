@@ -3221,6 +3221,90 @@ fn runSampledViewReuseProbe(allocator: std.mem.Allocator) !void {
     try runSampledViewReuseCase(allocator, true);
 }
 
+fn runSampledCacheBudgetProbe(allocator: std.mem.Allocator) !void {
+    const Memory = SizedGuestMemory(512 * 1024);
+    const guest = try allocator.create(Memory);
+    defer allocator.destroy(guest);
+    guest.* = .{};
+    var renderer = try vulkan.Renderer.init(allocator, .{ .defer_small_storage_writes = true });
+    defer renderer.deinit();
+    const Context = struct {
+        guest: *Memory,
+        renderer: *vulkan.Renderer,
+        advance_at: u64 = 0,
+        advances: usize = 0,
+        fn read(raw: ?*anyopaque, address: u64, bytes: []u8) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.advance_at != 0 and address <= self.advance_at and self.advance_at - address < bytes.len) {
+                self.renderer.frame_sequence += 1;
+                self.advance_at = 0;
+                self.advances += 1;
+            }
+            return Memory.read(self.guest, address, bytes);
+        }
+        fn write(raw: ?*anyopaque, address: u64, bytes: []const u8) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            return Memory.write(self.guest, address, bytes);
+        }
+    };
+    var context = Context{ .guest = guest, .renderer = &renderer };
+    _ = renderer.dcbBackend(.{ .context = &context, .read = Context.read, .write = Context.write });
+    // Two images prepared by one dispatch must survive even a one-byte soft
+    // budget. Advancing the publication counter between them is not a batch end.
+    renderer.sampled_image_cache_budget_bytes = 1;
+    const store_a = mubuf(0x1e, 0, 2, 0, 20);
+    const store_b = mubuf(0x1e, 16, 6, 0, 20);
+    const code = [_]u32{
+        vop1(1, 0, 240),                 vop1(1, 1, 240),
+        0xf09c_0f0a,                     0x0080_0200,
+        1,                               0xf09c_0f0a,
+        0x0082_0600,                     1,
+        store_a[0] & ~@as(u32, 1 << 13), store_a[1],
+        store_b[0] & ~@as(u32, 1 << 13), store_b[1],
+        0xbf81_0000,
+    };
+    for (code, 0..) |word, i| guest.word(0x100 + i * 4, word);
+    var state = gpu.State{};
+    const compute = gpu.resources.ShaderStage.compute;
+    try state.writeRegister(.shader, compute.programRegisterBase(), 1);
+    try state.writeRegister(.shader, compute.programRegisterBase() + 1, 0);
+    try state.writeRegister(.shader, 0x213, 24 << 1);
+    for (0..3) |round| {
+        const source: u32 = @intCast(0x20000 + round * 0x200);
+        guest.word(source, 0xff60_4020 + @as(u32, @intCast(round)));
+        guest.word(source + 0x100, 0xffc0_a080 + @as(u32, @intCast(round)));
+        context.advance_at = source + 0x100;
+        const userdata = sampledImageDescriptorWords(source, 1, 1) ++
+            sampledImageDescriptorWords(source + 0x100, 1, 1) ++ [_]u32{ 0, 0, 0, 0, @intCast(0x10000 + round * 0x100), 0, 32, 0 };
+        for (userdata, 0..) |word, i| try state.writeRegister(.shader, compute.userDataBase() + @as(u32, @intCast(i)), word);
+        _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
+        try std.testing.expectEqual(@as(usize, 2), renderer.sampled_image_cache.items.len);
+        var total: u64 = 0;
+        for (renderer.sampled_image_cache.items) |entry| {
+            try std.testing.expect(entry.image.allocation_bytes != 0);
+            total += entry.image.allocation_bytes;
+            try std.testing.expectEqual(renderer.sampled_image_batch, entry.last_used_batch);
+        }
+        try std.testing.expectEqual(total, renderer.sampled_image_cache_bytes);
+        try std.testing.expect(renderer.pending_command_buffers.items.len != 0);
+    }
+    try std.testing.expectEqual(@as(usize, 3), context.advances);
+    try std.testing.expectEqual(@as(u64, 4), renderer.frame_profile.texture_evictions);
+    for (0..3) |round| {
+        var output: [32]u8 = undefined;
+        try renderer.readbackGuestStorageBuffer(0x10000 + round * 0x100, &output);
+        for (0..8) |component| {
+            const channel = component % 4;
+            const expected: f32 = if (channel == 3) 1 else @as(f32, @floatFromInt(
+                (if (component < 4) @as(usize, 32) else 128) + channel * 32 + (if (channel == 0) round else 0),
+            )) / 255.0;
+            const actual: f32 = @bitCast(std.mem.readInt(u32, output[component * 4 ..][0..4], .little));
+            try std.testing.expectApproxEqAbs(expected, actual, 0.0001);
+        }
+    }
+    std.debug.print("sampled cache budget passed: queued consumers, current batch protection across frame publications and exact allocation accounting\n", .{});
+}
+
 fn runSampledViewReuseCase(allocator: std.mem.Allocator, canonical_aliases: bool) !void {
     const Memory = SizedGuestMemory(2 * 1024 * 1024);
     const guest = try allocator.create(Memory);
@@ -8840,6 +8924,10 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--sampled-view-reuse")) {
         try runSampledViewReuseProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--sampled-cache-budget")) {
+        try runSampledCacheBudgetProbe(allocator);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--sampled-scratch")) {

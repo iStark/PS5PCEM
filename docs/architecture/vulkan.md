@@ -79,6 +79,13 @@ all of its views with the existing submission fence. Explicit guest writes
 invalidate overlapping sampled copies even when the sparse content probe only
 sees unchanged padding; canonical image tracking also advances their epoch.
 
+The uploaded-texture cache also has a 2 GiB soft budget measured from Vulkan's
+actual image allocation requirements. It retires the oldest unused images and
+completes their queued consumers before allocating replacements. Images already
+selected for the current descriptor batch stay protected, even when publishing
+an intermediate colour target advances the frame counter. The
+`--sampled-cache-budget` smoke probe checks this lifetime and memory accounting.
+
 The decoded shader cache holds 1,024 programs. Yotei's opening cinematic
 exceeds the former 512-entry limit and otherwise repeatedly rebuilds shader
 analysis and resource checkpoints within each frame.

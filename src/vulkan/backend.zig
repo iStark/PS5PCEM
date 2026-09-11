@@ -729,6 +729,7 @@ const ColorTargetUpload = struct {
 const OwnedImage = struct {
     handle: vk.Image,
     memory: vk.DeviceMemory,
+    allocation_bytes: vk.DeviceSize = 0,
 };
 
 const DrawUploadSlice = struct {
@@ -3134,6 +3135,7 @@ const CachedSampledImage = struct {
     view: vk.ImageView,
     sampler: vk.Sampler,
     last_used_frame: u64,
+    last_used_batch: u64 = 0,
 };
 
 fn sampledGraphicsWriteTarget(primary: GuestColorTarget, extra_colors: []const GuestColorTarget, address: u64) GuestColorTarget {
@@ -3372,6 +3374,9 @@ pub const Renderer = struct {
     image_aliases: image_alias.Manager = .{},
     image_states: image_state.Tracker = .{},
     sampled_image_cache: std.ArrayList(CachedSampledImage) = .empty,
+    sampled_image_cache_bytes: u64 = 0,
+    sampled_image_cache_budget_bytes: u64 = 2 * 1024 * 1024 * 1024,
+    sampled_image_batch: u64 = 0,
     sampled_image_index: @import("sampled_image_index.zig").Index(maximum_cached_sampled_images) = .{},
     resident_image_views: std.ArrayList(CachedResidentImageView) = .empty,
     resident_samplers: std.ArrayList(CachedResidentSampler) = .empty,
@@ -17616,6 +17621,10 @@ pub const Renderer = struct {
             .samples = samples,
             .usage = usage,
         };
+        return self.createImageBacking(create_info, false);
+    }
+
+    fn createImageBacking(self: *Renderer, create_info: vk.ImageCreateInfo, sampled_cache: bool) Error!OwnedImage {
         var handle: vk.Image = 0;
         if (self.device_functions.create_image(self.device, &create_info, null, &handle) != vk.success) {
             return Error.ImageCreationFailed;
@@ -17623,6 +17632,7 @@ pub const Renderer = struct {
         errdefer self.device_functions.destroy_image(self.device, handle, null);
         var requirements: vk.MemoryRequirements = undefined;
         self.device_functions.get_image_memory_requirements(self.device, handle, &requirements);
+        if (sampled_cache) try self.trimSampledImageCache(requirements.size);
         const memory_type_index = self.findMemoryType(requirements.memory_type_bits, vk.memory_property_device_local_bit) orelse {
             return Error.NoCompatibleMemoryType;
         };
@@ -17631,14 +17641,19 @@ pub const Renderer = struct {
             .memory_type_index = memory_type_index,
         };
         var memory: vk.DeviceMemory = 0;
-        if (self.device_functions.allocate_memory(self.device, &allocation_info, null, &memory) != vk.success) {
+        const allocation_result = self.device_functions.allocate_memory(self.device, &allocation_info, null, &memory);
+        if (allocation_result != vk.success) {
+            std.debug.print("[vulkan memory] image allocation failed result={d} bytes={d} type={d} sampled_cache={d}MiB/{d}MiB images={d}\n", .{
+                allocation_result,                                     requirements.size,                  memory_type_index, self.sampled_image_cache_bytes / (1024 * 1024),
+                self.sampled_image_cache_budget_bytes / (1024 * 1024), self.sampled_image_cache.items.len,
+            });
             return Error.MemoryAllocationFailed;
         }
         errdefer self.device_functions.free_memory(self.device, memory, null);
         if (self.device_functions.bind_image_memory(self.device, handle, memory, 0) != vk.success) {
             return Error.MemoryBindingFailed;
         }
-        return .{ .handle = handle, .memory = memory };
+        return .{ .handle = handle, .memory = memory, .allocation_bytes = requirements.size };
     }
 
     fn createImage(self: *Renderer, width: u32, height: u32, format: u32, usage: vk.Flags) Error!OwnedImage {
@@ -19144,6 +19159,7 @@ pub const Renderer = struct {
                 continue;
             }
             item.last_used_frame = self.frame_sequence;
+            item.last_used_batch = self.sampled_image_batch;
             self.texture_cache_hits += 1;
             self.frame_profile.texture_hits +|= 1;
             return .{ .image = item.image, .view = item.view, .sampler = item.sampler };
@@ -19171,6 +19187,7 @@ pub const Renderer = struct {
                 continue;
             }
             item.last_used_frame = self.frame_sequence;
+            item.last_used_batch = self.sampled_image_batch;
             self.texture_cache_hits += 1;
             self.frame_profile.texture_hits +|= 1;
             return .{
@@ -19262,6 +19279,7 @@ pub const Renderer = struct {
         if (cache_hit_idx) |idx| {
             var item = &self.sampled_image_cache.items[idx];
             item.last_used_frame = self.frame_sequence;
+            item.last_used_batch = self.sampled_image_batch;
             self.texture_cache_hits += 1;
             self.frame_profile.texture_hits +|= 1;
             if (self.texture_cache_hits == 1) {
@@ -19526,19 +19544,17 @@ pub const Renderer = struct {
         );
         defer self.destroyBuffer(upload);
         try self.writeMapped(upload, linear);
-        const image = try self.createImageWithExtent(
-            image_width,
-            image_height,
-            image_depth,
-            upload_layers,
-            if (is_3d) vk.image_type_3d else vk.image_type_2d,
-            @as(vk.Flags, if (is_cube) vk.image_create_cube_compatible_bit else 0) |
+        const image = try self.createImageBacking(.{
+            .extent = .{ .width = image_width, .height = image_height, .depth = image_depth },
+            .array_layers = upload_layers,
+            .image_type = if (is_3d) vk.image_type_3d else vk.image_type_2d,
+            .flags = @as(vk.Flags, if (is_cube) vk.image_create_cube_compatible_bit else 0) |
                 (if (sampledImageHasSrgbPair(descriptor.unified_format)) vk.image_create_mutable_format_bit else 0),
-            image_format,
-            vk.image_usage_transfer_dst_bit | vk.image_usage_sampled_bit,
-            vk.sample_count_1_bit,
-            mip_levels,
-        );
+            .format = image_format,
+            .usage = vk.image_usage_transfer_dst_bit | vk.image_usage_sampled_bit,
+            .samples = vk.sample_count_1_bit,
+            .mip_levels = mip_levels,
+        }, true);
         errdefer self.destroyImage(image);
         try self.registerTrackedImage(image.handle, vk.image_aspect_color_bit, mip_levels, upload_layers);
         errdefer self.image_states.forgetImage(image.handle);
@@ -19672,31 +19688,7 @@ pub const Renderer = struct {
             {
                 continue;
             }
-            self.destroyImageView(stale.view);
-            self.invalidateResidentImageViews(stale.image.handle);
-            self.image_states.forgetImage(stale.image.handle);
-            self.destroyImage(stale.image);
-            self.image_aliases.unregister(stale.alias_token);
-            _ = self.sampled_image_cache.orderedRemove(stale_index);
-        }
-
-        if (self.sampled_image_cache.items.len >= maximum_cached_sampled_images) {
-            var oldest_idx: usize = 0;
-            var oldest_frame: u64 = std.math.maxInt(u64);
-            for (self.sampled_image_cache.items, 0..) |item, idx| {
-                if (item.last_used_frame < oldest_frame) {
-                    oldest_frame = item.last_used_frame;
-                    oldest_idx = idx;
-                }
-            }
-            self.frame_profile.texture_evictions +|= 1;
-            const evicted = self.sampled_image_cache.items[oldest_idx];
-            self.destroyImageView(evicted.view);
-            self.invalidateResidentImageViews(evicted.image.handle);
-            self.image_states.forgetImage(evicted.image.handle);
-            self.destroyImage(evicted.image);
-            self.image_aliases.unregister(evicted.alias_token);
-            _ = self.sampled_image_cache.orderedRemove(oldest_idx);
+            self.retireSampledImage(stale_index);
         }
 
         try self.sampled_image_cache.append(self.allocator, .{
@@ -19721,9 +19713,55 @@ pub const Renderer = struct {
             .view = view,
             .sampler = sampler,
             .last_used_frame = self.frame_sequence,
+            .last_used_batch = self.sampled_image_batch,
         });
 
+        self.sampled_image_cache_bytes += image.allocation_bytes;
         return .{ .image = image, .view = view, .sampler = sampler };
+    }
+
+    fn retireSampledImage(self: *Renderer, index: usize) void {
+        const entry = self.sampled_image_cache.items[index];
+        self.sampled_image_cache_bytes -= entry.image.allocation_bytes;
+        self.destroyImageView(entry.view);
+        self.invalidateResidentImageViews(entry.image.handle);
+        self.image_states.forgetImage(entry.image.handle);
+        self.destroyImage(entry.image);
+        self.image_aliases.unregister(entry.alias_token);
+        _ = self.sampled_image_cache.orderedRemove(index);
+        self.sampled_image_index.invalidate();
+    }
+
+    fn trimSampledImageCache(self: *Renderer, incoming_bytes: u64) Error!void {
+        var reclaimed = false;
+        while (self.sampled_image_cache_bytes +| incoming_bytes > self.sampled_image_cache_budget_bytes or
+            self.sampled_image_cache.items.len >= maximum_cached_sampled_images)
+        {
+            var victim: ?usize = null;
+            var oldest: u64 = std.math.maxInt(u64);
+            for (self.sampled_image_cache.items, 0..) |entry, index| {
+                // Resource preparation may publish a colour target and advance
+                // frame_sequence. A descriptor batch, unlike that counter,
+                // continues to protect every image selected for the next draw.
+                if (entry.last_used_batch == self.sampled_image_batch) continue;
+                if (victim == null or entry.last_used_batch < oldest) {
+                    victim = index;
+                    oldest = entry.last_used_batch;
+                }
+            }
+            const index = victim orelse {
+                if (self.sampled_image_cache.items.len >= maximum_cached_sampled_images)
+                    return Error.UnsupportedSampledImage;
+                // A single prepared batch can exceed the soft byte budget.
+                break;
+            };
+            self.retireSampledImage(index);
+            self.frame_profile.texture_evictions +|= 1;
+            reclaimed = true;
+        }
+        // Retired images can still belong to queued draws. Complete those
+        // consumers and release their memory before admitting a replacement.
+        if (reclaimed) try self.waitForSubmittedWork();
     }
 
     fn sampledSourceGeneration(self: *Renderer, address: u64, visible_bytes: usize) u64 {
@@ -20200,6 +20238,7 @@ pub const Renderer = struct {
         self: *Renderer,
         allow_draw_uploads: bool,
     ) (Error || std.mem.Allocator.Error)!void {
+        self.sampled_image_batch +%= 1;
         try self.refreshGpuProgress();
         // A soft-skipped draw/dispatch may have reserved a descriptor set
         // without recording a command buffer. Return only that unused slot;
