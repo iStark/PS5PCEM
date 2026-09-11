@@ -85,6 +85,9 @@ shuffle without assuming a host subgroup size or changing empty, partial or
 independently scheduled wave masks. `--wave64-ballots` checks interleaved masks
 and cross-half reads with both exchange policies; `--multi-wave64` covers loops
 and early exits in independently scheduled waves.
+The Vulkan backend includes these scratch banks in the device's shared-memory
+budget and retains the single-bank policy when guest LDS leaves too little room.
+`--spilled-lds` checks offloaded 64 KiB LDS with both wave32 and wave64 execution.
 
 A comparison can avoid that ballot when its VCC result is read only by
 `V_CNDMASK` before a complete comparison overwrite in the same guest block.

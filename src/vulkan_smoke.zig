@@ -2063,6 +2063,11 @@ fn runLdsWaveMemoryProbe(allocator: std.mem.Allocator) !void {
 }
 
 fn runSpilledLdsProbe(allocator: std.mem.Allocator) !void {
+    try runSpilledLdsWaveProbe(allocator, true);
+    try runSpilledLdsWaveProbe(allocator, false);
+}
+
+fn runSpilledLdsWaveProbe(allocator: std.mem.Allocator, wave32: bool) !void {
     var renderer = try vulkan.Renderer.init(allocator, .{});
     defer renderer.deinit();
     const Memory = SizedGuestMemory(1024 * 1024);
@@ -2093,7 +2098,8 @@ fn runSpilledLdsProbe(allocator: std.mem.Allocator) !void {
     var module = try analysis.translateSpirv(allocator, .{
         .stage = .compute,
         .local_size = .{ 64, 1, 1 },
-        .wave32 = true,
+        .wave32 = wave32,
+        .wave64_workgroup = !wave32,
         .compute_inputs = .{ .local_invocation_id_components = 1, .workgroup_id_sgprs = .{ 8, 9, 10 } },
         .workgroup_memory_size_bytes = 65536,
         .workgroup_memory_storage_slot = 2,
@@ -2121,7 +2127,7 @@ fn runSpilledLdsProbe(allocator: std.mem.Allocator) !void {
         try renderer.readbackGuestStorageBuffer(0xa0000, &fault);
         try std.testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, fault[8..12], .little));
     }
-    std.debug.print("Spilled LDS passed: 64 KiB per group, 2x2x2 isolation, cross-half DS/FLAT exchange, barriers and refreshed inputs\n", .{});
+    std.debug.print("Spilled LDS passed (wave32={any}): 64 KiB per group, 2x2x2 isolation, cross-half DS/FLAT exchange, barriers and refreshed inputs\n", .{wave32});
 }
 
 fn runDispatcherBudgetProbe(allocator: std.mem.Allocator) !void {

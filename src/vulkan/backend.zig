@@ -6367,9 +6367,12 @@ pub const Renderer = struct {
         var spilled_lds: ?OwnedBuffer = null;
         defer if (spilled_lds) |buffer| self.destroyBuffer(buffer);
         var lds_slot: ?u32 = null;
-        // Wave64 emulation additionally reserves one exchange word per lane
-        // and a scheduler word. Keep large guest LDS in isolated SSBO slices.
-        if (scene_collision_query and lds_bytes + (local_size[0] * local_size[1] * local_size[2] + 1) * 4 > self.device_info.max_compute_shared_memory_size) {
+        // Keep the single-bank fallback when guest LDS leaves insufficient
+        // shared memory for alternating exchanges. Budget the same scratch
+        // layout that the translator emits, including scheduler storage.
+        const invocations = @as(u64, local_size[0]) *| local_size[1] *| local_size[2];
+        const wave_exchange_double_buffer = @as(u64, lds_bytes) +| rdna2.spirv.wave64ScratchWords(invocations, true) *| 4 <= self.device_info.max_compute_shared_memory_size;
+        if (scene_collision_query and @as(u64, lds_bytes) +| rdna2.spirv.wave64ScratchWords(invocations, wave_exchange_double_buffer) *| 4 > self.device_info.max_compute_shared_memory_size) {
             const groups = std.math.mul(u64, group_count[0], group_count[1]) catch return Error.GuestBufferTooLarge;
             const total_groups = std.math.mul(u64, groups, group_count[2]) catch return Error.GuestBufferTooLarge;
             const bytes = std.math.mul(u64, total_groups, lds_bytes) catch return Error.GuestBufferTooLarge;
@@ -6385,6 +6388,7 @@ pub const Renderer = struct {
             .maximum_dispatcher_iterations = if (yotei_environment_lighting) 2048 else if (yotei_atmosphere_multiscatter) 1024 else if (yotei_atmosphere_precompute) 512 else 256,
             .report_dispatcher_exhaustion = scene_collision_query,
             .wave32 = initiator & (1 << 15) != 0,
+            .wave_exchange_double_buffer = wave_exchange_double_buffer,
             .storage_buffers = resources.mappings[0..resources.mapping_count],
             .sampled_images = resources.sampled_image_mappings[0..resources.sampled_image_mapping_count],
             .storage_images = resources.storage_image_mappings[0..resources.storage_image_mapping_count],

@@ -446,6 +446,12 @@ pub const Module = struct {
     }
 };
 
+/// Workgroup words reserved for wave64 exchanges and the converged scheduler.
+/// Saturation lets resource budgeting reject oversized guest workgroups safely.
+pub fn wave64ScratchWords(invocations: u64, double_buffer: bool) u64 {
+    return invocations *| @as(u64, if (double_buffer) 3 else 1) +| 1;
+}
+
 const ValueType = enum { bits32, sint32, float32 };
 const Value = struct { id: u32 = 0, value_type: ValueType = .bits32 };
 const Constant = struct { value_type: ValueType, bits: u32, id: u32 };
@@ -1480,7 +1486,7 @@ const Builder = struct {
             // Alternate exchange banks so the next operation's first barrier
             // completes prior readers before their bank is reused. The multi-
             // wave dispatcher has a separate region and never aliases them.
-            const scratch_words = invocations * @as(u64, if (options.wave_exchange_double_buffer) 3 else 1) + 1;
+            const scratch_words = wave64ScratchWords(invocations, options.wave_exchange_double_buffer);
             try self.emit(&self.declarations, 28, &.{ array_type, self.bits_type, try self.constant(.bits32, @intCast(scratch_words)) });
             try self.emit(&self.declarations, 32, &.{ array_pointer, 4, array_type });
             try self.emit(&self.declarations, 32, &.{ self.wave_word_pointer, 4, self.bits_type });
