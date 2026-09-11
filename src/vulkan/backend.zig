@@ -24,6 +24,16 @@ const pipeline_compiler = @import("pipeline_compiler.zig");
 const pipeline_cache_save = @import("pipeline_cache_save.zig");
 const spirv_cache = @import("spirv_cache.zig");
 const tessellation_spirv = @import("tessellation_spirv.zig");
+// Kept opt-in while the live LS/HS resource path is being validated.
+pub export var native_tessellation: bool = false;
+pub export var graphics_uniform_specialization: bool = false;
+pub export var capture_storage_program: u64 = 0;
+pub export var capture_storage_flip: u64 = 0;
+pub export var capture_storage_address: u64 = 0;
+pub export var capture_storage_bytes: u64 = 0;
+pub export var capture_storage_image_address: u64 = 0;
+pub export var capture_vertex_program: u64 = 0;
+pub export var capture_vertex_flip: u64 = 0;
 const sampled_lookup_plan = @import("sampled_lookup_plan.zig");
 
 /// Set to true to enable verbose per-frame GPU debug logging.
@@ -3042,6 +3052,17 @@ fn dumpComputeSpirv(allocator: std.mem.Allocator, program_address: u64, words: [
     file.writePositionalAll(io, std.mem.sliceAsBytes(words), 0) catch {};
 }
 
+fn dumpDiagnosticBytes(allocator: std.mem.Allocator, prefix: []const u8, suffix: []const u8, bytes: []const u8) !void {
+    var path_buffer: [256]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, "{s}{s}", .{ prefix, suffix });
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const file = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true });
+    defer file.close(io);
+    try file.writePositionalAll(io, bytes, 0);
+}
+
 fn dumpGraphicsSpirv(
     allocator: std.mem.Allocator,
     stage: []const u8,
@@ -3392,6 +3413,7 @@ pub const Renderer = struct {
     /// once so entries never move: callers hold `*const Analysis` into it for
     /// the length of a draw.
     analyzed_programs: std.ArrayList(AnalyzedProgram) = .empty,
+    tessellation_program: ?gpu.tessellation.Entry = null,
     analyzed_program_sequence: u64 = 0,
     texture_probes: [maximum_texture_probes]TextureProbe = @splat(.{}),
     texture_probe_count: usize = 0,
@@ -4320,6 +4342,7 @@ pub const Renderer = struct {
         self.compute_translations.deinit(self.allocator);
         for (self.analyzed_programs.items) |*entry| entry.analysis.deinit(self.allocator);
         self.analyzed_programs.deinit(self.allocator);
+        if (self.tessellation_program) |*entry| entry.deinit(self.allocator);
         for (self.completed_frames.items) |*frame| frame.pixels.deinit(self.allocator);
         self.completed_frames.deinit(self.allocator);
         self.guest_frame_scratch.deinit(self.allocator);
@@ -5613,6 +5636,17 @@ pub const Renderer = struct {
         group_count: [3]u32,
         initiator: u32,
     ) anyerror!DispatchReport {
+        return self.dispatchRdna2Analysis(state, local_size, group_count, initiator, null);
+    }
+
+    fn dispatchRdna2Analysis(
+        self: *Renderer,
+        state: *const gpu.State,
+        local_size: [3]u32,
+        group_count: [3]u32,
+        initiator: u32,
+        supplied_analysis: ?*const gpu.ShaderAnalysis,
+    ) anyerror!DispatchReport {
         const memory = self.guest_memory orelse return Error.GuestMemoryUnavailable;
         self.last_shader_read_failure = null;
         const reader = gpu.ShaderMemoryReader{ .context = self, .read_fn = readShaderMemory };
@@ -5621,11 +5655,11 @@ pub const Renderer = struct {
         };
         self.last_compute_program = program_address;
         self.trace_gpu_programs = .{ program_address, 0 };
-        const header_address = if (memory.shader_header) |resolve|
+        const header_address = if (supplied_analysis != null) null else if (memory.shader_header) |resolve|
             resolve(memory.context, program_address)
         else
             null;
-        var analysis = try self.analyzedProgram(reader, program_address, header_address);
+        var analysis = supplied_analysis orelse try self.analyzedProgram(reader, program_address, header_address);
         if (self.fullscreenVideoActive() and !analysis.hasBufferExternalEffects()) {
             self.elided_dispatches += 1;
             self.noteComputeKind("covered-by-video");
@@ -6516,7 +6550,23 @@ pub const Renderer = struct {
         }
         const submit_started = hostTimestampNs();
         try self.prepareStorageImageAccess(resources);
+        const capture_storage = self.shouldCaptureStorage(resources, program_address);
+        var capture_prefix_buffer: [128]u8 = undefined;
+        const capture_prefix = if (capture_storage) try std.fmt.bufPrint(&capture_prefix_buffer, "out/storage-capture-{d}-{x}-{d}", .{ self.flip_callbacks + 1, program_address, self.frame_profile.dispatches }) else "";
+        if (capture_storage) {
+            try dumpDiagnosticBytes(self.allocator, capture_prefix, ".state", std.mem.asBytes(state));
+            try dumpDiagnosticBytes(self.allocator, capture_prefix, ".spv", std.mem.sliceAsBytes(module.words));
+            try dumpDiagnosticBytes(self.allocator, capture_prefix, ".scalars", std.mem.sliceAsBytes(resources.scalar_registers[0..resources.scalar_count]));
+            try dumpDiagnosticBytes(self.allocator, capture_prefix, ".local", std.mem.asBytes(&local_size));
+            try dumpDiagnosticBytes(self.allocator, capture_prefix, ".groups", std.mem.asBytes(&group_count));
+            try self.captureStorageImages(resources, capture_prefix, "before");
+            try self.captureStorageBuffers(resources, capture_prefix, "before");
+        }
         const report = try self.dispatchSpirvWithGds(module.words, group_count, module_lease, uses_gds);
+        if (capture_storage) {
+            try self.captureStorageImages(resources, capture_prefix, "after");
+            try self.captureStorageBuffers(resources, capture_prefix, "after");
+        }
         if (resources.sampled_image_fault) |fault| {
             const command_buffer = try self.beginOneShot();
             defer self.releaseOneShot(command_buffer);
@@ -14755,13 +14805,64 @@ pub const Renderer = struct {
         );
     }
 
+    const PreparedTessellation = struct {
+        config: gpu.tessellation.Config,
+        factors: gpu.BufferDescriptor,
+    };
+
+    fn prepareTessellation(self: *Renderer, state: *const gpu.State, draw: GuestDraw) anyerror!?PreparedTessellation {
+        if (!@atomicLoad(bool, &native_tessellation, .monotonic)) return null;
+        const config = (try gpu.tessellation.Config.decode(state)) orelse return null;
+        if (!self.tessellation_shaders_available or draw.index_count != null or
+            draw.vertex_count != config.control_points or draw.first_vertex != 0 or draw.instance_count == 0)
+            return error.UnsupportedTessellationDraw;
+        const memory = self.guest_memory orelse return Error.GuestMemoryUnavailable;
+        const reader = gpu.ShaderMemoryReader{ .context = self, .read_fn = readShaderMemory };
+        const ls_low = state.readRegister(.shader, 0x148) orelse return error.MissingLocalShader;
+        const ls_high = state.readRegister(.shader, 0x149) orelse 0;
+        const ls_address = (@as(u64, ls_low) << 8) | (@as(u64, ls_high & 255) << 40);
+        const hs_address = gpu.resources.ShaderStage.hull.programAddress(state) orelse return error.MissingHullShader;
+        const local = try self.analyzedProgram(reader, ls_address, if (memory.shader_header) |resolve| resolve(memory.context, ls_address) else null);
+        const hull = try self.analyzedProgram(reader, hs_address, if (memory.shader_header) |resolve| resolve(memory.context, hs_address) else null);
+        if (self.tessellation_program == null or !self.tessellation_program.?.matches(config, local, hull)) {
+            const replacement = try gpu.tessellation.Entry.init(self.allocator, config, local, hull);
+            if (self.tessellation_program) |*entry| entry.deinit(self.allocator);
+            self.tessellation_program = replacement;
+            std.debug.print("[vulkan dcb] merged LS/HS @0x{x}/0x{x}: {d} patches/group, {d} control points, {d} words\n", .{ ls_address, hs_address, config.patches, config.control_points, replacement.merged.code.items.len });
+        }
+        const root = @as(u64, state.readRegister(.shader, 0x102) orelse return error.MissingHullShaderTable) |
+            (@as(u64, state.readRegister(.shader, 0x103) orelse return error.MissingHullShaderTable) << 32);
+        var table: [4]u32 = undefined;
+        try reader.readWords(root, &table);
+        const globals = @as(u64, table[2]) | (@as(u64, table[3]) << 32);
+        var words: [4]u32 = undefined;
+        try reader.readWords(globals + 32, &words);
+        const factors = try gpu.resources.decodeBufferDescriptor(&words);
+        if (factors.size_bytes < @as(u64, draw.instance_count) * config.factor_words * 4) return error.TessellationFactorBufferTooSmall;
+        try reader.readWords(globals + 48, &words);
+        const offchip = try gpu.resources.decodeBufferDescriptor(&words);
+        const groups = std.math.divCeil(u32, draw.instance_count, config.patches) catch unreachable;
+        if (offchip.size_bytes < @as(u64, groups) * config.inputs.offchip_group_bytes) return error.TessellationOffchipBufferTooSmall;
+        const compute = try self.allocator.create(gpu.State);
+        defer self.allocator.destroy(compute);
+        compute.* = state.*;
+        try config.prepareState(compute, draw.first_instance, draw.instance_count);
+        const report = try self.dispatchRdna2Analysis(compute, .{ config.localSize(), 1, 1 }, .{ groups, 1, 1 }, 0, &self.tessellation_program.?.merged);
+        if (report.spirv_words == 0) return error.TessellationPrepassNotExecuted;
+        return .{ .config = config, .factors = factors };
+    }
+
     fn drawGuestGraphics(
         self: *Renderer,
         state: *const gpu.State,
-        draw: GuestDraw,
+        guest_draw: GuestDraw,
         vertex_stage: gpu.resources.ShaderStage,
         target_override: ?gpu.resources.ColorTarget,
     ) anyerror!void {
+        const tessellation = try self.prepareTessellation(state, guest_draw);
+        const draw: GuestDraw = if (tessellation) |tess| .{
+            .vertex_count = try std.math.mul(u32, guest_draw.instance_count, tess.config.control_points),
+        } else guest_draw;
         self.trace_gpu_programs = .{
             vertex_stage.programAddress(state) orelse 0,
             gpu.resources.ShaderStage.pixel.programAddress(state) orelse 0,
@@ -15016,6 +15117,10 @@ pub const Renderer = struct {
         if (!self.honor_guest_culling) pipeline_state.cull_mode = 0;
         try applyColorAttachmentState(&pipeline_state, &render_state, bound_colors[0..bound_color_count]);
         pipeline_state.topology = guestPrimitiveTopology(render_state.primitive_type, draw);
+        if (tessellation) |tess| {
+            pipeline_state.tessellation_control_points = tess.config.control_points;
+            pipeline_state.tessellation_domain = @intFromEnum(tessellation_spirv.Domain.quads);
+        }
         pipeline_state.rasterization_samples = rasterSampleCount(color_samples) orelse
             return Error.UnsupportedColorTarget;
         if (depth_plane) |plane| {
@@ -15162,12 +15267,18 @@ pub const Renderer = struct {
             traceShaderAnalysisFailure(reader, vertex_stage, vertex_address, vertex_header, err);
             return err;
         };
-        const fragment_analysis = self.analyzedProgram(reader, fragment_address, fragment_header) catch |err| {
+        var fragment_analysis = self.analyzedProgram(reader, fragment_address, fragment_header) catch |err| {
             traceShaderAnalysisFailure(reader, .pixel, fragment_address, fragment_header, err);
             return err;
         };
         const vertex_bindings = try gpu.ShaderBindings.capture(state, vertex_stage, vertex_header, reader);
         const fragment_bindings = try gpu.ShaderBindings.capture(state, .pixel, fragment_header, reader);
+        var fragment_specialization = if (@atomicLoad(bool, &graphics_uniform_specialization, .monotonic))
+            try fragment_analysis.acquireUniformSpecialization(self.allocator, reader, &fragment_bindings, self.uniform_specialization_cache_enabled)
+        else
+            null;
+        defer if (fragment_specialization) |*lease| lease.release();
+        if (fragment_specialization) |lease| fragment_analysis = lease.analysis;
         var vertex_instruction_storage: std.ArrayList(gpu.ShaderInstruction) = .empty;
         defer vertex_instruction_storage.deinit(self.allocator);
         var vertex_instructions = vertex_analysis.program.instructions.items;
@@ -15442,6 +15553,19 @@ pub const Renderer = struct {
         self.frame_profile.graphics_storage_ns +|= elapsedHostNanoseconds(vertex_storage_started);
         defer vertex_storage.deinit(self);
         validateVertexIndexMappings(reader, vertex_storage, draw);
+        if (@atomicLoad(u64, &capture_vertex_program, .monotonic) == vertex_address and
+            @atomicLoad(u64, &capture_vertex_flip, .monotonic) == self.flip_callbacks + 1)
+        {
+            @atomicStore(u64, &capture_vertex_flip, 0, .monotonic);
+            var prefix_buffer: [128]u8 = undefined;
+            const prefix = try std.fmt.bufPrint(&prefix_buffer, "out/vertex-capture-{d}-{x}", .{ self.flip_callbacks + 1, vertex_address });
+            try dumpDiagnosticBytes(self.allocator, prefix, ".state", std.mem.asBytes(state));
+            try dumpDiagnosticBytes(self.allocator, prefix, ".draw", std.mem.asBytes(&draw));
+            try dumpDiagnosticBytes(self.allocator, prefix, ".scalars", std.mem.sliceAsBytes(vertex_storage.scalar_registers[0..vertex_storage.scalar_count]));
+            try dumpDiagnosticBytes(self.allocator, prefix, ".mappings", std.mem.sliceAsBytes(vertex_storage.mappings[0..vertex_storage.mapping_count]));
+            try self.captureStorageBuffers(vertex_storage, prefix, "vertex");
+            try self.captureGraphicsImages(graphics_resources, prefix);
+        }
         // Vertex V# registers also carry constants in other lifetimes. Their
         // recovered loads use the same dynamic scalar path as fragment loads.
         // Detect only the decoder's tightly constrained NV12/I420 layouts so
@@ -15858,6 +15982,14 @@ pub const Renderer = struct {
         self.frame_profile.graphics_storage_ns +|= elapsedHostNanoseconds(fragment_storage_started);
         defer fragment_storage.deinit(self);
         try self.prepareSampledImageLookups(fragment_storage, graphics_resources.mappings[0..fragment_mapping_count]);
+        if (tessellation) |tess| {
+            const slot = fragment_storage.freeDescriptor() orelse return Error.InvalidStorageDescriptor;
+            _ = try self.stageGuestStorageBufferAt(slot, tess.factors.address, @intCast(tess.factors.size_bytes));
+            fragment_storage.occupied[slot] = true;
+            fragment_storage.addresses[slot] = tess.factors.address;
+            fragment_storage.sizes[slot] = @intCast(tess.factors.size_bytes);
+            pipeline_state.tessellation_factor_slot = slot;
+        }
         // Unity PS loads color scales and matrices through s_buffer. Identity
         // constants are only a fallback for a genuinely missing V#: once the
         // constant buffer is staged, specializing those destinations would
@@ -16299,7 +16431,8 @@ pub const Renderer = struct {
                     // Prospero's merged graphics ABI supplies the vertex id in v5
                     // for both ordinary and export/NGG programs. Some shaders use
                     // v0 as a temporary before their attribute-fetch prolog.
-                    .vertex_index_vgpr = 5,
+                    .vertex_index_vgpr = if (tessellation == null) 5 else null,
+                    .tessellation_inputs = if (tessellation) |tess| tess.config.inputs else null,
                     .convert_negative_one_to_one_depth = convert_guest_depth,
                     .scalar_registers = vertex_scalar_regs[0..vertex_scalar_count],
                     .dynamic_scalar_binding = if (vertex_scalar_count != 0) .{
@@ -18658,6 +18791,156 @@ pub const Renderer = struct {
         }
     }
 
+    /// Diagnostic snapshots read the bound VkImage itself without publishing
+    /// guest memory or changing resource generations. Disabled by default.
+    fn captureGraphicsImages(self: *Renderer, resources: *const GraphicsResources, prefix: []const u8) !void {
+        const selected = @atomicLoad(u64, &capture_storage_image_address, .monotonic);
+        if (selected == 0) return;
+        for (resources.images[0..resources.image_count], resources.descriptors[0..resources.image_count], 0..) |prepared, descriptor, slot| {
+            if (descriptor.address != selected) continue;
+            if (descriptor.image_type != .color_2d or descriptor.samplesLog2() != 0 or
+                descriptor.viewBaseLevel() != 0 or descriptor.base_array != 0 or prepared.descriptor_layout != vk.image_layout_shader_read_only_optimal)
+                return error.UnsupportedDiagnosticSampledImage;
+            const byte_count = @as(usize, descriptor.width) * descriptor.height * storageImageBytesPerTexel(descriptor.unified_format);
+            if (byte_count == 0 or byte_count > 64 * 1024 * 1024) return error.UnsupportedDiagnosticSampledImage;
+            const readback = try self.createBuffer(byte_count, vk.buffer_usage_transfer_dst_bit, vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit);
+            defer self.destroyBuffer(readback);
+            const command_buffer = try self.beginOneShot();
+            defer self.releaseOneShot(command_buffer);
+            try self.transitionTrackedImage(command_buffer, prepared.image.handle, .{ .aspect_mask = vk.image_aspect_color_bit, .layer_count = 1 }, image_state.transfer_source_usage);
+            const copy = vk.BufferImageCopy{
+                .image_subresource = .{ .aspect_mask = vk.image_aspect_color_bit, .layer_count = 1 },
+                .image_extent = .{ .width = descriptor.width, .height = descriptor.height, .depth = 1 },
+            };
+            self.device_functions.cmd_copy_image_to_buffer(command_buffer, prepared.image.handle, vk.image_layout_transfer_src_optimal, readback.handle, 1, @ptrCast(&copy));
+            const barrier = vk.BufferMemoryBarrier{
+                .source_access_mask = vk.access_transfer_write_bit,
+                .destination_access_mask = vk.access_host_read_bit,
+                .buffer = readback.handle,
+                .offset = 0,
+                .size = readback.size,
+            };
+            self.device_functions.cmd_pipeline_barrier(command_buffer, vk.pipeline_stage_transfer_bit, vk.pipeline_stage_host_bit, 0, 0, null, 1, @ptrCast(&barrier), 0, null);
+            try self.transitionTrackedImage(command_buffer, prepared.image.handle, .{ .aspect_mask = vk.image_aspect_color_bit, .layer_count = 1 }, image_state.shader_read_usage);
+            try self.submitOneShot(command_buffer);
+            try self.waitForSubmittedWork();
+            const mapping = try self.mapBufferRange(readback, 0, byte_count);
+            defer mapping.release(self);
+            var suffix_buffer: [128]u8 = undefined;
+            const suffix = try std.fmt.bufPrint(&suffix_buffer, "-sampled-{d}-{x}-{d}x{d}-fmt{d}.bin", .{ slot, descriptor.address, descriptor.width, descriptor.height, descriptor.unified_format });
+            try dumpDiagnosticBytes(self.allocator, prefix, suffix, mapping.bytes);
+            std.debug.print("[vulkan diagnostic] captured {s}{s}\n", .{ prefix, suffix });
+        }
+    }
+
+    fn captureStorageImages(self: *Renderer, resources: *const ComputeResources, prefix: []const u8, phase: []const u8) !void {
+        for (resources.storage_images[0..resources.storage_image_count], 0..) |*prepared, slot| {
+            const descriptor = prepared.descriptor;
+            const selected = @atomicLoad(u64, &capture_storage_image_address, .monotonic);
+            if (selected != 0 and selected != descriptor.address) continue;
+            if (descriptor.image_type != .color_2d or descriptor.samplesLog2() != 0 or
+                descriptor.viewBaseLevel() != 0 or descriptor.base_array != 0 or prepared.subresource.depth_or_layers != 1)
+                return error.UnsupportedDiagnosticStorageImage;
+            const readback = try self.createBuffer(prepared.staging_bytes, vk.buffer_usage_transfer_dst_bit, vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit);
+            defer self.destroyBuffer(readback);
+            const command_buffer = try self.beginOneShot();
+            defer self.releaseOneShot(command_buffer);
+            try self.transitionTrackedImage(command_buffer, prepared.image.handle, .{ .aspect_mask = vk.image_aspect_color_bit, .layer_count = 1 }, image_state.transfer_source_usage);
+            const copy = vk.BufferImageCopy{
+                .image_subresource = .{ .aspect_mask = vk.image_aspect_color_bit, .layer_count = 1 },
+                .image_extent = .{ .width = prepared.subresource.width, .height = prepared.subresource.height, .depth = 1 },
+            };
+            self.device_functions.cmd_copy_image_to_buffer(command_buffer, prepared.image.handle, vk.image_layout_transfer_src_optimal, readback.handle, 1, @ptrCast(&copy));
+            const barrier = vk.BufferMemoryBarrier{
+                .source_access_mask = vk.access_transfer_write_bit,
+                .destination_access_mask = vk.access_host_read_bit,
+                .buffer = readback.handle,
+                .offset = 0,
+                .size = readback.size,
+            };
+            self.device_functions.cmd_pipeline_barrier(command_buffer, vk.pipeline_stage_transfer_bit, vk.pipeline_stage_host_bit, 0, 0, null, 1, @ptrCast(&barrier), 0, null);
+            try self.transitionTrackedImage(command_buffer, prepared.image.handle, .{ .aspect_mask = vk.image_aspect_color_bit, .layer_count = 1 }, image_state.storage_usage);
+            try self.submitOneShot(command_buffer);
+            try self.waitForSubmittedWork();
+            const mapping = try self.mapBufferRange(readback, 0, prepared.staging_bytes);
+            defer mapping.release(self);
+            var suffix_buffer: [128]u8 = undefined;
+            const suffix = try std.fmt.bufPrint(&suffix_buffer, "-{s}-{d}-{x}-{d}x{d}-fmt{d}.bin", .{ phase, slot, descriptor.address, prepared.subresource.width, prepared.subresource.height, descriptor.unified_format });
+            try dumpDiagnosticBytes(self.allocator, prefix, suffix, mapping.bytes);
+            std.debug.print("[vulkan diagnostic] captured {s}{s} writable={any}\n", .{ prefix, suffix, prepared.writable });
+        }
+    }
+
+    fn shouldCaptureStorage(self: *const Renderer, resources: *const ComputeResources, program: u64) bool {
+        if (@atomicLoad(u64, &capture_storage_flip, .monotonic) != self.flip_callbacks + 1) return false;
+        const selected = @atomicLoad(u64, &capture_storage_program, .monotonic);
+        if (selected == program) return true;
+        if (selected != std.math.maxInt(u64)) return false;
+        const image_address = @atomicLoad(u64, &capture_storage_image_address, .monotonic);
+        if (image_address != 0) {
+            for (resources.storage_images[0..resources.storage_image_count]) |image| {
+                if (image.writable and image.descriptor.address == image_address) return true;
+            }
+        }
+        const address = @atomicLoad(u64, &capture_storage_address, .monotonic);
+        const bytes = @atomicLoad(u64, &capture_storage_bytes, .monotonic);
+        if (address == 0 or bytes == 0 or bytes > 1024 * 1024) return false;
+        for (resources.addresses, resources.sizes, resources.writable) |base, size, writable| {
+            if (writable and address >= base and address - base < size and bytes <= size - (address - base)) return true;
+        }
+        return false;
+    }
+
+    fn diagnosticBufferRange(address: u64, size: usize, phase: []const u8) ?struct { offset: usize, size: usize } {
+        const selected = @atomicLoad(u64, &capture_storage_address, .monotonic);
+        if (selected == 0 or std.mem.eql(u8, phase, "vertex")) return .{ .offset = 0, .size = size };
+        const bytes = @atomicLoad(u64, &capture_storage_bytes, .monotonic);
+        if (bytes == 0 or bytes > 1024 * 1024) return null;
+        if (selected >= address and selected - address < size and bytes <= size - (selected - address))
+            return .{ .offset = @intCast(selected - address), .size = @intCast(bytes) };
+        // Keep small counters and parameters alongside the selected large
+        // range so unchanged stores can still be attributed to a dispatch.
+        if (size <= 4096) return .{ .offset = 0, .size = size };
+        return null;
+    }
+
+    fn captureStorageBuffers(self: *Renderer, resources: *const ComputeResources, prefix: []const u8, phase: []const u8) !void {
+        const bound = self.active_storage_buffers;
+        var uploaded: [maximum_storage_descriptors]bool = @splat(false);
+        var total: usize = 0;
+        // A readback wait clears upload-cache metadata. Snapshot every bound
+        // ring slice first, before waiting on the persistent allocations.
+        for (resources.addresses, resources.sizes, 0..) |address, size, slot| {
+            if (address == 0 or size == 0) continue;
+            const range = diagnosticBufferRange(address, size, phase) orelse continue;
+            for (self.draw_upload_cache.items) |cached| {
+                if (cached.guest_address != address or cached.size < size or cached.upload.buffer != bound[slot]) continue;
+                if (range.size > 64 * 1024 * 1024 or total + range.size > 512 * 1024 * 1024) return error.DiagnosticBufferLimit;
+                const ring = self.draw_upload_mapping orelse return Error.MemoryMapFailed;
+                var suffix_buffer: [96]u8 = undefined;
+                const suffix = try std.fmt.bufPrint(&suffix_buffer, "-{s}-buffer-{d}-{x}.bin", .{ phase, slot, address + range.offset });
+                try dumpDiagnosticBytes(self.allocator, prefix, suffix, ring[@as(usize, @intCast(cached.upload.offset)) + range.offset ..][0..range.size]);
+                uploaded[slot] = true;
+                total += range.size;
+                break;
+            }
+        }
+        for (resources.addresses, resources.sizes, 0..) |address, size, slot| {
+            if (address == 0 or size == 0 or uploaded[slot]) continue;
+            const range = diagnosticBufferRange(address, size, phase) orelse continue;
+            if (range.size > 64 * 1024 * 1024 or total + range.size > 512 * 1024 * 1024) return error.DiagnosticBufferLimit;
+            const entry = for (self.guest_buffers.items) |*candidate| {
+                if (candidate.guest_address == address and candidate.size == size and candidate.device_local.handle == bound[slot]) break candidate;
+            } else return Error.GuestBufferNotStaged;
+            const mapping = try self.mapStorageReadback(entry, range.offset + range.size);
+            defer mapping.release(self);
+            var suffix_buffer: [96]u8 = undefined;
+            const suffix = try std.fmt.bufPrint(&suffix_buffer, "-{s}-buffer-{d}-{x}.bin", .{ phase, slot, address + range.offset });
+            try dumpDiagnosticBytes(self.allocator, prefix, suffix, mapping.bytes[range.offset..][0..range.size]);
+            total += range.size;
+        }
+    }
+
     fn traceStorageImageContents(
         self: *Renderer,
         memory: GuestMemory,
@@ -19241,8 +19524,7 @@ pub const Renderer = struct {
             descriptor.address,
             probe_span,
         );
-        const source_generation = combineSourceGenerations(
-            combineSourceGenerations(resident_generation, page_generation), metadata_hash);
+        const source_generation = combineSourceGenerations(combineSourceGenerations(resident_generation, page_generation), metadata_hash);
         // Page generations make an O(number of pages) byte hash on every frame
         // unnecessary. Keep the hash fallback for standalone/smoke memory
         // providers which do not expose write tracking.
@@ -25099,8 +25381,7 @@ fn sampledDccFixedClearTexel(code: u8, descriptor: gpu.ImageDescriptor) ?DccClea
         71 => {
             result.length = 8;
             for (0..4) |channel| {
-                std.mem.writeInt(u16, result.bytes[channel * 2 ..][0..2],
-                    if (if (channel == alpha_channel) alpha_one else rgb_one) 0x3c00 else 0, .little);
+                std.mem.writeInt(u16, result.bytes[channel * 2 ..][0..2], if (if (channel == alpha_channel) alpha_one else rgb_one) 0x3c00 else 0, .little);
             }
         },
         else => return null,
