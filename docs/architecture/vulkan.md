@@ -18,7 +18,9 @@ storage images, a 512-set descriptor/scalar ring, a persistently mapped 128 MiB
 read-only/index upload arena, its pool, persistent guest render targets, and
 image/view/sampler/render-pass/framebuffer creation. It also owns bounded
 LRU compute and graphics-pipeline caches plus a 1,024-entry sampled-image LRU.
-Graphics SPIR-V translations also have a 64 MiB, 1,024-entry LRU. Its key
+Graphics SPIR-V translations have a lazy 256 MiB, 1,024-entry LRU. A captured
+streaming 3D scene exceeded 100 MiB of reused modules; the former 64 MiB budget
+caused roughly 200 repeated translations per frame. Its key
 includes decoded instructions, pipeline options and all translation bindings;
 dynamic scalar values are supplied through the per-draw SSBO. Keys serialize
 fields rather than padding or pointers and are compared in full after hashing.
