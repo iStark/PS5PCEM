@@ -343,6 +343,7 @@ pub const Options = struct {
     /// Synchronize guest 64-lane compute waves through workgroup memory.
     /// Multiple waves require a converged dispatcher around divergent blocks.
     wave64_workgroup: bool = false,
+    wave_exchange_double_buffer: bool = true,
     sampled_images: []const SampledImageBinding = &.{},
     storage_images: []const StorageImageBinding = &.{},
     /// Amount of per-workgroup LDS made available by COMPUTE_PGM_RSRC2. DS
@@ -779,10 +780,12 @@ const Builder = struct {
     local_invocation_index: u32 = 0,
     subgroup_local_invocation_id: u32 = 0,
     wave64_workgroup: bool = false,
+    wave_exchange_double_buffer: bool = true,
     converged_workgroup_dispatch: bool = false,
     dispatch_active: ?u32 = null,
     synchronize_linear_wave64_lds: bool = false,
     wave_scratch: u32 = 0,
+    wave_exchange_phase: u32 = 0,
     wave32: bool = false,
     wave_word_pointer: u32 = 0,
     /// The execution mask, as low and high halves, once a shader has narrowed
@@ -917,6 +920,7 @@ const Builder = struct {
             .maximum_dispatcher_iterations = options.maximum_dispatcher_iterations,
             .report_dispatcher_exhaustion = options.report_dispatcher_exhaustion,
             .wave64_workgroup = options.wave64_workgroup,
+            .wave_exchange_double_buffer = options.wave_exchange_double_buffer,
             .converged_workgroup_dispatch = options.wave64_workgroup and @as(u64, options.local_size[0]) * options.local_size[1] * options.local_size[2] > 64,
             .wave32 = options.wave32,
             .fragment_extent = options.fragment_extent,
@@ -1473,11 +1477,20 @@ const Builder = struct {
             const array_pointer = self.id();
             self.wave_word_pointer = self.id();
             self.wave_scratch = self.id();
-            // One exchange slot per invocation, plus the workgroup scheduler.
-            try self.emit(&self.declarations, 28, &.{ array_type, self.bits_type, try self.constant(.bits32, @intCast(invocations + 1)) });
+            // Alternate exchange banks so the next operation's first barrier
+            // completes prior readers before their bank is reused. The multi-
+            // wave dispatcher has a separate region and never aliases them.
+            const scratch_words = invocations * @as(u64, if (options.wave_exchange_double_buffer) 3 else 1) + 1;
+            try self.emit(&self.declarations, 28, &.{ array_type, self.bits_type, try self.constant(.bits32, @intCast(scratch_words)) });
             try self.emit(&self.declarations, 32, &.{ array_pointer, 4, array_type });
             try self.emit(&self.declarations, 32, &.{ self.wave_word_pointer, 4, self.bits_type });
             try self.emit(&self.declarations, 59, &.{ array_pointer, self.wave_scratch, 4 });
+            if (options.wave_exchange_double_buffer) {
+                const phase_pointer = self.id();
+                self.wave_exchange_phase = self.id();
+                try self.emit(&self.declarations, 32, &.{ phase_pointer, 6, self.bits_type }); // Private
+                try self.emit(&self.declarations, 59, &.{ phase_pointer, self.wave_exchange_phase, 6, try self.constant(.bits32, 0) });
+            }
         }
         if (options.private_memory_size_bytes != 0) {
             const words = std.math.divCeil(u32, options.private_memory_size_bytes, 4) catch
@@ -7535,7 +7548,27 @@ const Builder = struct {
             try self.emit(&self.body, 61, &.{ self.bits_type, invocation, self.local_invocation_index });
             index = try self.addBits(try self.andBits(invocation, ~@as(u32, 63)), lane);
         }
+        if (self.wave_exchange_phase != 0) {
+            const phase = self.id();
+            try self.emit(&self.body, 61, &.{ self.bits_type, phase, self.wave_exchange_phase });
+            index = try self.addBits(index, phase);
+        }
         return self.waveAbsolutePointer(index);
+    }
+
+    fn waveSchedulerPointer(self: *Builder, index: u32) Error!u32 {
+        const offset = if (self.wave_exchange_double_buffer) 2 * self.local_size[0] * self.local_size[1] * self.local_size[2] else 0;
+        return self.waveAbsolutePointer(try self.addBits(index, try self.constant(.bits32, offset)));
+    }
+
+    fn finishWaveExchange(self: *Builder) Error!void {
+        if (self.wave_exchange_phase == 0) return self.controlBarrier();
+        const phase = self.id();
+        try self.emit(&self.body, 61, &.{ self.bits_type, phase, self.wave_exchange_phase });
+        const next = self.id();
+        const words = self.local_size[0] * self.local_size[1] * self.local_size[2];
+        try self.emit(&self.body, 198, &.{ self.bits_type, next, phase, try self.constant(.bits32, words) }); // OpBitwiseXor
+        try self.emit(&self.body, 62, &.{ self.wave_exchange_phase, next });
     }
 
     fn waveAbsolutePointer(self: *Builder, index: u32) Error!u32 {
@@ -7556,8 +7589,7 @@ const Builder = struct {
         try self.emit(&self.body, 62, &.{ pointer, value });
         try self.controlBarrier();
         const result = try self.waveLoad(try self.andBits(source_lane, 63));
-        // Every reader must finish before another instruction reuses scratch.
-        try self.controlBarrier();
+        try self.finishWaveExchange();
         return result;
     }
 
@@ -7583,7 +7615,7 @@ const Builder = struct {
             try self.waveLoad(try self.constant(.bits32, 0)),
             try self.waveLoad(try self.constant(.bits32, 1)),
         };
-        try self.controlBarrier();
+        try self.finishWaveExchange();
         return result;
     }
 
@@ -10861,7 +10893,9 @@ fn selectWorkgroupDispatchPc(builder: *Builder, instructions: []const instructio
         try builder.emit(&builder.body, 169, &.{ builder.bits_type, selected, at_barrier, try builder.constant(.bits32, block.index | 0x8000_0000), candidate });
         candidate = selected;
     }
-    const pointer = try builder.wavePointer(try builder.currentLaneId());
+    const invocation = builder.id();
+    try builder.emit(&builder.body, 61, &.{ builder.bits_type, invocation, builder.local_invocation_index });
+    const pointer = try builder.waveSchedulerPointer(invocation);
     try builder.emit(&builder.body, 62, &.{ pointer, candidate });
     try builder.controlBarrier();
     const count = builder.local_size[0] * builder.local_size[1] * builder.local_size[2];
@@ -10869,7 +10903,7 @@ fn selectWorkgroupDispatchPc(builder: *Builder, instructions: []const instructio
     var base: u32 = 0;
     while (base < count) : (base += 64) {
         const wave_pc = builder.id();
-        try builder.emit(&builder.body, 61, &.{ builder.bits_type, wave_pc, try builder.waveAbsolutePointer(try builder.constant(.bits32, base)) });
+        try builder.emit(&builder.body, 61, &.{ builder.bits_type, wave_pc, try builder.waveSchedulerPointer(try builder.constant(.bits32, base)) });
         const earlier = builder.id();
         try builder.emit(&builder.body, 176, &.{ builder.bool_type, earlier, wave_pc, selected }); // OpULessThan
         const minimum = builder.id();
@@ -11346,6 +11380,7 @@ fn assemble(allocator: std.mem.Allocator, builder: *Builder, options: Options) E
     }
     if (builder.workgroup_memory != 0) try entry_point.append(allocator, builder.workgroup_memory);
     if (builder.wave_scratch != 0) try entry_point.append(allocator, builder.wave_scratch);
+    if (builder.wave_exchange_phase != 0) try entry_point.append(allocator, builder.wave_exchange_phase);
     if (builder.private_memory != 0) try entry_point.append(allocator, builder.private_memory);
     if (builder.fragment_valid_mask != 0) try entry_point.append(allocator, builder.fragment_valid_mask);
     for (builder.lane_spills.items) |spill| try entry_point.appendSlice(allocator, &.{ spill.value, spill.valid });

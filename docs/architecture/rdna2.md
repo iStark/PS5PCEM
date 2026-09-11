@@ -77,9 +77,14 @@ Bounds still come from the current Vulkan binding on every invocation.
 
 Workgroup-backed wave64 ballots clear one scratch word per physical invocation
 before accumulating the two mask halves. Lanes 0 and 1 initialize those halves;
-the existing barriers order initialization, atomic accumulation and scratch
-reuse. This removes the contended atomic stores without assuming a host subgroup
-size or changing empty, partial or independently scheduled wave masks.
+barriers order initialization and atomic accumulation. Exchanges alternate
+between two scratch banks, so the following exchange's first barrier protects
+previous readers before their bank is reused. The workgroup dispatcher has its
+own scratch region. This removes a final reuse barrier from each ballot and
+shuffle without assuming a host subgroup size or changing empty, partial or
+independently scheduled wave masks. `--wave64-ballots` checks interleaved masks
+and cross-half reads with both exchange policies; `--multi-wave64` covers loops
+and early exits in independently scheduled waves.
 
 A comparison can avoid that ballot when its VCC result is read only by
 `V_CNDMASK` before a complete comparison overwrite in the same guest block.
