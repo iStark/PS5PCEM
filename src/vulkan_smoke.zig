@@ -6795,6 +6795,80 @@ fn runSceneFlatPointerProbe(allocator: std.mem.Allocator) !void {
     std.debug.print("Scene FLAT snapshots passed: nested descriptor walk, carry-out address chain, relocated records, count bounds and live unmapped-read rejection\n", .{});
 }
 
+fn runFragmentShadowPointerProbe(allocator: std.mem.Allocator) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true });
+    defer renderer.deinit();
+    var guest = SizedGuestMemory(512 * 1024){};
+    const vertex = [_]u32{
+        vop1(6, 1, 261), vop1(1, 2, 255),  0x3f80_0000,      vop2(4, 3, 1, 2),
+        vop1(1, 4, 255), 0x3f40_0000,      vop2(8, 5, 3, 4), vop2(8, 6, 3, 3),
+        vop1(1, 7, 255), 0xbfc0_0000,      vop2(8, 6, 6, 7), vop1(1, 8, 255),
+        0x3f40_0000,     vop2(3, 6, 6, 8), vop1(1, 7, 128),  vop1(1, 8, 242),
+        0xf800_08cf,     0x0807_0605,      0xbf81_0000,
+    };
+    for (vertex, 0..) |word, i| guest.word(0x700 + i * 4, word);
+    var code: [0x12d4 / 4]u32 = @splat(0xbf800000);
+    const Site = struct { pc: usize, words: []const u32 };
+    for ([_]Site{
+        .{ .pc = 0x1194, .words = &.{ 0x943bff04, 0x00080010 } },
+        // Keep the real signed-index and CUBEID sites. The test supplies the
+        // face explicitly so both ends of the recorded window are exercised.
+        .{ .pc = 0x1284, .words = &.{0xbf820002} },
+        .{ .pc = 0x1288, .words = &.{ 0xd5440000, 0x04060500 } },
+        .{ .pc = 0x1290, .words = &.{vop1(1, 1, 6)} },
+        .{ .pc = 0x1294, .words = &.{vop2Source(0x25, 47, 59, 1)} },
+        .{ .pc = 0x129c, .words = &.{ 0xd5690033, 0x00025eff, 116 } },
+        .{ .pc = 0x12a8, .words = &.{ 0xf4041a80, 0xfa000040 } },
+        .{ .pc = 0x12c0, .words = &.{ 0xdc3887b8, 0x006a0033 } },
+        .{ .pc = 0x12c8, .words = &.{ 0xf800080f, 0x03020100, 0xbf810000 } },
+    }) |site| @memcpy(code[site.pc / 4 ..][0..site.words.len], site.words);
+    for (code, 0..) |word, i| guest.word(0x1000 + i * 4, word);
+    var state = gpu.State{};
+    const pixel = gpu.resources.ShaderStage.pixel;
+    try state.writeRegister(.shader, gpu.resources.ShaderStage.vertex.programRegisterBase(), 7);
+    try state.writeRegister(.shader, gpu.resources.ShaderStage.vertex.programRegisterBase() + 1, 0);
+    try state.writeRegister(.shader, pixel.programRegisterBase(), 0x10);
+    try state.writeRegister(.shader, pixel.programRegisterBase() + 1, 0);
+    try state.writeRegister(.shader, pixel.programRegisterBase() + 3, 8 << 1);
+    try state.writeRegister(.shader, pixel.userDataBase(), 0x10000);
+    try state.writeRegister(.context, 0x318, 0x40);
+    const context = [_][2]u32{
+        .{ 0x319, 0 }, .{ 0x31b, 0 },             .{ 0x31c, 10 << 2 },                 .{ 0x31d, 0 },
+        .{ 0x390, 0 }, .{ 0x3b0, (7 << 14) | 7 }, .{ 0x3b8, 1 << 24 },                 .{ 0x08e, 0xf },
+        .{ 0x00c, 0 }, .{ 0x00d, 8 | (8 << 16) }, .{ 0x094, 1 << 31 },                 .{ 0x095, 8 | (8 << 16) },
+        .{ 0x1e0, 0 }, .{ 0x200, 0 },             .{ 0x202, (0xcc << 16) | (1 << 4) }, .{ 0x204, 0 },
+        .{ 0x205, 0 },
+    };
+    for (context) |entry| try state.writeRegister(.context, entry[0], entry[1]);
+    for ([_]f32{ 4, 4, 4, 4, 1, 0 }, 0..) |value, i|
+        try state.writeRegister(.context, 0x10f + @as(u32, @intCast(i)), @bitCast(value));
+    var executor = gpu.DcbExecutor{ .state = &state, .backend = renderer.dcbBackend(guest.interface()), .allocator = allocator };
+    const stream = [_]u32{ command(gpu.pm4.draw_index_auto, 2), 3, 0 };
+    for (0..2) |pass| {
+        const base: u32 = @intCast(0x18000 + pass * 0x8000);
+        guest.word(0x10040, base);
+        for ([_][2]u32{ .{ 0, 0 }, .{ 127, 5 } }) |selection| {
+            const red: f32 = if (pass == 0) 0.25 else 0.75;
+            const values = [_]f32{ red, 0.5, 1.0, 1.0 };
+            for (values, 0..) |value, i| guest.word(base + 1976 + (selection[0] + selection[1]) * 116 + i * 4, @bitCast(value));
+            try state.writeRegister(.shader, pixel.userDataBase() + 4, selection[0] << 16);
+            try state.writeRegister(.shader, pixel.userDataBase() + 6, selection[1]);
+            _ = try executor.execute(&stream);
+            if (renderer.last_draw_error) |err| return err;
+            try renderer.flushPendingGuestWrites();
+            const center = guest.bytes[0x4000 + (4 * 8 + 4) * 4 ..][0..4];
+            const expected = [_]u8{ if (pass == 0) 64 else 191, 128, 255, 255 };
+            for (center, expected) |actual, wanted|
+                try std.testing.expect(@abs(@as(i16, actual) - wanted) <= 1);
+        }
+    }
+    try state.writeRegister(.shader, pixel.userDataBase() + 4, 128 << 16);
+    try state.writeRegister(.shader, pixel.userDataBase() + 6, 0);
+    _ = try executor.execute(&stream);
+    try std.testing.expectEqual(@as(?anyerror, error.GuestMemoryReadFailed), renderer.last_draw_error);
+    std.debug.print("fragment shadow records passed: rendered RGBA, live relocation, signed index, cube face range and unmapped-read rejection\n", .{});
+}
+
 fn runShadowRecordPointerProbe(allocator: std.mem.Allocator) !void {
     var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true });
     defer renderer.deinit();
@@ -8758,6 +8832,10 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--scene-bitset-pointers")) {
         try runSceneBitsetPointerProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--fragment-shadow-pointers")) {
+        try runFragmentShadowPointerProbe(allocator);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--shadow-record-pointers")) {

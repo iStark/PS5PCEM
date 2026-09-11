@@ -6482,31 +6482,7 @@ pub const Renderer = struct {
                 return Error.UnsupportedSampledImage;
             }
         }
-        if (resources.flat_memory_fault) |fault| {
-            const command_buffer = try self.beginOneShot();
-            defer self.releaseOneShot(command_buffer);
-            const barrier = vk.BufferMemoryBarrier{
-                .source_access_mask = vk.access_shader_write_bit,
-                .destination_access_mask = vk.access_host_read_bit,
-                .buffer = fault.buffer,
-                .offset = fault.offset,
-                .size = fault.size,
-            };
-            self.device_functions.cmd_pipeline_barrier(command_buffer, vk.pipeline_stage_compute_shader_bit, vk.pipeline_stage_host_bit, 0, 0, null, 1, @ptrCast(&barrier), 0, null);
-            try self.submitOneShot(command_buffer);
-            try self.waitForSubmittedWork();
-            const mapping = self.draw_upload_mapping orelse return Error.MemoryMapFailed;
-            const faults = std.mem.readInt(u32, mapping[@intCast(fault.offset)..][0..4], .little);
-            if (faults != 0) {
-                const record = mapping[@intCast(fault.offset + fault.size - 16)..][0..16];
-                std.debug.print("[vulkan dcb] FLAT snapshot fault program=0x{x} unmapped_words={d} first_pc=0x{x} address=0x{x} component={d}\n", .{
-                    program_address,                               faults,
-                    std.mem.readInt(u32, record[0..4], .little),   std.mem.readInt(u64, record[4..12], .little),
-                    std.mem.readInt(u32, record[12..16], .little),
-                });
-                return Error.GuestMemoryReadFailed;
-            }
-        }
+        try self.checkFlatMemoryFault(resources, program_address, vk.pipeline_stage_compute_shader_bit);
         const submit_elapsed_ns = elapsedHostNanoseconds(submit_started);
         self.frame_profile.compute_submit_ns +|= submit_elapsed_ns;
         if (self.traceCurrentGraphicsFrame()) {
@@ -8306,6 +8282,27 @@ pub const Renderer = struct {
     /// 168-byte object records. Keep guest pointers in the shader and expose
     /// the complete bounded records, including GPU-produced indices into them.
     /// This shape gate does not turn unrelated absolute addresses into zeros.
+    fn fragmentShadowRecords(analysis: *const gpu.ShaderAnalysis) bool {
+        // Material variants share the bounded shadow-record walk used by the
+        // compute lighting pass: a signed byte index, optional cube face 0..5,
+        // 116-byte records, and a base pointer loaded from the draw root+64.
+        // These instruction signatures keep unrelated absolute pointers on
+        // their explicit unsupported path until their bounds are recovered.
+        const Shape = struct { extract_pc: u32, extract: u32, cube_pc: u32, cube_sources: u32, multiply_pc: u32, multiply_dst: u32, multiply_sources: u32, load_pc: u32, read_pc: u32, read_sources: u32 };
+        for ([_]Shape{
+            .{ .extract_pc = 0x1194, .extract = 0x943bff04, .cube_pc = 0x1288, .cube_sources = 0x04060500, .multiply_pc = 0x129c, .multiply_dst = 0xd5690033, .multiply_sources = 0x00025eff, .load_pc = 0x12a8, .read_pc = 0x12c0, .read_sources = 0x006a0033 },
+            .{ .extract_pc = 0x35f8, .extract = 0x9402ff04, .cube_pc = 0x37e8, .cube_sources = 0x040a0300, .multiply_pc = 0x37fc, .multiply_dst = 0xd569005c, .multiply_sources = 0x0002b0ff, .load_pc = 0x3808, .read_pc = 0x3820, .read_sources = 0x006a005c },
+            .{ .extract_pc = 0x3c30, .extract = 0x9457ff51, .cube_pc = 0x3d38, .cube_sources = 0x040a0300, .multiply_pc = 0x3d4c, .multiply_dst = 0xd5690064, .multiply_sources = 0x0002c2ff, .load_pc = 0x3d58, .read_pc = 0x3d70, .read_sources = 0x006a0064 },
+        }) |shape| {
+            if (programHasRawInstruction(analysis, shape.extract_pc, &.{ shape.extract, 0x00080010 }) and
+                programHasRawInstruction(analysis, shape.cube_pc, &.{ 0xd5440000, shape.cube_sources }) and
+                programHasRawInstruction(analysis, shape.multiply_pc, &.{ shape.multiply_dst, shape.multiply_sources, 116 }) and
+                programHasRawInstruction(analysis, shape.load_pc, &.{ 0xf4041a80, 0xfa000040 }) and
+                programHasRawInstruction(analysis, shape.read_pc, &.{ 0xdc3887b8, shape.read_sources })) return true;
+        }
+        return false;
+    }
+
     fn prepareSceneFlatMemory(
         self: *Renderer,
         result: *ComputeResources,
@@ -8313,7 +8310,9 @@ pub const Renderer = struct {
         reader: gpu.ShaderMemoryReader,
         analysis: *const gpu.ShaderAnalysis,
     ) anyerror!void {
-        if (bindings.stage != .compute or bindings.user_data_count < 2 or bindings.scalar_user_data_base != 0) return;
+        if (bindings.user_data_count < 2 or bindings.scalar_user_data_base != 0) return;
+        const fragment_shadows = bindings.stage == .pixel and fragmentShadowRecords(analysis);
+        if (bindings.stage != .compute and !fragment_shadows) return;
         var matches = false;
         for ([_]u32{ 0x3ad4, 0x3a70, 0x39fc }) |pc| {
             if (programHasRawInstruction(analysis, pc, &.{ 0xdc34_8018, 0x0400_0004 }) and
@@ -8345,14 +8344,14 @@ pub const Renderer = struct {
         // by CUBEID's face (0..5), and a 116-byte stride. The scalar base is
         // loaded from root+6712 into VCC. Only this bounded pointer shape is
         // eligible; unmapped pages remain absent and active reads fault.
-        const shadows = programHasRawInstruction(analysis, 0x4a68, &.{ 0xd549_0041, 0x0221_214a }) and
+        const shadows = fragment_shadows or (programHasRawInstruction(analysis, 0x4a68, &.{ 0xd549_0041, 0x0221_214a }) and
             programHasRawInstruction(analysis, 0x4a70, &.{ 0xf404_1a80, 0xfa00_1a38 }) and
             programHasRawInstruction(analysis, 0x4a88, &.{ 0xd569_0047, 0x0002_82ff, 0x0000_0074 }) and
             programHasRawInstruction(analysis, 0x4a9c, &.{ 0xdc30_87b4, 0x4c6a_0047 }) and
             programHasRawInstruction(analysis, 0x4b0c, &.{ 0xd544_0034, 0x051e_6b34 }) and
             programHasRawInstruction(analysis, 0x4b1c, &.{0x4b48_6941}) and
             programHasRawInstruction(analysis, 0x4b2c, &.{ 0xd569_0034, 0x0003_48ff, 0x0000_0074 }) and
-            programHasRawInstruction(analysis, 0x4ba0, &.{ 0xdc38_8788, 0x476a_0034 });
+            programHasRawInstruction(analysis, 0x4ba0, &.{ 0xdc38_8788, 0x476a_0034 }));
         if (!matches and !bitsets and !shadows) return;
         const Region = struct { address: u64, size: usize };
         var regions: [maximum_storage_descriptors]Region = undefined;
@@ -8363,8 +8362,9 @@ pub const Renderer = struct {
         try self.flushGuestStorageRange(root, if (shadows) 8 else if (bitsets) 232 else 1024);
         if (shadows) {
             regions[0] = .{ .address = root, .size = 8 };
-            try self.flushGuestStorageRange(root + 6712, 8);
-            const base = (try reader.readU64(root + 6712)) & 0xffff_ffff_ffff;
+            const pointer_offset: u64 = if (fragment_shadows) 64 else 6712;
+            try self.flushGuestStorageRange(root + pointer_offset, 8);
+            const base = (try reader.readU64(root + pointer_offset)) & 0xffff_ffff_ffff;
             if (base == 0) return Error.GuestMemoryReadFailed;
             // GLOBAL adds the 32-bit vector byte offset to the scalar base.
             // Negative indices wrap in MUL_LO, producing a second small
@@ -9146,7 +9146,10 @@ pub const Renderer = struct {
         // Graphics already owns a combined VS/PS sampled-image table. Do not
         // overwrite its slots with this compute-only, per-stage table while
         // preparing graphics buffer and storage-image bindings.
-        if (bindings.stage != .compute) return result;
+        if (bindings.stage != .compute) {
+            try self.prepareSceneFlatMemory(result, bindings, reader, analysis);
+            return result;
+        }
         for (instructions) |inst| {
             const image_fetch = inst.opcode == .image_load or inst.opcode == .image_load_mip;
             if (!image_fetch and inst.opcode != .image_sample and inst.opcode != .image_gather4) continue;
@@ -15787,6 +15790,7 @@ pub const Renderer = struct {
             vertex_storage,
             graphics_resources.mappings[0..fragment_mapping_count],
         ) catch |err| blk: {
+            if (fragmentShadowRecords(fragment_analysis)) return err;
             if (log_verbose_gpu) std.debug.print(
                 "[vulkan dcb] fragment storage incomplete: {s}; translating without buffers\n",
                 .{@errorName(err)},
@@ -15909,6 +15913,7 @@ pub const Renderer = struct {
             .packed_color_exports = packed_color_exports,
             .descriptor_array_length = maximum_storage_descriptors,
             .scalar_memories = fragment_storage.scalar_memories[0..fragment_storage.scalar_memory_count],
+            .flat_memories = fragment_storage.flat_memories[0..fragment_storage.flat_memory_count],
             .sampled_image_array_length = self.device_info.sampled_image_capacity,
             .scalar_registers = fragment_scalar_regs[0..fragment_scalar_count],
             .dynamic_scalar_binding = if (fragment_scalar_count != 0) .{
@@ -16313,6 +16318,7 @@ pub const Renderer = struct {
                     false,
                     draw,
                 );
+                try self.checkFlatMemoryFault(fragment_storage, fragment_address, vk.pipeline_stage_fragment_shader_bit);
                 try self.commitStorageImages(memory, fragment_storage);
                 if (unity_ui_fallback) {
                     // The deferred HDR composite fallback presents its intact
@@ -16456,6 +16462,7 @@ pub const Renderer = struct {
                 false,
                 .{ .vertex_count = 4, .instance_count = 1 },
             );
+            try self.checkFlatMemoryFault(fragment_storage, fragment_address, vk.pipeline_stage_fragment_shader_bit);
             try self.commitStorageImages(memory, fragment_storage);
             if (planar_video_pass) {
                 // The VideoOut allocation is a different VA alias. Remember
@@ -16519,6 +16526,7 @@ pub const Renderer = struct {
             false,
             .{ .vertex_count = 3, .instance_count = 1 },
         );
+        try self.checkFlatMemoryFault(fragment_storage, fragment_address, vk.pipeline_stage_fragment_shader_bit);
         try self.commitStorageImages(memory, fragment_storage);
     }
 
@@ -18517,6 +18525,34 @@ pub const Renderer = struct {
             }, image_state.storage_usage);
         }
         try self.submitOneShot(command_buffer);
+    }
+
+    fn checkFlatMemoryFault(self: *Renderer, resources: *const ComputeResources, program_address: u64, source_stage: vk.Flags) anyerror!void {
+        if (resources.flat_memory_fault) |fault| {
+            const command_buffer = try self.beginOneShot();
+            defer self.releaseOneShot(command_buffer);
+            const barrier = vk.BufferMemoryBarrier{
+                .source_access_mask = vk.access_shader_write_bit,
+                .destination_access_mask = vk.access_host_read_bit,
+                .buffer = fault.buffer,
+                .offset = fault.offset,
+                .size = fault.size,
+            };
+            self.device_functions.cmd_pipeline_barrier(command_buffer, source_stage, vk.pipeline_stage_host_bit, 0, 0, null, 1, @ptrCast(&barrier), 0, null);
+            try self.submitOneShot(command_buffer);
+            try self.waitForSubmittedWork();
+            const mapping = self.draw_upload_mapping orelse return Error.MemoryMapFailed;
+            const faults = std.mem.readInt(u32, mapping[@intCast(fault.offset)..][0..4], .little);
+            if (faults != 0) {
+                const record = mapping[@intCast(fault.offset + fault.size - 16)..][0..16];
+                std.debug.print("[vulkan dcb] FLAT snapshot fault program=0x{x} unmapped_words={d} first_pc=0x{x} address=0x{x} component={d}\n", .{
+                    program_address,                               faults,
+                    std.mem.readInt(u32, record[0..4], .little),   std.mem.readInt(u64, record[4..12], .little),
+                    std.mem.readInt(u32, record[12..16], .little),
+                });
+                return Error.GuestMemoryReadFailed;
+            }
+        }
     }
 
     fn commitStorageImages(self: *Renderer, memory: GuestMemory, resources: *const ComputeResources) anyerror!void {

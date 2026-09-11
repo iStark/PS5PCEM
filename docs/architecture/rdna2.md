@@ -92,6 +92,15 @@ immediately preceding a memory instruction takes priority over the dispatch
 snapshot, because guest shaders routinely reuse dimension SGPRs before loading
 the real descriptor into them.
 
+Recognized material shadow-record walks also use bounded absolute-memory
+snapshots in fragment shaders. Their root+64 pointer selects 116-byte records
+through a signed byte index and cube face, matching the compute lighting
+contract. Snapshots refresh the actual mapped pages for each draw; active
+unmapped reads report a fault. Other absolute-pointer shapes still require
+their own resource bounds. `vulkan-smoke --fragment-shadow-pointers` checks
+rendered colour, pointer relocation, the maximum face/index and an unmapped
+negative index; the compute pointer probes cover the shared fault checks.
+
 Compute LDS is declared as bounded SPIR-V Workgroup memory using the size encoded
 by `COMPUTE_PGM_RSRC2`. Lowering covers 32/64/96/128-bit DS reads and writes,
 paired `read2`/`write2` byte addressing (including `st64` scaling), signed and
