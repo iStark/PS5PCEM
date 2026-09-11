@@ -772,6 +772,10 @@ const Builder = struct {
     storage_array: u32 = 0,
     storage_word_pointer_type: u32 = 0,
     storage_block_pointer_type: u32 = 0,
+    // Descriptor ranges are constant within a draw/dispatch. Reuse their SSA
+    // extent within a block, including a nonuniform descriptor with the same
+    // index ID. A label clears these values to preserve dominance.
+    buffer_extents: [64]struct { descriptor: u32 = 0, extent: u32 = 0 } = @splat(.{}),
     local_invocation_index: u32 = 0,
     subgroup_local_invocation_id: u32 = 0,
     wave64_workgroup: bool = false,
@@ -1513,6 +1517,7 @@ const Builder = struct {
         if (opcode == 248 and list == &self.body) {
             self.lane_predicate_mask = null;
             @memset(&self.mutable_register_values, 0);
+            @memset(&self.buffer_extents, .{});
         }
         switch (opcode) {
             345, 346 => self.uses_group_shuffle = true, // Shuffle / ShuffleXor
@@ -7839,18 +7844,19 @@ const Builder = struct {
         // Query the descriptor's live range. Baking `extent_bytes` into SPIR-V
         // makes an otherwise identical shader a new pipeline whenever a sprite
         // batch contains a different number of vertices.
-        const block_pointer = self.id();
-        try self.emit(&self.body, 65, &.{
-            self.storage_block_pointer_type,
-            block_pointer,
-            self.storage_array,
-            address.descriptor_index orelse try self.constant(.bits32, address.binding.descriptor_index),
-        }); // OpAccessChain descriptor
-        if (address.descriptor_index != null) try self.emit(&self.annotations, 71, &.{ block_pointer, 5300 });
-        const word_count = self.id();
-        try self.emit(&self.body, 68, &.{ self.bits_type, word_count, block_pointer, 0 }); // OpArrayLength
-        const extent = self.id();
-        try self.emit(&self.body, 196, &.{ self.bits_type, extent, word_count, try self.constant(.bits32, 2) });
+        const descriptor = address.descriptor_index orelse try self.constant(.bits32, address.binding.descriptor_index);
+        const cached = &self.buffer_extents[descriptor % self.buffer_extents.len];
+        const extent = if (cached.descriptor == descriptor) cached.extent else blk: {
+            const block_pointer = self.id();
+            try self.emit(&self.body, 65, &.{ self.storage_block_pointer_type, block_pointer, self.storage_array, descriptor });
+            if (address.descriptor_index != null) try self.emit(&self.annotations, 71, &.{ block_pointer, 5300 });
+            const word_count = self.id();
+            try self.emit(&self.body, 68, &.{ self.bits_type, word_count, block_pointer, 0 }); // OpArrayLength
+            const extent = self.id();
+            try self.emit(&self.body, 196, &.{ self.bits_type, extent, word_count, try self.constant(.bits32, 2) });
+            cached.* = .{ .descriptor = descriptor, .extent = extent };
+            break :blk extent;
+        };
         // The last byte this word touches, so a word straddling the end counts
         // as outside rather than half inside.
         const last = try self.addBits(address.byte_offset, try self.constant(.bits32, delta * 4 + 3));

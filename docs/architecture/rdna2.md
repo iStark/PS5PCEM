@@ -70,6 +70,11 @@ branches and loop iterations. On a captured 8,959-instruction compute program,
 this reduces SPIR-V from 1,304,166 to 1,201,382 words; it does not by itself
 establish a runtime FPS improvement.
 
+Buffer range queries reuse their descriptor extent within each SPIR-V block.
+The descriptor index remains dynamic for nonuniform resource tables, and labels
+invalidate cached IDs to keep branch and loop uses dominated by their definitions.
+Bounds still come from the current Vulkan binding on every invocation.
+
 Workgroup-backed wave64 ballots clear one scratch word per physical invocation
 before accumulating the two mask halves. Lanes 0 and 1 initialize those halves;
 the existing barriers order initialization, atomic accumulation and scratch
