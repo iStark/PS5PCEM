@@ -11,9 +11,12 @@ const shaders = @import("shaders.zig");
 const State = @import("state.zig").State;
 
 pub const Config = struct {
+    pub const IndexFormat = enum { uint16, uint32 };
     patches: u8,
     control_points: u8,
     factor_words: u8,
+    index_format: ?IndexFormat = null,
+    lds_bytes: u32 = 8192,
     inputs: rdna2.spirv.TessellationInputs,
 
     pub fn decode(state: *const State) !?Config {
@@ -23,12 +26,12 @@ pub const Config = struct {
         const patches = layout & 255;
         const input = (layout >> 8) & 63;
         const output = (layout >> 14) & 63;
-        // This ABI variant feeds one four-control-point patch per instance.
-        // Other layouts need their own input assembly and LDS entry mapping.
-        if (input != 4 or output != 4 or patches == 0 or patches > 64)
+        if (input != output or (input != 3 and input != 4) or
+            patches == 0 or patches * input > 256)
             return error.UnsupportedTessellationLayout;
         const domain = mode & 3;
-        if (domain != 2) return error.UnsupportedTessellationDomain;
+        if ((input == 3 and domain != 1) or (input == 4 and domain != 2))
+            return error.UnsupportedTessellationDomain;
         const partition = (mode >> 2) & 7;
         const topology = (mode >> 5) & 7;
         if (partition == 1 or partition > 3 or topology < 2 or topology > 3) return error.UnsupportedTessellationMode;
@@ -37,12 +40,21 @@ pub const Config = struct {
         if (state.readRegister(.uconfig, 0x24f)) |offchip| {
             if ((offchip >> 9) & 3 != 0) return error.UnsupportedTessellationOffchipSize;
         }
+        // GFX10 HS LDS_SIZE occupies bits 18..26, in 512-byte blocks.
+        // The indexed triangle LS writes 80 bytes per vertex (20 KiB/group
+        // in the observed layout), exceeding the existing quad's 8 KiB.
+        const lds_bytes = if (input == 3)
+            (((state.readRegister(.shader, 0x10b) orelse 0) >> 18) & 511) * 512
+        else
+            8192;
+        if (lds_bytes == 0 or lds_bytes > 32768) return error.UnsupportedTessellationLdsSize;
         return .{
             .patches = @intCast(patches),
-            .control_points = 4,
-            .factor_words = 6,
+            .control_points = @intCast(input),
+            .factor_words = if (domain == 1) 4 else 6,
+            .lds_bytes = lds_bytes,
             .inputs = .{
-                .domain = .quads,
+                .domain = if (domain == 1) .triangles else .quads,
                 .spacing = switch (partition) {
                     0 => .equal,
                     3 => .fractional_even,
@@ -61,6 +73,7 @@ pub const Config = struct {
     }
 
     pub fn prepareState(self: Config, state: *State, first_instance: u32, instances: u32) !void {
+        if (self.control_points != 4 or self.index_format != null) return error.UnsupportedTessellationDraw;
         const ls_low = state.readRegister(.shader, 0x148) orelse return error.MissingLocalShader;
         const ls_high = state.readRegister(.shader, 0x149) orelse 0;
         var user: [16]u32 = @splat(0);
@@ -74,6 +87,35 @@ pub const Config = struct {
         try state.writeRegister(.shader, 0x20d, ls_high);
         // 16 user SGPRs, WGID_X in s16, 8 KiB LDS, local ID in v0.
         try state.writeRegister(.shader, 0x213, (16 << 1) | (1 << 7) | (16 << 15));
+        try state.writeRegister(.shader, 0x207, self.localSize());
+        try state.writeRegister(.shader, 0x208, 1);
+        try state.writeRegister(.shader, 0x209, 1);
+    }
+
+    pub fn prepareIndexedState(self: Config, state: *State, first_instance: u32, patch_count: u32, base_vertex: i32, index_address: u64) !void {
+        const format = self.index_format orelse return error.UnsupportedTessellationDraw;
+        if (self.control_points != 3 or patch_count == 0 or index_address >> 48 != 0)
+            return error.UnsupportedTessellationDraw;
+        const index_bytes: u32 = if (format == .uint16) 2 else 4;
+        const byte_count = try std.math.mul(u32, try std.math.mul(u32, patch_count, 3), index_bytes);
+        var user: [28]u32 = @splat(0);
+        user[0] = state.readRegister(.shader, 0x102) orelse return error.MissingHullShaderTable;
+        user[1] = state.readRegister(.shader, 0x103) orelse return error.MissingHullShaderTable;
+        user[2] = @bitCast(base_vertex);
+        user[3] = first_instance;
+        user[4] = patch_count;
+        // The merged LS entry preserves s8..s23 before its own loads. s24
+        // onwards are temporaries in this indexed ABI. The synthetic compute
+        // entry uses s24:s27 for the index descriptor and s28 for WGID_X.
+        for (0..16) |i| user[8 + i] = state.readRegister(.shader, @intCast(0x10c + i)) orelse 0;
+        user[24] = @truncate(index_address);
+        user[25] = @intCast(index_address >> 32);
+        user[26] = byte_count;
+        user[27] = 0x0000_0fac; // Raw, byte-addressed buffer.
+        for (user, 0..) |value, i| try state.writeRegister(.shader, @intCast(0x240 + i), value);
+        try state.writeRegister(.shader, 0x20c, state.readRegister(.shader, 0x148) orelse return error.MissingLocalShader);
+        try state.writeRegister(.shader, 0x20d, state.readRegister(.shader, 0x149) orelse 0);
+        try state.writeRegister(.shader, 0x213, (28 << 1) | (1 << 7) | ((self.lds_bytes / 512) << 15));
         try state.writeRegister(.shader, 0x207, self.localSize());
         try state.writeRegister(.shader, 0x208, 1);
         try state.writeRegister(.shader, 0x209, 1);
@@ -124,26 +166,31 @@ pub const Entry = struct {
         if (!has_root) return error.UnsupportedHullShaderEntry;
         var w = Words{ .allocator = allocator };
         defer w.code.deinit(allocator);
-        try w.sop2(0x26, 17, 16, 128 + config.patches, null);
-        try w.sop2(0x03, 18, 15, 17, null);
-        try w.sop2(0x07, 18, 18, 128 + config.patches, null);
-        try w.sop2(0x1e, 18, 18, 130, null);
-        try w.vop1(0x02, 19, 256); // readfirstlane(local_id)
-        try w.sop2(0x03, 19, 18, 19, null);
-        try w.sop2(0x08, 19, 19, 128, null);
-        try w.sop2(0x07, 19, 19, 192, null);
-        try w.sop2(0x1e, 3, 19, 136, null);
-        try w.sop2(0x10, 3, 3, 19, null);
-        try w.sop2(0x1e, 2, 16, 143, null);
-        try w.sop2(0x26, 4, 16, 255, @as(u32, config.patches) * config.factor_words * 4);
-        try w.vop2(0x16, 5, 130, 0);
-        try w.vop2(0x25, 5, 17, 5);
-        try w.vop2(0x25, 5, 14, 5);
-        try w.vop2(0x1b, 2, 131, 0);
-        try w.vop1(0x01, 3, 256);
-        try w.vop2(0x16, 1, 130, 0);
-        try w.vop2(0x1a, 127, 136, 2);
-        try w.vop2(0x1c, 127, 257, 127);
+        if (config.index_format) |format| {
+            try w.indexedTriangleEntry(config, format);
+        } else {
+            if (config.control_points != 4) return error.UnsupportedTessellationDraw;
+            try w.sop2(0x26, 17, 16, 128 + config.patches, null);
+            try w.sop2(0x03, 18, 15, 17, null);
+            try w.sop2(0x07, 18, 18, 128 + config.patches, null);
+            try w.sop2(0x1e, 18, 18, 130, null);
+            try w.waveFirstId(19);
+            try w.sop2(0x03, 19, 18, 19, null);
+            try w.sop2(0x08, 19, 19, 128, null);
+            try w.sop2(0x07, 19, 19, 192, null);
+            try w.sop2(0x1e, 3, 19, 136, null);
+            try w.sop2(0x10, 3, 3, 19, null);
+            try w.sop2(0x1e, 2, 16, 143, null);
+            try w.sop2(0x26, 4, 16, 255, @as(u32, config.patches) * config.factor_words * 4);
+            try w.vop2(0x16, 5, 130, 0);
+            try w.vop2(0x25, 5, 17, 5);
+            try w.vop2(0x25, 5, 14, 5);
+            try w.vop2(0x1b, 2, 131, 0);
+            try w.vop1(0x01, 3, 256);
+            try w.vop2(0x16, 1, 130, 0);
+            try w.vop2(0x1a, 127, 136, 2);
+            try w.vop2(0x1c, 127, 257, 127);
+        }
         try w.code.appendSlice(allocator, local.code.items[0..local_end]);
         try w.code.append(allocator, 0xbf8a0000); // all LS writes visible to HS
         try w.vop1(0x01, 1, 256 + 127);
@@ -165,6 +212,53 @@ pub const Entry = struct {
 const Words = struct {
     allocator: std.mem.Allocator,
     code: std.ArrayList(u32) = .empty,
+
+    fn indexedTriangleEntry(self: *Words, config: Config, format: Config.IndexFormat) !void {
+        // Local IDs span a 256-thread group. Exact integer division retains
+        // patches crossing a wave boundary (64 and 128 are not divisible by 3).
+        try self.vop3(0x16a, 1, 256, 255, 128, 0xaaaa_aaab); // mul_hi(id, magic)
+        try self.vop2(0x16, 1, 129, 1); // relative patch = id / 3
+        try self.vop2(0x0b, 126, 131, 1); // patch * 3
+        try self.vop2(0x26, 126, 256, 126); // control point = id - patch*3
+        try self.vop2(0x1a, 127, 136, 126);
+        try self.vop2(0x1c, 127, 257, 127); // HS packed patch / control point
+        try self.vop1(0x01, 3, 256); // LS relative vertex
+        try self.vop1(0x01, 5, 3); // LS instance ID
+        try self.sop2(0x26, 96, 28, 255, config.patches); // group first patch
+        try self.sop2(0x26, 97, 96, 131, null); // group first index
+        try self.vop2(0x25, 126, 97, 0);
+        try self.vop2(0x1a, 126, if (format == .uint16) 129 else 130, 126);
+        const opcode: u32 = if (format == .uint16) 0x0a else 0x0c;
+        try self.code.append(self.allocator, 0xe000_1000 | (opcode << 18));
+        try self.code.append(self.allocator, (128 << 24) | (6 << 16) | (2 << 8) | 126);
+        try self.code.append(self.allocator, 0xbf8c_3f70); // wait for indices
+        try self.vop2(0x25, 2, 2, 2); // indexed vertex + signed base vertex
+        try self.sop2(0x03, 98, 4, 96, null);
+        try self.sop2(0x07, 98, 98, 255, config.patches);
+        try self.sop2(0x26, 98, 98, 131, null); // active vertices in group
+        try self.waveFirstId(99);
+        try self.sop2(0x03, 100, 98, 99, null);
+        try self.sop2(0x08, 100, 100, 128, null);
+        try self.sop2(0x07, 100, 100, 192, null); // active lanes in this wave
+        try self.sop2(0x1e, 3, 100, 136, null);
+        try self.sop2(0x10, 3, 3, 100, null);
+        try self.sop2(0x1e, 2, 28, 143, null); // offchip group byte offset
+        try self.sop2(0x26, 4, 28, 255, @as(u32, config.patches) * config.factor_words * 4);
+    }
+
+    fn waveFirstId(self: *Words, scalar: u32) !void {
+        // Guest EXEC masks cover 64 lanes even on a host with 32-wide
+        // subgroups. Both host halves must derive the same guest wave base.
+        try self.vop2(0x1b, 126, 255, 0);
+        try self.code.append(self.allocator, 0xffff_ffc0);
+        try self.vop1(0x02, scalar, 256 + 126);
+    }
+
+    fn vop3(self: *Words, op: u32, dst: u32, a: u32, b: u32, c: u32, literal: ?u32) !void {
+        try self.code.append(self.allocator, 0xd400_0000 | (op << 16) | dst);
+        try self.code.append(self.allocator, a | (b << 9) | (c << 18));
+        if (literal) |value| try self.code.append(self.allocator, value);
+    }
     fn sop2(self: *Words, op: u32, dst: u32, a: u32, b: u32, literal: ?u32) !void {
         try self.code.append(self.allocator, 0x80000000 | (op << 23) | (dst << 16) | (b << 8) | a);
         if (literal) |value| try self.code.append(self.allocator, value);
@@ -218,4 +312,41 @@ test "tessellation register decoding and compute entry preserve graphics state" 
     try std.testing.expectEqual(null, state.readRegister(.shader, 0x240));
     try std.testing.expectEqualDeep(state.context, compute.context);
     try std.testing.expectEqualDeep(state.uconfig, compute.uconfig);
+}
+
+test "indexed triangle tessellation preserves graphics registers and rejects invalid ranges" {
+    var state = State{};
+    try state.writeRegister(.uconfig, 0x242, 9);
+    try state.writeRegister(.context, 0x2d6, 0xc355);
+    try state.writeRegister(.context, 0x2db, 0x40049);
+    try std.testing.expectError(error.UnsupportedTessellationLdsSize, Config.decode(&state));
+    try state.writeRegister(.shader, 0x10b, 40 << 18);
+    var config = (try Config.decode(&state)).?;
+    try std.testing.expectEqual(.triangles, config.inputs.domain);
+    try std.testing.expectEqual(.fractional_odd, config.inputs.spacing);
+    try std.testing.expectEqual(.clockwise, config.inputs.order);
+    try std.testing.expectEqual(4, config.factor_words);
+    try std.testing.expectEqual(20480, config.lds_bytes);
+    try std.testing.expectEqual(256, config.localSize());
+    config.index_format = .uint32;
+    try state.writeRegister(.shader, 0x148, 0x69122f);
+    try state.writeRegister(.shader, 0x149, 0x80);
+    try state.writeRegister(.shader, 0x102, 0x12345678);
+    try state.writeRegister(.shader, 0x103, 0x20);
+    for (0..16) |i| try state.writeRegister(.shader, @intCast(0x10c + i), @intCast(100 + i));
+    var compute = state;
+    try std.testing.expectError(error.UnsupportedTessellationDraw, config.prepareIndexedState(&compute, 0, 0, 0, 0x1000));
+    try std.testing.expectError(error.UnsupportedTessellationDraw, config.prepareIndexedState(&compute, 0, 1, 0, 1 << 48));
+    try std.testing.expectError(error.Overflow, config.prepareIndexedState(&compute, 0, 0x40000000, 0, 0x1000));
+    try std.testing.expectEqualDeep(state, compute);
+    try config.prepareIndexedState(&compute, 11, 88, -7, 0x2012345000);
+    try std.testing.expectEqual(@as(u32, @bitCast(@as(i32, -7))), compute.readRegister(.shader, 0x242).?);
+    try std.testing.expectEqual(11, compute.readRegister(.shader, 0x243).?);
+    for (0..16) |i| try std.testing.expectEqual(@as(u32, @intCast(100 + i)), compute.readRegister(.shader, @intCast(0x248 + i)).?);
+    try std.testing.expectEqual(0x12345000, compute.readRegister(.shader, 0x258).?);
+    try std.testing.expectEqual(0x20, compute.readRegister(.shader, 0x259).?);
+    try std.testing.expectEqual(1056, compute.readRegister(.shader, 0x25a).?);
+    try std.testing.expectEqualDeep(state.context, compute.context);
+    try std.testing.expectEqualDeep(state.uconfig, compute.uconfig);
+    try std.testing.expectEqual(112, state.readRegister(.shader, 0x118).?);
 }

@@ -14718,6 +14718,14 @@ pub const Renderer = struct {
     }
 
     pub fn probeTessellationInputs(self: *Renderer) anyerror!void {
+        try self.probeTessellationDomain(.quads);
+        try self.probeTessellationDomain(.triangles);
+    }
+
+    fn probeTessellationDomain(self: *Renderer, domain: tessellation_spirv.Domain) anyerror!void {
+        const triangles = domain == .triangles;
+        const patches: usize = if (triangles) 85 else 63;
+        const factor_words: usize = if (triangles) 4 else 6;
         const op = struct {
             fn v(index: u32) rdna2.Operand {
                 return .{ .kind = .vgpr, .reg = index };
@@ -14770,37 +14778,45 @@ pub const Renderer = struct {
         var module = try rdna2.translateProgramSpirv(self.allocator, &program, .{
             .stage = .vertex,
             .tessellation_inputs = .{
-                .domain = .quads,
+                .domain = if (triangles) .triangles else .quads,
                 .spacing = .fractional_odd,
                 .order = .counter_clockwise,
                 .coordinate_vgprs = .{ 5, 6 },
                 .relative_patch_vgpr = 7,
                 .patch_id_vgpr = 8,
-                .patches_per_group = 63,
+                .patches_per_group = @intCast(patches),
                 .offchip_offset_sgpr = 4,
                 .offchip_group_bytes = 32768,
             },
         });
         defer module.deinit(self.allocator);
-        var factors: [65 * 6]f32 = @splat(0);
-        const buffer = try self.createBuffer(@sizeOf(@TypeOf(factors)), vk.buffer_usage_storage_buffer_bit, vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit);
+        var factor_storage: [87 * 6]f32 = @splat(0);
+        const factors = factor_storage[0 .. (patches + 2) * factor_words];
+        const buffer = try self.createBuffer(factors.len * 4, vk.buffer_usage_storage_buffer_bit, vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit);
         defer self.destroyBuffer(buffer);
         var state = GraphicsPipelineState.default(graphics_probe_width, graphics_probe_height);
-        state.tessellation_control_points = 4;
+        state.tessellation_control_points = if (triangles) 3 else 4;
         state.tessellation_factor_slot = 3;
-        state.tessellation_domain = @intFromEnum(tessellation_spirv.Domain.quads);
-        for ([_]?usize{ 0, 63, 64, null }) |active_patch| {
-            @memset(&factors, 0);
-            if (active_patch) |patch| @memcpy(factors[patch * 6 ..][0..6], &[_]f32{ 2.25, 3.25, 1.25, 2.75, 2.5, 1.5 });
-            try self.writeMapped(buffer, std.mem.sliceAsBytes(&factors));
+        state.tessellation_domain = @intFromEnum(domain);
+        for ([_]?usize{ 0, patches, patches + 1, null }) |active_patch| {
+            @memset(factors, 0);
+            if (active_patch) |patch| {
+                const levels = [_]f32{ 2.25, 3.25, 1.25, 2.75, 2.5, 1.5 };
+                @memcpy(factors[patch * factor_words ..][0..factor_words], levels[0..factor_words]);
+            }
+            try self.writeMapped(buffer, std.mem.sliceAsBytes(factors));
             try self.beginFrameDraw();
             self.updateStorageDescriptorRange(3, buffer.handle, 0, buffer.size);
-            try self.drawGraphicsShaders(module.words, &graphics_probe_fragment_spirv, &.{}, &.{}, state, null, &.{}, null, false, true, false, .{ .vertex_count = 66 * 4 });
+            try self.drawGraphicsShaders(module.words, &graphics_probe_fragment_spirv, &.{}, &.{}, state, null, &.{}, null, false, true, false, .{ .vertex_count = @as(u32, @intCast(patches + 3)) * state.tessellation_control_points });
             for (0..graphics_probe_height) |y| for (0..graphics_probe_width) |x| {
                 const expected = if (active_patch) |patch| blk: {
-                    const left = 4 + (patch % 63 % 2) * 24 + (patch % 2) * 8;
-                    const top = 4 + (patch / 63) * 24;
-                    break :blk x >= left and x < left + 8 and y >= top and y < top + 8;
+                    const left = 4 + (patch % patches % 2) * 24 + (patch % 2) * 8;
+                    const top = 4 + (patch / patches) * 24;
+                    if (x < left or x >= left + 8 or y < top or y >= top + 8) break :blk false;
+                    // Pixel centers exactly on the triangle's diagonal depend
+                    // on edge ownership; verify its interior and exterior.
+                    if (triangles and x - left + y - top == 7) continue;
+                    break :blk !triangles or x - left + y - top < 7;
                 } else false;
                 const offset = (y * graphics_probe_width + x) * 4;
                 const colored = self.graphics_probe_frame[offset] != 0;
@@ -14808,7 +14824,7 @@ pub const Renderer = struct {
                 try std.testing.expectEqual(expected, colored);
             };
         }
-        std.debug.print("tessellation inputs passed: fractional quad factors, patch IDs across groups, offchip offsets, changing factors, zero/OOB patch culling\n", .{});
+        std.debug.print("tessellation {s} inputs passed: fractional factors, patch IDs across groups, offchip offsets, changing factors, zero/OOB patch culling\n", .{@tagName(domain)});
     }
 
     fn drawGraphicsProbe(self: *Renderer) anyerror!void {
@@ -14832,14 +14848,25 @@ pub const Renderer = struct {
     const PreparedTessellation = struct {
         config: gpu.tessellation.Config,
         factors: gpu.BufferDescriptor,
+        patch_count: u32,
     };
 
     fn prepareTessellation(self: *Renderer, state: *const gpu.State, draw: GuestDraw) anyerror!?PreparedTessellation {
         if (!@atomicLoad(bool, &native_tessellation, .monotonic)) return null;
-        const config = (try gpu.tessellation.Config.decode(state)) orelse return null;
-        if (!self.tessellation_shaders_available or draw.index_count != null or
-            draw.vertex_count != config.control_points or draw.first_vertex != 0 or draw.instance_count == 0)
+        var config = (try gpu.tessellation.Config.decode(state)) orelse return null;
+        if (!self.tessellation_shaders_available or draw.instance_count == 0)
             return error.UnsupportedTessellationDraw;
+        const patch_count = if (config.control_points == 3) indexed: {
+            const count = draw.index_count orelse return error.UnsupportedTessellationDraw;
+            if (count == 0 or count % 3 != 0 or draw.instance_count != 1)
+                return error.UnsupportedTessellationDraw;
+            config.index_format = if (draw.index_uint32) .uint32 else .uint16;
+            break :indexed count / 3;
+        } else quads: {
+            if (draw.index_count != null or draw.vertex_count != config.control_points or draw.first_vertex != 0)
+                return error.UnsupportedTessellationDraw;
+            break :quads draw.instance_count;
+        };
         const memory = self.guest_memory orelse return Error.GuestMemoryUnavailable;
         const reader = gpu.ShaderMemoryReader{ .context = self, .read_fn = readShaderMemory };
         const ls_low = state.readRegister(.shader, 0x148) orelse return error.MissingLocalShader;
@@ -14862,18 +14889,22 @@ pub const Renderer = struct {
         var words: [4]u32 = undefined;
         try reader.readWords(globals + 32, &words);
         const factors = try gpu.resources.decodeBufferDescriptor(&words);
-        if (factors.size_bytes < @as(u64, draw.instance_count) * config.factor_words * 4) return error.TessellationFactorBufferTooSmall;
+        if (factors.size_bytes < @as(u64, patch_count) * config.factor_words * 4) return error.TessellationFactorBufferTooSmall;
         try reader.readWords(globals + 48, &words);
         const offchip = try gpu.resources.decodeBufferDescriptor(&words);
-        const groups = std.math.divCeil(u32, draw.instance_count, config.patches) catch unreachable;
+        const groups = std.math.divCeil(u32, patch_count, config.patches) catch unreachable;
         if (offchip.size_bytes < @as(u64, groups) * config.inputs.offchip_group_bytes) return error.TessellationOffchipBufferTooSmall;
         const compute = try self.allocator.create(gpu.State);
         defer self.allocator.destroy(compute);
         compute.* = state.*;
-        try config.prepareState(compute, draw.first_instance, draw.instance_count);
+        if (config.index_format != null) {
+            try config.prepareIndexedState(compute, draw.first_instance, patch_count, draw.vertex_offset, draw.index_address);
+        } else {
+            try config.prepareState(compute, draw.first_instance, patch_count);
+        }
         const report = try self.dispatchRdna2Analysis(compute, .{ config.localSize(), 1, 1 }, .{ groups, 1, 1 }, 0, &self.tessellation_program.?.merged);
         if (report.spirv_words == 0) return error.TessellationPrepassNotExecuted;
-        return .{ .config = config, .factors = factors };
+        return .{ .config = config, .factors = factors, .patch_count = patch_count };
     }
 
     fn drawGuestGraphics(
@@ -14885,7 +14916,7 @@ pub const Renderer = struct {
     ) anyerror!void {
         const tessellation = try self.prepareTessellation(state, guest_draw);
         const draw: GuestDraw = if (tessellation) |tess| .{
-            .vertex_count = try std.math.mul(u32, guest_draw.instance_count, tess.config.control_points),
+            .vertex_count = try std.math.mul(u32, tess.patch_count, tess.config.control_points),
         } else guest_draw;
         self.trace_gpu_programs = .{
             vertex_stage.programAddress(state) orelse 0,
@@ -15143,7 +15174,11 @@ pub const Renderer = struct {
         pipeline_state.topology = guestPrimitiveTopology(render_state.primitive_type, draw);
         if (tessellation) |tess| {
             pipeline_state.tessellation_control_points = tess.config.control_points;
-            pipeline_state.tessellation_domain = @intFromEnum(tessellation_spirv.Domain.quads);
+            pipeline_state.tessellation_domain = @intFromEnum(switch (tess.config.inputs.domain) {
+                .triangles => tessellation_spirv.Domain.triangles,
+                .quads => tessellation_spirv.Domain.quads,
+                .isolines => tessellation_spirv.Domain.isolines,
+            });
         }
         pipeline_state.rasterization_samples = rasterSampleCount(color_samples) orelse
             return Error.UnsupportedColorTarget;

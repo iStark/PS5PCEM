@@ -512,7 +512,7 @@ fn decodeImpl(
         if (inst.opcode.isBranch()) furthest_branch_target = @max(furthest_branch_target, inst.branch_target);
         // An earlier path can jump beyond this return and intervening padding.
         // Decode through every referenced forward target before ending the body.
-        if (inst.opcode.isProgramEnd() and furthest_branch_target < word_index * 4) break;
+        if (isProgramTerminator(inst) and furthest_branch_target < word_index * 4) break;
     } else {
         std.debug.print(
             "[gpu shader] instruction limit program=0x{x} instructions={d} words={d} pc=0x{x} first=0x{x:0>8} last=0x{x:0>8}\n",
@@ -548,7 +548,11 @@ fn isHardwareNggSetpc(inst: rdna2.Instruction) bool {
 }
 
 fn isProgramTerminator(inst: rdna2.Instruction) bool {
-    return inst.opcode.isProgramEnd();
+    // A merged local/export shader transfers to the hardware continuation
+    // through s6:s7. Its following allocation bytes can be AGC metadata,
+    // with no intervening END_PGM. Other SETPC sources can enter a fetch
+    // shader and must retain the following vertex continuation.
+    return inst.opcode.isProgramEnd() or isHardwareNggSetpc(inst);
 }
 
 /// Replaces a non-s6 `S_SETPC_B64` with the fetch-shader body, dropping the
@@ -570,7 +574,7 @@ pub fn inlineFetchShader(
 
     var fetch_len = fetch.len;
     if (fetch_len != 0 and fetch[fetch_len - 1].opcode == .s_setpc_b64) fetch_len -= 1;
-    if (fetch_len != 0 and isProgramTerminator(fetch[fetch_len - 1])) fetch_len -= 1;
+    if (fetch_len != 0 and fetch[fetch_len - 1].opcode.isProgramEnd()) fetch_len -= 1;
     if (fetch_len == 0) return false;
 
     const fetch_base: u32 = 0x4000_0000;
@@ -649,6 +653,32 @@ test "analysis follows a forward branch beyond an early return and padding" {
     defer analysis.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u32, 20), analysis.program.instructions.items[5].pc);
     try std.testing.expect(analysis.graph.blockForPc(16) != null);
+}
+
+test "analysis stops at hardware continuation before trailing shader metadata" {
+    var memory = TestMemory{};
+    memory.word(0, 0xbe80_0381); // s_mov_b32 s0, 1
+    memory.word(4, 0xbefd_2106); // s_setpc_b64 s[6:7]
+    memory.word(8, 0x2010_00e0); // Metadata, not a valid instruction.
+    var analysis = try decodeBounded(std.testing.allocator, memory.reader(), 0, 16, 12);
+    defer analysis.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), analysis.code.items.len);
+    try std.testing.expectEqual(rdna2.Opcode.s_setpc_b64, analysis.program.instructions.items[1].opcode);
+}
+
+test "hardware continuation preserves reachable forward paths and ordinary fetch returns" {
+    var memory = TestMemory{};
+    memory.word(0, 0xbf85_0002); // s_cbranch_scc1 -> pc 12
+    memory.word(4, 0xbefd_2106); // Hardware continuation on the other path.
+    memory.word(8, 0xbf80_0000);
+    memory.word(12, 0xbefd_2102); // Ordinary fetch shader; continuation follows.
+    memory.word(16, 0xbe80_0381);
+    memory.word(20, 0xbf81_0000);
+    var analysis = try decode(std.testing.allocator, memory.reader(), 0, 16);
+    defer analysis.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 6), analysis.code.items.len);
+    try std.testing.expect(analysis.graph.blockForPc(12) != null);
+    try std.testing.expectEqual(@as(u32, 20), analysis.program.instructions.items[5].pc);
 }
 
 test "analysis releases an invalid branch target without freeing instructions twice" {

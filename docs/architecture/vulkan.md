@@ -105,10 +105,20 @@ LS/HS path. It remains `false` by default; development launch controls may
 enable it explicitly. [`gpu.tessellation`](../../src/gpu/tessellation.zig)
 merges the local and hull programs into a compute prepass, preserves the
 graphics register state, and supplies offchip data and generated factors to
-the domain stage. The supported path is non-indexed, four-control-point quad
-patches; unsupported layouts fail explicitly. The tessellation unit test and
-`vulkan-smoke --tessellation-inputs` cover register setup and domain inputs.
-Live-title rendering remains a separate validation step.
+the domain stage. Supported layouts are nonindexed four-control-point quads
+and indexed three-control-point triangles, with at most 256 control points
+per group. Indexed draws currently require a single instance, preserve the
+base vertex and instance ID, and accept either 16-bit or 32-bit indices.
+Triangle LDS size comes from the HS register; unsupported layouts fail
+explicitly. Local programs end at their hardware continuation before trailing
+allocation metadata. Guest 64-lane masks use the same wave base in both halves
+of a 32-wide host subgroup pair.
+
+`vulkan-smoke --indexed-tessellation` checks the merged LS/HS path for both
+layouts, including partial groups, high user SGPRs and 20 KiB triangle LDS.
+`--tessellation-inputs` checks fractional triangle and quad factors, domain
+inputs, offchip offsets and zero/out-of-bounds patch culling. Live-title
+rendering remains a separate validation step.
 
 Developer capture controls also default to zero: `capture_storage_program`
 and `capture_storage_flip` select compute snapshots; `capture_vertex_program`

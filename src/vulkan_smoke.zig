@@ -102,6 +102,11 @@ fn sop1(opcode: u8, destination: u8, source: u9) u32 {
     return 0xbe80_0000 | (@as(u32, destination) << 16) | (@as(u32, opcode) << 8) | source;
 }
 
+fn sop2(opcode: u7, destination: u7, source0: u8, source1: u8) u32 {
+    return 0x8000_0000 | (@as(u32, opcode) << 23) | (@as(u32, destination) << 16) |
+        (@as(u32, source1) << 8) | source0;
+}
+
 /// One indexed buffer access, encoded the way the hardware spells it.
 ///
 /// The resource names its descriptor by the first scalar register divided by
@@ -8745,9 +8750,116 @@ fn runHighHalfStoreProbe(allocator: std.mem.Allocator) !void {
     std.debug.print("high-half stores passed: 64 adjacent lanes, unaligned byte/halfword writes, guards and changed inputs on cache hits\n", .{});
 }
 
+// Exercise the hardware values supplied to an indexed LS and consumed by its
+// HS. Three-vertex patches cross wave boundaries; the final group has only
+// nine vertices. Data lives above 16 KiB in LDS and must survive the barrier.
+fn runIndexedTessellationProbe(allocator: std.mem.Allocator) !void {
+    try runNativeLsHsProbe(allocator, true);
+    try runNativeLsHsProbe(allocator, false);
+}
+
+fn runNativeLsHsProbe(allocator: std.mem.Allocator, triangles: bool) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{});
+    defer renderer.deinit();
+    const guest = try allocator.create(GuestMemory);
+    defer allocator.destroy(guest);
+    guest.* = .{};
+    _ = renderer.dcbBackend(guest.interface());
+    const local_code = [_]u32{
+        sop2(0x1e, 96, 3, 144), // active LS lanes in s3[7:0]
+        sop2(0x29, 126, 193, 96), // EXEC = low active bits of -1
+        vop1(1, 4, if (triangles) 20 else 13), // high user SGPR, alongside v2/v3/v5
+        vop2Source(0x1a, 10, 132, 0), // local ID * 16
+        0xd800_0000 | (if (triangles) @as(u32, 0x4000) else 0) | (0xdf << 18),
+        (2 << 8) | 10,
+        0xbefd_2106, // hardware LS -> HS continuation
+    };
+    const hull_code = [_]u32{
+        0xf408_0200, 0xfa00_0000, // s[8:11] = root-table output descriptor
+        sop1(4, 126, 193), // restore EXEC before the stage's barrier
+        0xbf8a_0000,
+        sop2(0x1e, 96, 3, 144),
+        sop2(0x29, 126, 193, 96),
+        vop2Source(0x1b, 10, 255, 1), 255, // relative patch in v1[7:0]
+        vop2Source(0x0b, 10, if (triangles) 131 else 132, 10), // patch * control points
+        vop2Source(0x16, 11, 136, 1), // control point in v1[15:8]
+        vop2(0x25, 10, 11, 10),
+        vop2Source(0x1a, 10, 132, 10),
+        0xd800_0000 | (if (triangles) @as(u32, 0x4000) else 0) | (0xff << 18),
+        (20 << 24) | 10,
+        sop2(0x20, 12, 2, 131), // group output = offchip offset / 8
+        0xbf8c_3f70,
+        0xe000_1000 | (0x1e << 18),
+        (12 << 24) | (2 << 16) | (20 << 8) | 10,
+        0xbf81_0000,
+    };
+    for (local_code, 0..) |word, i| guest.word(0x800 + i * 4, word);
+    for (hull_code, 0..) |word, i| guest.word(0x1000 + i * 4, word);
+    const reader = gpu.ShaderMemoryReader{ .context = guest, .read_fn = GuestMemory.read };
+    var local = try gpu.shader_analysis.decodeBounded(allocator, reader, 0x800, local_code.len, local_code.len * 4);
+    defer local.deinit(allocator);
+    var hull = try gpu.shader_analysis.decodeBounded(allocator, reader, 0x1000, hull_code.len, hull_code.len * 4);
+    defer hull.deinit(allocator);
+    for ([_]gpu.tessellation.Config.IndexFormat{ .uint16, .uint32 }) |format| {
+        if (!triangles and format == .uint32) continue;
+        var state = gpu.State{};
+        try state.writeRegister(.uconfig, 0x242, 9);
+        try state.writeRegister(.context, 0x2d6, if (triangles) 0xc355 else 0x1043f);
+        try state.writeRegister(.context, 0x2db, if (triangles) 0x40049 else 0x4006a);
+        try state.writeRegister(.shader, 0x10b, 40 << 18);
+        try state.writeRegister(.shader, 0x148, 8);
+        try state.writeRegister(.shader, 0x102, 0x2000);
+        try state.writeRegister(.shader, 0x103, 0);
+        for (0..6) |i| try state.writeRegister(.shader, @intCast(0x10c + i), 0);
+        try state.writeRegister(.shader, 0x111, 0xdead_beef);
+        try state.writeRegister(.shader, 0x118, 0xdead_beef);
+        var config = (try gpu.tessellation.Config.decode(&state)).?;
+        config.index_format = if (triangles) format else null;
+        var entry = try gpu.tessellation.Entry.init(allocator, config, &local, &hull);
+        defer entry.deinit(allocator);
+        for (entry.merged.code.items, 0..) |word, i| guest.word(0x10000 + i * 4, word);
+        for ([_]u32{ 0x4000, 0, 8192, 0xfac }, 0..) |word, i| guest.word(0x2000 + i * 4, word);
+        @memset(guest.bytes[0x4000..0x6000], 0xcd);
+        const index_bytes: usize = if (format == .uint16) 2 else 4;
+        for (0..264) |i| {
+            const index: u32 = @intCast(31 + (i * 73) % 264 + (if (format == .uint32) @as(usize, 100000) else 0));
+            if (format == .uint16)
+                std.mem.writeInt(u16, guest.bytes[0x3000 + i * index_bytes ..][0..2], @intCast(index), .little)
+            else
+                guest.word(0x3000 + i * index_bytes, index);
+        }
+        if (triangles)
+            try config.prepareIndexedState(&state, 11, 88, -7, 0x3000)
+        else
+            try config.prepareState(&state, 11, 66);
+        try state.writeRegister(.shader, 0x20c, 0x100);
+        _ = try renderer.dispatchRdna2State(&state, .{ config.localSize(), 1, 1 }, .{ 2, 1, 1 });
+        var output: [8192]u8 = undefined;
+        try renderer.readbackGuestStorageBuffer(0x4000, &output);
+        for (0..2) |group| for (0..256) |lane| {
+            const vertices: usize = if (triangles) 255 else 252;
+            const i = group * vertices + lane;
+            const active = lane < vertices and i < 264;
+            const index: u32 = @intCast(if (triangles) 24 + (i * 73) % 264 + (if (format == .uint32) @as(usize, 100000) else 0) else lane % 4);
+            const instance: u32 = @intCast(if (triangles) 11 else 11 + i / 4);
+            const expected: [4]u32 = if (active) .{ index, @intCast(lane), 0xdead_beef, instance } else @splat(0xcdcd_cdcd);
+            for (expected, 0..) |value, channel| {
+                const actual = std.mem.readInt(u32, output[(group * 256 + lane) * 16 + channel * 4 ..][0..4], .little);
+                if (value != actual) std.debug.print("native LS/HS triangles={any} {s}: group={d} lane={d} channel={d}\n", .{ triangles, @tagName(format), group, lane, channel });
+                try std.testing.expectEqual(value, actual);
+            }
+        };
+    }
+    std.debug.print("native LS/HS triangles={any} passed: indices/control points, base vertex, instance, high user SGPR, wave boundaries, LDS and partial group\n", .{triangles});
+}
+
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
     const args = try init.minimal.args.toSlice(allocator);
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--indexed-tessellation")) {
+        try runIndexedTessellationProbe(allocator);
+        return;
+    }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--fragment-first-active")) {
         try runFragmentFirstActiveLaneProbe(allocator, false);
         return;
