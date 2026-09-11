@@ -24513,11 +24513,42 @@ fn programHasRawInstruction(
     pc: u32,
     words: []const u32,
 ) bool {
-    for (analysis.program.instructions.items) |inst| {
-        if (inst.pc != pc or @as(usize, @intCast(inst.raw_count)) < words.len) continue;
-        if (std.mem.eql(u32, inst.raw[0..words.len], words)) return true;
+    // Decoding and branch specialization preserve instruction PC order.
+    // These probes run during resource preparation for every draw/dispatch;
+    // a missing signature must not scan a many-thousand-instruction shader.
+    const instructions = analysis.program.instructions.items;
+    var low: usize = 0;
+    var high = instructions.len;
+    while (low < high) {
+        const middle = low + (high - low) / 2;
+        const inst = &instructions[middle];
+        if (inst.pc < pc) {
+            low = middle + 1;
+        } else if (inst.pc > pc) {
+            high = middle;
+        } else {
+            return inst.raw_count >= words.len and std.mem.eql(u32, inst.raw[0..words.len], words);
+        }
     }
     return false;
+}
+
+test "raw shader signatures require instruction boundaries and complete words" {
+    const allocator = std.testing.allocator;
+    const words = [_]u32{ 0xbe8003ff, 0x12345678, 0xbf800000, 0xbf810000 };
+    var program = try rdna2.decodeProgram(allocator, &words);
+    defer program.deinit(allocator);
+    var analysis: gpu.ShaderAnalysis = undefined;
+    analysis.program = program;
+    try std.testing.expect(programHasRawInstruction(&analysis, 0, words[0..2]));
+    try std.testing.expect(programHasRawInstruction(&analysis, 8, words[2..3]));
+    try std.testing.expect(programHasRawInstruction(&analysis, 12, words[3..4]));
+    try std.testing.expect(!programHasRawInstruction(&analysis, 4, words[1..2]));
+    try std.testing.expect(!programHasRawInstruction(&analysis, 8, words[2..4]));
+    try std.testing.expect(!programHasRawInstruction(&analysis, 12, words[2..3]));
+    try std.testing.expect(!programHasRawInstruction(&analysis, 16, words[3..4]));
+    analysis.program.instructions.items = &.{};
+    try std.testing.expect(!programHasRawInstruction(&analysis, 0, words[0..1]));
 }
 
 fn guestProgramHasWord(memory: GuestMemory, program_address: u64, pc: u64, expected: u32) bool {
