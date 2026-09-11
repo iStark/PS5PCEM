@@ -18909,8 +18909,9 @@ pub const Renderer = struct {
         }
         self.reportChangedTextureContent(descriptor, byte_count, content_hash);
 
-        const linear = try self.allocator.alloc(u8, byte_count);
-        defer self.allocator.free(linear);
+        var linear_scratch = try self.image_scratch.acquire(self.allocator, byte_count);
+        defer linear_scratch.release();
+        const linear = linear_scratch.bytes;
         const reader = gpu.ShaderMemoryReader{ .context = memory.context, .read_fn = memory.read };
         var source_available = true;
         const dcc_materialized_texel: ?DccClearTexel = if (aliases_active_render_target)
@@ -18941,8 +18942,9 @@ pub const Renderer = struct {
             );
         } else if (mip_plan) |plan| {
             @memset(linear, 0);
-            const tiled = try self.allocator.alloc(u8, probe_span);
-            defer self.allocator.free(tiled);
+            var tiled_scratch = try self.image_scratch.acquire(self.allocator, probe_span);
+            defer tiled_scratch.release();
+            const tiled = tiled_scratch.bytes;
             if (!plan.readSource(memory, descriptor.address, tiled)) {
                 if (descriptor.tile_mode != .depth) return Error.GuestMemoryReadFailed;
                 source_available = false;
@@ -18971,8 +18973,9 @@ pub const Renderer = struct {
             // texel. A 4096×4096 RGBA texture therefore issued 16.7 million
             // range checks and took several seconds. Validate/copy the tiled
             // allocation once, then detile the host slice without callbacks.
-            const tiled = try self.allocator.alloc(u8, probe_span);
-            defer self.allocator.free(tiled);
+            var tiled_scratch = try self.image_scratch.acquire(self.allocator, probe_span);
+            defer tiled_scratch.release();
+            const tiled = tiled_scratch.bytes;
             if (!memory.read(memory.context, descriptor.address, tiled)) {
                 if (descriptor.tile_mode != .depth) return Error.GuestMemoryReadFailed;
                 source_available = false;

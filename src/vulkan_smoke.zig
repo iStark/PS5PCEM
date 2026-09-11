@@ -3083,6 +3083,59 @@ fn runImageScratchProbe(allocator: std.mem.Allocator) !void {
     std.debug.print("image scratch passed: alternating pooled/unpooled extents, linear/RB+ padding, native updates, partial GPU writes and failed-write retry\n", .{});
 }
 
+fn runSampledScratchProbe(allocator: std.mem.Allocator) !void {
+    const Memory = SizedGuestMemory(8 * 1024 * 1024);
+    const guest = try allocator.create(Memory);
+    defer allocator.destroy(guest);
+    guest.* = .{};
+    var renderer = try vulkan.Renderer.init(allocator, .{});
+    defer renderer.deinit();
+    _ = renderer.dcbBackend(guest.interface());
+    const code = [_]u32{
+        vop1(1, 0, 255), 0x3e80_0000,
+        vop1(1, 1, 255), 0x3f40_0000,
+        0xf09c_010a,     0x0040_0200,
+        1,               0xe070_0000,
+        0x8003_0200,     0xbf81_0000,
+    };
+    for (code, 0..) |word, i| guest.word(0x100 + i * 4, word);
+    var state = gpu.State{};
+    const compute = gpu.resources.ShaderStage.compute;
+    try state.writeRegister(.shader, compute.programRegisterBase(), 1);
+    try state.writeRegister(.shader, compute.programRegisterBase() + 1, 0);
+    try state.writeRegister(.shader, 0x213, 16 << 1);
+    var images = [_][8]u32{
+        sampledImageDescriptorWords(0x200000, 257, 129),
+        sampledImageDescriptorWords(0x200000, 385, 97),
+        sampledImageDescriptorWords(0x200000, 512, 512),
+    };
+    images[1][3] |= @as(u32, @intFromEnum(gpu.resources.TileMode.standard_4kb)) << 20;
+    images[2][3] |= (3 << 16) | (@as(u32, @intFromEnum(gpu.resources.TileMode.standard_4kb)) << 20);
+    images[2][5] = 3 << 4;
+    for ([_]bool{ false, true, true, false, true }, 0..) |enabled, pass| {
+        renderer.image_scratch.enabled = enabled;
+        for (images, 0..) |words, index| {
+            const descriptor = try gpu.resources.decodeImageDescriptor(&words);
+            const texture = try gpu.TextureLayout.fromImage(descriptor);
+            const value: u8 = @intCast(30 + pass * 31 + index * 7);
+            @memset(guest.bytes[0x200000..][0..@intCast(texture.required_source_bytes)], value);
+            var userdata: [16]u32 = @splat(0);
+            @memcpy(userdata[0..8], &words);
+            @memcpy(userdata[12..16], &[_]u32{ 0x10000, 4 << 16, 1, 0 });
+            for (userdata, 0..) |word, i| try state.writeRegister(.shader, compute.userDataBase() + @as(u32, @intCast(i)), word);
+            _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
+            var output: [4]u8 = undefined;
+            try renderer.readbackGuestStorageBuffer(0x10000, &output);
+            try std.testing.expectApproxEqAbs(@as(f32, @floatFromInt(value)) / 255.0, @as(f32, @bitCast(std.mem.readInt(u32, &output, .little))), 0.00001);
+            const uploaded = renderer.frame_profile.texture_upload_bytes;
+            _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
+            try std.testing.expectEqual(uploaded, renderer.frame_profile.texture_upload_bytes);
+        }
+    }
+    try std.testing.expect(renderer.image_scratch.entries[0].len + renderer.image_scratch.entries[1].len >= 1024 * 1024);
+    std.debug.print("sampled scratch passed: pooled/unpooled linear/tiled/mip uploads, changing sizes and CPU content, unchanged cache reuse\n", .{});
+}
+
 fn runZeroDepthSampleProbe(allocator: std.mem.Allocator) !void {
     var renderer = try vulkan.Renderer.init(allocator, .{});
     defer renderer.deinit();
@@ -8153,6 +8206,10 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--storage-reuse")) {
         try runStorageImageReuseProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--sampled-scratch")) {
+        try runSampledScratchProbe(allocator);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--image-scratch")) {
