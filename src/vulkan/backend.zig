@@ -3354,7 +3354,9 @@ pub const Renderer = struct {
     compute_pipelines: std.ArrayList(ComputePipelineEntry) = .empty,
     compute_pipeline_sequence: u64 = 0,
     graphics_pipelines: std.ArrayList(GraphicsPipelineEntry) = .empty,
-    graphics_translations: spirv_cache.Cache = .{},
+    // A streamed 3D scene can reuse hundreds of large vertex/fragment modules
+    // per frame. A 64 MiB limit evicts them before the next frame consumes them.
+    graphics_translations: spirv_cache.Cache = .{ .maximum_bytes = 256 * 1024 * 1024 },
     /// Compute programs also recur with different runtime scalar values. Keep
     /// their translations within a separate budget so scene kernels cannot
     /// evict the UI/graphics working set. The runner can raise the lazy bound
