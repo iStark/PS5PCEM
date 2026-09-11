@@ -1399,11 +1399,17 @@ pub const AddressSpace = struct {
     }
 
     fn mappingForPageLocked(self: *const AddressSpace, page: u64) ?Mapping {
-        for (self.mappings.items) |mapping| {
-            if (mapping.kind == .reserved) continue;
-            if (page >= mapping.address and page_size <= mapping.end() - page) return mapping;
+        // Mappings are ordered and disjoint. Only an exact start or its
+        // predecessor can contain this page; earlier ends may be below it.
+        var index = self.insertionIndex(page);
+        if (index == self.mappings.items.len or self.mappings.items[index].address != page) {
+            if (index == 0) return null;
+            index -= 1;
         }
-        return null;
+        const mapping = self.mappings.items[index];
+        if (mapping.kind == .reserved or page >= mapping.end() or
+            page_size > mapping.end() - page) return null;
+        return mapping;
     }
 
     /// Caller owns the mapping mutex. Removing the entry prevents a later
@@ -2175,11 +2181,37 @@ test "pinned direct memory preserves physical identity across remapping" {
     try testing.expectEqualStrings("alias", view.bytes[view.offset..][0..5]);
 }
 
+test "GPU page mapping lookup selects the containing range and its protection" {
+    var mappings = [_]Mapping{
+        .{ .address = 2 * page_size, .size = page_size, .protection = .read_execute, .kind = .module },
+        .{ .address = 8 * page_size, .size = 2 * page_size, .protection = .read_write, .kind = .private },
+        .{ .address = 12 * page_size, .size = page_size, .protection = .none, .kind = .reserved },
+        .{ .address = 16 * page_size, .size = page_size, .protection = .read_only, .kind = .direct_memory },
+    };
+    var space = AddressSpace{
+        .allocator = testing.allocator,
+        .mappings = .{ .items = &mappings, .capacity = mappings.len },
+    };
+    // Metadata only: selecting a later writable mapping must not borrow the
+    // protection of the earlier module when subtracting an address past it.
+    try testing.expectEqualDeep(mappings[1], space.mappingForPageLocked(8 * page_size).?);
+    try testing.expectEqualDeep(mappings[1], space.mappingForPageLocked(9 * page_size).?);
+    try testing.expectEqualDeep(mappings[0], space.mappingForPageLocked(2 * page_size).?);
+    try testing.expectEqualDeep(mappings[3], space.mappingForPageLocked(16 * page_size).?);
+    for ([_]u64{ 0, 3 * page_size, 7 * page_size, 10 * page_size, 12 * page_size, 17 * page_size, std.math.maxInt(u64) }) |page| {
+        try testing.expectEqual(null, space.mappingForPageLocked(page));
+    }
+    try testing.expectEqual(null, space.mappingForPageLocked(10 * page_size - 1));
+    space.mappings.items = &.{};
+    try testing.expectEqual(null, space.mappingForPageLocked(8 * page_size));
+}
+
 test "GPU page tracker advances generations on HLE and native writes" {
     var space = try AddressSpace.init(testing.allocator);
     defer space.deinit();
 
-    const address = system_managed.start;
+    try space.mapFixed(system_managed.start, page_size, .read_only, .module, null);
+    const address = system_managed.start + 4 * page_size;
     try space.mapFixed(address, 2 * page_size, .read_write, .private, null);
     try space.write(address, "initial");
     space.enableGpuMemoryTracking();
