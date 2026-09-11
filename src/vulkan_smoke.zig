@@ -7994,6 +7994,11 @@ fn runHostImportProbe(allocator: std.mem.Allocator, retain: bool) !void {
 }
 
 fn runBufferContentCacheProbe(allocator: std.mem.Allocator, device_budget: usize) !void {
+    try runBufferContentCacheSizeProbe(allocator, device_budget, 256);
+    try runBufferContentCacheSizeProbe(allocator, device_budget, 4 * 1024 * 1024 + 256);
+}
+
+fn runBufferContentCacheSizeProbe(allocator: std.mem.Allocator, device_budget: usize, comptime size: usize) !void {
     const Memory = SizedGuestMemory(8 * 1024 * 1024);
     const guest = try allocator.create(Memory);
     defer allocator.destroy(guest);
@@ -8009,9 +8014,8 @@ fn runBufferContentCacheProbe(allocator: std.mem.Allocator, device_budget: usize
     memory.fingerprint = Memory.fingerprint;
     _ = renderer.dcbBackend(memory);
     const source = 0x10000;
-    const size = 4 * 1024 * 1024 + 256;
     const output = 0x500000;
-    const offset = 35000;
+    const offset: usize = @min(35000, size - 8);
     const code = [_]u32{
         vop1(1, 0, 8),
         0xe030_1000, 0x8000_0100, // load at v0 from source V#s0
@@ -8115,7 +8119,7 @@ fn runBufferContentCacheProbe(allocator: std.mem.Allocator, device_budget: usize
     _ = try renderer.dispatchSpirv(module.words, .{ 1, 1, 1 });
     try renderer.readbackGuestStorageBuffer(output, &queued_result);
     try std.testing.expectEqual(@as(u32, 0xaabb_ccdd), std.mem.readInt(u32, queued_result[0..4], .little));
-    std.debug.print("buffer content cache passed: unchanged reuse, full-range native writes, GPU overwrites, unavailable-fingerprint fallback and queued readers\n", .{});
+    std.debug.print("buffer content cache passed ({d} bytes): unchanged reuse, full-range native writes, GPU overwrites, unavailable-fingerprint fallback and queued readers\n", .{size});
 }
 
 fn runParallelCopyProbe(allocator: std.mem.Allocator) !void {

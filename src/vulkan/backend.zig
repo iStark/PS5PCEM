@@ -3284,6 +3284,9 @@ pub const Renderer = struct {
     host_import_budget_bytes: usize = 512 * 1024 * 1024,
     host_import_pool_hits: u64 = 0,
     host_import_pool_misses: u64 = 0,
+    /// Small constant buffers also recur while earlier GPU readers are queued.
+    /// Compare every byte before deciding whether their backing needs an upload.
+    storage_fingerprint_min_bytes: usize = 64,
     loader_api_version: u32,
     device_info: DeviceInfo,
     geometry_shaders_available: bool,
@@ -5268,7 +5271,7 @@ pub const Renderer = struct {
                 track(memory.context, guest_address, size)
             else
                 0;
-            const source_hash = if (tracked_generation == 0 and size >= 64 * 1024 and
+            const source_hash = if (tracked_generation == 0 and size >= self.storage_fingerprint_min_bytes and
                 (!self.draw_uploads_enabled or cache_hit))
             hash: {
                 const fingerprint = memory.fingerprint orelse break :hash null;

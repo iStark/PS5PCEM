@@ -41,6 +41,13 @@ range. Small buffers retain eager visibility. This removes the former
 multi-megabyte upload/readback cycle from every dispatch while keeping cache and
 descriptor-set growth bounded.
 
+Without page tracking, clean storage buffers of at least 64 bytes use a
+full-range content fingerprint. Unchanged small constant buffers can therefore
+keep their queued GPU readers and reuse the existing upload. Changed contents
+still wait for those readers before replacement; GPU writes invalidate the
+fingerprint. The `--buffer-content-cache` probe checks both 256-byte and
+multi-megabyte ranges, including direct CPU edits and queued consumers.
+
 `PS5_GPU_HOST_IMPORT=1` enables an experimental Windows path using
 `VK_EXT_external_memory_host` when page tracking is disabled. Storage ranges
 of at least 64 KiB can directly reference coherent guest RAM through an
