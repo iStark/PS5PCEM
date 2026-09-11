@@ -122,9 +122,9 @@ pub const Pool = struct {
         const storage = allocation orelse try allocator.alloc(scalar.ScalarRegisters, pcs.len);
         const snapshots = storage[0..pcs.len];
         if (pcs.len != 0) {
-            // The evaluator resets every snapshot, including skipped blocks,
-            // before reading current USER_DATA and guest memory. No values live
-            // across preparations, even after an early stop or failed read.
+            // The evaluator overwrites visited snapshots and clears skipped
+            // blocks before returning. No values live across preparations,
+            // even after an early stop or failed read.
             _ = scalar.evaluateDecodedResourceStateAtCheckpoints(reader, bindings, instructions, pcs, snapshots);
         }
         return .{
@@ -274,6 +274,7 @@ test "checkpoint reuse keeps guest reads fresh and clears skipped or failed stat
     defer fresh_pool.deinit(a);
     var memory = TestMemory{};
     var bindings = std.mem.zeroes(shaders.StageBindings);
+    bindings.resource_instruction_budget = 16 * 1024;
     bindings.user_data_count = 2;
     bindings.user_data[0] = 0x4000;
     for ([_]?u32{ 1, 0, null, 7, 0 }, 0..) |value, iteration| {
@@ -315,7 +316,8 @@ test "checkpoint leases isolate nested callers and reject another instruction al
     var pool = Pool{};
     defer pool.deinit(a);
     var memory = TestMemory{};
-    const bindings = std.mem.zeroes(shaders.StageBindings);
+    var bindings = std.mem.zeroes(shaders.StageBindings);
+    bindings.resource_instruction_budget = 16 * 1024;
     var first = try pool.prepare(a, &instructions, &plan, .sampled, memory.reader(), &bindings);
     first.release();
     var outer = try pool.prepare(a, &instructions, &plan, .resource, memory.reader(), &bindings);
@@ -357,7 +359,8 @@ fn checkAllocationFailures(allocator: std.mem.Allocator) !void {
     var pool = Pool{};
     defer pool.deinit(allocator);
     var memory = TestMemory{};
-    const bindings = std.mem.zeroes(shaders.StageBindings);
+    var bindings = std.mem.zeroes(shaders.StageBindings);
+    bindings.resource_instruction_budget = 16 * 1024;
     var cached = try pool.prepare(allocator, &instructions, &plan, .resource, memory.reader(), &bindings);
     defer cached.release();
     var fallback = try pool.prepare(allocator, &instructions, null, .sampled, memory.reader(), &bindings);

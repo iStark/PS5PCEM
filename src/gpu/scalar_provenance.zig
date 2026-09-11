@@ -450,11 +450,15 @@ const RegisterCheckpointCollector = struct {
     fn finish(self: *RegisterCheckpointCollector, evaluation: *const Evaluation) void {
         // A checkpoint after END may query final state. Unvisited sites
         // inside the program remain unknown, including after an early stop.
-        if (evaluation.stop_reason != .end_program) return;
-        for (self.pcs, self.snapshots) |pc, *snapshot|
-            if (pc > evaluation.stop_pc) {
+        // Visited snapshots were initialized by their first capture. Clear
+        // only the remaining sites, avoiding a redundant full-array write.
+        for (self.pcs, self.snapshots, 0..) |pc, *snapshot, index| {
+            if (evaluation.stop_reason == .end_program and pc > evaluation.stop_pc) {
                 snapshot.* = evaluation.registers;
-            };
+            } else if (index >= self.seen.capacity() or !self.seen.isSet(index)) {
+                snapshot.* = @splat(.{});
+            }
+        }
     }
 };
 
@@ -470,7 +474,6 @@ pub fn evaluateDecodedResourceStateAtCheckpoints(
     snapshots: []ScalarRegisters,
 ) Evaluation {
     std.debug.assert(checkpoint_pcs.len == snapshots.len);
-    for (snapshots) |*snapshot| snapshot.* = @splat(.{});
     var collector = RegisterCheckpointCollector{
         .pcs = checkpoint_pcs,
         .snapshots = snapshots,
