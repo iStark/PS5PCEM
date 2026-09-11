@@ -17,9 +17,19 @@ pub fn Index(comptime capacity: usize) type {
 
         pub const Iterator = struct {
             index: *const Self,
-            slot: Slot,
+            slot: usize,
+            linear_end: usize = 0,
 
             pub fn next(self: *Iterator) ?usize {
+                // Renderer cache limits can exceed the fixed bucket storage.
+                // Fall back to the original scan without narrowing the caller's
+                // configured capacity or dropping any possible alias.
+                if (self.linear_end != 0) {
+                    if (self.slot == self.linear_end) return null;
+                    const slot = self.slot;
+                    self.slot += 1;
+                    return slot;
+                }
                 if (self.slot == empty) return null;
                 const slot = self.slot;
                 self.slot = self.index.links[slot];
@@ -48,8 +58,8 @@ pub fn Index(comptime capacity: usize) type {
         }
 
         pub fn candidatesBy(self: *Self, items: anytype, address: u64, comptime addressOf: anytype) Iterator {
+            if (items.len > capacity) return .{ .index = self, .slot = 0, .linear_end = items.len };
             if (!self.valid) {
-                std.debug.assert(items.len <= capacity);
                 @memset(&self.heads, empty);
                 // Preserve the old ascending scan order when several views
                 // share an address or unrelated addresses hash together.
@@ -143,4 +153,18 @@ test "descriptor address buckets preserve view order after slot replacement" {
             try matched.append(std.testing.allocator, slot);
     }
     try std.testing.expectEqualSlices(usize, &.{ 1, 2 }, matched.items);
+}
+
+test "address buckets fall back for oversized caches and recover after invalidation" {
+    const Entry = struct { guest_address: u64 };
+    var entries: [65]Entry = undefined;
+    for (&entries, 0..) |*entry, i| entry.* = .{ .guest_address = 0x1000 + i * 256 };
+    var index = Index(64){};
+    var candidates = index.candidates(&entries, entries[64].guest_address);
+    for (0..entries.len) |slot| try std.testing.expectEqual(@as(?usize, slot), candidates.next());
+    try std.testing.expectEqual(null, candidates.next());
+    index.invalidate();
+    candidates = index.candidates(entries[0..1], entries[0].guest_address);
+    try std.testing.expectEqual(@as(?usize, 0), candidates.next());
+    try std.testing.expectEqual(null, candidates.next());
 }

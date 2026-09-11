@@ -1765,6 +1765,10 @@ const CachedRenderTarget = struct {
     /// The matched guest compositor uses a negative-height viewport. Keep its
     /// attachment resident and apply that orientation only at scanout/readback.
     scanout_flip_vertical: bool = false,
+
+    fn address(self: CachedRenderTarget) u64 {
+        return self.target.descriptor.address;
+    }
 };
 
 /// A guest depth allocation reduced to what a Vulkan attachment needs.
@@ -3345,6 +3349,7 @@ pub const Renderer = struct {
     magnify_source_height: u32 = 0,
     magnify_source_format: u32 = 0,
     guest_buffers: std.ArrayList(GuestBufferEntry) = .empty,
+    guest_buffer_address_index: @import("sampled_image_index.zig").Index(512) = .{},
     active_storage_buffers: [maximum_storage_descriptors]vk.Buffer = @splat(0),
     guest_buffer_sequence: u64 = 0,
     gds_storage: std.ArrayList(u8) = .empty,
@@ -3395,6 +3400,7 @@ pub const Renderer = struct {
     graphics_probe_colored_pixels: u32 = 0,
     graphics_probe_frame: [graphics_probe_bytes]u8 = @splat(0),
     render_targets: std.ArrayList(CachedRenderTarget) = .empty,
+    render_target_address_index: @import("sampled_image_index.zig").Index(4096) = .{},
     render_target_cache_limit: usize = 64,
     color_passes: std.ArrayList(ColorPass) = .empty,
     color_pass_sequence: u64 = 0,
@@ -5062,7 +5068,9 @@ pub const Renderer = struct {
 
         var entry_index: ?usize = null;
         var recycled_entry = false;
-        for (self.guest_buffers.items, 0..) |entry, index| {
+        var candidates = self.guest_buffer_address_index.candidates(self.guest_buffers.items, guest_address);
+        while (candidates.next()) |index| {
+            const entry = self.guest_buffers.items[index];
             if (entry.guest_address == guest_address and entry.size == size) {
                 if (entry.device_local.host_mapping) |view| {
                     if (host_identity == null or view.identity != host_identity.?) {
@@ -5148,6 +5156,7 @@ pub const Renderer = struct {
             if (recycle_index == null) {
                 try self.guest_buffers.ensureUnusedCapacity(self.allocator, 1);
                 const backing = try self.createStorageBacking(size, self.storageFitsDeviceBudget(size, null), guest_address, host_identity);
+                self.guest_buffer_address_index.invalidate();
                 self.guest_buffers.appendAssumeCapacity(.{
                     .descriptor_index = descriptor_index,
                     .guest_address = guest_address,
@@ -5178,6 +5187,7 @@ pub const Renderer = struct {
                     victim.last_gpu_use = 0;
                 }
                 victim.descriptor_index = descriptor_index;
+                self.guest_buffer_address_index.invalidate();
                 victim.guest_address = guest_address;
                 victim.size = size;
                 victim.last_used_sequence = self.guest_buffer_sequence;
@@ -11315,7 +11325,9 @@ pub const Renderer = struct {
         descriptor: gpu.resources.ImageDescriptor,
         image_format: u32,
     ) ?usize {
-        for (self.render_targets.items, 0..) |cached, index| {
+        var candidates = self.render_target_address_index.candidatesBy(self.render_targets.items, descriptor.address, CachedRenderTarget.address);
+        while (candidates.next()) |index| {
+            const cached = self.render_targets.items[index];
             // A VkImageView cannot start at an arbitrary byte inside another
             // image allocation. Reuse only a render target that describes the
             // same image exactly; overlap and equal texel size are insufficient
@@ -11334,13 +11346,15 @@ pub const Renderer = struct {
     }
 
     fn latestRenderTargetAtAddress(
-        self: *const Renderer,
+        self: *Renderer,
         descriptor: gpu.resources.ImageDescriptor,
         image_format: u32,
     ) ?usize {
         var best: ?usize = null;
         var best_sequence: u64 = 0;
-        for (self.render_targets.items, 0..) |cached, index| {
+        var candidates = self.render_target_address_index.candidatesBy(self.render_targets.items, descriptor.address, CachedRenderTarget.address);
+        while (candidates.next()) |index| {
+            const cached = self.render_targets.items[index];
             if (!cached.initialized or
                 cached.target.descriptor.fragments_log2 != 0 or
                 cached.target.descriptor.address != descriptor.address or
@@ -12340,7 +12354,9 @@ pub const Renderer = struct {
     }
 
     fn acquireRenderTarget(self: *Renderer, target: GuestColorTarget) anyerror!usize {
-        for (self.render_targets.items, 0..) |cached_snapshot, index| {
+        var candidates = self.render_target_address_index.candidatesBy(self.render_targets.items, target.descriptor.address, CachedRenderTarget.address);
+        while (candidates.next()) |index| {
+            const cached_snapshot = self.render_targets.items[index];
             if (!sameRenderTarget(cached_snapshot.target, target)) continue;
             const metadata_changed = !sameRenderTargetMetadata(cached_snapshot.target.descriptor, target.descriptor);
             if (self.traceCurrentGraphicsFrame()) {
@@ -12381,11 +12397,13 @@ pub const Renderer = struct {
         cached.last_used_sequence = self.render_target_sequence;
         if (self.render_targets.items.len >= self.render_target_cache_limit) {
             const victim_index = try self.evictRenderTarget();
+            self.render_target_address_index.invalidate();
             self.render_targets.items[victim_index] = cached;
             self.frame_profile.render_target_misses += 1;
             return victim_index;
         }
         try self.render_targets.ensureUnusedCapacity(self.allocator, 1);
+        self.render_target_address_index.invalidate();
         self.render_targets.appendAssumeCapacity(cached);
         self.frame_profile.render_target_misses += 1;
         if (self.render_targets.items.len == 1) {
@@ -19656,7 +19674,9 @@ pub const Renderer = struct {
         // Raw compute buffers can back the same texture allocation. Their
         // deferred writes are not registered as image aliases in either mode.
         var buffer_sequence: u64 = 0;
-        for (self.guest_buffers.items) |cached| {
+        var buffer_candidates = self.guest_buffer_address_index.candidates(self.guest_buffers.items, address);
+        while (buffer_candidates.next()) |index| {
+            const cached = self.guest_buffers.items[index];
             if (cached.guest_address != address) continue;
             buffer_sequence = @max(buffer_sequence, cached.last_used_sequence);
         }
