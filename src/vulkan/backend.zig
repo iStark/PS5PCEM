@@ -7923,9 +7923,12 @@ pub const Renderer = struct {
         var table_loads: [maximum_storage_mappings]u32 = undefined;
         var table_load_count: usize = 0;
         const instructions = analysis.program.instructions.items;
+        // Checkpoints carry registers only. Reuse the empty load history
+        // instead of reinitializing its 512 records for every instruction.
+        var scalar = gpu.ScalarEvaluation{};
         for (instructions) |inst| {
             if (!isPointerScalarLoad(inst.opcode) or inst.src0.kind != .sgpr or inst.src0.reg + 1 >= 128) continue;
-            const scalar = gpu.ScalarEvaluation{ .registers = scalarRegistersAtCheckpoint(checkpoint_pcs, checkpoint_registers, inst.pc).* };
+            scalar.registers = scalarRegistersAtCheckpoint(checkpoint_pcs, checkpoint_registers, inst.pc).*;
             const table = try scalarPointerTablePlan(bindings, reader, analysis, &scalar, inst);
             var pointers = PointerCandidates{};
             var offset: u64 = 0;
@@ -7977,8 +7980,8 @@ pub const Renderer = struct {
         // The shader checks both address halves and each word's buffer range.
         for (instructions) |inst| {
             if (!isPointerScalarLoad(inst.opcode) or inst.src0.kind != .sgpr or inst.src0.reg + 1 >= 128) continue;
-            const scalar = scalarRegistersAtCheckpoint(checkpoint_pcs, checkpoint_registers, inst.pc);
-            if (scalar[inst.src0.reg].known and scalar[inst.src0.reg + 1].known and
+            const registers = scalarRegistersAtCheckpoint(checkpoint_pcs, checkpoint_registers, inst.pc);
+            if (registers[inst.src0.reg].known and registers[inst.src0.reg + 1].known and
                 std.mem.indexOfScalar(u32, table_loads[0..table_load_count], inst.pc) == null) continue;
             for (slots[0..page_count]) |slot| {
                 if (result.scalar_memory_count == result.scalar_memories.len) return Error.InvalidStorageDescriptor;
@@ -8436,6 +8439,9 @@ pub const Renderer = struct {
         const scalar_checkpoint_pcs = checkpoints.pcs;
         const scalar_checkpoint_registers = checkpoints.snapshots;
 
+        // Descriptor resolvers borrow this state read-only. Only the register
+        // snapshot changes between checkpoints; the load history stays empty.
+        var instruction_scalar = gpu.ScalarEvaluation{};
         for (instructions) |inst| {
             const is_store = switch (inst.opcode) {
                 .buffer_load_ubyte,
@@ -8521,13 +8527,11 @@ pub const Renderer = struct {
             // reuse the same SGPR quartet for several SMEM-loaded V# values;
             // a final whole-program snapshot (or the first mapping for that
             // SGPR) is not authoritative for a later MUBUF operation.
-            const instruction_scalar = gpu.ScalarEvaluation{
-                .registers = scalarRegistersAtCheckpoint(
-                    scalar_checkpoint_pcs,
-                    scalar_checkpoint_registers,
-                    inst.pc,
-                ).*,
-            };
+            instruction_scalar.registers = scalarRegistersAtCheckpoint(
+                scalar_checkpoint_pcs,
+                scalar_checkpoint_registers,
+                inst.pc,
+            ).*;
             // The instruction-local scalar state is authoritative. Attribute
             // tables are ordered by semantic/location, while shader fetches
             // are free to consume those attributes in a different order. In
@@ -8721,24 +8725,22 @@ pub const Renderer = struct {
             // instruction; using the entry snapshot bound late destinations
             // to an unrelated fallback slot (notably a 2D image for a 3D
             // image_store in large volume-processing kernels).
-            const image_scalar = gpu.ScalarEvaluation{
-                .registers = scalarRegistersAtCheckpoint(
-                    scalar_checkpoint_pcs,
-                    scalar_checkpoint_registers,
-                    inst.pc,
-                ).*,
-            };
+            instruction_scalar.registers = scalarRegistersAtCheckpoint(
+                scalar_checkpoint_pcs,
+                scalar_checkpoint_registers,
+                inst.pc,
+            ).*;
             var descriptor = (try resolveComputeImageDescriptor(
                 bindings,
                 reader,
                 analysis,
-                &image_scalar,
+                &instruction_scalar,
                 resource_sgpr,
                 inst.pc,
                 result.storage_image_mapping_count,
             )) orelse {
                 if (!writable and bindings.stage == .compute and self.sampled_image_nonuniform_indexing) {
-                    if (try resolveBufferImageCandidates(bindings, reader, analysis, &image_scalar, inst)) |candidates| {
+                    if (try resolveBufferImageCandidates(bindings, reader, analysis, &instruction_scalar, inst)) |candidates| {
                         var compressed = true;
                         for (candidates.words[0..candidates.count]) |words| {
                             const image = try gpu.resources.decodeImageDescriptor(&words);
@@ -8747,7 +8749,7 @@ pub const Renderer = struct {
                         if (compressed and !candidates.requires_null_check) continue;
                     }
                 }
-                self.reportResourceFailure(bindings, inst, &image_scalar);
+                self.reportResourceFailure(bindings, inst, &instruction_scalar);
                 std.debug.print(
                     "[vulkan dcb] storage image pc=0x{x}: T# s{d}:s{d} unresolved\n",
                     .{ inst.pc, resource_sgpr, resource_sgpr + 7 },
@@ -8818,7 +8820,7 @@ pub const Renderer = struct {
                     index,
                     writable,
                 ) catch |err| {
-                    self.reportResourceFailure(bindings, inst, &image_scalar);
+                    self.reportResourceFailure(bindings, inst, &instruction_scalar);
                     std.debug.print(
                         "[vulkan dcb] storage image pc=0x{x}: stage failed {s} addr=0x{x} {d}x{d}x{d} pitch={d} fmt={d} type={s} tile={f} levels={d}..{d} base_array={d} flags=0x{x} metadata=0x{x} dcc={any} cmask={any} fmask={any}\n",
                         .{
@@ -8915,28 +8917,26 @@ pub const Renderer = struct {
             }
 
             const descriptor_slot = result.sampled_image_mapping_count;
-            const sampled_scalar = gpu.ScalarEvaluation{
-                .registers = scalarRegistersAtCheckpoint(
-                    scalar_checkpoint_pcs,
-                    scalar_checkpoint_registers,
-                    inst.pc,
-                ).*,
-            };
+            instruction_scalar.registers = scalarRegistersAtCheckpoint(
+                scalar_checkpoint_pcs,
+                scalar_checkpoint_registers,
+                inst.pc,
+            ).*;
             const direct_image = try resolveComputeSampledImageDescriptor(
                 bindings,
                 reader,
                 analysis,
-                &sampled_scalar,
+                &instruction_scalar,
                 resource_sgpr,
                 inst.pc,
                 descriptor_slot,
             );
             const candidates = if (direct_image == null and self.sampled_image_nonuniform_indexing)
-                try resolveBufferImageCandidates(bindings, reader, analysis, &sampled_scalar, inst)
+                try resolveBufferImageCandidates(bindings, reader, analysis, &instruction_scalar, inst)
             else
                 null;
             if (direct_image == null and candidates == null) {
-                self.reportResourceFailure(bindings, inst, &sampled_scalar);
+                self.reportResourceFailure(bindings, inst, &instruction_scalar);
                 std.debug.print(
                     "[vulkan dcb] sampled image pc=0x{x}: T# s{d}:s{d} unresolved\n",
                     .{ inst.pc, resource_sgpr, resource_sgpr + 7 },
@@ -8974,12 +8974,12 @@ pub const Renderer = struct {
                         bindings,
                         reader,
                         analysis,
-                        &sampled_scalar,
+                        &instruction_scalar,
                         sampler_sgpr,
                         inst.pc,
                         descriptor_slot,
                     )) orelse {
-                        self.reportResourceFailure(bindings, inst, &sampled_scalar);
+                        self.reportResourceFailure(bindings, inst, &instruction_scalar);
                         std.debug.print(
                             "[vulkan dcb] sampled image pc=0x{x}: S# s{d}:s{d} unresolved\n",
                             .{ inst.pc, sampler_sgpr, sampler_sgpr + 3 },
@@ -9030,7 +9030,7 @@ pub const Renderer = struct {
                         sampled_dimension,
                         null,
                     ) catch |err| {
-                        self.reportResourceFailure(bindings, inst, &sampled_scalar);
+                        self.reportResourceFailure(bindings, inst, &instruction_scalar);
                         std.debug.print(
                             "[vulkan dcb] sampled image pc=0x{x}: stage failed {s} dim={s} addr=0x{x} {d}x{d}x{d} pitch={d} fmt={d} type={s} tile={f} levels={d}..{d}\n",
                             .{ inst.pc, @errorName(err), @tagName(sampled_dimension), image_descriptor.address, image_descriptor.width, image_descriptor.height, image_descriptor.depth_or_layers, image_descriptor.pitch, image_descriptor.unified_format, @tagName(image_descriptor.image_type), image_descriptor.tile_mode, image_descriptor.base_level, image_descriptor.last_level },
@@ -16948,6 +16948,7 @@ pub const Renderer = struct {
         const scalar_checkpoint_pcs = checkpoints.pcs;
         const scalar_checkpoint_registers = checkpoints.snapshots;
 
+        var sampled_scalar = gpu.ScalarEvaluation{};
         for (instructions) |inst| {
             const image_fetch = inst.opcode == .image_load or inst.opcode == .image_load_mip;
             if (!gpu.resource_checkpoints.needsCheckpoint(inst, .sampled)) continue;
@@ -16985,13 +16986,11 @@ pub const Renderer = struct {
             // compute programs. Recover the state at this particular sample;
             // the fallback slots still cover shaders that reference only SRT
             // metadata and have no executable scalar producer.
-            const sampled_scalar = gpu.ScalarEvaluation{
-                .registers = scalarRegistersAtCheckpoint(
-                    scalar_checkpoint_pcs,
-                    scalar_checkpoint_registers,
-                    inst.pc,
-                ).*,
-            };
+            sampled_scalar.registers = scalarRegistersAtCheckpoint(
+                scalar_checkpoint_pcs,
+                scalar_checkpoint_registers,
+                inst.pc,
+            ).*;
             const image_descriptor = (try resolveComputeSampledImageDescriptor(
                 bindings,
                 reader,
