@@ -951,9 +951,9 @@ const maximum_htile_bytes = 8 * 1024 * 1024;
 /// On-disk driver pipeline cache. Reused across runs so per-title shader
 /// compilation is paid once instead of on every launch.
 const pipeline_cache_path = "vulkan_pipeline_cache.bin";
-/// Streamed 3D scenes can exceed 1 GiB of driver pipelines. Keep persistence
+/// Streamed 3D scenes can exceed 2 GiB of driver pipelines. Keep persistence
 /// bounded without dropping every subsequent save once that scene is loaded.
-const maximum_pipeline_cache_bytes = 2 * 1024 * 1024 * 1024;
+const maximum_pipeline_cache_bytes = 4 * 1024 * 1024 * 1024;
 
 /// Reads the persisted driver pipeline cache, if any. Any failure — missing
 /// file, unreadable file, unreasonable size — returns null; the caller then

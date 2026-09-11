@@ -28,8 +28,8 @@ When `PS5_GPU_ASYNC_PIPELINES=1`, first-use compute and graphics pipelines are c
 single-worker FIFO which serializes the shared driver cache and falls back to a
 correct inline drain if the host cannot create a thread. The Vulkan-driver
 cache is persisted as
-`vulkan_pipeline_cache.bin` between runs; invalid, unreadable, or oversized
-cache data simply falls back to an empty driver cache, so it can only affect
+`vulkan_pipeline_cache.bin` between runs, with a 4 GiB size limit. Invalid,
+unreadable, or oversized data falls back to an empty driver cache, so it can only affect
 startup compilation time, never correctness.
 `stageGuestStorageBuffer` keys coherent allocations by exact guest address and
 size, with 64 slots and a 128 MiB per-range cap. Large writable ranges remain
