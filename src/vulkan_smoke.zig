@@ -1592,6 +1592,76 @@ fn runSaveExecProbe(allocator: std.mem.Allocator) !void {
     std.debug.print("SAVEEXEC passed: AND/ANDN1/ORN2 operand order, saved masks, overlapping destinations, SCC and preserved EXEC_HI for 32-bit operations\n", .{});
 }
 
+fn runBufferCompactionProbe(allocator: std.mem.Allocator) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{});
+    defer renderer.deinit();
+    var guest = GuestMemory{};
+    _ = renderer.dcbBackend(guest.interface());
+    const atomic = mubuf(0x32, 0, 2, 0, 4);
+    const store = mubuf(0x1c, 0, 0, 3, 8);
+    // Reserve one dense range per guest wave, then distribute it among its
+    // active lanes. The cutoff and parity produce sparse and high-only masks.
+    const code = [_]u32{
+        vop2Source(0x1b, 1, 129, 0), // parity = lane & 1
+        0x7da6_0000, // CMPX LE s0, v0
+        0x7da4_0280, // CMPX EQ 0, v1
+        sop1(4, 12, 126), // save EXEC
+        sop1(0x10, 14, 126), // population of both EXEC halves
+        0xd766_0003, 127 | (128 << 9), // rank high
+        0xd765_0003,     126 | (259 << 9), // rank low
+        vop1(1, 2, 128),
+        0x7da4_0680, // only rank zero performs the atomic
+        vop1(1, 2, 14),
+        (atomic[0] & ~@as(u32, 1 << 13)) | (1 << 14),
+        atomic[1],
+        sop1(4, 126, 12), // restore participating lanes
+        vop1(2, 15, 258), // broadcast the returned base
+        vop2Source(0x25, 3, 15, 3), // output index = base + rank
+        store[0],
+        store[1],
+        0xbf81_0000,
+    };
+    for (code, 0..) |word, index| guest.word(0x100 + index * 4, word);
+    var state = gpu.State{};
+    const compute = gpu.resources.ShaderStage.compute;
+    try state.writeRegister(.shader, compute.programRegisterBase(), 1);
+    try state.writeRegister(.shader, compute.programRegisterBase() + 1, 0);
+    try state.writeRegister(.shader, 0x213, 12 << 1);
+    for ([_]u32{ 0, 1, 35, 62, 64 }) |cutoff| for ([_]u32{ 1, 3 }) |groups| {
+        const counter_address = 0x10000;
+        const output_address = 0x11000;
+        guest.word(counter_address, 7);
+        for (0..256) |word| guest.word(output_address + word * 4, 0xcccc_cccc);
+        for ([_]u32{ cutoff, 0, 0, 0, counter_address, 4 << 16, 1, 0, output_address, 4 << 16, 256, 0 }, 0..) |word, index| {
+            try state.writeRegister(.shader, compute.userDataBase() + @as(u32, @intCast(index)), word);
+        }
+        _ = try renderer.dispatchRdna2State(&state, .{ 64, 1, 1 }, .{ groups, 1, 1 });
+        var counter: [4]u8 = undefined;
+        var output: [1024]u8 = undefined;
+        try renderer.readbackGuestStorageBuffer(counter_address, &counter);
+        try renderer.readbackGuestStorageBuffer(output_address, &output);
+        const first = (cutoff + 1) & ~@as(u32, 1);
+        const count = (64 - first) / 2 * groups;
+        const actual_count = std.mem.readInt(u32, &counter, .little);
+        if (actual_count != 7 + count) std.debug.print("compaction cutoff={d} groups={d}: expected count={d}, actual={d}\n", .{ cutoff, groups, 7 + count, actual_count });
+        try std.testing.expectEqual(7 + count, actual_count);
+        var occurrences: [64]u32 = @splat(0);
+        for (0..256) |index| {
+            const value = std.mem.readInt(u32, output[index * 4 ..][0..4], .little);
+            if (index < 7 or index >= 7 + count) {
+                try std.testing.expectEqual(@as(u32, 0xcccc_cccc), value);
+            } else {
+                try std.testing.expect(value < 64 and value >= cutoff and value % 2 == 0);
+                occurrences[value] += 1;
+            }
+        }
+        for (occurrences, 0..) |actual, lane| {
+            try std.testing.expectEqual(if (lane >= cutoff and lane % 2 == 0) groups else @as(u32, 0), actual);
+        }
+    };
+    std.debug.print("buffer compaction passed: sparse/high-only/empty wave64 masks, exact counts, dense indices, concurrent waves and preserved padding\n", .{});
+}
+
 fn runBufferAtomicProbe(allocator: std.mem.Allocator) !void {
     var renderer = try vulkan.Renderer.init(allocator, .{});
     defer renderer.deinit();
@@ -8047,6 +8117,10 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--dpp")) {
         try runDppProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--buffer-compaction")) {
+        try runBufferCompactionProbe(allocator);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--buffer-atomics")) {

@@ -11417,6 +11417,7 @@ fn translateInstructions(
     var has_predicated_write = false;
     var cross_half_read = false;
     var uses_gds = false;
+    var scans_wave_mask = false;
     for (effective.ngg_lds_exports) |ngg_export| {
         if (effective.stage == .vertex and effective.vertex_parameter_sources.len == 0 and ngg_export.target >= 0x20 and ngg_export.target < 0x40) {
             effective.parameter_mask |= @as(u32, 1) << @intCast(ngg_export.target - 0x20);
@@ -11429,6 +11430,8 @@ fn translateInstructions(
             if (constantWaveLane(candidate.src1)) |lane| cross_half_read = cross_half_read or lane >= 32;
         }
         uses_gds = uses_gds or candidate.gds;
+        scans_wave_mask = scans_wave_mask or candidate.opcode == .s_bcnt1_i32_b64 or
+            candidate.opcode == .s_ff1_i32_b64;
         if (candidate.dst.kind == .exec_lo or candidate.dst.kind == .exec_hi or
             std.mem.indexOf(u8, @tagName(candidate.opcode), "saveexec") != null)
         {
@@ -11511,12 +11514,14 @@ fn translateInstructions(
     effective.uses_lane_identity = effective.uses_lane_identity or effective.uses_execution_mask or
         (effective.uses_execution_mask and has_predicated_write);
     const invocation_count = @as(u64, effective.local_size[0]) * effective.local_size[1] * effective.local_size[2];
-    // Single-wave GDS kernels also consume the physical EXEC bits for ballot
-    // counts and compact indices. Per-invocation predicates turn a sparse mask
-    // into 64 active lanes, publishing unwritten records as valid output.
+    // Single-wave kernels that count or scan masks need physical EXEC bits,
+    // including buffer-based compaction without any GDS instructions.
+    // Per-invocation predicates turn a sparse mask into 64 active lanes,
+    // publishing unwritten records as valid output.
     // Multi-wave GDS kernels retain their existing path until their global
     // wave operations can participate in the converged dispatcher as well.
-    if (!effective.wave32 and effective.stage == .compute and invocation_count >= 64 and invocation_count <= 1024 and invocation_count % 64 == 0 and (cross_half_read or uses_gds) and (!uses_gds or invocation_count == 64)) {
+    const single_wave_mask_scan = invocation_count == 64 and scans_wave_mask and effective.uses_execution_mask;
+    if (!effective.wave32 and effective.stage == .compute and invocation_count >= 64 and invocation_count <= 1024 and invocation_count % 64 == 0 and (cross_half_read or uses_gds or single_wave_mask_scan) and (!uses_gds or invocation_count == 64)) {
         effective.wave64_workgroup = true;
         effective.uses_lane_identity = true;
         effective.uses_execution_mask = true;
