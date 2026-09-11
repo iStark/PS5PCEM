@@ -17568,7 +17568,7 @@ pub const Renderer = struct {
             return Error.GuestMemoryWriteFailed;
         }
         const cached = &self.storage_image_cache.items[cache_index];
-        cached.guest_content_hash = std.hash.Wyhash.hash(0, allocation);
+        cached.guest_content_hash = gpu.parallel_copy.fingerprint(allocation);
         cached.guest_content_hash_valid = true;
         cached.guest_page_generation = if (memory.gpu_generation) |generation|
             generation(memory.context, snapshot.descriptor.address, snapshot.allocation_bytes)
@@ -18039,7 +18039,7 @@ pub const Renderer = struct {
         const allocation = allocation_scratch.bytes;
         if (!memory.read(memory.context, descriptor.address, allocation)) return Error.GuestMemoryReadFailed;
         const guest_content_hash = if (guest_page_generation == 0)
-            std.hash.Wyhash.hash(0, allocation)
+            gpu.parallel_copy.fingerprint(allocation)
         else
             0;
 

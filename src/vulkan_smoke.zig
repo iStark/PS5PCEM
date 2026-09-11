@@ -2934,7 +2934,7 @@ fn runSceneMaskProbe(allocator: std.mem.Allocator) !void {
 }
 
 fn runImageScratchProbe(allocator: std.mem.Allocator) !void {
-    const Memory = SizedGuestMemory(2 * 1024 * 1024);
+    const Memory = SizedGuestMemory(24 * 1024 * 1024);
     const guest = try allocator.create(Memory);
     defer allocator.destroy(guest);
     guest.* = .{};
@@ -2955,9 +2955,15 @@ fn runImageScratchProbe(allocator: std.mem.Allocator) !void {
     var descriptors = [_][8]u32{
         imageDescriptorWords(0x40000, 257, 129),
         imageDescriptorWords(0x100000, 385, 97),
+        // Exceed the parallel fingerprint threshold on both staging and
+        // writeback; cache digests must agree when worker counts change.
+        imageDescriptorWords(0x400000, 2049, 1025),
     };
     descriptors[1][3] |= @as(u32, @intFromEnum(gpu.resources.TileMode.render_target)) << 20;
+    const previous_participants = gpu.parallel_copy.guest_copy_pool.participants.load(.acquire);
+    defer gpu.parallel_copy.guest_copy_pool.participants.store(previous_participants, .release);
     for ([_]bool{ false, true, true, false, true }, 0..) |enabled, pass| {
+        gpu.parallel_copy.guest_copy_pool.participants.store(if (pass % 2 == 0) 4 else 1, .release);
         renderer.image_scratch.enabled = enabled;
         for (descriptors, 0..) |words, index| {
             const descriptor = try gpu.resources.decodeImageDescriptor(&words);
@@ -2992,6 +2998,15 @@ fn runImageScratchProbe(allocator: std.mem.Allocator) !void {
             // pooling, CPU updates, partial GPU writes and callback failures.
             try std.testing.expect(std.mem.allEqual(u8, guest.bytes[address..][0..pixel], sentinel));
             try std.testing.expect(std.mem.allEqual(u8, guest.bytes[address + pixel + 4 ..][0 .. size - pixel - 4], sentinel));
+            if (index == 2) {
+                gpu.parallel_copy.guest_copy_pool.participants.store(if (pass % 2 == 0) 1 else 4, .release);
+                const uploaded = renderer.frame_profile.texture_upload_bytes;
+                _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
+                // Publishing a partial write and switching hash workers must
+                // still reuse the image when the guest bytes did not change.
+                try std.testing.expectEqual(uploaded, renderer.frame_profile.texture_upload_bytes);
+                try renderer.flushPendingGuestWrites();
+            }
         }
     }
     try std.testing.expect(renderer.image_scratch.entries[0].len != 0);
