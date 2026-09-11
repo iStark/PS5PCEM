@@ -3207,7 +3207,7 @@ fn runSampledDccClearProbe(allocator: std.mem.Allocator) !void {
                         (if (format == 56) 64.0 / 255.0 else 0.25)
                     else if (key & @as(u8, if (channel == (if (alpha_msb) @as(usize, 3) else 0)) 0x40 else 0x80) != 0) 1 else 0;
                     std.testing.expectApproxEqAbs(expected, @as(f32, @bitCast(std.mem.readInt(u32, output[channel * 4 ..][0..4], .little))), 0.00001) catch |err| {
-                        std.debug.print("DCC sample mismatch format={d} alpha_msb={any} key=0x{x} channel={d}\n", .{format, alpha_msb, key, channel});
+                        std.debug.print("DCC sample mismatch format={d} alpha_msb={any} key=0x{x} channel={d}\n", .{ format, alpha_msb, key, channel });
                         return err;
                     };
                 }
@@ -7299,8 +7299,8 @@ fn runVectorBufferAddressProbe(allocator: std.mem.Allocator) !void {
         for ([_]u32{ 0, 0xffff_fff8 }) |offset| {
             const load = mubuf(0x0e, 0, 0, 0, 0);
             const code = [_]u32{
-                vop1(1, 0, 8), vop1(1, 4, 8),
-                load[0], (load[1] & 0x00ff_ffff) | (12 << 24),
+                vop1(1, 0, 8),              vop1(1, 4, 8),
+                load[0],                    (load[1] & 0x00ff_ffff) | (12 << 24),
                 mubuf(0x1e, 0, 0, 4, 4)[0], mubuf(0x1e, 0, 0, 4, 4)[1],
                 0xbf81_0000,
             };
@@ -9115,12 +9115,12 @@ pub fn main(init: std.process.Init) !void {
         try runGdsWave64AppendProbe(allocator);
         return;
     }
-    if (args.len == 2 and std.mem.eql(u8, args[1], "--gds-resident")) {
-        try runGdsResidentProbe(allocator);
-        return;
-    }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--gds-memory")) {
         try runGdsMemoryProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--gds-resident")) {
+        try runGdsResidentProbe(allocator);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--packed-buffer")) {
