@@ -2183,14 +2183,16 @@ fn runDispatcherBudgetProbe(allocator: std.mem.Allocator) !void {
 }
 
 fn runWave64BallotsProbe(allocator: std.mem.Allocator) !void {
-    for ([_]bool{ false, true }) |double_buffer| try runWave64BallotsCase(allocator, double_buffer);
+    inline for (.{ 64, 128, 512 }) |lanes| for ([_]bool{ false, true }) |double_buffer| {
+        try runWave64BallotsCase(allocator, double_buffer, lanes);
+    };
 }
 
-fn runWave64BallotsCase(allocator: std.mem.Allocator, double_buffer: bool) !void {
+fn runWave64BallotsCase(allocator: std.mem.Allocator, double_buffer: bool, comptime lanes: usize) !void {
     var renderer = try vulkan.Renderer.init(allocator, .{});
     defer renderer.deinit();
     const groups = 64;
-    const output_bytes = groups * 64 * 4;
+    const output_bytes = groups * lanes * 4;
     const Memory = SizedGuestMemory(output_bytes + 0x10000);
     const guest = try allocator.create(Memory);
     defer allocator.destroy(guest);
@@ -2199,8 +2201,8 @@ fn runWave64BallotsCase(allocator: std.mem.Allocator, double_buffer: bool) !void
     var code: std.ArrayList(u32) = .empty;
     defer code.deinit(allocator);
     try code.appendSlice(allocator, &.{
-        vop1(1, 7, 8),   vop2Source(0x1a, 7, 134, 7), vop2(0x25, 7, 0, 7),
-        vop1(1, 1, 8),   vop2Source(0x1b, 1, 191, 1), vop2(0x1d, 1, 0, 1),
+        vop1(1, 7, 8),   vop2Source(0x1a, 7, 128 + @as(u9, std.math.log2_int(usize, lanes)), 7), vop2(0x25, 7, 0, 7),
+        vop1(1, 1, 8),   vop2Source(0x1b, 1, 191, 1),                                            vop2(0x1d, 1, 0, 1),
         vop1(1, 2, 128), vop1(1, 4, 135),
     });
     for (0..32) |round| {
@@ -2226,23 +2228,26 @@ fn runWave64BallotsCase(allocator: std.mem.Allocator, double_buffer: bool) !void
         .stage = .compute,
         .wave64_workgroup = true,
         .wave_exchange_double_buffer = double_buffer,
-        .local_size = .{ 64, 1, 1 },
+        .local_size = .{ lanes, 1, 1 },
         .compute_inputs = .{ .local_invocation_id_components = 1, .workgroup_id_sgprs = .{ 8, null, null } },
         .storage_buffers = &.{.{ .resource_sgpr = 0, .descriptor_index = 0, .extent_bytes = output_bytes, .stride = 4 }},
     });
     defer baseline.deinit(allocator);
-    var expected: [groups * 64]u32 = @splat(0);
-    for (&expected, 0..) |*value, invocation| for (0..32) |round| {
-        const group = invocation / 64;
-        const local_lane = invocation % 64;
+    const expected = try allocator.alloc(u32, groups * lanes);
+    defer allocator.free(expected);
+    @memset(expected, 0);
+    for (expected, 0..) |*value, invocation| for (0..32) |round| {
+        const group = invocation / lanes;
+        const local_lane = invocation % lanes;
+        const wave_base = local_lane & ~@as(usize, 63);
         const cutoff = (round * 7 + 5) % 65;
         var mask: u64 = 0;
         for (0..64) |lane| {
-            if (lane ^ group < cutoff) mask |= @as(u64, 1) << @intCast(lane);
+            if ((wave_base + lane) ^ (group & 63) < cutoff) mask |= @as(u64, 1) << @intCast(lane);
         }
-        const selected: u32 = if (local_lane ^ group < cutoff) 7 else 1;
+        const selected: u32 = if (local_lane ^ (group & 63) < cutoff) 7 else 1;
         value.* = (value.* +% selected +% @as(u32, @truncate(mask))) ^ @as(u32, @truncate(mask >> 32));
-        value.* = (value.* +% @as(u32, @intCast(group))) ^ @as(u32, @intCast(63 ^ group));
+        value.* = (value.* +% @as(u32, @intCast(wave_base ^ (group & 63)))) ^ @as(u32, @intCast((wave_base + 63) ^ (group & 63)));
     };
     const output = try allocator.alloc(u8, output_bytes);
     defer allocator.free(output);
@@ -2250,11 +2255,11 @@ fn runWave64BallotsCase(allocator: std.mem.Allocator, double_buffer: bool) !void
     _ = try renderer.stageGuestStorageBufferAt(0, 0x10000, output_bytes);
     _ = try renderer.dispatchSpirv(baseline.words, .{ groups, 1, 1 });
     try renderer.readbackGuestStorageBuffer(0x10000, output);
-    for (0..groups * 64) |lane| {
+    for (0..groups * lanes) |lane| {
         const actual = std.mem.readInt(u32, output[lane * 4 ..][0..4], .little);
         try std.testing.expectEqual(expected[lane], actual);
     }
-    std.debug.print("explicit wave64 ballots passed: double_buffer={} 32 interleaved masks and cross-half exchanges across 64 groups\n", .{double_buffer});
+    std.debug.print("explicit wave64 ballots passed: lanes={d} double_buffer={} 32 interleaved masks and cross-half exchanges across 64 groups\n", .{ lanes, double_buffer });
 }
 
 fn runWave64Probe(allocator: std.mem.Allocator) !void {
