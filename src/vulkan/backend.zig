@@ -22799,6 +22799,16 @@ pub const Renderer = struct {
     }
 
     fn reportGuestDrawFailure(self: *Renderer, state: *const gpu.State, err: anyerror) void {
+        if (self.trace_resource_failures) {
+            const vertex = if (graphicsVertexStage(state)) |stage| stage.programAddress(state) else null;
+            const local = (@as(u64, state.readRegister(.shader, 0x148) orelse 0) << 8) |
+                (@as(u64, (state.readRegister(.shader, 0x149) orelse 0) & 255) << 40);
+            std.debug.print("[draw failure] flip={d} draw={d} error={s} vs={?x} ps={?x} ls={x} hs={?x} primitive={?x} layout={?x} mode={?x}\n", .{
+                self.flip_callbacks,                                   self.frame_profile.draws,            @errorName(err),                                      vertex,
+                gpu.resources.ShaderStage.pixel.programAddress(state), local,                               gpu.resources.ShaderStage.hull.programAddress(state), state.readRegister(.uconfig, 0x242),
+                state.readRegister(.context, 0x2d6),                   state.readRegister(.context, 0x2db),
+            });
+        }
         if (!self.shouldReportDrawError(err)) return;
         std.debug.print("[vulkan dcb] draw rejected: {s}\n", .{@errorName(err)});
         if (err != Error.UnsupportedColorTarget) return;
