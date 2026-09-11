@@ -842,6 +842,7 @@ const Builder = struct {
     /// only report the mistake as DEVICE_LOST when a large compute kernel runs,
     /// so track the emitted operations and declare their exact requirements.
     uses_group_shuffle: bool = false,
+    lane_mask_scan_pcs: []const u32 = &.{},
     uses_group_shuffle_relative: bool = false,
     scalar_specializations: []const ScalarRegister,
     dynamic_scalar_binding: ?DynamicScalarBinding,
@@ -3166,7 +3167,17 @@ const Builder = struct {
     }
 
     fn findFirstBit64(self: *Builder, inst: instruction.Instruction, from_high: bool) Error!void {
-        const pair = try self.sourcePair(inst.src0);
+        var pair = try self.sourcePair(inst.src0);
+        if (std.mem.indexOfScalar(u32, self.lane_mask_scan_pcs, inst.pc) != null) {
+            // Saved graphics masks contain one predicate per invocation.
+            // A scalar bit scan needs the subgroup-wide bitfield instead.
+            const ballot = self.id();
+            try self.emit(&self.body, 339, &.{ try self.ensureVec4(.bits32), ballot, try self.constant(.bits32, 3), try self.isNonZero(pair[0]) });
+            for (0..2) |i| {
+                pair[i] = self.id();
+                try self.emit(&self.body, 81, &.{ self.bits_type, pair[i], ballot, @intCast(i) });
+            }
+        }
         const zero = try self.constant(.bits32, 0);
         const minus_one = try self.constant(.sint32, 0xffff_ffff);
         const thirty_two = try self.constant(.sint32, 32);
@@ -11516,6 +11527,12 @@ fn translateInstructions(
     try builder.configureLaneSpills(instructions);
     var graph = try control_flow.buildInstructionsWithBarriers(allocator, instructions, builder.converged_workgroup_dispatch);
     defer graph.deinit(allocator);
+    const lane_mask_scans = if (effective.stage == .fragment and !effective.wave32)
+        try @import("lane_mask_provenance.zig").scanPcs(allocator, instructions, &graph)
+    else
+        try allocator.alloc(u32, 0);
+    defer allocator.free(lane_mask_scans);
+    builder.lane_mask_scan_pcs = lane_mask_scans;
     if (builder.converged_workgroup_dispatch) {
         try translateDispatcher(&builder, instructions, &graph);
     } else if (graph.blocks.items.len == 1) {
@@ -11544,6 +11561,7 @@ fn translateInstructions(
             builder_alive = false;
             builder = try Builder.init(allocator, effective);
             builder_alive = true;
+            builder.lane_mask_scan_pcs = lane_mask_scans;
             try builder.configureLaneSpills(instructions);
             translateDispatcher(&builder, instructions, &graph) catch |dispatch_err| {
                 if (dispatch_err != Error.UnsupportedControlFlow) return dispatch_err;
@@ -11552,6 +11570,7 @@ fn translateInstructions(
                 builder_alive = false;
                 builder = try Builder.init(allocator, effective);
                 builder_alive = true;
+                builder.lane_mask_scan_pcs = lane_mask_scans;
                 try builder.configureLaneSpills(instructions);
                 builder.used_control_flow_fallback = true;
                 try builder.emit(&builder.body, 248, &.{builder.label});

@@ -3553,7 +3553,7 @@ fn runUiAttachmentProbe(allocator: std.mem.Allocator) !void {
     std.debug.print("UI attachments passed: missing color/clip defaults, explicit disable/DX clip, stale depth and HTILE comparisons\n", .{});
 }
 
-fn runFragmentFirstActiveLaneProbe(allocator: std.mem.Allocator) !void {
+fn runFragmentFirstActiveLaneProbe(allocator: std.mem.Allocator, scan_mask: bool) !void {
     var renderer = try vulkan.Renderer.init(allocator, .{});
     defer renderer.deinit();
     var guest = GuestMemory{};
@@ -3578,13 +3578,42 @@ fn runFragmentFirstActiveLaneProbe(allocator: std.mem.Allocator) !void {
     for ([_]f32{ 4, 4, -4, 4, 1, 0 }, 0..) |value, i|
         try state.writeRegister(.context, 0x10f + @as(u32, @intCast(i)), @bitCast(value));
     var executor = gpu.DcbExecutor{ .state = &state, .backend = renderer.dcbBackend(guest.interface()), .allocator = allocator };
-    for ([_]u9{ 129, 128, 129 }) |selected| {
-        const fragment = [_]u32{
+    for (0..@as(usize, if (scan_mask) 4 else 1)) |mode| for ([_]u9{ 129, 128, 129 }) |selected| {
+        var fragment = std.ArrayList(u32).empty;
+        defer fragment.deinit(allocator);
+        try fragment.appendSlice(allocator, &.{
             vop1(7, 6, 258), vop2Source(0x1b, 6, 129, 6), // pixel X parity
             sop1(4, 20, 126), // preserve full EXEC
             0x7c000000 | (0xc2 << 17) | (6 << 9) | @as(u32, selected), // CMP_EQ_U32
             sop1(0x24, 22, 106), // select alternating columns in EXEC
-            vop1(2, 12, 262), // READFIRSTLANE s12, v6: disabled lanes must not supply it
+        });
+        if (scan_mask) {
+            try fragment.append(allocator, sop1(4, 24, 126)); // copy EXEC to a saved scalar mask
+            if (mode == 1) try fragment.append(allocator, 0x87808000 | (24 << 16) | 24); // saved &= 0
+            if (mode == 2) {
+                // Reusing a saved-mask SGPR for an integer must discard its
+                // mask provenance, including a partial pair overwrite.
+                try fragment.append(allocator, sop1(3, 24, 144)); // low=16; high retains saved mask
+            }
+            if (mode == 3) try fragment.append(allocator, sop1(3, 30, 128));
+            const loop_start = fragment.items.len;
+            try fragment.append(allocator, sop1(0x14, 12, 24)); // FF1 s12, saved mask
+            if (mode == 1 or mode == 2) {
+                const expected_bit: u32 = if (mode == 1) 193 else 132; // -1 or 4
+                try fragment.append(allocator, 0xbf060000 | (expected_bit << 8) | 12);
+                try fragment.append(allocator, 0x850c8081); // s12 = (scan == expected) ? 1 : 0
+            } else try fragment.appendSlice(allocator, &.{ 0xd760000c, 262 | (12 << 9) }); // READLANE s12, v6, s12
+            if (mode == 3) {
+                try fragment.appendSlice(allocator, &.{
+                    0x87987e18, // saved &= EXEC on the back edge
+                    0x801e811e, // counter++
+                    0xbf06821e, // counter == 2
+                });
+                const branch: i32 = @as(i32, @intCast(loop_start)) - @as(i32, @intCast(fragment.items.len)) - 1;
+                try fragment.append(allocator, 0xbf840000 | @as(u32, @as(u16, @bitCast(@as(i16, @intCast(branch))))));
+            }
+        } else try fragment.append(allocator, vop1(2, 12, 262));
+        try fragment.appendSlice(allocator, &.{
             sop1(4, 126, 20), // restore all pixels before displaying the result
             vop1(6, 0, 12),
             vop1(1, 1, 128),
@@ -3592,21 +3621,21 @@ fn runFragmentFirstActiveLaneProbe(allocator: std.mem.Allocator) !void {
             0xf800180f,
             0x02010100,
             0xbf810000,
-        };
-        for (fragment, 0..) |word, i| guest.word(0x900 + i * 4, word);
+        });
+        for (fragment.items, 0..) |word, i| guest.word(0x900 + i * 4, word);
         _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 0 });
         if (renderer.last_draw_error) |err| return err;
         try renderer.flushPendingGuestWrites();
         for (0..64) |pixel| {
             const actual = std.mem.readInt(u32, guest.bytes[0x2000 + pixel * 4 ..][0..4], .little);
-            const expected: u32 = if (selected == 129) 0xff0000ff else 0xff000000;
+            const expected: u32 = if (mode == 1 or mode == 2 or selected == 129) 0xff0000ff else 0xff000000;
             if (actual != expected) {
-                std.debug.print("Fragment first-active mismatch selection={d} pixel={d}: expected=0x{x} actual=0x{x}\n", .{ selected - 128, pixel, expected, actual });
+                std.debug.print("Fragment first-active mismatch mode={d} selection={d} pixel={d}: expected=0x{x} actual=0x{x}\n", .{ mode, selected - 128, pixel, expected, actual });
                 return error.FragmentFirstActiveLaneMismatch;
             }
         }
-    }
-    std.debug.print("Fragment first active lane passed: alternating EXEC masks exclude inactive source lanes across repeated draws\n", .{});
+    };
+    std.debug.print("Fragment first active lane passed: alternating masks, saved-mask scans, empty masks, integer overwrites and loop back edges\n", .{});
 }
 
 fn runFragmentPositionProbe(allocator: std.mem.Allocator) !void {
@@ -7603,7 +7632,11 @@ pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
     const args = try init.minimal.args.toSlice(allocator);
     if (args.len == 2 and std.mem.eql(u8, args[1], "--fragment-first-active")) {
-        try runFragmentFirstActiveLaneProbe(allocator);
+        try runFragmentFirstActiveLaneProbe(allocator, false);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--fragment-mask-first-lane")) {
+        try runFragmentFirstActiveLaneProbe(allocator, true);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--deferred-shader-metadata")) {
