@@ -2049,6 +2049,8 @@ const FrameProfile = struct {
     shader_translate_ns: u64 = 0,
     graphics_resource_ns: u64 = 0,
     graphics_storage_ns: u64 = 0,
+    shader_metadata_candidates: u64 = 0,
+    shader_metadata_scans_skipped: u64 = 0,
     graphics_setup_ns: u64 = 0,
     graphics_pipeline_lookup_ns: u64 = 0,
     graphics_scalar_upload_ns: u64 = 0,
@@ -3327,6 +3329,11 @@ pub const Renderer = struct {
     reanimal_restore_timeline_after_flip: ?u64 = null,
     reanimal_skip_compute_until_flip: ?u64 = null,
     defer_small_storage_writes_enabled: bool,
+    // Conservative bounds on unpublished small GPU writes. Stale bounds after
+    // an exact readback are harmless; completion resets them after publication.
+    deferred_shader_metadata_start: u64 = std.math.maxInt(u64),
+    deferred_shader_metadata_end: u64 = 0,
+    deferred_shader_metadata_bounds_enabled: bool = true,
     depth_transfer_enabled: bool,
     image_state_optimization_enabled: bool,
     guest_memory: ?GuestMemory = null,
@@ -5577,7 +5584,12 @@ pub const Renderer = struct {
         // Scalar resource discovery runs on the host. A preceding dispatch
         // may have generated the descriptor it is about to read, including
         // a field inside a small buffer rather than its exact base address.
-        if (self.defer_small_storage_writes_enabled and bytes.len != 0) {
+        const overlaps_metadata = address < self.deferred_shader_metadata_end and
+            address +| bytes.len > self.deferred_shader_metadata_start;
+        if (self.defer_small_storage_writes_enabled and bytes.len != 0 and
+            (!self.deferred_shader_metadata_bounds_enabled or overlaps_metadata))
+        {
+            self.frame_profile.shader_metadata_candidates +|= self.guest_buffers.items.len;
             for (self.guest_buffers.items, 0..) |entry, index| {
                 if (!entry.gpu_dirty or entry.size >= deferred_storage_write_min_bytes or
                     !byteRangesOverlap(address, bytes.len, entry.guest_address, entry.size)) continue;
@@ -5587,6 +5599,8 @@ pub const Renderer = struct {
                     return false;
                 };
             }
+        } else if (self.defer_small_storage_writes_enabled and bytes.len != 0) {
+            self.frame_profile.shader_metadata_scans_skipped +|= 1;
         }
         const success = memory.read(memory.context, address, bytes);
         if (!success and self.trace_resource_failures) self.last_shader_read_failure = .{
@@ -6371,7 +6385,7 @@ pub const Renderer = struct {
         // shared memory for alternating exchanges. Budget the same scratch
         // layout that the translator emits, including scheduler storage.
         const invocations = @as(u64, local_size[0]) *| local_size[1] *| local_size[2];
-        const wave_exchange_double_buffer = @as(u64, lds_bytes) +| rdna2.spirv.wave64ScratchWords(invocations, true) *| 4 <= self.device_info.max_compute_shared_memory_size;
+        var wave_exchange_double_buffer = @as(u64, lds_bytes) +| rdna2.spirv.wave64ScratchWords(invocations, true) *| 4 <= self.device_info.max_compute_shared_memory_size;
         if (scene_collision_query and @as(u64, lds_bytes) +| rdna2.spirv.wave64ScratchWords(invocations, wave_exchange_double_buffer) *| 4 > self.device_info.max_compute_shared_memory_size) {
             const groups = std.math.mul(u64, group_count[0], group_count[1]) catch return Error.GuestBufferTooLarge;
             const total_groups = std.math.mul(u64, groups, group_count[2]) catch return Error.GuestBufferTooLarge;
@@ -6381,6 +6395,9 @@ pub const Renderer = struct {
             spilled_lds = try self.createBuffer(bytes, vk.buffer_usage_storage_buffer_bit, vk.memory_property_device_local_bit);
             self.updateStorageDescriptorRange(lds_slot.?, spilled_lds.?.handle, 0, bytes);
             resources.occupied[lds_slot.?] = true;
+            // Spilled guest LDS no longer consumes workgroup memory. Keep
+            // alternating exchanges when their scratch alone fits the device.
+            wave_exchange_double_buffer = rdna2.spirv.wave64ScratchWords(invocations, true) *| 4 <= self.device_info.max_compute_shared_memory_size;
         }
         const module_lease = self.compute_translations.acquirePrepared(self.allocator, &analysis.program, .{
             .stage = .compute,
@@ -9398,8 +9415,7 @@ pub const Renderer = struct {
             self.invalidateBufferColorTarget(resources.addresses[index]);
             const buffer_index = for (self.guest_buffers.items, 0..) |*entry, slot| {
                 if (entry.guest_address != resources.addresses[index] or entry.size != resources.sizes[index]) continue;
-                entry.gpu_dirty = true;
-                entry.content_hash = null;
+                self.markGuestBufferWritten(entry);
                 break slot;
             } else return Error.GuestBufferNotStaged;
             if (self.defer_small_storage_writes_enabled or
@@ -9409,6 +9425,14 @@ pub const Renderer = struct {
             }
             try self.flushGuestStorageBuffer(buffer_index);
         }
+    }
+
+    fn markGuestBufferWritten(self: *Renderer, entry: *GuestBufferEntry) void {
+        entry.gpu_dirty = true;
+        entry.content_hash = null;
+        if (entry.size >= deferred_storage_write_min_bytes) return;
+        self.deferred_shader_metadata_start = @min(self.deferred_shader_metadata_start, entry.guest_address);
+        self.deferred_shader_metadata_end = @max(self.deferred_shader_metadata_end, entry.guest_address +| entry.size);
     }
 
     fn invalidateBufferColorTarget(self: *Renderer, address: u64) void {
@@ -14049,7 +14073,7 @@ pub const Renderer = struct {
         const copy = vk.BufferCopy{ .source_offset = 0, .destination_offset = 0, .size = seed.len };
         self.device_functions.cmd_copy_buffer(command_buffer, source.handle, entry.device_local.handle, 1, @ptrCast(&copy));
         try self.submitOneShot(command_buffer);
-        entry.gpu_dirty = true;
+        self.markGuestBufferWritten(entry);
         try self.flushGuestStoragePrefix(index, 3);
         try std.testing.expect(entry.gpu_dirty);
         var actual: [16]u8 = undefined;
@@ -16254,6 +16278,19 @@ pub const Renderer = struct {
         const try_guest_vs = probe_parameter_mask == 0;
         if (try_guest_vs) {
             const vertex_translate_started = hostTimestampNs();
+            const vertex_pipeline_options = rdna2.ir.PipelineOptions{
+                .enable_typed_ir = self.shader_ir_enabled,
+                .enable_ssa_optimization = self.shader_ssa_optimization_enabled,
+            };
+            // An inlined fetch shader changes the decoded program despite
+            // sharing its original code bytes. Only borrow the analysis key
+            // when both the instructions and lowering options are unchanged.
+            const vertex_translation_key = if (self.prepared_program_keys_enabled and
+                vertex_instruction_storage.items.len == 0 and
+                std.meta.eql(vertex_analysis.pipeline_options, vertex_pipeline_options))
+                vertex_analysis.translation_key
+            else
+                null;
             // Omitted PA_CL_CLIP_CNTL inherits AGC's zero default (-W..W).
             // Explicit DX_CLIP_SPACE_DEF still preserves 0..W, as in Yotei.
             const convert_guest_depth = !render_state.raster.zero_to_one_depth;
@@ -16292,7 +16329,7 @@ pub const Renderer = struct {
                     convert_guest_depth,
                 ))
             else
-                self.graphics_translations.acquire(self.allocator, &vertex_program, .{
+                self.graphics_translations.acquirePrepared(self.allocator, &vertex_program, .{
                     .stage = .vertex,
                     // The PS5 NGG/export ABI supplies S_NGG_VERTEX_INDEX in v5;
                     // ordinary VS programs retain the legacy v0 convention.
@@ -16315,10 +16352,7 @@ pub const Renderer = struct {
                     .descriptor_array_length = maximum_storage_descriptors,
                     .scalar_memories = vertex_storage.scalar_memories[0..vertex_storage.scalar_memory_count],
                     .sampled_image_array_length = self.device_info.sampled_image_capacity,
-                }, .{
-                    .enable_typed_ir = self.shader_ir_enabled,
-                    .enable_ssa_optimization = self.shader_ssa_optimization_enabled,
-                });
+                }, vertex_pipeline_options, vertex_translation_key);
             if (vertex_module_result) |vertex_lease| {
                 self.frame_profile.shader_translate_ns +|= elapsedHostNanoseconds(vertex_translate_started);
                 defer vertex_lease.release();
@@ -20956,6 +20990,8 @@ pub const Renderer = struct {
                 return false;
             };
         }
+        self.deferred_shader_metadata_start = std.math.maxInt(u64);
+        self.deferred_shader_metadata_end = 0;
         return true;
     }
 
@@ -21649,6 +21685,10 @@ pub const Renderer = struct {
             std.debug.print(
                 "[gpu buffers] flip={d} content_reused_kib={d} fingerprint_ms={d}\n",
                 .{ self.flip_callbacks, profile.content_reused_bytes / 1024, profile.buffer_fingerprint_ns / std.time.ns_per_ms },
+            );
+            if (profile.shader_metadata_candidates +| profile.shader_metadata_scans_skipped != 0) std.debug.print(
+                "[gpu shader reads] flip={d} metadata_candidates={d} scans_skipped={d}\n",
+                .{ self.flip_callbacks, profile.shader_metadata_candidates, profile.shader_metadata_scans_skipped },
             );
             if (profile.feedback_snapshots != 0) std.debug.print(
                 "[gpu feedback] flip={d} snapshots={d} copy_kib={d}\n",

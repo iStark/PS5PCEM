@@ -25,6 +25,9 @@ includes decoded instructions, pipeline options and all translation bindings;
 dynamic scalar values are supplied through the per-draw SSBO. Keys serialize
 fields rather than padding or pointers and are compared in full after hashing.
 This avoids repeating translation just to discover an existing Vulkan pipeline.
+Compute, fragment and unchanged vertex programs reuse the immutable analysis
+key prefix, avoiding repeated serialization of decoded instructions. Inlined
+vertex fetch programs and changed lowering options rebuild the complete key.
 When `PS5_GPU_ASYNC_PIPELINES=1`, first-use compute and graphics pipelines are created by
 [`vulkan.pipeline_compiler`](../../src/vulkan/pipeline_compiler.zig), an on-demand
 single-worker FIFO which serializes the shared driver cache and falls back to a
@@ -243,6 +246,12 @@ reserved data selections are rejected. Completed render targets are retained by
 guest address. `SetFlip` resolves its registered VideoOut slot and sends the
 matching address and dimensions to the presentation path; diagnostic captures
 can still request a CPU-visible linear frame explicitly.
+
+When small GPU writes are deferred, host shader-metadata reads first check
+conservative address bounds before scanning the buffer cache. Overlapping
+reads, including fields inside a buffer, still publish the exact dirty range
+before resource discovery. Completion resets the bounds only after all small
+writes have been published successfully.
 
 The storage-buffer cache applies its byte budget in both retention modes.
 Accounting includes retained allocation capacity and any transfer mirror,
