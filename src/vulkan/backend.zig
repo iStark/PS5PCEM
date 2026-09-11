@@ -8945,7 +8945,11 @@ pub const Renderer = struct {
                 );
                 return Error.UnsupportedSampledImage;
             }
-            const candidate_count: usize = if (candidates) |table| table.count else 1;
+            // The candidate array is 256 KiB. Borrow its optional payload so
+            // accessing one descriptor or sampler does not copy the whole
+            // table on every iteration in ReleaseSafe builds.
+            const candidate_table: ?*const BufferImageCandidates = if (candidates) |*table| table else null;
+            const candidate_count: usize = if (candidate_table) |table| table.count else 1;
             if (candidate_count == 0) {
                 result.sampled_image_mappings[result.sampled_image_mapping_count] = .{
                     .resource_sgpr = resource_sgpr,
@@ -8953,13 +8957,13 @@ pub const Renderer = struct {
                     .descriptor_index = 0,
                     .instruction_pc = inst.pc,
                     .unbound = true,
-                    .unbound_fault_descriptor = if (candidates.?.requires_null_check) try self.prepareUnboundImageFault(result) else null,
+                    .unbound_fault_descriptor = if (candidate_table.?.requires_null_check) try self.prepareUnboundImageFault(result) else null,
                 };
                 result.sampled_image_mapping_count += 1;
                 continue;
             }
             for (0..candidate_count) |candidate_index| {
-                const candidate_words: ?[8]u32 = if (candidates) |table| table.words[candidate_index] else null;
+                const candidate_words: ?[8]u32 = if (candidate_table) |table| table.words[candidate_index] else null;
                 const image_descriptor = if (candidate_words) |words| try gpu.resources.decodeImageDescriptor(&words) else direct_image.?;
                 if (inst.opcode == .image_load and !isBlockCompressedUnifiedFormat(image_descriptor.unified_format)) {
                     // Uncompressed fetches were bound through the storage-image
@@ -8969,7 +8973,7 @@ pub const Renderer = struct {
                 }
                 var sampler_descriptor: gpu.resources.SamplerDescriptor = if (image_fetch)
                     std.mem.zeroes(gpu.resources.SamplerDescriptor)
-                else if (if (candidates) |table| table.sampler else null) |sampler|
+                else if (if (candidate_table) |table| table.sampler else null) |sampler|
                     sampler
                 else
                     (try resolveComputeSamplerDescriptor(
