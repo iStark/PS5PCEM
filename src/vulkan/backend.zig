@@ -3423,7 +3423,7 @@ pub const Renderer = struct {
     /// once so entries never move: callers hold `*const Analysis` into it for
     /// the length of a draw.
     analyzed_programs: std.ArrayList(AnalyzedProgram) = .empty,
-    tessellation_program: ?gpu.tessellation.Entry = null,
+    tessellation_programs: gpu.tessellation.Cache = .{},
     analyzed_program_sequence: u64 = 0,
     texture_probes: [maximum_texture_probes]TextureProbe = @splat(.{}),
     texture_probe_count: usize = 0,
@@ -4352,7 +4352,7 @@ pub const Renderer = struct {
         self.compute_translations.deinit(self.allocator);
         for (self.analyzed_programs.items) |*entry| entry.analysis.deinit(self.allocator);
         self.analyzed_programs.deinit(self.allocator);
-        if (self.tessellation_program) |*entry| entry.deinit(self.allocator);
+        self.tessellation_programs.deinit(self.allocator);
         for (self.completed_frames.items) |*frame| frame.pixels.deinit(self.allocator);
         self.completed_frames.deinit(self.allocator);
         self.guest_frame_scratch.deinit(self.allocator);
@@ -14878,11 +14878,9 @@ pub const Renderer = struct {
         const hs_address = gpu.resources.ShaderStage.hull.programAddress(state) orelse return error.MissingHullShader;
         const local = try self.analyzedProgram(reader, ls_address, if (memory.shader_header) |resolve| resolve(memory.context, ls_address) else null);
         const hull = try self.analyzedProgram(reader, hs_address, if (memory.shader_header) |resolve| resolve(memory.context, hs_address) else null);
-        if (self.tessellation_program == null or !self.tessellation_program.?.matches(config, local, hull)) {
-            const replacement = try gpu.tessellation.Entry.init(self.allocator, config, local, hull);
-            if (self.tessellation_program) |*entry| entry.deinit(self.allocator);
-            self.tessellation_program = replacement;
-            std.debug.print("[vulkan dcb] merged LS/HS @0x{x}/0x{x}: {d} patches/group, {d} control points, {d} words\n", .{ ls_address, hs_address, config.patches, config.control_points, replacement.merged.code.items.len });
+        const cached = try self.tessellation_programs.get(self.allocator, config, local, hull);
+        if (cached.created) {
+            std.debug.print("[vulkan dcb] merged LS/HS @0x{x}/0x{x}: {d} patches/group, {d} control points, {d} words\n", .{ ls_address, hs_address, config.patches, config.control_points, cached.entry.merged.code.items.len });
         }
         const root = @as(u64, state.readRegister(.shader, 0x102) orelse return error.MissingHullShaderTable) |
             (@as(u64, state.readRegister(.shader, 0x103) orelse return error.MissingHullShaderTable) << 32);
@@ -14905,7 +14903,7 @@ pub const Renderer = struct {
         } else {
             try config.prepareState(compute, draw.first_instance, patch_count);
         }
-        const report = try self.dispatchRdna2Analysis(compute, .{ config.localSize(), 1, 1 }, .{ groups, 1, 1 }, 0, &self.tessellation_program.?.merged);
+        const report = try self.dispatchRdna2Analysis(compute, .{ config.localSize(), 1, 1 }, .{ groups, 1, 1 }, 0, &cached.entry.merged);
         if (report.spirv_words == 0) return error.TessellationPrepassNotExecuted;
         return .{ .config = config, .factors = factors, .patch_count = patch_count };
     }

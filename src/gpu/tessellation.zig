@@ -139,7 +139,8 @@ pub const Entry = struct {
     }
 
     pub fn matches(self: *const Entry, config: Config, local: *const analysis.Analysis, hull: *const analysis.Analysis) bool {
-        return std.meta.eql(self.config, config) and std.mem.eql(u32, self.local_words, local.code.items) and std.mem.eql(u32, self.hull_words, hull.code.items);
+        return std.meta.eql(self.config, config) and std.meta.eql(self.merged.pipeline_options, local.pipeline_options) and
+            std.mem.eql(u32, self.local_words, local.code.items) and std.mem.eql(u32, self.hull_words, hull.code.items);
     }
 
     pub fn init(allocator: std.mem.Allocator, config: Config, local: *const analysis.Analysis, hull: *const analysis.Analysis) !Entry {
@@ -206,6 +207,34 @@ pub const Entry = struct {
         merged.enableUniformSpecializations(allocator) catch {};
         merged.enableTranslationKey(allocator) catch {};
         return .{ .config = config, .local_words = local_words, .hull_words = hull_words, .merged = merged };
+    }
+};
+
+/// Retain analyses across alternating LS/HS pairs. Entries own their shader
+/// words, so guest code replacement cannot turn a stale analysis into a hit.
+pub const Cache = struct {
+    entries: [8]?Entry = @splat(null),
+    next: usize = 0,
+
+    pub const Result = struct { entry: *Entry, created: bool };
+
+    pub fn deinit(self: *Cache, allocator: std.mem.Allocator) void {
+        for (&self.entries) |*slot| if (slot.*) |*entry| entry.deinit(allocator);
+        self.* = .{};
+    }
+
+    /// The returned pointer remains valid until this slot is evicted by a
+    /// later lookup. A failed build leaves every existing entry intact.
+    pub fn get(self: *Cache, allocator: std.mem.Allocator, config: Config, local: *const analysis.Analysis, hull: *const analysis.Analysis) !Result {
+        for (&self.entries) |*slot| if (slot.*) |*entry| {
+            if (entry.matches(config, local, hull)) return .{ .entry = entry, .created = false };
+        };
+        const replacement = try Entry.init(allocator, config, local, hull);
+        const slot = &self.entries[self.next];
+        if (slot.*) |*entry| entry.deinit(allocator);
+        slot.* = replacement;
+        self.next = (self.next + 1) % self.entries.len;
+        return .{ .entry = &slot.*.?, .created = true };
     }
 };
 
@@ -349,4 +378,63 @@ test "indexed triangle tessellation preserves graphics registers and rejects inv
     try std.testing.expectEqualDeep(state.context, compute.context);
     try std.testing.expectEqualDeep(state.uconfig, compute.uconfig);
     try std.testing.expectEqual(112, state.readRegister(.shader, 0x118).?);
+}
+
+test "tessellation cache retains alternating programs and invalidates code and options" {
+    const allocator = std.testing.allocator;
+    var source = Words{ .allocator = allocator };
+    defer source.code.deinit(allocator);
+    try source.code.appendSlice(allocator, &.{
+        0x7e04_0280, 0xbefd_2106, // v_mov_b32 v2, 0; LS continuation
+        0xf408_0200, 0xfa00_0000, 0xbf81_0000, // HS root load; end
+    });
+    const reader = shaders.MemoryReader{ .context = &source, .read_fn = Words.read };
+    var local = try analysis.decodeBounded(allocator, reader, 0, 2, 8);
+    defer local.deinit(allocator);
+    var hull = try analysis.decodeBounded(allocator, reader, 8, 3, 12);
+    defer hull.deinit(allocator);
+    var state = State{};
+    try state.writeRegister(.uconfig, 0x242, 9);
+    try state.writeRegister(.context, 0x2d6, 0x1043f);
+    try state.writeRegister(.context, 0x2db, 0x4006a);
+    const config = (try Config.decode(&state)).?;
+    var cache = Cache{};
+    defer cache.deinit(allocator);
+    const first = try cache.get(allocator, config, &local, &hull);
+    try std.testing.expect(first.created);
+    const first_code = first.entry.merged.code.items.ptr;
+
+    // The guest can reuse a program address for different instructions.
+    source.code.items[0] = 0x7e04_0281;
+    var changed = try analysis.decodeBounded(allocator, reader, 0, 2, 8);
+    defer changed.deinit(allocator);
+    try std.testing.expect((try cache.get(allocator, config, &changed, &hull)).created);
+    for (0..12) |_| {
+        const old = try cache.get(allocator, config, &local, &hull);
+        try std.testing.expect(!old.created);
+        try std.testing.expectEqual(first_code, old.entry.merged.code.items.ptr);
+        try std.testing.expect(!(try cache.get(allocator, config, &changed, &hull)).created);
+    }
+    changed.pipeline_options.enable_typed_ir = false;
+    try std.testing.expect((try cache.get(allocator, config, &changed, &hull)).created);
+    try std.testing.expect(!(try cache.get(allocator, config, &local, &hull)).created);
+
+    // A failed replacement must not discard any cached analysis.
+    source.code.items[0] = 0xbf81_0000;
+    var invalid = try analysis.decodeBounded(allocator, reader, 0, 1, 4);
+    defer invalid.deinit(allocator);
+    const next = cache.next;
+    try std.testing.expectError(error.MissingLocalShaderContinuation, cache.get(allocator, config, &invalid, &hull));
+    try std.testing.expectEqual(next, cache.next);
+    try std.testing.expect(!(try cache.get(allocator, config, &local, &hull)).created);
+
+    // Exceed the bound, exercise destruction and reconstruct the evicted pair.
+    for (1..cache.entries.len + 1) |patches| {
+        var other = config;
+        other.patches = @intCast(patches);
+        other.inputs.patches_per_group = @intCast(patches);
+        try std.testing.expect((try cache.get(allocator, other, &local, &hull)).created);
+    }
+    try std.testing.expect((try cache.get(allocator, config, &local, &hull)).created);
+    try std.testing.expect(!(try cache.get(allocator, config, &local, &hull)).created);
 }
