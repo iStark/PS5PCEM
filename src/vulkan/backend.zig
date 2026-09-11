@@ -912,6 +912,41 @@ fn sampledImageDescriptorBinding(dimension: rdna2.spirv.SampledImageDimension) u
     };
 }
 
+test "graphics pipeline buckets verify colliding state and shaders after replacement" {
+    var vertex = [_]u32{ 1, 2 };
+    var fragment = [_]u32{ 3, 4 };
+    var other_words = [_]u32{ 5, 6 };
+    const state = GraphicsPipelineState.default(64, 64);
+    const entry = GraphicsPipelineEntry{
+        .hash = 13,
+        .state_hash = 0,
+        .vertex_hash = 0,
+        .fragment_hash = 0,
+        .state = state,
+        .vertex_words = &vertex,
+        .fragment_words = &fragment,
+        .pipeline = 1,
+        .last_used_sequence = 0,
+    };
+    var entries = [_]GraphicsPipelineEntry{ entry, entry, entry };
+    entries[0].state.width = 65;
+    entries[1].fragment_words = &other_words;
+    entries[2].pipeline = 3;
+    var renderer: Renderer = undefined;
+    renderer.graphics_pipelines = .{ .items = &entries, .capacity = entries.len };
+    renderer.graphics_pipeline_index = .{};
+    try std.testing.expectEqual(@as(vk.Pipeline, 3), renderer.findGraphicsPipeline(13, state, &vertex, &fragment).?.pipeline);
+    try std.testing.expectEqual(&entries[0], renderer.findGraphicsPipeline(13, entries[0].state, &vertex, &fragment).?);
+    try std.testing.expectEqual(null, renderer.findGraphicsPipeline(13, state, &other_words, &fragment));
+    try std.testing.expectEqual(&entries[1], renderer.findGraphicsPipeline(13, state, &vertex, &other_words).?);
+    // Replacing an LRU slot must remove its old key from lookup and expose
+    // the new key even when the number of cached entries does not change.
+    entries[2].hash = 99;
+    renderer.graphics_pipeline_index.invalidate();
+    try std.testing.expectEqual(null, renderer.findGraphicsPipeline(13, state, &vertex, &fragment));
+    try std.testing.expectEqual(&entries[2], renderer.findGraphicsPipeline(99, state, &vertex, &fragment).?);
+}
+
 test "sampled descriptor lookup preserves physical slots across repeated instruction mappings" {
     const mappings = [_]gpu.ShaderSpirvSampledImageBinding{
         .{ .resource_sgpr = 0, .sampler_sgpr = 0, .descriptor_index = 2, .dimension = .cube, .unbound = true },
@@ -3395,6 +3430,7 @@ pub const Renderer = struct {
     compute_pipelines: std.ArrayList(ComputePipelineEntry) = .empty,
     compute_pipeline_sequence: u64 = 0,
     graphics_pipelines: std.ArrayList(GraphicsPipelineEntry) = .empty,
+    graphics_pipeline_index: @import("sampled_image_index.zig").Index(maximum_graphics_pipelines) = .{},
     // A streamed 3D scene can reuse hundreds of large vertex/fragment modules
     // per frame. A 64 MiB limit evicts them before the next frame consumes them.
     graphics_translations: spirv_cache.Cache = .{ .maximum_bytes = 256 * 1024 * 1024 },
@@ -5997,10 +6033,10 @@ pub const Renderer = struct {
         try self.beginComputeDispatch();
         var yotei_gds_before: ?[]u8 = null;
         defer if (yotei_gds_before) |bytes| self.allocator.free(bytes);
-        const trace_yotei_gds = uses_gds and
+        const trace_yotei_gds = self.trace_resource_failures and uses_gds and
             program_address == 0x8000_3f2a_00 and
             self.reported_yotei_gds_dispatches < 8;
-        const trace_yotei_visibility = program_address == 0x8000_4101_00 and
+        const trace_yotei_visibility = self.trace_resource_failures and program_address == 0x8000_4101_00 and
             self.reported_yotei_visibility_dispatches < 8;
         if (uses_gds) {
             if (trace_yotei_gds) try self.downloadGdsStorage();
@@ -10602,6 +10638,28 @@ pub const Renderer = struct {
         }
     }
 
+    fn findGraphicsPipeline(
+        self: *Renderer,
+        hash: u64,
+        pipeline_state: GraphicsPipelineState,
+        vertex_words: []const u32,
+        fragment_words: []const u32,
+    ) ?*GraphicsPipelineEntry {
+        var candidates = self.graphics_pipeline_index.candidatesBy(self.graphics_pipelines.items, hash, struct {
+            fn key(entry: GraphicsPipelineEntry) u64 {
+                return entry.hash;
+            }
+        }.key);
+        while (candidates.next()) |slot| {
+            const entry = &self.graphics_pipelines.items[slot];
+            if (entry.hash == hash and
+                std.mem.eql(u8, std.mem.asBytes(&entry.state), std.mem.asBytes(&pipeline_state)) and
+                std.mem.eql(u32, entry.vertex_words, vertex_words) and
+                std.mem.eql(u32, entry.fragment_words, fragment_words)) return entry;
+        }
+        return null;
+    }
+
     fn getGraphicsPipeline(
         self: *Renderer,
         render_pass: vk.RenderPass,
@@ -10613,8 +10671,16 @@ pub const Renderer = struct {
         const state_hash = std.hash.Wyhash.hash(0, std.mem.asBytes(&pipeline_state));
         const vertex_hash_only = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(vertex_words));
         const fragment_hash_only = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(fragment_words));
-        const vertex_hash = std.hash.Wyhash.hash(state_hash, std.mem.sliceAsBytes(vertex_words));
-        const hash = std.hash.Wyhash.hash(vertex_hash, std.mem.sliceAsBytes(fragment_words));
+        // Hash each module once. Complete word comparison below still verifies
+        // a hit, including collisions in any of these component hashes.
+        const key_parts = [3]u64{ state_hash, vertex_hash_only, fragment_hash_only };
+        const hash = std.hash.Wyhash.hash(0, std.mem.asBytes(&key_parts));
+        if (self.findGraphicsPipeline(hash, pipeline_state, vertex_words, fragment_words)) |entry| {
+            self.graphics_pipeline_cache_hits += 1;
+            self.frame_profile.graphics_pipeline_hits += 1;
+            entry.last_used_sequence = self.graphics_pipeline_sequence;
+            return entry.pipeline;
+        }
         var state_match = false;
         var vertex_match = false;
         var fragment_match = false;
@@ -10622,16 +10688,6 @@ pub const Renderer = struct {
             state_match = state_match or entry.state_hash == state_hash;
             vertex_match = vertex_match or entry.vertex_hash == vertex_hash_only;
             fragment_match = fragment_match or entry.fragment_hash == fragment_hash_only;
-            if (entry.hash == hash and
-                std.mem.eql(u8, std.mem.asBytes(&entry.state), std.mem.asBytes(&pipeline_state)) and
-                std.mem.eql(u32, entry.vertex_words, vertex_words) and
-                std.mem.eql(u32, entry.fragment_words, fragment_words))
-            {
-                self.graphics_pipeline_cache_hits += 1;
-                self.frame_profile.graphics_pipeline_hits += 1;
-                entry.last_used_sequence = self.graphics_pipeline_sequence;
-                return entry.pipeline;
-            }
         }
         const build_started = hostTimestampNs();
         var work = GraphicsPipelineCompileJob{
@@ -10696,6 +10752,7 @@ pub const Renderer = struct {
             self.allocator.free(victim.fragment_words);
             victim.* = replacement;
         }
+        self.graphics_pipeline_index.invalidate();
         self.graphics_pipeline_cache_misses += 1;
         self.frame_profile.graphics_pipeline_misses += 1;
         self.frame_profile.graphics_pipeline_miss_state_match += @intFromBool(state_match);

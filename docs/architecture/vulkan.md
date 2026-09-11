@@ -114,6 +114,10 @@ explicitly. Local programs end at their hardware continuation before trailing
 allocation metadata. Guest 64-lane masks use the same wave base in both halves
 of a 32-wide host subgroup pair.
 
+Eight merged LS/HS analyses are retained across alternating pairs. Reuse checks
+the complete local/hull code, layout, index format and lowering options;
+guest code replacement cannot reuse an older analysis by address alone.
+
 `vulkan-smoke --indexed-tessellation` checks the merged LS/HS path for both
 layouts, including partial groups, high user SGPRs and 20 KiB triangle LDS.
 `--tessellation-inputs` checks fractional triangle and quad factors, domain
@@ -226,6 +230,11 @@ the descriptor's live word count with `OpArrayLength`, so changing streamed
 addresses, values, or batch extents does not create a new shader module or
 graphics-pipeline key. Indexed draws retain `INDEX_BASE`, buffer size and index
 type; `DRAW_INDEX_OFFSET_2` uploads the exact 16- or 32-bit guest index range.
+Graphics-pipeline lookup hashes each module once and searches a bucket of
+candidates. A hit still requires byte-for-byte state and shader equality.
+Insertion and slot replacement invalidate the buckets; hash collisions cannot
+select a different pipeline. Yotei GDS/visibility resource dumps require
+`trace_resource_failures`, so normal execution avoids their extra readbacks.
 `enable_graphics_probe` retains the fixed-shader diagnostic only for draws with
 no guest graphics programs. Compute dispatch captures scalar user data,
 optionally resolves
