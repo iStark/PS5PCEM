@@ -7064,8 +7064,8 @@ pub const Renderer = struct {
         return .{ .pipeline_cache_hit = false, .group_count = group_count, .spirv_words = 0 };
     }
 
-    /// AGC clears an RGBA8 colour allocation through a formatted V# whose
-    /// records each cover four packed pixels. Treating that allocation as a
+    /// AGC clears a colour allocation through a formatted V# whose records
+    /// each cover several packed pixels. Treating that allocation as a
     /// host-visible SSBO makes a fullscreen clear cross PCIe and also leaves
     /// the aliased Vulkan image stale. Match the complete seven-instruction
     /// kernel and clear the resident attachment directly instead.
@@ -7127,9 +7127,17 @@ pub const Renderer = struct {
             return Error.GuestBufferTooLarge;
         if (dispatched != descriptor.record_count) return null;
 
-        const packed_value = state.readRegister(.shader, 0x244) orelse return null;
-        inline for (0x245..0x248) |register| {
-            if ((state.readRegister(.shader, register) orelse return null) != packed_value) return null;
+        var clear_words: [4]u32 = undefined;
+        inline for (0..4) |index| {
+            clear_words[index] = state.readRegister(.shader, 0x244 + index) orelse return null;
+        }
+        const packed_value = clear_words[0];
+        const uniform_words = clear_words[1] == packed_value and clear_words[2] == packed_value and clear_words[3] == packed_value;
+        // A pending SSBO copy still owns its guest writeback. Let the buffer
+        // kernel overwrite it in place; clearing a separate VkImage would
+        // allow that older buffer to replace the new colour during publication.
+        for (self.guest_buffers.items) |entry| {
+            if (entry.gpu_dirty and entry.guest_address == descriptor.address) return null;
         }
 
         var target_index: ?usize = null;
@@ -7144,7 +7152,8 @@ pub const Renderer = struct {
                 continue;
             }
             const format = colorTargetFormat(candidate) orelse continue;
-            if (format.vulkan != vk.format_r8g8b8a8_unorm or format.bytes_per_texel != 4) continue;
+            if (format.vulkan != vk.format_r8g8b8a8_unorm and format.vulkan != vk.format_r16g16b16a16_sfloat) continue;
+            if (packedBufferClearColor(format.vulkan, clear_words) == null) continue;
             const layout = gpu.SurfaceLayout.fromColorTarget(candidate) catch continue;
             if (layout.required_source_bytes != descriptor.size_bytes or layout.layers != 1) continue;
             target_index = try self.acquireRenderTarget(.{
@@ -7162,8 +7171,8 @@ pub const Renderer = struct {
             var newest_sequence: u64 = 0;
             for (self.render_targets.items, 0..) |cached, index| {
                 if (cached.target.descriptor.address != descriptor.address or
-                    cached.target.format.vulkan != vk.format_r8g8b8a8_unorm or
-                    cached.target.format.bytes_per_texel != 4 or
+                    (cached.target.format.vulkan != vk.format_r8g8b8a8_unorm and cached.target.format.vulkan != vk.format_r16g16b16a16_sfloat) or
+                    packedBufferClearColor(cached.target.format.vulkan, clear_words) == null or
                     cached.target.layout.required_source_bytes != descriptor.size_bytes or
                     cached.target.layout.layers != 1 or
                     cached.target.descriptor.dcc_enabled or
@@ -7184,8 +7193,8 @@ pub const Renderer = struct {
         // storage images rather than colour attachments. Once an exact cache
         // entry exists, keep the recurring fullscreen clear on the Vulkan
         // queue instead of filling and publishing tens of MiB through the CPU
-        // every frame. Restrict this to the two byte formats for which the
-        // packed V# pattern and a Vulkan colour clear are exactly equivalent.
+        // every frame. Accept only formats for which the packed V# pattern
+        // and a Vulkan colour clear are exactly equivalent.
         var storage_image_index: ?usize = null;
         if (target_index == null) {
             var newest_sequence: u64 = 0;
@@ -7200,11 +7209,8 @@ pub const Renderer = struct {
                     continue;
                 }
                 const format = storageImageFormat(cached.descriptor.unified_format) orelse continue;
-                if (format.vulkan != vk.format_r8_unorm and
-                    format.vulkan != vk.format_r8g8b8a8_unorm)
-                {
-                    continue;
-                }
+                if (format.vulkan != vk.format_r8_unorm and format.vulkan != vk.format_r8g8b8a8_unorm) continue;
+                if (packedBufferClearColor(format.vulkan, clear_words) == null) continue;
                 if (storage_image_index != null and cached.last_used_sequence <= newest_sequence) continue;
                 storage_image_index = index;
                 newest_sequence = cached.last_used_sequence;
@@ -7221,15 +7227,7 @@ pub const Renderer = struct {
                 .{ .aspect_mask = vk.image_aspect_color_bit },
                 image_state.transfer_destination_usage,
             );
-            var bytes: [4]u8 = undefined;
-            std.mem.writeInt(u32, &bytes, packed_value, .little);
-            const scale: f32 = 1.0 / 255.0;
-            const clear = vk.ClearColorValue{ .float32 = .{
-                @as(f32, @floatFromInt(bytes[0])) * scale,
-                @as(f32, @floatFromInt(bytes[1])) * scale,
-                @as(f32, @floatFromInt(bytes[2])) * scale,
-                @as(f32, @floatFromInt(bytes[3])) * scale,
-            } };
+            const clear = packedBufferClearColor(storageImageFormat(snapshot.descriptor.unified_format).?.vulkan, clear_words).?;
             const range = vk.ImageSubresourceRange{ .aspect_mask = vk.image_aspect_color_bit };
             self.device_functions.cmd_clear_color_image(
                 command_buffer,
@@ -7275,6 +7273,7 @@ pub const Renderer = struct {
         // resident attachment. Publish the identical repeated 16-byte pattern
         // to guest memory once; subsequent clears remain entirely on the GPU.
         if (target_index == null) {
+            if (!uniform_words) return null;
             const byte_count = std.math.cast(usize, descriptor.size_bytes) orelse
                 return Error.GuestBufferTooLarge;
             if (byte_count == 0 or byte_count > maximum_frame_bytes or byte_count & 0xf != 0) return null;
@@ -7316,15 +7315,7 @@ pub const Renderer = struct {
             .{ .aspect_mask = vk.image_aspect_color_bit },
             image_state.transfer_destination_usage,
         );
-        var bytes: [4]u8 = undefined;
-        std.mem.writeInt(u32, &bytes, packed_value, .little);
-        const scale: f32 = 1.0 / 255.0;
-        const clear = vk.ClearColorValue{ .float32 = .{
-            @as(f32, @floatFromInt(bytes[0])) * scale,
-            @as(f32, @floatFromInt(bytes[1])) * scale,
-            @as(f32, @floatFromInt(bytes[2])) * scale,
-            @as(f32, @floatFromInt(bytes[3])) * scale,
-        } };
+        const clear = packedBufferClearColor(snapshot.target.format.vulkan, clear_words).?;
         const range = vk.ImageSubresourceRange{ .aspect_mask = vk.image_aspect_color_bit };
         self.device_functions.cmd_clear_color_image(
             command_buffer,
@@ -7364,7 +7355,7 @@ pub const Renderer = struct {
         if (log_verbose_gpu or self.emulated_buffer_clear_dispatches <= 4) {
             std.debug.print(
                 "[vulkan dcb] emulated packed color clear: addr=0x{x} bytes=0x{x} records={d} (#{d})\n",
-                .{ descriptor.address, packed_value, descriptor.record_count, self.emulated_buffer_clear_dispatches },
+                .{ descriptor.address, descriptor.size_bytes, descriptor.record_count, self.emulated_buffer_clear_dispatches },
             );
         }
         return .{ .pipeline_cache_hit = false, .group_count = group_count, .spirv_words = 0 };
@@ -24233,6 +24224,46 @@ fn storageImageCanAliasRenderTarget(
     // A2B10 image stores 0xFF000000, which unpacks as B=1008.
     _ = bytes_per_texel;
     return false;
+}
+
+/// A formatted 16-byte buffer store can clear an image only when it repeats
+/// one complete native texel. Keep exceptional half values on the raw-buffer
+/// path: a Vulkan float clear need not preserve NaN payloads or subnormals.
+fn packedBufferClearColor(image_format: u32, words: [4]u32) ?vk.ClearColorValue {
+    if (image_format == vk.format_r16g16b16a16_sfloat) {
+        if (words[0] != words[2] or words[1] != words[3]) return null;
+        var values: [4]f32 = undefined;
+        for (&values, 0..) |*value, channel| {
+            const bits: u16 = @truncate(words[channel / 2] >> @as(u5, @intCast((channel % 2) * 16)));
+            const magnitude = bits & 0x7fff;
+            if (magnitude >= 0x7c00 or (magnitude != 0 and magnitude < 0x400)) return null;
+            value.* = @floatCast(@as(f16, @bitCast(bits)));
+        }
+        return .{ .float32 = values };
+    }
+    if (image_format != vk.format_r8_unorm and image_format != vk.format_r8g8b8a8_unorm) return null;
+    for (words[1..]) |word| if (word != words[0]) return null;
+    var bytes: [4]u8 = undefined;
+    std.mem.writeInt(u32, &bytes, words[0], .little);
+    if (image_format == vk.format_r8_unorm) {
+        for (bytes[1..]) |byte| if (byte != bytes[0]) return null;
+    }
+    var values: [4]f32 = undefined;
+    for (&values, bytes) |*value, byte| value.* = @as(f32, @floatFromInt(byte)) * (1.0 / 255.0);
+    return .{ .float32 = values };
+}
+
+test "packed clear patterns preserve native texels and reject lossy half conversion" {
+    const half_clear = packedBufferClearColor(vk.format_r16g16b16a16_sfloat, .{ 0xb400_3800, 0x4000_3a00, 0xb400_3800, 0x4000_3a00 }).?;
+    try std.testing.expectEqualSlices(f32, &.{ 0.5, -0.25, 0.75, 2 }, &half_clear.float32);
+    for ([_]u32{ 1, 0x7e11, 0x7c00, 0xfc00 }) |exceptional| {
+        try std.testing.expectEqual(null, packedBufferClearColor(vk.format_r16g16b16a16_sfloat, .{ exceptional, 0, exceptional, 0 }));
+    }
+    try std.testing.expectEqual(null, packedBufferClearColor(vk.format_r16g16b16a16_sfloat, .{ 0, 0x3c00_0000, 0, 0 }));
+    try std.testing.expect(packedBufferClearColor(vk.format_r8g8b8a8_unorm, @splat(0xff56_3412)) != null);
+    try std.testing.expectEqual(null, packedBufferClearColor(vk.format_r8_unorm, @splat(0xff56_3412)));
+    try std.testing.expect(packedBufferClearColor(vk.format_r8_unorm, @splat(0x8080_8080)) != null);
+    try std.testing.expectEqual(null, packedBufferClearColor(vk.format_r8g8b8a8_unorm, .{ 1, 1, 1, 2 }));
 }
 
 fn storageImageTypesCanAlias(a: gpu.resources.ImageType, b: gpu.resources.ImageType) bool {
