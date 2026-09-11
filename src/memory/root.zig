@@ -642,6 +642,21 @@ pub const AddressSpace = struct {
         return self.coversLocked(address, size, null);
     }
 
+    /// A fixed direct-memory request can retain an identical complete mapping.
+    /// Restrict reuse to one exact entry so partial replacements and metadata
+    /// boundaries continue through the normal unmap/map transaction.
+    pub fn matchesDirectMemoryMapping(self: *AddressSpace, address: u64, size: u64, offset: u64, protection: Protection) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (size == 0) return false;
+        const index = self.insertionIndex(address);
+        if (index == self.mappings.items.len) return false;
+        const mapping = self.mappings.items[index];
+        return mapping.address == address and mapping.size == size and
+            mapping.kind == .direct_memory and mapping.backing_offset == offset and
+            std.meta.eql(mapping.protection, protection);
+    }
+
     /// Stable physical identity for an entire readable direct-memory range.
     /// Private pages and ranges crossing a mapping boundary use the copy path.
     pub fn directMemoryOffset(self: *AddressSpace, address: u64, size: usize) ?u64 {

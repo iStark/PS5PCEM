@@ -637,6 +637,12 @@ fn mapDirectMemory(
         if (occupied and (!explicit_fixed or map_flags & map_no_overwrite != 0)) {
             return KernelError.enomem.raw();
         }
+        // Rebinding the same complete physical range with the same access
+        // permissions changes no pages. Keep its host views and GPU tracking;
+        // no-overwrite requests have already retained their failure semantics.
+        if (occupied and address_space.matchesDirectMemoryMapping(requested_address, len, physical_address, protection)) {
+            break :fixed requested_address;
+        }
 
         // Mapping into a range the title reserved earlier is the common case
         // and has to commit inside the reservation rather than release it. A
@@ -2023,6 +2029,60 @@ test "walking physical memory ends rather than inventing a last region" {
         KernelError.eacces.raw(),
         sceKernelDirectMemoryQuery(past, 1, &info, size),
     );
+}
+
+test "repeated fixed direct memory mapping preserves its observed pages" {
+    var space = try memory.AddressSpace.initWithDirectMemory(testing.allocator, direct_memory_size);
+    defer space.deinit();
+    init(testing.allocator);
+    defer deinit();
+    attachAddressSpace(&space);
+
+    var physical: u64 = 0;
+    try testing.expectEqual(errno.ok, sceKernelAllocateDirectMemory(0, direct_memory_size, 4 * page_size, page_size, 0, &physical));
+    const base = memory.user.start;
+    const bytes = 2 * page_size;
+    const permissions = prot_cpu_read | prot_cpu_write | prot_gpu_read | prot_gpu_write;
+    var address = base;
+    try testing.expectEqual(errno.ok, sceKernelMapDirectMemory(&address, bytes, permissions, map_fixed, physical, 0));
+    try space.write(base, "keep");
+    space.enableGpuMemoryTracking();
+    const generation = try space.trackGpuRead(base, bytes);
+    try testing.expect(generation != 0);
+
+    try testing.expectEqual(errno.ok, sceKernelMapDirectMemory(&address, bytes, permissions, map_fixed, physical, 0));
+    try testing.expectEqual(base, address);
+    try testing.expectEqual(generation, space.gpuGeneration(base, bytes));
+    var value: [4]u8 = undefined;
+    try space.read(base, &value);
+    try testing.expectEqualStrings("keep", &value);
+
+    try testing.expectEqual(KernelError.enomem.raw(), sceKernelMapDirectMemory(&address, bytes, permissions, @bitCast(@as(u32, @intCast(map_fixed)) | map_no_overwrite), physical, 0));
+    try testing.expectEqual(@as(u64, 0), address);
+    try testing.expectEqual(generation, space.gpuGeneration(base, bytes));
+
+    // Fragmented metadata keeps the normal replacement and query boundaries.
+    try space.setMetadata(base + page_size, page_size, .{ .name = "split-name" });
+    address = base;
+    try testing.expectEqual(errno.ok, sceKernelMapDirectMemory(&address, bytes, permissions, map_fixed, physical, 0));
+    try testing.expectEqual(@as(u64, 0), space.gpuGeneration(base, bytes));
+    try testing.expectEqual(bytes, space.query(base, false).?.size);
+    try testing.expectEqualStrings("direct", std.mem.sliceTo(&space.query(base + page_size, false).?.name, 0));
+    try space.read(base, &value);
+    try testing.expectEqualStrings("keep", &value);
+
+    // A different physical range must still replace the old mapping.
+    address = base;
+    try testing.expectEqual(errno.ok, sceKernelMapDirectMemory(&address, bytes, permissions, map_fixed, physical + bytes, 0));
+    try testing.expectEqual(@as(u64, 0), space.gpuGeneration(base, bytes));
+    try space.read(base, &value);
+    try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0 }, &value);
+    try testing.expectEqual(@as(?u64, physical + bytes), space.directMemoryOffset(base, bytes));
+
+    // Different permissions keep the normal replacement/protection path.
+    try testing.expectEqual(errno.ok, sceKernelMapDirectMemory(&address, bytes, prot_cpu_read, map_fixed, physical + bytes, 0));
+    try testing.expect(space.isReadable(base, bytes));
+    try testing.expect(!space.isWritable(base, bytes));
 }
 
 test "direct memory maps at an exact guest address" {

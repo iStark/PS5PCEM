@@ -31,6 +31,14 @@ visible through every other address mapped to those physical pages. The pool's
 capacity remains virtual; mapped pages consume backing/commit resources, and
 physical working-set pages are faulted on first touch.
 
+An explicit fixed direct-memory request retains its host views when the guest
+address, complete size, physical offset and CPU permissions match one existing
+mapping exactly. This avoids repeated unmap, placeholder splitting, view and
+commit calls, and preserves GPU page observations of the unchanged storage.
+No-overwrite requests still reject occupied ranges. Changed backing, changed
+permissions, partial ranges and fragmented mapping metadata follow the normal
+replacement path; requested names and GPU access bits are still updated.
+
 Direct and flexible memory are cut from one supply of a little under 13.5 GiB,
 which is what the console leaves a title after the system takes its share, so
 the direct pool is what remains once the flexible budget is set aside. Reporting
