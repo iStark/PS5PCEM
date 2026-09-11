@@ -543,6 +543,7 @@ fn evaluate(
 
     var scc: ?bool = null;
     var pc: u32 = 0;
+    var decoded_cursor: usize = 0;
     var lane_spills = LaneSpills{};
     var setpc_follows: u8 = 0;
     var unknown_scalar_exits: std.StaticBitSet(64 * 1024) = .initEmpty();
@@ -557,10 +558,16 @@ fn evaluate(
             }
         }
         const inst = if (decoded_instructions) |instructions| decoded: {
-            const candidate = decodedInstructionAtOrAfter(instructions, pc) orelse {
+            // Most resource instructions are visited in order. Search only
+            // after a branch or a gap in the decoder's instruction stream.
+            if (decoded_cursor >= instructions.len or instructions[decoded_cursor].pc != pc) {
+                decoded_cursor = decodedInstructionIndexAtOrAfter(instructions, pc);
+            }
+            if (decoded_cursor == instructions.len) {
                 result.stop_reason = .end_program;
                 return result;
-            };
+            }
+            const candidate = instructions[decoded_cursor];
             if (candidate.pc != pc) {
                 // The cached decoder omitted an unknown word. Resume at its
                 // next known instruction just as the live decoder skips an
@@ -569,6 +576,7 @@ fn evaluate(
                 lane_spills = .{};
                 continue;
             }
+            decoded_cursor += 1;
             break :decoded candidate;
         } else live: {
             var words = [_]u32{ 0, 0 };
@@ -670,8 +678,9 @@ fn evaluate(
                             // Capture one iteration's resource state, forget
                             // loop-carried scalar writes, then recover the
                             // independent descriptors after the loop.
-                            for (instructions) |loop_inst| {
-                                if (loop_inst.pc < inst.branch_target or loop_inst.pc >= inst.pc) continue;
+                            const loop_begin = decodedInstructionIndexAtOrAfter(instructions, inst.branch_target);
+                            for (instructions[loop_begin..]) |loop_inst| {
+                                if (loop_inst.pc >= inst.pc) break;
                                 invalidateDestination(&result, loop_inst.dst, @max(loop_inst.data_words, destinationWords(loop_inst.opcode)));
                                 lane_spills.invalidateInstruction(loop_inst);
                             }
@@ -723,8 +732,8 @@ fn evaluate(
 
 fn resourceLoopHasUnresolvedExit(instructions: []const rdna2.Instruction, loop_start: u32, back_edge: u32, unknown_scalar_exits: *const std.StaticBitSet(64 * 1024)) bool {
     if (loop_start >= back_edge) return false;
-    for (instructions) |inst| {
-        if (inst.pc < loop_start) continue;
+    const loop_begin = decodedInstructionIndexAtOrAfter(instructions, loop_start);
+    for (instructions[loop_begin..]) |inst| {
         if (inst.pc >= back_edge) break;
         if (inst.branch_target <= back_edge) continue;
         switch (inst.opcode) {
@@ -736,7 +745,7 @@ fn resourceLoopHasUnresolvedExit(instructions: []const rdna2.Instruction, loop_s
     return false;
 }
 
-fn decodedInstructionAtOrAfter(instructions: []const rdna2.Instruction, pc: u32) ?rdna2.Instruction {
+fn decodedInstructionIndexAtOrAfter(instructions: []const rdna2.Instruction, pc: u32) usize {
     var low: usize = 0;
     var high = instructions.len;
     while (low < high) {
@@ -747,7 +756,7 @@ fn decodedInstructionAtOrAfter(instructions: []const rdna2.Instruction, pc: u32)
             high = middle;
         }
     }
-    return if (low < instructions.len) instructions[low] else null;
+    return low;
 }
 
 fn executeSmem(
@@ -2054,6 +2063,29 @@ test "resource checkpoints reach late descriptors in large shaders" {
     const result = evaluateDecodedResourceStateAtCheckpoints(memory.reader(), &bindings, instructions, &.{(count + 1) * 4}, &snapshots);
     try std.testing.expectEqual(StopReason.end_program, result.stop_reason);
     try std.testing.expectEqual(@as(u32, 42), snapshots[0][8].value);
+}
+
+test "decoded resource cursor preserves gaps and prefix boundaries" {
+    const instructions = [_]rdna2.Instruction{
+        .{ .pc = 0, .opcode = .s_mov_b32, .dst = .{ .kind = .sgpr, .reg = 8 }, .src0 = .{ .kind = .integer_inline_constant, .value = 11 }, .word_count = 1 },
+        // PC 4 was omitted by the decoder.
+        .{ .pc = 8, .opcode = .s_mov_b32, .dst = .{ .kind = .sgpr, .reg = 9 }, .src0 = .{ .kind = .integer_inline_constant, .value = 22 }, .word_count = 1 },
+        .{ .pc = 12, .opcode = .s_endpgm, .word_count = 1 },
+    };
+    var storage = [_]u8{0} ** 4;
+    var memory = TestMemory{ .base = 0x4000, .bytes = &storage };
+    const bindings = testBindings(0x3000, 0x4000);
+    const prefix = evaluateDecodedResourceStateUntil(memory.reader(), &bindings, &instructions, 8);
+    try std.testing.expectEqual(StopReason.prefix_complete, prefix.stop_reason);
+    try std.testing.expectEqual(@as(u32, 11), prefix.registers[8].value);
+    try std.testing.expect(!prefix.registers[9].known);
+    var snapshots: [2]ScalarRegisters = undefined;
+    const complete = evaluateDecodedResourceStateAtCheckpoints(memory.reader(), &bindings, &instructions, &.{ 8, 12 }, &snapshots);
+    try std.testing.expectEqual(StopReason.end_program, complete.stop_reason);
+    try std.testing.expectEqual(@as(u32, 3), complete.instruction_count);
+    try std.testing.expectEqual(@as(u32, 11), snapshots[0][8].value);
+    try std.testing.expect(!snapshots[0][9].known);
+    try std.testing.expectEqual(@as(u32, 22), snapshots[1][9].value);
 }
 
 test "scalar descriptor loads follow a pointer moved into VCC" {
