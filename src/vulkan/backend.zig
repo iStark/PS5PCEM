@@ -10470,19 +10470,32 @@ pub const Renderer = struct {
         surface_bytes: u64,
         bytes_per_texel: u8,
     ) anyerror!?DccClearTexel {
-        if (!descriptor.dcc_enabled or descriptor.dcc_address == 0 or
-            descriptor.samplesLog2() != 0 or descriptor.viewMipLevels() != 1 or
+        const metadata_address = descriptor.dccMetadataAddress() orelse return null;
+        if (descriptor.samplesLog2() != 0 or descriptor.viewMipLevels() != 1 or
             descriptor.depth_or_layers != 1)
         {
             return null;
         }
-        const code = (try self.uniformDccCode(descriptor.dcc_address, surface_bytes)) orelse return null;
-        if (code != 0x10) return null;
+        const code = (try self.uniformDccCode(metadata_address, surface_bytes)) orelse return null;
+        if (code != 0x10) return sampledDccFixedClearTexel(code, descriptor);
         return self.readUniformDccSingleTexel(
             descriptor.address,
             surface_bytes,
             bytes_per_texel,
         );
+    }
+
+    fn sampledDccMetadataHash(self: *Renderer, descriptor: gpu.ImageDescriptor, surface_bytes: u64) anyerror!u64 {
+        const address = descriptor.dccMetadataAddress() orelse return 0;
+        const key_bytes_u64 = std.math.divCeil(u64, surface_bytes, dcc_block_bytes) catch return 0;
+        if (key_bytes_u64 == 0 or key_bytes_u64 > maximum_dcc_key_bytes) return 0;
+        const key_bytes: usize = @intCast(key_bytes_u64);
+        try self.flushPendingGuestWrite(address, key_bytes);
+        var scratch = try self.image_scratch.acquire(self.allocator, key_bytes);
+        defer scratch.release();
+        const memory = self.guest_memory orelse return 0;
+        if (!memory.read(memory.context, address, scratch.bytes)) return 0;
+        return std.hash.Wyhash.hash(address, scratch.bytes);
     }
 
     fn stageCmaskFastClear(
@@ -18717,6 +18730,9 @@ pub const Renderer = struct {
             0xdcc1_5a4e_5eed_f00d
         else
             0;
+        // A fast clear changes DCC keys without touching the base pixels.
+        // Include those keys before both sampled-cache lookup paths.
+        const metadata_hash = try self.sampledDccMetadataHash(descriptor, source_bytes);
         const state_hash = sampledImageStateHash(descriptor, sampler_descriptor) ^ feedback_snapshot_salt;
         const image_state_hash = sampledImageViewStateHash(
             descriptor,
@@ -18745,8 +18761,8 @@ pub const Renderer = struct {
             probe_span,
         );
         const early_source_generation = combineSourceGenerations(
-            early_resident_generation,
-            early_page_generation,
+            combineSourceGenerations(early_resident_generation, early_page_generation),
+            metadata_hash,
         );
         // Some guest-memory providers do not expose page generations. In that
         // case the distributed content probe is the CPU-write proof, while the
@@ -18845,7 +18861,8 @@ pub const Renderer = struct {
             descriptor.address,
             probe_span,
         );
-        const source_generation = combineSourceGenerations(resident_generation, page_generation);
+        const source_generation = combineSourceGenerations(
+            combineSourceGenerations(resident_generation, page_generation), metadata_hash);
         // Page generations make an O(number of pages) byte hash on every frame
         // unnecessary. Keep the hash fallback for standalone/smoke memory
         // providers which do not expose write tracking.
@@ -18925,7 +18942,7 @@ pub const Renderer = struct {
         if (dcc_materialized_texel) |texel| {
             fillTexels(linear, texel.bytes[0..texel.length]);
             if (log_verbose_gpu or self.traceCurrentGraphicsFrame()) std.debug.print(
-                "[vulkan dcb] materialized DCC comp-to-single sample @0x{x} {d}x{d} key@0x{x} texel={x:0>2}{x:0>2}{x:0>2}{x:0>2}\n",
+                "[vulkan dcb] materialized DCC sample @0x{x} {d}x{d} key@0x{x} texel={x:0>2}{x:0>2}{x:0>2}{x:0>2}\n",
                 .{
                     descriptor.address,
                     descriptor.width,
@@ -18933,7 +18950,7 @@ pub const Renderer = struct {
                     if (aliases_active_render_target)
                         render_target_write.?.descriptor.dcc_address
                     else
-                        descriptor.dcc_address,
+                        descriptor.dccMetadataAddress() orelse 0,
                     texel.bytes[0],
                     texel.bytes[1],
                     texel.bytes[2],
@@ -24456,6 +24473,9 @@ fn sampledImageStateHash(
     sampler: gpu.resources.SamplerDescriptor,
 ) u64 {
     const words = [_]u32{
+        @truncate(descriptor.dccMetadataAddress() orelse 0),
+        @truncate((descriptor.dccMetadataAddress() orelse 0) >> 32),
+        descriptor.descriptor_flags & (3 << 21),
         descriptor.unified_format,
         descriptor.base_array,
         @as(u32, descriptor.base_level) |
@@ -24486,6 +24506,9 @@ fn sampledImageViewStateHash(
     force_srgb: bool,
 ) u64 {
     const words = [_]u32{
+        @truncate(descriptor.dccMetadataAddress() orelse 0),
+        @truncate((descriptor.dccMetadataAddress() orelse 0) >> 32),
+        descriptor.descriptor_flags & (3 << 21),
         descriptor.unified_format,
         descriptor.base_array,
         @as(u32, descriptor.base_level) |
@@ -24555,6 +24578,30 @@ fn colorDccClearTexel(code: u8, descriptor: gpu.resources.ColorTarget) ?DccClear
             };
             for (channels, 0..) |channel, index| {
                 std.mem.writeInt(u16, result.bytes[index * 2 ..][0..2], channel, .little);
+            }
+        },
+        else => return null,
+    }
+    return result;
+}
+
+fn sampledDccFixedClearTexel(code: u8, descriptor: gpu.ImageDescriptor) ?DccClearTexel {
+    if (code != 0x00 and code != 0x40 and code != 0x80 and code != 0xc0) return null;
+    const rgb_one = code & 0x80 != 0;
+    const alpha_one = code & 0x40 != 0;
+    const alpha_channel: usize = if (descriptor.descriptor_flags & (1 << 22) != 0) 3 else 0;
+    var result = DccClearTexel{ .bytes = @splat(0), .length = 0 };
+    switch (descriptor.unified_format) {
+        56, 130 => {
+            result.length = 4;
+            for (0..4) |channel| result.bytes[channel] =
+                if (if (channel == alpha_channel) alpha_one else rgb_one) 255 else 0;
+        },
+        71 => {
+            result.length = 8;
+            for (0..4) |channel| {
+                std.mem.writeInt(u16, result.bytes[channel * 2 ..][0..2],
+                    if (if (channel == alpha_channel) alpha_one else rgb_one) 0x3c00 else 0, .little);
             }
         },
         else => return null,

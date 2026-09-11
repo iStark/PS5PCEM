@@ -216,6 +216,15 @@ pub const ImageDescriptor = struct {
         return self.address == 0;
     }
 
+    /// RDNA2 T# bit 213 enables DCC reads; bits 255:216 hold address[47:8].
+    /// Keep the raw descriptor flags authoritative for sampled resources,
+    /// alongside the explicit metadata fields used by attachment-derived views.
+    pub fn dccMetadataAddress(self: ImageDescriptor) ?u64 {
+        if (!self.dcc_enabled and self.descriptor_flags & (1 << 21) == 0) return null;
+        const address = if (self.dcc_address != 0) self.dcc_address else self.metadata_address;
+        return if (address != 0) address else null;
+    }
+
     pub fn resourceMipLevels(self: ImageDescriptor) u8 {
         if (self.image_type == .color_2d_msaa or self.image_type == .color_2d_msaa_array) return 1;
         var largest = @max(self.width, self.height);
@@ -1088,6 +1097,19 @@ test "image descriptors decode Gen5 dimensions views and metadata" {
     try testing.expectEqual(@as(u16, 2), descriptor.base_array);
     try testing.expectEqual(metadata, descriptor.metadata_address);
     try testing.expectEqual(@as(u8, 3), descriptor.viewMipLevels());
+}
+
+test "image DCC reads require the compression bit and a metadata address" {
+    var words = [_]u32{ 0x506c8e00, 0xc4700000, 0x00e9c19f, 0x91b00fac, 0, 0x00700000, 0x607b0000, 0x00508be8 };
+    const descriptor = try decodeImageDescriptor(&words);
+    try testing.expectEqual(@as(?u64, 0x508be86000), descriptor.dccMetadataAddress());
+    words[6] &= ~@as(u32, 1 << 21);
+    try testing.expectEqual(@as(?u64, null), (try decodeImageDescriptor(&words)).dccMetadataAddress());
+    words[6] |= 1 << 21;
+    words[6] &= 0x00ffffff;
+    words[7] = 0;
+    try testing.expectEqual(@as(?u64, null), (try decodeImageDescriptor(&words)).dccMetadataAddress());
+    try testing.expectEqual(@as(?u64, null), (try decodeImageDescriptor(words[0..4])).dccMetadataAddress());
 }
 
 test "sampler descriptors normalize fixed-point lod values" {

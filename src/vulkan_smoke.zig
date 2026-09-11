@@ -3083,6 +3083,68 @@ fn runImageScratchProbe(allocator: std.mem.Allocator) !void {
     std.debug.print("image scratch passed: alternating pooled/unpooled extents, linear/RB+ padding, native updates, partial GPU writes and failed-write retry\n", .{});
 }
 
+fn runSampledDccClearProbe(allocator: std.mem.Allocator) !void {
+    const Memory = SizedGuestMemory(2 * 1024 * 1024);
+    const guest = try allocator.create(Memory);
+    defer allocator.destroy(guest);
+    guest.* = .{};
+    var renderer = try vulkan.Renderer.init(allocator, .{});
+    defer renderer.deinit();
+    _ = renderer.dcbBackend(guest.interface());
+    const code = [_]u32{
+        vop1(1, 0, 255), 0x3e80_0000, vop1(1, 1, 255), 0x3f40_0000,
+        0xf09c_0f0a, 0x0040_0200, 1, // Sample RGBA into v2:v5.
+        0xe078_0000, 0x8003_0200, 0xbf81_0000,
+    };
+    for (code, 0..) |word, i| guest.word(0x100 + i * 4, word);
+    var state = gpu.State{};
+    const compute = gpu.resources.ShaderStage.compute;
+    try state.writeRegister(.shader, compute.programRegisterBase(), 1);
+    try state.writeRegister(.shader, compute.programRegisterBase() + 1, 0);
+    try state.writeRegister(.shader, 0x213, 16 << 1);
+    const source = 0x20000;
+    const metadata = 0x120000;
+    for ([_]u16{ 56, 71 }) |format| {
+        var words = sampledImageDescriptorWords(source, 256, 128);
+        words[1] = (words[1] & ~@as(u32, 0x1ff00000)) | (@as(u32, format) << 20);
+        words[3] |= @as(u32, @intFromEnum(gpu.resources.TileMode.render_target)) << 20;
+        words[7] = metadata >> 16;
+        const texture = try gpu.TextureLayout.fromImage(try gpu.resources.decodeImageDescriptor(&words));
+        const surface_bytes: usize = @intCast(texture.required_source_bytes);
+        const key_bytes = std.math.divCeil(usize, surface_bytes, 256) catch unreachable;
+        // The unchanged base contains real texels different from every clear.
+        if (format == 56) @memset(guest.bytes[source..][0..surface_bytes], 64) else {
+            var offset: usize = 0;
+            while (offset < surface_bytes) : (offset += 2)
+                std.mem.writeInt(u16, guest.bytes[source + offset ..][0..2], 0x3400, .little);
+        }
+        for ([_]bool{ true, false }) |alpha_msb| {
+            words[6] = (1 << 21) | (@as(u32, @intFromBool(alpha_msb)) << 22) | (((metadata >> 8) & 255) << 24);
+            const userdata = words ++ [_]u32{ 0, 0, 0, 0, 0x10000, 16 << 16, 1, 0 };
+            for (userdata, 0..) |word, i| try state.writeRegister(.shader, compute.userDataBase() + @as(u32, @intCast(i)), word);
+            for ([_]u8{ 0x40, 0x80, 0xc0, 0x00, 0x40, 0xff, 0x20 }) |key| {
+                @memset(guest.bytes[metadata..][0..key_bytes], key);
+                _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
+                var output: [16]u8 = undefined;
+                try renderer.readbackGuestStorageBuffer(0x10000, &output);
+                for (0..4) |channel| {
+                    const expected: f32 = if (key == 0xff or key == 0x20)
+                        (if (format == 56) 64.0 / 255.0 else 0.25)
+                    else if (key & @as(u8, if (channel == (if (alpha_msb) @as(usize, 3) else 0)) 0x40 else 0x80) != 0) 1 else 0;
+                    std.testing.expectApproxEqAbs(expected, @as(f32, @bitCast(std.mem.readInt(u32, output[channel * 4 ..][0..4], .little))), 0.00001) catch |err| {
+                        std.debug.print("DCC sample mismatch format={d} alpha_msb={any} key=0x{x} channel={d}\n", .{format, alpha_msb, key, channel});
+                        return err;
+                    };
+                }
+                const uploaded = renderer.frame_profile.texture_upload_bytes;
+                _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
+                try std.testing.expectEqual(uploaded, renderer.frame_profile.texture_upload_bytes);
+            }
+        }
+    }
+    std.debug.print("sampled DCC clears passed: RGBA8/RGBA16F fixed clears, alpha placement, metadata-only updates, cache hits and raw fallback\n", .{});
+}
+
 fn runSampledScratchProbe(allocator: std.mem.Allocator) !void {
     const Memory = SizedGuestMemory(8 * 1024 * 1024);
     const guest = try allocator.create(Memory);
@@ -8206,6 +8268,10 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--storage-reuse")) {
         try runStorageImageReuseProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--sampled-dcc-clears")) {
+        try runSampledDccClearProbe(allocator);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--sampled-scratch")) {
