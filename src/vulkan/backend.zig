@@ -13500,8 +13500,11 @@ pub const Renderer = struct {
             }
         }
         const cached = &self.completed_frames.items[frame_index.?];
-        cached.pixels.clearRetainingCapacity();
-        try cached.pixels.appendSlice(self.allocator, frame);
+        // Every byte is replaced below. Clearing the old list first poisons
+        // the entire previous image in safety builds, adding a redundant pass.
+        try cached.pixels.ensureTotalCapacity(self.allocator, frame.len);
+        cached.pixels.items.len = frame.len;
+        @memcpy(cached.pixels.items, frame);
         self.frame_sequence +%= 1;
         cached.width = target.descriptor.width;
         cached.height = target.descriptor.height;
