@@ -798,6 +798,9 @@ const Builder = struct {
     /// the per-invocation predicate instead of rebuilding the same lane-index,
     /// half-selection and bit-test graph for every store.
     lane_predicate_mask: ?[2]u32 = null,
+    lane_predicate_mode_condition: u32 = 0,
+    lane_predicate_dispatch_active: u32 = 0,
+    lane_predicate_is_local: bool = false,
     lane_predicate: u32 = 0,
     workgroup_id_input: u32 = 0,
     num_workgroups_input: u32 = 0,
@@ -1504,6 +1507,9 @@ const Builder = struct {
     }
 
     fn emit(self: *Builder, list: *std.ArrayList(u32), opcode: u16, args: []const u32) Error!void {
+        // A cached SSA predicate must dominate its uses. Internal bounds and
+        // lookup branches introduce labels inside a single guest block too.
+        if (opcode == 248 and list == &self.body) self.lane_predicate_mask = null;
         switch (opcode) {
             345, 346 => self.uses_group_shuffle = true, // Shuffle / ShuffleXor
             347, 348 => self.uses_group_shuffle_relative = true, // ShuffleUp / ShuffleDown
@@ -7941,11 +7947,26 @@ const Builder = struct {
     /// asked of the lane's own index. Null while the mask is untouched, which is
     /// every lane enabled and needs no test.
     fn laneEnabled(self: *Builder) Error!?u32 {
+        const mask = self.exec_mask orelse return self.dispatch_active;
+        if (self.lane_predicate_mask) |cached| {
+            if (std.mem.eql(u32, &cached, &mask) and
+                self.lane_predicate_mode_condition == self.exec_mask_lane_predicate_condition and
+                self.lane_predicate_is_local == self.exec_mask_is_lane_predicate and
+                self.lane_predicate_dispatch_active == (self.dispatch_active orelse 0))
+                return self.lane_predicate;
+        }
         const guest = try self.guestLaneEnabled();
-        const active = self.dispatch_active orelse return guest;
-        const predicate = guest orelse return active;
-        const result = self.id();
-        try self.emit(&self.body, 167, &.{ self.bool_type, result, active, predicate });
+        const predicate = guest.?;
+        const result = if (self.dispatch_active) |active| combined: {
+            const id_ = self.id();
+            try self.emit(&self.body, 167, &.{ self.bool_type, id_, active, predicate });
+            break :combined id_;
+        } else predicate;
+        self.lane_predicate_mask = mask;
+        self.lane_predicate_mode_condition = self.exec_mask_lane_predicate_condition;
+        self.lane_predicate_is_local = self.exec_mask_is_lane_predicate;
+        self.lane_predicate_dispatch_active = self.dispatch_active orelse 0;
+        self.lane_predicate = result;
         return result;
     }
 
@@ -7969,12 +7990,6 @@ const Builder = struct {
             return @as(?u32, try self.isNonZero(mask[0]));
         }
         if (self.local_invocation_index == 0) return Error.UnsupportedControlFlow;
-        if (self.exec_mask_lane_predicate_condition == 0) {
-            if (self.lane_predicate_mask) |cached_mask| {
-                if (cached_mask[0] == mask[0] and cached_mask[1] == mask[1]) return self.lane_predicate;
-            }
-        }
-
         const invocation = self.id();
         try self.emit(&self.body, 61, &.{ self.bits_type, invocation, self.local_invocation_index }); // OpLoad
         const lane = try self.andBits(invocation, if (self.wave32) 31 else 63);
@@ -8006,8 +8021,6 @@ const Builder = struct {
             }); // OpSelect
             return selected;
         }
-        self.lane_predicate_mask = mask;
-        self.lane_predicate = wave_predicate;
         return wave_predicate;
     }
 
@@ -15137,6 +15150,44 @@ test "structured entry block retains specialized scalar inputs" {
     // Translation itself is the assertion: before entry-state inheritance the
     // first comparison returned UndefinedRegister for s86.
     try std.testing.expect(containsOpcode(module.words, 253)); // OpReturn
+}
+
+test "dispatcher reuses unchanged EXEC decoding along arithmetic runs" {
+    var short_shifts: usize = 0;
+    for ([_]usize{ 1, 65 }) |count| {
+        var program = instruction.Program{ .code = &.{}, .instructions = .empty };
+        defer program.deinit(std.testing.allocator);
+        try program.instructions.append(std.testing.allocator, .{
+            .pc = 0,
+            .opcode = .s_mov_b64,
+            .dst = .{ .kind = .exec_lo },
+            .src0 = .{ .kind = .integer_inline_constant, .value = 0xffff_ffff },
+        });
+        try program.instructions.append(std.testing.allocator, .{ .pc = 4, .opcode = .s_branch, .branch_target = 8 });
+        for (0..count) |i| try program.instructions.append(std.testing.allocator, .{
+            .pc = @intCast(8 + i * 4),
+            .opcode = .v_add_f32,
+            .dst = .{ .kind = .vgpr, .reg = 1 },
+            .src0 = .{ .kind = .integer_inline_constant, .value = 0 },
+            .src1 = .{ .kind = .vgpr, .reg = 0 },
+        });
+        try program.instructions.append(std.testing.allocator, .{
+            .pc = @intCast(8 + count * 4),
+            .opcode = .s_branch,
+            .branch_target = 8,
+        });
+        var module = try translate(std.testing.allocator, &program, .{
+            .stage = .compute,
+            .local_size = .{ 128, 1, 1 },
+            .wave64_workgroup = true,
+            .uses_execution_mask = true,
+            .compute_inputs = .{ .local_invocation_id_components = 1 },
+        });
+        defer module.deinit(std.testing.allocator);
+        try std.testing.expect(module.used_dispatcher);
+        const shifts = countOpcode(module.words, 194);
+        if (count == 1) short_shifts = shifts else try std.testing.expectEqual(short_shifts, shifts);
+    }
 }
 
 test "unstructured back edges lower through a dispatcher" {

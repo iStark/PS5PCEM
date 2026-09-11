@@ -58,6 +58,13 @@ other unstructured graphs become a block-index dispatcher (`OpLoopMerge` plus
 branches. The linear diagnostic pass remains only when even that shape cannot
 be represented.
 
+EXEC predicates are reused within each emitted SPIR-V basic block, including
+dispatcher blocks whose mask representation is loaded at runtime. The cache
+includes both mask words, the representation condition and the scheduled-wave
+predicate. Every emitted label invalidates it, so bounds checks and descriptor
+lookup branches cannot reuse an SSA value that does not dominate the access.
+This avoids repeating lane-index and mask decoding along long arithmetic runs.
+
 Executable MUBUF lowering covers byte/short/dword scalar and vector transfers
 plus the ten common 32-bit buffer atomics; `glc` atomics preserve their returned
 old value in the guest VGPR. A binding may select a different staged V# at each
