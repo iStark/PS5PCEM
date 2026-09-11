@@ -4832,21 +4832,28 @@ pub const Renderer = struct {
     }
 
     fn readStorageBacking(self: *Renderer, entry: *GuestBufferEntry, destination: []u8) (Error || std.mem.Allocator.Error)!void {
+        if (destination.len == 0) return;
+        const mapping = try self.mapStorageReadback(entry, destination.len);
+        defer mapping.release(self);
+        @memcpy(destination, mapping.bytes);
+    }
+
+    /// Maps the completed GPU result so publication can copy directly into
+    /// guest memory instead of passing through another host allocation.
+    fn mapStorageReadback(self: *Renderer, entry: *GuestBufferEntry, size: usize) (Error || std.mem.Allocator.Error)!BufferMapping {
+        if (size == 0 or size > entry.size) return Error.MemoryMapFailed;
         const transfer = entry.host_transfer orelse {
-            if (!self.storage_buffer_read_use_waits) return self.readMapped(entry.device_local, destination);
             // Reading this allocation does not update a descriptor set. Wait
             // for its last GPU use while leaving unrelated commands queued.
-            try self.waitForStorageBufferUse(entry);
-            const mapping = try self.mapBufferRange(entry.device_local, 0, destination.len);
-            defer mapping.release(self);
-            @memcpy(destination, mapping.bytes);
-            return;
+            if (self.storage_buffer_read_use_waits)
+                try self.waitForStorageBufferUse(entry)
+            else
+                try self.waitForSubmittedWork();
+            return self.mapBufferRange(entry.device_local, 0, size);
         };
-        if (destination.len == 0) return;
-        if (destination.len > entry.size) return Error.MemoryMapFailed;
         // A prefix can end between dwords. Copy its containing word only into
         // the private mirror, then publish exactly the requested guest bytes.
-        const copy_size = std.mem.alignForward(usize, destination.len, 4);
+        const copy_size = std.mem.alignForward(usize, size, 4);
         const command_buffer = try self.beginOneShot();
         defer self.releaseOneShot(command_buffer);
         const before = [_]vk.BufferMemoryBarrier{
@@ -4860,7 +4867,8 @@ pub const Renderer = struct {
         self.device_functions.cmd_pipeline_barrier(command_buffer, vk.pipeline_stage_transfer_bit, vk.pipeline_stage_host_bit, 0, 0, null, 1, @ptrCast(&readable), 0, null);
         entry.last_gpu_use = command_buffer_pending_tick;
         try self.submitOneShot(command_buffer);
-        try self.readMapped(transfer, destination);
+        try self.waitForSubmittedWork();
+        return self.mapBufferRange(transfer, 0, size);
     }
 
     /// Uploads one exact guest range and publishes it at a stable element of
@@ -5188,12 +5196,10 @@ pub const Renderer = struct {
         const entry_size = std.math.cast(usize, entry.size) orelse return Error.GuestBufferTooLarge;
         const size = @min(requested_size, entry_size);
         if (size == 0) return;
-        var bytes_scratch = try self.image_scratch.acquire(self.allocator, size);
-        defer bytes_scratch.release();
-        const bytes = bytes_scratch.bytes;
-        try self.readStorageBacking(entry, bytes);
+        const mapping = try self.mapStorageReadback(entry, size);
+        defer mapping.release(self);
         const memory = self.guest_memory orelse return Error.GuestMemoryUnavailable;
-        if (!memory.write(memory.context, entry.guest_address, bytes)) return Error.GuestMemoryWriteFailed;
+        if (!memory.write(memory.context, entry.guest_address, mapping.bytes)) return Error.GuestMemoryWriteFailed;
         self.frame_profile.readback_bytes +%= size;
         self.frame_profile.storage_readback_bytes +%= size;
         if (size == entry_size) {
@@ -6312,7 +6318,7 @@ pub const Renderer = struct {
                 self.reported_yotei_gds_dispatches += 1;
             }
         }
-        try self.commitComputeWrites(memory, resources);
+        try self.commitComputeWrites(resources);
         if (trace_yotei_visibility) {
             for (resources.writable, 0..) |writable, slot| {
                 if (!writable or resources.sizes[slot] == 0) continue;
@@ -9076,7 +9082,7 @@ pub const Renderer = struct {
         return result;
     }
 
-    fn commitComputeWrites(self: *Renderer, memory: GuestMemory, resources: *const ComputeResources) anyerror!void {
+    fn commitComputeWrites(self: *Renderer, resources: *const ComputeResources) anyerror!void {
         const profile_started = hostTimestampNs();
         defer self.frame_profile.storage_commit_ns +|= elapsedHostNanoseconds(profile_started);
         for (resources.writable, 0..) |writable, index| {
@@ -9085,22 +9091,18 @@ pub const Renderer = struct {
             // bind must seed from its result, including deferred writes, and
             // an older completed frame must not publish over the new bytes.
             self.invalidateBufferColorTarget(resources.addresses[index]);
+            const buffer_index = for (self.guest_buffers.items, 0..) |*entry, slot| {
+                if (entry.guest_address != resources.addresses[index] or entry.size != resources.sizes[index]) continue;
+                entry.gpu_dirty = true;
+                entry.content_hash = null;
+                break slot;
+            } else return Error.GuestBufferNotStaged;
             if (self.defer_small_storage_writes_enabled or
                 resources.sizes[index] >= deferred_storage_write_min_bytes)
             {
-                for (self.guest_buffers.items) |*entry| {
-                    if (entry.guest_address != resources.addresses[index] or
-                        entry.size != resources.sizes[index]) continue;
-                    entry.gpu_dirty = true;
-                    entry.content_hash = null;
-                    break;
-                }
                 continue;
             }
-            const bytes = try self.allocator.alloc(u8, resources.sizes[index]);
-            defer self.allocator.free(bytes);
-            try self.readbackGuestStorageBuffer(resources.addresses[index], bytes);
-            if (!memory.write(memory.context, resources.addresses[index], bytes)) return Error.GuestMemoryWriteFailed;
+            try self.flushGuestStorageBuffer(buffer_index);
         }
     }
 
