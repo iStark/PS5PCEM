@@ -243,6 +243,15 @@ readback as stores. Swizzled descriptors use V# `index_stride` to permute each
 dword address, while short loads/stores are split into byte operations so they
 remain correct across both linear and swizzle-separated dword boundaries.
 Dynamically unresolved SMEM and images remain explicit unsupported semantics.
+Tiled sampled images can copy compute-detiler output directly into the Vulkan
+image, without reading the packed texels back to the CPU and uploading them
+again. Sixty-four detile descriptor sets retain their command-buffer ownership
+until completion, allowing uploads to queue without overwriting an in-flight
+binding. Verbose diagnostics retain the CPU readback path; the host diagnostic
+`direct_detile_uploads` also permits comparison. `vulkan-smoke --queued-detile`
+checks 70 distinct textures, updates, four mip levels, rebased views and agreement
+with the CPU readback path.
+
 Indirect descriptor tables recover the descriptor load and its byte-offset
 producer through control-flow reaching definitions. Writes in sibling branches
 cannot hide the actual table load. All requested words must have the same

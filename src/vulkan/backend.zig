@@ -3293,7 +3293,10 @@ pub const Renderer = struct {
     compute_pipeline_layout: vk.PipelineLayout,
     detile_set_layout: vk.DescriptorSetLayout = 0,
     detile_pool: vk.DescriptorPool = 0,
-    detile_set: vk.DescriptorSet = 0,
+    detile_sets: [64]vk.DescriptorSet = @splat(0),
+    detile_command_slots: [64]?usize = @splat(null),
+    direct_detile_uploads: bool = true,
+    direct_detile_upload_count: u64 = 0,
     detile_pipeline_layout: vk.PipelineLayout = 0,
     detile_pipeline: vk.Pipeline = 0,
     detile_shader: vk.ShaderModule = 0,
@@ -19662,6 +19665,8 @@ pub const Renderer = struct {
         defer linear_scratch.release();
         const linear = linear_scratch.bytes;
         const reader = gpu.ShaderMemoryReader{ .context = memory.context, .read_fn = memory.read };
+        var detiled_upload: ?OwnedBuffer = null;
+        defer if (detiled_upload) |buffer| self.destroyBuffer(buffer);
         var source_available = true;
         const dcc_materialized_texel: ?DccClearTexel = if (fixed_clear) |texel|
             texel
@@ -19701,8 +19706,15 @@ pub const Renderer = struct {
                 source_available = false;
                 fillUnbackedDepthSample(descriptor.unified_format, linear);
             } else if (self.computeDetileBuffer(plan, tiled, byte_count) catch null) |gpu_linear| {
-                defer self.destroyBuffer(gpu_linear);
-                try self.readMapped(gpu_linear, linear);
+                if (self.direct_detile_uploads and !log_verbose_gpu) {
+                    // The detiler emits the packed mip ranges consumed by
+                    // BufferImageCopy. Keep that result on the GPU.
+                    detiled_upload = gpu_linear;
+                    self.direct_detile_upload_count +|= 1;
+                } else {
+                    defer self.destroyBuffer(gpu_linear);
+                    try self.readMapped(gpu_linear, linear);
+                }
             } else {
                 var cursor: usize = 0;
                 var level_index: u8 = 0;
@@ -19759,7 +19771,10 @@ pub const Renderer = struct {
         // doing it unconditionally added another full 64 MiB CPU pass for a
         // 4096² texture after detiling. Normal rendering only needs to know
         // whether the image is entirely empty.
-        const nonzero = if (log_verbose_gpu)
+        const nonzero = if (detiled_upload != null)
+            // CPU texel diagnostics are unavailable on the direct path.
+            @as(u32, 1)
+        else if (log_verbose_gpu)
             countNonzeroRgba(linear)
         else if (containsNonzeroByte(linear))
             @as(u32, 1)
@@ -19778,7 +19793,7 @@ pub const Renderer = struct {
         const raw_probe_span = probe_span;
         var raw_nonzero: u32 = 0;
         var raw_probe_hits: u32 = 0;
-        if ((log_verbose_gpu or self.texture_cache_misses <= 4) and raw_probe_span != 0) {
+        if (detiled_upload == null and (log_verbose_gpu or self.texture_cache_misses <= 4) and raw_probe_span != 0) {
             const steps = [_]u64{ 0, raw_probe_span / 4, raw_probe_span / 2, (raw_probe_span * 3) / 4 };
             var step_i: usize = 0;
             while (step_i < steps.len) : (step_i += 1) {
@@ -19797,7 +19812,7 @@ pub const Renderer = struct {
                 }
             }
         }
-        if (log_verbose_gpu or self.texture_cache_misses <= 4) std.debug.print(
+        if (detiled_upload == null and (log_verbose_gpu or self.texture_cache_misses <= 4)) std.debug.print(
             "[vulkan dcb] staged sample {d}x{d}x{d} tile={f} addr=0x{x} mips={d} base={d} nonzero_texels={d}/{d} raw_probe_nz={d} hits={d} first_rgba=({d},{d},{d},{d})\n",
             .{
                 descriptor.width,
@@ -19895,13 +19910,13 @@ pub const Renderer = struct {
         else
             1;
         const mip_levels: u32 = if (mip_plan) |plan| plan.level_count else 1;
-        const upload = try self.createBuffer(
+        const upload = detiled_upload orelse try self.createBuffer(
             byte_count,
             vk.buffer_usage_transfer_src_bit,
             vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit,
         );
-        defer self.destroyBuffer(upload);
-        try self.writeMapped(upload, linear);
+        defer if (detiled_upload == null) self.destroyBuffer(upload);
+        if (detiled_upload == null) try self.writeMapped(upload, linear);
         const image = try self.createImageBacking(.{
             .extent = .{ .width = image_width, .height = image_height, .depth = image_depth },
             .array_layers = upload_layers,
@@ -20897,10 +20912,10 @@ pub const Renderer = struct {
 
         const pool_size = vk.DescriptorPoolSize{
             .descriptor_type = vk.descriptor_type_storage_buffer,
-            .descriptor_count = 2,
+            .descriptor_count = 2 * self.detile_sets.len,
         };
         const pool_info = vk.DescriptorPoolCreateInfo{
-            .max_sets = 1,
+            .max_sets = self.detile_sets.len,
             .pool_size_count = 1,
             .pool_sizes = @ptrCast(&pool_size),
         };
@@ -20909,12 +20924,13 @@ pub const Renderer = struct {
         }
         errdefer self.device_functions.destroy_descriptor_pool(self.device, self.detile_pool, null);
 
+        const layouts = [_]vk.DescriptorSetLayout{self.detile_set_layout} ** 64;
         const allocate_info = vk.DescriptorSetAllocateInfo{
             .descriptor_pool = self.detile_pool,
-            .descriptor_set_count = 1,
-            .set_layouts = @ptrCast(&self.detile_set_layout),
+            .descriptor_set_count = layouts.len,
+            .set_layouts = &layouts,
         };
-        if (self.device_functions.allocate_descriptor_sets(self.device, &allocate_info, @ptrCast(&self.detile_set)) != vk.success) {
+        if (self.device_functions.allocate_descriptor_sets(self.device, &allocate_info, &self.detile_sets) != vk.success) {
             return Error.DescriptorSetAllocationFailed;
         }
 
@@ -20961,6 +20977,18 @@ pub const Renderer = struct {
         _ = self.pipeline_cache_generation.fetchAdd(1, .release);
     }
 
+    fn acquireDetileSet(self: *Renderer) Error!usize {
+        for (self.detile_command_slots, 0..) |slot, index| {
+            const command_slot = slot orelse return index;
+            if (self.command_buffer_ticks.items[command_slot] <= self.completed_tick) return index;
+        }
+        // Command slots are reused only after completion. Their current tick
+        // can include newer work, but never permits an update while an older
+        // detile still uses the descriptor. Bound all outstanding leases.
+        try self.waitForSubmittedWork();
+        return 0;
+    }
+
     fn computeDetileBuffer(
         self: *Renderer,
         plan: SampledViewPlan,
@@ -20980,6 +21008,9 @@ pub const Renderer = struct {
         }
         if (!params_ok) return null;
 
+        const descriptor_slot = try self.acquireDetileSet();
+        const descriptor_set = self.detile_sets[descriptor_slot];
+
         const src = try self.createBuffer(
             tiled.len,
             vk.buffer_usage_storage_buffer_bit,
@@ -20998,7 +21029,7 @@ pub const Renderer = struct {
         const dst_info = vk.DescriptorBufferInfo{ .buffer = dst.handle, .offset = 0, .range = dst.size };
         const writes = [_]vk.WriteDescriptorSet{
             .{
-                .destination_set = self.detile_set,
+                .destination_set = descriptor_set,
                 .destination_binding = 0,
                 .destination_array_element = 0,
                 .descriptor_count = 1,
@@ -21006,7 +21037,7 @@ pub const Renderer = struct {
                 .buffer_info = @ptrCast(&src_info),
             },
             .{
-                .destination_set = self.detile_set,
+                .destination_set = descriptor_set,
                 .destination_binding = 1,
                 .destination_array_element = 0,
                 .descriptor_count = 1,
@@ -21019,13 +21050,14 @@ pub const Renderer = struct {
         const command_buffer = try self.beginOneShot();
         defer self.releaseOneShot(command_buffer);
         self.device_functions.cmd_bind_pipeline(command_buffer, vk.pipeline_bind_point_compute, self.detile_pipeline);
+        const command_slot = self.recording_command_slot.?;
         self.device_functions.cmd_bind_descriptor_sets(
             command_buffer,
             vk.pipeline_bind_point_compute,
             self.detile_pipeline_layout,
             0,
             1,
-            @ptrCast(&self.detile_set),
+            @ptrCast(&descriptor_set),
             0,
             null,
         );
@@ -21091,6 +21123,7 @@ pub const Renderer = struct {
             null,
         );
         try self.submitOneShot(command_buffer);
+        self.detile_command_slots[descriptor_slot] = command_slot;
         return dst;
     }
 

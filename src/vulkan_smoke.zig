@@ -8412,6 +8412,71 @@ fn runLargeIndirectImageProbe(allocator: std.mem.Allocator) !void {
     std.debug.print("large indirect sampled images passed: compute/fragment lookup, 4352 mixed 2D/3D views, exact aliases, null bounds, relocated table and shared sampler\n", .{});
 }
 
+fn runQueuedDetileProbe(allocator: std.mem.Allocator) !void {
+    const count = 70; // exceed the detile descriptor pool before readback
+    const texture_stride = 512 * 1024;
+    const textures = 0x100000;
+    var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true });
+    defer renderer.deinit();
+    const guest = try allocator.create(SizedGuestMemory(textures + count * texture_stride));
+    defer allocator.destroy(guest);
+    guest.* = .{};
+    _ = renderer.dcbBackend(guest.interface());
+    const code = [_]u32{
+        0x9314_a018, // s20 = workgroup X * 32
+        0xf42c_0004,    20 << 25, // s[0:7] = table[s20]
+        vop1(1, 1, 24), vop1(1, 2, 255),
+        0x3e80_0000,    vop1(1, 3, 255),
+        0x3e80_0000,    0xf09c_010a,
+        0x0080_0402,    3,
+        0xe070_2000,    0x8003_0401,
+        0xbf81_0000,
+    };
+    for (code, 0..) |word, index| guest.word(0x100 + index * 4, word);
+    var state = gpu.State{};
+    const compute = gpu.resources.ShaderStage.compute;
+    try state.writeRegister(.shader, compute.programRegisterBase(), 1);
+    try state.writeRegister(.shader, compute.programRegisterBase() + 1, 0);
+    try state.writeRegister(.shader, 0x213, (24 << 1) | (1 << 7));
+    var userdata: [24]u32 = @splat(0);
+    @memcpy(userdata[8..12], &[_]u32{ 0x10000, 32 << 16, count, 0 });
+    @memcpy(userdata[12..16], &[_]u32{ 0x20000, 4 << 16, count + 1, 0 });
+    for (userdata, 0..) |word, index| try state.writeRegister(.shader, compute.userDataBase() + @as(u32, @intCast(index)), word);
+    for (0..3) |round| {
+        // Cover the direct path, rebased mip views, and the diagnostic CPU path.
+        renderer.direct_detile_uploads = round != 2;
+        const base_level: u32 = if (round == 1) 1 else 0;
+        for (0..count) |index| {
+            const address: u32 = @intCast(textures + index * texture_stride);
+            var image = sampledImageDescriptorWords(address, 256, 256);
+            image[3] |= (base_level << 12) | (3 << 16) | (@as(u32, @intFromEnum(gpu.resources.TileMode.standard_4kb)) << 20);
+            image[5] = 3 << 4;
+            for (image, 0..) |word, component| guest.word(0x10000 + index * 32 + component * 4, word);
+            const texture = try gpu.TextureLayout.fromImage(try gpu.resources.decodeImageDescriptor(&image));
+            try std.testing.expect(texture.required_source_bytes <= texture_stride);
+            for (0..4) |level| {
+                const view = try texture.subresource(@intCast(level), 0, 1);
+                const value: u32 = @intCast(1 + index + level * 40 + round * 7);
+                for (0..view.height) |y| for (0..view.width) |x| {
+                    const at = address + @as(usize, @intCast(try view.sourceByteOffset(@intCast(x), @intCast(y), 0, 0)));
+                    guest.word(at, 0xff00_0000 | value);
+                };
+            }
+        }
+        const before = renderer.direct_detile_upload_count;
+        _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ count + 1, 1, 1 });
+        try std.testing.expectEqual(before + @as(u64, if (round == 2) 0 else count), renderer.direct_detile_upload_count);
+        var pixels: [(count + 1) * 4]u8 = undefined;
+        try renderer.readbackGuestStorageBuffer(0x20000, &pixels);
+        for (0..count + 1) |index| {
+            const expected: f32 = if (index == count) 0 else @as(f32, @floatFromInt(1 + index + base_level * 40 + round * 7)) / 255.0;
+            const actual: f32 = @bitCast(std.mem.readInt(u32, pixels[index * 4 ..][0..4], .little));
+            try std.testing.expectApproxEqAbs(expected, actual, 0.00001);
+        }
+    }
+    std.debug.print("queued detile uploads passed: 70 distinct textures, descriptor reuse, four mip levels, rebased views, updates, OOB and CPU-path agreement\n", .{});
+}
+
 fn runIndirectImageProbe(allocator: std.mem.Allocator) !void {
     for (0..8) |case_index| {
         var renderer = try vulkan.Renderer.init(allocator, .{ .trace_resource_failures = true });
@@ -9178,6 +9243,10 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--indirect-images")) {
         try runIndirectImageProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--queued-detile")) {
+        try runQueuedDetileProbe(allocator);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--typed-indices")) {
