@@ -100,6 +100,29 @@ The decoded shader cache holds 1,024 programs. Yotei's opening cinematic
 exceeds the former 512-entry limit and otherwise repeatedly rebuilds shader
 analysis and resource checkpoints within each frame.
 
+The exported `native_tessellation` switch enables the in-progress native
+LS/HS path. It remains `false` by default; development launch controls may
+enable it explicitly. [`gpu.tessellation`](../../src/gpu/tessellation.zig)
+merges the local and hull programs into a compute prepass, preserves the
+graphics register state, and supplies offchip data and generated factors to
+the domain stage. The supported path is non-indexed, four-control-point quad
+patches; unsupported layouts fail explicitly. The tessellation unit test and
+`vulkan-smoke --tessellation-inputs` cover register setup and domain inputs.
+Live-title rendering remains a separate validation step.
+
+Developer capture controls also default to zero: `capture_storage_program`
+and `capture_storage_flip` select compute snapshots; `capture_vertex_program`
+and `capture_vertex_flip` select a vertex snapshot. Storage address/byte-count
+and image-address controls narrow the capture. They write state, shader data
+and bounded resource readbacks under `out/`; the directory must exist.
+Readbacks preserve guest resource generations but add synchronization, so
+captures must be disabled when measuring FPS. The separate
+`graphics_uniform_specialization` experiment remains disabled by default.
+
+`vulkan-smoke --flat-pointers` checks signed offsets, carry across 4 GiB,
+divergent lanes, overlapping snapshots (last match wins), unaligned reads,
+relocation and per-word vector bounds/faults, including BVH-enabled options.
+
 Graphics draws record until a real guest ordering packet, compute/readback
 dependency, or VideoOut flip closes the batch. Each draw binds
 an immutable descriptor set and scalar slice; read-only guest buffers and index

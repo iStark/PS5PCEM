@@ -3218,7 +3218,7 @@ fn runSampledDccClearProbe(allocator: std.mem.Allocator) !void {
                         (if (format == 56) 64.0 / 255.0 else 0.25)
                     else if (key & @as(u8, if (channel == (if (alpha_msb) @as(usize, 3) else 0)) 0x40 else 0x80) != 0) 1 else 0;
                     std.testing.expectApproxEqAbs(expected, @as(f32, @bitCast(std.mem.readInt(u32, output[channel * 4 ..][0..4], .little))), 0.00001) catch |err| {
-                        std.debug.print("DCC sample mismatch format={d} alpha_msb={any} key=0x{x} channel={d}\n", .{format, alpha_msb, key, channel});
+                        std.debug.print("DCC sample mismatch format={d} alpha_msb={any} key=0x{x} channel={d}\n", .{ format, alpha_msb, key, channel });
                         return err;
                     };
                 }
@@ -6373,12 +6373,97 @@ fn runArrayGradientCase(allocator: std.mem.Allocator, format: u32, first_layer: 
     try std.testing.expectApproxEqAbs(expected, actual, 0.00001);
 }
 
+fn runFlatWaveSnapshotProbe(allocator: std.mem.Allocator) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true });
+    defer renderer.deinit();
+    var guest = GuestMemory{};
+    _ = renderer.dcbBackend(guest.interface());
+    const code = [_]u32{
+        vop1(1, 4, 256),
+        mubuf(0x0d, 0, 0, 4, 8)[0],
+        mubuf(0x0d, 0, 0, 4, 8)[1],
+        0xdc38_8000,
+        0x007d_0000,
+        mubuf(0x1e, 0, 0, 4, 12)[0],
+        mubuf(0x1e, 0, 0, 4, 12)[1],
+        0xbf81_0000,
+    };
+    for (code, 0..) |word, index| guest.word(0x100 + index * 4, word);
+    var analysis = try gpu.shader_analysis.decode(allocator, .{ .context = &guest, .read_fn = GuestMemory.read }, 0x100, code.len);
+    defer analysis.deinit(allocator);
+    for ([_]bool{ false, true }) |bvh_mode1| {
+        if (bvh_mode1 and !renderer.storage_buffer_nonuniform_indexing) continue;
+        var module = try analysis.translateSpirv(allocator, .{
+            .stage = .compute,
+            .local_size = .{ 64, 1, 1 },
+            .compute_inputs = .{ .local_invocation_id_components = 1 },
+            .storage_buffers = &.{
+                .{ .resource_sgpr = 8, .descriptor_index = 0, .stride = 8 },
+                .{ .resource_sgpr = 12, .descriptor_index = 1, .stride = 16 },
+            },
+            .flat_memories = &.{ .{ .descriptor_index = 2, .fault_record_word = 20 }, .{ .descriptor_index = 3 } },
+            .bvh_intersection_mode1 = bvh_mode1,
+        });
+        defer module.deinit(allocator);
+        for (0..2) |pass| {
+            const base: u64 = 0x20_ffff_fff0 + (@as(u64, @intCast(pass)) << 36);
+            const offsets = [_]i64{ 0, 17, 24, 44, 60, 64, -4, 0x1_0000_0000 };
+            for (0..64) |lane| {
+                const pointer: u64 = @intCast(@as(i64, @intCast(base)) + offsets[lane % offsets.len]);
+                guest.word(0x10000 + lane * 8, @truncate(pointer));
+                guest.word(0x10004 + lane * 8, @truncate(pointer >> 32));
+            }
+            var first: [64]u8 = undefined;
+            var last: [32]u8 = undefined;
+            for (&first, 0..) |*byte, index| byte.* = @intCast(0x10 + index + pass);
+            for (&last, 0..) |*byte, index| byte.* = @intCast(0xa0 + index + pass);
+            for (0..2) |region| {
+                const at = 0x12000 + region * 0x100;
+                const address = base + region * 16;
+                const data: []const u8 = if (region == 0) &first else &last;
+                guest.word(at, @truncate(address));
+                guest.word(at + 4, @truncate(address >> 32));
+                guest.word(at + 8, 0);
+                guest.word(at + 12, @intCast(data.len));
+                @memcpy(guest.bytes[at + 16 ..][0..data.len], data);
+            }
+            @memset(guest.bytes[0x12050..0x12060], 0);
+            _ = try renderer.stageGuestStorageBufferAt(0, 0x10000, 64 * 8);
+            _ = try renderer.stageGuestStorageBufferAt(1, 0x11000, 64 * 16);
+            _ = try renderer.stageGuestStorageBufferAt(2, 0x12000, 96);
+            _ = try renderer.stageGuestStorageBufferAt(3, 0x12100, 48);
+            _ = try renderer.dispatchSpirv(module.words, .{ 1, 1, 1 });
+            var output: [64 * 16]u8 = undefined;
+            try renderer.readbackGuestStorageBuffer(0x11000, &output);
+            var faults: u32 = 0;
+            for (0..64) |lane| for (0..4) |word| {
+                const relative = offsets[lane % offsets.len] + @as(i64, @intCast(word * 4));
+                const expected = if (relative >= 16 and relative + 4 <= 48)
+                    std.mem.readInt(u32, last[@intCast(relative - 16)..][0..4], .little)
+                else if (relative >= 0 and relative + 4 <= 64)
+                    std.mem.readInt(u32, first[@intCast(relative)..][0..4], .little)
+                else blk: {
+                    faults += 1;
+                    break :blk @as(u32, 0);
+                };
+                try std.testing.expectEqual(expected, std.mem.readInt(u32, output[lane * 16 + word * 4 ..][0..4], .little));
+            };
+            var header: [96]u8 = undefined;
+            try renderer.readbackGuestStorageBuffer(0x12000, &header);
+            try std.testing.expectEqual(faults, std.mem.readInt(u32, header[8..12], .little));
+            try std.testing.expectEqual(@as(u32, 12), std.mem.readInt(u32, header[80..84], .little));
+        }
+    }
+    std.debug.print("FLAT wave snapshots passed: divergent descriptors, last overlapping region wins, unaligned loads, relocation, partial vector bounds and faults\n", .{});
+}
+
 fn runFlatPointerProbe(allocator: std.mem.Allocator) !void {
     var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true });
     defer renderer.deinit();
     var guest = GuestMemory{};
     _ = renderer.dcbBackend(guest.interface());
-    for ([_]bool{ false, true }) |repeat| for ([_]u32{ 125, 0, 106 }) |saddr| for ([_]i32{ -4, 0, 4 }) |offset| {
+    for ([_]bool{ false, true }) |bvh_mode1| for ([_]bool{ false, true }) |repeat| for ([_]u32{ 125, 0, 106 }) |saddr| for ([_]i32{ -4, 0, 4 }) |offset| {
+        if (bvh_mode1 and !renderer.storage_buffer_nonuniform_indexing) continue;
         const scalar_base = saddr != 125;
         const code = [_]u32{
             if (repeat) 0xbe9e_0382 else 0xbf80_0000, // two iterations, or a straight-line probe
@@ -6406,6 +6491,7 @@ fn runFlatPointerProbe(allocator: std.mem.Allocator) !void {
                 .{ .resource_sgpr = 12, .descriptor_index = 1, .stride = 16 },
             },
             .flat_memories = &.{ .{ .descriptor_index = 2, .fault_record_word = 12 }, .{ .descriptor_index = 3 } },
+            .bvh_intersection_mode1 = bvh_mode1,
         });
         defer module.deinit(allocator);
         for (0..2) |pass| {
@@ -7310,8 +7396,8 @@ fn runVectorBufferAddressProbe(allocator: std.mem.Allocator) !void {
         for ([_]u32{ 0, 0xffff_fff8 }) |offset| {
             const load = mubuf(0x0e, 0, 0, 0, 0);
             const code = [_]u32{
-                vop1(1, 0, 8), vop1(1, 4, 8),
-                load[0], (load[1] & 0x00ff_ffff) | (12 << 24),
+                vop1(1, 0, 8),              vop1(1, 4, 8),
+                load[0],                    (load[1] & 0x00ff_ffff) | (12 << 24),
                 mubuf(0x1e, 0, 0, 4, 4)[0], mubuf(0x1e, 0, 0, 4, 4)[1],
                 0xbf81_0000,
             };
@@ -8996,6 +9082,7 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--flat-pointers")) {
         try runFlatPointerProbe(allocator);
+        try runFlatWaveSnapshotProbe(allocator);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--clean-buffer-retention")) {
@@ -9130,12 +9217,12 @@ pub fn main(init: std.process.Init) !void {
         try runGdsWave64AppendProbe(allocator);
         return;
     }
-    if (args.len == 2 and std.mem.eql(u8, args[1], "--gds-resident")) {
-        try runGdsResidentProbe(allocator);
-        return;
-    }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--gds-memory")) {
         try runGdsMemoryProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--gds-resident")) {
+        try runGdsResidentProbe(allocator);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--packed-buffer")) {
