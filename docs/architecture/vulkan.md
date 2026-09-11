@@ -243,6 +243,11 @@ readback as stores. Swizzled descriptors use V# `index_stride` to permute each
 dword address, while short loads/stores are split into byte operations so they
 remain correct across both linear and swizzle-separated dword boundaries.
 Dynamically unresolved SMEM and images remain explicit unsupported semantics.
+Indirect descriptor tables recover the descriptor load and its byte-offset
+producer through control-flow reaching definitions. Writes in sibling branches
+cannot hide the actual table load. All requested words must have the same
+producer; ambiguous joins and partial clobbers remain unsupported. Candidate
+bounds still account for 32-bit multiplication wrap and buffer limits.
 For the supported fragment subset, inline 2D/3D image and sampler descriptors are
 decoded from user SGPRs. Compute sampling also recovers descriptors from the
 exact preceding scalar loads or the dispatch SRT after SGPR reuse. Both paths

@@ -26668,31 +26668,33 @@ fn resolveBufferTablePlan(
     maximum_offsets: u32,
 ) anyerror!?BufferTablePlan {
     const instructions = analysis.program.instructions.items;
-    var index = instructions.len;
-    var producer: ?gpu.ShaderInstruction = null;
-    while (index != 0) {
-        index -= 1;
-        const inst = instructions[index];
-        if (inst.pc >= before_pc) continue;
-        var overlaps = false;
-        for ([_]rdna2.Operand{ inst.dst, inst.dst2 }) |destination| {
-            const first = gpu.scalar_provenance.scalarRegisterIndex(destination) orelse continue;
-            const vector_mask = destination.kind == .vcc_lo and switch (inst.family) {
-                .vop1, .vop2, .vop3, .vop3p, .vopc => true,
-                else => false,
-            };
-            const count = @max(inst.data_words, if (vector_mask or std.mem.endsWith(u8, @tagName(inst.opcode), "64")) @as(u8, 2) else 1);
-            overlaps = overlaps or (wanted_sgpr < first + count and first < wanted_sgpr + wanted_words);
-        }
-        if (!overlaps) continue;
-        const destination = gpu.scalar_provenance.scalarRegisterIndex(inst.dst) orelse return null;
-        if (!isBufferScalarLoad(inst.opcode) or
-            wanted_sgpr < destination or wanted_sgpr + wanted_words > destination + inst.data_words or inst.src0.kind != .sgpr or
-            (gpu.scalar_provenance.scalarRegisterIndex(inst.src1) orelse 128) >= 124 or inst.memory_offset < 0) return null;
-        producer = inst;
-        break;
+    if (wanted_words == 0 or wanted_sgpr >= 128 or wanted_words > 128 - wanted_sgpr) return null;
+    const before = for (instructions, 0..) |inst, i| {
+        if (inst.pc >= before_pc) break i;
+    } else instructions.len;
+    var definitions = gpu.index_bounds.ScalarDefinitionBatch{
+        .instructions = instructions,
+        .graph = &analysis.graph,
+        .persistent = if (analysis.scalar_definitions) |cache|
+            if (cache.matches(instructions, &analysis.graph)) cache else null
+        else
+            null,
+    };
+    // Textually later instructions may belong to a different branch. Every
+    // descriptor word must reach this use from the same buffer-table load;
+    // joins with different writers and partial clobbers remain unsupported.
+    const producer = definitions.lookup(before, wanted_sgpr) orelse return null;
+    if (producer != .instruction) return null;
+    const load_index = producer.instruction;
+    for (1..wanted_words) |word| {
+        const definition = definitions.lookup(before, wanted_sgpr + @as(u32, @intCast(word))) orelse return null;
+        if (definition != .instruction or definition.instruction != load_index) return null;
     }
-    const load = producer orelse return null;
+    const load = instructions[load_index];
+    const destination = gpu.scalar_provenance.scalarRegisterIndex(load.dst) orelse return null;
+    if (!isBufferScalarLoad(load.opcode) or
+        wanted_sgpr < destination or wanted_sgpr + wanted_words > destination + load.data_words or load.src0.kind != .sgpr or
+        (gpu.scalar_provenance.scalarRegisterIndex(load.src1) orelse 128) >= 124 or load.memory_offset < 0) return null;
     const buffer = table: {
         // A visited checkpoint may retain the original table descriptor.
         // Unvisited branches instead need its definitions at this load;
@@ -26710,22 +26712,11 @@ fn resolveBufferTablePlan(
     var index_bound: ?u32 = null;
     var index_register: ?u32 = null;
     const offset_register = gpu.scalar_provenance.scalarRegisterIndex(load.src1).?;
-    while (index != 0) {
-        index -= 1;
+    const offset_definition = definitions.lookup(load_index, @intCast(offset_register)) orelse return null;
+    if (offset_definition != .instruction) return null;
+    const index = offset_definition.instruction;
+    {
         const inst = instructions[index];
-        var writes_offset = false;
-        for ([_]rdna2.Operand{ inst.dst, inst.dst2 }) |destination| {
-            const first = gpu.scalar_provenance.scalarRegisterIndex(destination) orelse continue;
-            const vector_mask = destination.kind == .vcc_lo and switch (inst.family) {
-                .vop1, .vop2, .vop3, .vop3p, .vopc => true,
-                else => false,
-            };
-            // Scalar 32-bit ALU writes to VCC_LO leave VCC_HI intact. Vector
-            // condition masks and 64-bit scalar destinations write the pair.
-            const count = @max(inst.data_words, if (vector_mask or std.mem.endsWith(u8, @tagName(inst.opcode), "64")) @as(u8, 2) else 1);
-            writes_offset = writes_offset or (offset_register >= first and offset_register - first < count);
-        }
-        if (!writes_offset) continue;
         if (gpu.scalar_provenance.scalarRegisterIndex(inst.dst) != offset_register) return null;
         if (inst.opcode != .s_mul_i32 and inst.opcode != .s_mulk_i32 and inst.opcode != .s_lshl_b32) return null;
         const factor = switch (inst.src1.kind) {
@@ -26750,7 +26741,6 @@ fn resolveBufferTablePlan(
                     index_bound = @min(index_bound orelse std.math.maxInt(u32), bound);
             };
         }
-        break;
     }
     const multiplier = stride orelse return null;
     if (multiplier == 0 or multiplier != buffer.stride or buffer.address == 0 or buffer.size_bytes == 0) return null;
@@ -29038,7 +29028,7 @@ test "GFX10 DCC comp-to-single materializes a uniform native texel" {
     try std.testing.expectEqual(@as(u8, texel.len), resolved.length);
     try std.testing.expectEqualSlices(u8, &texel, resolved.bytes[0..resolved.length]);
 
-    surface[dcc_block_bytes * 2] = 0;
+    surface[dcc_block_bytes * 2] ^= 1;
     try std.testing.expect(uniformDccSingleTexel(&surface, texel.len) == null);
 }
 
@@ -30028,6 +30018,61 @@ test "unnormalized guest samplers satisfy Vulkan restrictions" {
     try std.testing.expectEqual(@as(f32, 0), info.maximum_lod);
 }
 
+test "buffer table plans follow reaching loads and offsets across sibling branches" {
+    const Memory = struct {
+        fn read(_: ?*anyopaque, _: u64, _: []u8) bool {
+            return false;
+        }
+    };
+    const allocator = std.testing.allocator;
+    const reader = gpu.ShaderMemoryReader{ .context = null, .read_fn = Memory.read };
+    var instructions = [_]gpu.ShaderInstruction{
+        .{ .pc = 0, .opcode = .s_nop },
+        .{ .pc = 4, .opcode = .s_mul_i32, .dst = .{ .kind = .sgpr, .reg = 60 }, .src0 = .{ .kind = .sgpr, .reg = 8 }, .src1 = .{ .kind = .literal_constant, .value = 96 } },
+        .{ .pc = 8, .opcode = .s_cbranch_scc0, .branch_target = 20 },
+        .{ .pc = 12, .opcode = .s_mov_b32, .dst = .{ .kind = .sgpr, .reg = 60 }, .src0 = .{ .kind = .integer_inline_constant, .value = 7 } },
+        .{ .pc = 16, .opcode = .s_branch, .branch_target = 44 },
+        .{ .pc = 20, .opcode = .s_buffer_load_dwordx16, .dst = .{ .kind = .sgpr, .reg = 32 }, .data_words = 16, .src0 = .{ .kind = .sgpr, .reg = 20 }, .src1 = .{ .kind = .sgpr, .reg = 60 } },
+        .{ .pc = 28, .opcode = .s_cbranch_scc0, .branch_target = 40 },
+        .{ .pc = 32, .opcode = .s_mov_b32, .dst = .{ .kind = .sgpr, .reg = 32 }, .src0 = .{ .kind = .integer_inline_constant, .value = 1 } },
+        .{ .pc = 36, .opcode = .s_branch, .branch_target = 44 },
+        .{ .pc = 40, .opcode = .image_sample, .src1 = .{ .kind = .sgpr, .reg = 32 }, .src2 = .{ .kind = .sgpr, .reg = 52 } },
+        .{ .pc = 44, .opcode = .s_endpgm },
+    };
+    var scalar = gpu.ScalarEvaluation{};
+    for ([_]u32{ 0x1000, 96 << 16, 4, 0 }, 20..) |value, register|
+        scalar.registers[register] = .{ .known = true, .value = value };
+    for (0..4) |variant| {
+        // First keep both clobbers on branches which cannot reach the sample.
+        // Then make the offset, descriptor, or its last word ambiguous.
+        instructions[4].branch_target = if (variant == 1) 20 else 44;
+        instructions[8].branch_target = if (variant >= 2) 40 else 44;
+        instructions[7].dst.reg = if (variant == 3) 39 else 32;
+        const program = rdna2.Program{ .code = &.{}, .instructions = .{ .items = &instructions, .capacity = instructions.len } };
+        var graph = try rdna2.buildControlFlow(allocator, &program);
+        defer graph.deinit(allocator);
+        var cache = gpu.index_bounds.ScalarDefinitionCache.init(allocator, &instructions, &graph);
+        defer cache.deinit();
+        for ([_]bool{ false, true }) |cached| {
+            var analysis: gpu.ShaderAnalysis = undefined;
+            analysis.program = program;
+            analysis.graph = graph;
+            analysis.scalar_definitions = if (cached) &cache else null;
+            const plan = try resolveBufferTablePlan(reader, &analysis, &scalar, 32, 8, 40, null, 16384);
+            if (variant != 0) {
+                try std.testing.expect(plan == null);
+                continue;
+            }
+            try std.testing.expect(plan != null);
+            try std.testing.expectEqual(@as(u64, 0x1000), plan.?.buffer.address);
+            try std.testing.expectEqual(@as(u64, 0), plan.?.first);
+            // Unknown 32-bit indices also reach wrapped offsets: gcd(96, 2^32).
+            try std.testing.expectEqual(@as(u64, 32), plan.?.step);
+            try std.testing.expectEqual(@as(u64, 384), plan.?.limit);
+        }
+    }
+}
+
 test "image descriptor reads preserve split mappings and truncated buffer bounds" {
     const Memory = struct {
         bytes: [64]u8 = undefined,
@@ -30158,6 +30203,8 @@ test "compute resources retain temporal scalar load specializations" {
 test "prepared resource pools reset bindings and keep active loans distinct" {
     var renderer: Renderer = undefined;
     renderer.allocator = std.testing.allocator;
+    renderer.image_scratch = .{};
+    renderer.checkpoint_scratch = .{};
     renderer.free_compute_resource_count = 0;
     renderer.free_graphics_resource_count = 0;
     defer renderer.destroyResourcePools();
