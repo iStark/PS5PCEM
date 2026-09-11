@@ -22,6 +22,23 @@ pub const Error = error{
     UnsupportedHost,
     CreateFailed,
     ResizeFailed,
+    MapFailed,
+};
+
+const WindowsViews = struct {
+    extern "kernel32" fn MapViewOfFile(NativeHandle, u32, u32, u32, usize) callconv(.winapi) ?*anyopaque;
+    extern "kernel32" fn UnmapViewOfFile(*const anyopaque) callconv(.winapi) i32;
+};
+
+/// An independent alias owns its host mapping until deinit. Closing the section
+/// handle or replacing a guest VA does not invalidate this view's pages.
+pub const SharedView = struct {
+    bytes: []u8,
+    offset: usize,
+
+    pub fn deinit(self: SharedView) void {
+        if (builtin.os.tag == .windows) _ = WindowsViews.UnmapViewOfFile(self.bytes.ptr);
+    }
 };
 
 /// A host object whose pages can be mapped into more than one guest address.
@@ -33,6 +50,20 @@ pub const Error = error{
 pub const SharedBacking = struct {
     size: u64,
     handle: NativeHandle,
+
+    /// Windows views start on allocation granularity, while the requested
+    /// physical range may start on any byte. Only committed direct-memory
+    /// ranges should be passed here; creating an alias does not commit pages.
+    pub fn mapView(self: *const SharedBacking, offset: u64, size: usize) Error!SharedView {
+        if (builtin.os.tag != .windows) return Error.UnsupportedHost;
+        if (size == 0 or offset > self.size or size > self.size - offset) return Error.InvalidSize;
+        const start = std.mem.alignBackward(u64, offset, 64 * 1024);
+        const end = std.mem.alignForward(u64, offset + size, 4096);
+        if (end > self.size) return Error.InvalidSize;
+        const length: usize = @intCast(end - start);
+        const pointer = WindowsViews.MapViewOfFile(self.handle, 0x0002, @intCast(start >> 32), @truncate(start), length) orelse return Error.MapFailed;
+        return .{ .bytes = @as([*]u8, @ptrCast(pointer))[0..length], .offset = @intCast(offset - start) };
+    }
 
     pub fn init(size: u64) Error!SharedBacking {
         if (size == 0 or size > std.math.maxInt(i64)) return Error.InvalidSize;

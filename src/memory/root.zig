@@ -18,6 +18,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 pub const SharedBacking = @import("backing_store.zig").SharedBacking;
+pub const SharedView = @import("backing_store.zig").SharedView;
 pub const HostMutex = @import("host_mutex.zig").Mutex;
 
 const windows_mem_free: u32 = 0x0001_0000;
@@ -639,6 +640,39 @@ pub const AddressSpace = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         return self.coversLocked(address, size, null);
+    }
+
+    /// Stable physical identity for an entire readable direct-memory range.
+    /// Private pages and ranges crossing a mapping boundary use the copy path.
+    pub fn directMemoryOffset(self: *AddressSpace, address: u64, size: usize) ?u64 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.directMemoryOffsetLocked(address, size);
+    }
+
+    fn directMemoryOffsetLocked(self: *AddressSpace, address: u64, size: usize) ?u64 {
+        if (size == 0) return null;
+        for (self.mappings.items) |mapping| {
+            if (mapping.kind != .direct_memory or !mapping.protection.read) continue;
+            if (address < mapping.address or address >= mapping.end() or size > mapping.end() - address) continue;
+            return (mapping.backing_offset orelse continue) + (address - mapping.address);
+        }
+        return null;
+    }
+
+    /// Recheck identity under the mapping lock before acquiring an independent
+    /// view. The returned view remains valid after guest unmap/remap or deinit.
+    pub fn pinDirectMemory(self: *AddressSpace, address: u64, size: usize, expected_offset: u64) ?SharedView {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if ((self.directMemoryOffsetLocked(address, size) orelse return null) != expected_offset) return null;
+        const backing = if (self.direct_backing) |*value| value else return null;
+        const view = backing.mapView(expected_offset, size) catch return null;
+        if (!isHostRangeReadable(@intFromPtr(view.bytes.ptr), view.bytes.len)) {
+            view.deinit();
+            return null;
+        }
+        return view;
     }
 
     /// Whether every byte is backed by committed, CPU-readable guest pages.
@@ -2107,6 +2141,38 @@ test "fixed pages are identity mapped, protected, and decommitted" {
     try testing.expectError(Error.ProtectionDenied, space.write(address, "x"));
     try space.unmap(address, page_size);
     try testing.expect(!space.isMapped(address, page_size));
+}
+
+test "pinned direct memory preserves physical identity across remapping" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    var space = try AddressSpace.initWithDirectMemory(testing.allocator, 256 * 1024);
+    var space_alive = true;
+    defer if (space_alive) space.deinit();
+    const address = user.start;
+    try space.mapFixed(address, 64 * 1024, .read_write, .direct_memory, 0);
+    try space.write(address + 4096, "first");
+    const original = space.directMemoryOffset(address + 4096, 4096).?;
+    const view = space.pinDirectMemory(address + 4096, 4096, original).?;
+    defer view.deinit();
+    try testing.expectEqualStrings("first", view.bytes[view.offset..][0..5]);
+    try space.unmap(address, 64 * 1024);
+    try testing.expectEqual(null, space.directMemoryOffset(address + 4096, 4096));
+    try space.mapFixed(address, 64 * 1024, .read_write, .direct_memory, 64 * 1024);
+    try space.write(address + 4096, "other");
+    try testing.expectEqual(@as(?u64, 64 * 1024 + 4096), space.directMemoryOffset(address + 4096, 4096));
+    try testing.expectEqual(null, space.pinDirectMemory(address + 4096, 4096, original));
+    try testing.expectEqualStrings("first", view.bytes[view.offset..][0..5]);
+    @memcpy(view.bytes[view.offset..][0..5], "alias");
+    var text: [5]u8 = undefined;
+    try space.read(address + 4096, &text);
+    try testing.expectEqualStrings("other", &text);
+    try space.mapFixed(address + 128 * 1024, 64 * 1024, .read_write, .direct_memory, 0);
+    try space.read(address + 128 * 1024 + 4096, &text);
+    try testing.expectEqualStrings("alias", &text);
+    try testing.expectEqual(null, space.directMemoryOffset(address + 65532, 8));
+    space.deinit();
+    space_alive = false;
+    try testing.expectEqualStrings("alias", view.bytes[view.offset..][0..5]);
 }
 
 test "GPU page tracker advances generations on HLE and native writes" {
