@@ -3953,6 +3953,79 @@ fn runFullscreenOrientationProbe(allocator: std.mem.Allocator) !void {
     std.debug.print("fullscreen orientation passed: procedural triangle, both viewport signs, runtime UV scale/bias and guest-memory/resident sources and a masked fullscreen quad\n", .{});
 }
 
+fn runBufferTargetCoherenceProbe(allocator: std.mem.Allocator) !void {
+    for ([_]bool{ false, true }) |deferred| for ([_]u32{ 8, 256 }) |extent| {
+        var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true, .defer_small_storage_writes = deferred });
+        defer renderer.deinit();
+        var guest = SizedGuestMemory(512 * 1024){};
+        const center = 0x2000 + (extent / 2 * extent + extent / 2) * 4;
+        const vertex = [_]u32{
+            vop1(6, 1, 261), vop1(1, 2, 255),  0x3f800000,       vop2(4, 3, 1, 2),
+            vop1(1, 4, 255), 0x3f400000,       vop2(8, 5, 3, 4), vop2(8, 6, 3, 3),
+            vop1(1, 7, 255), 0xbfc00000,       vop2(8, 6, 6, 7), vop1(1, 8, 255),
+            0x3f400000,      vop2(3, 6, 6, 8), vop1(1, 7, 128),  vop1(1, 8, 242),
+            0xf80008cf,      0x08070605,       0xbf810000,
+        };
+        const fragment = [_]u32{ vop1(1, 0, 242), vop1(1, 1, 128), vop1(1, 2, 128), vop1(1, 3, 242), 0xf800080f, 0x03020100, 0xbf810000 };
+        const store = mubuf(0x1c, 0, 1, 0, 0);
+        const fill = [_]u32{ 0xd7460000, 0x04010c05, vop1(1, 1, 4), store[0], store[1], 0xbf810000 };
+        for (vertex, 0..) |word, i| guest.word(0x700 + i * 4, word);
+        for (fragment, 0..) |word, i| guest.word(0x900 + i * 4, word);
+        for (fill, 0..) |word, i| guest.word(0x100 + i * 4, word);
+        var state = gpu.State{};
+        for ([_]gpu.resources.ShaderStage{ .vertex, .pixel, .compute }, [_]u32{ 7, 9, 1 }) |stage, program| {
+            try state.writeRegister(.shader, stage.programRegisterBase(), program);
+            try state.writeRegister(.shader, stage.programRegisterBase() + 1, 0);
+        }
+        try state.writeRegister(.shader, 0x213, (5 << 1) | (1 << 7));
+        const context = [_][2]u32{
+            .{ 0x318, 0x20 },                    .{ 0x319, 0 },             .{ 0x31b, 0 },             .{ 0x31c, 10 << 2 }, .{ 0x31d, 0 },
+            .{ 0x390, 0 },                       .{ 0x3b0, (7 << 14) | 7 }, .{ 0x3b8, 1 << 24 },       .{ 0x08e, 0xf },     .{ 0x00c, 0 },
+            .{ 0x00d, 8 | (8 << 16) },           .{ 0x094, 1 << 31 },       .{ 0x095, 8 | (8 << 16) }, .{ 0x1e0, 0 },       .{ 0x200, 0 },
+            .{ 0x202, (0xcc << 16) | (1 << 4) }, .{ 0x204, 0 },             .{ 0x205, 0 },
+        };
+        for (context) |entry| try state.writeRegister(.context, entry[0], entry[1]);
+        try state.writeRegister(.context, 0x3b0, ((extent - 1) << 14) | (extent - 1));
+        try state.writeRegister(.context, 0x00d, extent | (extent << 16));
+        try state.writeRegister(.context, 0x095, extent | (extent << 16));
+        const half_extent: f32 = @floatFromInt(extent / 2);
+        for ([_]f32{ half_extent, half_extent, half_extent, half_extent, 1, 0 }, 0..) |value, i|
+            try state.writeRegister(.context, 0x10f + @as(u32, @intCast(i)), @bitCast(value));
+        var executor = gpu.DcbExecutor{ .state = &state, .backend = renderer.dcbBackend(guest.interface()), .allocator = allocator };
+        const draw = [_]u32{ command(gpu.pm4.draw_index_auto, 2), 3, 0 };
+        _ = try executor.execute(&draw);
+        if (renderer.last_draw_error) |err| return err;
+        // The compute fill overwrites an already resident attachment. The
+        // following triangle must keep the new fill outside its coverage.
+        for ([_]u32{ 0xff563412, 0xffab8967, 0xff563412 }) |color| {
+            for ([_]u32{ 0x2000, 4 << 16, extent * extent, 0, color }, 0..) |word, i|
+                try state.writeRegister(.shader, 0x240 + @as(u32, @intCast(i)), word);
+            _ = try renderer.dispatchRdna2State(&state, .{ 64, 1, 1 }, .{ extent * extent / 64, 1, 1 });
+            _ = try executor.execute(&draw);
+            if (renderer.last_draw_error) |err| return err;
+            try renderer.flushPendingGuestWrites();
+            const actual = std.mem.readInt(u32, guest.bytes[0x2000..][0..4], .little);
+            std.debug.print("buffer target coherence deferred={any} extent={d}: expected=0x{x} actual=0x{x}\n", .{ deferred, extent, color, actual });
+            try std.testing.expectEqual(color, actual);
+            try std.testing.expectEqual(@as(u32, 0xff0000ff), std.mem.readInt(u32, guest.bytes[center..][0..4], .little));
+        }
+        // Leave a new green triangle only on the GPU, then write one pixel
+        // through the same full-buffer view. The other invocations are
+        // absent, so the untouched centre must come from that latest draw.
+        guest.word(0x900, vop1(1, 0, 128));
+        guest.word(0x904, vop1(1, 1, 242));
+        _ = try executor.execute(&draw);
+        if (renderer.last_draw_error) |err| return err;
+        try std.testing.expectEqual(@as(u32, 0xff0000ff), std.mem.readInt(u32, guest.bytes[center..][0..4], .little));
+        try state.writeRegister(.shader, 0x244, 0xff765432);
+        _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
+        try renderer.flushPendingGuestWrites();
+        try std.testing.expectEqual(@as(u32, 0xff765432), std.mem.readInt(u32, guest.bytes[0x2000..][0..4], .little));
+        try std.testing.expectEqual(@as(u32, 0xff00ff00), std.mem.readInt(u32, guest.bytes[center..][0..4], .little));
+    };
+    std.debug.print("buffer target coherence passed: eager/deferred fills survive attachment reuse, partial stores retain latest GPU pixels\n", .{});
+}
+
 fn runResidentTargetReuseProbe(allocator: std.mem.Allocator) !void {
     for ([_]usize{ 64, 128 }) |limit| try runResidentTargetReuseAtLimit(allocator, limit);
 }
@@ -8024,6 +8097,10 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--fragment-position")) {
         try runFragmentPositionProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--buffer-target-coherence")) {
+        try runBufferTargetCoherenceProbe(allocator);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--target-reuse")) {

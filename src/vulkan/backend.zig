@@ -4778,7 +4778,7 @@ pub const Renderer = struct {
     /// Reuses host/device allocations for an exact guest range. Guest-authored
     /// buffers upload current bytes; large GPU-authored outputs stay resident
     /// until a consumer explicitly needs guest-visible data.
-    pub fn stageGuestStorageBuffer(self: *Renderer, guest_address: u64, size: usize) (Error || std.mem.Allocator.Error)!StagedBuffer {
+    pub fn stageGuestStorageBuffer(self: *Renderer, guest_address: u64, size: usize) anyerror!StagedBuffer {
         return self.stageGuestStorageBufferAt(0, guest_address, size);
     }
 
@@ -4871,13 +4871,24 @@ pub const Renderer = struct {
         descriptor_index: u32,
         guest_address: u64,
         size: usize,
-    ) (Error || std.mem.Allocator.Error)!StagedBuffer {
+    ) anyerror!StagedBuffer {
         const profile_started = hostTimestampNs();
         defer self.frame_profile.storage_stage_ns +|= elapsedHostNanoseconds(profile_started);
         if (descriptor_index >= maximum_storage_descriptors) return Error.InvalidStorageDescriptor;
         if (size == 0) return Error.GuestMemoryReadFailed;
         if (size > maximum_staged_buffer_bytes) return Error.GuestBufferTooLarge;
         const memory = self.guest_memory orelse return Error.GuestMemoryUnavailable;
+        // A raw V# may read or partially overwrite a colour allocation that
+        // was last produced as an attachment. Preserve those pixels before
+        // staging the buffer; otherwise a masked store starts from stale RAM.
+        if (try self.materializeRenderTargetAt(guest_address)) {
+            for (self.completed_frames.items) |*frame| {
+                if (frame.guest_address != guest_address or !frame.needs_writeback) continue;
+                const target = frame.target orelse continue;
+                try self.commitGuestColorTarget(target, frame.pixels.items);
+                frame.needs_writeback = false;
+            }
+        }
         self.guest_buffer_sequence +%= 1;
 
         var entry_index: ?usize = null;
@@ -9075,6 +9086,10 @@ pub const Renderer = struct {
         defer self.frame_profile.storage_commit_ns +|= elapsedHostNanoseconds(profile_started);
         for (resources.writable, 0..) |writable, index| {
             if (!writable) continue;
+            // The buffer now owns this allocation. A subsequent attachment
+            // bind must seed from its result, including deferred writes, and
+            // an older completed frame must not publish over the new bytes.
+            self.invalidateBufferColorTarget(resources.addresses[index]);
             if (self.defer_small_storage_writes_enabled or
                 resources.sizes[index] >= deferred_storage_write_min_bytes)
             {
@@ -9091,6 +9106,24 @@ pub const Renderer = struct {
             defer self.allocator.free(bytes);
             try self.readbackGuestStorageBuffer(resources.addresses[index], bytes);
             if (!memory.write(memory.context, resources.addresses[index], bytes)) return Error.GuestMemoryWriteFailed;
+        }
+    }
+
+    fn invalidateBufferColorTarget(self: *Renderer, address: u64) void {
+        if (address == 0) return;
+        for (self.render_targets.items) |*cached| {
+            if (cached.target.descriptor.address != address) continue;
+            cached.initialized = false;
+            cached.gpu_generation = 0;
+            cached.host_generation = 0;
+            cached.scanout_flip_vertical = false;
+        }
+        for (self.completed_frames.items) |*cached| {
+            if (cached.guest_address != address) continue;
+            cached.needs_writeback = false;
+            cached.guest_address = 0;
+            cached.sequence = 0;
+            cached.target = null;
         }
     }
 
