@@ -769,7 +769,6 @@ const maximum_frame_descriptor_sets = 512;
 const descriptor_scalar_stride = std.mem.alignForward(usize, dynamic_scalar_buffer_bytes, 256);
 const descriptor_scalar_ring_bytes = descriptor_scalar_stride * maximum_frame_descriptor_sets;
 const gds_slot_bytes = 64 * 1024;
-const gds_ring_bytes = gds_slot_bytes * maximum_frame_descriptor_sets;
 /// Read-only vertex/constant ranges are copied into one persistently mapped
 /// per-frame arena. It snapshots guest data for queued draws without creating
 /// and freeing one Vulkan allocation per binding.
@@ -3319,6 +3318,9 @@ pub const Renderer = struct {
     active_storage_buffers: [maximum_storage_descriptors]vk.Buffer = @splat(0),
     guest_buffer_sequence: u64 = 0,
     gds_storage: std.ArrayList(u8) = .empty,
+    gds_host_dirty: bool = true,
+    gds_gpu_dirty: bool = false,
+    retain_gds_on_gpu: bool = true,
     compute_pipelines: std.ArrayList(ComputePipelineEntry) = .empty,
     compute_pipeline_sequence: u64 = 0,
     graphics_pipelines: std.ArrayList(GraphicsPipelineEntry) = .empty,
@@ -4177,13 +4179,15 @@ pub const Renderer = struct {
         try renderer.gds_storage.resize(allocator, 64 * 1024);
         errdefer renderer.gds_storage.deinit(allocator);
         @memset(renderer.gds_storage.items, 0);
-        renderer.gds_buffer = try renderer.createBuffer(
-            gds_ring_bytes,
+        renderer.gds_buffer = try renderer.createBufferWithMemoryPreference(
+            gds_slot_bytes,
             vk.buffer_usage_storage_buffer_bit,
             vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit,
+            vk.memory_property_host_cached_bit,
         );
         errdefer renderer.destroyBuffer(renderer.gds_buffer.?);
         try renderer.writeMapped(renderer.gds_buffer.?, renderer.gds_storage.items);
+        renderer.gds_host_dirty = false;
         renderer.updateGdsDescriptor(renderer.gds_buffer.?);
         renderer.createDetilePass() catch |err| {
             std.debug.print("[vulkan] compute detile unavailable: {s}\n", .{@errorName(err)});
@@ -5238,6 +5242,10 @@ pub const Renderer = struct {
     }
 
     fn dispatchSpirvWithModule(self: *Renderer, words: []const u32, group_count: [3]u32, module: ?spirv_cache.Lease) (Error || std.mem.Allocator.Error)!DispatchReport {
+        return self.dispatchSpirvWithGds(words, group_count, module, false);
+    }
+
+    fn dispatchSpirvWithGds(self: *Renderer, words: []const u32, group_count: [3]u32, module: ?spirv_cache.Lease, uses_gds: bool) (Error || std.mem.Allocator.Error)!DispatchReport {
         const lookup = try self.getComputePipeline(words, module);
         const command_buffer = try self.beginOneShot();
         defer self.releaseOneShot(command_buffer);
@@ -5254,8 +5262,29 @@ pub const Renderer = struct {
                 null,
             );
         }
+        if (uses_gds) {
+            const barrier = vk.BufferMemoryBarrier{
+                .source_access_mask = vk.access_shader_write_bit | vk.access_host_write_bit,
+                .destination_access_mask = vk.access_shader_read_bit | vk.access_shader_write_bit,
+                .buffer = self.gds_buffer.?.handle,
+                .offset = 0,
+                .size = gds_slot_bytes,
+            };
+            self.device_functions.cmd_pipeline_barrier(command_buffer, vk.pipeline_stage_compute_shader_bit | vk.pipeline_stage_host_bit, vk.pipeline_stage_compute_shader_bit, 0, 0, null, 1, @ptrCast(&barrier), 0, null);
+        }
         self.device_functions.cmd_dispatch(command_buffer, group_count[0], group_count[1], group_count[2]);
+        if (uses_gds) {
+            const barrier = vk.BufferMemoryBarrier{
+                .source_access_mask = vk.access_shader_write_bit,
+                .destination_access_mask = vk.access_host_read_bit,
+                .buffer = self.gds_buffer.?.handle,
+                .offset = 0,
+                .size = gds_slot_bytes,
+            };
+            self.device_functions.cmd_pipeline_barrier(command_buffer, vk.pipeline_stage_compute_shader_bit, vk.pipeline_stage_host_bit, 0, 0, null, 1, @ptrCast(&barrier), 0, null);
+        }
         try self.submitOneShot(command_buffer);
+        if (uses_gds) self.gds_gpu_dirty = true;
         return .{
             .pipeline_cache_hit = lookup.cache_hit,
             .group_count = group_count,
@@ -5671,6 +5700,7 @@ pub const Renderer = struct {
         const trace_yotei_visibility = program_address == 0x8000_4101_00 and
             self.reported_yotei_visibility_dispatches < 8;
         if (uses_gds) {
+            if (trace_yotei_gds) try self.downloadGdsStorage();
             try self.uploadGdsStorage();
             if (trace_yotei_gds) {
                 yotei_gds_before = try self.allocator.dupe(u8, self.gds_storage.items);
@@ -6230,7 +6260,7 @@ pub const Renderer = struct {
         }
         const submit_started = hostTimestampNs();
         try self.prepareStorageImageAccess(resources);
-        const report = try self.dispatchSpirvWithModule(module.words, group_count, module_lease);
+        const report = try self.dispatchSpirvWithGds(module.words, group_count, module_lease, uses_gds);
         if (resources.sampled_image_fault) |fault| {
             const command_buffer = try self.beginOneShot();
             defer self.releaseOneShot(command_buffer);
@@ -6300,7 +6330,7 @@ pub const Renderer = struct {
             std.debug.print("[vulkan dcb] compute submit complete program=0x{x}\n", .{program_address});
         }
         if (uses_gds) {
-            try self.downloadGdsStorage();
+            if (!self.retain_gds_on_gpu or yotei_gds_before != null) try self.downloadGdsStorage();
             if (yotei_gds_before) |before| {
                 var changed: usize = 0;
                 var nonzero: usize = 0;
@@ -6414,11 +6444,7 @@ pub const Renderer = struct {
             addresses.size_bytes / addresses.stride;
         const writes: usize = @intCast(@min(@as(u64, element_count), @min(dispatched, source_records)));
 
-        const gds_bytes: usize = 64 * 1024;
-        if (self.gds_storage.items.len == 0) {
-            try self.gds_storage.resize(self.allocator, gds_bytes);
-            @memset(self.gds_storage.items, 0);
-        }
+        try self.prepareGdsHostWrite();
         var address_bytes: [4]u8 = undefined;
         var value_bytes: [4]u8 = undefined;
         std.mem.writeInt(u32, &value_bytes, fill_value, .little);
@@ -6440,10 +6466,8 @@ pub const Renderer = struct {
     }
 
     /// Executes the matching system kernel which gathers selected GDS dwords
-    /// into a guest buffer. GDS already has persistent host backing for DMA and
-    /// the initialization kernel above; running this tiny transfer on the CPU
-    /// keeps all three producers/consumers coherent without exposing a second,
-    /// unsynchronised Vulkan copy of the same 64 KiB address space.
+    /// into a guest buffer. Synchronize the persistent GPU allocation before
+    /// reading its host shadow, just as the DMA path does.
     fn tryEmulateGdsReadback(
         self: *Renderer,
         memory: GuestMemory,
@@ -6522,7 +6546,7 @@ pub const Renderer = struct {
             const source_bytes = std.math.mul(usize, writes, addresses.stride) catch return Error.GuestBufferTooLarge;
             try self.flushPendingGuestWrite(addresses.address, source_bytes);
         }
-        if (!self.ensureGdsStorage()) return Error.MemoryAllocationFailed;
+        try self.downloadGdsStorage();
 
         var address_bytes: [4]u8 = undefined;
         var value_bytes: [4]u8 = undefined;
@@ -6842,7 +6866,8 @@ pub const Renderer = struct {
             m0_base &= 0xffff;
             break;
         }
-        if (self.ensureGdsStorage()) {
+        try self.prepareGdsHostWrite();
+        {
             var item: u32 = 0;
             while (item < 3) : (item += 1) {
                 const gds_offset = m0_base + item * 4;
@@ -17404,37 +17429,56 @@ pub const Renderer = struct {
 
     fn updateGdsDescriptor(self: *Renderer, buffer: OwnedBuffer) void {
         std.debug.assert(gds_descriptor_binding == rdna2.spirv.gds_descriptor_binding);
-        const slot = self.current_descriptor_slot orelse 0;
         const buffer_info = vk.DescriptorBufferInfo{
             .buffer = buffer.handle,
-            .offset = slot * gds_slot_bytes,
+            .offset = 0,
             .range = gds_slot_bytes,
         };
-        const write = vk.WriteDescriptorSet{
-            .destination_set = self.descriptor_set,
+        // GDS has one lifetime-long allocation. Bind every ring slot once,
+        // before any submission, instead of rewriting the same descriptor on
+        // each dispatch. Scalar and ordinary storage bindings still rotate.
+        var writes: [maximum_frame_descriptor_sets]vk.WriteDescriptorSet = undefined;
+        for (self.descriptor_sets, &writes) |set, *write| write.* = .{
+            .destination_set = set,
             .destination_binding = gds_descriptor_binding,
             .destination_array_element = 0,
             .descriptor_count = 1,
             .descriptor_type = vk.descriptor_type_storage_buffer,
             .buffer_info = @ptrCast(&buffer_info),
         };
-        self.device_functions.update_descriptor_sets(self.device, 1, @ptrCast(&write), 0, null);
-        self.active_descriptor_set = self.descriptor_set;
+        self.device_functions.update_descriptor_sets(self.device, writes.len, &writes, 0, null);
     }
 
     fn uploadGdsStorage(self: *Renderer) Error!void {
         const buffer = self.gds_buffer orelse return Error.InvalidStorageDescriptor;
         if (!self.ensureGdsStorage()) return Error.MemoryAllocationFailed;
-        const slot = self.current_descriptor_slot orelse 0;
-        try self.writeMappedAt(buffer, slot * gds_slot_bytes, self.gds_storage.items);
-        self.updateGdsDescriptor(buffer);
+        if (self.gds_host_dirty) {
+            // Every CPU mutation first reads back/waits for earlier GDS work.
+            // Subsequent GPU consumers share one allocation and use barriers.
+            std.debug.assert(!self.gds_gpu_dirty);
+            try self.writeMapped(buffer, self.gds_storage.items);
+            self.gds_host_dirty = false;
+        }
+        self.active_descriptor_set = self.descriptor_set;
     }
 
     fn downloadGdsStorage(self: *Renderer) Error!void {
-        const buffer = self.gds_buffer orelse return Error.InvalidStorageDescriptor;
         if (!self.ensureGdsStorage()) return Error.MemoryAllocationFailed;
-        const slot = self.current_descriptor_slot orelse 0;
-        try self.readMappedAt(buffer, slot * gds_slot_bytes, self.gds_storage.items);
+        if (!self.gds_gpu_dirty) return;
+        const buffer = self.gds_buffer orelse return Error.InvalidStorageDescriptor;
+        try self.readMapped(buffer, self.gds_storage.items);
+        self.gds_gpu_dirty = false;
+    }
+
+    /// Synchronize the host shadow only when a CPU consumer needs GDS bytes.
+    pub fn readbackGdsStorage(self: *Renderer) Error![]const u8 {
+        try self.downloadGdsStorage();
+        return self.gds_storage.items;
+    }
+
+    fn prepareGdsHostWrite(self: *Renderer) Error!void {
+        try self.downloadGdsStorage();
+        self.gds_host_dirty = true;
     }
 
     /// Publish all sampled-image bindings for one draw/dispatch in a single
@@ -20626,7 +20670,7 @@ pub const Renderer = struct {
                 if (!memory.read(memory.context, dma.source_address, bytes)) return false;
             },
             1 => {
-                if (!self.ensureGdsStorage()) return false;
+                self.downloadGdsStorage() catch return false;
                 const offset = std.math.cast(usize, dma.source_address) orelse return false;
                 if (offset > self.gds_storage.items.len or byte_count > self.gds_storage.items.len - offset) return false;
                 @memcpy(bytes, self.gds_storage.items[offset..][0..byte_count]);
@@ -20658,7 +20702,7 @@ pub const Renderer = struct {
                 self.applyUniformDccWrite(dma.destination_address, bytes) catch return false;
             },
             1 => {
-                if (!self.ensureGdsStorage()) return false;
+                self.prepareGdsHostWrite() catch return false;
                 const offset = std.math.cast(usize, dma.destination_address) orelse return false;
                 if (offset > self.gds_storage.items.len or byte_count > self.gds_storage.items.len - offset) return false;
                 @memcpy(self.gds_storage.items[offset..][0..byte_count], bytes);

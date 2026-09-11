@@ -4617,9 +4617,9 @@ fn runGdsAtomicProbe(allocator: std.mem.Allocator) !void {
         }
         const report = try renderer.dispatchRdna2State(&state, .{ 64, 1, 1 }, .{ 3, 1, 1 });
         try std.testing.expect(report.spirv_words != 0);
-        for (0..renderer.gds_storage.items.len / 4) |index| {
+        for (0..(try renderer.readbackGdsStorage()).len / 4) |index| {
             const expected: u32 = if (index == 0x108 / 4) case.expected else 0;
-            try std.testing.expectEqual(expected, std.mem.readInt(u32, renderer.gds_storage.items[index * 4 ..][0..4], .little));
+            try std.testing.expectEqual(expected, std.mem.readInt(u32, (try renderer.readbackGdsStorage())[index * 4 ..][0..4], .little));
         }
     }
     const return_code = [_]u32{
@@ -4639,7 +4639,7 @@ fn runGdsAtomicProbe(allocator: std.mem.Allocator) !void {
     var previous: [4]u8 = undefined;
     try renderer.readbackGuestStorageBuffer(0x18000, &previous);
     try std.testing.expectEqual(@as(u32, 15), std.mem.readInt(u32, &previous, .little));
-    try std.testing.expectEqual(@as(u32, 17), std.mem.readInt(u32, renderer.gds_storage.items[0x108..][0..4], .little));
+    try std.testing.expectEqual(@as(u32, 17), std.mem.readInt(u32, (try renderer.readbackGdsStorage())[0x108..][0..4], .little));
     const prefix_code = [_]u32{
         0xbefc_0300,
         0xd766_0003, 0x0001_0002, // mbcnt high(s2, 0)
@@ -4671,7 +4671,7 @@ fn runGdsAtomicProbe(allocator: std.mem.Allocator) !void {
             try std.testing.expectEqual(@as(u32, @popCount(mask & before)), std.mem.readInt(u32, prefixes[lane * 4 ..][0..4], .little));
         }
         prefix_total += @popCount(mask);
-        try std.testing.expectEqual(prefix_total, std.mem.readInt(u32, renderer.gds_storage.items[0x120..][0..4], .little));
+        try std.testing.expectEqual(prefix_total, std.mem.readInt(u32, (try renderer.readbackGdsStorage())[0x120..][0..4], .little));
     }
     std.debug.print("GDS atomic passed: persistent counter, cross-workgroup updates, EXEC low/high, segment and physical bounds, returned value\n", .{});
 }
@@ -4721,9 +4721,81 @@ fn runGdsWave64AppendProbe(allocator: std.mem.Allocator) !void {
                 try std.testing.expectEqual(word, actual);
             }
         }
-        try std.testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, renderer.gds_storage.items[0x104..][0..4], .little));
+        try std.testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, (try renderer.readbackGdsStorage())[0x104..][0..4], .little));
     }
     std.debug.print("GDS wave64 append passed: dynamic sparse masks, high-only/empty EXEC, compact ranks and shared append/consume return values\n", .{});
+}
+
+fn runGdsResidentProbe(allocator: std.mem.Allocator) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true });
+    defer renderer.deinit();
+    var guest = GuestMemory{};
+    const backend = renderer.dcbBackend(guest.interface());
+    const code = [_]u32{
+        0xbefc_0300, vop1(1, 1, 1), vop1(1, 2, 4),
+        0xbefe_0402, 0xd802_0004,   0x0000_0102,
+        0xbf81_0000,
+    };
+    for (code, 0..) |word, index| guest.word(0x100 + index * 4, word);
+    var state = gpu.State{};
+    const compute = gpu.resources.ShaderStage.compute;
+    try state.writeRegister(.shader, compute.programRegisterBase(), 1);
+    try state.writeRegister(.shader, compute.programRegisterBase() + 1, 0);
+    try state.writeRegister(.shader, 0x213, 5 << 1);
+    for ([_]u32{ 0x0100_0010, 1, 0, 0x100, 4 }, 0..) |word, index| {
+        try state.writeRegister(.shader, compute.userDataBase() + @as(u32, @intCast(index)), word);
+    }
+    // Cross the descriptor ring boundary while one active high lane in each
+    // workgroup updates the same counter. No CPU reads between dispatches.
+    for (0..520) |index| {
+        _ = try renderer.dispatchRdna2State(&state, .{ 64, 1, 1 }, .{ 3, 1, 1 });
+        if (index == 9) try std.testing.expect(renderer.pending_command_buffers.items.len >= 10);
+    }
+    try std.testing.expect(renderer.gds_gpu_dirty);
+    try std.testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, renderer.gds_storage.items[0x108..][0..4], .little));
+    const dma = gpu.state.DmaData{
+        .engine = 0,
+        .source = 1,
+        .source_cache_policy = 0,
+        .source_address = 0x108,
+        .destination = 0,
+        .destination_cache_policy = 0,
+        .destination_address = 0x18000,
+        .byte_count = 8,
+        .wait_for_previous = true,
+        .write_confirm = true,
+        .block_engine = true,
+    };
+    try std.testing.expect(backend.vtable.dma_data.?(backend.context, dma));
+    try std.testing.expectEqual(@as(u32, 1560), std.mem.readInt(u32, guest.bytes[0x18000..][0..4], .little));
+    try state.writeRegister(.shader, compute.userDataBase() + 1, 2);
+    for (0..8) |_| _ = try renderer.dispatchRdna2State(&state, .{ 64, 1, 1 }, .{ 3, 1, 1 });
+    var partial = dma;
+    partial.source = 2;
+    partial.source_address = 7;
+    partial.destination = 1;
+    partial.destination_address = 0x10c;
+    partial.byte_count = 4;
+    try std.testing.expect(backend.vtable.dma_data.?(backend.context, partial));
+    try state.writeRegister(.shader, compute.userDataBase() + 1, 3);
+    _ = try renderer.dispatchRdna2State(&state, .{ 64, 1, 1 }, .{ 3, 1, 1 });
+    try std.testing.expect(backend.vtable.dma_data.?(backend.context, dma));
+    try std.testing.expectEqual(@as(u32, 1617), std.mem.readInt(u32, guest.bytes[0x18000..][0..4], .little));
+    try std.testing.expectEqual(@as(u32, 7), std.mem.readInt(u32, guest.bytes[0x18004..][0..4], .little));
+    guest.word(0x19000, 19);
+    partial.source = 0;
+    partial.source_address = 0x19000;
+    partial.destination_address = 0x108;
+    try std.testing.expect(backend.vtable.dma_data.?(backend.context, partial));
+    _ = try renderer.dispatchRdna2State(&state, .{ 64, 1, 1 }, .{ 3, 1, 1 });
+    try std.testing.expect(backend.vtable.dma_data.?(backend.context, dma));
+    try std.testing.expectEqual(@as(u32, 28), std.mem.readInt(u32, guest.bytes[0x18000..][0..4], .little));
+    try std.testing.expectEqual(@as(u32, 7), std.mem.readInt(u32, guest.bytes[0x18004..][0..4], .little));
+    renderer.retain_gds_on_gpu = false;
+    _ = try renderer.dispatchRdna2State(&state, .{ 64, 1, 1 }, .{ 3, 1, 1 });
+    try std.testing.expect(!renderer.gds_gpu_dirty);
+    try std.testing.expectEqual(@as(u32, 37), std.mem.readInt(u32, (try renderer.readbackGdsStorage())[0x108..][0..4], .little));
+    std.debug.print("resident GDS passed: 520 queued producers, descriptor reuse, DMA reads, partial CPU writes, resumed GPU atomics and synchronous mode\n", .{});
 }
 
 fn runGdsMemoryProbe(allocator: std.mem.Allocator) !void {
@@ -4791,7 +4863,7 @@ fn runGdsMemoryProbe(allocator: std.mem.Allocator) !void {
             },
             else => {},
         }
-        try std.testing.expectEqualSlices(u8, &expected_gds, renderer.gds_storage.items);
+        try std.testing.expectEqualSlices(u8, &expected_gds, (try renderer.readbackGdsStorage()));
     }
     std.debug.print("GDS memory passed: persistent word pairs, low/high EXEC, per-word segment bounds, address wrap and physical bounds\n", .{});
 }
@@ -8441,6 +8513,10 @@ pub fn main(init: std.process.Init) !void {
     if (args.len == 2 and std.mem.eql(u8, args[1], "--gds")) {
         try runGdsAtomicProbe(allocator);
         try runGdsWave64AppendProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--gds-resident")) {
+        try runGdsResidentProbe(allocator);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--gds-memory")) {
