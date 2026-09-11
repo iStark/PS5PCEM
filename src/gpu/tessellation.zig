@@ -9,6 +9,74 @@ const rdna2 = @import("rdna2");
 const analysis = @import("shader_analysis.zig");
 const shaders = @import("shaders.zig");
 const State = @import("state.zig").State;
+const ScalarDefinitionBatch = @import("index_bounds.zig").ScalarDefinitionBatch;
+
+/// Locate the ring-table pointer consumed by the HS, rather than assuming
+/// it is the third word of the root table. The triangle ABI loads this
+/// pointer from root+16; the quad ABI obtains it from root+8.
+pub fn ringTablePointerOffset(hull: *const analysis.Analysis) !u32 {
+    const instructions = hull.program.instructions.items;
+    var definitions = ScalarDefinitionBatch{ .instructions = instructions, .graph = &hull.graph };
+    if (hull.scalar_definitions) |cache| {
+        if (cache.matches(instructions, &hull.graph)) definitions.persistent = cache;
+    }
+    var result: ?u32 = null;
+    var found_factors = false;
+    var found_offchip = false;
+    for (instructions, 0..) |store, store_index| {
+        switch (store.opcode) {
+            .buffer_store_dword, .buffer_store_dwordx2, .buffer_store_dwordx3, .buffer_store_dwordx4 => {},
+            else => continue,
+        }
+        if (store.src1.kind != .sgpr or store.src2.kind != .sgpr or
+            (store.src2.reg != 2 and store.src2.reg != 4)) continue;
+        const factors = store.src2.reg == 4;
+        const descriptor_index = try tupleDefinition(&definitions, store_index, store.src1.reg, 4);
+        const descriptor = instructions[descriptor_index];
+        const descriptor_offset = try directScalarLoadOffset(descriptor, store.src1.reg, 4);
+        if (descriptor_offset != @as(u32, if (factors) 32 else 48) or descriptor.src0.kind != .sgpr)
+            return error.UnsupportedHullShaderRingTable;
+        const pointer_index = try tupleDefinition(&definitions, descriptor_index, descriptor.src0.reg, 2);
+        const pointer = instructions[pointer_index];
+        const offset = try directScalarLoadOffset(pointer, descriptor.src0.reg, 2);
+        if (pointer.src0.kind != .sgpr or pointer.src0.reg != 0)
+            return error.UnsupportedHullShaderRingTable;
+        for (0..2) |word| {
+            const definition = definitions.lookup(pointer_index, @intCast(word)) orelse return error.UnsupportedHullShaderRingTable;
+            if (definition != .entry) return error.UnsupportedHullShaderRingTable;
+        }
+        if (result) |previous| {
+            if (offset != previous) return error.UnsupportedHullShaderRingTable;
+        }
+        result = offset;
+        if (factors) found_factors = true else found_offchip = true;
+    }
+    if (!found_factors or !found_offchip) return error.UnsupportedHullShaderRingTable;
+    return result.?;
+}
+
+fn tupleDefinition(definitions: *ScalarDefinitionBatch, before: usize, register: u32, words: u32) !usize {
+    const first = definitions.lookup(before, register) orelse return error.UnsupportedHullShaderRingTable;
+    if (first != .instruction) return error.UnsupportedHullShaderRingTable;
+    for (1..words) |word| {
+        const next = definitions.lookup(before, register + @as(u32, @intCast(word))) orelse return error.UnsupportedHullShaderRingTable;
+        if (next != .instruction or next.instruction != first.instruction) return error.UnsupportedHullShaderRingTable;
+    }
+    return first.instruction;
+}
+
+fn directScalarLoadOffset(inst: rdna2.Instruction, register: u32, words: u32) !u32 {
+    switch (inst.opcode) {
+        .s_load_dwordx2, .s_load_dwordx4, .s_load_dwordx8, .s_load_dwordx16 => {},
+        else => return error.UnsupportedHullShaderRingTable,
+    }
+    const zero_offset = inst.src1.kind == .null or
+        ((inst.src1.kind == .integer_inline_constant or inst.src1.kind == .literal_constant) and inst.src1.value == 0);
+    if (!zero_offset or inst.memory_offset < 0 or inst.dst.kind != .sgpr or
+        register < inst.dst.reg or register + words > inst.dst.reg + inst.data_words)
+        return error.UnsupportedHullShaderRingTable;
+    return std.math.add(u32, @intCast(inst.memory_offset), (register - inst.dst.reg) * 4);
+}
 
 pub const Config = struct {
     pub const IndexFormat = enum { uint16, uint32 };
@@ -131,6 +199,7 @@ pub const Entry = struct {
     local_words: []u32,
     hull_words: []u32,
     merged: analysis.Analysis,
+    ring_table_pointer_offset: ?u32 = null,
 
     pub fn deinit(self: *Entry, allocator: std.mem.Allocator) void {
         self.merged.deinit(allocator);
@@ -306,6 +375,43 @@ const Words = struct {
         return true;
     }
 };
+
+test "hull ring pointers follow factor and offchip loads instead of a fixed root slot" {
+    const allocator = std.testing.allocator;
+    for ([_]bool{ false, true }) |triangles| {
+        var source = Words{ .allocator = allocator };
+        defer source.code.deinit(allocator);
+        try source.code.appendSlice(allocator, &.{ 0xf408_0200, 0xfa00_0000 }); // s8:s11 = root[0..16]
+        if (triangles) try source.code.appendSlice(allocator, &.{ 0xf404_0300, 0xfa00_0010 }); // s12:s13 = root[16..24]
+        const pointer: u32 = if (triangles) 12 else 10;
+        try source.code.appendSlice(allocator, &.{
+            0xf408_0400 | (pointer / 2), 0xfa00_0030, // offchip V# s16
+            0xe078_1000, 0x0204_0000, // store via s16 + s2
+            0xf408_0500 | (pointer / 2), 0xfa00_0020, // factors V# s20
+            0xe078_1000, 0x0405_0000, // store via s20 + s4
+            0xbf81_0000,
+        });
+        const reader = shaders.MemoryReader{ .context = &source, .read_fn = Words.read };
+        var hull = try analysis.decodeBounded(allocator, reader, 0, source.code.items.len, source.code.items.len * 4);
+        defer hull.deinit(allocator);
+        try std.testing.expectEqual(@as(u32, if (triangles) 16 else 8), try ringTablePointerOffset(&hull));
+        try hull.enableScalarDefinitionCache(allocator);
+        try std.testing.expectEqual(@as(u32, if (triangles) 16 else 8), try ringTablePointerOffset(&hull));
+        if (triangles) {
+            // Equal descriptor offsets do not make two different root tables
+            // interchangeable: only the offchip pointer now comes from root+8.
+            source.code.items[4] = 0xf408_0405;
+            var mixed = try analysis.decodeBounded(allocator, reader, 0, source.code.items.len, source.code.items.len * 4);
+            defer mixed.deinit(allocator);
+            try std.testing.expectError(error.UnsupportedHullShaderRingTable, ringTablePointerOffset(&mixed));
+            source.code.items[4] = 0xf408_0406;
+            try source.code.insert(allocator, 4, 0xbe8d_0380); // clobber just the pointer's high word
+            var clobbered = try analysis.decodeBounded(allocator, reader, 0, source.code.items.len, source.code.items.len * 4);
+            defer clobbered.deinit(allocator);
+            try std.testing.expectError(error.UnsupportedHullShaderRingTable, ringTablePointerOffset(&clobbered));
+        }
+    }
+}
 
 test "tessellation register decoding and compute entry preserve graphics state" {
     var state = State{};

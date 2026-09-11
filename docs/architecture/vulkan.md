@@ -117,6 +117,11 @@ of a 32-wide host subgroup pair.
 Eight merged LS/HS analyses are retained across alternating pairs. Reuse checks
 the complete local/hull code, layout, index format and lowering options;
 guest code replacement cannot reuse an older analysis by address alone.
+The ring-table pointer is recovered from the reaching scalar definitions of
+the HS factor/offchip stores. Triangle programs load it from root+16, whereas
+the captured quad program uses root+8. Ambiguous definitions, partial pointer
+clobbers and inconsistent tables fail explicitly instead of binding another
+root-table entry as the tessellation factors.
 
 `vulkan-smoke --indexed-tessellation` checks the merged LS/HS path for both
 layouts, including partial groups, high user SGPRs and 20 KiB triangle LDS.

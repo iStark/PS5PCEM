@@ -14941,9 +14941,14 @@ pub const Renderer = struct {
         }
         const root = @as(u64, state.readRegister(.shader, 0x102) orelse return error.MissingHullShaderTable) |
             (@as(u64, state.readRegister(.shader, 0x103) orelse return error.MissingHullShaderTable) << 32);
-        var table: [4]u32 = undefined;
-        try reader.readWords(root, &table);
-        const globals = @as(u64, table[2]) | (@as(u64, table[3]) << 32);
+        const ring_pointer_offset = cached.entry.ring_table_pointer_offset orelse resolve: {
+            const offset = try gpu.tessellation.ringTablePointerOffset(hull);
+            cached.entry.ring_table_pointer_offset = offset;
+            break :resolve offset;
+        };
+        var table: [2]u32 = undefined;
+        try reader.readWords(try std.math.add(u64, root, ring_pointer_offset), &table);
+        const globals = @as(u64, table[0]) | (@as(u64, table[1]) << 32);
         var words: [4]u32 = undefined;
         try reader.readWords(globals + 32, &words);
         const factors = try gpu.resources.decodeBufferDescriptor(&words);
