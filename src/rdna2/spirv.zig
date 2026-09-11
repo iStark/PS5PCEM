@@ -7836,6 +7836,18 @@ const Builder = struct {
         return self.bufferAddressDelta(inst, 0);
     }
 
+    fn bufferWordAddressDelta(self: *Builder, inst: instruction.Instruction, base: BufferAddress, word: u32) Error!BufferAddress {
+        if (word == 0) return base;
+        // Linear vector accesses share the index, scalar offset and runtime
+        // descriptor selection. Preserve 32-bit byte-offset wrap per word;
+        // swizzled buffers must apply their permutation to each offset first.
+        if (base.binding.swizzled and base.binding.stride != 0)
+            return self.bufferAddressDelta(inst, word * 4);
+        var address = base;
+        address.byte_offset = try self.addBits(base.byte_offset, try self.constant(.bits32, word * 4));
+        return address;
+    }
+
     /// Whether a word access lies inside the descriptor's live Vulkan range.
     /// Keeping the range dynamic prevents streamed buffer sizes from becoming
     /// part of the generated module (and consequently the pipeline cache key).
@@ -8113,8 +8125,9 @@ const Builder = struct {
             return;
         }
         var addresses: [16]BufferAddress = undefined;
+        const base = try self.bufferAddress(inst);
         for (0..count) |index| {
-            addresses[index] = try self.bufferAddressDelta(inst, @intCast(index * 4));
+            addresses[index] = try self.bufferWordAddressDelta(inst, base, @intCast(index));
         }
         for (0..count) |index| {
             const result = try self.loadBufferWord(addresses[index], 0);
@@ -8213,9 +8226,10 @@ const Builder = struct {
 
     fn bufferStoreWords(self: *Builder, inst: instruction.Instruction, count: u8) Error!void {
         if (!try self.hasBufferStorage(inst)) return; // drop stores without this host V#
+        const base = try self.bufferAddress(inst);
         for (0..count) |index| {
             const value = try self.source(try consecutiveRegister(inst.dst, @intCast(index)), .bits32);
-            const address = try self.bufferAddressDelta(inst, @intCast(index * 4));
+            const address = try self.bufferWordAddressDelta(inst, base, @intCast(index));
             try self.storeBufferWord(address, 0, value);
         }
     }

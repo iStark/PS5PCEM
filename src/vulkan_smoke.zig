@@ -7043,6 +7043,54 @@ fn runBufferTableCase(allocator: std.mem.Allocator, large: bool) !void {
     std.debug.print("buffer table selection passed (large={any}): active-lane index, VCC_HI offset, runtime V# reads/writes, unequal bounds, untouched neighbours and relocation\n", .{large});
 }
 
+fn runVectorBufferAddressProbe(allocator: std.mem.Allocator) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{});
+    defer renderer.deinit();
+    var guest = GuestMemory{};
+    _ = renderer.dcbBackend(guest.interface());
+    for ([_]bool{ false, true }) |swizzled| {
+        for ([_]u32{ 0, 0xffff_fff8 }) |offset| {
+            const load = mubuf(0x0e, 0, 0, 0, 0);
+            const code = [_]u32{
+                vop1(1, 0, 8), vop1(1, 4, 8),
+                load[0], (load[1] & 0x00ff_ffff) | (12 << 24),
+                mubuf(0x1e, 0, 0, 4, 4)[0], mubuf(0x1e, 0, 0, 4, 4)[1],
+                0xbf81_0000,
+            };
+            for (code, 0..) |word, i| guest.word(0x100 + i * 4, word);
+            var analysis = try gpu.shader_analysis.decode(allocator, .{ .context = &guest, .read_fn = GuestMemory.read }, 0x100, code.len);
+            defer analysis.deinit(allocator);
+            var module = try analysis.translateSpirv(allocator, .{
+                .stage = .compute,
+                .compute_inputs = .{ .workgroup_id_sgprs = .{ 8, null, null } },
+                .scalar_registers = &.{.{ .register = 12, .value = offset }},
+                .storage_buffers = &.{
+                    .{ .resource_sgpr = 0, .descriptor_index = 0, .stride = 16, .swizzled = swizzled },
+                    .{ .resource_sgpr = 4, .descriptor_index = 1, .stride = 16 },
+                },
+            });
+            defer module.deinit(allocator);
+            for ([_]usize{ 200, 40 }) |extent| {
+                for (0..64) |i| guest.word(0x10000 + i * 4, @as(u32, @intCast(i)) * 101 + 7);
+                @memset(guest.bytes[0x11000..][0..128], 0xa5);
+                _ = try renderer.stageGuestStorageBufferAt(0, 0x10000, extent);
+                _ = try renderer.stageGuestStorageBufferAt(1, 0x11000, 128);
+                _ = try renderer.dispatchSpirv(module.words, .{ 8, 1, 1 });
+                var output: [128]u8 = undefined;
+                try renderer.readbackGuestStorageBuffer(0x11000, &output);
+                for (0..8) |group| for (0..4) |component| {
+                    const element: u32 = @intCast(if (swizzled) component * 32 + group * 4 else group * 16 + component * 4);
+                    const address = element +% offset;
+                    const expected: u32 = if (address < extent) address / 4 * 101 + 7 else 0;
+                    const actual = std.mem.readInt(u32, output[group * 16 + component * 4 ..][0..4], .little);
+                    try std.testing.expectEqual(expected, actual);
+                };
+            }
+        }
+    }
+    std.debug.print("vector buffer addresses passed: overlapping destination/index, linear and swizzled loads, offset wrap and shrinking live bounds\n", .{});
+}
+
 fn runScalarPointerProbe(allocator: std.mem.Allocator) !void {
     var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true });
     defer renderer.deinit();
@@ -8670,6 +8718,10 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--typed-indices")) {
         try runTypedIndexProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--vector-buffer-addresses")) {
+        try runVectorBufferAddressProbe(allocator);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--scalar-pointers")) {
