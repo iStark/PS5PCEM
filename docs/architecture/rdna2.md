@@ -81,6 +81,14 @@ the existing barriers order initialization, atomic accumulation and scratch
 reuse. This removes the contended atomic stores without assuming a host subgroup
 size or changing empty, partial or independently scheduled wave masks.
 
+A comparison can avoid that ballot when its VCC result is read only by
+`V_CNDMASK` before a complete comparison overwrite in the same guest block.
+Each invocation then stores only its own bit in the usual VCC pair. Scalar
+mask reads, carry outputs, partial writes and block boundaries prevent this
+optimization; consumers that observe other lanes still receive the full mask.
+The bounded proof removes 51 barriers from the captured 8,959-instruction
+compute program. This is a shader-level reduction, not a measured FPS gain.
+
 Executable MUBUF lowering covers byte/short/dword scalar and vector transfers
 plus the ten common 32-bit buffer atomics; `glc` atomics preserve their returned
 old value in the guest VGPR. A binding may select a different staged V# at each

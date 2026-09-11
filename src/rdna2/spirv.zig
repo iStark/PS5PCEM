@@ -850,6 +850,7 @@ const Builder = struct {
     /// so track the emitted operations and declare their exact requirements.
     uses_group_shuffle: bool = false,
     lane_mask_scan_pcs: []const u32 = &.{},
+    local_vcc_pcs: []const u32 = &.{},
     uses_group_shuffle_relative: bool = false,
     scalar_specializations: []const ScalarRegister,
     dynamic_scalar_binding: ?DynamicScalarBinding,
@@ -2320,6 +2321,22 @@ const Builder = struct {
             try self.emit(&self.body, 167, &.{ self.bool_type, active_condition, enabled, condition }); // OpLogicalAnd
         }
         if (self.wave64_workgroup) {
+            if (std.mem.indexOfScalar(u32, self.local_vcc_pcs, inst.pc) != null) {
+                // Only this invocation's bit is observable before the next
+                // complete VCC overwrite. Preserve its normal bit position so
+                // CNDMASK needs no special representation or consumer path.
+                const lane = try self.currentLaneId();
+                const bit = self.id();
+                try self.emit(&self.body, 196, &.{ self.bits_type, bit, try self.constant(.bits32, 1), try self.andBits(lane, 31) });
+                const zero = try self.constant(.bits32, 0);
+                const value = try self.bvhSelect(self.bits_type, active_condition, bit, zero);
+                const high = try self.isNonZero(try self.shiftRightBits(lane, 5));
+                try self.destinationPair(inst.dst, .{
+                    try self.bvhSelect(self.bits_type, high, zero, value),
+                    try self.bvhSelect(self.bits_type, high, value, zero),
+                });
+                return;
+            }
             try self.destinationPair(inst.dst, try self.waveBallot(active_condition));
             return;
         }
@@ -11581,6 +11598,12 @@ fn translateInstructions(
         try allocator.alloc(u32, 0);
     defer allocator.free(lane_mask_scans);
     builder.lane_mask_scan_pcs = lane_mask_scans;
+    const local_vcc_pcs = if (effective.wave64_workgroup)
+        try @import("local_vcc.zig").scanPcs(allocator, instructions, &graph)
+    else
+        try allocator.alloc(u32, 0);
+    defer allocator.free(local_vcc_pcs);
+    builder.local_vcc_pcs = local_vcc_pcs;
     if (builder.converged_workgroup_dispatch) {
         try translateDispatcher(&builder, instructions, &graph);
     } else if (graph.blocks.items.len == 1) {
@@ -11610,6 +11633,7 @@ fn translateInstructions(
             builder = try Builder.init(allocator, effective);
             builder_alive = true;
             builder.lane_mask_scan_pcs = lane_mask_scans;
+            builder.local_vcc_pcs = local_vcc_pcs;
             try builder.configureLaneSpills(instructions);
             translateDispatcher(&builder, instructions, &graph) catch |dispatch_err| {
                 if (dispatch_err != Error.UnsupportedControlFlow) return dispatch_err;
@@ -11619,6 +11643,7 @@ fn translateInstructions(
                 builder = try Builder.init(allocator, effective);
                 builder_alive = true;
                 builder.lane_mask_scan_pcs = lane_mask_scans;
+                builder.local_vcc_pcs = local_vcc_pcs;
                 try builder.configureLaneSpills(instructions);
                 builder.used_control_flow_fallback = true;
                 try builder.emit(&builder.body, 248, &.{builder.label});

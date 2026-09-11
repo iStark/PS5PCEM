@@ -2189,15 +2189,19 @@ fn runWave64BallotsProbe(allocator: std.mem.Allocator) !void {
     var code: std.ArrayList(u32) = .empty;
     defer code.deinit(allocator);
     try code.appendSlice(allocator, &.{
-        vop1(1, 7, 8), vop2Source(0x1a, 7, 134, 7), vop2(0x25, 7, 0, 7),
-        vop1(1, 1, 8), vop2Source(0x1b, 1, 191, 1), vop2(0x1d, 1, 0, 1),
-        vop1(1, 2, 128),
+        vop1(1, 7, 8),   vop2Source(0x1a, 7, 134, 7), vop2(0x25, 7, 0, 7),
+        vop1(1, 1, 8),   vop2Source(0x1b, 1, 191, 1), vop2(0x1d, 1, 0, 1),
+        vop1(1, 2, 128), vop1(1, 4, 135),
     });
     for (0..32) |round| {
         const cutoff: u32 = @intCast((round * 7 + 5) % 65);
         try code.appendSlice(allocator, &.{
+            0x7d88_0200 | (128 + cutoff),
+            vop2Source(1, 3, 129, 4), // Lane-local VCC selection: false=1, true=7.
+            vop2(0x25, 2, 3, 2),
             0x7d88_0200 | (128 + cutoff), // CMP_GT cutoff, v1; full VCC pair.
-            vop2Source(0x25, 2, 106, 2), vop2Source(0x1d, 2, 107, 2),
+            vop2Source(0x25, 2, 106, 2),
+            vop2Source(0x1d, 2, 107, 2),
         });
     }
     try code.appendSlice(allocator, &mubuf(0x1c, 0, 2, 7, 0));
@@ -2206,19 +2210,24 @@ fn runWave64BallotsProbe(allocator: std.mem.Allocator) !void {
     var analysis = try gpu.shader_analysis.decode(allocator, .{ .context = guest, .read_fn = Memory.read }, 0x100, code.items.len);
     defer analysis.deinit(allocator);
     var baseline = try analysis.translateSpirv(allocator, .{
-        .stage = .compute, .wave64_workgroup = true, .local_size = .{ 64, 1, 1 },
+        .stage = .compute,
+        .wave64_workgroup = true,
+        .local_size = .{ 64, 1, 1 },
         .compute_inputs = .{ .local_invocation_id_components = 1, .workgroup_id_sgprs = .{ 8, null, null } },
         .storage_buffers = &.{.{ .resource_sgpr = 0, .descriptor_index = 0, .extent_bytes = output_bytes, .stride = 4 }},
     });
     defer baseline.deinit(allocator);
-    var expected: [64]u32 = @splat(0);
-    for (&expected, 0..) |*value, group| for (0..32) |round| {
+    var expected: [groups * 64]u32 = @splat(0);
+    for (&expected, 0..) |*value, invocation| for (0..32) |round| {
+        const group = invocation / 64;
+        const local_lane = invocation % 64;
         const cutoff = (round * 7 + 5) % 65;
         var mask: u64 = 0;
         for (0..64) |lane| {
             if (lane ^ group < cutoff) mask |= @as(u64, 1) << @intCast(lane);
         }
-        value.* = (value.* +% @as(u32, @truncate(mask))) ^ @as(u32, @truncate(mask >> 32));
+        const selected: u32 = if (local_lane ^ group < cutoff) 7 else 1;
+        value.* = (value.* +% selected +% @as(u32, @truncate(mask))) ^ @as(u32, @truncate(mask >> 32));
     };
     const output = try allocator.alloc(u8, output_bytes);
     defer allocator.free(output);
@@ -2228,9 +2237,9 @@ fn runWave64BallotsProbe(allocator: std.mem.Allocator) !void {
     try renderer.readbackGuestStorageBuffer(0x10000, output);
     for (0..groups * 64) |lane| {
         const actual = std.mem.readInt(u32, output[lane * 4 ..][0..4], .little);
-        try std.testing.expectEqual(expected[(lane / 64) % 64], actual);
+        try std.testing.expectEqual(expected[lane], actual);
     }
-    std.debug.print("explicit wave64 ballots passed: 32 changing full masks across 64 groups without a cross-lane instruction\n", .{});
+    std.debug.print("explicit wave64 ballots passed: 32 lane-local selections followed by full-mask reads across 64 groups\n", .{});
 }
 
 fn runWave64Probe(allocator: std.mem.Allocator) !void {
