@@ -2176,6 +2176,63 @@ fn runDispatcherBudgetProbe(allocator: std.mem.Allocator) !void {
     std.debug.print("dispatcher budgets passed: bounded early exit, 512 complete iterations and pipeline reuse\n", .{});
 }
 
+fn runWave64BallotsProbe(allocator: std.mem.Allocator) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{});
+    defer renderer.deinit();
+    const groups = 64;
+    const output_bytes = groups * 64 * 4;
+    const Memory = SizedGuestMemory(output_bytes + 0x10000);
+    const guest = try allocator.create(Memory);
+    defer allocator.destroy(guest);
+    guest.* = .{};
+    _ = renderer.dcbBackend(guest.interface());
+    var code: std.ArrayList(u32) = .empty;
+    defer code.deinit(allocator);
+    try code.appendSlice(allocator, &.{
+        vop1(1, 7, 8), vop2Source(0x1a, 7, 134, 7), vop2(0x25, 7, 0, 7),
+        vop1(1, 1, 8), vop2Source(0x1b, 1, 191, 1), vop2(0x1d, 1, 0, 1),
+        vop1(1, 2, 128),
+    });
+    for (0..32) |round| {
+        const cutoff: u32 = @intCast((round * 7 + 5) % 65);
+        try code.appendSlice(allocator, &.{
+            0x7d88_0200 | (128 + cutoff), // CMP_GT cutoff, v1; full VCC pair.
+            vop2Source(0x25, 2, 106, 2), vop2Source(0x1d, 2, 107, 2),
+        });
+    }
+    try code.appendSlice(allocator, &mubuf(0x1c, 0, 2, 7, 0));
+    try code.append(allocator, 0xbf81_0000);
+    for (code.items, 0..) |word, i| guest.word(0x100 + i * 4, word);
+    var analysis = try gpu.shader_analysis.decode(allocator, .{ .context = guest, .read_fn = Memory.read }, 0x100, code.items.len);
+    defer analysis.deinit(allocator);
+    var baseline = try analysis.translateSpirv(allocator, .{
+        .stage = .compute, .wave64_workgroup = true, .local_size = .{ 64, 1, 1 },
+        .compute_inputs = .{ .local_invocation_id_components = 1, .workgroup_id_sgprs = .{ 8, null, null } },
+        .storage_buffers = &.{.{ .resource_sgpr = 0, .descriptor_index = 0, .extent_bytes = output_bytes, .stride = 4 }},
+    });
+    defer baseline.deinit(allocator);
+    var expected: [64]u32 = @splat(0);
+    for (&expected, 0..) |*value, group| for (0..32) |round| {
+        const cutoff = (round * 7 + 5) % 65;
+        var mask: u64 = 0;
+        for (0..64) |lane| {
+            if (lane ^ group < cutoff) mask |= @as(u64, 1) << @intCast(lane);
+        }
+        value.* = (value.* +% @as(u32, @truncate(mask))) ^ @as(u32, @truncate(mask >> 32));
+    };
+    const output = try allocator.alloc(u8, output_bytes);
+    defer allocator.free(output);
+    @memset(guest.bytes[0x10000..], 0xa5);
+    _ = try renderer.stageGuestStorageBufferAt(0, 0x10000, output_bytes);
+    _ = try renderer.dispatchSpirv(baseline.words, .{ groups, 1, 1 });
+    try renderer.readbackGuestStorageBuffer(0x10000, output);
+    for (0..groups * 64) |lane| {
+        const actual = std.mem.readInt(u32, output[lane * 4 ..][0..4], .little);
+        try std.testing.expectEqual(expected[(lane / 64) % 64], actual);
+    }
+    std.debug.print("explicit wave64 ballots passed: 32 changing full masks across 64 groups without a cross-lane instruction\n", .{});
+}
+
 fn runWave64Probe(allocator: std.mem.Allocator) !void {
     for ([_][3]u32{ .{ 64, 1, 1 }, .{ 4, 4, 4 } }) |local_size| try runWave64Case(allocator, local_size);
     std.debug.print("wave64 passed: lane 63, full masks, carry bits and uniform EXEC branches across workgroup shapes\n", .{});
@@ -8517,6 +8574,10 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--wave64")) {
         try runWave64Probe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--wave64-ballots")) {
+        try runWave64BallotsProbe(allocator);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--multi-wave64")) {

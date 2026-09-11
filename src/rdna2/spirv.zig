@@ -1248,7 +1248,7 @@ const Builder = struct {
             try self.emit(&self.declarations, 59, &.{ storage_array_pointer, self.storage_array, 12 }); // OpVariable
         }
         {
-            var needs_thread_id = options.uses_lane_identity;
+            var needs_thread_id = options.uses_lane_identity or options.wave64_workgroup;
             for (options.storage_buffers) |binding| {
                 needs_thread_id = needs_thread_id or binding.add_thread_id;
             }
