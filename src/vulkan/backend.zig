@@ -19297,7 +19297,7 @@ pub const Renderer = struct {
         return .{ .image = image, .view = view, .sampler = sampler };
     }
 
-    fn sampledSourceGeneration(self: *const Renderer, address: u64, visible_bytes: usize) u64 {
+    fn sampledSourceGeneration(self: *Renderer, address: u64, visible_bytes: usize) u64 {
         var generation = self.image_aliases.generationForRange(aliasRange(address, visible_bytes));
         for (self.completed_frames.items) |cached| {
             if (cached.guest_address == address) generation = @max(generation, cached.sequence);
@@ -19316,7 +19316,9 @@ pub const Renderer = struct {
         // and canonical alias generations are absent in the default mode.
         var storage_sequence: u64 = 0;
         if (!self.canonical_image_aliases_enabled) {
-            for (self.storage_image_cache.items) |cached| {
+            var candidates = self.storage_image_address_index.candidatesBy(self.storage_image_cache.items, address, CachedStorageImage.address);
+            while (candidates.next()) |index| {
+                const cached = &self.storage_image_cache.items[index];
                 // Match flushGuestStorageImageRange's allocation-base rule.
                 if (!cached.valid or cached.descriptor.address != address) continue;
                 storage_sequence = @max(storage_sequence, cached.last_used_sequence);
