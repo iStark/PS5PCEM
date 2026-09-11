@@ -23,10 +23,12 @@ pub const Group = struct {
 pub const Plan = struct {
     groups: std.AutoArrayHashMapUnmanaged(Key, Group) = .{},
     next: std.ArrayList(usize) = .empty,
+    table: std.ArrayList(u32) = .empty,
 
     pub fn deinit(self: *Plan, allocator: std.mem.Allocator) void {
         self.groups.deinit(allocator);
         self.next.deinit(allocator);
+        self.table.deinit(allocator);
         self.* = .{};
     }
 

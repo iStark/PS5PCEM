@@ -8275,7 +8275,12 @@ pub const Renderer = struct {
         const slot = resources.freeDescriptor() orelse return;
         const upload = try self.allocateDrawUpload(total_words * 4);
         const mapping = self.draw_upload_mapping orelse return Error.MemoryMapFailed;
-        const table = std.mem.bytesAsSlice(u32, @as([]align(4) u8, @alignCast(mapping[@intCast(upload.offset)..][0 .. total_words * 4])));
+        // Hash insertion reads previous entries while probing collisions.
+        // The upload arena may be write-combined memory: assemble in cached
+        // CPU memory and publish once with a sequential copy instead.
+        try plan.table.ensureTotalCapacity(self.allocator, total_words);
+        plan.table.items.len = total_words;
+        const table = plan.table.items;
         @memset(table, 0);
         var cursor: usize = 0;
         for (plan.groups.values()) |members| {
@@ -8294,6 +8299,8 @@ pub const Renderer = struct {
             }
             cursor += group.len;
         }
+        std.debug.assert(cursor == total_words);
+        @memcpy(mapping[@intCast(upload.offset)..][0 .. total_words * 4], std.mem.sliceAsBytes(table));
         self.updateStorageDescriptorRange(slot, upload.buffer, upload.offset, upload.size);
         resources.occupied[slot] = true;
         self.frame_profile.upload_bytes +%= upload.size;
@@ -8327,7 +8334,11 @@ pub const Renderer = struct {
         const slot = resources.freeDescriptor() orelse return Error.InvalidStorageDescriptor;
         const upload = try self.allocateDrawUpload(total_words * 4);
         const mapping = self.draw_upload_mapping orelse return Error.MemoryMapFailed;
-        const table = std.mem.bytesAsSlice(u32, @as([]align(4) u8, @alignCast(mapping[@intCast(upload.offset)..][0 .. total_words * 4])));
+        // Collision probes must read cached CPU memory, not the potentially
+        // write-combined upload mapping. Keep only the final copy in the arena.
+        try plan.table.ensureTotalCapacity(self.allocator, total_words);
+        plan.table.items.len = total_words;
+        const table = plan.table.items;
         @memset(table, 0);
         var cursor: usize = 0;
         for (plan.groups.values()) |members| {
@@ -8347,6 +8358,7 @@ pub const Renderer = struct {
             cursor += group.len;
         }
         std.debug.assert(cursor == total_words);
+        @memcpy(mapping[@intCast(upload.offset)..][0 .. total_words * 4], std.mem.sliceAsBytes(table));
         resources.occupied[slot] = true;
         self.updateStorageDescriptorRange(slot, upload.buffer, upload.offset, total_words * 4);
         self.active_descriptor_set = self.descriptor_set;
