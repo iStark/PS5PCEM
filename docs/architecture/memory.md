@@ -75,4 +75,14 @@ Partial protection, metadata, and unmap operations split table entries at exact
 16 KiB boundaries. Reads and writes validate the complete committed range
 before dereferencing the identity-mapped pointer.
 
+Optional GPU page tracking protects writable source pages until their next CPU
+write and records a generation for each page. Its protection lookup uses the
+containing mapping in the sorted table and checks the upper bound before
+subtracting the page address. This prevents a later writable allocation from
+inheriting an earlier module's permissions through unsigned underflow, and
+avoids scanning every earlier mapping for each tracked page. Tests cover gaps,
+reserved ranges, full-page boundaries and writes to a later allocation with
+different permissions. Native rendering and performance with page tracking
+enabled still require title-specific verification.
+
 ---
