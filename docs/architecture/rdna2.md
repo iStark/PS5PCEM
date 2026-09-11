@@ -64,6 +64,11 @@ includes both mask words, the representation condition and the scheduled-wave
 predicate. Every emitted label invalidates it, so bounds checks and descriptor
 lookup branches cannot reuse an SSA value that does not dominate the access.
 This avoids repeating lane-index and mask decoding along long arithmetic runs.
+The dispatcher also reuses loaded register values until a store replaces them
+or a label starts a new block. Function variables still carry values across
+branches and loop iterations. On a captured 8,959-instruction compute program,
+this reduces SPIR-V from 1,304,166 to 1,201,382 words; it does not by itself
+establish a runtime FPS improvement.
 
 Executable MUBUF lowering covers byte/short/dword scalar and vector transfers
 plus the ten common 32-bit buffer atomics; `glc` atomics preserve their returned

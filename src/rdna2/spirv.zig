@@ -867,6 +867,7 @@ const Builder = struct {
     /// guest registers mutable in that path avoids manufacturing forward
     /// OpPhi operands and maps naturally onto nested RDNA scalar loops.
     mutable_register_pointers: [384]u32 = @splat(0),
+    mutable_register_values: [384]u32 = @splat(0),
     mutable_scc_pointer: u32 = 0,
     mutable_carry_pointer: u32 = 0,
     mutable_exec_mode_pointer: u32 = 0,
@@ -1509,7 +1510,10 @@ const Builder = struct {
     fn emit(self: *Builder, list: *std.ArrayList(u32), opcode: u16, args: []const u32) Error!void {
         // A cached SSA predicate must dominate its uses. Internal bounds and
         // lookup branches introduce labels inside a single guest block too.
-        if (opcode == 248 and list == &self.body) self.lane_predicate_mask = null;
+        if (opcode == 248 and list == &self.body) {
+            self.lane_predicate_mask = null;
+            @memset(&self.mutable_register_values, 0);
+        }
         switch (opcode) {
             345, 346 => self.uses_group_shuffle = true, // Shuffle / ShuffleXor
             347, 348 => self.uses_group_shuffle_relative = true, // ShuffleUp / ShuffleDown
@@ -1570,8 +1574,11 @@ const Builder = struct {
 
     fn registerBits(self: *Builder, index: usize, default_bits: u32) Error!u32 {
         if (self.mutable_register_pointers[index] != 0) {
+            const cached = self.mutable_register_values[index];
+            if (cached != 0) return cached;
             const loaded = self.id();
             try self.emit(&self.body, 61, &.{ self.bits_type, loaded, self.mutable_register_pointers[index] }); // OpLoad
+            self.mutable_register_values[index] = loaded;
             return loaded;
         }
         const current = self.registers[index];
@@ -1870,6 +1877,7 @@ const Builder = struct {
         };
         if (self.mutable_register_pointers[index] != 0) {
             try self.emit(&self.body, 62, &.{ self.mutable_register_pointers[index], bits }); // OpStore
+            self.mutable_register_values[index] = bits;
         }
         if (index == 126 or index == 127) {
             const low = try self.registerBits(126, 0xffff_ffff);
@@ -15152,8 +15160,9 @@ test "structured entry block retains specialized scalar inputs" {
     try std.testing.expect(containsOpcode(module.words, 253)); // OpReturn
 }
 
-test "dispatcher reuses unchanged EXEC decoding along arithmetic runs" {
+test "dispatcher reuses invariant state along arithmetic runs" {
     var short_shifts: usize = 0;
+    var short_loads: usize = 0;
     for ([_]usize{ 1, 65 }) |count| {
         var program = instruction.Program{ .code = &.{}, .instructions = .empty };
         defer program.deinit(std.testing.allocator);
@@ -15186,7 +15195,14 @@ test "dispatcher reuses unchanged EXEC decoding along arithmetic runs" {
         defer module.deinit(std.testing.allocator);
         try std.testing.expect(module.used_dispatcher);
         const shifts = countOpcode(module.words, 194);
-        if (count == 1) short_shifts = shifts else try std.testing.expectEqual(short_shifts, shifts);
+        const loads = countOpcode(module.words, 61);
+        if (count == 1) {
+            short_shifts = shifts;
+            short_loads = loads;
+        } else {
+            try std.testing.expectEqual(short_shifts, shifts);
+            try std.testing.expectEqual(short_loads, loads);
+        }
     }
 }
 
