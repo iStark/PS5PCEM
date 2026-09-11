@@ -99,6 +99,7 @@ const submission_allocation_header_bytes: u64 = 0x10;
 const SubmissionAlias = struct {
     cpu_address: u64 = 0,
     byte_length: u64 = 0,
+    protect_header: bool = true,
 };
 var submission_alias_lock = ExecutionLock{};
 var submission_aliases: [maximum_submission_aliases]SubmissionAlias =
@@ -496,6 +497,9 @@ fn noteIndirectBuilderTarget(
     markBuilderArenaExecuted(address, byte_length);
     const pointer: [*]const u32 = @ptrFromInt(address);
     const stream = streamOf(pointer, @intCast(word_count)) orelse return;
+    // An indirect range can start inside a larger allocation. Its submitted
+    // payload is current, but the preceding words are not a new block header.
+    rememberSubmissionRange(stream, false);
     active_addresses[depth] = address;
     noteReachableBuilderArenas(stream, depth + 1, active_addresses);
 }
@@ -789,6 +793,10 @@ pub fn trackGraphicsCommandAllocation(arena_base: u64, address: u64, dword_count
 /// bits are shared. RELEASE_MEM commonly targets a label embedded in that same
 /// arena, so retain enough recent CPU ranges to resolve the compact form.
 fn rememberSubmissionAlias(stream: []const u32) void {
+    rememberSubmissionRange(stream, true);
+}
+
+fn rememberSubmissionRange(stream: []const u32, protect_header: bool) void {
     const bytes = std.mem.sliceAsBytes(stream);
     if (bytes.len == 0) return;
     const cpu_address = @intFromPtr(bytes.ptr);
@@ -800,6 +808,7 @@ fn rememberSubmissionAlias(stream: []const u32) void {
     submission_aliases[next_submission_alias] = .{
         .cpu_address = cpu_address,
         .byte_length = bytes.len,
+        .protect_header = protect_header,
     };
     next_submission_alias = (next_submission_alias + 1) % submission_aliases.len;
 }
@@ -845,10 +854,9 @@ const SubmissionHeaderCollision = struct {
     target_address: u64,
 };
 
-/// Command buffers passed by the guest begin immediately after the allocator's
-/// 16-byte block header. A malformed packet recovered from descriptor data must
-/// never be allowed to publish a fence into that header: doing so corrupts the
-/// block size and makes the later guest free walk an effectively random VA.
+/// Protect the inferred 16-byte header before a submitted allocation. Appended
+/// command ranges have no separate allocation header. Newer payload ranges
+/// supersede old header locations when the guest reuses its command arena.
 fn findSubmissionHeaderCollision(address: u64, byte_length: usize) ?SubmissionHeaderCollision {
     if (byte_length == 0) return null;
     const write_end = std.math.add(u64, address, byte_length) catch return null;
@@ -862,9 +870,11 @@ fn findSubmissionHeaderCollision(address: u64, byte_length: usize) ?SubmissionHe
         const alias = submission_aliases[index];
         if (alias.byte_length == 0 or alias.cpu_address < submission_allocation_header_bytes) continue;
         const header_start = alias.cpu_address - submission_allocation_header_bytes;
-        if (address < alias.cpu_address and write_end > header_start) {
+        if (alias.protect_header and address < alias.cpu_address and write_end > header_start) {
             return .{ .arena_address = alias.cpu_address, .target_address = address };
         }
+        if (address >= alias.cpu_address and address - alias.cpu_address <= alias.byte_length and
+            byte_length <= alias.byte_length - (address - alias.cpu_address)) return null;
     }
     return null;
 }
@@ -1924,6 +1934,10 @@ fn submittedCommandPrefix(stream: []const u32) []const u32 {
 /// walk of the live slice followed by a later scheduler copy can otherwise
 /// turn a proven packet boundary into a truncated root stream.
 fn submittedCommandPrefixForArena(stream: []const u32, arena_address: u64) []const u32 {
+    return submittedCommandPrefixForRange(stream, arena_address, true);
+}
+
+fn submittedCommandPrefixForRange(stream: []const u32, arena_address: u64, protect_header: bool) []const u32 {
     var walker = gpu.pm4.Walker.init(stream);
     while (true) {
         const offset = walker.index;
@@ -1959,7 +1973,7 @@ fn submittedCommandPrefixForArena(stream: []const u32, arena_address: u64) []con
                 return stream[0..offset];
             }
         }
-        if (packetWritesSubmissionAllocationHeaderAt(arena_address, value)) |target| {
+        if (if (protect_header) packetWritesSubmissionAllocationHeaderAt(arena_address, value) else null) |target| {
             if (unsafe_island_reports < 32) {
                 std.debug.print(
                     "[dcb guard] trimmed command prefix before allocation-header write: target=0x{x} arena=0x{x} opcode=0x{x}\n",
@@ -2311,6 +2325,7 @@ fn executeAcceptedStream(
     event_id: u32,
 ) SubmitOutcome {
     rememberSubmissionAlias(stream);
+    noteBuilderArenaExecuted(stream);
     // Freeze the caller-owned allocation before validating it. AGC command
     // arenas are shared with producer threads and may be recycled while this
     // HLE call is waiting for the serialized command processor. Validating the
@@ -2390,7 +2405,7 @@ fn flushPendingGraphicsSegment() void {
     const available = pointer[0..@intCast(byte_length / @sizeOf(u32))];
     const snapshot = std.heap.page_allocator.dupe(u32, available) catch return;
     defer std.heap.page_allocator.free(snapshot);
-    const commands = submittedCommandPrefixForArena(snapshot, start);
+    const commands = submittedCommandPrefixForRange(snapshot, start, false);
     if (commands.len == 0) return;
     if (pending_graphics_reports < 32) {
         std.debug.print(
@@ -2400,7 +2415,7 @@ fn flushPendingGraphicsSegment() void {
         pending_graphics_reports += 1;
     }
     const original_commands = available[0..commands.len];
-    rememberSubmissionAlias(original_commands);
+    rememberSubmissionRange(original_commands, false);
     // This is work appended to the preceding public DCB, not another guest
     // submission. Execute its labels and Vulkan commands, but do not turn a
     // second RELEASE_MEM in the same allocation into another retirement edge:
@@ -2698,7 +2713,6 @@ fn acceptSubmitted(label: []const u8, stream: []const u32, driver_completion_lab
         dcbWithCompletionPrelude(stream)
     else
         stream;
-    noteBuilderArenaExecuted(commands);
     announce(label, commands);
     return executeAcceptedStream(label, commands, driver_completion_label, event_id);
 }
@@ -3982,6 +3996,67 @@ test "bulk DMA writes may span a snapshotted submission header" {
     ));
     try testing.expectEqual(@as(u32, 0), allocation[16]);
     try testing.expectEqual(@as(u32, 0), allocation[19]);
+}
+
+test "GPU header guards follow the newest overlapping submission" {
+    reset();
+    defer reset();
+    var allocation: [96]u32 = @splat(0);
+    const value: u32 = 0x1122_3344;
+    const old_header = @intFromPtr(&allocation[62]);
+    rememberSubmissionAlias(allocation[64..]);
+    try testing.expect(!writeGuestMemory(null, old_header, std.mem.asBytes(&value)));
+
+    // A newly submitted larger range reuses the previous header as payload.
+    rememberSubmissionAlias(allocation[4..]);
+    try testing.expect(writeGuestMemory(null, old_header, std.mem.asBytes(&value)));
+    try testing.expectEqual(value, allocation[62]);
+    try testing.expect(!writeGuestMemory(null, @intFromPtr(&allocation[2]), std.mem.asBytes(&value)));
+
+    // Reversing that order makes the smaller range's header current again.
+    rememberSubmissionAlias(allocation[64..]);
+    try testing.expect(!writeGuestMemory(null, old_header, std.mem.asBytes(&value)));
+    // Partial payload coverage cannot authorize a write across its end.
+    rememberSubmissionAlias(allocation[60..63]);
+    const wide: u64 = 7;
+    try testing.expect(!writeGuestMemory(null, old_header, std.mem.asBytes(&wide)));
+}
+
+test "appended DCB ranges do not invent allocation headers" {
+    reset();
+    defer reset();
+    var allocation: [24]u32 = @splat(0);
+    const target = @intFromPtr(&allocation[10]);
+    rememberSubmissionAlias(allocation[4..]);
+    rememberSubmissionRange(allocation[12..], false);
+    const value: u32 = 9;
+    try testing.expect(writeGuestMemory(null, target, std.mem.asBytes(&value)));
+    try testing.expectEqual(value, allocation[10]);
+    try testing.expect(!writeGuestMemory(null, @intFromPtr(&allocation[2]), std.mem.asBytes(&value)));
+    const commands = [_]u32{
+        command(gpu.pm4.write_data, 4), 1 << 8,
+        @truncate(target), @truncate(target >> 32), value,
+        command(gpu.pm4.nop, 1), 0,
+    };
+    const continuation = @intFromPtr(&allocation[12]);
+    try testing.expectEqual(@as(usize, 0), submittedCommandPrefixForArena(&commands, continuation).len);
+    try testing.expectEqual(commands.len, submittedCommandPrefixForRange(&commands, continuation, false).len);
+}
+
+test "indirect DCB payload supersedes a recycled submission header" {
+    reset();
+    defer reset();
+    var allocation: [96]u32 = @splat(0x8000_0000);
+    rememberSubmissionAlias(allocation[64..]);
+    const target = @intFromPtr(&allocation[62]);
+    const value: u32 = 0x1234;
+    const write = [_]u32{ command(gpu.pm4.write_data, 4), 1 << 8, @truncate(target), @truncate(target >> 32), value };
+    @memcpy(allocation[4..][0..write.len], &write);
+    const child_address = @intFromPtr(&allocation[4]);
+    const root = [_]u32{ command(gpu.pm4.indirect_buffer, 3), @truncate(child_address), @truncate(child_address >> 32), allocation.len - 4 };
+    const outcome = submitDeviceStream(&root);
+    try testing.expect(outcome.accepted and outcome.completed);
+    try testing.expectEqual(value, allocation[62]);
 }
 
 test "one completion batch coalesces duplicate release contexts" {

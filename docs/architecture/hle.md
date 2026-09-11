@@ -645,6 +645,12 @@ FIFO-ordered. The other queue continues, and a real release label makes the
 scheduler recheck and resume the blocked stream without replaying earlier side
 effects or forcing memory to a satisfying value.
 
+Command-arena header guards follow the newest submitted ranges. A reused
+payload supersedes an older header location, while a current allocation's
+header remains protected. Appended and indirect command ranges do not imply
+separate allocation headers; labels immediately before a continuation remain
+valid payload addresses in their enclosing allocation.
+
 The title's shipped driver uses three consecutive `/dev/gc` operations for this
 path. Command `#49` has an exact 72-byte preamble layout and reports completion
 through the word at byte 64. Command `#50` has a 24-byte queue-list layout whose
