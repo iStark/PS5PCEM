@@ -10485,17 +10485,20 @@ pub const Renderer = struct {
         );
     }
 
-    fn sampledDccMetadataHash(self: *Renderer, descriptor: gpu.ImageDescriptor, surface_bytes: u64) anyerror!u64 {
-        const address = descriptor.dccMetadataAddress() orelse return 0;
-        const key_bytes_u64 = std.math.divCeil(u64, surface_bytes, dcc_block_bytes) catch return 0;
-        if (key_bytes_u64 == 0 or key_bytes_u64 > maximum_dcc_key_bytes) return 0;
+    fn sampledDccMetadata(self: *Renderer, descriptor: gpu.ImageDescriptor, surface_bytes: u64) anyerror!struct { hash: u64 = 0, uniform_code: ?u8 = null } {
+        const address = descriptor.dccMetadataAddress() orelse return .{};
+        const key_bytes_u64 = std.math.divCeil(u64, surface_bytes, dcc_block_bytes) catch return .{};
+        if (key_bytes_u64 == 0 or key_bytes_u64 > maximum_dcc_key_bytes) return .{};
         const key_bytes: usize = @intCast(key_bytes_u64);
         try self.flushPendingGuestWrite(address, key_bytes);
         var scratch = try self.image_scratch.acquire(self.allocator, key_bytes);
         defer scratch.release();
-        const memory = self.guest_memory orelse return 0;
-        if (!memory.read(memory.context, address, scratch.bytes)) return 0;
-        return std.hash.Wyhash.hash(address, scratch.bytes);
+        const memory = self.guest_memory orelse return .{};
+        if (!memory.read(memory.context, address, scratch.bytes)) return .{};
+        const code: ?u8 = for (scratch.bytes[1..]) |byte| {
+            if (byte != scratch.bytes[0]) break null;
+        } else scratch.bytes[0];
+        return .{ .hash = std.hash.Wyhash.hash(address, scratch.bytes), .uniform_code = code };
     }
 
     fn stageCmaskFastClear(
@@ -18732,7 +18735,13 @@ pub const Renderer = struct {
             0;
         // A fast clear changes DCC keys without touching the base pixels.
         // Include those keys before both sampled-cache lookup paths.
-        const metadata_hash = try self.sampledDccMetadataHash(descriptor, source_bytes);
+        const dcc_metadata = try self.sampledDccMetadata(descriptor, source_bytes);
+        const metadata_hash = dcc_metadata.hash;
+        const fixed_clear: ?DccClearTexel = if (!aliases_active_render_target and
+            descriptor.samplesLog2() == 0 and descriptor.viewMipLevels() == 1 and descriptor.depth_or_layers == 1)
+            (if (dcc_metadata.uniform_code) |code| sampledDccFixedClearTexel(code, descriptor) else null)
+        else
+            null;
         const state_hash = sampledImageStateHash(descriptor, sampler_descriptor) ^ feedback_snapshot_salt;
         const image_state_hash = sampledImageViewStateHash(
             descriptor,
@@ -18751,11 +18760,13 @@ pub const Renderer = struct {
         // CPU writers, so matching both proves that no deferred writer needs
         // publication. Check that proof before the much more expensive alias
         // authority/overlap walk in flushPendingGuestWrite.
-        const early_resident_generation = self.sampledSourceGeneration(
+        // Fixed DCC clears never read the underlying pixel allocation. Its
+        // prior occupants can change without invalidating this sampled view.
+        const early_resident_generation = if (fixed_clear != null) 0 else self.sampledSourceGeneration(
             descriptor.address,
             probe_span,
         );
-        const early_page_generation = self.sampledPageGeneration(
+        const early_page_generation = if (fixed_clear != null) 0 else self.sampledPageGeneration(
             memory,
             descriptor.address,
             probe_span,
@@ -18770,7 +18781,7 @@ pub const Renderer = struct {
         // is cheap (at most 128 cache lines, once per source per frame) and is
         // still far less work than walking and synchronizing every image alias
         // for every descriptor binding.
-        const early_content_hash = if (early_page_generation != 0)
+        const early_content_hash = if (fixed_clear != null or early_page_generation != 0)
             0
         else
             self.probeSampledSource(
@@ -18841,7 +18852,7 @@ pub const Renderer = struct {
         // publish its deferred writeback before hashing or staging guest bytes,
         // otherwise the cache would bind stale contents.
         const flush_started = hostTimestampNs();
-        self.flushPendingGuestWrite(descriptor.address, probe_span) catch |err| {
+        if (fixed_clear == null) self.flushPendingGuestWrite(descriptor.address, probe_span) catch |err| {
             if (log_verbose_gpu) std.debug.print(
                 "[vulkan dcb] sampled image writeback flush failed: {s} addr=0x{x}\n",
                 .{ @errorName(err), descriptor.address },
@@ -18855,8 +18866,8 @@ pub const Renderer = struct {
         self.invalidateTextureProbes(descriptor.address, probe_span);
 
         const generation_started = hostTimestampNs();
-        const resident_generation = self.sampledSourceGeneration(descriptor.address, probe_span);
-        const page_generation = self.sampledPageGeneration(
+        const resident_generation = if (fixed_clear != null) 0 else self.sampledSourceGeneration(descriptor.address, probe_span);
+        const page_generation = if (fixed_clear != null) 0 else self.sampledPageGeneration(
             memory,
             descriptor.address,
             probe_span,
@@ -18866,7 +18877,7 @@ pub const Renderer = struct {
         // Page generations make an O(number of pages) byte hash on every frame
         // unnecessary. Keep the hash fallback for standalone/smoke memory
         // providers which do not expose write tracking.
-        const content_hash = if (page_generation != 0)
+        const content_hash = if (fixed_clear != null or page_generation != 0)
             0
         else
             self.probeSampledSource(
@@ -18931,7 +18942,9 @@ pub const Renderer = struct {
         const linear = linear_scratch.bytes;
         const reader = gpu.ShaderMemoryReader{ .context = memory.context, .read_fn = memory.read };
         var source_available = true;
-        const dcc_materialized_texel: ?DccClearTexel = if (aliases_active_render_target)
+        const dcc_materialized_texel: ?DccClearTexel = if (fixed_clear) |texel|
+            texel
+        else if (aliases_active_render_target)
             try self.colorTargetFastClearTexel(render_target_write.?)
         else
             try self.sampledDccSingleTexel(

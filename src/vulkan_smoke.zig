@@ -3137,7 +3137,12 @@ fn runSampledDccClearProbe(allocator: std.mem.Allocator) !void {
                     };
                 }
                 const uploaded = renderer.frame_profile.texture_upload_bytes;
+                // A fixed clear is defined entirely by metadata. Changing the
+                // hidden base pixels must neither affect it nor upload again.
+                const fixed_clear = key != 0xff and key != 0x20;
+                if (fixed_clear) guest.bytes[source] ^= 1;
                 _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
+                if (fixed_clear) guest.bytes[source] ^= 1;
                 try std.testing.expectEqual(uploaded, renderer.frame_profile.texture_upload_bytes);
             }
         }
