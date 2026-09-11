@@ -7544,9 +7544,11 @@ const Builder = struct {
         const pointer = try self.wavePointer(try self.shiftRightBits(lane, 5));
         const scope = try self.constant(.bits32, 2);
         const relaxed = try self.constant(.bits32, 0);
-        // Atomic initialization permits every invocation to participate without
-        // introducing a divergent branch around a workgroup barrier.
-        try self.emit(&self.body, 228, &.{ pointer, scope, relaxed, relaxed });
+        // Scratch has one word per physical invocation. Each lane clears its
+        // own word, so lanes 0 and 1 initialize the two ballot halves without
+        // contended atomic stores or divergence around the workgroup barrier.
+        const initialization_pointer = try self.wavePointer(lane);
+        try self.emit(&self.body, 62, &.{ initialization_pointer, relaxed });
         try self.controlBarrier();
         const bit = self.id();
         try self.emit(&self.body, 196, &.{ self.bits_type, bit, try self.constant(.bits32, 1), try self.andBits(lane, 31) });

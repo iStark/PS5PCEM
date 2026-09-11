@@ -70,6 +70,12 @@ branches and loop iterations. On a captured 8,959-instruction compute program,
 this reduces SPIR-V from 1,304,166 to 1,201,382 words; it does not by itself
 establish a runtime FPS improvement.
 
+Workgroup-backed wave64 ballots clear one scratch word per physical invocation
+before accumulating the two mask halves. Lanes 0 and 1 initialize those halves;
+the existing barriers order initialization, atomic accumulation and scratch
+reuse. This removes the contended atomic stores without assuming a host subgroup
+size or changing empty, partial or independently scheduled wave masks.
+
 Executable MUBUF lowering covers byte/short/dword scalar and vector transfers
 plus the ten common 32-bit buffer atomics; `glc` atomics preserve their returned
 old value in the guest VGPR. A binding may select a different staged V# at each
