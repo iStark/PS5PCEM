@@ -26,6 +26,16 @@ const SharedModule = struct {
 pub const Lease = struct {
     shared: *SharedModule,
 
+    /// Takes ownership even if allocating the lease fails. This lets generated
+    /// fallback shaders share the same lifetime handling as cached shaders.
+    pub fn fromOwned(allocator: std.mem.Allocator, module: rdna2.spirv.Module) std.mem.Allocator.Error!Lease {
+        var owned = module;
+        errdefer owned.deinit(allocator);
+        const shared = try allocator.create(SharedModule);
+        shared.* = .{ .allocator = allocator, .module = owned };
+        return .{ .shared = shared };
+    }
+
     pub const View = struct {
         words: []const u32,
         used_control_flow_fallback: bool,
@@ -255,6 +265,22 @@ test "cache leases survive eviction and cache destruction without copying shader
     try std.testing.expectEqualSlices(u32, fresh.words, third.view().words);
     try std.testing.expectEqual(fresh.used_dispatcher, third.view().used_dispatcher);
     try std.testing.expectEqual(fresh.used_control_flow_fallback, third.view().used_control_flow_fallback);
+}
+
+test "owned translation leases preserve words and release them on allocation failure" {
+    const a = std.testing.allocator;
+    const words = try a.dupe(u32, &.{ 0x07230203, 17, 23 });
+    const lease = try Lease.fromOwned(a, .{ .words = words, .used_control_flow_fallback = true });
+    try std.testing.expect(lease.view().words.ptr == words.ptr);
+    try std.testing.expectEqualSlices(u32, &.{ 0x07230203, 17, 23 }, lease.view().words);
+    try std.testing.expect(lease.view().used_control_flow_fallback);
+    lease.release();
+
+    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 1 });
+    const f = failing.allocator();
+    const failed_words = try f.dupe(u32, &.{ 0x07230203, 29 });
+    try std.testing.expectError(error.OutOfMemory, Lease.fromOwned(f, .{ .words = failed_words }));
+    try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
 }
 
 test "cache lease owns an oversized uncached translation" {

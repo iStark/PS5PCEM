@@ -15879,7 +15879,7 @@ pub const Renderer = struct {
             else
                 vertex_analysis.program;
             const vertex_module_result = if (unity_ui_fallback)
-                buildUnityUiVertexSpirv(
+                ownVertexTranslation(self.allocator, buildUnityUiVertexSpirv(
                     self.allocator,
                     vertex_storage.mappings[0..vertex_storage.mapping_count],
                     unity_ui_position.?,
@@ -15887,9 +15887,9 @@ pub const Renderer = struct {
                     unity_ui_color.?,
                     readUnityUiProjection(reader, vertex_storage, unity_ui_matrix.?) orelse
                         .{ 1.0 / 1920.0, -1.0 / 1080.0, -1.0, 1.0 },
-                )
+                ))
             else if (centered_retro_framebuffer)
-                buildFullscreenProbeVertexSpirv(
+                ownVertexTranslation(self.allocator, buildFullscreenProbeVertexSpirv(
                     self.allocator,
                     true,
                     1.0,
@@ -15897,16 +15897,16 @@ pub const Renderer = struct {
                         @as(f32, @floatFromInt(graphics_resources.descriptors[0].height))) /
                         (@as(f32, @floatFromInt(target.descriptor.width)) /
                             @as(f32, @floatFromInt(target.descriptor.height))),
-                )
+                ))
             else if (unity_sprite_fallback)
-                buildUnitySpriteVertexSpirv(
+                ownVertexTranslation(self.allocator, buildUnitySpriteVertexSpirv(
                     self.allocator,
                     vertex_storage.mappings[0..vertex_storage.mapping_count],
                     unity_sprite_matrix.?,
                     convert_guest_depth,
-                )
+                ))
             else
-                self.graphics_translations.translate(self.allocator, &vertex_program, .{
+                self.graphics_translations.acquire(self.allocator, &vertex_program, .{
                     .stage = .vertex,
                     // The PS5 NGG/export ABI supplies S_NGG_VERTEX_INDEX in v5;
                     // ordinary VS programs retain the legacy v0 convention.
@@ -15933,10 +15933,10 @@ pub const Renderer = struct {
                     .enable_typed_ir = self.shader_ir_enabled,
                     .enable_ssa_optimization = self.shader_ssa_optimization_enabled,
                 });
-            if (vertex_module_result) |vertex_module_owned| {
+            if (vertex_module_result) |vertex_lease| {
                 self.frame_profile.shader_translate_ns +|= elapsedHostNanoseconds(vertex_translate_started);
-                var vertex_module = vertex_module_owned;
-                defer vertex_module.deinit(self.allocator);
+                defer vertex_lease.release();
+                const vertex_module = vertex_lease.view();
                 if (self.dump_graphics_spirv) {
                     dumpGraphicsSpirv(self.allocator, "vs", vertex_address, vertex_module.words);
                 }
@@ -26940,6 +26940,10 @@ fn buildParameterProbeFragmentSpirv(allocator: std.mem.Allocator) !rdna2.spirv.M
         .parameter_mask = 1,
         .infer_fragment_parameter_mask = false,
     });
+}
+
+fn ownVertexTranslation(allocator: std.mem.Allocator, result: anyerror!rdna2.spirv.Module) anyerror!spirv_cache.Lease {
+    return spirv_cache.Lease.fromOwned(allocator, try result);
 }
 
 /// Unity's ordinary sprite export shader consumes a unit quad, a per-draw
