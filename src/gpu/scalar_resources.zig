@@ -97,6 +97,12 @@ pub const Resolver = struct {
         const component: u32 = @intCast(register - destination);
         switch (inst.opcode) {
             .s_mov_b32, .s_mov_b64 => return self.operand(inst.src0, component, index, depth + 1),
+            .s_and_b32 => {
+                if (component != 0) return null;
+                const a = (try self.operand(inst.src0, 0, index, depth + 1)) orelse return null;
+                const b = (try self.operand(inst.src1, 0, index, depth + 1)) orelse return null;
+                return a & b;
+            },
             .s_mul_i32, .s_mulk_i32 => {
                 if (component != 0) return null;
                 const a = (try self.operand(inst.src0, 0, index, depth + 1)) orelse return null;
@@ -141,6 +147,10 @@ pub const Resolver = struct {
         for (base_words[0..@as(usize, if (is_buffer) 4 else 2)], 0..) |*value, part| {
             value.* = (try self.operand(inst.src0, @intCast(part), index, depth + 1)) orelse return null;
         }
+        // An empty V# returns zero for every offset. Requiring a uniform
+        // workgroup/loop index first loses valid descriptors selected through
+        // an optional empty indirection buffer.
+        if (is_buffer and base_words[2] == 0) return 0;
         const offset = (try self.operand(inst.src1, 0, index, depth + 1)) orelse return null;
         const displacement = @as(i64, inst.memory_offset) + offset;
         if (displacement < 0) return null;
@@ -162,6 +172,49 @@ pub const Resolver = struct {
         return try self.reader.readU32(byte);
     }
 };
+
+test "empty scalar buffers resolve independently of dynamic offsets" {
+    const M = struct {
+        calls: usize = 0,
+        fn read(context: ?*anyopaque, _: u64, output: []u8) bool {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.calls += 1;
+            if (output.len != 4) return false;
+            std.mem.writeInt(u32, output[0..4], 0x12345678, .little);
+            return true;
+        }
+    };
+    var instructions = [_]rdna2.Instruction{
+        .{ .pc = 0, .opcode = .s_buffer_load_dwordx4, .dst = .{ .kind = .sgpr, .reg = 8 }, .src0 = .{ .kind = .sgpr }, .src1 = .{ .kind = .sgpr, .reg = 40 }, .data_words = 4 },
+        .{ .pc = 8, .opcode = .s_and_b32, .dst = .{ .kind = .sgpr, .reg = 12 }, .src0 = .{ .kind = .sgpr, .reg = 8 }, .src1 = .{ .kind = .literal_constant, .value = 255 } },
+        .{ .pc = 16, .opcode = .s_endpgm },
+    };
+    var graph = try rdna2.control_flow.buildInstructions(std.testing.allocator, &instructions);
+    defer graph.deinit(std.testing.allocator);
+    var bindings = std.mem.zeroes(shaders.StageBindings);
+    bindings.user_data_count = 4;
+    bindings.user_data[0] = 0x1000;
+    bindings.user_data[1] = 16 << 16;
+    const snapshot = scalar.Evaluation{};
+    var memory = M{};
+    for (0..4) |variant| {
+        bindings.user_data[2] = if (variant == 1 or variant == 3) 1 else 0;
+        instructions[0].opcode = if (variant == 2) .s_load_dwordx4 else .s_buffer_load_dwordx4;
+        instructions[0].src1 = if (variant == 3) .{ .kind = .null } else .{ .kind = .sgpr, .reg = 40 };
+        var resolver = Resolver{ .bindings = &bindings, .reader = .{ .context = &memory, .read_fn = M.read }, .instructions = &instructions, .graph = &graph, .snapshot = &snapshot };
+        var words: [4]u32 = undefined;
+        const success = try resolver.words(8, 8, &words);
+        try std.testing.expectEqual(variant == 0 or variant == 3, success);
+        if (success) try std.testing.expect(std.mem.allEqual(u32, &words, if (variant == 0) 0 else 0x12345678));
+        try std.testing.expectEqual(@as(usize, if (variant == 3) 4 else 0), memory.calls);
+    }
+    var resolver = Resolver{ .bindings = &bindings, .reader = .{ .context = &memory, .read_fn = M.read }, .instructions = &instructions, .graph = &graph, .snapshot = &snapshot };
+    var masked: [1]u32 = undefined;
+    try std.testing.expect(try resolver.words(12, 16, &masked));
+    try std.testing.expectEqual(@as(u32, 0x78), masked[0]);
+    instructions[1].src1 = .{ .kind = .sgpr, .reg = 41 };
+    try std.testing.expect(!try resolver.words(12, 16, &masked));
+}
 
 test "resource descriptors survive lane spills, SGPR reuse, loops and branch joins" {
     const M = struct {

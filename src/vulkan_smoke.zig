@@ -360,7 +360,7 @@ fn runStorageImageCopyCase(
     std.debug.print("storage image coordinate copy passed: {s}\n", .{if (packed_coordinates) "A16 packed X/Y with poisoned adjacent VGPR" else "32-bit X/Y"});
 }
 
-fn runSpilledImageDescriptorProbe(allocator: std.mem.Allocator, compact: bool) !void {
+fn runSpilledImageDescriptorProbe(allocator: std.mem.Allocator, compact: bool, empty_index: bool) !void {
     for ([_]bool{ false, true }) |skip_spill| {
         var renderer = try vulkan.Renderer.init(allocator, .{});
         defer renderer.deinit();
@@ -375,8 +375,17 @@ fn runSpilledImageDescriptorProbe(allocator: std.mem.Allocator, compact: bool) !
         const surface = try texture.base();
         for ([_][8]u32{ imageDescriptorWords(source, 4, 4), imageDescriptorWords(destination, 4, 4) }, 0..) |descriptor, image_index|
             for (descriptor, 0..) |word, component| guest.word(0x1000 + image_index * 32 + component * 4, word);
+        for ([_]u32{ 0xdead0000, 4 << 16, 0, 0 }, 0..) |word, component| guest.word(0x1040 + component * 4, word);
+        const indirection = [_]u32{
+            0xf408_1400, 0xfa00_0040, // V#s80:s83 has NUM_RECORDS=0
+            0xf420_00e8, 2 << 25, // s_buffer_load_dword s3, V#s80, workgroup s2
+            0x8703_ff03, 255, // s_and_b32 s3,s3,255
+            0x8f03_8503, // s_lshl_b32 s3,s3,5
+        };
+        const prefix_words: usize = if (empty_index) indirection.len else 0;
+        if (empty_index) for (indirection, 0..) |word, index| guest.word(program + index * 4, word);
         const prolog = [_]u32{
-            if (compact) 0xf408_0500 else 0xf40c_0500, 0xfa00_0000, // load source T#
+            if (compact) 0xf408_0500 else 0xf40c_0500, if (empty_index) 3 << 25 else 0xfa00_0000, // load source T#
             if (compact) 0xf408_1100 else 0xf40c_1100, 0xfa00_0020, // load destination T#
             vop1(1, 0, if (skip_spill) 128 else 129),
             0x7d84_0080, // VCC depends on a VGPR: host scalar walk cannot choose the branch
@@ -388,8 +397,8 @@ fn runSpilledImageDescriptorProbe(allocator: std.mem.Allocator, compact: bool) !
             0xd760_0044, 0x0001_0127, 0xd760_0045,
             0x0001_0327, 0xd760_0046, 0x0001_0527,
         };
-        for (prolog, 0..) |word, index| guest.word(program + index * 4, word);
-        var cursor: usize = program + prolog.len * 4;
+        for (prolog, 0..) |word, index| guest.word(program + (prefix_words + index) * 4, word);
+        var cursor: usize = program + (prefix_words + prolog.len) * 4;
         for (0..4) |y| for (0..4) |x| {
             const r128: u32 = if (compact) 1 << 15 else 0;
             const pixel = [_]u32{ vop1(1, 0, @intCast(128 + x)), vop1(1, 1, @intCast(128 + y)), 0xf000_0f08 | r128, 0x0005_0400, 0xf020_0f08 | r128, 0x0011_0400 };
@@ -405,7 +414,7 @@ fn runSpilledImageDescriptorProbe(allocator: std.mem.Allocator, compact: bool) !
         const compute = gpu.resources.ShaderStage.compute;
         try state.writeRegister(.shader, compute.programRegisterBase(), program >> 8);
         try state.writeRegister(.shader, compute.programRegisterBase() + 1, 0);
-        try state.writeRegister(.shader, 0x213, 2 << 1);
+        try state.writeRegister(.shader, 0x213, (2 << 1) | (if (empty_index) @as(u32, 1 << 7) else 0));
         for ([_]u32{ 0x207, 0x208, 0x209 }) |reg| try state.writeRegister(.shader, reg, 1);
         try state.writeRegister(.shader, compute.userDataBase(), 0x1000);
         try state.writeRegister(.shader, compute.userDataBase() + 1, 0);
@@ -418,7 +427,7 @@ fn runSpilledImageDescriptorProbe(allocator: std.mem.Allocator, compact: bool) !
             const byte: usize = @intCast(try surface.sourceByteOffset(0, @intCast(y), 0, 0));
             try std.testing.expectEqualSlices(u8, guest.bytes[source + byte ..][0..16], guest.bytes[destination + byte ..][0..16]);
         }
-        std.debug.print("spilled image descriptor passed: R128={}, {s}, RGBA8 copy verified\n", .{ compact, if (skip_spill) "original load path" else "save/borrow/restore path" });
+        std.debug.print("spilled image descriptor passed: R128={}, empty_index={}, {s}, RGBA8 copy verified\n", .{ compact, empty_index, if (skip_spill) "original load path" else "save/borrow/restore path" });
     }
 }
 
@@ -9268,8 +9277,10 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--spilled-image-descriptor")) {
-        try runSpilledImageDescriptorProbe(allocator, false);
-        try runSpilledImageDescriptorProbe(allocator, true);
+        for ([_]bool{ false, true }) |empty_index| {
+            try runSpilledImageDescriptorProbe(allocator, false, empty_index);
+            try runSpilledImageDescriptorProbe(allocator, true, empty_index);
+        }
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--trigonometry")) {

@@ -296,6 +296,11 @@ become pitch, metadata, or lookup-key words. `R128=0` still retains all eight
 descriptor words. The spill probe covers both sizes, and `--indirect-images`
 checks compact table selection, null/OOB entries, aliases and a 128-image lookup.
 This follows AMD's [RDNA 2 ISA, sections 8.2.1 and 8.2.6](https://docs.amd.com/api/khub/documents/Et~wpu9g~Ffl7d9q0QZ~Og/content).
+Descriptor recovery also evaluates `S_AND_B32` index masks and zero-record
+scalar buffers: an empty V# returns zero even when its SOFFSET varies by
+workgroup. Nonempty buffers still require a proven offset. The spill probe
+also checks image selection through an empty index buffer and a masked offset;
+the empty buffer's unmapped base is never read.
 For the supported fragment subset, inline 2D/3D image and sampler descriptors are
 decoded from user SGPRs. Compute sampling also recovers descriptors from the
 exact preceding scalar loads or the dispatch SRT after SGPR reuse. Both paths
