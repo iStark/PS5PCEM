@@ -44,8 +44,18 @@ order. The physical shape participates in the translation cache key.
 `--compute-workgroup-shape` verifies coordinates and group sizes on the GPU.
 Yotei's visibility shader used Z=256 on a device limited to Z=64. Shape
 remapping removes that invalid dispatch, but `yotei_visibility_gpu` remains
-false until full shader results match reference and native validation;
-its conservative visibility fallback is still the default.
+false pending native validation. The full original shader matches independent
+CPU reference masks on three depth fixtures; its conservative visibility
+fallback is still the default.
+
+`yotei_gds_culling_gpu` similarly enables the original screen-space GDS cull.
+It filters tiles against depth bands and appends packed X/Y coordinates using
+the real GDS counters. The legacy CPU fallback instead emits dense linear
+indices. The original shader's output sets and three counters match an
+independent depth reference on four fixtures under Vulkan validation: mixed
+depth bands, empty bands, EXEC restoration after an empty band, and coordinate
+offsets. Over-dispatch checks empty and partial workgroups; output tails and
+unrelated GDS words remain untouched. This flag is false pending native validation.
 
 `stageGuestStorageBuffer` keys coherent allocations by exact guest address and
 size, with 64 slots and a 128 MiB per-range cap. Large writable ranges remain

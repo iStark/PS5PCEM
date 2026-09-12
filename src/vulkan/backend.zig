@@ -38,6 +38,8 @@ pub export var capture_fragment_program: u64 = 0;
 pub export var capture_graphics_buffers: bool = true;
 // Diagnostic comparison until the full visibility pass is validated natively.
 pub export var yotei_visibility_gpu: bool = false;
+// Compare exact depth-filtered, packed-coordinate lists with the legacy fallback.
+pub export var yotei_gds_culling_gpu: bool = false;
 pub export var capture_graphics_target: u64 = 0;
 // Zero preserves synchronous retirement for baseline comparisons.
 pub export var sampled_retirement_slack_bytes: u64 = 0;
@@ -6204,7 +6206,7 @@ pub const Renderer = struct {
             break :blk prepared;
         };
         defer resources.deinit(self);
-        if (isYoteiGdsCullingDispatch(uses_gds, group_count, local_size, analysis.program.instructions.items.len)) {
+        if (!@atomicLoad(bool, &yotei_gds_culling_gpu, .monotonic) and isYoteiGdsCullingDispatch(uses_gds, group_count, local_size, analysis.program.instructions.items.len)) {
             if (try self.emulateYoteiGdsCulling(memory, resources, group_count)) |report| {
                 return report;
             }
@@ -7251,10 +7253,10 @@ pub const Renderer = struct {
         };
     }
 
-    /// Yotei's screen-space GDS cull uses ds_append. The current SPIR-V
-    /// lowering leaves EXEC empty on NVIDIA, so the kernel never writes.
-    /// Build the dense visible list on the CPU (one dword per pixel in each
-    /// writable V#) and publish the matching GDS counters.
+    /// Legacy fallback retained for native comparisons. It writes dense linear
+    /// indices, whereas the original shader depth-filters packed X/Y coordinates.
+    /// The original DS_APPEND shader now passes isolated GPU/reference checks;
+    /// yotei_gds_culling_gpu enables it while native validation is in progress.
     fn emulateYoteiGdsCulling(
         self: *Renderer,
         memory: GuestMemory,
