@@ -301,6 +301,15 @@ scalar buffers: an empty V# returns zero even when its SOFFSET varies by
 workgroup. Nonempty buffers still require a proven offset. The spill probe
 also checks image selection through an empty index buffer and a masked offset;
 the empty buffer's unmapped base is never read.
+For nonempty DWORD index buffers of at most 64 KiB, resource recovery can bound
+every possible scalar load from the complete current payload, including OOB
+zeroes. It follows a proven lane spill back to that load and rereads the payload
+for each dispatch. Material fields masked by `S_AND_B32` then bound the separate
+pointer-form T# table, avoiding unrelated data past the reachable descriptors.
+A shared sampler is recovered only when every possible material load is in
+bounds and all four sampler words agree. The indirect-image probe checks this
+chain with 816-byte records, a VCC offset, changing indices, OOB loads and a
+conflicting sampler; conflicting values remain unsupported.
 Translation validates large sampled-image tables with exact hash keys for the
 T#/S#/instruction site and all eight candidate words. This avoids a quadratic
 scan while preserving duplicate rejection, including conflicts between a

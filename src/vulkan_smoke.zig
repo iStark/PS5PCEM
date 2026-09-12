@@ -8754,7 +8754,78 @@ fn runIndirectImageProbe(allocator: std.mem.Allocator) !void {
             try std.testing.expectError(error.UnsupportedSampledImage, renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ groups, 1, 1 }));
         }
     }
+    try runMaskedPointerImageProbe(allocator);
     std.debug.print("indirect sampled images passed: runtime selection, aliases, bounds, wrapping, guarded SGPR/VCC offsets, 128 textures and mixed 2D/3D views\n", .{});
+}
+
+fn runMaskedPointerImageProbe(allocator: std.mem.Allocator) !void {
+    for ([_]bool{ false, true }) |spill| {
+        var renderer = try vulkan.Renderer.init(allocator, .{});
+        defer renderer.deinit();
+        var guest = GuestMemory{};
+        _ = renderer.dcbBackend(guest.interface());
+        const store = mubuf(0x1c, 0, 4, 1, 12);
+        const code = [_]u32{
+            vop1(1, 1, 20), // preserve workgroup ID for output
+            0x8f18_8214, // byte offset = workgroup * 4
+            0xf420_0602,                             24 << 25, // scalar index from V#s4
+            if (spill) 0xd761_0027 else 0xbf80_0000,
+            if (spill) 24 | (136 << 9) else 0xbf80_0000, // save index in v39 lane8
+            if (spill) 0xbe98_03ff else 0xbf80_0000,
+            if (spill) 0xffff_ffff else 0xbf80_0000, // borrow s24
+            if (spill) 0xd760_0018 else 0xbf80_0000,
+            if (spill) 295 | (136 << 9) else 0xbf80_0000, // restore index
+            0x9318_ff18, 816, // material record offset
+            0xf42c_0404, (24 << 25) | 136, // shared sampler s16:s19 in a coalesced material load
+            0xf424_0604, (24 << 25) | 556, // two material words, first holds texture selector
+            0x876a_ff18, 255, // VCC_LO = selector & 255
+            0x8f6a_856a, // byte offset = VCC_LO << 5
+            0xf40c_0600,     (106 << 25) | 544, // full T#s24 from pointer SRT
+            vop1(1, 2, 255), 0x3e80_0000,
+            vop1(1, 3, 255), 0x3e80_0000,
+            0xf09c_010a,     0x0086_0402,
+            3,               store[0],
+            store[1],        0xbf81_0000,
+        };
+        for (code, 0..) |word, index| guest.word(0x100 + index * 4, word);
+        for (0..2) |index| {
+            const address: u32 = 0x8000 + @as(u32, @intCast(index)) * 0x1000;
+            const image = sampledImageDescriptorWords(address, 1, 1);
+            for (image, 0..) |word, component| guest.word(0x2000 + 544 + index * 32 + component * 4, word);
+            guest.word(address, if (index == 0) 0xff00_00ff else 0xff00_0040);
+        }
+        // The root contains exactly two T#s. Later bytes are unrelated data,
+        // so enumerating all 256 values of the mask must not be necessary.
+        guest.word(0x2000 + 544 + 64, 0xdead_beef);
+        var state = gpu.State{};
+        try state.writeRegister(.shader, 0x20c, 1);
+        try state.writeRegister(.shader, 0x20d, 0);
+        try state.writeRegister(.shader, 0x213, (20 << 1) | (1 << 7));
+        var userdata: [20]u32 = @splat(0);
+        userdata[0] = 0x2000;
+        @memcpy(userdata[4..8], &[_]u32{ 0x3000, 4 << 16, 4, 0 });
+        @memcpy(userdata[8..12], &[_]u32{ 0x4000, 816 << 16, 2, 0 });
+        @memcpy(userdata[12..16], &[_]u32{ 0x10000, 4 << 16, 6, 0 });
+        for (userdata, 0..) |word, index| try state.writeRegister(.shader, 0x240 + @as(u32, @intCast(index)), word);
+        for (0..2) |round| {
+            for ([_]u32{ 0, 1, 0, 1 }, 0..) |value, index| guest.word(0x3000 + index * 4, value);
+            if (round != 0) guest.word(0x3000 + 12, 0);
+            guest.word(0x4000 + 556, if (round == 0) 0x3f80_0000 else 0xabcd_ef01);
+            guest.word(0x4000 + 816 + 556, if (round == 0) 0xabcd_ef01 else 0x3f80_0000);
+            _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 6, 1, 1 });
+            var output: [24]u8 = undefined;
+            try renderer.readbackGuestStorageBuffer(0x10000, &output);
+            for (0..6) |group| {
+                const record: usize = if (group >= 4 or (round != 0 and group == 3)) 0 else group % 2;
+                const expected: f32 = if (record == round) 1 else 64.0 / 255.0;
+                const actual: f32 = @bitCast(std.mem.readInt(u32, output[group * 4 ..][0..4], .little));
+                try std.testing.expectApproxEqAbs(expected, actual, 0.00001);
+            }
+        }
+        guest.word(0x4000 + 816 + 136, 0x400);
+        try std.testing.expectError(error.UnsupportedSampledImage, renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 6, 1, 1 }));
+        std.debug.print("masked pointer images passed: spill={}, indexed materials, VCC mask, bounded SRT, OOB and refreshed indices\n", .{spill});
+    }
 }
 
 fn runGraphicsDescriptorReuseProbe(allocator: std.mem.Allocator) !void {

@@ -802,12 +802,55 @@ pub fn scalarLaneDefinitions(instructions: []const Instruction, graph: *const Gr
 }
 
 fn scalarBitUpperBound(instructions: []const Instruction, graph: *const Graph, before: usize, register: u32, depth: u32) ?u32 {
+    if (scalarDefinition(instructions, graph, before, register)) |scalar_definition| {
+        switch (scalar_definition) {
+            .entry => {},
+            .instruction => |index| {
+                const inst = instructions[index];
+                if (inst.opcode == .s_and_b32 and
+                    @import("scalar_provenance.zig").scalarRegisterIndex(inst.dst) == register and
+                    !inst.src0.negate and !inst.src0.absolute and !inst.src0.dpp and
+                    !inst.src1.negate and !inst.src1.absolute and !inst.src1.dpp)
+                {
+                    // The other operand may come from a runtime material
+                    // buffer. The immediate mask alone bounds every result,
+                    // including when the destination is a VCC scalar alias.
+                    const mask = immediate(inst.src0) orelse immediate(inst.src1) orelse return null;
+                    return std.math.add(u32, mask, 1) catch null;
+                }
+            },
+        }
+    }
     const definition = scalarLaneDefinition(instructions, graph, before, register, depth) orelse return null;
     const vector = instructions[definition.instruction];
     if (definition.component != 0 or vector.opcode != .v_lshrrev_b32 or vector.src1.sdwa_sel != 6 or vector.src1.dpp) return null;
     const shift = (immediate(vector.src0) orelse return null) & 31;
     if (shift == 0) return null;
     return @as(u32, 1) << @intCast(32 - shift);
+}
+
+test "scalar table index masks bound dynamic values and VCC aliases" {
+    var instructions = [_]Instruction{
+        .{ .pc = 0, .opcode = .s_and_b32, .dst = .{ .kind = .vcc_lo }, .src0 = .{ .kind = .sgpr, .reg = 52 }, .src1 = .{ .kind = .literal_constant, .value = 255 } },
+        .{ .pc = 8, .opcode = .s_lshl_b32, .dst = .{ .kind = .vcc_lo }, .src0 = .{ .kind = .vcc_lo }, .src1 = .{ .kind = .integer_inline_constant, .value = 5 } },
+        .{ .pc = 12, .opcode = .s_endpgm },
+    };
+    var graph = try rdna2.control_flow.buildInstructions(std.testing.allocator, &instructions);
+    defer graph.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(?u32, 256), scalarUpperBound(&instructions, &graph, 1, 106));
+    std.mem.swap(rdna2.Operand, &instructions[0].src0, &instructions[0].src1);
+    try std.testing.expectEqual(@as(?u32, 256), scalarUpperBound(&instructions, &graph, 1, 106));
+    instructions[0].src0.value = 0;
+    try std.testing.expectEqual(@as(?u32, 1), scalarUpperBound(&instructions, &graph, 1, 106));
+    instructions[0].src0.value = std.math.maxInt(u32);
+    try std.testing.expectEqual(@as(?u32, null), scalarUpperBound(&instructions, &graph, 1, 106));
+    instructions[0].src0 = .{ .kind = .sgpr, .reg = 53 };
+    try std.testing.expectEqual(@as(?u32, null), scalarUpperBound(&instructions, &graph, 1, 106));
+    instructions[0].src0 = .{ .kind = .literal_constant, .value = 255, .negate = true };
+    try std.testing.expectEqual(@as(?u32, null), scalarUpperBound(&instructions, &graph, 1, 106));
+    instructions[0].opcode = .s_or_b32;
+    instructions[0].src0.negate = false;
+    try std.testing.expectEqual(@as(?u32, null), scalarUpperBound(&instructions, &graph, 1, 106));
 }
 
 fn scalarIdentity(instructions: []const Instruction, graph: *const Graph, before: usize, register: u32, depth: u32) ?Definition {

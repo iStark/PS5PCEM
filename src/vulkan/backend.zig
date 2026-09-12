@@ -26574,9 +26574,80 @@ const BufferTablePlan = struct {
     first: u64,
     step: u64,
     limit: u64,
+    fully_in_bounds: bool = false,
 };
 
 const ScalarPointerTablePlan = struct { base: u64, first: u64, step: u32, count: u32 };
+
+/// A scalar DWORD index buffer may vary by workgroup or loop iteration. Its
+/// complete, small payload still gives a uniform upper bound for every load,
+/// including the zero returned for out-of-range offsets. Never cache payloads.
+fn loadedScalarIndexUpperBound(
+    bindings: *const gpu.ShaderBindings,
+    reader: gpu.ShaderMemoryReader,
+    analysis: *const gpu.ShaderAnalysis,
+    scalar: *const gpu.ScalarEvaluation,
+    before: usize,
+    register: u32,
+) anyerror!?u32 {
+    const instructions = analysis.program.instructions.items;
+    const cache = if (analysis.scalar_definitions) |definitions|
+        if (definitions.matches(instructions, &analysis.graph)) definitions else null
+    else
+        null;
+    const origin = (if (cache) |definitions|
+        definitions.savedOrigin(before, register)
+    else
+        gpu.index_bounds.savedScalarOrigin(instructions, &analysis.graph, before, register)) orelse return null;
+    const index = switch (origin.definition) {
+        .entry => return null,
+        .instruction => |index| index,
+    };
+    const load = instructions[index];
+    if (load.opcode != .s_buffer_load_dword or load.data_words != 1 or load.memory_offset != 0 or
+        load.src0.kind != .sgpr or gpu.scalar_provenance.scalarRegisterIndex(load.dst) != origin.register) return null;
+    const buffer = (resolveProducedBufferDescriptor(bindings, reader, analysis, scalar, load.src0.reg, load.pc, 0) catch return null) orelse return null;
+    if (buffer.stride != 4 or buffer.swizzle_enabled or buffer.address & 3 != 0 or buffer.size_bytes > 64 * 1024) return null;
+    const count: usize = @intCast(buffer.size_bytes / 4);
+    var bytes: [64 * 1024]u8 = undefined;
+    if (count != 0) reader.read(buffer.address, bytes[0 .. count * 4]) catch return null;
+    var maximum: u32 = 0;
+    for (0..count) |word| maximum = @max(maximum, std.mem.readInt(u32, bytes[word * 4 ..][0..4], .little));
+    return std.math.add(u32, maximum, 1) catch null;
+}
+
+fn maskedBufferIndexUpperBound(
+    bindings: *const gpu.ShaderBindings,
+    reader: gpu.ShaderMemoryReader,
+    analysis: *const gpu.ShaderAnalysis,
+    scalar: *const gpu.ScalarEvaluation,
+    before: usize,
+    register: u32,
+) anyerror!?u32 {
+    const instructions = analysis.program.instructions.items;
+    const definition = gpu.index_bounds.scalarDefinition(instructions, &analysis.graph, before, register) orelse return null;
+    const index = switch (definition) {
+        .entry => return null,
+        .instruction => |index| index,
+    };
+    const mask = instructions[index];
+    if (mask.opcode != .s_and_b32 or gpu.scalar_provenance.scalarRegisterIndex(mask.dst) != register or
+        mask.src0.negate or mask.src0.absolute or mask.src0.dpp or
+        mask.src1.negate or mask.src1.absolute or mask.src1.dpp) return null;
+    const immediate_first = mask.src0.kind == .integer_inline_constant or mask.src0.kind == .literal_constant;
+    const literal = if (immediate_first) mask.src0 else mask.src1;
+    if (literal.kind != .integer_inline_constant and literal.kind != .literal_constant) return null;
+    const source = gpu.scalar_provenance.scalarRegisterIndex(if (immediate_first) mask.src1 else mask.src0) orelse return null;
+    const plan = (resolveBufferTablePlan(reader, analysis, scalar, @intCast(source), 1, mask.pc, bindings, 16384) catch return null) orelse return null;
+    var maximum: u32 = 0;
+    var offset = plan.first;
+    while (offset < plan.limit) : (offset += plan.step) {
+        const byte = offset & ~@as(u64, 3);
+        const word = if (byte + 4 <= plan.buffer.size_bytes) reader.readU32(plan.buffer.address + byte) catch return null else 0;
+        maximum = @max(maximum, word & literal.value);
+    }
+    return std.math.add(u32, maximum, 1) catch null;
+}
 
 fn scalarPointerTablePlan(
     bindings: *const gpu.ShaderBindings,
@@ -26616,7 +26687,7 @@ fn scalarPointerTablePlan(
     };
     const source = gpu.scalar_provenance.scalarRegisterIndex(multiply.src0) orelse return null;
     var resolver = gpu.scalar_resources.Resolver{ .bindings = bindings, .reader = reader, .instructions = instructions, .graph = &analysis.graph, .snapshot = scalar, .definition_cache = analysis.scalar_definitions };
-    const count = analysis.scalarIndexUpperBound(multiply_index, @intCast(source)) orelse bound: {
+    var count = analysis.scalarIndexUpperBound(multiply_index, @intCast(source)) orelse bound: {
         const limit = gpu.index_bounds.scalarGuardedLoopLimit(instructions, &analysis.graph, multiply_index, @intCast(source)) orelse return null;
         const value = if (gpu.scalar_provenance.scalarRegisterIndex(limit.operand)) |register| value: {
             var word: [1]u32 = undefined;
@@ -26629,6 +26700,8 @@ fn scalarPointerTablePlan(
         if (value == 0 or value > std.math.maxInt(i32)) return null;
         break :bound value;
     };
+    if (try maskedBufferIndexUpperBound(bindings, reader, analysis, scalar, multiply_index, @intCast(source))) |bound|
+        count = @min(count, bound);
     if (step == 0 or count == 0 or count > 16384) return null;
     const first = @as(u64, @intCast(load.memory_offset)) + displacement;
     const length = @as(u64, count - 1) * step + @as(u64, load.data_words) * 4;
@@ -26852,6 +26925,9 @@ fn resolveBufferTablePlan(
         if (gpu.scalar_provenance.scalarRegisterIndex(inst.src0)) |source_register| {
             index_register = @intCast(source_register);
             index_bound = analysis.scalarIndexUpperBound(index, @intCast(source_register));
+            if (index_bound == null) if (bindings) |inputs| {
+                index_bound = try loadedScalarIndexUpperBound(inputs, reader, analysis, scalar, index, @intCast(source_register));
+            };
             if (bindings) |inputs| if (inputs.compute_dispatch) |dispatch| {
                 var entries: [3]gpu.index_bounds.EntryBound = undefined;
                 var entry_count: usize = 0;
@@ -26887,7 +26963,14 @@ fn resolveBufferTablePlan(
     const residue = if (bounded) displacement else displacement % step;
     const limit = @min(buffer.size_bytes, if (bounded) displacement + @as(u64, index_bound.?) * multiplier else @as(u64, 1) << 32);
     if (residue >= limit or (limit - residue + step - 1) / step > maximum_offsets) return null;
-    return .{ .buffer = buffer, .first = residue, .step = step, .limit = limit };
+    return .{
+        .buffer = buffer,
+        .first = residue,
+        .step = step,
+        .limit = limit,
+        .fully_in_bounds = bounded and index_bound.? != 0 and
+            displacement + @as(u64, index_bound.? - 1) * multiplier + wanted_words * 4 <= buffer.size_bytes,
+    };
 }
 
 /// Material records may hold indices into a separate global T# table. Recover
@@ -27271,7 +27354,24 @@ fn resolveProducedSamplerDescriptor(
         .definition_cache = analysis.scalar_definitions,
     };
     var words: [4]u32 = undefined;
-    if (!try resolver.words(sampler_sgpr, before_pc, &words)) return null;
+    if (!try resolver.words(sampler_sgpr, before_pc, &words)) {
+        const plan = (resolveBufferTablePlan(reader, analysis, scalar, sampler_sgpr, 4, before_pc, bindings, 16384) catch return null) orelse return null;
+        // A sampler can be shared by dynamically chosen material records only
+        // when every possible load is in bounds and all four words agree.
+        // Otherwise even an OOB zero sampler could select different filtering.
+        if (!plan.fully_in_bounds or plan.buffer.address & 3 != 0) return null;
+        var first = true;
+        var offset = plan.first;
+        while (offset < plan.limit) : (offset += plan.step) {
+            var candidate: [4]u32 = undefined;
+            reader.readWords(plan.buffer.address + (offset & ~@as(u64, 3)), &candidate) catch return null;
+            if (first) {
+                words = candidate;
+                first = false;
+            } else if (!std.mem.eql(u32, &words, &candidate)) return null;
+        }
+        if (first) return null;
+    }
     return gpu.resources.decodeSamplerDescriptor(&words) catch null;
 }
 
@@ -30199,6 +30299,57 @@ test "buffer table plans follow reaching loads and offsets across sibling branch
             try std.testing.expectEqual(@as(u64, 384), plan.?.limit);
         }
     }
+}
+
+test "loaded scalar index bounds reread payloads and reject unavailable proof" {
+    const Memory = struct {
+        bytes: [64]u8 = @splat(0),
+        inaccessible: bool = false,
+        reads: usize = 0,
+        fn read(context: ?*anyopaque, address: u64, output: []u8) bool {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.reads += 1;
+            if (self.inaccessible or address != 0x1000 or output.len != self.bytes.len) return false;
+            @memcpy(output, &self.bytes);
+            return true;
+        }
+    };
+    var memory = Memory{};
+    const reader = gpu.ShaderMemoryReader{ .context = &memory, .read_fn = Memory.read };
+    for ([_]u32{ 1, 5, 2, 0 }, 0..) |word, index|
+        std.mem.writeInt(u32, memory.bytes[index * 4 ..][0..4], word, .little);
+    var instructions = [_]gpu.ShaderInstruction{
+        .{ .pc = 0, .opcode = .s_buffer_load_dword, .dst = .{ .kind = .sgpr, .reg = 8 }, .src0 = .{ .kind = .sgpr, .reg = 4 }, .src1 = .{ .kind = .sgpr, .reg = 9 }, .data_words = 1 },
+        .{ .pc = 8, .opcode = .s_endpgm },
+    };
+    const program = rdna2.Program{ .code = &.{}, .instructions = .{ .items = &instructions, .capacity = instructions.len } };
+    var graph = try rdna2.buildControlFlow(std.testing.allocator, &program);
+    defer graph.deinit(std.testing.allocator);
+    var analysis: gpu.ShaderAnalysis = undefined;
+    analysis.program = program;
+    analysis.graph = graph;
+    analysis.scalar_definitions = null;
+    var bindings = std.mem.zeroes(gpu.ShaderBindings);
+    bindings.user_data_count = 8;
+    @memcpy(bindings.user_data[4..8], &[_]u32{ 0x1000, 4 << 16, 16, 0 });
+    const scalar = gpu.ScalarEvaluation{};
+    try std.testing.expectEqual(@as(?u32, 6), try loadedScalarIndexUpperBound(&bindings, reader, &analysis, &scalar, 1, 8));
+    std.mem.writeInt(u32, memory.bytes[4..8], 13, .little);
+    try std.testing.expectEqual(@as(?u32, 14), try loadedScalarIndexUpperBound(&bindings, reader, &analysis, &scalar, 1, 8));
+    std.mem.writeInt(u32, memory.bytes[4..8], std.math.maxInt(u32), .little);
+    try std.testing.expectEqual(@as(?u32, null), try loadedScalarIndexUpperBound(&bindings, reader, &analysis, &scalar, 1, 8));
+    memory.inaccessible = true;
+    try std.testing.expectEqual(@as(?u32, null), try loadedScalarIndexUpperBound(&bindings, reader, &analysis, &scalar, 1, 8));
+    const reads = memory.reads;
+    bindings.user_data[6] = 0;
+    try std.testing.expectEqual(@as(?u32, 1), try loadedScalarIndexUpperBound(&bindings, reader, &analysis, &scalar, 1, 8));
+    bindings.user_data[6] = 4;
+    bindings.user_data[5] = 8 << 16;
+    try std.testing.expectEqual(@as(?u32, null), try loadedScalarIndexUpperBound(&bindings, reader, &analysis, &scalar, 1, 8));
+    bindings.user_data[5] = 4 << 16;
+    bindings.user_data[6] = 16385;
+    try std.testing.expectEqual(@as(?u32, null), try loadedScalarIndexUpperBound(&bindings, reader, &analysis, &scalar, 1, 8));
+    try std.testing.expectEqual(reads, memory.reads);
 }
 
 test "image descriptor reads preserve split mappings and truncated buffer bounds" {
