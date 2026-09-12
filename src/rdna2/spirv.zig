@@ -500,6 +500,8 @@ fn decodeBufferUnifiedFormat(format: u8) ?BufferFormat {
         22 => .{ .data = 4, .number = 7 },
         23...28 => .{ .data = 5, .number = format - 23 },
         29 => .{ .data = 5, .number = 7 },
+        // GFX10 compatibility: used by Yotei's packed animation buffers.
+        31 => .{ .data = 6, .number = 1 },
         36 => .{ .data = 6, .number = 7 },
         43 => .{ .data = 7, .number = 7 },
         44 => .{ .data = 8, .number = 0 },
@@ -14255,6 +14257,7 @@ test "unresolved individual MUBUF binding behaves as a null buffer" {
 }
 
 test "GFX10 unified buffer formats expose packed component layouts" {
+    try std.testing.expectEqual(BufferFormat{ .data = 6, .number = 1 }, decodeBufferUnifiedFormat(31).?);
     try std.testing.expectEqual(BufferFormat{ .data = 10, .number = 0 }, decodeBufferUnifiedFormat(56).?);
     try std.testing.expectEqual(BufferFormat{ .data = 12, .number = 7 }, decodeBufferUnifiedFormat(71).?);
     try std.testing.expectEqual(

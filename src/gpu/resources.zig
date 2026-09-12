@@ -475,7 +475,10 @@ pub fn decodeBufferDescriptor(words: []const u32) Error!BufferDescriptor {
     if ((word3 >> 30) != 0) return Error.InvalidDescriptor;
 
     const format: u8 = @truncate((word3 >> 12) & 0x7f);
-    if (format != 0 and !isValidUnifiedFormat(format)) return Error.InvalidFormat;
+    // Yotei's animation buffers retain GFX10 10_11_11_SNORM (31), although
+    // the public RDNA2 table omits it. Keep this compatibility in V# decoding;
+    // it does not establish support for the same encoding in image resources.
+    if (format != 0 and format != 31 and !isValidUnifiedFormat(format)) return Error.InvalidFormat;
     const stride: u16 = @truncate((word1 >> 16) & 0x3fff);
     const records = words[2];
     return .{
@@ -1047,6 +1050,19 @@ test "buffer descriptors retain 48-bit addresses and byte extent" {
     try testing.expect(descriptor.swizzle_enabled);
     try testing.expectEqual(@as(u8, 2), descriptor.index_stride);
     try testing.expect(descriptor.add_thread_id);
+}
+
+test "animation buffers accept GFX10 packed SNORM descriptors" {
+    const words = [_]u32{ 0x21556380, 0x00040080, 0x1815, 0x0001f3ac };
+    const descriptor = try decodeBufferDescriptor(&words);
+    try testing.expectEqual(@as(u64, 0x8021556380), descriptor.address);
+    try testing.expectEqual(@as(u64, 0x6054), descriptor.size_bytes);
+    try testing.expectEqual(@as(u16, 4), descriptor.stride);
+    try testing.expectEqual(@as(u8, 31), descriptor.unified_format);
+    try testing.expectEqualSlices(u8, &.{ 4, 5, 6, 1 }, &descriptor.dst_select);
+    var invalid = words;
+    invalid[3] = (invalid[3] & ~@as(u32, 0x7f000)) | (47 << 12);
+    try testing.expectError(Error.InvalidFormat, decodeBufferDescriptor(&invalid));
 }
 
 test "image descriptors reject reserved bit 94 in overlapping table words" {

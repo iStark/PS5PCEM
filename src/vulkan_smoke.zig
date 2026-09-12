@@ -5331,6 +5331,11 @@ fn runPackedChannelOrderProbe(allocator: std.mem.Allocator) !void {
     // Independent packed words, including a captured tree normal. The two
     // 10-bit layouts and both mini-float layouts must not exchange channels.
     const cases = [_]struct { format: u32, bits: u32, expected: [4]f32 }{
+        // Yotei animation V#s use the GFX10 packed SNORM format omitted from
+        // the public RDNA2 format table. X/Y have 11 bits and Z has 10 bits.
+        .{ .format = 31, .bits = (511 << 22) | (2047 << 11) | 1024, .expected = .{ -1, -1.0 / 1023.0, 1, 1 } },
+        .{ .format = 31, .bits = (512 << 22) | (1023 << 11) | 513, .expected = .{ 513.0 / 1023.0, 1, -1, 1 } },
+        .{ .format = 31, .bits = (767 << 22) | (1535 << 11) | 2047, .expected = .{ -1.0 / 1023.0, -513.0 / 1023.0, -257.0 / 511.0, 1 } },
         .{ .format = 51, .bits = 0x3df8_74a2, .expected = .{ 162.0 / 511.0, -483.0 / 511.0, -33.0 / 511.0, 0 } },
         .{ .format = 51, .bits = (2 << 30) | (511 << 20) | (1023 << 10) | 512, .expected = .{ -1, -1.0 / 511.0, 1, -1 } },
         .{ .format = 50, .bits = (3 << 30) | (512 << 20) | (256 << 10) | 1023, .expected = .{ 1, 256.0 / 1023.0, 512.0 / 1023.0, 1 } },
@@ -5354,7 +5359,7 @@ fn runPackedChannelOrderProbe(allocator: std.mem.Allocator) !void {
             try std.testing.expectApproxEqAbs(expected, actual, 0.00001);
         }
     }
-    std.debug.print("Packed channel order passed: tree SNORM normals, signed endpoints, UNORM and both mini-float layouts\n", .{});
+    std.debug.print("Packed channel order passed: animation and tree SNORM, signed endpoints, UNORM and both mini-float layouts\n", .{});
 }
 
 fn runPackedBufferProbe(allocator: std.mem.Allocator) !void {
