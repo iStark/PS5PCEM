@@ -189,6 +189,12 @@ identical before/after images of a draw that never ran. A `.capture-error`
 file marks a captured draw that returns an error; its after image must not be
 treated as evidence of a completed draw. `--draw-capture-resources` exercises
 the two capture phases around a submit and verifies the queued GPU inputs.
+Buffer snapshots use each live descriptor's buffer and byte offset, including
+ring offsets whose upload lookup was cleared during resource preparation.
+The capture regression covers that earlier submit as well as the submit
+between vertex and fragment snapshots. `capture_graphics_buffers=false`
+skips graphics buffer dumps when only attachment images are needed; it does
+not affect compute captures or shader execution.
 The attachment snapshots leave guest memory and resource
 generations unchanged and restore its color-attachment usage after copying.
 Readbacks preserve guest resource generations but add synchronization, so

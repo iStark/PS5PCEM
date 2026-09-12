@@ -35,6 +35,7 @@ pub export var capture_storage_image_address: u64 = 0;
 pub export var capture_vertex_program: u64 = 0;
 pub export var capture_vertex_flip: u64 = 0;
 pub export var capture_fragment_program: u64 = 0;
+pub export var capture_graphics_buffers: bool = true;
 pub export var capture_graphics_target: u64 = 0;
 // Zero preserves synchronous retirement for baseline comparisons.
 pub export var sampled_retirement_slack_bytes: u64 = 0;
@@ -3472,6 +3473,7 @@ pub const Renderer = struct {
     guest_buffers: std.ArrayList(GuestBufferEntry) = .empty,
     guest_buffer_address_index: @import("sampled_image_index.zig").Index(512) = .{},
     active_storage_buffers: [maximum_storage_descriptors]vk.Buffer = @splat(0),
+    active_storage_offsets: [maximum_storage_descriptors]vk.DeviceSize = @splat(0),
     guest_buffer_sequence: u64 = 0,
     gds_storage: std.ArrayList(u8) = .empty,
     gds_host_dirty: bool = true,
@@ -14432,6 +14434,13 @@ pub const Renderer = struct {
         const expected = [_][2]u8{ .{ 0x11, 0x22 }, .{ 0x11, 0x33 }, .{ 0x44, 0x55 } };
         for (expected, 0..) |values, pass| {
             try self.beginFrameDraw();
+            if (capture_resources and pass == 0) {
+                // A captured descriptor can name a nonzero ring offset.
+                const padding = try self.allocateDrawUpload(256);
+                const mapping = try self.mapDrawUpload(padding);
+                defer mapping.release(self);
+                @memset(mapping.bytes, 0xef);
+            }
             if (pass != 1) {
                 first = try self.allocateDrawUpload(16);
                 const mapping = try self.mapDrawUpload(first);
@@ -14457,6 +14466,13 @@ pub const Renderer = struct {
                 vertex.addresses[0] = 0x1000;
                 vertex.sizes[0] = 16;
                 try self.draw_upload_cache.append(self.allocator, .{ .guest_address = 0x1000, .size = 16, .upload = first });
+                // Resource preparation itself may submit work before the
+                // vertex snapshot, losing lookup metadata for earlier slots.
+                const preparation = try self.beginOneShot();
+                defer self.releaseOneShot(preparation);
+                try self.submitOneShot(preparation);
+                try self.waitForSubmittedWork();
+                try std.testing.expectEqual(@as(usize, 0), self.draw_upload_cache.items.len);
                 try self.captureStorageBuffers(vertex, "out/diagnostic-inheritance", "vertex", null);
                 // The target snapshot between vertex and fragment preparation
                 // submits a readback, clearing upload-cache metadata while the
@@ -15902,6 +15918,7 @@ pub const Renderer = struct {
             dumpDiagnosticBytes(self.allocator, capture_prefix, ".capture-error", "draw returned an error\n") catch {};
         };
         const capture_target = capture_draw and @atomicLoad(u64, &capture_graphics_target, .monotonic) == target.descriptor.address;
+        const capture_buffers = capture_draw and @atomicLoad(bool, &capture_graphics_buffers, .monotonic);
         defer if (capture_target) self.captureGraphicsTarget(target, capture_prefix, "after") catch |err| {
             std.debug.print("[vulkan diagnostic] target capture failed: {s}\n", .{@errorName(err)});
         };
@@ -15914,7 +15931,7 @@ pub const Renderer = struct {
             try dumpDiagnosticBytes(self.allocator, prefix, ".mappings", std.mem.sliceAsBytes(vertex_storage.mappings[0..vertex_storage.mapping_count]));
             try dumpDiagnosticBytes(self.allocator, prefix, ".image-descriptors", std.mem.sliceAsBytes(graphics_resources.descriptors[0..graphics_resources.image_count]));
             try dumpDiagnosticBytes(self.allocator, prefix, ".image-mappings", std.mem.sliceAsBytes(graphics_resources.mappings[0..graphics_resources.mapping_count]));
-            try self.captureStorageBuffers(vertex_storage, prefix, "vertex", null);
+            if (capture_buffers) try self.captureStorageBuffers(vertex_storage, prefix, "vertex", null);
             try self.captureGraphicsImages(graphics_resources, prefix);
             if (capture_target) try self.captureGraphicsTarget(target, prefix, "before");
         }
@@ -16359,7 +16376,7 @@ pub const Renderer = struct {
         if (capture_draw) {
             try dumpDiagnosticBytes(self.allocator, capture_prefix, ".fragment-scalars", std.mem.sliceAsBytes(fragment_scalar_regs[0..fragment_scalar_count]));
             try dumpDiagnosticBytes(self.allocator, capture_prefix, ".fragment-mappings", std.mem.sliceAsBytes(fragment_storage.mappings[0..fragment_storage.mapping_count]));
-            try self.captureStorageBuffers(fragment_storage, capture_prefix, "fragment", vertex_storage);
+            if (capture_buffers) try self.captureStorageBuffers(fragment_storage, capture_prefix, "fragment", vertex_storage);
         }
         if (self.shouldReportFragmentResources(fragment_address)) {
             std.debug.print(
@@ -18231,6 +18248,7 @@ pub const Renderer = struct {
         };
         self.device_functions.update_descriptor_sets(self.device, 1, @ptrCast(&write), 0, null);
         self.active_storage_buffers[descriptor_index] = buffer;
+        self.active_storage_offsets[descriptor_index] = offset;
         if (self.draw_upload_buffer) |ring| {
             if (buffer == ring.handle) self.draw_upload_batch_uses_ring = true;
         }
@@ -19337,6 +19355,7 @@ pub const Renderer = struct {
 
     fn captureStorageBuffers(self: *Renderer, resources: *const ComputeResources, prefix: []const u8, phase: []const u8, already_captured: ?*const ComputeResources) !void {
         const bound = self.active_storage_buffers;
+        const bound_offsets = self.active_storage_offsets;
         var uploaded: [maximum_storage_descriptors]bool = @splat(false);
         var total: usize = 0;
         // A readback wait clears upload-cache metadata. Snapshot every bound
@@ -19348,17 +19367,27 @@ pub const Renderer = struct {
             if (already_captured) |earlier| if (earlier.occupied[slot]) continue;
             if (address == 0 or size == 0) continue;
             const range = diagnosticBufferRange(address, size, phase) orelse continue;
-            for (self.draw_upload_cache.items) |cached| {
-                if (cached.guest_address != address or cached.size < size or cached.upload.buffer != bound[slot]) continue;
+            // Resource preparation can submit work and clear the upload lookup
+            // even before this first capture. The live descriptor's buffer and
+            // offset, rather than that cache, identify its pinned snapshot.
+            const transient = if (self.draw_upload_buffer != null and self.draw_upload_buffer.?.handle == bound[slot])
+                self.draw_upload_buffer
+            else found: {
+                for (self.draw_upload_spills.items) |spill| {
+                    if (spill.handle == bound[slot]) break :found @as(?OwnedBuffer, spill);
+                }
+                break :found null;
+            };
+            if (transient) |buffer| {
+                if (bound_offsets[slot] > buffer.size or size > buffer.size - bound_offsets[slot]) return Error.GuestBufferNotStaged;
                 if (range.size > 64 * 1024 * 1024 or total + range.size > 512 * 1024 * 1024) return error.DiagnosticBufferLimit;
-                const mapping = try self.mapDrawUpload(cached.upload);
+                const mapping = try self.mapDrawUpload(.{ .buffer = buffer.handle, .offset = bound_offsets[slot], .size = size });
                 defer mapping.release(self);
                 var suffix_buffer: [96]u8 = undefined;
                 const suffix = try std.fmt.bufPrint(&suffix_buffer, "-{s}-buffer-{d}-{x}.bin", .{ phase, slot, address + range.offset });
                 try dumpDiagnosticBytes(self.allocator, prefix, suffix, mapping.bytes[range.offset..][0..range.size]);
                 uploaded[slot] = true;
                 total += range.size;
-                break;
             }
         }
         for (resources.addresses, resources.sizes, 0..) |address, size, slot| {
@@ -19369,11 +19398,14 @@ pub const Renderer = struct {
             const entry = for (self.guest_buffers.items) |*candidate| {
                 if (candidate.guest_address == address and candidate.size == size and candidate.device_local.handle == bound[slot]) break candidate;
             } else return Error.GuestBufferNotStaged;
-            const mapping = try self.mapStorageReadback(entry, range.offset + range.size);
+            const buffer_offset = std.math.cast(usize, bound_offsets[slot]) orelse return Error.GuestBufferNotStaged;
+            const range_start = std.math.add(usize, buffer_offset, range.offset) catch return Error.GuestBufferNotStaged;
+            const range_end = std.math.add(usize, range_start, range.size) catch return Error.GuestBufferNotStaged;
+            const mapping = try self.mapStorageReadback(entry, range_end);
             defer mapping.release(self);
             var suffix_buffer: [96]u8 = undefined;
             const suffix = try std.fmt.bufPrint(&suffix_buffer, "-{s}-buffer-{d}-{x}.bin", .{ phase, slot, address + range.offset });
-            try dumpDiagnosticBytes(self.allocator, prefix, suffix, mapping.bytes[range.offset..][0..range.size]);
+            try dumpDiagnosticBytes(self.allocator, prefix, suffix, mapping.bytes[range_start..range_end]);
             total += range.size;
         }
     }
@@ -21042,6 +21074,7 @@ pub const Renderer = struct {
         self.descriptor_set = self.descriptor_sets[0];
         self.active_descriptor_set = null;
         @memset(&self.active_storage_buffers, 0);
+        @memset(&self.active_storage_offsets, 0);
         self.dynamic_scalar_mapping = self.dynamic_scalar_mapping_base;
     }
 
@@ -21104,6 +21137,7 @@ pub const Renderer = struct {
         self.descriptor_set = self.descriptor_sets[slot];
         self.active_descriptor_set = null;
         @memset(&self.active_storage_buffers, 0);
+        @memset(&self.active_storage_offsets, 0);
         const base = self.dynamic_scalar_mapping_base orelse return Error.InvalidStorageDescriptor;
         const word_offset = slot * descriptor_scalar_stride / @sizeOf(u32);
         self.dynamic_scalar_mapping = base + word_offset;
