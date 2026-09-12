@@ -714,6 +714,111 @@ pub fn validateStorageBufferBindings(bindings: []const StorageBufferBinding, des
     }
 }
 
+/// Validate exact T#/S#/PC associations without comparing every pair in a
+/// large material table. A binding without candidate words occupies its whole
+/// site; table candidates at that site must have distinct eight-word keys.
+pub fn validateSampledImageBindings(allocator: std.mem.Allocator, bindings: []const SampledImageBinding, descriptor_count: u32) Error!void {
+    const Site = struct { resource: u32, sampler: u32, pc: ?u32 };
+    const Candidate = struct { site: Site, words: [8]u32 };
+    var sites: std.AutoHashMapUnmanaged(Site, bool) = .empty;
+    defer sites.deinit(allocator);
+    var candidates: std.AutoHashMapUnmanaged(Candidate, void) = .empty;
+    defer candidates.deinit(allocator);
+    for (bindings, 0..) |binding, index| {
+        if (binding.resource_sgpr >= 128 or binding.sampler_sgpr >= 128 or
+            (binding.candidate_words != null and binding.resource_sgpr + 4 > 128) or
+            binding.descriptor_index >= descriptor_count)
+            return Error.InvalidStorageBinding;
+
+        // Most shaders have only a handful of images. Keep that path free of
+        // allocations, and bound the quadratic work to these small lists.
+        if (bindings.len <= 32) {
+            for (bindings[0..index]) |previous| {
+                if (previous.resource_sgpr == binding.resource_sgpr and
+                    previous.sampler_sgpr == binding.sampler_sgpr and
+                    previous.instruction_pc == binding.instruction_pc and
+                    (previous.candidate_words == null or binding.candidate_words == null or
+                        std.mem.eql(u32, &previous.candidate_words.?, &binding.candidate_words.?)))
+                    return Error.InvalidStorageBinding;
+            }
+            continue;
+        }
+        const site = Site{ .resource = binding.resource_sgpr, .sampler = binding.sampler_sgpr, .pc = binding.instruction_pc };
+        const entry = try sites.getOrPut(allocator, site);
+        if (entry.found_existing) {
+            if (!entry.value_ptr.* or binding.candidate_words == null) return Error.InvalidStorageBinding;
+        } else entry.value_ptr.* = binding.candidate_words != null;
+        if (binding.candidate_words) |words| {
+            const candidate = try candidates.getOrPut(allocator, .{ .site = site, .words = words });
+            if (candidate.found_existing) return Error.InvalidStorageBinding;
+        }
+    }
+}
+
+test "sampled image validation preserves candidate and site identity" {
+    var bindings: [64]SampledImageBinding = undefined;
+    for (&bindings, 0..) |*binding, index| binding.* = .{
+        .resource_sgpr = 12,
+        .sampler_sgpr = 20,
+        .descriptor_index = 0,
+        .candidate_words = .{ 1, 2, 3, 4, 5, 6, 7, @intCast(index) },
+    };
+    // Exercise both the small allocation-free path and the large-table path.
+    for ([_]usize{ 16, 64 }) |count| {
+        const last = &bindings[count - 1];
+        const original = last.*;
+        try validateSampledImageBindings(std.testing.allocator, bindings[0..count], 2);
+        last.* = bindings[0];
+        // Changing the host index or image dimension cannot make a duplicate
+        // guest association unambiguous.
+        last.descriptor_index = 1;
+        last.dimension = .cube;
+        try std.testing.expectError(Error.InvalidStorageBinding, validateSampledImageBindings(std.testing.allocator, bindings[0..count], 2));
+        last.instruction_pc = 0; // PC zero and an unqualified site are distinct.
+        try validateSampledImageBindings(std.testing.allocator, bindings[0..count], 2);
+        last.instruction_pc = null;
+        last.sampler_sgpr = 24;
+        try validateSampledImageBindings(std.testing.allocator, bindings[0..count], 2);
+        last.sampler_sgpr = 20;
+        last.resource_sgpr = 16;
+        try validateSampledImageBindings(std.testing.allocator, bindings[0..count], 2);
+        last.* = original;
+        last.candidate_words = null;
+        try std.testing.expectError(Error.InvalidStorageBinding, validateSampledImageBindings(std.testing.allocator, bindings[0..count], 2));
+        last.* = original;
+        const first = bindings[0];
+        bindings[0].candidate_words = null;
+        try std.testing.expectError(Error.InvalidStorageBinding, validateSampledImageBindings(std.testing.allocator, bindings[0..count], 2));
+        bindings[0] = first;
+        last.descriptor_index = 2;
+        try std.testing.expectError(Error.InvalidStorageBinding, validateSampledImageBindings(std.testing.allocator, bindings[0..count], 2));
+        last.* = original;
+        last.resource_sgpr = 125;
+        try std.testing.expectError(Error.InvalidStorageBinding, validateSampledImageBindings(std.testing.allocator, bindings[0..count], 2));
+        last.* = original;
+        last.sampler_sgpr = 128;
+        try std.testing.expectError(Error.InvalidStorageBinding, validateSampledImageBindings(std.testing.allocator, bindings[0..count], 2));
+        last.* = original;
+    }
+}
+
+test "sampled image validation releases partial lookup allocations" {
+    const Check = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var bindings: [64]SampledImageBinding = undefined;
+            for (&bindings, 0..) |*binding, index| binding.* = .{
+                .resource_sgpr = 12,
+                .sampler_sgpr = 20,
+                .descriptor_index = 0,
+                .instruction_pc = @intCast(index / 2),
+                .candidate_words = .{ 1, 2, 3, 4, 5, 6, 7, @intCast(index % 2) },
+            };
+            try validateSampledImageBindings(allocator, &bindings, 1);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+}
+
 const Builder = struct {
     const LaneSpill = struct { vgpr: u32, lane: u32, value: u32, valid: u32 };
     allocator: std.mem.Allocator,
@@ -1286,26 +1391,9 @@ const Builder = struct {
             {
                 return Error.InvalidStorageBinding;
             }
+            try validateSampledImageBindings(allocator, options.sampled_images, sampled_array_length);
             var sampled_dimensions: [4]bool = @splat(false);
-            for (options.sampled_images, 0..) |binding, index| {
-                if (binding.resource_sgpr >= 128 or binding.sampler_sgpr >= 128 or
-                    (binding.candidate_words != null and binding.resource_sgpr + 4 > 128) or
-                    binding.descriptor_index >= sampled_array_length)
-                {
-                    return Error.InvalidStorageBinding;
-                }
-                for (options.sampled_images[0..index]) |previous| {
-                    if (previous.resource_sgpr == binding.resource_sgpr and
-                        previous.sampler_sgpr == binding.sampler_sgpr and
-                        previous.instruction_pc == binding.instruction_pc)
-                    {
-                        if (previous.candidate_words == null or binding.candidate_words == null or
-                            std.mem.eql(u32, &previous.candidate_words.?, &binding.candidate_words.?))
-                        {
-                            return Error.InvalidStorageBinding;
-                        }
-                    }
-                }
+            for (options.sampled_images) |binding| {
                 if (!binding.unbound) sampled_dimensions[sampledImageDimensionIndex(binding.dimension)] = true;
             }
             if (self.vector4_type == 0) {

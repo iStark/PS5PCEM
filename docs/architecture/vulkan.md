@@ -301,6 +301,12 @@ scalar buffers: an empty V# returns zero even when its SOFFSET varies by
 workgroup. Nonempty buffers still require a proven offset. The spill probe
 also checks image selection through an empty index buffer and a masked offset;
 the empty buffer's unmapped base is never read.
+Translation validates large sampled-image tables with exact hash keys for the
+T#/S#/instruction site and all eight candidate words. This avoids a quadratic
+scan while preserving duplicate rejection, including conflicts between a
+whole-site binding and any candidate at that site. Lists of at most 32 images
+keep the allocation-free scan. This changes host validation only; emitted
+shader code and resource selection stay the same.
 For the supported fragment subset, inline 2D/3D image and sampler descriptors are
 decoded from user SGPRs. Compute sampling also recovers descriptors from the
 exact preceding scalar loads or the dispatch SRT after SGPR reuse. Both paths

@@ -94,11 +94,12 @@ pub const Instruction = struct {
 
     unsupported_reason: []const u8 = "",
 
-    /// Whether any source refers to a literal in the following word.
+    /// Number of SGPR words occupied by this MIMG instruction's T#.
     pub fn imageResourceWords(self: Instruction) u32 {
         return if (self.image_r128) 4 else 8;
     }
 
+    /// Whether any source refers to a literal in the following word.
     pub fn hasLiteral(self: Instruction) bool {
         return self.src0.isLiteral() or self.src1.isLiteral() or
             self.src2.isLiteral() or self.src3.isLiteral();
