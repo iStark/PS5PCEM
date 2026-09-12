@@ -45,12 +45,13 @@ pub fn appendMissingPointerLoads(
         }
         if (inst.pc >= prefix_end or inst.pc / 4 >= seen.capacity() or seen.isSet(inst.pc / 4)) continue;
         const destination = scalar.scalarRegisterIndex(inst.dst) orelse continue;
-        if (inst.src0.kind != .sgpr or inst.src0.reg >= 127 or inst.data_words == 0 or
+        const pointer_register = scalar.scalarRegisterIndex(inst.src0) orelse continue;
+        if (pointer_register >= 127 or inst.data_words == 0 or
             inst.data_words > 16 or destination + inst.data_words > 128 or inst.memory_offset < 0) continue;
         if (output.len - end < inst.data_words) break;
         var resolver = Resolver{ .bindings = bindings, .reader = reader, .instructions = instructions, .graph = graph, .snapshot = &empty, .definition_cache = cache };
         var base: [2]u32 = undefined;
-        if (!(resolver.words(inst.src0.reg, inst.pc, &base) catch false) or base[1] > 0xffff) continue;
+        if (!(resolver.words(@intCast(pointer_register), inst.pc, &base) catch false) or base[1] > 0xffff) continue;
         const pointer = @as(u64, base[0]) | (@as(u64, base[1]) << 32);
         if (pointer == 0) continue;
         var offset: [1]u32 = .{0};
@@ -309,6 +310,42 @@ test "missing pointer constants follow branch definitions and stay draw-local" {
     const walked = scalar.evaluateDecodedResourceState(reader, &bindings, &original);
     try std.testing.expectEqual(@as(usize, 1), walked.load_count);
     try std.testing.expectEqual(@as(u32, 8), walked.loads[0].pc);
+}
+
+test "missing VCC pointer loads use both reaching halves and reject clobbers" {
+    const M = struct {
+        fn read(_: ?*anyopaque, address: u64, bytes: []u8) bool {
+            if (address != 0x1000 or bytes.len != 8) return false;
+            std.mem.writeInt(u32, bytes[0..4], 0x3f800000, .little);
+            std.mem.writeInt(u32, bytes[4..8], 0x3e800000, .little);
+            return true;
+        }
+    };
+    const original = [_]rdna2.Instruction{
+        .{ .pc = 0, .opcode = .s_mov_b64, .dst = .{ .kind = .vcc_lo }, .src0 = .{ .kind = .sgpr } },
+        .{ .pc = 4, .opcode = .s_cbranch_execz, .branch_target = 20 },
+        .{ .pc = 8, .opcode = .s_nop },
+        .{ .pc = 12, .opcode = .s_load_dwordx2, .family = .smem, .dst = .{ .kind = .sgpr, .reg = 4 }, .src0 = .{ .kind = .vcc_lo }, .src1 = .{ .kind = .null }, .data_words = 2, .word_count = 2 },
+        .{ .pc = 20, .opcode = .s_endpgm },
+    };
+    var bindings = std.mem.zeroes(shaders.StageBindings);
+    bindings.user_data_count = 2;
+    bindings.user_data[0] = 0x1000;
+    const reader = shaders.MemoryReader{ .context = null, .read_fn = M.read };
+    for (0..3) |variant| {
+        var instructions = original;
+        if (variant != 0) instructions[2] = .{ .pc = 8, .opcode = .v_readfirstlane_b32, .dst = if (variant == 1) .{ .kind = .vcc_lo } else .{ .kind = .vcc_hi }, .src0 = .{ .kind = .vgpr } };
+        var graph = try rdna2.control_flow.buildInstructions(std.testing.allocator, &instructions);
+        defer graph.deinit(std.testing.allocator);
+        var output: [2]rdna2.spirv.ScalarRegister = undefined;
+        const count = appendMissingPointerLoads(&bindings, reader, &instructions, &graph, null, &output, 0, 24);
+        try std.testing.expectEqual(@as(usize, if (variant == 0) 2 else 0), count);
+        if (variant == 0) {
+            try std.testing.expectEqual(@as(u32, 0x3f800000), output[0].value);
+            try std.testing.expectEqual(@as(u32, 0x3e800000), output[1].value);
+            try std.testing.expectEqual(@as(?u32, 12), output[1].producer_pc);
+        }
+    }
 }
 
 test "missing pointer recovery preserves all sixteen words and rejects partial reads" {

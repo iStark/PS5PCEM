@@ -7782,16 +7782,25 @@ fn runBranchedPointerConstantProbe(allocator: std.mem.Allocator) !void {
     defer renderer.deinit();
     var guest = GuestMemory{};
     _ = renderer.dcbBackend(guest.interface());
-    for (0..2) |wide| {
+    for (0..4) |variant| {
+        const wide = variant % 2;
+        const pointer_register: u8 = if (variant < 2) 0 else 106;
         const code = [_]u32{
             vop1(1, 1, 8), // Workgroup index is not a CPU scalar constant.
             0x7d84_0280, // v_cmp_eq_u32 VCC, 0, v1
-            0xbf87_0004, // Runtime branch to the second coefficient.
-            0xf400_1a80,                                 125 << 25, // s_load_dword VCC_LO, s0, 0
-            vop1(1, 2, 106),                             0xbf82_0003,
-            if (wide == 0) 0xf400_1a80 else 0xf410_0400, (125 << 25) | 4,
-            vop1(1, 2, if (wide == 0) 106 else 31),      mubuf(0x1c, 0, 2, 1, 4)[0],
-            mubuf(0x1c, 0, 2, 1, 4)[1],                  0xbf81_0000,
+            0xbf87_0005, // Runtime branch to the second coefficient.
+            sop1(4, pointer_register, 0), // The compare clobbered VCC; restore the pointer in each arm.
+            @as(u32, 0xf400_1a80) | (pointer_register / 2),
+            125 << 25,
+            vop1(1, 2, 106),
+            0xbf82_0004,
+            sop1(4, pointer_register, 0),
+            (if (wide == 0) @as(u32, 0xf400_1a80) else 0xf410_0400) | (pointer_register / 2),
+            (125 << 25) | 4,
+            vop1(1, 2, if (wide == 0) 106 else 31),
+            mubuf(0x1c, 0, 2, 1, 4)[0],
+            mubuf(0x1c, 0, 2, 1, 4)[1],
+            0xbf81_0000,
         };
         for (code, 0..) |word, index| guest.word(0x100 + index * 4, word);
         var state = gpu.State{};
@@ -7810,7 +7819,7 @@ fn runBranchedPointerConstantProbe(allocator: std.mem.Allocator) !void {
             try std.testing.expectEqual(coefficients[0], std.mem.readInt(u32, output[4..8], .little));
         }
     }
-    std.debug.print("branched pointer constants passed: both VCC coefficient paths and changed dispatch data\n", .{});
+    std.debug.print("branched pointer constants passed: SGPR/VCC bases, overlapping VCC destination, 1/16 words and changed dispatch data\n", .{});
 }
 
 fn runScalarPointerProbe(allocator: std.mem.Allocator) !void {
@@ -7819,59 +7828,88 @@ fn runScalarPointerProbe(allocator: std.mem.Allocator) !void {
     defer renderer.deinit();
     var guest = GuestMemory{};
     _ = renderer.dcbBackend(guest.interface());
-    const code = [_]u32{
-        vop1(1, 4, 20), 0xb814_0008, // preserve group index, then multiply by pointer size
-        0xf424_0004, 20 << 25, // s_buffer_load_dwordx2 s0, V#s8, s20
-        0xf408_0100,                 (125 << 25) | 4, // s_load_dwordx4 s4, s0, 4
-        vop1(1, 0, 4),               vop1(1, 1, 5),
-        vop1(1, 2, 6),               vop1(1, 3, 7),
-        mubuf(0x1e, 0, 0, 4, 12)[0], mubuf(0x1e, 0, 0, 4, 12)[1],
-        0xbf81_0000,
-    };
-    for (code, 0..) |word, index| guest.word(0x100 + index * 4, word);
-    var analysis = try gpu.shader_analysis.decode(allocator, .{ .context = &guest, .read_fn = GuestMemory.read }, 0x100, code.len);
-    defer analysis.deinit(allocator);
-    var module = try analysis.translateSpirv(allocator, .{
-        .stage = .compute,
-        .compute_inputs = .{ .workgroup_id_sgprs = .{ 20, null, null } },
-        .storage_buffers = &.{
-            .{ .resource_sgpr = 8, .descriptor_index = 0, .stride = 8 },
-            .{ .resource_sgpr = 12, .descriptor_index = 1, .stride = 16 },
-        },
-        .scalar_memories = &.{
-            .{ .resource_sgpr = 0, .instruction_pc = 16, .descriptor_index = 2 },
-            .{ .resource_sgpr = 0, .instruction_pc = 16, .descriptor_index = 3 },
-        },
-    });
-    defer module.deinit(allocator);
-    const pointers = [_]u64{ 0x1fffffff0, 0x1fffffff8, 0x2fffffff0, 0x200000004, 0x100000000, 0 };
-    const expected = [_][4]u32{
-        .{ 11, 12, 13, 20 }, .{ 13, 20, 21, 22 }, .{ 0, 0, 0, 0 },
-        .{ 22, 23, 0, 0 },   .{ 0, 0, 0, 0 },     .{ 0, 0, 0, 0 },
-    };
-    for (0..2) |pass| {
-        const relocation = @as(u64, @intCast(pass)) << 36;
-        for (pointers, 0..) |pointer, index| {
-            const value = pointer + relocation;
-            guest.word(0x10000 + index * 8, @truncate(value));
-            guest.word(0x10004 + index * 8, @truncate(value >> 32));
-        }
-        for ([_]u64{ 0x1fffffff0, 0x200000000 }, 0..) |base, region| {
-            const at = 0x12000 + region * 0x100;
-            guest.word(at, @truncate(base + relocation));
-            guest.word(at + 4, @truncate((base + relocation) >> 32));
-            for (0..4) |word| guest.word(at + 8 + word * 4, @intCast(10 + region * 10 + word));
-        }
-        _ = try renderer.stageGuestStorageBufferAt(0, 0x10000, pointers.len * 8);
-        _ = try renderer.stageGuestStorageBufferAt(1, 0x11000, pointers.len * 16);
-        _ = try renderer.stageGuestStorageBufferAt(2, 0x12000, 24);
-        _ = try renderer.stageGuestStorageBufferAt(3, 0x12100, 24);
-        _ = try renderer.dispatchSpirv(module.words, .{ pointers.len, 1, 1 });
-        var output: [pointers.len * 16]u8 = undefined;
-        try renderer.readbackGuestStorageBuffer(0x11000, &output);
-        for (expected, 0..) |words, index| for (words, 0..) |word, component| {
-            try std.testing.expectEqual(word, std.mem.readInt(u32, output[index * 16 + component * 4 ..][0..4], .little));
+    for ([_]u32{ 0, 106 }) |pointer_register| {
+        const code = [_]u32{
+            vop1(1, 4, 20), 0xb814_0008, // preserve group index, then multiply by pointer size
+            0xf424_0004 | (pointer_register << 6), 20 << 25, // s_buffer_load_dwordx2 pointer, V#s8, s20
+            0xf408_0100 | (pointer_register / 2), (125 << 25) | 4, // s_load_dwordx4 s4, pointer, 4
+            vop1(1, 0, 4),                        vop1(1, 1, 5),
+            vop1(1, 2, 6),                        vop1(1, 3, 7),
+            mubuf(0x1e, 0, 0, 4, 12)[0],          mubuf(0x1e, 0, 0, 4, 12)[1],
+            0xbf81_0000,
         };
+        for (code, 0..) |word, index| guest.word(0x100 + index * 4, word);
+        var analysis = try gpu.shader_analysis.decode(allocator, .{ .context = &guest, .read_fn = GuestMemory.read }, 0x100, code.len);
+        defer analysis.deinit(allocator);
+        var module = try analysis.translateSpirv(allocator, .{
+            .stage = .compute,
+            .compute_inputs = .{ .workgroup_id_sgprs = .{ 20, null, null } },
+            .scalar_registers = &.{
+                .{ .register = 4, .value = 0xdeadbeef, .producer_pc = 16 },
+                .{ .register = 5, .value = 0xdeadbeef, .producer_pc = 16 },
+                .{ .register = 6, .value = 0xdeadbeef, .producer_pc = 16 },
+                .{ .register = 7, .value = 0xdeadbeef, .producer_pc = 16 },
+            },
+            .storage_buffers = &.{
+                .{ .resource_sgpr = 8, .descriptor_index = 0, .stride = 8 },
+                .{ .resource_sgpr = 12, .descriptor_index = 1, .stride = 16 },
+            },
+            .scalar_memories = &.{
+                .{ .resource_sgpr = pointer_register, .instruction_pc = 16, .descriptor_index = 2 },
+                .{ .resource_sgpr = pointer_register, .instruction_pc = 16, .descriptor_index = 3 },
+            },
+        });
+        defer module.deinit(allocator);
+        const pointers = [_]u64{ 0x1fffffff0, 0x1fffffff8, 0x2fffffff0, 0x200000004, 0x100000000, 0 };
+        const expected = [_][4]u32{
+            .{ 11, 12, 13, 20 }, .{ 13, 20, 21, 22 }, .{ 0, 0, 0, 0 },
+            .{ 22, 23, 0, 0 },   .{ 0, 0, 0, 0 },     .{ 0, 0, 0, 0 },
+        };
+        for (0..2) |pass| {
+            const relocation = @as(u64, @intCast(pass)) << 36;
+            for (pointers, 0..) |pointer, index| {
+                const value = pointer + relocation;
+                guest.word(0x10000 + index * 8, @truncate(value));
+                guest.word(0x10004 + index * 8, @truncate(value >> 32));
+            }
+            for ([_]u64{ 0x1fffffff0, 0x200000000 }, 0..) |base, region| {
+                const at = 0x12000 + region * 0x100;
+                guest.word(at, @truncate(base + relocation));
+                guest.word(at + 4, @truncate((base + relocation) >> 32));
+                for (0..4) |word| guest.word(at + 8 + word * 4, @intCast(10 + region * 10 + word));
+            }
+            _ = try renderer.stageGuestStorageBufferAt(0, 0x10000, pointers.len * 8);
+            _ = try renderer.stageGuestStorageBufferAt(1, 0x11000, pointers.len * 16);
+            _ = try renderer.stageGuestStorageBufferAt(2, 0x12000, 24);
+            _ = try renderer.stageGuestStorageBufferAt(3, 0x12100, 24);
+            _ = try renderer.dispatchSpirv(module.words, .{ pointers.len, 1, 1 });
+            var output: [pointers.len * 16]u8 = undefined;
+            try renderer.readbackGuestStorageBuffer(0x11000, &output);
+            for (expected, 0..) |words, index| for (words, 0..) |word, component| {
+                try std.testing.expectEqual(word, std.mem.readInt(u32, output[index * 16 + component * 4 ..][0..4], .little));
+            };
+        }
+        // Exercise the renderer's candidate-page preparation as well as lowering.
+        // Each workgroup selects a different pointer; the second read crosses 4 KiB.
+        var state = gpu.State{};
+        try state.writeRegister(.shader, 0x20c, 1);
+        try state.writeRegister(.shader, 0x20d, 0);
+        try state.writeRegister(.shader, 0x213, (20 << 1) | (1 << 7));
+        for ([_]u32{ 0x10000, 8 << 16, 2, 0, 0x11000, 16 << 16, 2, 0 }, 0..) |word, index|
+            try state.writeRegister(.shader, 0x248 + @as(u32, @intCast(index)), word);
+        for (0..2) |pass| {
+            for ([_]u32{ 0x18008, 0x1eff8 }, 0..) |pointer, group| {
+                guest.word(0x10000 + group * 8, pointer);
+                guest.word(0x10004 + group * 8, 0);
+                for (0..4) |word| guest.word(pointer + 4 + word * 4, @intCast(100 + pass * 100 + group * 10 + word));
+            }
+            _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 2, 1, 1 });
+            var output: [32]u8 = undefined;
+            try renderer.readbackGuestStorageBuffer(0x11000, &output);
+            for (0..2) |group| for (0..4) |word| {
+                try std.testing.expectEqual(@as(u32, @intCast(100 + pass * 100 + group * 10 + word)), std.mem.readInt(u32, output[group * 16 + word * 4 ..][0..4], .little));
+            };
+        }
     }
     // SOFFSET remains a real register even when it names a word of the V#.
     // The SSBO binding already represents V#'s base; s0 supplies byte offset 8.

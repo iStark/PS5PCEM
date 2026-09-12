@@ -8424,7 +8424,9 @@ pub const Renderer = struct {
         // instead of reinitializing its 512 records for every instruction.
         var scalar = gpu.ScalarEvaluation{};
         for (instructions) |inst| {
-            if (!isPointerScalarLoad(inst.opcode) or inst.src0.kind != .sgpr or inst.src0.reg + 1 >= 128) continue;
+            if (!isPointerScalarLoad(inst.opcode)) continue;
+            const pointer_register = gpu.scalar_provenance.scalarRegisterIndex(inst.src0) orelse continue;
+            if (pointer_register + 1 >= 128) continue;
             if (hasScalarLoadAt(proven_pointer_loads, inst.pc)) continue;
             scalar.registers = scalarRegistersAtCheckpoint(checkpoint_pcs, checkpoint_registers, inst.pc).*;
             const table = try scalarPointerTablePlan(bindings, reader, analysis, &scalar, inst);
@@ -8440,11 +8442,11 @@ pub const Renderer = struct {
                 table_loads[table_load_count] = inst.pc;
                 table_load_count += 1;
             } else {
-                if (scalar.registers[inst.src0.reg].known and scalar.registers[inst.src0.reg + 1].known) continue;
+                if (scalar.registers[pointer_register].known and scalar.registers[pointer_register + 1].known) continue;
                 const known_offset = scalarMemoryOffset(inst, &scalar) orelse continue;
                 if (known_offset < 0) continue;
                 offset = @intCast(known_offset);
-                pointers = (try resolveBufferPointerCandidates(bindings, reader, analysis, &scalar, inst.src0.reg, inst.pc)) orelse continue;
+                pointers = (try resolveBufferPointerCandidates(bindings, reader, analysis, &scalar, @intCast(pointer_register), inst.pc)) orelse continue;
             }
             for (pointers.addresses[0..pointers.count]) |pointer| {
                 const first = (pointer + offset) & ~@as(u64, 3);
@@ -8478,14 +8480,16 @@ pub const Renderer = struct {
         // a dynamic offset into a page discovered by a neighbouring load.
         // The shader checks both address halves and each word's buffer range.
         for (instructions) |inst| {
-            if (!isPointerScalarLoad(inst.opcode) or inst.src0.kind != .sgpr or inst.src0.reg + 1 >= 128) continue;
+            if (!isPointerScalarLoad(inst.opcode)) continue;
+            const pointer_register = gpu.scalar_provenance.scalarRegisterIndex(inst.src0) orelse continue;
+            if (pointer_register + 1 >= 128) continue;
             if (hasScalarLoadAt(proven_pointer_loads, inst.pc)) continue;
             const registers = scalarRegistersAtCheckpoint(checkpoint_pcs, checkpoint_registers, inst.pc);
-            if (registers[inst.src0.reg].known and registers[inst.src0.reg + 1].known and
+            if (registers[pointer_register].known and registers[pointer_register + 1].known and
                 std.mem.indexOfScalar(u32, table_loads[0..table_load_count], inst.pc) == null) continue;
             for (slots[0..page_count]) |slot| {
                 if (result.scalar_memory_count == result.scalar_memories.len) return Error.InvalidStorageDescriptor;
-                result.scalar_memories[result.scalar_memory_count] = .{ .resource_sgpr = inst.src0.reg, .instruction_pc = inst.pc, .descriptor_index = slot };
+                result.scalar_memories[result.scalar_memory_count] = .{ .resource_sgpr = @intCast(pointer_register), .instruction_pc = inst.pc, .descriptor_index = slot };
                 result.scalar_memory_count += 1;
             }
         }
@@ -27295,7 +27299,9 @@ fn scalarPointerTablePlan(
     scalar: *const gpu.ScalarEvaluation,
     load: gpu.ShaderInstruction,
 ) anyerror!?ScalarPointerTablePlan {
-    if (!isPointerScalarLoad(load.opcode) or load.src0.kind != .sgpr or load.memory_offset < 0) return null;
+    if (!isPointerScalarLoad(load.opcode) or load.memory_offset < 0) return null;
+    const pointer_register = gpu.scalar_provenance.scalarRegisterIndex(load.src0) orelse return null;
+    if (pointer_register + 1 >= 128) return null;
     const offset_register = gpu.scalar_provenance.scalarRegisterIndex(load.src1) orelse return null;
     const instructions = analysis.program.instructions.items;
     var load_index: usize = 0;
@@ -27335,7 +27341,7 @@ fn scalarPointerTablePlan(
     const length = @as(u64, count - 1) * step + @as(u64, load.data_words) * 4;
     if (length > 1024 * 1024 or first + length > std.math.maxInt(u32)) return null;
     var words: [2]u32 = undefined;
-    if (!try resolver.words(load.src0.reg, load.pc, &words) or words[1] > 0xffff) return null;
+    if (!try resolver.words(@intCast(pointer_register), load.pc, &words) or words[1] > 0xffff) return null;
     const base = @as(u64, words[0]) | (@as(u64, words[1]) << 32);
     if (base == 0 or base + first + length > 0x1_0000_0000_0000) return null;
     return .{ .base = base, .first = first, .step = step, .count = count };

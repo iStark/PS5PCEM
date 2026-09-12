@@ -8345,9 +8345,11 @@ const Builder = struct {
         const zero = try self.constant(.bits32, 0);
         var values: [16]u32 = @splat(zero);
         if (inst.data_words > values.len) return Error.UnsupportedBufferAddressing;
+        const pointer_register = registerIndex(inst.src0) orelse return Error.UnsupportedBufferAddressing;
+        if (pointer_register >= 127) return Error.UnsupportedBufferAddressing;
         var matched = false;
         for (self.scalar_memory_bindings) |binding| {
-            if (binding.instruction_pc == inst.pc and inst.src0.kind == .sgpr and binding.resource_sgpr == inst.src0.reg) matched = true;
+            if (binding.instruction_pc == inst.pc and binding.resource_sgpr == pointer_register) matched = true;
         }
         if (!matched and self.snapshot_unbound_reads) {
             if (self.flat_memory_bindings.len == 0 or inst.memory_offset < 0) return Error.UnsupportedBufferAddressing;
@@ -8376,7 +8378,7 @@ const Builder = struct {
                 addresses[word][0] = try self.andBits(addresses[word][0], 0xffff_fffc);
             }
             for (self.scalar_memory_bindings) |binding| {
-                if (binding.instruction_pc != inst.pc or binding.resource_sgpr != inst.src0.reg) continue;
+                if (binding.instruction_pc != inst.pc or binding.resource_sgpr != pointer_register) continue;
                 const host_binding = StorageBufferBinding{ .resource_sgpr = binding.resource_sgpr, .descriptor_index = binding.descriptor_index };
                 const header = BufferAddress{ .binding = host_binding, .byte_offset = zero };
                 const base_low = try self.loadBufferWord(header, 0);
@@ -9549,8 +9551,8 @@ const Builder = struct {
         // A mapped pointer load may visit several table entries in a loop.
         // Its runtime address must win over a scalar evaluator's snapshot.
         for (self.scalar_memory_bindings) |binding| {
-            if (binding.instruction_pc == inst.pc and inst.src0.kind == .sgpr and
-                binding.resource_sgpr == inst.src0.reg) return false;
+            if (binding.instruction_pc == inst.pc and
+                binding.resource_sgpr == registerIndex(inst.src0)) return false;
         }
 
         // A bound V# is the source of truth for s_buffer_load. Read its live
