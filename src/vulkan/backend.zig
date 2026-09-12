@@ -2074,6 +2074,9 @@ const FrameProfile = struct {
     sampled_retire_wait_calls: u64 = 0,
     sampled_retire_blocked_calls: u64 = 0,
     sampled_retire_fence_ns: u64 = 0,
+    draw_upload_wraps: u64 = 0,
+    draw_upload_spills: u64 = 0,
+    draw_upload_spill_bytes: u64 = 0,
     feedback_snapshots: u64 = 0,
     feedback_snapshot_bytes: u64 = 0,
     storage_image_evictions: u64 = 0,
@@ -3324,6 +3327,8 @@ pub const Renderer = struct {
     draw_upload_buffer: ?OwnedBuffer = null,
     draw_upload_mapping: ?[*]u8 = null,
     draw_upload_offset: usize = 0,
+    draw_upload_batch_uses_ring: bool = false,
+    draw_upload_spills: std.ArrayList(OwnedBuffer) = .empty,
     /// Exact guest ranges already snapshotted into the current draw arena.
     /// Command-processor writes and dispatches close the batch before they can
     /// invalidate these entries, so later draws may safely reuse each slice.
@@ -4421,6 +4426,8 @@ pub const Renderer = struct {
         for (self.imported_allocations.items) |allocation| self.releaseImportedAllocation(allocation);
         self.imported_allocations.deinit(self.allocator);
         self.draw_upload_cache.deinit(self.allocator);
+        for (self.draw_upload_spills.items) |buffer| self.destroyBuffer(buffer);
+        self.draw_upload_spills.deinit(self.allocator);
         if (self.linear_upload_buffer) |buffer| self.destroyBuffer(buffer);
         if (self.magnify_source_image) |image| self.destroyImage(image);
         if (self.draw_upload_buffer) |buffer| {
@@ -5472,8 +5479,9 @@ pub const Renderer = struct {
                     };
                 }
                 const upload = try self.allocateDrawUpload(size);
-                const mapping = self.draw_upload_mapping orelse return Error.MemoryMapFailed;
-                const destination = mapping[@intCast(upload.offset)..][0..size];
+                const mapping = try self.mapDrawUpload(upload);
+                defer mapping.release(self);
+                const destination = mapping.bytes;
                 if (!memory.read(memory.context, guest_address, destination)) {
                     return Error.GuestMemoryReadFailed;
                 }
@@ -6686,8 +6694,9 @@ pub const Renderer = struct {
             self.device_functions.cmd_pipeline_barrier(command_buffer, vk.pipeline_stage_compute_shader_bit, vk.pipeline_stage_host_bit, 0, 0, null, 1, @ptrCast(&barrier), 0, null);
             try self.submitOneShot(command_buffer);
             try self.waitForSubmittedWork();
-            const mapping = self.draw_upload_mapping orelse return Error.MemoryMapFailed;
-            const record = mapping[@intCast(fault.offset)..][0..16];
+            const mapping = try self.mapDrawUpload(fault);
+            defer mapping.release(self);
+            const record = mapping.bytes[0..16];
             const faults = std.mem.readInt(u32, record[0..4], .little);
             if (faults != 0) {
                 std.debug.print("[vulkan dcb] active unsupported image program=0x{x} accesses={d} first_pc=0x{x} descriptor_prefix=0x{x}\n", .{
@@ -8389,8 +8398,9 @@ pub const Renderer = struct {
                     const slot = result.freeDescriptor() orelse return Error.InvalidStorageDescriptor;
                     if (page_count == pages.len) return Error.InvalidStorageDescriptor;
                     const upload = try self.allocateDrawUpload(bytes.len + 8);
-                    const mapping = self.draw_upload_mapping orelse return Error.MemoryMapFailed;
-                    const destination = mapping[@intCast(upload.offset)..][0 .. bytes.len + 8];
+                    const mapping = try self.mapDrawUpload(upload);
+                    defer mapping.release(self);
+                    const destination = mapping.bytes;
                     std.mem.writeInt(u64, destination[0..8], page, .little);
                     @memcpy(destination[8..], &bytes);
                     self.updateStorageDescriptorRange(slot, upload.buffer, upload.offset, upload.size);
@@ -8672,11 +8682,12 @@ pub const Renderer = struct {
         // Reserve the entire snapshot together, so wrapping the upload ring
         // cannot overwrite a region that this dispatch has not consumed yet.
         const upload = try self.allocateDrawUpload(total);
-        const mapping = self.draw_upload_mapping orelse return Error.MemoryMapFailed;
+        const mapping = try self.mapDrawUpload(upload);
+        defer mapping.release(self);
         var cursor = upload.offset;
         for (regions[0..region_count], 0..) |region, index| {
             try self.flushGuestStorageRange(region.address, region.size);
-            const destination = mapping[@intCast(cursor)..][0 .. region.size + 16 + @as(usize, if (index == 0) 16 else 0)];
+            const destination = mapping.bytes[@intCast(cursor - upload.offset)..][0 .. region.size + 16 + @as(usize, if (index == 0) 16 else 0)];
             std.mem.writeInt(u64, destination[0..8], region.address, .little);
             std.mem.writeInt(u32, destination[8..12], 0, .little);
             std.mem.writeInt(u32, destination[12..16], @intCast(region.size), .little);
@@ -8722,7 +8733,8 @@ pub const Renderer = struct {
         // Lack of a table slot leaves the existing complete comparison path.
         const slot = resources.freeDescriptor() orelse return;
         const upload = try self.allocateDrawUpload(total_words * 4);
-        const mapping = self.draw_upload_mapping orelse return Error.MemoryMapFailed;
+        const mapping = try self.mapDrawUpload(upload);
+        defer mapping.release(self);
         // Hash insertion reads previous entries while probing collisions.
         // The upload arena may be write-combined memory: assemble in cached
         // CPU memory and publish once with a sequential copy instead.
@@ -8748,7 +8760,7 @@ pub const Renderer = struct {
             cursor += group.len;
         }
         std.debug.assert(cursor == total_words);
-        @memcpy(mapping[@intCast(upload.offset)..][0 .. total_words * 4], std.mem.sliceAsBytes(table));
+        @memcpy(mapping.bytes, std.mem.sliceAsBytes(table));
         self.updateStorageDescriptorRange(slot, upload.buffer, upload.offset, upload.size);
         resources.occupied[slot] = true;
         self.frame_profile.upload_bytes +%= upload.size;
@@ -8781,7 +8793,8 @@ pub const Renderer = struct {
         if (total_words == 0) return;
         const slot = resources.freeDescriptor() orelse return Error.InvalidStorageDescriptor;
         const upload = try self.allocateDrawUpload(total_words * 4);
-        const mapping = self.draw_upload_mapping orelse return Error.MemoryMapFailed;
+        const mapping = try self.mapDrawUpload(upload);
+        defer mapping.release(self);
         // Collision probes must read cached CPU memory, not the potentially
         // write-combined upload mapping. Keep only the final copy in the arena.
         try plan.table.ensureTotalCapacity(self.allocator, total_words);
@@ -8806,7 +8819,7 @@ pub const Renderer = struct {
             cursor += group.len;
         }
         std.debug.assert(cursor == total_words);
-        @memcpy(mapping[@intCast(upload.offset)..][0 .. total_words * 4], std.mem.sliceAsBytes(table));
+        @memcpy(mapping.bytes, std.mem.sliceAsBytes(table));
         resources.occupied[slot] = true;
         self.updateStorageDescriptorRange(slot, upload.buffer, upload.offset, total_words * 4);
         self.active_descriptor_set = self.descriptor_set;
@@ -8843,8 +8856,9 @@ pub const Renderer = struct {
         }
         const slot = result.freeDescriptor() orelse return Error.InvalidStorageDescriptor;
         const upload = try self.allocateDrawUpload(16);
-        const mapping = self.draw_upload_mapping orelse return Error.MemoryMapFailed;
-        @memset(mapping[@intCast(upload.offset)..][0..16], 0);
+        const mapping = try self.mapDrawUpload(upload);
+        defer mapping.release(self);
+        @memset(mapping.bytes, 0);
         self.updateStorageDescriptorRange(slot, upload.buffer, upload.offset, 16);
         result.occupied[slot] = true;
         result.sampled_image_fault = upload;
@@ -13156,8 +13170,9 @@ pub const Renderer = struct {
                 defer self.allocator.free(indices);
                 if (!memory.read(memory.context, draw.index_address, indices)) return Error.GuestMemoryReadFailed;
                 index_upload = try self.allocateDrawUpload(bytes);
-                const upload_mapping = self.draw_upload_mapping orelse return Error.MemoryMapFailed;
-                const destination = upload_mapping[@intCast(index_upload.?.offset)..][0..bytes];
+                const upload_mapping = try self.mapDrawUpload(index_upload.?);
+                defer upload_mapping.release(self);
+                const destination = upload_mapping.bytes;
                 @memcpy(destination, indices);
                 self.frame_profile.upload_bytes += bytes;
                 self.frame_profile.index_upload_bytes += bytes;
@@ -13492,8 +13507,9 @@ pub const Renderer = struct {
                 var available_offset = self.draw_upload_offset;
                 if (reserveAlignedRange(&available_offset, draw_upload_ring_bytes, bytes, draw_upload_alignment) != null) {
                     indices = try self.allocateDrawUpload(bytes);
-                    const mapping = self.draw_upload_mapping orelse return Error.MemoryMapFailed;
-                    if (!memory.read(memory.context, draw.index_address, mapping[@intCast(indices.?.offset)..][0..bytes])) return Error.GuestMemoryReadFailed;
+                    const mapping = try self.mapDrawUpload(indices.?);
+                    defer mapping.release(self);
+                    if (!memory.read(memory.context, draw.index_address, mapping.bytes)) return Error.GuestMemoryReadFailed;
                 } else {
                     // A wrap could overwrite storage/scalar snapshots already
                     // bound for this not-yet-recorded draw. Keep them intact.
@@ -14354,6 +14370,77 @@ pub const Renderer = struct {
             }
         }
         return elapsed;
+    }
+
+    /// A rollover must preserve inputs of a draw that has not been recorded yet.
+    pub fn probeDrawUploadRollover(self: *Renderer) anyerror!void {
+        var program = rdna2.Program{ .code = &.{}, .instructions = .empty };
+        defer program.deinit(self.allocator);
+        try program.instructions.appendSlice(self.allocator, &.{
+            .{ .family = .mubuf, .opcode = .buffer_load_dword, .dst = .{ .kind = .vgpr, .reg = 0 }, .src0 = .{ .kind = .vgpr, .reg = 2 }, .src1 = .{ .kind = .sgpr, .reg = 8 }, .src2 = .{ .kind = .integer_inline_constant, .value = 0 }, .src_count = 3, .data_words = 1 },
+            .{ .family = .mubuf, .opcode = .buffer_load_dword, .dst = .{ .kind = .vgpr, .reg = 1 }, .src0 = .{ .kind = .vgpr, .reg = 2 }, .src1 = .{ .kind = .sgpr, .reg = 12 }, .src2 = .{ .kind = .integer_inline_constant, .value = 0 }, .src_count = 3, .data_words = 1 },
+            .{ .family = .mubuf, .opcode = .buffer_store_dword, .dst = .{ .kind = .vgpr, .reg = 0 }, .src0 = .{ .kind = .vgpr, .reg = 2 }, .src1 = .{ .kind = .sgpr, .reg = 16 }, .src2 = .{ .kind = .integer_inline_constant, .value = 0 }, .src_count = 3, .data_words = 1 },
+            .{ .family = .mubuf, .opcode = .buffer_store_dword, .dst = .{ .kind = .vgpr, .reg = 1 }, .src0 = .{ .kind = .vgpr, .reg = 2 }, .src1 = .{ .kind = .sgpr, .reg = 16 }, .src2 = .{ .kind = .integer_inline_constant, .value = 0 }, .src_count = 3, .data_words = 1, .memory_offset = 4 },
+            .{ .family = .sopp, .opcode = .s_endpgm },
+        });
+        for (program.instructions.items, 0..) |*inst, i| inst.pc = @intCast(i * 4);
+        var module = try rdna2.translateProgramSpirv(self.allocator, &program, .{
+            .stage = .compute,
+            .wave32 = true,
+            .local_size = .{ 1, 1, 1 },
+            .storage_buffers = &.{
+                .{ .resource_sgpr = 8, .descriptor_index = 0, .extent_bytes = 16 },
+                .{ .resource_sgpr = 12, .descriptor_index = 1, .extent_bytes = 16 },
+                .{ .resource_sgpr = 16, .descriptor_index = 2, .extent_bytes = 8 },
+            },
+        });
+        defer module.deinit(self.allocator);
+        const pipeline = try self.getComputePipeline(module.words, null);
+        const output = try self.createBuffer(768, vk.buffer_usage_storage_buffer_bit, vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit);
+        defer self.destroyBuffer(output);
+        try self.waitForSubmittedWork();
+        self.draw_upload_offset = 0;
+        var first: DrawUploadSlice = undefined;
+        const expected = [_][2]u8{ .{ 0x11, 0x22 }, .{ 0x11, 0x33 }, .{ 0x44, 0x55 } };
+        for (expected, 0..) |values, pass| {
+            try self.beginFrameDraw();
+            if (pass != 1) {
+                first = try self.allocateDrawUpload(16);
+                const mapping = try self.mapDrawUpload(first);
+                defer mapping.release(self);
+                @memset(mapping.bytes, values[0]);
+            }
+            // The second pass binds the previous ring slice without making
+            // a new ring allocation. That binding must also prevent wrapping.
+            self.updateStorageDescriptorRange(0, first.buffer, first.offset, first.size);
+            if (pass < 2) self.draw_upload_offset = draw_upload_ring_bytes - 2;
+            const second = try self.allocateDrawUpload(16);
+            {
+                const mapping = try self.mapDrawUpload(second);
+                defer mapping.release(self);
+                @memset(mapping.bytes, values[1]);
+            }
+            self.updateStorageDescriptorRange(1, second.buffer, second.offset, second.size);
+            self.updateStorageDescriptorRange(2, output.handle, pass * 256, 8);
+            const commands = try self.beginOneShot();
+            defer self.releaseOneShot(commands);
+            self.device_functions.cmd_bind_pipeline(commands, vk.pipeline_bind_point_compute, pipeline.pipeline);
+            self.device_functions.cmd_bind_descriptor_sets(commands, vk.pipeline_bind_point_compute, self.compute_pipeline_layout, 0, 1, @ptrCast(&self.descriptor_set), 0, null);
+            self.device_functions.cmd_dispatch(commands, 1, 1, 1);
+            const host = vk.BufferMemoryBarrier{ .source_access_mask = vk.access_shader_write_bit, .destination_access_mask = vk.access_host_read_bit, .buffer = output.handle, .offset = pass * 256, .size = 8 };
+            self.device_functions.cmd_pipeline_barrier(commands, vk.pipeline_stage_compute_shader_bit, vk.pipeline_stage_host_bit, 0, 0, null, 1, @ptrCast(&host), 0, null);
+            try self.submitOneShot(commands);
+            // Leave readers queued while the next batch retires its spills.
+        }
+        var observed: [768]u8 = undefined;
+        try self.readMapped(output, &observed);
+        for (expected, 0..) |values, pass| {
+            for (values, 0..) |value, index| try std.testing.expectEqual(@as(u32, value) * 0x01010101, std.mem.readInt(u32, observed[pass * 256 + index * 4 ..][0..4], .little));
+        }
+        try self.finishDrawBatch();
+        try std.testing.expectEqual(@as(usize, 0), self.draw_upload_spills.items.len);
+        try std.testing.expectEqual(@as(u64, 2), self.frame_profile.draw_upload_spills);
+        try std.testing.expectEqual(@as(u64, 1), self.frame_profile.draw_upload_wraps);
     }
 
     /// Measure the same GPU-to-host copy path used by image writebacks.
@@ -18085,6 +18172,9 @@ pub const Renderer = struct {
         };
         self.device_functions.update_descriptor_sets(self.device, 1, @ptrCast(&write), 0, null);
         self.active_storage_buffers[descriptor_index] = buffer;
+        if (self.draw_upload_buffer) |ring| {
+            if (buffer == ring.handle) self.draw_upload_batch_uses_ring = true;
+        }
     }
 
     fn updateGdsDescriptor(self: *Renderer, buffer: OwnedBuffer) void {
@@ -18987,10 +19077,11 @@ pub const Renderer = struct {
             self.device_functions.cmd_pipeline_barrier(command_buffer, source_stage, vk.pipeline_stage_host_bit, 0, 0, null, 1, @ptrCast(&barrier), 0, null);
             try self.submitOneShot(command_buffer);
             try self.waitForSubmittedWork();
-            const mapping = self.draw_upload_mapping orelse return Error.MemoryMapFailed;
-            const faults = std.mem.readInt(u32, mapping[@intCast(fault.offset)..][0..4], .little);
+            const mapping = try self.mapDrawUpload(fault);
+            defer mapping.release(self);
+            const faults = std.mem.readInt(u32, mapping.bytes[0..4], .little);
             if (faults != 0) {
-                const record = mapping[@intCast(fault.offset + fault.size - 16)..][0..16];
+                const record = mapping.bytes[@intCast(fault.size - 16)..][0..16];
                 std.debug.print("[vulkan dcb] FLAT snapshot fault program=0x{x} unmapped_words={d} first_pc=0x{x} address=0x{x} component={d}\n", .{
                     program_address,                               faults,
                     std.mem.readInt(u32, record[0..4], .little),   std.mem.readInt(u64, record[4..12], .little),
@@ -19197,10 +19288,11 @@ pub const Renderer = struct {
             for (self.draw_upload_cache.items) |cached| {
                 if (cached.guest_address != address or cached.size < size or cached.upload.buffer != bound[slot]) continue;
                 if (range.size > 64 * 1024 * 1024 or total + range.size > 512 * 1024 * 1024) return error.DiagnosticBufferLimit;
-                const ring = self.draw_upload_mapping orelse return Error.MemoryMapFailed;
+                const mapping = try self.mapDrawUpload(cached.upload);
+                defer mapping.release(self);
                 var suffix_buffer: [96]u8 = undefined;
                 const suffix = try std.fmt.bufPrint(&suffix_buffer, "-{s}-buffer-{d}-{x}.bin", .{ phase, slot, address + range.offset });
-                try dumpDiagnosticBytes(self.allocator, prefix, suffix, ring[@as(usize, @intCast(cached.upload.offset)) + range.offset ..][0..range.size]);
+                try dumpDiagnosticBytes(self.allocator, prefix, suffix, mapping.bytes[range.offset..][0..range.size]);
                 uploaded[slot] = true;
                 total += range.size;
                 break;
@@ -20853,6 +20945,8 @@ pub const Renderer = struct {
         self: *Renderer,
         allow_draw_uploads: bool,
     ) (Error || std.mem.Allocator.Error)!void {
+        self.retireDrawUploadSpills();
+        self.draw_upload_batch_uses_ring = false;
         self.sampled_image_batch +%= 1;
         try self.refreshGpuProgress();
         // A soft-skipped draw/dispatch may have reserved a descriptor set
@@ -20922,6 +21016,8 @@ pub const Renderer = struct {
 
     fn finishDrawBatch(self: *Renderer) Error!void {
         try self.flushQueuedCommands();
+        self.retireDrawUploadSpills();
+        self.draw_upload_batch_uses_ring = false;
         self.draw_batch_active = false;
         self.draw_uploads_enabled = false;
         if (self.current_descriptor_slot) |slot| {
@@ -20942,9 +21038,21 @@ pub const Renderer = struct {
         );
         if (offset == null) {
             if (bytes > draw_upload_ring_bytes) return Error.GuestBufferTooLarge;
+            // Waiting protects recorded commands, not inputs of the draw
+            // currently being prepared. Keep its ring snapshots intact until
+            // that draw has been recorded; a later batch can wrap the ring.
+            if (self.draw_upload_batch_uses_ring) {
+                self.draw_upload_spills.ensureUnusedCapacity(self.allocator, 1) catch return Error.MemoryAllocationFailed;
+                const spill = try self.createBuffer(bytes, vk.buffer_usage_storage_buffer_bit | vk.buffer_usage_index_buffer_bit, vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit);
+                self.draw_upload_spills.appendAssumeCapacity(spill);
+                self.frame_profile.draw_upload_spills +|= 1;
+                self.frame_profile.draw_upload_spill_bytes +|= bytes;
+                return .{ .buffer = spill.handle, .offset = 0, .size = bytes };
+            }
             try self.waitForSubmittedWork();
             self.draw_upload_offset = 0;
             self.draw_upload_cache.clearRetainingCapacity();
+            self.frame_profile.draw_upload_wraps +|= 1;
             offset = reserveAlignedRange(
                 &self.draw_upload_offset,
                 draw_upload_ring_bytes,
@@ -20953,7 +21061,29 @@ pub const Renderer = struct {
             );
         }
         const buffer = self.draw_upload_buffer orelse return Error.InvalidStorageDescriptor;
+        self.draw_upload_batch_uses_ring = true;
         return .{ .buffer = buffer.handle, .offset = offset orelse return Error.GuestBufferTooLarge, .size = bytes };
+    }
+
+    fn mapDrawUpload(self: *Renderer, upload: DrawUploadSlice) Error!BufferMapping {
+        const ring = self.draw_upload_buffer orelse return Error.InvalidStorageDescriptor;
+        if (upload.buffer == ring.handle) {
+            const mapping = self.draw_upload_mapping orelse return Error.MemoryMapFailed;
+            return .{ .memory = ring.memory, .bytes = mapping[@intCast(upload.offset)..][0..@intCast(upload.size)], .persistent = true };
+        }
+        for (self.draw_upload_spills.items) |buffer| {
+            if (upload.buffer == buffer.handle) return self.mapBufferRange(buffer, @intCast(upload.offset), @intCast(upload.size));
+        }
+        return Error.GuestBufferNotStaged;
+    }
+
+    fn retireDrawUploadSpills(self: *Renderer) void {
+        if (self.draw_upload_spills.items.len == 0) return;
+        // Cached slices can name a spill from the previous batch. Clear those
+        // references before its Vulkan allocation enters timeline retirement.
+        self.draw_upload_cache.clearRetainingCapacity();
+        for (self.draw_upload_spills.items) |buffer| self.destroyBuffer(buffer);
+        self.draw_upload_spills.clearRetainingCapacity();
     }
 
     fn deferVulkanObject(self: *Renderer, object: DeferredVulkanObject) void {
@@ -22320,6 +22450,7 @@ pub const Renderer = struct {
                     @min(@atomicLoad(u64, &sampled_retirement_slack_bytes, .monotonic), self.sampled_image_cache_budget_bytes / 8) / 1024,
                 },
             );
+            std.debug.print("[gpu uploads] flip={d} wraps={d} spills={d} spill_kib={d}\n", .{ self.flip_callbacks, profile.draw_upload_wraps, profile.draw_upload_spills, profile.draw_upload_spill_bytes / 1024 });
             std.debug.print(
                 "[gpu draw] flip={d} shader_check_ms={d} storage_ms={d} setup_ms={d} pipeline_lookup_ms={d} scalar_upload_ms={d} record_ms={d}\n",
                 .{
@@ -29545,6 +29676,7 @@ test "a descriptor reused after an intermediate flush remains reserved by queued
     renderer.completed_tick = 7;
     renderer.guest_buffers = .empty;
     renderer.active_storage_buffers = @splat(0);
+    renderer.draw_upload_spills = .empty;
     renderer.deferred_vulkan_objects = .empty;
     renderer.pending_command_buffers = .empty;
     defer renderer.pending_command_buffers.deinit(std.testing.allocator);

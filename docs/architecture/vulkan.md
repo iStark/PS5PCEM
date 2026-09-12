@@ -193,6 +193,14 @@ with an exact descriptor range. These snapshots retain the existing batch,
 submission and upload-ring invalidation boundaries. Vulkan objects used
 by recorded commands carry the batch's retirement tick. A submit signals the
 timeline semaphore once for every command-buffer prefix in that batch.
+An upload-ring rollover must also preserve snapshots of the draw currently
+being prepared: waiting for submitted work cannot protect an unrecorded draw.
+Once that draw allocates or binds a ring slice, further uploads that do not fit
+use temporary buffers. The next descriptor batch retires those buffers against
+their submitted/queued timeline tick and can wrap the ring normally. Index,
+lookup, fault-record and captured-buffer access all map the actual backing.
+`--draw-upload-rollover` checks new and rebound inputs across queued batches in
+both host mapping modes; `[gpu uploads]` reports wraps and spill allocations.
 Compatibility mode immediately waits for the submitted tick;
 `PS5_GPU_TIMELINE_SCHEDULER=1` instead reuses command buffers, descriptor sets,
 storage-image leases, and deferred objects only after their owning tick has
