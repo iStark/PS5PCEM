@@ -988,6 +988,10 @@ fn executeScalar(result: *Evaluation, program_address: u64, inst: rdna2.Instruct
         return;
     }
 
+    // A failed wide logical operation must also forget its condition code.
+    // Otherwise a lane-dependent mask can reuse an earlier true comparison
+    // and keep the resource walk on a conditional back edge indefinitely.
+    if (isBitwise64(inst.opcode)) scc.* = null;
     const a = source(result, inst.src0) orelse {
         invalidateDestination(result, inst.dst, destinationWords(inst.opcode));
         return;
@@ -996,7 +1000,7 @@ fn executeScalar(result: *Evaluation, program_address: u64, inst: rdna2.Instruct
     const combined_sources = if (b) |value| Sources.merge(a.sources, value.sources) else a.sources;
 
     if (destinationWords(inst.opcode) == 2) {
-        executeScalar64(result, inst, a, b, combined_sources, scc.*);
+        executeScalar64(result, inst, a, b, combined_sources, scc);
         return;
     }
     if (inst.opcode == .s_ff1_i32_b64) {
@@ -1192,7 +1196,7 @@ fn executeScalar64(
     a: ScalarValue,
     b: ?ScalarValue,
     sources: Sources,
-    scc: ?bool,
+    scc: *?bool,
 ) void {
     const destination = scalarRegisterIndex(inst.dst) orelse return;
     if (destination + 1 >= maximum_scalar_registers) {
@@ -1205,6 +1209,10 @@ fn executeScalar64(
     };
     var all_sources = Sources.merge(sources, wide_a.sources);
     const av = wide_a.value;
+    if (inst.src_count >= 2 and b == null) {
+        invalidateDestination(result, inst.dst, 2);
+        return;
+    }
     var bv: u64 = 0;
     if (b) |low| {
         // BFE's data is 64-bit, but its packed offset/width is one SGPR.
@@ -1223,7 +1231,7 @@ fn executeScalar64(
     }
     const value: ?u64 = switch (inst.opcode) {
         .s_mov_b64 => av,
-        .s_cselect_b64 => if (scc) |condition|
+        .s_cselect_b64 => if (scc.*) |condition|
             if (condition) av else bv
         else
             null,
@@ -1245,6 +1253,7 @@ fn executeScalar64(
         else => null,
     };
     if (value) |known| {
+        if (isBitwise64(inst.opcode)) scc.* = known != 0;
         write(result, inst.dst, @truncate(known), all_sources, inst.pc);
         result.registers[destination + 1] = .{ .known = true, .value = @truncate(known >> 32), .sources = all_sources, .producer_pc = inst.pc };
     } else invalidateDestination(result, inst.dst, 2);
@@ -1373,6 +1382,13 @@ fn destinationWords(opcode: rdna2.Opcode) u8 {
 fn isComparison(opcode: rdna2.Opcode) bool {
     return switch (opcode) {
         .s_cmp_eq_i32, .s_cmp_lg_i32, .s_cmp_gt_i32, .s_cmp_ge_i32, .s_cmp_lt_i32, .s_cmp_le_i32, .s_cmp_eq_u32, .s_cmp_lg_u32, .s_cmp_gt_u32, .s_cmp_ge_u32, .s_cmp_lt_u32, .s_cmp_le_u32, .s_cmp_eq_u64, .s_cmp_lg_u64, .s_bitcmp0_b32, .s_bitcmp1_b32 => true,
+        else => false,
+    };
+}
+
+fn isBitwise64(opcode: rdna2.Opcode) bool {
+    return switch (opcode) {
+        .s_and_b64, .s_or_b64, .s_xor_b64, .s_andn2_b64, .s_orn2_b64, .s_nand_b64, .s_nor_b64, .s_xnor_b64 => true,
         else => false,
     };
 }
@@ -1703,6 +1719,59 @@ test "scalar logical results update SCC and forget unknown operands" {
         try std.testing.expectEqual(@as(?bool, null), scc);
         try std.testing.expect(state.register(8) == null);
     }
+}
+
+test "64-bit bitwise operations replace SCC using both result words" {
+    const cases = [_]struct { opcode: rdna2.Opcode, a: u64, b: u64, expected: u64 }{
+        .{ .opcode = .s_and_b64, .a = 0x100000000, .b = 0x100000000, .expected = 0x100000000 },
+        .{ .opcode = .s_or_b64, .a = 0, .b = 0x8000000000000000, .expected = 0x8000000000000000 },
+        .{ .opcode = .s_xor_b64, .a = 0x100000001, .b = 0x100000001, .expected = 0 },
+        .{ .opcode = .s_andn2_b64, .a = 0x100000001, .b = 1, .expected = 0x100000000 },
+        .{ .opcode = .s_orn2_b64, .a = 0, .b = 0xffffffff, .expected = 0xffffffff00000000 },
+        .{ .opcode = .s_nand_b64, .a = 0xffffffffffffffff, .b = 0xffffffffffffffff, .expected = 0 },
+        .{ .opcode = .s_nor_b64, .a = 0xffffffff00000000, .b = 0xffffffff, .expected = 0 },
+        .{ .opcode = .s_xnor_b64, .a = 0xffffffff00000000, .b = 0, .expected = 0xffffffff },
+    };
+    for (cases) |case| {
+        const inst = rdna2.Instruction{ .opcode = case.opcode, .dst = .{ .kind = .sgpr, .reg = 8 }, .src0 = .{ .kind = .sgpr, .reg = 4 }, .src1 = .{ .kind = .sgpr, .reg = 6 }, .src_count = 2 };
+        var state = Evaluation{};
+        const words = [_]u32{ @truncate(case.a), @truncate(case.a >> 32), @truncate(case.b), @truncate(case.b >> 32) };
+        for (words, 4..) |word, index| state.registers[index] = .{ .known = true, .value = word };
+        var scc: ?bool = case.expected == 0;
+        executeScalar(&state, 0, inst, &scc);
+        try std.testing.expectEqual(@as(u32, @truncate(case.expected)), state.register(8).?.value);
+        try std.testing.expectEqual(@as(u32, @truncate(case.expected >> 32)), state.register(9).?.value);
+        try std.testing.expectEqual(@as(?bool, case.expected != 0), scc);
+        for (4..8) |unknown| {
+            var partial = state;
+            partial.registers[unknown] = .{};
+            scc = true;
+            executeScalar(&partial, 0, inst, &scc);
+            try std.testing.expect(scc == null);
+            try std.testing.expect(partial.register(8) == null and partial.register(9) == null);
+        }
+    }
+}
+
+test "unknown 64-bit loop masks cannot reuse an earlier true SCC" {
+    var storage = [_]u8{0} ** 4;
+    var memory = TestMemory{ .base = 0x4000, .bytes = &storage };
+    memory.write(0x4000, 0x3f800000);
+    var bindings = testBindings(0x3000, 0x4000);
+    bindings.resource_instruction_budget = 64;
+    const instructions = [_]rdna2.Instruction{
+        .{ .pc = 0, .opcode = .s_cmp_lg_u32, .src0 = .{ .kind = .integer_inline_constant, .value = 1 }, .src1 = .{ .kind = .integer_inline_constant }, .src_count = 2, .word_count = 1 },
+        .{ .pc = 4, .opcode = .s_andn2_b64, .dst = .{ .kind = .sgpr, .reg = 4 }, .src0 = .{ .kind = .sgpr, .reg = 4 }, .src1 = .{ .kind = .sgpr, .reg = 6 }, .src_count = 2, .word_count = 1 },
+        .{ .pc = 8, .opcode = .s_cbranch_scc1, .branch_target = 4, .word_count = 1 },
+        .{ .pc = 12, .family = .smem, .opcode = .s_load_dword, .dst = .{ .kind = .vcc_lo }, .src0 = .{ .kind = .sgpr, .reg = 0 }, .src1 = .{ .kind = .null }, .data_words = 1, .word_count = 2 },
+        .{ .pc = 20, .opcode = .s_endpgm, .word_count = 1 },
+    };
+    var snapshots: [1]ScalarRegisters = undefined;
+    const result = evaluateDecodedResourceStateAtCheckpoints(memory.reader(), &bindings, &instructions, &.{20}, &snapshots);
+    try std.testing.expectEqual(StopReason.end_program, result.stop_reason);
+    try std.testing.expectEqual(@as(usize, 1), result.loadSlice().len);
+    try std.testing.expectEqual(@as(u32, 12), result.loadSlice()[0].pc);
+    try std.testing.expectEqual(@as(u32, 0x3f800000), snapshots[0][106].value);
 }
 
 test "uniform guards survive unrelated vector masks without reusing overwritten masks" {
