@@ -506,6 +506,11 @@ fn runSampledStorageRefreshCase(allocator: std.mem.Allocator, buffer_writer: boo
         }
         for (0..2) |repeat| {
             const misses_before = renderer.texture_cache_misses;
+            if (buffer_writer and repeat != 0 and phase != 0) {
+                // Binding the unchanged allocation as an SSBO reader does
+                // not produce a new texture content epoch.
+                _ = try renderer.stageGuestStorageBufferAt(31, source, 65536 * 4);
+            }
             _ = try reader.execute(&stream);
             var data: [16]u8 = undefined;
             try renderer.readbackGuestStorageBuffer(output, &data);

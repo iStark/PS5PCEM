@@ -1047,6 +1047,8 @@ const GuestBufferEntry = struct {
     device_local: OwnedBuffer,
     host_transfer: ?OwnedBuffer = null,
     last_used_sequence: u64,
+    /// Content epoch advances on GPU writes, independently of cache reads.
+    last_written_sequence: u64 = 0,
     /// Pending until the recorded consumer receives a submission timeline tick.
     last_gpu_use: u64 = 0,
     gpu_dirty: bool = false,
@@ -5214,6 +5216,7 @@ pub const Renderer = struct {
                         changed.device_local = replacement.device;
                         changed.host_transfer = replacement.transfer;
                         changed.last_gpu_use = 0;
+                        changed.last_written_sequence = 0;
                         changed.gpu_dirty = false;
                         changed.page_generation = 0;
                         changed.content_hash = null;
@@ -5325,6 +5328,7 @@ pub const Renderer = struct {
                 victim.guest_address = guest_address;
                 victim.size = size;
                 victim.last_used_sequence = self.guest_buffer_sequence;
+                victim.last_written_sequence = 0;
                 victim.gpu_dirty = false;
                 victim.page_generation = 0;
                 victim.content_hash = null;
@@ -9546,6 +9550,8 @@ pub const Renderer = struct {
     }
 
     fn markGuestBufferWritten(self: *Renderer, entry: *GuestBufferEntry) void {
+        self.guest_buffer_sequence +%= 1;
+        entry.last_written_sequence = self.guest_buffer_sequence;
         entry.gpu_dirty = true;
         entry.content_hash = null;
         if (entry.size >= deferred_storage_write_min_bytes) return;
@@ -20256,12 +20262,13 @@ pub const Renderer = struct {
         }
         // Raw compute buffers can back the same texture allocation. Their
         // deferred writes are not registered as image aliases in either mode.
+        // Read-only SSBO bindings do not change the sampled content epoch.
         var buffer_sequence: u64 = 0;
         var buffer_candidates = self.guest_buffer_address_index.candidates(self.guest_buffers.items, address);
         while (buffer_candidates.next()) |index| {
             const cached = self.guest_buffers.items[index];
             if (cached.guest_address != address) continue;
-            buffer_sequence = @max(buffer_sequence, cached.last_used_sequence);
+            buffer_sequence = @max(buffer_sequence, cached.last_written_sequence);
         }
         return combineSourceGenerations(
             combineSourceGenerations(combineSourceGenerations(generation, target_sequence), storage_sequence),

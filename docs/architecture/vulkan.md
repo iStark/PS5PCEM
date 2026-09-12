@@ -51,6 +51,12 @@ write. Exact-size resident hits remain on the GPU. The `--buffer-view-coherence`
 probe checks both cache modes, small deferred writes and large buffers, including
 preservation of the larger view's tail.
 
+Sampled views of raw storage buffers track the last GPU write separately from
+cache usage. Rebinding an unchanged buffer for reading preserves its sampled
+texture, while a later write invalidates the view even after publication to
+guest memory. The `--sampled-storage-refresh` probe verifies both updates and
+unchanged read bindings alongside storage-image writers and sampler changes.
+
 Without page tracking, clean storage buffers of at least 64 bytes use a
 full-range content fingerprint. Unchanged small constant buffers can therefore
 keep their queued GPU readers and reuse the existing upload. Changed contents
