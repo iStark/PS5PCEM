@@ -3392,14 +3392,22 @@ fn runSampledViewReuseProbe(allocator: std.mem.Allocator) !void {
 }
 
 fn runSampledCacheBudgetProbe(allocator: std.mem.Allocator) !void {
-    try runSampledCacheBudgetCase(allocator, .one_byte);
-    try runSampledCacheBudgetCase(allocator, .bounded_sync);
-    try runSampledCacheBudgetCase(allocator, .bounded_async);
-    try runSampledCacheBudgetCase(allocator, .replace_sync);
+    for ([_]bool{ false, true }) |timeline| {
+        try runSampledCacheBudgetCase(allocator, .one_byte, timeline);
+        try runSampledCacheBudgetCase(allocator, .bounded_sync, timeline);
+        try runSampledCacheBudgetCase(allocator, .bounded_async, timeline);
+        try runSampledCacheBudgetCase(allocator, .replace_sync, timeline);
+        try runSampledCacheBudgetCase(allocator, .bounded_reuse, timeline);
+        try runSampledCacheBudgetCase(allocator, .bounded_reuse_mismatch, timeline);
+    }
 }
 
-fn runSampledCacheBudgetCase(allocator: std.mem.Allocator, mode: enum { one_byte, bounded_sync, bounded_async, replace_sync }) !void {
-    const bounded_case = mode == .bounded_sync or mode == .bounded_async;
+fn runSampledCacheBudgetCase(allocator: std.mem.Allocator, mode: enum { one_byte, bounded_sync, bounded_async, replace_sync, bounded_reuse, bounded_reuse_mismatch }, timeline: bool) !void {
+    const reuse = mode == .bounded_reuse or mode == .bounded_reuse_mismatch;
+    const bounded_case = mode == .bounded_sync or mode == .bounded_async or reuse;
+    const previous_reuse = vulkan.backend.sampled_backing_reuse;
+    defer vulkan.backend.sampled_backing_reuse = previous_reuse;
+    vulkan.backend.sampled_backing_reuse = reuse;
     const deferred_retirement = mode == .bounded_async;
     const replace_contents = mode == .replace_sync;
     const previous_slack = vulkan.backend.sampled_retirement_slack_bytes;
@@ -3409,7 +3417,7 @@ fn runSampledCacheBudgetCase(allocator: std.mem.Allocator, mode: enum { one_byte
     const guest = try allocator.create(Memory);
     defer allocator.destroy(guest);
     guest.* = .{};
-    var renderer = try vulkan.Renderer.init(allocator, .{ .defer_small_storage_writes = true });
+    var renderer = try vulkan.Renderer.init(allocator, .{ .defer_small_storage_writes = true, .enable_timeline_scheduler = timeline });
     defer renderer.deinit();
     const Context = struct {
         guest: *Memory,
@@ -3457,6 +3465,11 @@ fn runSampledCacheBudgetCase(allocator: std.mem.Allocator, mode: enum { one_byte
         const source: u32 = @intCast(0x20000 + (if (replace_contents) @as(usize, 0) else round) * 0x200);
         guest.word(source, 0xff60_4020 + @as(u32, @intCast(round)));
         guest.word(source + 0x100, 0xffc0_a080 + @as(u32, @intCast(round)));
+        const width: u16 = if (mode == .bounded_reuse_mismatch and round >= 8) 2 else 1;
+        if (width == 2) {
+            guest.word(source + 4, 0xff60_4020 + @as(u32, @intCast(round)));
+            guest.word(source + 0x104, 0xffc0_a080 + @as(u32, @intCast(round)));
+        }
         if (replace_contents) {
             const first = guest.bytes[source..][0..4].*;
             const second = guest.bytes[source + 0x100 ..][0..4].*;
@@ -3464,8 +3477,8 @@ fn runSampledCacheBudgetCase(allocator: std.mem.Allocator, mode: enum { one_byte
             try std.testing.expect(backend.vtable.write(backend.context, source + 0x100, &second));
         }
         context.advance_at = source + 0x100;
-        const userdata = sampledImageDescriptorWords(source, 1, 1) ++
-            sampledImageDescriptorWords(source + 0x100, 1, 1) ++ [_]u32{ 0, 0, 0, 0, @intCast(0x10000 + round * 0x100), 0, 32, 0 };
+        const userdata = sampledImageDescriptorWords(source, width, 1) ++
+            sampledImageDescriptorWords(source + 0x100, width, 1) ++ [_]u32{ 0, 0, 0, 0, @intCast(0x10000 + round * 0x100), 0, 32, 0 };
         for (userdata, 0..) |word, i| try state.writeRegister(.shader, compute.userDataBase() + @as(u32, @intCast(i)), word);
         _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
         try std.testing.expectEqual(if (bounded_case) @min((round + 1) * 2, 16) else @as(usize, 2), renderer.sampled_image_cache.items.len);
@@ -3481,6 +3494,17 @@ fn runSampledCacheBudgetCase(allocator: std.mem.Allocator, mode: enum { one_byte
         // resident images plus at most two retired images awaiting consumers.
         if (bounded_case and round == 0) renderer.sampled_image_cache_budget_bytes = total * 8;
         if (!replace_contents) try std.testing.expect(renderer.pending_sampled_image_bytes <= renderer.sampled_image_cache_budget_bytes / 8);
+        if (reuse) {
+            // Queue an alternate view before its backing is recycled. Both
+            // views must retain their original texels for earlier consumers.
+            var swapped = userdata;
+            for ([_]usize{ 3, 11 }) |word| swapped[word] = (swapped[word] & ~@as(u32, 0xfff)) | 6 | (5 << 3) | (4 << 6) | (7 << 9);
+            swapped[20] = @intCast(0x14000 + round * 0x100);
+            for (swapped, 0..) |word, i| try state.writeRegister(.shader, compute.userDataBase() + @as(u32, @intCast(i)), word);
+            _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
+            try std.testing.expectEqual(@as(u64, (round + 1) * 2), renderer.sampled_image_uploads);
+            try std.testing.expect(renderer.resident_image_views.items.len >= 2);
+        }
     }
     try std.testing.expectEqual(rounds, context.advances);
     try std.testing.expectEqual(@as(u64, if (replace_contents) 0 else if (bounded_case) 8 else 4), renderer.frame_profile.texture_evictions);
@@ -3488,6 +3512,11 @@ fn runSampledCacheBudgetCase(allocator: std.mem.Allocator, mode: enum { one_byte
     // in the baseline, even when the old images still have queued consumers.
     if (replace_contents) try std.testing.expectEqual(@as(u64, 0), renderer.frame_profile.sampled_retire_wait_calls);
     if (deferred_retirement) try std.testing.expect(renderer.frame_profile.sampled_retire_wait_calls < renderer.frame_profile.texture_evictions);
+    if (reuse) {
+        try std.testing.expectEqual(@as(u64, if (mode == .bounded_reuse) 8 else 0), renderer.frame_profile.sampled_backing_reuses);
+        try std.testing.expectEqual(@as(u64, if (mode == .bounded_reuse) 16 else 24), renderer.frame_profile.sampled_allocate_calls);
+        try std.testing.expectEqual(@as(u64, if (mode == .bounded_reuse) 0 else 8), renderer.frame_profile.sampled_retire_wait_calls);
+    }
     for (0..rounds) |round| {
         var output: [32]u8 = undefined;
         try renderer.readbackGuestStorageBuffer(0x10000 + round * 0x100, &output);
@@ -3499,9 +3528,18 @@ fn runSampledCacheBudgetCase(allocator: std.mem.Allocator, mode: enum { one_byte
             const actual: f32 = @bitCast(std.mem.readInt(u32, output[component * 4 ..][0..4], .little));
             try std.testing.expectApproxEqAbs(expected, actual, 0.0001);
         }
+        if (reuse) {
+            var swapped: [32]u8 = undefined;
+            try renderer.readbackGuestStorageBuffer(0x14000 + round * 0x100, &swapped);
+            for (0..8) |component| {
+                const channel = component % 4;
+                const original = component / 4 * 4 + (if (channel == 3) @as(usize, 3) else 2 - channel);
+                try std.testing.expectEqualSlices(u8, output[original * 4 ..][0..4], swapped[component * 4 ..][0..4]);
+            }
+        }
     }
     try std.testing.expectEqual(@as(u64, 0), renderer.pending_sampled_image_bytes);
-    std.debug.print("sampled cache budget passed: mode={s}, queued consumers, batch protection, exact allocation accounting, evictions={d} retirement waits={d}\n", .{ @tagName(mode), renderer.frame_profile.texture_evictions, renderer.frame_profile.sampled_retire_wait_calls });
+    std.debug.print("sampled cache budget passed: mode={s} timeline={any}, queued consumers, batch protection, exact allocation accounting, evictions={d} retirement waits={d} backing reuses={d}\n", .{ @tagName(mode), timeline, renderer.frame_profile.texture_evictions, renderer.frame_profile.sampled_retire_wait_calls, renderer.frame_profile.sampled_backing_reuses });
 }
 
 fn runSampledViewReuseCase(allocator: std.mem.Allocator, canonical_aliases: bool) !void {

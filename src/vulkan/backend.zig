@@ -38,6 +38,8 @@ pub export var capture_fragment_program: u64 = 0;
 pub export var capture_graphics_target: u64 = 0;
 // Zero preserves synchronous retirement for baseline comparisons.
 pub export var sampled_retirement_slack_bytes: u64 = 0;
+// Opt-in until native comparisons establish visual correctness and benefit.
+pub export var sampled_backing_reuse: bool = false;
 const sampled_lookup_plan = @import("sampled_lookup_plan.zig");
 
 /// Set to true to enable verbose per-frame GPU debug logging.
@@ -744,6 +746,25 @@ const OwnedImage = struct {
     handle: vk.Image,
     memory: vk.DeviceMemory,
     allocation_bytes: vk.DeviceSize = 0,
+};
+
+const SampledBackingKey = struct {
+    flags: u32,
+    image_type: u32,
+    format: u32,
+    extent: vk.Extent3D,
+    mip_levels: u32,
+    array_layers: u32,
+    samples: u32,
+    tiling: u32,
+    usage: u32,
+
+    fn from(info: vk.ImageCreateInfo) ?SampledBackingKey {
+        if (info.p_next != null or info.sharing_mode != vk.sharing_mode_exclusive or
+            info.queue_family_index_count != 0 or info.queue_family_indices != null or
+            info.initial_layout != vk.image_layout_undefined) return null;
+        return .{ .flags = info.flags, .image_type = info.image_type, .format = info.format, .extent = info.extent, .mip_levels = info.mip_levels, .array_layers = info.array_layers, .samples = info.samples, .tiling = info.tiling, .usage = info.usage };
+    }
 };
 
 const DrawUploadSlice = struct {
@@ -2068,6 +2089,7 @@ const FrameProfile = struct {
     sampled_create_calls: u64 = 0,
     sampled_create_ns: u64 = 0,
     sampled_allocate_calls: u64 = 0,
+    sampled_backing_reuses: u64 = 0,
     sampled_allocate_ns: u64 = 0,
     sampled_allocation_retries: u64 = 0,
     sampled_trim_ns: u64 = 0,
@@ -3190,6 +3212,7 @@ fn sampledImageDimensionForInstruction(
 }
 
 const CachedSampledImage = struct {
+    backing_key: ?SampledBackingKey = null,
     alias_token: image_alias.Token,
     guest_address: u64,
     guest_bytes: usize,
@@ -20218,7 +20241,7 @@ pub const Renderer = struct {
         );
         defer if (detiled_upload == null) self.destroyBuffer(upload);
         if (detiled_upload == null) try self.writeMapped(upload, linear);
-        const image = try self.createImageBacking(.{
+        const image_info = vk.ImageCreateInfo{
             .extent = .{ .width = image_width, .height = image_height, .depth = image_depth },
             .array_layers = upload_layers,
             .image_type = if (is_3d) vk.image_type_3d else vk.image_type_2d,
@@ -20228,9 +20251,12 @@ pub const Renderer = struct {
             .usage = vk.image_usage_transfer_dst_bit | vk.image_usage_sampled_bit,
             .samples = vk.sample_count_1_bit,
             .mip_levels = mip_levels,
-        }, true);
+        };
+        const backing_key = SampledBackingKey.from(image_info);
+        const recycled = if (@atomicLoad(bool, &sampled_backing_reuse, .monotonic)) self.recycleSampledBacking(backing_key) else null;
+        const image = recycled orelse try self.createImageBacking(image_info, true);
         errdefer self.destroyImage(image);
-        try self.registerTrackedImage(image.handle, vk.image_aspect_color_bit, mip_levels, upload_layers);
+        if (recycled == null) try self.registerTrackedImage(image.handle, vk.image_aspect_color_bit, mip_levels, upload_layers);
         errdefer self.image_states.forgetImage(image.handle);
 
         const command_buffer = try self.beginOneShot();
@@ -20366,6 +20392,7 @@ pub const Renderer = struct {
         }
 
         try self.sampled_image_cache.append(self.allocator, .{
+            .backing_key = backing_key,
             .alias_token = alias_token,
             .guest_address = descriptor.address,
             .guest_bytes = probe_span,
@@ -20392,6 +20419,40 @@ pub const Renderer = struct {
 
         self.sampled_image_cache_bytes += image.allocation_bytes;
         return .{ .image = image, .view = view, .sampler = sampler };
+    }
+
+    fn recycleSampledBacking(self: *Renderer, requested: ?SampledBackingKey) ?OwnedImage {
+        const key = requested orelse return null;
+        if (self.sampled_image_cache_bytes > self.sampled_image_cache_budget_bytes) return null;
+        const trim_started = hostTimestampNs();
+        defer self.frame_profile.sampled_trim_ns +|= elapsedHostNanoseconds(trim_started);
+        var victim: ?usize = null;
+        var oldest: u64 = std.math.maxInt(u64);
+        for (self.sampled_image_cache.items, 0..) |entry, index| {
+            if (entry.last_used_batch == self.sampled_image_batch) continue;
+            if (victim == null or entry.last_used_batch < oldest) {
+                victim = index;
+                oldest = entry.last_used_batch;
+            }
+        }
+        const index = victim orelse return null;
+        const entry = self.sampled_image_cache.items[index];
+        if (!std.meta.eql(entry.backing_key orelse return null, key)) return null;
+        if (self.sampled_image_cache_bytes +| entry.image.allocation_bytes <= self.sampled_image_cache_budget_bytes and
+            self.sampled_image_cache.items.len < maximum_cached_sampled_images) return null;
+        // Choose exactly the ordinary LRU victim. Keep the image's tracked
+        // usage: the next transfer barrier orders its old queued consumers
+        // before replacing texels. Prepared-but-unrecorded consumers are
+        // protected by last_used_batch and can never reach this path.
+        self.sampled_image_cache_bytes -= entry.image.allocation_bytes;
+        self.destroyImageView(entry.view);
+        self.invalidateResidentImageViews(entry.image.handle);
+        self.image_aliases.unregister(entry.alias_token);
+        _ = self.sampled_image_cache.orderedRemove(index);
+        self.sampled_image_index.invalidate();
+        self.frame_profile.texture_evictions +|= 1;
+        self.frame_profile.sampled_backing_reuses +|= 1;
+        return entry.image;
     }
 
     fn retireSampledImage(self: *Renderer, index: usize) void {
@@ -22434,7 +22495,7 @@ pub const Renderer = struct {
                 .{ self.flip_callbacks, self.storage_image_cache_limit / (1024 * 1024), profile.storage_image_evictions },
             );
             std.debug.print(
-                "[gpu sampled cache] flip={d} creates={d}/{d}us allocs={d}/{d}us retries={d} trim_us={d} retire_waits={d} blocked={d} retire_fence_us={d} pending_kib={d} slack_kib={d}\n",
+                "[gpu sampled cache] flip={d} creates={d}/{d}us allocs={d}/{d}us retries={d} trim_us={d} retire_waits={d} blocked={d} retire_fence_us={d} pending_kib={d} slack_kib={d} reuses={d}\n",
                 .{
                     self.flip_callbacks,
                     profile.sampled_create_calls,
@@ -22448,6 +22509,7 @@ pub const Renderer = struct {
                     profile.sampled_retire_fence_ns / std.time.ns_per_us,
                     self.pending_sampled_image_bytes / 1024,
                     @min(@atomicLoad(u64, &sampled_retirement_slack_bytes, .monotonic), self.sampled_image_cache_budget_bytes / 8) / 1024,
+                    profile.sampled_backing_reuses,
                 },
             );
             std.debug.print("[gpu uploads] flip={d} wraps={d} spills={d} spill_kib={d}\n", .{ self.flip_callbacks, profile.draw_upload_wraps, profile.draw_upload_spills, profile.draw_upload_spill_bytes / 1024 });

@@ -123,6 +123,19 @@ an intermediate colour target advances the frame counter. The
 `--sampled-cache-budget` smoke probe checks this lifetime and memory accounting
 in both modes, including queued consumers whose images have been evicted.
 
+The diagnostic `sampled_backing_reuse` export, disabled by default, can reuse
+the ordinary LRU victim's image and memory when a new upload has identical
+Vulkan creation parameters and would exceed the cache budget or entry limit.
+It preserves the image's tracked usage so transfer barriers order prior queued
+readers before the new upload. Old primary and alternate views retire with
+their consumers; new views preserve the requested swizzle and sampler.
+No idle pool or extra memory allowance is introduced, and an incompatible
+oldest image follows the existing allocation and retirement path. The
+`reuses` counter distinguishes this path from fresh allocations. The budget
+probe checks queued original and swizzled reads before and after reuse, rejects
+different extents, and runs with both fence and timeline scheduling. Native
+FPS and visual comparisons are still required before enabling this by default.
+
 The decoded shader cache holds 1,024 programs. Yotei's opening cinematic
 exceeds the former 512-entry limit and otherwise repeatedly rebuilds shader
 analysis and resource checkpoints within each frame.
