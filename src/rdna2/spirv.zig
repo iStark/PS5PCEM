@@ -98,8 +98,8 @@ pub const SampledImageBinding = struct {
     /// Null is a stage-wide association. Compute shaders can qualify a binding
     /// by PC when the guest reloads the same T#/S# SGPR pair between samples.
     instruction_pc: ?u32 = null,
-    /// A member of a bounded runtime T# table. The shader compares all eight
-    /// descriptor words; aliases with different mips/views remain distinct.
+    /// A member of a bounded runtime T# table. R128 keys have a zero upper
+    /// half; full descriptors retain all eight words, including mip/view data.
     candidate_words: ?[8]u32 = null,
     /// Exact runtime lookup in an SSBO, used instead of a linear comparison
     /// chain when the backend has staged a large candidate set.
@@ -1289,7 +1289,7 @@ const Builder = struct {
             var sampled_dimensions: [4]bool = @splat(false);
             for (options.sampled_images, 0..) |binding, index| {
                 if (binding.resource_sgpr >= 128 or binding.sampler_sgpr >= 128 or
-                    (binding.candidate_words != null and binding.resource_sgpr + 8 > 128) or
+                    (binding.candidate_words != null and binding.resource_sgpr + 4 > 128) or
                     binding.descriptor_index >= sampled_array_length)
                 {
                     return Error.InvalidStorageBinding;
@@ -5540,14 +5540,20 @@ const Builder = struct {
         return result;
     }
 
-    fn loadSampledImage(self: *Builder, binding: SampledImageBinding) Error!u32 {
+    fn loadSampledImage(self: *Builder, binding: SampledImageBinding, inst: instruction.Instruction) Error!u32 {
         const dimension = sampledImageDimensionIndex(binding.dimension);
         var slot = try self.constant(.bits32, binding.descriptor_index);
         if (binding.candidate_words != null) {
             self.uses_nonuniform_sampled_images = true;
             var actual: [8]u32 = undefined;
+            if (binding.resource_sgpr + inst.imageResourceWords() > 128) return Error.InvalidStorageBinding;
             for (&actual, 0..) |*word, index| {
-                word.* = try self.source(.{ .kind = .sgpr, .reg = binding.resource_sgpr + @as(u32, @intCast(index)) }, .bits32);
+                // Keep the lookup's fixed eight-word key without reading
+                // unrelated SGPRs beside a four-word image descriptor.
+                word.* = if (index < inst.imageResourceWords())
+                    try self.source(.{ .kind = .sgpr, .reg = binding.resource_sgpr + @as(u32, @intCast(index)) }, .bits32)
+                else
+                    try self.constant(.bits32, 0);
             }
             if (binding.lookup) |lookup| {
                 const encoded = try self.lookupDescriptor(lookup, &actual);
@@ -5734,7 +5740,7 @@ const Builder = struct {
             const z = try self.source(try imageIntegerAddressOperand(inst, 2), .bits32);
             try self.emit(&self.body, 80, &.{ try self.ensureBitsVec3(), coordinates, x, y, z }); // OpCompositeConstruct
         }
-        const sampled_image = try self.loadSampledImage(binding);
+        const sampled_image = try self.loadSampledImage(binding, inst);
         const image = self.id();
         try self.emit(&self.body, 100, &.{ self.sampled_image_image_types[dimension_index], image, sampled_image }); // OpImage
         if (binding.candidate_words != null) try self.emit(&self.annotations, 71, &.{ image, 5300 }); // NonUniform
@@ -6284,7 +6290,7 @@ const Builder = struct {
                 try self.emit(&self.body, 80, &.{ self.vector2_type, coordinates, coordinate_x, coordinate_y });
             }
         }
-        const sampled_image = try self.loadSampledImage(binding);
+        const sampled_image = try self.loadSampledImage(binding, inst);
         if (inst.image_sample_flags.offset) {
             coordinates = try self.adjustSampleCoordinates(inst, sampled_image, coordinates, image_dimension);
         }
@@ -6590,7 +6596,7 @@ const Builder = struct {
             try self.emit(&self.body, 80, &.{ self.vector2_type, coordinates, raw_x, raw_y });
         }
 
-        const sampled_image = try self.loadSampledImage(binding);
+        const sampled_image = try self.loadSampledImage(binding, inst);
 
         const component: u32 = @ctz(inst.data_mask);
         if (self.stage == .compute or inst.image_sample_flags.lod or compare) {
@@ -8908,7 +8914,7 @@ const Builder = struct {
         const zero = try self.constant(.bits32, 0);
         var nonzero = try self.constantBool(false);
         var first_words: [2]u32 = undefined;
-        for (0..8) |word| {
+        for (0..inst.imageResourceWords()) |word| {
             const value = try self.source(.{ .kind = .sgpr, .reg = inst.src1.reg + @as(u32, @intCast(word)) }, .bits32);
             if (word < 2) first_words[word] = value;
             const either = self.id();

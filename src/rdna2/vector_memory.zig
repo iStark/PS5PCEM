@@ -729,6 +729,12 @@ test "MIMG r128 flag is taken from the first encoding word" {
     const code = [_]u32{ (@as(u32, 0x20) << 18) | (1 << 15), 0 };
     const inst = try decodeMimg(0, &code, 0);
     try std.testing.expect(inst.image_r128);
+    try std.testing.expectEqual(@as(u32, 4), inst.imageResourceWords());
+    const full = try decodeMimg(0xe74, &.{ 0xf088_0808, 0x0261_0e4c }, 0);
+    const compact = try decodeMimg(0xe48, &.{ 0xf088_8808, 0x02f4_0348 }, 0);
+    try std.testing.expectEqual(@as(u32, 8), full.imageResourceWords());
+    try std.testing.expectEqual(@as(u32, 4), compact.imageResourceWords());
+    try std.testing.expectEqual(@as(u32, 80), compact.src1.reg);
 }
 
 test "MIMG floating-point maximum atomic decodes" {

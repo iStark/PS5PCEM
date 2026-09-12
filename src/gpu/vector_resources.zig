@@ -50,7 +50,7 @@ fn predecessors(graph: *const rdna2.control_flow.Graph, from: u32, stop: ?u32, r
     return reached;
 }
 
-/// Each returned tuple identifies eight scalar-to-vector moves which execute
+/// Each returned tuple identifies four or eight scalar-to-vector moves which execute
 /// under one mask. Taking whole tuples avoids a Cartesian product of unrelated
 /// descriptor words. Unknown, partial and lane-shuffled writes are rejected.
 pub fn imageTuples(
@@ -61,10 +61,12 @@ pub fn imageTuples(
     output: []Tuple,
 ) ?usize {
     if (graph.blocks.items.len > maximum_blocks) return null;
+    if (sample_index >= instructions.len) return null;
+    const word_count = instructions[sample_index].imageResourceWords();
     const reachable = definitions.reachableBlocks(graph) orelse return null;
     var reads: Tuple = undefined;
     var vector: u32 = 0;
-    for (&reads, 0..) |*read, component| {
+    for (reads[0..word_count], 0..) |*read, component| {
         const definition = definitions.scalarDefinition(instructions, graph, sample_index, resource + @as(u32, @intCast(component))) orelse return null;
         const index = switch (definition) {
             .entry => return null,
@@ -76,12 +78,12 @@ pub fn imageTuples(
         if (inst.src0.reg != vector + component or (component != 0 and index <= reads[component - 1])) return null;
         read.* = index;
     }
-    for (instructions[reads[0]..reads[7]]) |inst| if (writesExec(inst) or inst.opcode.isBranch()) return null;
+    for (instructions[reads[0]..reads[word_count - 1]]) |inst| if (writesExec(inst) or inst.opcode.isBranch()) return null;
     const read_block = blockAt(graph, reads[0]) orelse return null;
     const ancestors = predecessors(graph, read_block, null, &reachable);
     var count: usize = 0;
     var component: usize = 0;
-    var tuple: Tuple = undefined;
+    var tuple: Tuple = @splat(0);
     var first_complete: ?usize = null;
     for (instructions, 0..) |inst, index| {
         const block = blockAt(graph, index) orelse return null;
@@ -93,7 +95,7 @@ pub fn imageTuples(
         for ([_]rdna2.Operand{ inst.dst, inst.dst2 }) |dst| {
             if (dst.kind != .vgpr) continue;
             const width = @max(inst.data_words, if (std.mem.endsWith(u8, @tagName(inst.opcode), "64")) @as(u8, 2) else 1);
-            overlaps = overlaps or (dst.reg < vector + 8 and dst.reg + width > vector);
+            overlaps = overlaps or (dst.reg < vector + word_count and dst.reg + width > vector);
         }
         if (!overlaps) continue;
         // A later loop-carried overwrite needs a separate loop analysis.
@@ -101,7 +103,7 @@ pub fn imageTuples(
             scalar.scalarRegisterIndex(inst.src0) == null or !plain(inst.src0) or !plain(inst.dst)) return null;
         tuple[component] = index;
         component += 1;
-        if (component == 8) {
+        if (component == word_count) {
             if (count == output.len) return null;
             output[count] = tuple;
             count += 1;
@@ -146,6 +148,14 @@ test "vector resource tuples preserve all words under a common mask" {
     try std.testing.expectEqual(@as(?usize, 2), imageTuples(&code, &graph, 27, 4, &tuples));
     try std.testing.expectEqual(@as(usize, 7), tuples[0][7]);
     try std.testing.expectEqual(@as(usize, 16), tuples[1][7]);
+    // R128 uses only the first four moves; unrelated upper-half writes
+    // must neither become part of the tuple nor prevent its recovery.
+    code[27].image_r128 = true;
+    code[13].src0.negate = true;
+    try std.testing.expectEqual(@as(?usize, 2), imageTuples(&code, &graph, 27, 4, &tuples));
+    try std.testing.expectEqual(@as(usize, 3), tuples[0][3]);
+    try std.testing.expectEqual(@as(usize, 12), tuples[1][3]);
+    code[27].image_r128 = false;
     code[13].src0.negate = true;
     try std.testing.expectEqual(null, imageTuples(&code, &graph, 27, 4, &tuples));
     code[13].src0.negate = false;

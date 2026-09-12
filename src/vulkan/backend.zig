@@ -9170,6 +9170,7 @@ pub const Renderer = struct {
                 resource_sgpr,
                 inst.pc,
                 result.storage_image_mapping_count,
+                inst.imageResourceWords(),
             )) orelse {
                 if (!writable and bindings.stage == .compute and self.sampled_image_nonuniform_indexing) {
                     if (try resolveBufferImageCandidates(bindings, reader, analysis, &instruction_scalar, inst)) |candidates| {
@@ -9184,7 +9185,7 @@ pub const Renderer = struct {
                 self.reportResourceFailure(bindings, inst, &instruction_scalar);
                 std.debug.print(
                     "[vulkan dcb] storage image pc=0x{x}: T# s{d}:s{d} unresolved\n",
-                    .{ inst.pc, resource_sgpr, resource_sgpr + 7 },
+                    .{ inst.pc, resource_sgpr, resource_sgpr + inst.imageResourceWords() - 1 },
                 );
                 return Error.UnsupportedStorageImage;
             };
@@ -9365,6 +9366,7 @@ pub const Renderer = struct {
                 resource_sgpr,
                 inst.pc,
                 descriptor_slot,
+                inst.imageResourceWords(),
             );
             const candidates = if (direct_image == null and self.sampled_image_nonuniform_indexing)
                 try resolveBufferImageCandidates(bindings, reader, analysis, &instruction_scalar, inst)
@@ -9374,7 +9376,7 @@ pub const Renderer = struct {
                 self.reportResourceFailure(bindings, inst, &instruction_scalar);
                 std.debug.print(
                     "[vulkan dcb] sampled image pc=0x{x}: T# s{d}:s{d} unresolved\n",
-                    .{ inst.pc, resource_sgpr, resource_sgpr + 7 },
+                    .{ inst.pc, resource_sgpr, resource_sgpr + inst.imageResourceWords() - 1 },
                 );
                 return Error.UnsupportedSampledImage;
             }
@@ -9397,7 +9399,7 @@ pub const Renderer = struct {
             }
             for (0..candidate_count) |candidate_index| {
                 const candidate_words: ?[8]u32 = if (candidate_table) |table| table.words[candidate_index] else null;
-                const image_descriptor = if (candidate_words) |words| try gpu.resources.decodeImageDescriptor(&words) else direct_image.?;
+                const image_descriptor = if (candidate_words) |words| try gpu.resources.decodeImageDescriptor(words[0..inst.imageResourceWords()]) else direct_image.?;
                 if (inst.opcode == .image_load and !isBlockCompressedUnifiedFormat(image_descriptor.unified_format)) {
                     // Uncompressed fetches were bound through the storage-image
                     // pass above. Only compressed, read-only fetches need this
@@ -17669,6 +17671,7 @@ pub const Renderer = struct {
                 inst.src1.reg,
                 inst.pc,
                 image_slot,
+                inst.imageResourceWords(),
             )) orelse {
                 if (try self.appendIndirectGraphicsImages(result, bindings, reader, analysis, &sampled_scalar, inst, sampler_slot, render_target_write, extra_colors)) continue;
                 self.reportResourceFailure(bindings, inst, &sampled_scalar);
@@ -17810,7 +17813,7 @@ pub const Renderer = struct {
         var sampler = candidates.sampler orelse (try resolveComputeSamplerDescriptor(bindings, reader, analysis, scalar, inst.src2.reg, inst.pc, sampler_slot)) orelse return false;
         if (inst.opcode == .image_gather4) sampler = pointGatherSampler(sampler);
         for (candidates.words[0..candidates.count]) |words| {
-            const descriptor = try gpu.resources.decodeImageDescriptor(&words);
+            const descriptor = try gpu.resources.decodeImageDescriptor(words[0..inst.imageResourceWords()]);
             const dimension = sampledImageDimensionForInstruction(inst.image_dimension, descriptor.image_type) orelse return false;
             const image_key = SampledImageKey{ .image = descriptor, .sampler = sampler, .dimension = dimension };
             var slot = result.image_lookup.get(image_key);
@@ -26551,10 +26554,10 @@ const ImageCandidateSet = struct {
     }
 };
 
-fn readBufferImageWords(reader: gpu.ShaderMemoryReader, buffer: gpu.BufferDescriptor, offset: u64) ![8]u32 {
+fn readBufferImageWords(reader: gpu.ShaderMemoryReader, buffer: gpu.BufferDescriptor, offset: u64, word_count: u32) ![8]u32 {
     var words: [8]u32 = @splat(0);
     if (offset >= buffer.size_bytes) return words;
-    const count: usize = @intCast(@min((buffer.size_bytes - offset) / 4, words.len));
+    const count: usize = @intCast(@min((buffer.size_bytes - offset) / 4, word_count));
     // One checked read also preserves zero-fill at a truncated V# boundary.
     // Readers may split adjacent mappings: retain the former word-wise path
     // when they cannot resolve the complete descriptor in one operation.
@@ -26648,7 +26651,7 @@ fn resolveScalarPointerImageCandidates(
     var before: usize = 0;
     while (before < instructions.len and instructions[before].pc < sample.pc) : (before += 1) {}
     var load_index: ?usize = null;
-    for (0..8) |component| {
+    for (0..sample.imageResourceWords()) |component| {
         const definition = gpu.index_bounds.scalarDefinition(instructions, &analysis.graph, before, sample.src1.reg + @as(u32, @intCast(component))) orelse return null;
         const index = switch (definition) {
             .entry => return null,
@@ -26658,14 +26661,14 @@ fn resolveScalarPointerImageCandidates(
         load_index = index;
     }
     const load = instructions[load_index.?];
-    if (load.dst.kind != .sgpr or sample.src1.reg < load.dst.reg or sample.src1.reg + 8 > load.dst.reg + load.data_words) return null;
+    if (load.dst.kind != .sgpr or sample.src1.reg < load.dst.reg or sample.src1.reg + sample.imageResourceWords() > load.dst.reg + load.data_words) return null;
     const plan = (try scalarPointerTablePlan(bindings, reader, analysis, scalar, load)) orelse return null;
     var result = BufferImageCandidates{};
     for (0..plan.count) |index| {
-        var words: [8]u32 = undefined;
-        try reader.readWords(((plan.base + plan.first + index * plan.step) & ~@as(u64, 3)) + (sample.src1.reg - load.dst.reg) * 4, &words);
+        var words: [8]u32 = @splat(0);
+        try reader.readWords(((plan.base + plan.first + index * plan.step) & ~@as(u64, 3)) + (sample.src1.reg - load.dst.reg) * 4, words[0..sample.imageResourceWords()]);
         if (std.mem.allEqual(u32, &words, 0)) continue;
-        _ = gpu.resources.decodeImageDescriptor(&words) catch return null;
+        _ = gpu.resources.decodeImageDescriptor(words[0..sample.imageResourceWords()]) catch return null;
         var duplicate = false;
         for (result.words[0..result.count]) |previous| if (std.mem.eql(u32, &previous, &words)) {
             duplicate = true;
@@ -26764,8 +26767,8 @@ fn typedVectorIndexRange(
         .definition_cache = analysis.scalar_definitions,
     };
     var words: [8]u32 = undefined;
-    if (!(resolver.words(fetch.src1.reg, fetch.pc, &words) catch false)) return null;
-    const descriptor = gpu.resources.decodeImageDescriptor(&words) catch return null;
+    if (!(resolver.words(fetch.src1.reg, fetch.pc, words[0..fetch.imageResourceWords()]) catch false)) return null;
+    const descriptor = gpu.resources.decodeImageDescriptor(words[0..fetch.imageResourceWords()]) catch return null;
     if (descriptor.dst_select[0] != 4) return null;
     return switch (descriptor.unified_format) {
         5 => .{ .positive_limit = 256 },
@@ -26901,7 +26904,7 @@ fn resolveIndexedBufferImageCandidates(
     var before: usize = 0;
     while (before < instructions.len and instructions[before].pc < sample.pc) : (before += 1) {}
     var load_index: ?usize = null;
-    for (0..8) |component| {
+    for (0..sample.imageResourceWords()) |component| {
         const definition = gpu.index_bounds.scalarDefinition(instructions, &analysis.graph, before, sample.src1.reg + @as(u32, @intCast(component))) orelse return null;
         const index = switch (definition) {
             .entry => return null,
@@ -26912,7 +26915,7 @@ fn resolveIndexedBufferImageCandidates(
     }
     const load = instructions[load_index.?];
     if (!isBufferScalarLoad(load.opcode) or load.dst.kind != .sgpr or load.src0.kind != .sgpr or
-        load.memory_offset < 0 or sample.src1.reg < load.dst.reg or sample.src1.reg + 8 > load.dst.reg + load.data_words) return null;
+        load.memory_offset < 0 or sample.src1.reg < load.dst.reg or sample.src1.reg + sample.imageResourceWords() > load.dst.reg + load.data_words) return null;
     const offset_register = gpu.scalar_provenance.scalarRegisterIndex(load.src1) orelse return null;
     const definition = gpu.index_bounds.scalarDefinition(instructions, &analysis.graph, load_index.?, @intCast(offset_register)) orelse return null;
     const shift_index = switch (definition) {
@@ -26947,9 +26950,9 @@ fn resolveIndexedBufferImageCandidates(
         if (seen_count == seen.len) return null;
         seen[seen_count] = target;
         seen_count += 1;
-        const words = try readBufferImageWords(reader, buffer, target);
+        const words = try readBufferImageWords(reader, buffer, target, sample.imageResourceWords());
         all_null = all_null and std.mem.allEqual(u32, &words, 0);
-        _ = gpu.resources.decodeImageDescriptor(&words) catch continue;
+        _ = gpu.resources.decodeImageDescriptor(words[0..sample.imageResourceWords()]) catch continue;
         if (!unique.append(&result, words)) return null;
     }
     if (result.count == 0 and !all_null) return null;
@@ -26963,7 +26966,7 @@ fn resolveBufferImageCandidates(
     scalar: *const gpu.ScalarEvaluation,
     sample: gpu.ShaderInstruction,
 ) anyerror!?BufferImageCandidates {
-    const plan = (try resolveBufferTablePlan(reader, analysis, scalar, sample.src1.reg, 8, sample.pc, bindings, 16384)) orelse {
+    const plan = (try resolveBufferTablePlan(reader, analysis, scalar, sample.src1.reg, sample.imageResourceWords(), sample.pc, bindings, 16384)) orelse {
         if (try resolveIndexedBufferImageCandidates(bindings, reader, analysis, scalar, sample)) |candidates| return candidates;
         if (try resolveScalarPointerImageCandidates(bindings, reader, analysis, scalar, sample)) |candidates| return candidates;
         if (try resolvePointerImageCandidates(bindings, reader, analysis, scalar, sample)) |candidates| return candidates;
@@ -26974,9 +26977,9 @@ fn resolveBufferImageCandidates(
     var all_null = true;
     var offset = plan.first;
     while (offset < plan.limit) : (offset += plan.step) {
-        const words = try readBufferImageWords(reader, plan.buffer, offset & ~@as(u64, 3));
+        const words = try readBufferImageWords(reader, plan.buffer, offset & ~@as(u64, 3), sample.imageResourceWords());
         all_null = all_null and std.mem.allEqual(u32, &words, 0);
-        const descriptor = gpu.resources.decodeImageDescriptor(&words) catch continue;
+        const descriptor = gpu.resources.decodeImageDescriptor(words[0..sample.imageResourceWords()]) catch continue;
         if (descriptor.address == 0) continue;
         if (!unique.append(&result, words)) return null;
     }
@@ -27003,8 +27006,8 @@ fn resolveVectorImageCandidates(
     const count = gpu.vector_resources.imageTuples(instructions, &analysis.graph, sample_index, sample.src1.reg, &tuples) orelse return null;
     var result = BufferImageCandidates{};
     for (tuples[0..count]) |tuple| {
-        var words: [8]u32 = undefined;
-        for (tuple, 0..) |index, component| {
+        var words: [8]u32 = @splat(0);
+        for (tuple[0..sample.imageResourceWords()], 0..) |index, component| {
             const move = instructions[index];
             var resolver = gpu.scalar_resources.Resolver{
                 .bindings = bindings,
@@ -27021,7 +27024,7 @@ fn resolveVectorImageCandidates(
         // record. The runtime descriptor lookup already maps unmatched nulls
         // to zero; they must not allocate a physical Vulkan image.
         if (std.mem.allEqual(u32, &words, 0)) continue;
-        _ = gpu.resources.decodeImageDescriptor(&words) catch return null;
+        _ = gpu.resources.decodeImageDescriptor(words[0..sample.imageResourceWords()]) catch return null;
         var duplicate = false;
         for (result.words[0..result.count]) |previous| {
             if (std.mem.eql(u32, &previous, &words)) duplicate = true;
@@ -27083,7 +27086,7 @@ fn resolvePointerImageCandidates(
     sample: gpu.ShaderInstruction,
 ) anyerror!?BufferImageCandidates {
     const instructions = analysis.program.instructions.items;
-    const image_load = pointerLoadForRegisters(instructions, sample.src1.reg, 8, sample.pc) orelse return null;
+    const image_load = pointerLoadForRegisters(instructions, sample.src1.reg, sample.imageResourceWords(), sample.pc) orelse return null;
     const sampler_load = pointerLoadForRegisters(instructions, sample.src2.reg, 4, sample.pc) orelse return null;
     if (image_load.src0.reg != sampler_load.src0.reg) return null;
     const image_offset = (scalarMemoryOffset(image_load, scalar) orelse return null) + (sample.src1.reg - image_load.dst.reg) * 4;
@@ -27092,9 +27095,9 @@ fn resolvePointerImageCandidates(
     const pointers = (try resolveBufferPointerCandidates(bindings, reader, analysis, scalar, image_load.src0.reg, @min(image_load.pc, sampler_load.pc))) orelse return null;
     var result = BufferImageCandidates{};
     for (pointers.addresses[0..pointers.count]) |pointer| {
-        var words: [8]u32 = undefined;
-        reader.readWords((pointer + @as(u64, @intCast(image_offset))) & ~@as(u64, 3), &words) catch continue;
-        const descriptor = gpu.resources.decodeImageDescriptor(&words) catch continue;
+        var words: [8]u32 = @splat(0);
+        reader.readWords((pointer + @as(u64, @intCast(image_offset))) & ~@as(u64, 3), words[0..sample.imageResourceWords()]) catch continue;
+        const descriptor = gpu.resources.decodeImageDescriptor(words[0..sample.imageResourceWords()]) catch continue;
         if (descriptor.address == 0) continue;
         var sampler_words: [4]u32 = undefined;
         reader.readWords((pointer + @as(u64, @intCast(sampler_offset))) & ~@as(u64, 3), &sampler_words) catch continue;
@@ -27139,15 +27142,16 @@ fn scalarBufferDescriptor(
 fn scalarImageDescriptor(
     scalar: *const gpu.ScalarEvaluation,
     resource_sgpr: u32,
+    word_count: u32,
 ) gpu.resources.Error!?gpu.ImageDescriptor {
-    if (resource_sgpr + 8 > gpu.scalar_provenance.maximum_scalar_registers) return null;
+    if (resource_sgpr + word_count > gpu.scalar_provenance.maximum_scalar_registers) return null;
     var words: [8]u32 = undefined;
-    for (&words, 0..) |*word, index| {
+    for (words[0..word_count], 0..) |*word, index| {
         const value = scalar.registers[resource_sgpr + index];
         if (!value.known) return null;
         word.* = value.value;
     }
-    return gpu.resources.decodeImageDescriptor(&words) catch |err| switch (err) {
+    return gpu.resources.decodeImageDescriptor(words[0..word_count]) catch |err| switch (err) {
         error.InvalidDescriptor, error.InvalidFormat => null,
         else => return err,
     };
@@ -27235,6 +27239,7 @@ fn resolveProducedImageDescriptor(
     scalar: *const gpu.ScalarEvaluation,
     resource_sgpr: u32,
     before_pc: u32,
+    word_count: u32,
 ) anyerror!?gpu.ImageDescriptor {
     var resolver = gpu.scalar_resources.Resolver{
         .bindings = bindings,
@@ -27245,8 +27250,8 @@ fn resolveProducedImageDescriptor(
         .definition_cache = analysis.scalar_definitions,
     };
     var words: [8]u32 = undefined;
-    if (!try resolver.words(resource_sgpr, before_pc, &words)) return null;
-    return gpu.resources.decodeImageDescriptor(&words) catch null;
+    if (!try resolver.words(resource_sgpr, before_pc, words[0..word_count])) return null;
+    return gpu.resources.decodeImageDescriptor(words[0..word_count]) catch null;
 }
 
 fn resolveProducedSamplerDescriptor(
@@ -27278,8 +27283,9 @@ fn resolveComputeSampledImageDescriptor(
     resource_sgpr: u32,
     instruction_pc: u32,
     fallback_slot: usize,
+    word_count: u32,
 ) anyerror!?gpu.ImageDescriptor {
-    if (try scalarImageDescriptor(scalar, resource_sgpr)) |descriptor| return descriptor;
+    if (try scalarImageDescriptor(scalar, resource_sgpr, word_count)) |descriptor| return descriptor;
 
     if (try resolveProducedImageDescriptor(
         bindings,
@@ -27288,8 +27294,9 @@ fn resolveComputeSampledImageDescriptor(
         scalar,
         resource_sgpr,
         instruction_pc,
+        word_count,
     )) |descriptor| return descriptor;
-    if (fallback_slot <= std.math.maxInt(u16)) {
+    if (word_count == 8 and fallback_slot <= std.math.maxInt(u16)) {
         const fallback = bindings.resolve(
             reader,
             .read_only_texture,
@@ -27351,8 +27358,9 @@ fn resolveComputeImageDescriptor(
     resource_sgpr: u32,
     instruction_pc: u32,
     fallback_slot: usize,
+    word_count: u32,
 ) anyerror!?gpu.ImageDescriptor {
-    if (try scalarImageDescriptor(scalar, resource_sgpr)) |descriptor| return descriptor;
+    if (try scalarImageDescriptor(scalar, resource_sgpr, word_count)) |descriptor| return descriptor;
 
     // A common AGC compute prolog loads a destination T# from a pointer held
     // directly in USER_DATA after an EXECZ bounds check. Scalar prefix
@@ -27366,8 +27374,9 @@ fn resolveComputeImageDescriptor(
         scalar,
         resource_sgpr,
         instruction_pc,
+        word_count,
     )) |descriptor| return descriptor;
-    if (fallback_slot <= std.math.maxInt(u16)) {
+    if (word_count == 8 and fallback_slot <= std.math.maxInt(u16)) {
         const fallback = bindings.resolve(
             reader,
             .read_write_texture,
@@ -30213,18 +30222,38 @@ test "image descriptor reads preserve split mappings and truncated buffer bounds
     for ([_]bool{ false, true }) |word_only| {
         memory.word_only = word_only;
         buffer.size_bytes = 64;
-        const words = try readBufferImageWords(reader, buffer, 3);
+        const words = try readBufferImageWords(reader, buffer, 3, 8);
         for (words, 0..) |word, index| {
             try std.testing.expectEqual(std.mem.readInt(u32, memory.bytes[3 + index * 4 ..][0..4], .little), word);
         }
+        const compact = try readBufferImageWords(reader, buffer, 48, 4);
+        for (compact[0..4], 0..) |word, index|
+            try std.testing.expectEqual(std.mem.readInt(u32, memory.bytes[48 + index * 4 ..][0..4], .little), word);
+        try std.testing.expect(std.mem.allEqual(u32, compact[4..], 0));
         buffer.size_bytes = 10;
-        const truncated = try readBufferImageWords(reader, buffer, 4);
+        const truncated = try readBufferImageWords(reader, buffer, 4, 8);
         try std.testing.expectEqual(@as(u32, 0x0706_0504), truncated[0]);
         try std.testing.expect(std.mem.allEqual(u32, truncated[1..], 0));
-        try std.testing.expectEqual([_]u32{0} ** 8, try readBufferImageWords(reader, buffer, 10));
+        try std.testing.expectEqual([_]u32{0} ** 8, try readBufferImageWords(reader, buffer, 10, 8));
     }
     memory.inaccessible = true;
-    try std.testing.expectError(error.MemoryReadFailed, readBufferImageWords(reader, buffer, 0));
+    try std.testing.expectError(error.MemoryReadFailed, readBufferImageWords(reader, buffer, 0, 8));
+}
+
+test "R128 scalar images ignore unknown and unrelated upper registers" {
+    var scalar = gpu.ScalarEvaluation{};
+    const words = [_]u32{ 0x40, 56 << 20, 0x8000c000, 0x90000fac };
+    for (words, 80..) |value, register| scalar.registers[register] = .{ .known = true, .value = value };
+    const compact = (try scalarImageDescriptor(&scalar, 80, 4)).?;
+    try std.testing.expect(!compact.extended);
+    try std.testing.expectEqual(compact.width, compact.pitch);
+    try std.testing.expectEqual(@as(u64, 0), compact.metadata_address);
+    try std.testing.expectEqual(null, try scalarImageDescriptor(&scalar, 80, 8));
+    for (84..88) |register| scalar.registers[register] = .{ .known = true, .value = 0xffffffff };
+    try std.testing.expectEqualDeep(compact, (try scalarImageDescriptor(&scalar, 80, 4)).?);
+    const full = (try scalarImageDescriptor(&scalar, 80, 8)).?;
+    try std.testing.expect(full.extended);
+    try std.testing.expect(full.metadata_address != 0);
 }
 
 test "graphics SRT slots allow multiple images to share one sampler" {

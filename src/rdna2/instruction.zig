@@ -74,7 +74,7 @@ pub const Instruction = struct {
     image_nsa_address: [12]u8 = [_]u8{0} ** 12,
     image_dimension: isa.ImageDimension = .dim_2d,
     image_sample_flags: isa.ImageSampleFlags = .{},
-    /// MIMG r128: the T# occupies eight SGPRs instead of four.
+    /// MIMG r128: the T# occupies four SGPRs instead of eight.
     image_r128: bool = false,
     memory_segment: u2 = 0,
     data_signed: bool = false,
@@ -95,6 +95,10 @@ pub const Instruction = struct {
     unsupported_reason: []const u8 = "",
 
     /// Whether any source refers to a literal in the following word.
+    pub fn imageResourceWords(self: Instruction) u32 {
+        return if (self.image_r128) 4 else 8;
+    }
+
     pub fn hasLiteral(self: Instruction) bool {
         return self.src0.isLiteral() or self.src1.isLiteral() or
             self.src2.isLiteral() or self.src3.isLiteral();

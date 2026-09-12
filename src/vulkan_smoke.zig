@@ -360,7 +360,7 @@ fn runStorageImageCopyCase(
     std.debug.print("storage image coordinate copy passed: {s}\n", .{if (packed_coordinates) "A16 packed X/Y with poisoned adjacent VGPR" else "32-bit X/Y"});
 }
 
-fn runSpilledImageDescriptorProbe(allocator: std.mem.Allocator) !void {
+fn runSpilledImageDescriptorProbe(allocator: std.mem.Allocator, compact: bool) !void {
     for ([_]bool{ false, true }) |skip_spill| {
         var renderer = try vulkan.Renderer.init(allocator, .{});
         defer renderer.deinit();
@@ -370,11 +370,14 @@ fn runSpilledImageDescriptorProbe(allocator: std.mem.Allocator) !void {
         const program = 0x2000;
         const source = 0x5000;
         const destination = 0x6000;
+        const source_words = imageDescriptorWords(source, 4, 4);
+        const texture = try gpu.TextureLayout.fromImage(try gpu.resources.decodeImageDescriptor(source_words[0..@as(usize, if (compact) 4 else 8)]));
+        const surface = try texture.base();
         for ([_][8]u32{ imageDescriptorWords(source, 4, 4), imageDescriptorWords(destination, 4, 4) }, 0..) |descriptor, image_index|
             for (descriptor, 0..) |word, component| guest.word(0x1000 + image_index * 32 + component * 4, word);
         const prolog = [_]u32{
-            0xf40c_0500, 0xfa00_0000, // load source T# s20:s27
-            0xf40c_1100,                              0xfa00_0020, // load destination T# s68:s75
+            if (compact) 0xf408_0500 else 0xf40c_0500, 0xfa00_0000, // load source T#
+            if (compact) 0xf408_1100 else 0xf40c_1100, 0xfa00_0020, // load destination T#
             vop1(1, 0, if (skip_spill) 128 else 129),
             0x7d84_0080, // VCC depends on a VGPR: host scalar walk cannot choose the branch
             0xbf87_000f, // skip all three saves, clobbers and restores
@@ -388,12 +391,14 @@ fn runSpilledImageDescriptorProbe(allocator: std.mem.Allocator) !void {
         for (prolog, 0..) |word, index| guest.word(program + index * 4, word);
         var cursor: usize = program + prolog.len * 4;
         for (0..4) |y| for (0..4) |x| {
-            const pixel = [_]u32{ vop1(1, 0, @intCast(128 + x)), vop1(1, 1, @intCast(128 + y)), 0xf000_0f08, 0x0005_0400, 0xf020_0f08, 0x0011_0400 };
+            const r128: u32 = if (compact) 1 << 15 else 0;
+            const pixel = [_]u32{ vop1(1, 0, @intCast(128 + x)), vop1(1, 1, @intCast(128 + y)), 0xf000_0f08 | r128, 0x0005_0400, 0xf020_0f08 | r128, 0x0011_0400 };
             for (pixel) |word| {
                 guest.word(cursor, word);
                 cursor += 4;
             }
-            for (0..4) |component| guest.bytes[source + y * 256 + x * 4 + component] = @intCast(7 + y * 37 + x * 11 + component);
+            const byte: usize = @intCast(try surface.sourceByteOffset(@intCast(x), @intCast(y), 0, 0));
+            for (0..4) |component| guest.bytes[source + byte + component] = @intCast(7 + y * 37 + x * 11 + component);
         };
         guest.word(cursor, 0xbf81_0000);
         var state = gpu.State{};
@@ -409,8 +414,11 @@ fn runSpilledImageDescriptorProbe(allocator: std.mem.Allocator) !void {
         _ = try executor.execute(&stream);
         if (renderer.last_dispatch_error) |err| return err;
         try renderer.flushPendingGuestWrites();
-        for (0..4) |y| try std.testing.expectEqualSlices(u8, guest.bytes[source + y * 256 ..][0..16], guest.bytes[destination + y * 256 ..][0..16]);
-        std.debug.print("spilled image descriptor passed: {s}, RGBA8 copy verified\n", .{if (skip_spill) "original load path" else "save/borrow/restore path"});
+        for (0..4) |y| {
+            const byte: usize = @intCast(try surface.sourceByteOffset(0, @intCast(y), 0, 0));
+            try std.testing.expectEqualSlices(u8, guest.bytes[source + byte ..][0..16], guest.bytes[destination + byte ..][0..16]);
+        }
+        std.debug.print("spilled image descriptor passed: R128={}, {s}, RGBA8 copy verified\n", .{ compact, if (skip_spill) "original load path" else "save/borrow/restore path" });
     }
 }
 
@@ -8614,7 +8622,7 @@ fn runQueuedDetileProbe(allocator: std.mem.Allocator) !void {
 }
 
 fn runIndirectImageProbe(allocator: std.mem.Allocator) !void {
-    for (0..8) |case_index| {
+    for (0..10) |case_index| {
         var renderer = try vulkan.Renderer.init(allocator, .{ .trace_resource_failures = true });
         defer renderer.deinit();
         if (!renderer.sampled_image_nonuniform_indexing) return error.NonuniformSampledImagesUnavailable;
@@ -8622,7 +8630,8 @@ fn runIndirectImageProbe(allocator: std.mem.Allocator) !void {
         _ = renderer.dcbBackend(guest.interface());
         const wrapping = case_index == 1;
         const guarded = case_index == 2 or case_index == 4 or case_index == 5;
-        const wide = case_index == 3;
+        const compact = case_index >= 8;
+        const wide = case_index == 3 or case_index == 9;
         const material_constants = case_index == 6;
         const mixed_views = case_index == 7;
         const offset_register: u32 = if (case_index == 4 or case_index == 5) 106 + @as(u32, @intCast(case_index - 4)) else 20;
@@ -8652,8 +8661,8 @@ fn runIndirectImageProbe(allocator: std.mem.Allocator) !void {
             0x3e80_0000,
             if (mixed_views) vop1(1, 4, 255) else 0xbf80_0000,
             if (mixed_views) 0x3f40_0000 else 0xbf80_0000,
-            if (mixed_views) 0xf09c_0112 else 0xf09c_010a,
-            if (mixed_views) 0x0080_0202 else 0x0080_0402,
+            if (mixed_views) 0xf09c_0112 else if (compact) 0xf09c_810a else 0xf09c_010a,
+            if (mixed_views) 0x0080_0202 else if (compact) 0x0081_0402 else 0x0080_0402,
             if (mixed_views) 0x0403 else 3, // overlapping destination checks coordinate preservation across view banks
             0xe070_2000,
             if (mixed_views) 0x8003_0201 else 0x8003_0401,
@@ -8692,7 +8701,13 @@ fn runIndirectImageProbe(allocator: std.mem.Allocator) !void {
                 image[4] = 1; // two volume slices; v4 selects the second
             }
             if (!wide and index == 2) image[3] = (image[3] & ~@as(u32, 7)) | 6; // same allocation, blue in red channel
-            for (image, 0..) |word, component| guest.word(table + (if (wrapping) @as(usize, 16) else 0) + index * stride + component * 4, word);
+            if (compact) {
+                // One coalesced eight-word load carries four unrelated words
+                // followed by a compact T#. Adjacent s8:s11 hold the V# and
+                // must not participate in the GPU's texture lookup key.
+                for (image[0..4], 0..) |word, component| guest.word(table + index * stride + 16 + component * 4, word);
+                guest.word(table + index * stride, 146);
+            } else for (image, 0..) |word, component| guest.word(table + (if (wrapping) @as(usize, 16) else 0) + index * stride + component * 4, word);
             const layout = try gpu.TextureLayout.fromImage(try gpu.resources.decodeImageDescriptor(&image));
             const surface = try layout.base();
             for (0..if (mixed_views and index == 1) @as(usize, 2) else 1) |z| for (0..extent) |y| for (0..extent) |x| {
@@ -9253,7 +9268,8 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--spilled-image-descriptor")) {
-        try runSpilledImageDescriptorProbe(allocator);
+        try runSpilledImageDescriptorProbe(allocator, false);
+        try runSpilledImageDescriptorProbe(allocator, true);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--trigonometry")) {

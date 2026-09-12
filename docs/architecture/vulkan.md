@@ -288,6 +288,14 @@ different incoming origins remain unsupported. Only immutable provenance is
 cached; descriptor data is reread for each dispatch. The
 `vulkan-smoke --spilled-image-descriptor` probe checks RGBA image copies on both
 the save/borrow/restore path and the path that retains the original descriptor.
+MIMG `R128=1` names a four-word T#, including one coalesced with a preceding
+sampler in an eight-word scalar load. Image recovery reads only those four
+words and retains the compact descriptor's implicit mip-chain layout. Runtime
+texture keys zero their upper half on both CPU and GPU; neighboring SGPRs never
+become pitch, metadata, or lookup-key words. `R128=0` still retains all eight
+descriptor words. The spill probe covers both sizes, and `--indirect-images`
+checks compact table selection, null/OOB entries, aliases and a 128-image lookup.
+This follows AMD's [RDNA 2 ISA, sections 8.2.1 and 8.2.6](https://docs.amd.com/api/khub/documents/Et~wpu9g~Ffl7d9q0QZ~Og/content).
 For the supported fragment subset, inline 2D/3D image and sampler descriptors are
 decoded from user SGPRs. Compute sampling also recovers descriptors from the
 exact preceding scalar loads or the dispatch SRT after SGPR reuse. Both paths
