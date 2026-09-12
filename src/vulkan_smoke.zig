@@ -3092,6 +3092,59 @@ fn runSceneMaskProbe(allocator: std.mem.Allocator) !void {
         }
     }
     std.debug.print("signed stack masks passed: high-word VGPR/SGPR LT, negative limits, inactive lanes and preserved VCC\n", .{});
+    try runUnsigned64ExecProbe(allocator);
+}
+
+fn runUnsigned64ExecProbe(allocator: std.mem.Allocator) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{});
+    defer renderer.deinit();
+    var guest = GuestMemory{};
+    _ = renderer.dcbBackend(guest.interface());
+    const values = [_][2]u64{
+        .{ 0, 0 },                       .{ 1, 0 },                                         .{ 0, 1 },                     .{ 0x1_0000_0000, 0xffff_ffff },
+        .{ 0xffff_ffff, 0x1_0000_0000 }, .{ 0x8000_0000_0000_0000, 0x7fff_ffff_ffff_ffff }, .{ 0x7fff_ffff, 0x7fff_ffff }, .{ 0xffff_ffff_ffff_ffff, 0xffff_ffff_ffff_ffff },
+    };
+    for ([_]u32{ 64, 256 }) |lanes| for (0..4) |encoding| {
+        for (0..lanes) |lane| {
+            const pair = values[(lane / 2) % values.len];
+            std.mem.writeInt(u64, guest.bytes[0x10000 + lane * 16 ..][0..8], pair[0], .little);
+            std.mem.writeInt(u64, guest.bytes[0x10008 + lane * 16 ..][0..8], pair[1], .little);
+        }
+        @memset(guest.bytes[0x12000..0x12800], 0xcc);
+        const code = [_]u32{
+            mubuf(0x0e, 0, 2, 0, 0)[0], mubuf(0x0e, 0, 2, 0, 0)[1], // v2:v5 = paired u64 inputs
+            0x7d84_0080, // establish VCC = lane == 0
+            vop2Source(0x1b, 1, 129, 0),                     0x7daa_0280, // only odd lanes before CMPX
+            if (encoding == 0) 0x7de8_0902 else 0xd4f4_007e, if (encoding == 0) 0xbf80_0000 else @as(u32, if (encoding == 3) 8 else 258) | (@as(u32, if (encoding >= 2) 255 else 260) << 9),
+            if (encoding >= 2) 0x7fff_ffff else 0xbf80_0000, vop1(1, 6, 255),
+            0x1234_5678,                                     mubuf(0x1c, 0, 6, 0, 4)[0],
+            mubuf(0x1c, 0, 6, 0, 4)[1],
+            sop1(4, 126, 193),          vop1(1, 6, 106), // restore EXEC, preserve previous VCC
+            mubuf(0x1c, 4, 6, 0, 4)[0], mubuf(0x1c, 4, 6, 0, 4)[1],
+            0xbf81_0000,
+        };
+        const program: u32 = 0x100 + @as(u32, @intCast(encoding)) * 0x100;
+        for (code, 0..) |word, index| guest.word(program + index * 4, word);
+        var state = gpu.State{};
+        try state.writeRegister(.shader, 0x20c, program >> 8);
+        try state.writeRegister(.shader, 0x20d, 0);
+        try state.writeRegister(.shader, 0x213, 10 << 1);
+        for ([_]u32{ 0x10000, 16 << 16, lanes, 0, 0x12000, 8 << 16, lanes, 0, 0, 1 }, 0..) |word, index|
+            try state.writeRegister(.shader, 0x240 + @as(u32, @intCast(index)), word);
+        const report = try renderer.dispatchRdna2State(&state, .{ lanes, 1, 1 }, .{ 1, 1, 1 });
+        try std.testing.expect(report.spirv_words != 0);
+        var output: [256 * 8]u8 = undefined;
+        try renderer.readbackGuestStorageBuffer(0x12000, output[0 .. lanes * 8]);
+        for (0..lanes) |lane| {
+            const pair = values[(lane / 2) % values.len];
+            const left: u64 = if (encoding == 3) 0x1_0000_0000 else pair[0];
+            const right: u64 = if (encoding >= 2) 0x7fff_ffff else pair[1];
+            const expected: u32 = if (lane % 2 == 1 and left > right) 0x1234_5678 else 0xcccc_cccc;
+            try std.testing.expectEqual(expected, std.mem.readInt(u32, output[lane * 8 ..][0..4], .little));
+            try std.testing.expectEqual(@as(u32, if (lane == 0) 0xffff_ffff else 0), std.mem.readInt(u32, output[lane * 8 + 4 ..][0..4], .little));
+        }
+    };
+    std.debug.print("u64 greater CMPX passed: both encodings, high-word ordering, equality, literal/SGPR inputs, inactive lanes and preserved VCC at 64/256 lanes\n", .{});
 }
 
 fn runImageScratchProbe(allocator: std.mem.Allocator) !void {

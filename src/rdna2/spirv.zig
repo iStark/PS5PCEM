@@ -9591,6 +9591,7 @@ const Builder = struct {
             .v_cmpx_neq_f16 => .v_cmp_neq_f16,
             .v_cmpx_nlt_f16 => .v_cmp_ge_f16,
             .v_cmpx_ne_i64, .v_cmpx_ne_u64 => .v_cmp_ne_u64,
+            .v_cmpx_gt_u64 => .v_cmp_gt_u64,
             else => null,
         };
     }

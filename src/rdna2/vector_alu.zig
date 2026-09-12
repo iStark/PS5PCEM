@@ -224,6 +224,7 @@ fn vopcOpcode(id: u32) isa.Opcode {
         0xe2 => .v_cmp_eq_u64,
         0xe4 => .v_cmp_gt_u64,
         0xe5 => .v_cmp_ne_u64,
+        0xf4 => .v_cmpx_gt_u64,
         0xed => .v_cmp_neq_f16,
         0xf5 => .v_cmpx_ne_u64,
         0xfd => .v_cmpx_neq_f16,
@@ -280,6 +281,7 @@ fn isCompareExec(op: isa.Opcode) bool {
         .v_cmpx_neq_f16,
         .v_cmpx_nlt_f16,
         .v_cmpx_ne_i64,
+        .v_cmpx_gt_u64,
         .v_cmpx_ne_u64,
         => true,
         else => false,
@@ -1150,4 +1152,22 @@ test "VOP3 compares retain explicit scalar mask destinations" {
     const cmpx = try decodeVop3(0, &.{ 0xd4f5_001c, 0x0001_0018 }, 0);
     try std.testing.expectEqual(isa.Opcode.v_cmpx_ne_u64, cmpx.opcode);
     try std.testing.expectEqual(isa.OperandKind.exec_lo, cmpx.dst.kind);
+}
+
+test "Yotei 64-bit unsigned greater CMPX decodes both encodings and literal width" {
+    // Captured compute shader 0x800027c200, pc=0x37fc. The literal is
+    // 32 bits in the instruction stream; its unsigned high word is zero.
+    const extended = try decodeVop3(0x37fc, &.{ 0xd4f4_007e, 0x0001_fe02, 0x7fff_ffff }, 0);
+    try std.testing.expectEqual(isa.Opcode.v_cmpx_gt_u64, extended.opcode);
+    try std.testing.expectEqual(isa.OperandKind.exec_lo, extended.dst.kind);
+    try std.testing.expectEqual(isa.OperandKind.sgpr, extended.src0.kind);
+    try std.testing.expectEqual(2, extended.src0.reg);
+    try std.testing.expectEqual(isa.OperandKind.literal_constant, extended.src1.kind);
+    try std.testing.expectEqual(0x7fff_ffff, extended.src1.value);
+    try std.testing.expectEqual(3, extended.word_count);
+    const compact = try decodeVopc(0, &.{0x7de8_0500}, 0);
+    try std.testing.expectEqual(isa.Opcode.v_cmpx_gt_u64, compact.opcode);
+    try std.testing.expectEqual(isa.OperandKind.exec_lo, compact.dst.kind);
+    try std.testing.expectEqual(0, compact.src0.reg);
+    try std.testing.expectEqual(2, compact.src1.reg);
 }

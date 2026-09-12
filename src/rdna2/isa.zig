@@ -505,6 +505,7 @@ pub const Opcode = enum {
     v_cmp_eq_i64,
     v_cmp_eq_u64,
     v_cmp_gt_u64,
+    v_cmpx_gt_u64,
     v_cmp_ne_u64,
     v_cmpx_ne_i64,
     v_cmpx_ne_u64,
