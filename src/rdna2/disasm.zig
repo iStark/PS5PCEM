@@ -116,6 +116,7 @@ pub fn formatInstruction(inst: Instruction, w: *Writer) Writer.Error!void {
             if (inst.offset_enable) try w.writeAll(" offen");
             if (inst.globally_coherent) try w.writeAll(" glc");
             if (inst.system_coherent) try w.writeAll(" slc");
+            if (inst.gds) try w.writeAll(" gds");
         },
         .mimg => {
             try w.print(" dmask:0x{x} dim:{s}", .{ inst.data_mask, @tagName(inst.image_dimension) });
@@ -129,6 +130,13 @@ pub fn formatInstruction(inst: Instruction, w: *Writer) Writer.Error!void {
         }),
         else => {},
     }
+    switch (inst.dst.omod) {
+        1 => try w.writeAll(" mul:2"),
+        2 => try w.writeAll(" mul:4"),
+        3 => try w.writeAll(" div:2"),
+        else => {},
+    }
+    if (inst.dst.clamp) try w.writeAll(" clamp");
 }
 
 /// Prints a whole decoded program, one instruction per line.
