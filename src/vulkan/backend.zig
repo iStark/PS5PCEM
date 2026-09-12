@@ -34,6 +34,8 @@ pub export var capture_storage_bytes: u64 = 0;
 pub export var capture_storage_image_address: u64 = 0;
 pub export var capture_vertex_program: u64 = 0;
 pub export var capture_vertex_flip: u64 = 0;
+pub export var capture_fragment_program: u64 = 0;
+pub export var capture_graphics_target: u64 = 0;
 const sampled_lookup_plan = @import("sampled_lookup_plan.zig");
 
 /// Set to true to enable verbose per-frame GPU debug logging.
@@ -15710,18 +15712,28 @@ pub const Renderer = struct {
         self.frame_profile.graphics_storage_ns +|= elapsedHostNanoseconds(vertex_storage_started);
         defer vertex_storage.deinit(self);
         validateVertexIndexMappings(reader, vertex_storage, draw);
-        if (@atomicLoad(u64, &capture_vertex_program, .monotonic) == vertex_address and
-            @atomicLoad(u64, &capture_vertex_flip, .monotonic) == self.flip_callbacks + 1)
-        {
+        const capture_draw = @atomicLoad(u64, &capture_vertex_program, .monotonic) == vertex_address and
+            @atomicLoad(u64, &capture_vertex_flip, .monotonic) == self.flip_callbacks + 1 and
+            (@atomicLoad(u64, &capture_fragment_program, .monotonic) == 0 or
+                @atomicLoad(u64, &capture_fragment_program, .monotonic) == fragment_address);
+        var capture_prefix_buffer: [128]u8 = undefined;
+        const capture_prefix = if (capture_draw) try std.fmt.bufPrint(&capture_prefix_buffer, "out/vertex-capture-{d}-{x}", .{ self.flip_callbacks + 1, vertex_address }) else "";
+        const capture_target = capture_draw and @atomicLoad(u64, &capture_graphics_target, .monotonic) == target.descriptor.address;
+        defer if (capture_target) self.captureGraphicsTarget(target, capture_prefix, "after") catch |err| {
+            std.debug.print("[vulkan diagnostic] target capture failed: {s}\n", .{@errorName(err)});
+        };
+        if (capture_draw) {
             @atomicStore(u64, &capture_vertex_flip, 0, .monotonic);
-            var prefix_buffer: [128]u8 = undefined;
-            const prefix = try std.fmt.bufPrint(&prefix_buffer, "out/vertex-capture-{d}-{x}", .{ self.flip_callbacks + 1, vertex_address });
+            const prefix = capture_prefix;
             try dumpDiagnosticBytes(self.allocator, prefix, ".state", std.mem.asBytes(state));
             try dumpDiagnosticBytes(self.allocator, prefix, ".draw", std.mem.asBytes(&draw));
             try dumpDiagnosticBytes(self.allocator, prefix, ".scalars", std.mem.sliceAsBytes(vertex_storage.scalar_registers[0..vertex_storage.scalar_count]));
             try dumpDiagnosticBytes(self.allocator, prefix, ".mappings", std.mem.sliceAsBytes(vertex_storage.mappings[0..vertex_storage.mapping_count]));
+            try dumpDiagnosticBytes(self.allocator, prefix, ".image-descriptors", std.mem.sliceAsBytes(graphics_resources.descriptors[0..graphics_resources.image_count]));
+            try dumpDiagnosticBytes(self.allocator, prefix, ".image-mappings", std.mem.sliceAsBytes(graphics_resources.mappings[0..graphics_resources.mapping_count]));
             try self.captureStorageBuffers(vertex_storage, prefix, "vertex");
             try self.captureGraphicsImages(graphics_resources, prefix);
+            if (capture_target) try self.captureGraphicsTarget(target, prefix, "before");
         }
         // Vertex V# registers also carry constants in other lifetimes. Their
         // recovered loads use the same dynamic scalar path as fragment loads.
@@ -16160,6 +16172,11 @@ pub const Renderer = struct {
         if (!self.reported_fragment_storage_bindings) {
             std.debug.print("[vulkan dcb] first fragment storage mappings={d}\n", .{fragment_storage.mapping_count});
             self.reported_fragment_storage_bindings = true;
+        }
+        if (capture_draw) {
+            try dumpDiagnosticBytes(self.allocator, capture_prefix, ".fragment-scalars", std.mem.sliceAsBytes(fragment_scalar_regs[0..fragment_scalar_count]));
+            try dumpDiagnosticBytes(self.allocator, capture_prefix, ".fragment-mappings", std.mem.sliceAsBytes(fragment_storage.mappings[0..fragment_storage.mapping_count]));
+            try self.captureStorageBuffers(fragment_storage, capture_prefix, "fragment");
         }
         if (self.shouldReportFragmentResources(fragment_address)) {
             std.debug.print(
@@ -18961,6 +18978,42 @@ pub const Renderer = struct {
 
     /// Diagnostic snapshots read the bound VkImage itself without publishing
     /// guest memory or changing resource generations. Disabled by default.
+    fn captureGraphicsTarget(self: *Renderer, target: GuestColorTarget, prefix: []const u8, phase: []const u8) !void {
+        if (target.descriptor.fragments_log2 != 0) return error.UnsupportedDiagnosticColorTarget;
+        const cached = for (self.render_targets.items) |entry| {
+            if (entry.initialized and sameRenderTarget(entry.target, target)) break entry;
+        } else return;
+        const byte_count = try colorTargetFrameBytes(target);
+        if (byte_count == 0 or byte_count > 64 * 1024 * 1024) return error.UnsupportedDiagnosticColorTarget;
+        const readback = try self.createBuffer(byte_count, vk.buffer_usage_transfer_dst_bit, vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit);
+        defer self.destroyBuffer(readback);
+        const command_buffer = try self.beginOneShot();
+        defer self.releaseOneShot(command_buffer);
+        const range = vk.ImageSubresourceRange{ .aspect_mask = vk.image_aspect_color_bit, .layer_count = 1 };
+        try self.transitionTrackedImage(command_buffer, cached.image.handle, range, image_state.transfer_source_usage);
+        const copy = vk.BufferImageCopy{
+            .image_subresource = .{ .aspect_mask = vk.image_aspect_color_bit, .layer_count = 1 },
+            .image_extent = .{ .width = target.descriptor.width, .height = target.descriptor.height, .depth = 1 },
+        };
+        self.device_functions.cmd_copy_image_to_buffer(command_buffer, cached.image.handle, vk.image_layout_transfer_src_optimal, readback.handle, 1, @ptrCast(&copy));
+        const barrier = vk.BufferMemoryBarrier{
+            .source_access_mask = vk.access_transfer_write_bit,
+            .destination_access_mask = vk.access_host_read_bit,
+            .buffer = readback.handle,
+            .offset = 0,
+            .size = readback.size,
+        };
+        self.device_functions.cmd_pipeline_barrier(command_buffer, vk.pipeline_stage_transfer_bit, vk.pipeline_stage_host_bit, 0, 0, null, 1, @ptrCast(&barrier), 0, null);
+        try self.transitionTrackedImage(command_buffer, cached.image.handle, range, image_state.color_attachment_usage);
+        try self.submitOneShot(command_buffer);
+        try self.waitForSubmittedWork();
+        const mapping = try self.mapBufferRange(readback, 0, byte_count);
+        defer mapping.release(self);
+        var suffix_buffer: [128]u8 = undefined;
+        const suffix = try std.fmt.bufPrint(&suffix_buffer, "-target-{s}-{x}-{d}x{d}-vk{d}.bin", .{ phase, target.descriptor.address, target.descriptor.width, target.descriptor.height, target.format.vulkan });
+        try dumpDiagnosticBytes(self.allocator, prefix, suffix, mapping.bytes);
+    }
+
     fn captureGraphicsImages(self: *Renderer, resources: *const GraphicsResources, prefix: []const u8) !void {
         const selected = @atomicLoad(u64, &capture_storage_image_address, .monotonic);
         if (selected == 0) return;

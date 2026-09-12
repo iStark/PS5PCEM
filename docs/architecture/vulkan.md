@@ -147,6 +147,12 @@ and `capture_storage_flip` select compute snapshots; `capture_vertex_program`
 and `capture_vertex_flip` select a vertex snapshot. Storage address/byte-count
 and image-address controls narrow the capture. They write state, shader data
 and bounded resource readbacks under `out/`; the directory must exist.
+`capture_fragment_program` optionally restricts a vertex capture to one pixel
+shader. `capture_graphics_target` selects the primary color attachment for raw
+before/after snapshots, preserving NaNs and infinities for shader diagnosis.
+Draw captures also include fragment constants, buffers and sampled-image
+descriptors. The attachment snapshots leave guest memory and resource
+generations unchanged and restore its color-attachment usage after copying.
 Readbacks preserve guest resource generations but add synchronization, so
 captures must be disabled when measuring FPS. The separate
 `graphics_uniform_specialization` experiment remains disabled by default.
