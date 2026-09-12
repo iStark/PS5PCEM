@@ -280,6 +280,14 @@ producer through control-flow reaching definitions. Writes in sibling branches
 cannot hide the actual table load. All requested words must have the same
 producer; ambiguous joins and partial clobbers remain unsupported. Candidate
 bounds still account for 32-bit multiplication wrap and buffer limits.
+Uniform resource words saved with `v_writelane_b32` and restored with
+`v_readlane_b32` retain their original scalar-load provenance across branches
+and loops. Each constant lane must have one proven save, and all paths must
+lead to the same original word. Dynamic lane writes, vector clobbers and
+different incoming origins remain unsupported. Only immutable provenance is
+cached; descriptor data is reread for each dispatch. The
+`vulkan-smoke --spilled-image-descriptor` probe checks RGBA image copies on both
+the save/borrow/restore path and the path that retains the original descriptor.
 For the supported fragment subset, inline 2D/3D image and sampler descriptors are
 decoded from user SGPRs. Compute sampling also recovers descriptors from the
 exact preceding scalar loads or the dispatch SRT after SGPR reuse. Both paths

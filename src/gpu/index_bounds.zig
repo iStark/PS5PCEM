@@ -207,6 +207,58 @@ fn reachingDefinition(instructions: []const Instruction, graph: *const Graph, be
 
 pub const ScalarDefinition = union(enum) { entry, instruction: usize };
 
+pub const ScalarOrigin = struct { definition: ScalarDefinition, register: u32 };
+
+/// A compiler can borrow an SGPR after saving it with WRITELANE. At a join,
+/// the original load and a READLANE restore are distinct writers of the same
+/// resource word. Follow only proven constant-lane saves; every incoming path
+/// must name the identical original word, without relying on current values.
+pub fn savedScalarOrigin(instructions: []const Instruction, graph: *const Graph, before: usize, register: u32) ?ScalarOrigin {
+    const Query = struct { before: usize, register: u32 };
+    var pending: [256]Query = undefined;
+    pending[0] = .{ .before = before, .register = register };
+    var count: usize = 1;
+    var cursor: usize = 0;
+    var result: ?ScalarOrigin = null;
+    while (cursor < count) : (cursor += 1) {
+        const query = pending[cursor];
+        const incoming = reachingDefinitions(instructions, graph, query.before, .{ .register = query.register }) orelse return null;
+        if (incoming.entry) {
+            const entry = ScalarOrigin{ .definition = .entry, .register = query.register };
+            if (result) |previous| {
+                if (!std.meta.eql(previous, entry)) return null;
+            } else result = entry;
+        }
+        for (incoming.items[0..incoming.count]) |index| {
+            const inst = instructions[index];
+            if (inst.opcode != .v_readlane_b32) {
+                const origin = ScalarOrigin{ .definition = .{ .instruction = index }, .register = query.register };
+                if (result) |previous| {
+                    if (!std.meta.eql(previous, origin)) return null;
+                } else result = origin;
+                continue;
+            }
+            if (inst.src0.kind != .vgpr or inst.src0.absolute or inst.src0.negate or inst.src0.dpp) return null;
+            const lane = immediate(inst.src1) orelse return null;
+            if (lane >= 64) return null;
+            const save_index = reachingDefinition(instructions, graph, index, .{ .register = inst.src0.reg, .lane = lane }) orelse return null;
+            const save = instructions[save_index];
+            if (save.opcode != .v_writelane_b32 or immediate(save.src1) != lane or
+                save.src0.absolute or save.src0.negate or save.src0.dpp) return null;
+            const source = @import("scalar_provenance.zig").scalarRegisterIndex(save.src0) orelse return null;
+            const next = Query{ .before = save_index, .register = @intCast(source) };
+            var seen = false;
+            for (pending[0..count]) |queued| seen = seen or std.meta.eql(queued, next);
+            if (seen) continue;
+            if (count == pending.len) return null;
+            pending[count] = next;
+            count += 1;
+        }
+    }
+    // A restore-only cycle without an entry/load origin is not evidence.
+    return result;
+}
+
 /// Distinguishes an unchanged USER_DATA word from a unique shader writer.
 /// Mixed entry/written paths and loop-carried alternatives remain unknown.
 pub fn scalarDefinition(instructions: []const Instruction, graph: *const Graph, before: usize, register: u32) ?ScalarDefinition {
@@ -232,6 +284,7 @@ pub const ScalarDefinitionCache = struct {
     instructions: []const Instruction,
     graph: Graph,
     entries: std.AutoHashMapUnmanaged(Key, ?ScalarDefinition) = .empty,
+    saved_origins: std.AutoHashMapUnmanaged(Key, ?ScalarOrigin) = .empty,
     reachable: ?[maximum_blocks]bool = undefined,
     reachability_ready: bool = false,
     allocation_failed: bool = false,
@@ -245,6 +298,7 @@ pub const ScalarDefinitionCache = struct {
 
     pub fn deinit(self: *ScalarDefinitionCache) void {
         self.entries.deinit(self.allocator);
+        self.saved_origins.deinit(self.allocator);
         self.bounds.deinit(self.allocator);
         self.lanes.deinit(self.allocator);
     }
@@ -257,6 +311,18 @@ pub const ScalarDefinitionCache = struct {
         if (!self.index_allocation_failed and self.bounds.count() < maximum_index_queries) {
             self.bounds.put(self.allocator, key, value) catch {
                 self.index_allocation_failed = true;
+            };
+        }
+        return value;
+    }
+
+    pub fn savedOrigin(self: *ScalarDefinitionCache, before: usize, register: u32) ?ScalarOrigin {
+        const key = Key{ .before = before, .register = register };
+        if (self.saved_origins.get(key)) |value| return value;
+        const value = savedScalarOrigin(self.instructions, &self.graph, before, register);
+        if (!self.allocation_failed and self.saved_origins.count() < maximum_entries) {
+            self.saved_origins.put(self.allocator, key, value) catch {
+                self.allocation_failed = true;
             };
         }
         return value;

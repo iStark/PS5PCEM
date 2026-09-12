@@ -360,6 +360,60 @@ fn runStorageImageCopyCase(
     std.debug.print("storage image coordinate copy passed: {s}\n", .{if (packed_coordinates) "A16 packed X/Y with poisoned adjacent VGPR" else "32-bit X/Y"});
 }
 
+fn runSpilledImageDescriptorProbe(allocator: std.mem.Allocator) !void {
+    for ([_]bool{ false, true }) |skip_spill| {
+        var renderer = try vulkan.Renderer.init(allocator, .{});
+        defer renderer.deinit();
+        const guest = try allocator.create(GuestMemory);
+        defer allocator.destroy(guest);
+        guest.* = .{};
+        const program = 0x2000;
+        const source = 0x5000;
+        const destination = 0x6000;
+        for ([_][8]u32{ imageDescriptorWords(source, 4, 4), imageDescriptorWords(destination, 4, 4) }, 0..) |descriptor, image_index|
+            for (descriptor, 0..) |word, component| guest.word(0x1000 + image_index * 32 + component * 4, word);
+        const prolog = [_]u32{
+            0xf40c_0500, 0xfa00_0000, // load source T# s20:s27
+            0xf40c_1100,                              0xfa00_0020, // load destination T# s68:s75
+            vop1(1, 0, if (skip_spill) 128 else 129),
+            0x7d84_0080, // VCC depends on a VGPR: host scalar walk cannot choose the branch
+            0xbf87_000f, // skip all three saves, clobbers and restores
+            0xd761_0027, 0x0001_0044, // save s68 in v39 lane 0
+            0xd761_0027, 0x0001_0245, // save s69 in v39 lane 1
+            0xd761_0027, 0x0001_0446, // save s70 in v39 lane 2
+            0xbec4_0380, 0xbec5_0380, 0xbec6_0380, // borrow s68:s70
+            0xd760_0044, 0x0001_0127, 0xd760_0045,
+            0x0001_0327, 0xd760_0046, 0x0001_0527,
+        };
+        for (prolog, 0..) |word, index| guest.word(program + index * 4, word);
+        var cursor: usize = program + prolog.len * 4;
+        for (0..4) |y| for (0..4) |x| {
+            const pixel = [_]u32{ vop1(1, 0, @intCast(128 + x)), vop1(1, 1, @intCast(128 + y)), 0xf000_0f08, 0x0005_0400, 0xf020_0f08, 0x0011_0400 };
+            for (pixel) |word| {
+                guest.word(cursor, word);
+                cursor += 4;
+            }
+            for (0..4) |component| guest.bytes[source + y * 256 + x * 4 + component] = @intCast(7 + y * 37 + x * 11 + component);
+        };
+        guest.word(cursor, 0xbf81_0000);
+        var state = gpu.State{};
+        const compute = gpu.resources.ShaderStage.compute;
+        try state.writeRegister(.shader, compute.programRegisterBase(), program >> 8);
+        try state.writeRegister(.shader, compute.programRegisterBase() + 1, 0);
+        try state.writeRegister(.shader, 0x213, 2 << 1);
+        for ([_]u32{ 0x207, 0x208, 0x209 }) |reg| try state.writeRegister(.shader, reg, 1);
+        try state.writeRegister(.shader, compute.userDataBase(), 0x1000);
+        try state.writeRegister(.shader, compute.userDataBase() + 1, 0);
+        var executor = gpu.DcbExecutor{ .state = &state, .backend = renderer.dcbBackend(guest.interface()), .allocator = allocator };
+        const stream = [_]u32{ command(gpu.pm4.dispatch_direct, 4), 1, 1, 1, 0x41 };
+        _ = try executor.execute(&stream);
+        if (renderer.last_dispatch_error) |err| return err;
+        try renderer.flushPendingGuestWrites();
+        for (0..4) |y| try std.testing.expectEqualSlices(u8, guest.bytes[source + y * 256 ..][0..16], guest.bytes[destination + y * 256 ..][0..16]);
+        std.debug.print("spilled image descriptor passed: {s}, RGBA8 copy verified\n", .{if (skip_spill) "original load path" else "save/borrow/restore path"});
+    }
+}
+
 fn runSampledStorageRefreshProbe(allocator: std.mem.Allocator) !void {
     for ([_]bool{ false, true }) |buffer_writer| try runSampledStorageRefreshCase(allocator, buffer_writer);
 }
@@ -9196,6 +9250,10 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--image-exec")) {
         try runPredicatedImageLoadProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--spilled-image-descriptor")) {
+        try runSpilledImageDescriptorProbe(allocator);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--trigonometry")) {

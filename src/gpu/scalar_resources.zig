@@ -62,13 +62,26 @@ pub const Resolver = struct {
         };
     }
 
-    fn word(self: *Resolver, register: u32, before: usize, depth: u8) anyerror!?u32 {
+    fn word(self: *Resolver, requested_register: u32, before: usize, depth: u8) anyerror!?u32 {
+        var register = requested_register;
         if (register >= scalar.maximum_scalar_registers or depth >= 24 or self.remaining == 0) return null;
         self.remaining -= 1;
-        const definition = (if (self.batch_enabled)
+        const direct_definition = if (self.batch_enabled)
             self.definition_batch.lookup(before, register)
         else
-            definitions.scalarDefinition(self.instructions, self.graph, before, register)) orelse return null;
+            definitions.scalarDefinition(self.instructions, self.graph, before, register);
+        const needs_restore = if (direct_definition) |definition| switch (definition) {
+            .entry => false,
+            .instruction => |index| self.instructions[index].opcode == .v_readlane_b32,
+        } else true;
+        const definition = if (needs_restore) restored: {
+            const origin = (if (self.batch_enabled and self.definition_batch.persistent != null)
+                self.definition_batch.persistent.?.savedOrigin(before, register)
+            else
+                definitions.savedScalarOrigin(self.instructions, self.graph, before, register)) orelse return null;
+            register = origin.register;
+            break :restored origin.definition;
+        } else direct_definition.?;
         const index = switch (definition) {
             .entry => {
                 if (register < self.bindings.scalar_user_data_base) return null;
@@ -149,6 +162,65 @@ pub const Resolver = struct {
         return try self.reader.readU32(byte);
     }
 };
+
+test "resource descriptors survive lane spills, SGPR reuse, loops and branch joins" {
+    const M = struct {
+        bias: u32 = 0xabc00000,
+        fn read(context: ?*anyopaque, address: u64, output: []u8) bool {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            if (address < 0x1000 or address + output.len > 0x1240 or output.len != 4) return false;
+            std.mem.writeInt(u32, output[0..4], self.bias + @as(u32, @intCast(address - 0x1000)), .little);
+            return true;
+        }
+    };
+    const original = [_]rdna2.Instruction{
+        .{ .pc = 0, .opcode = .s_load_dwordx8, .dst = .{ .kind = .sgpr, .reg = 68 }, .src0 = .{ .kind = .sgpr }, .src1 = .{ .kind = .null }, .memory_offset = 352, .data_words = 8 },
+        .{ .pc = 8, .opcode = .s_cbranch_execz, .branch_target = 56 },
+        .{ .pc = 12, .opcode = .v_writelane_b32, .dst = .{ .kind = .vgpr, .reg = 39 }, .src0 = .{ .kind = .sgpr, .reg = 68 }, .src1 = .{ .kind = .integer_inline_constant } },
+        .{ .pc = 20, .opcode = .v_writelane_b32, .dst = .{ .kind = .vgpr, .reg = 39 }, .src0 = .{ .kind = .sgpr, .reg = 69 }, .src1 = .{ .kind = .integer_inline_constant, .value = 1 } },
+        .{ .pc = 28, .opcode = .s_mov_b64, .dst = .{ .kind = .sgpr, .reg = 68 }, .src0 = .{ .kind = .vgpr } },
+        .{ .pc = 32, .opcode = .s_nop },
+        .{ .pc = 40, .opcode = .v_readlane_b32, .dst = .{ .kind = .sgpr, .reg = 68 }, .src0 = .{ .kind = .vgpr, .reg = 39 }, .src1 = .{ .kind = .integer_inline_constant } },
+        .{ .pc = 48, .opcode = .v_readlane_b32, .dst = .{ .kind = .sgpr, .reg = 69 }, .src0 = .{ .kind = .vgpr, .reg = 39 }, .src1 = .{ .kind = .integer_inline_constant, .value = 1 } },
+        .{ .pc = 52, .opcode = .s_nop },
+        .{ .pc = 56, .opcode = .s_endpgm },
+    };
+    for (0..9) |variant| {
+        var instructions = original;
+        switch (variant) {
+            0 => {},
+            1 => instructions[5] = .{ .pc = 32, .opcode = .s_cbranch_scc1, .branch_target = 28 },
+            2 => instructions[5] = .{ .pc = 32, .opcode = .v_mov_b32, .dst = .{ .kind = .vgpr, .reg = 39 } },
+            3 => instructions[3].src1 = .{ .kind = .sgpr, .reg = 4 },
+            4 => instructions[6].src1.value = 1,
+            5 => instructions[2] = .{ .pc = 12, .opcode = .s_cbranch_scc1, .branch_target = 20 },
+            6 => instructions[5] = .{ .pc = 32, .opcode = .buffer_load_dwordx2, .dst = .{ .kind = .vgpr, .reg = 38 }, .data_words = 2 },
+            7 => instructions[8] = .{ .pc = 52, .opcode = .s_cbranch_scc1, .branch_target = 12 },
+            8 => instructions[8] = .{ .pc = 52, .opcode = .s_mov_b32, .dst = .{ .kind = .sgpr, .reg = 68 }, .src0 = .{ .kind = .integer_inline_constant, .value = 1 } },
+            else => unreachable,
+        }
+        var graph = try rdna2.control_flow.buildInstructions(std.testing.allocator, &instructions);
+        defer graph.deinit(std.testing.allocator);
+        var cache = definitions.ScalarDefinitionCache.init(std.testing.allocator, &instructions, &graph);
+        defer cache.deinit();
+        var memory = M{};
+        var bindings = std.mem.zeroes(shaders.StageBindings);
+        bindings.user_data_count = 2;
+        bindings.user_data[0] = 0x1000;
+        const snapshot = scalar.Evaluation{};
+        var resolver = Resolver{ .bindings = &bindings, .reader = .{ .context = &memory, .read_fn = M.read }, .instructions = &instructions, .graph = &graph, .snapshot = &snapshot, .definition_cache = &cache };
+        for (0..2) |_| {
+            resolver.remaining = 512;
+            var words: [8]u32 = undefined;
+            const recoverable = variant < 2 or variant == 7;
+            try std.testing.expectEqual(recoverable, try resolver.words(68, 56, &words));
+            if (recoverable) for (words, 0..) |value, component| {
+                try std.testing.expectEqual(memory.bias + 352 + component * 4, value);
+            };
+            memory.bias += 0x1000; // Persistent origins must not retain guest words.
+        }
+    }
+}
 
 test "scalar resource recovery reconstructs bitfield sampler constants" {
     const M = struct {
