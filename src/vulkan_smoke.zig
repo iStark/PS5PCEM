@@ -8293,6 +8293,87 @@ fn runBufferContentCacheProbe(allocator: std.mem.Allocator, device_budget: usize
     try runBufferContentCacheSizeProbe(allocator, device_budget, 4 * 1024 * 1024 + 256);
 }
 
+fn runBufferViewCoherenceProbe(allocator: std.mem.Allocator) !void {
+    try runBufferViewCoherenceSizeProbe(allocator, 0);
+    try runBufferViewCoherenceSizeProbe(allocator, 4 * 1024 * 1024);
+}
+
+fn runBufferViewCoherenceSizeProbe(allocator: std.mem.Allocator, comptime padding: u32) !void {
+    const Memory = SizedGuestMemory(padding + 0x30000);
+    const guest = try allocator.create(Memory);
+    defer allocator.destroy(guest);
+    for ([_]bool{ false, true }) |retain| {
+        guest.* = .{};
+        var renderer = try vulkan.Renderer.init(allocator, .{
+            .enable_timeline_scheduler = true,
+            .defer_small_storage_writes = padding == 0,
+            .retain_clean_storage_buffers = retain,
+        });
+        defer renderer.deinit();
+        var memory = guest.interface();
+        memory.fingerprint = Memory.fingerprint;
+        _ = renderer.dcbBackend(memory);
+        const source = 0x10000;
+        const output = padding + 0x20000;
+        const read_code = [_]u32{
+            vop1(1, 0, 8),
+            0xe030_1000,
+            0x8000_0100,
+            0xbf8c_0f70,
+            0xe070_0000,
+            0x8001_0100,
+            0xbf81_0000,
+        };
+        const write_code = [_]u32{
+            vop1(1, 0, 8), vop1(1, 1, 9),
+            0xe070_1000,   0x8000_0100,
+            0xbf81_0000,
+        };
+        for (read_code, 0..) |word, i| guest.word(0x100 + i * 4, word);
+        for (write_code, 0..) |word, i| guest.word(0x400 + i * 4, word);
+        var state = gpu.State{};
+        const compute = gpu.resources.ShaderStage.compute;
+        try state.writeRegister(.shader, compute.programRegisterBase() + 1, 0);
+        try state.writeRegister(.shader, 0x213, 10 << 1);
+        const userdata = [_]u32{ source, 4 << 16, 32, 0, output, 4 << 16, 1, 0, 0, 0 };
+        for (userdata, 0..) |word, i|
+            try state.writeRegister(.shader, compute.userDataBase() + @as(u32, @intCast(i)), word);
+        guest.word(source, 0x0102_0304);
+        // Keep both range sizes alive while alternating GPU authorship. A
+        // narrower write must reach the wider reader without losing its tail.
+        const steps = [_]struct { write: bool, bytes: u32, offset: u32, value: u32 }{
+            .{ .write = false, .bytes = 128, .offset = 0, .value = 0x0102_0304 },
+            .{ .write = true, .bytes = 64, .offset = 0, .value = 0xdead_beef },
+            .{ .write = false, .bytes = 128, .offset = 0, .value = 0xdead_beef },
+            .{ .write = true, .bytes = 128, .offset = 96, .value = 0xcafe_f00d },
+            .{ .write = false, .bytes = 64, .offset = 0, .value = 0xdead_beef },
+            .{ .write = true, .bytes = 64, .offset = 4, .value = 0xaabb_ccdd },
+            .{ .write = false, .bytes = 128, .offset = 4, .value = 0xaabb_ccdd },
+            .{ .write = false, .bytes = 128, .offset = 96, .value = 0xcafe_f00d },
+        };
+        for (steps, 0..) |step, index| {
+            try state.writeRegister(.shader, compute.programRegisterBase(), if (step.write) 4 else 1);
+            try state.writeRegister(.shader, compute.userDataBase() + 2, (padding + step.bytes) / 4);
+            try state.writeRegister(.shader, compute.userDataBase() + 8, if (step.offset == 96) padding + step.offset else step.offset);
+            try state.writeRegister(.shader, compute.userDataBase() + 9, step.value);
+            _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
+            if (!step.write) {
+                var result: [4]u8 = undefined;
+                try renderer.readbackGuestStorageBuffer(output, &result);
+                const actual = std.mem.readInt(u32, &result, .little);
+                if (actual != step.value)
+                    std.debug.print("buffer view padding={d} retain={any} step={d}: expected=0x{x} actual=0x{x}\n", .{ padding, retain, index, step.value, actual });
+                try std.testing.expectEqual(step.value, actual);
+            }
+        }
+        try renderer.flushPendingGuestWrites();
+        try std.testing.expectEqual(@as(u32, 0xdead_beef), std.mem.readInt(u32, guest.bytes[source..][0..4], .little));
+        try std.testing.expectEqual(@as(u32, 0xaabb_ccdd), std.mem.readInt(u32, guest.bytes[source + 4 ..][0..4], .little));
+        try std.testing.expectEqual(@as(u32, 0xcafe_f00d), std.mem.readInt(u32, guest.bytes[source + padding + 96 ..][0..4], .little));
+    }
+    std.debug.print("buffer view coherence passed: GPU writes across {d}/{d}-byte views, preserved tail, both cache modes\n", .{ padding + 64, padding + 128 });
+}
+
 fn runBufferContentCacheSizeProbe(allocator: std.mem.Allocator, device_budget: usize, comptime size: usize) !void {
     const Memory = SizedGuestMemory(8 * 1024 * 1024);
     const guest = try allocator.create(Memory);
@@ -9290,6 +9371,10 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--buffer-content-cache")) {
         try runBufferContentCacheProbe(allocator, 0);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--buffer-view-coherence")) {
+        try runBufferViewCoherenceProbe(allocator);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--zero-depth-samples")) {

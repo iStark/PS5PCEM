@@ -5168,6 +5168,17 @@ pub const Renderer = struct {
         if (size == 0) return Error.GuestMemoryReadFailed;
         if (size > maximum_staged_buffer_bytes) return Error.GuestBufferTooLarge;
         const memory = self.guest_memory orelse return Error.GuestMemoryUnavailable;
+        // V# ranges at one allocation base can change between commands. An
+        // exact resident hit keeps its GPU result, but a differently sized
+        // view uploads guest bytes and must first observe the earlier writer.
+        // Publish the whole old view so its dirty tail cannot later overwrite
+        // a newer, narrower write when the cache finally retires it.
+        var previous_views = self.guest_buffer_address_index.candidates(self.guest_buffers.items, guest_address);
+        while (previous_views.next()) |index| {
+            const previous = self.guest_buffers.items[index];
+            if (previous.guest_address == guest_address and previous.size != size and previous.gpu_dirty)
+                try self.flushGuestStorageBuffer(index);
+        }
         // A raw V# may read or partially overwrite a colour allocation that
         // was last produced as an attachment. Preserve those pixels before
         // staging the buffer; otherwise a masked store starts from stale RAM.

@@ -44,6 +44,13 @@ range. Small buffers retain eager visibility. This removes the former
 multi-megabyte upload/readback cycle from every dispatch while keeping cache and
 descriptor-set growth bounded.
 
+Changing a storage view's size at the same guest address publishes the previous
+GPU writer before uploading the new view. The complete old range is published,
+so a later eviction cannot restore an obsolete prefix over a newer narrow
+write. Exact-size resident hits remain on the GPU. The `--buffer-view-coherence`
+probe checks both cache modes, small deferred writes and large buffers, including
+preservation of the larger view's tail.
+
 Without page tracking, clean storage buffers of at least 64 bytes use a
 full-range content fingerprint. Unchanged small constant buffers can therefore
 keep their queued GPU readers and reuse the existing upload. Changed contents
