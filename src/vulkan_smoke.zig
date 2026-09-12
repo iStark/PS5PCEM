@@ -4833,13 +4833,14 @@ fn runResidentTargetReuseAtLimit(allocator: std.mem.Allocator, limit: usize) !vo
     std.debug.print("resident target reuse passed: {d} entries, warm working set, full cache, sampled source, GPU readback, released pins, queued transfer-buffer reseeding\n", .{limit});
 }
 
-fn runQueuedBufferReuseProbe(allocator: std.mem.Allocator, use_waits: bool, retain: bool, device_budget: usize) !void {
+fn runQueuedBufferReuseProbe(allocator: std.mem.Allocator, use_waits: bool, retain: bool, device_budget: usize, rename_budget: usize) !void {
     var renderer = try vulkan.Renderer.init(allocator, .{
         .enable_timeline_scheduler = true,
         .storage_buffer_use_waits = use_waits,
         .retain_clean_storage_buffers = retain,
         .storage_buffer_cache_budget_bytes = 64 * 16,
         .device_storage_budget_bytes = device_budget,
+        .storage_buffer_rename_budget_bytes = rename_budget,
     });
     defer renderer.deinit();
     var guest = GuestMemory{};
@@ -5031,6 +5032,90 @@ fn runQueuedBufferReuseProbe(allocator: std.mem.Allocator, use_waits: bool, reta
         try std.testing.expectEqual(value, std.mem.readInt(u32, rebound_result[0..4], .little));
     }
     std.debug.print("compute module lifetime passed: cached/uncached translations, eviction, pipeline reuse and changing input bytes\n", .{});
+}
+
+fn runStorageBufferRenameProbe(allocator: std.mem.Allocator, fingerprint: bool) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{
+        .enable_timeline_scheduler = true,
+        .retain_clean_storage_buffers = true,
+        .storage_buffer_rename_budget_bytes = 4 * 1024 * 1024,
+    });
+    defer renderer.deinit();
+    var guest = GuestMemory{};
+    var memory = guest.interface();
+    if (fingerprint) memory.fingerprint = GuestMemory.fingerprint;
+    _ = renderer.dcbBackend(memory);
+    renderer.storage_fingerprint_min_bytes = 16;
+    const code = [_]u32{ 0xe030_0000, 0x8002_0000, 0xe070_0000, 0x8003_0000, 0xbf81_0000 };
+    for (code, 0..) |word, index| guest.word(0x100 + index * 4, word);
+    var analysis = try gpu.shader_analysis.decode(allocator, .{ .context = &guest, .read_fn = GuestMemory.read }, 0x100, 16);
+    defer analysis.deinit(allocator);
+    var module = try analysis.translateSpirv(allocator, .{
+        .stage = .compute,
+        .local_size = .{ 1, 1, 1 },
+        .storage_buffers = &.{
+            .{ .resource_sgpr = 8, .descriptor_index = 0, .extent_bytes = 16 },
+            .{ .resource_sgpr = 12, .descriptor_index = 1, .extent_bytes = 16 },
+        },
+    });
+    defer module.deinit(allocator);
+    for (0..8) |index| _ = try renderer.stageGuestStorageBufferAt(@intCast(index + 2), 0x2000 + index * 0x100, 16);
+    // Leave every reader queued while updating the same guest source eight
+    // times. Each command must observe its own upload, with no intervening
+    // submission or wait. The second batch must reuse the completed spares.
+    for (0..2) |pass| {
+        renderer.draw_batch_active = true;
+        const submitted = renderer.submitted_tick;
+        const renames = renderer.frame_profile.storage_buffer_renames;
+        const reuses = renderer.frame_profile.storage_buffer_rename_reuses;
+        for (0..8) |index| {
+            renderer.current_descriptor_slot = index;
+            renderer.descriptor_set = renderer.descriptor_sets[index];
+            @memset(&renderer.active_storage_buffers, 0);
+            guest.word(0x1000, @intCast(0x12340000 + pass * 0x100 + index));
+            _ = try renderer.stageGuestStorageBufferAt(0, 0x1000, 16);
+            _ = try renderer.stageGuestStorageBufferAt(1, 0x2000 + index * 0x100, 16);
+            _ = try renderer.dispatchSpirv(module.words, .{ 1, 1, 1 });
+            try std.testing.expectEqual(submitted, renderer.submitted_tick);
+            try std.testing.expectEqual(index + 1, renderer.pending_command_buffers.items.len);
+        }
+        try std.testing.expectEqual(renames + 7, renderer.frame_profile.storage_buffer_renames);
+        if (pass != 0) try std.testing.expectEqual(reuses + 7, renderer.frame_profile.storage_buffer_rename_reuses);
+        try std.testing.expect(renderer.retired_storage_buffer_bytes <= renderer.storage_buffer_rename_budget_bytes);
+        for (0..8) |index| {
+            var result: [16]u8 = undefined;
+            try renderer.readbackGuestStorageBuffer(0x2000 + index * 0x100, &result);
+            try std.testing.expectEqual(@as(u32, @intCast(0x12340000 + pass * 0x100 + index)), std.mem.readInt(u32, result[0..4], .little));
+        }
+    }
+    renderer.draw_batch_active = false;
+    renderer.current_descriptor_slot = null;
+    renderer.descriptor_set = renderer.descriptor_sets[0];
+    @memset(&renderer.active_storage_buffers, 0);
+    guest.word(0x1000, 0x76543210);
+    _ = try renderer.stageGuestStorageBufferAt(0, 0x1000, 16);
+    _ = try renderer.stageGuestStorageBufferAt(1, 0x2000, 16);
+    renderer.draw_batch_active = true;
+    renderer.current_descriptor_slot = 0;
+    _ = try renderer.dispatchSpirv(module.words, .{ 1, 1, 1 });
+    renderer.current_descriptor_slot = 1;
+    renderer.descriptor_set = renderer.descriptor_sets[1];
+    // Another binding in this same descriptor snapshot still names the
+    // allocation. Renaming only slot 0 must not split these two aliases.
+    renderer.active_storage_buffers[2] = renderer.active_storage_buffers[0];
+    const renames = renderer.frame_profile.storage_buffer_renames;
+    const submitted = renderer.submitted_tick;
+    guest.word(0x1000, 0xfedcba98);
+    _ = try renderer.stageGuestStorageBufferAt(0, 0x1000, 16);
+    try std.testing.expectEqual(renames, renderer.frame_profile.storage_buffer_renames);
+    try std.testing.expect(renderer.submitted_tick > submitted);
+    var result: [16]u8 = undefined;
+    try renderer.readbackGuestStorageBuffer(0x2000, &result);
+    try std.testing.expectEqual(@as(u32, 0x76543210), std.mem.readInt(u32, result[0..4], .little));
+    renderer.draw_batch_active = false;
+    renderer.current_descriptor_slot = null;
+    renderer.descriptor_set = renderer.descriptor_sets[0];
+    std.debug.print("storage buffer rename passed (fingerprint={any}): 16 queued snapshots, no upload submissions, completed spare reuse, bounded allocations, descriptor aliases\n", .{fingerprint});
 }
 
 fn runDeviceStorageBudgetProbe(allocator: std.mem.Allocator) !void {
@@ -6780,7 +6865,7 @@ fn runFlatPointerProbe(allocator: std.mem.Allocator) !void {
 }
 
 fn runCleanBufferRetentionProbe(allocator: std.mem.Allocator) !void {
-    for ([_]bool{ false, true }) |use_waits| try runQueuedBufferReuseProbe(allocator, use_waits, true, 0);
+    for ([_]bool{ false, true }) |use_waits| try runQueuedBufferReuseProbe(allocator, use_waits, true, 0, 0);
     for ([_]bool{ false, true }) |retain| {
         var renderer = try vulkan.Renderer.init(allocator, .{
             .enable_timeline_scheduler = true,
@@ -9520,7 +9605,7 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--device-storage")) {
-        for ([_]bool{ false, true }) |use_waits| try runQueuedBufferReuseProbe(allocator, use_waits, false, 64 * 1024 * 1024);
+        for ([_]bool{ false, true }) |use_waits| try runQueuedBufferReuseProbe(allocator, use_waits, false, 64 * 1024 * 1024, 0);
         try runBufferContentCacheProbe(allocator, 64 * 1024 * 1024);
         try runDeviceStorageBudgetProbe(allocator);
         return;
@@ -9863,7 +9948,13 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--buffer-reuse")) {
-        for ([_]bool{ false, true }) |use_waits| try runQueuedBufferReuseProbe(allocator, use_waits, false, 0);
+        for ([_]bool{ false, true }) |use_waits| try runQueuedBufferReuseProbe(allocator, use_waits, false, 0, 0);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--buffer-rename")) {
+        for ([_]bool{ false, true }) |fingerprint| try runStorageBufferRenameProbe(allocator, fingerprint);
+        for ([_]usize{ 1, 4 * 1024 * 1024 }) |budget|
+            try runQueuedBufferReuseProbe(allocator, true, false, 0, budget);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--parallel-copy")) {
@@ -10426,7 +10517,7 @@ pub fn main(init: std.process.Init) !void {
     try runIndexedCopyKernel(allocator, &renderer, &guest, backend);
     try runStorageImageCopyKernel(allocator, &renderer, &guest, backend);
 
-    try runQueuedBufferReuseProbe(allocator, true, false, 0);
+    try runQueuedBufferReuseProbe(allocator, true, false, 0, 0);
 
     var output_buffer: [1024]u8 = undefined;
     var output = std.Io.File.stdout().writer(init.io, &output_buffer);

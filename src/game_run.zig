@@ -637,6 +637,10 @@ fn run(init: std.process.Init) !bool {
         defer allocator.free(text);
         break :parse @min(std.fmt.parseInt(usize, text, 10) catch 0, 2048);
     } else |_| 0;
+    const storage_rename_mib: usize = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_STORAGE_RENAME_MIB")) |text| parse: {
+        defer allocator.free(text);
+        break :parse @min(std.fmt.parseInt(usize, text, 10) catch 0, 256);
+    } else |_| 0;
     if (builtin.os.tag == .windows and !force_headless) live_gpu: {
         host_window.init(output_mode.width(), output_mode.height()) catch |err| {
             try stderr.print("live Vulkan window unavailable: {s}; continuing headless\n", .{@errorName(err)});
@@ -681,6 +685,7 @@ fn run(init: std.process.Init) !bool {
             .storage_image_cache_limit = storage_image_cache_mib * 1024 * 1024,
             .compute_translation_cache_limit = compute_translation_cache_mib * 1024 * 1024,
             .device_storage_budget_bytes = device_storage_mib * 1024 * 1024,
+            .storage_buffer_rename_budget_bytes = storage_rename_mib * 1024 * 1024,
             .enable_host_import = enable_host_import,
             .native_window = .{
                 .instance = native.instance,

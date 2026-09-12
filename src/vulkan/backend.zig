@@ -267,6 +267,9 @@ pub const Options = struct {
     /// budget is a growth limit; replacing a backing may exceed it temporarily.
     retain_clean_storage_buffers: bool = false,
     storage_buffer_cache_budget_bytes: usize = 4 * 1024 * 1024 * 1024,
+    /// Opt-in spare allocations for small CPU uploads with queued readers.
+    /// Retired allocation bytes are bounded independently of the live cache.
+    storage_buffer_rename_budget_bytes: usize = 0,
     /// Optional device-local storage backing with a CPU-cached transfer mirror.
     /// Zero keeps the existing host-visible allocation policy.
     device_storage_budget_bytes: usize = 0,
@@ -1094,6 +1097,12 @@ const GuestBufferEntry = struct {
     /// Zero selects the legacy upload path when tracking is unavailable.
     page_generation: u64 = 0,
     content_hash: ?u64 = null,
+};
+
+const RetiredStorageBuffer = struct {
+    buffer: OwnedBuffer,
+    retire_tick: u64,
+    allocation_bytes: u64,
 };
 
 const ComputePipelineEntry = struct {
@@ -2137,6 +2146,8 @@ const FrameProfile = struct {
     buffer_fingerprint_ns: u64 = 0,
     storage_buffer_waits: u64 = 0,
     storage_buffer_waits_avoided: u64 = 0,
+    storage_buffer_renames: u64 = 0,
+    storage_buffer_rename_reuses: u64 = 0,
     content_reused_bytes: u64 = 0,
     compute_submit_ns: u64 = 0,
     shader_analysis_hits: u64 = 0,
@@ -3381,6 +3392,8 @@ pub const Renderer = struct {
     draw_batch_active: bool = false,
     draw_uploads_enabled: bool = false,
     deferred_vulkan_objects: std.ArrayList(DeferredVulkanObjectEntry) = .empty,
+    retired_storage_buffers: std.ArrayList(RetiredStorageBuffer) = .empty,
+    retired_storage_buffer_bytes: u64 = 0,
     pending_sampled_image_bytes: u64 = 0,
     compute_pipeline_layout: vk.PipelineLayout,
     detile_set_layout: vk.DescriptorSetLayout = 0,
@@ -3721,6 +3734,7 @@ pub const Renderer = struct {
     /// Diagnostic opt-in while reconstructed NGG winding is being validated.
     honor_guest_culling: bool = false,
     storage_buffer_cache_budget_bytes: usize = 4 * 1024 * 1024 * 1024,
+    storage_buffer_rename_budget_bytes: usize = 0,
     device_storage_budget_bytes: usize = 0,
 
     fn destroyResourcePools(self: *Renderer) void {
@@ -4320,6 +4334,7 @@ pub const Renderer = struct {
             .gpu_feedback_snapshots = options.gpu_feedback_snapshots,
             .storage_buffer_use_waits = options.storage_buffer_use_waits,
             .retain_clean_storage_buffers = options.retain_clean_storage_buffers,
+            .storage_buffer_rename_budget_bytes = options.storage_buffer_rename_budget_bytes,
             .storage_buffer_cache_budget_bytes = options.storage_buffer_cache_budget_bytes,
             .device_storage_budget_bytes = options.device_storage_budget_bytes,
             .window_presentation = window_presentation,
@@ -4459,6 +4474,8 @@ pub const Renderer = struct {
             if (entry.host_transfer) |transfer| self.destroyBuffer(transfer);
         }
         self.guest_buffers.deinit(self.allocator);
+        for (self.retired_storage_buffers.items) |entry| self.destroyBuffer(entry.buffer);
+        self.retired_storage_buffers.deinit(self.allocator);
         for (self.imported_allocations.items) |allocation| self.releaseImportedAllocation(allocation);
         self.imported_allocations.deinit(self.allocator);
         self.draw_upload_cache.deinit(self.allocator);
@@ -5431,7 +5448,7 @@ pub const Renderer = struct {
                     // The backing buffer may still be read by an older timeline
                     // tick. Changed pages are uncommon; wait only on that path,
                     // while unchanged draws bind the persistent copy directly.
-                    if (cache_hit or recycled_entry) try self.waitForStorageBufferHostWrite(entry);
+                    if (cache_hit or recycled_entry) try self.prepareStorageBufferHostWrite(entry, descriptor_index);
                     const mapping = try self.mapBufferRange(entry.host_transfer orelse entry.device_local, 0, size);
                     defer mapping.release(self);
                     const destination = mapping.bytes.ptr;
@@ -5550,7 +5567,7 @@ pub const Renderer = struct {
             // queued work: gpu_dirty tracks writes, not outstanding reads.
             // Finish those readers before overwriting either an exact hit or
             // a recycled allocation, also when page tracking is disabled.
-            if (cache_hit or recycled_entry) try self.waitForStorageBufferHostWrite(entry);
+            if (cache_hit or recycled_entry) try self.prepareStorageBufferHostWrite(entry, descriptor_index);
             const mapping = try self.mapBufferRange(entry.host_transfer orelse entry.device_local, 0, size);
             defer mapping.release(self);
             const read_ok = memory.read(memory.context, guest_address, mapping.bytes);
@@ -20884,6 +20901,58 @@ pub const Renderer = struct {
         try self.waitForTick(self.submitted_tick);
     }
 
+    fn prepareStorageBufferHostWrite(self: *Renderer, entry: *GuestBufferEntry, descriptor_index: u32) Error!void {
+        if (try self.renameStorageBufferForHostWrite(entry, descriptor_index)) return;
+        return self.waitForStorageBufferHostWrite(entry);
+    }
+
+    fn renameStorageBufferForHostWrite(self: *Renderer, entry: *GuestBufferEntry, descriptor_index: u32) Error!bool {
+        const budget = self.storage_buffer_rename_budget_bytes;
+        if (budget == 0 or !self.storage_buffer_use_waits or self.current_descriptor_slot == null or
+            self.draw_uploads_enabled or entry.gpu_dirty or entry.host_transfer != null or
+            entry.device_local.host_mapping != null or entry.device_local.size > 1024 * 1024 or
+            entry.last_gpu_use <= self.completed_tick or
+            self.storageBufferBoundElsewhere(entry.device_local.handle, descriptor_index)) return false;
+
+        // Do not submit queued readers just to recycle their input. A spare
+        // keeps their descriptor snapshot valid until its original tick ends.
+        try self.refreshGpuProgress();
+        if (entry.last_gpu_use <= self.completed_tick) return false;
+        var requirements: vk.MemoryRequirements = undefined;
+        self.device_functions.get_buffer_memory_requirements(self.device, entry.device_local.handle, &requirements);
+        var replacement_index: ?usize = null;
+        for (self.retired_storage_buffers.items, 0..) |retired, index| {
+            if (retired.retire_tick <= self.completed_tick and retired.buffer.size == entry.device_local.size and
+                self.retired_storage_buffer_bytes - retired.allocation_bytes +| requirements.size <= budget)
+            {
+                replacement_index = index;
+                break;
+            }
+        }
+        const replacement = if (replacement_index) |index| take: {
+            const retired = self.retired_storage_buffers.swapRemove(index);
+            self.retired_storage_buffer_bytes -= retired.allocation_bytes;
+            self.frame_profile.storage_buffer_rename_reuses += 1;
+            break :take retired.buffer;
+        } else allocate: {
+            if (self.retired_storage_buffers.items.len >= 256 or
+                self.retired_storage_buffer_bytes +| requirements.size > budget) return false;
+            self.retired_storage_buffers.ensureUnusedCapacity(self.allocator, 1) catch return false;
+            const backing = self.createStorageBacking(@intCast(entry.device_local.size), false, entry.guest_address, null) catch return false;
+            break :allocate backing.device;
+        };
+        self.retired_storage_buffers.appendAssumeCapacity(.{
+            .buffer = entry.device_local,
+            .retire_tick = if (entry.last_gpu_use == command_buffer_pending_tick) self.submitted_tick + 1 else entry.last_gpu_use,
+            .allocation_bytes = requirements.size,
+        });
+        self.retired_storage_buffer_bytes += requirements.size;
+        entry.device_local = replacement;
+        entry.last_gpu_use = 0;
+        self.frame_profile.storage_buffer_renames += 1;
+        return true;
+    }
+
     fn waitForStorageBufferHostWrite(self: *Renderer, entry: *const GuestBufferEntry) Error!void {
         if (!self.storage_buffer_use_waits or self.current_descriptor_slot == null) {
             // The standalone staging API reuses one descriptor set. Updating
@@ -22573,6 +22642,8 @@ pub const Renderer = struct {
             );
             if (profile.storage_buffer_waits + profile.storage_buffer_waits_avoided != 0)
                 std.debug.print("[gpu buffer waits] flip={d} waits={d} avoided={d}\n", .{ self.flip_callbacks, profile.storage_buffer_waits, profile.storage_buffer_waits_avoided });
+            if (profile.storage_buffer_renames != 0)
+                std.debug.print("[gpu buffer rename] flip={d} renames={d} reused={d} pool={d}/{d}KiB\n", .{ self.flip_callbacks, profile.storage_buffer_renames, profile.storage_buffer_rename_reuses, self.retired_storage_buffers.items.len, self.retired_storage_buffer_bytes / 1024 });
             std.debug.print(
                 "[gpu shaders] flip={d} pso_hit={d} pso_miss={d}/{d}ms cpso={d}/{d}/{d}ms compute_ms={d}/{d}/{d}/{d} pso_cache={d} cpso_cache={d} miss_match(state/vs/ps)={d}/{d}/{d} sa_hit={d} sa_miss={d}/{d}ms prov_ms={d} xlat_ms={d} res_ms={d} sampled_ms={d}/{d}/{d}/{d} probe_ms={d} target_create_ms={d}/{d} cxlat={d}/{d}/{d}MiB\n",
                 .{
