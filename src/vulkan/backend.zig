@@ -8802,6 +8802,15 @@ pub const Renderer = struct {
         return slot;
     }
 
+    fn traceSkippedStorage(self: *Renderer, bindings: *const gpu.ShaderBindings, inst: gpu.ShaderInstruction, reason: []const u8, descriptor: ?gpu.BufferDescriptor) void {
+        if (!self.trace_resource_failures) return;
+        std.debug.print("[storage skipped] flip={d} draw={d} stage={s} program=0x{x} pc=0x{x} op={s} reason={s} address=0x{x} bytes={d}\n", .{
+            self.flip_callbacks,                             self.frame_profile.draws, @tagName(bindings.stage), bindings.program_address,
+            inst.pc,                                         inst.opcode.mnemonic(),   reason,                   if (descriptor) |value| value.address else 0,
+            if (descriptor) |value| value.size_bytes else 0,
+        });
+    }
+
     fn prepareComputeResources(
         self: *Renderer,
         bindings: *const gpu.ShaderBindings,
@@ -8982,6 +8991,7 @@ pub const Renderer = struct {
             else
                 null) orelse {
                 if (try self.prepareBufferTableCandidates(result, bindings, reader, analysis, &instruction_scalar, inst, is_store)) continue;
+                self.traceSkippedStorage(bindings, inst, "unresolved descriptor", null);
                 if (log_verbose_gpu) {
                     const full = gpu.scalar_provenance.evaluatePrefix(reader, bindings);
                     std.debug.print(
@@ -9003,6 +9013,7 @@ pub const Renderer = struct {
                 continue;
             };
             if (descriptor.isNull() or descriptor.size_bytes == 0) {
+                self.traceSkippedStorage(bindings, inst, "null descriptor", descriptor);
                 if (log_verbose_gpu) std.debug.print(
                     "[vulkan dcb] MissingStorageDescriptor: pc=0x{x} {s} V# s{d} null/empty (addr=0x{x} size={d}); soft-skip\n",
                     .{
@@ -9016,6 +9027,7 @@ pub const Renderer = struct {
                 continue;
             }
             const size = std.math.cast(usize, descriptor.size_bytes) orelse {
+                self.traceSkippedStorage(bindings, inst, "descriptor size", descriptor);
                 if (log_verbose_gpu) std.debug.print(
                     "[vulkan dcb] GuestBufferTooLarge: V# s{d} size_bytes=0x{x}; soft-skip\n",
                     .{ resource_sgpr, descriptor.size_bytes },
@@ -9024,10 +9036,12 @@ pub const Renderer = struct {
             };
             const descriptor_index = result.descriptorForRange(descriptor.address, size) orelse blk: {
                 const free = result.freeDescriptor() orelse {
+                    self.traceSkippedStorage(bindings, inst, "descriptor capacity", descriptor);
                     if (log_verbose_gpu) std.debug.print("[vulkan dcb] no free storage slot for V# s{d}; soft-skip\n", .{resource_sgpr});
                     continue;
                 };
                 _ = self.stageGuestStorageBufferAt(free, descriptor.address, size) catch |err| {
+                    self.traceSkippedStorage(bindings, inst, @errorName(err), descriptor);
                     if (log_verbose_gpu) std.debug.print(
                         "[vulkan dcb] stage V# s{d} failed: {s} addr=0x{x} size=0x{x} stride={d} records={d}; soft-skip\n",
                         .{
@@ -15666,9 +15680,9 @@ pub const Renderer = struct {
             null,
             graphics_resources.mappings[fragment_mapping_count..graphics_resources.mapping_count],
         ) catch |err| blk: {
-            if (log_verbose_gpu) std.debug.print(
-                "[vulkan dcb] vertex storage incomplete: {s}; translating without buffers\n",
-                .{@errorName(err)},
+            if (log_verbose_gpu or self.trace_resource_failures) std.debug.print(
+                "[vulkan dcb] vertex storage incomplete: {s}; translating without buffers flip={d} draw={d} vs=0x{x} ps=0x{x}\n",
+                .{ @errorName(err), self.flip_callbacks, self.frame_profile.draws, vertex_address, fragment_address },
             );
             break :blk try ComputeResources.acquire(self);
         };
@@ -16095,9 +16109,9 @@ pub const Renderer = struct {
             graphics_resources.mappings[0..fragment_mapping_count],
         ) catch |err| blk: {
             if (fragmentShadowRecords(fragment_analysis)) return err;
-            if (log_verbose_gpu) std.debug.print(
-                "[vulkan dcb] fragment storage incomplete: {s}; translating without buffers\n",
-                .{@errorName(err)},
+            if (log_verbose_gpu or self.trace_resource_failures) std.debug.print(
+                "[vulkan dcb] fragment storage incomplete: {s}; translating without buffers flip={d} draw={d} vs=0x{x} ps=0x{x}\n",
+                .{ @errorName(err), self.flip_callbacks, self.frame_profile.draws, vertex_address, fragment_address },
             );
             break :blk try ComputeResources.acquire(self);
         };
