@@ -8412,6 +8412,7 @@ pub const Renderer = struct {
         analysis: *const gpu.ShaderAnalysis,
         checkpoint_pcs: []const u32,
         checkpoint_registers: []const gpu.scalar_provenance.ScalarRegisters,
+        proven_pointer_loads: []const gpu.ShaderSpirvScalarRegister,
     ) anyerror!void {
         var pages: [maximum_storage_descriptors]u64 = undefined;
         var slots: [maximum_storage_descriptors]u32 = undefined;
@@ -8424,6 +8425,7 @@ pub const Renderer = struct {
         var scalar = gpu.ScalarEvaluation{};
         for (instructions) |inst| {
             if (!isPointerScalarLoad(inst.opcode) or inst.src0.kind != .sgpr or inst.src0.reg + 1 >= 128) continue;
+            if (hasScalarLoadAt(proven_pointer_loads, inst.pc)) continue;
             scalar.registers = scalarRegistersAtCheckpoint(checkpoint_pcs, checkpoint_registers, inst.pc).*;
             const table = try scalarPointerTablePlan(bindings, reader, analysis, &scalar, inst);
             var pointers = PointerCandidates{};
@@ -8477,6 +8479,7 @@ pub const Renderer = struct {
         // The shader checks both address halves and each word's buffer range.
         for (instructions) |inst| {
             if (!isPointerScalarLoad(inst.opcode) or inst.src0.kind != .sgpr or inst.src0.reg + 1 >= 128) continue;
+            if (hasScalarLoadAt(proven_pointer_loads, inst.pc)) continue;
             const registers = scalarRegistersAtCheckpoint(checkpoint_pcs, checkpoint_registers, inst.pc);
             if (registers[inst.src0.reg].known and registers[inst.src0.reg + 1].known and
                 std.mem.indexOfScalar(u32, table_loads[0..table_load_count], inst.pc) == null) continue;
@@ -8972,6 +8975,21 @@ pub const Renderer = struct {
             &result.scalar_registers,
             result.scalar_count,
         );
+        const recovered_pointer_begin = result.scalar_count;
+        if (instructions.ptr == analysis.program.instructions.items.ptr and
+            instructions.len == analysis.program.instructions.items.len)
+        {
+            result.scalar_count = gpu.scalar_resources.appendMissingPointerLoads(
+                bindings,
+                reader,
+                instructions,
+                &analysis.graph,
+                analysis.scalar_definitions,
+                &result.scalar_registers,
+                result.scalar_count,
+                specialized_scalar_prefix_end,
+            );
+        }
         // Stage only V# ranges named by actual SMEM/MUBUF instructions below.
         // The old eager metadata sweep interpreted every constant-buffer
         // mapping as an SRT offset, including layouts whose buffers are already
@@ -9238,7 +9256,7 @@ pub const Renderer = struct {
             if (is_store) result.writable[descriptor_index] = true;
         }
 
-        try self.prepareScalarPointerMemory(result, bindings, reader, analysis, scalar_checkpoint_pcs, scalar_checkpoint_registers);
+        try self.prepareScalarPointerMemory(result, bindings, reader, analysis, scalar_checkpoint_pcs, scalar_checkpoint_registers, result.scalar_registers[recovered_pointer_begin..result.scalar_count]);
 
         for (instructions) |inst| {
             const writable = switch (inst.opcode) {
@@ -16430,6 +16448,10 @@ pub const Renderer = struct {
         };
         self.frame_profile.graphics_storage_ns +|= elapsedHostNanoseconds(fragment_storage_started);
         defer fragment_storage.deinit(self);
+        if (fragment_storage.scalar_count != 0) {
+            fragment_scalar_count = fragment_storage.scalar_count;
+            @memcpy(fragment_scalar_regs[0..fragment_scalar_count], fragment_storage.scalar_registers[0..fragment_scalar_count]);
+        }
         try self.prepareSampledImageLookups(fragment_storage, graphics_resources.mappings[0..fragment_mapping_count]);
         if (tessellation) |tess| {
             const slot = fragment_storage.freeDescriptor() orelse return Error.InvalidStorageDescriptor;
@@ -25245,6 +25267,11 @@ fn inferNggLdsExports(
     }
     if (parameter_word != zw) return 0;
     return output_count;
+}
+
+fn hasScalarLoadAt(registers: []const gpu.ShaderSpirvScalarRegister, pc: u32) bool {
+    for (registers) |entry| if (entry.producer_pc == pc) return true;
+    return false;
 }
 
 fn collectScalarLoadSpecializations(

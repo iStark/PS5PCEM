@@ -7777,7 +7777,44 @@ fn runVectorBufferAddressProbe(allocator: std.mem.Allocator) !void {
     std.debug.print("vector buffer addresses passed: overlapping destination/index, linear and swizzled loads, offset wrap and shrinking live bounds\n", .{});
 }
 
+fn runBranchedPointerConstantProbe(allocator: std.mem.Allocator) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{});
+    defer renderer.deinit();
+    var guest = GuestMemory{};
+    _ = renderer.dcbBackend(guest.interface());
+    for (0..2) |wide| {
+        const code = [_]u32{
+            vop1(1, 1, 8), // Workgroup index is not a CPU scalar constant.
+            0x7d84_0280, // v_cmp_eq_u32 VCC, 0, v1
+            0xbf87_0004, // Runtime branch to the second coefficient.
+            0xf400_1a80,                                 125 << 25, // s_load_dword VCC_LO, s0, 0
+            vop1(1, 2, 106),                             0xbf82_0003,
+            if (wide == 0) 0xf400_1a80 else 0xf410_0400, (125 << 25) | 4,
+            vop1(1, 2, if (wide == 0) 106 else 31),      mubuf(0x1c, 0, 2, 1, 4)[0],
+            mubuf(0x1c, 0, 2, 1, 4)[1],                  0xbf81_0000,
+        };
+        for (code, 0..) |word, index| guest.word(0x100 + index * 4, word);
+        var state = gpu.State{};
+        try state.writeRegister(.shader, 0x20c, 1);
+        try state.writeRegister(.shader, 0x20d, 0);
+        try state.writeRegister(.shader, 0x213, (8 << 1) | (1 << 7));
+        for ([_]u32{ 0x9000, 0, 0, 0, 0x10000, 4 << 16, 2, 0 }, 0..) |word, index|
+            try state.writeRegister(.shader, 0x240 + @as(u32, @intCast(index)), word);
+        for ([_][2]u32{ .{ 0x3f800000, 0x3e800000 }, .{ 0x3f000000, 0x3fc00000 } }) |coefficients| {
+            guest.word(0x9000, coefficients[0]);
+            for (0..16) |index| guest.word(0x9004 + index * 4, coefficients[1] + @as(u32, @intCast(index)));
+            _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 2, 1, 1 });
+            var output: [8]u8 = undefined;
+            try renderer.readbackGuestStorageBuffer(0x10000, &output);
+            try std.testing.expectEqual(coefficients[1] + @as(u32, if (wide == 0) 0 else 15), std.mem.readInt(u32, output[0..4], .little));
+            try std.testing.expectEqual(coefficients[0], std.mem.readInt(u32, output[4..8], .little));
+        }
+    }
+    std.debug.print("branched pointer constants passed: both VCC coefficient paths and changed dispatch data\n", .{});
+}
+
 fn runScalarPointerProbe(allocator: std.mem.Allocator) !void {
+    try runBranchedPointerConstantProbe(allocator);
     var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true });
     defer renderer.deinit();
     var guest = GuestMemory{};

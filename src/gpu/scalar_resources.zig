@@ -17,6 +17,67 @@ pub var persistent_definition_cache_enabled = std.atomic.Value(bool).init(true);
 pub var persistent_definition_cache_hits = std.atomic.Value(u64).init(0);
 pub var persistent_definition_cache_misses = std.atomic.Value(u64).init(0);
 
+/// Recover pointer loads omitted by the representative scalar walk. An empty
+/// snapshot forces every address input to come from its reaching definition;
+/// a value observed on another path or loop iteration is not evidence here.
+/// Returns the new end of the specialization list. The appended range consists
+/// only of loads whose entire address and payload were recovered together.
+pub fn appendMissingPointerLoads(
+    bindings: *const shaders.StageBindings,
+    reader: shaders.MemoryReader,
+    instructions: []const rdna2.Instruction,
+    graph: *const rdna2.control_flow.Graph,
+    cache: ?*definitions.ScalarDefinitionCache,
+    output: []rdna2.spirv.ScalarRegister,
+    count: usize,
+    prefix_end: u32,
+) usize {
+    var seen = std.StaticBitSet(64 * 1024).initEmpty();
+    for (output[0..count]) |entry| if (entry.producer_pc) |pc| {
+        if (pc / 4 < seen.capacity()) seen.set(pc / 4);
+    };
+    const empty = scalar.Evaluation{};
+    var end = count;
+    for (instructions) |inst| {
+        switch (inst.opcode) {
+            .s_load_dword, .s_load_dwordx2, .s_load_dwordx4, .s_load_dwordx8, .s_load_dwordx16 => {},
+            else => continue,
+        }
+        if (inst.pc >= prefix_end or inst.pc / 4 >= seen.capacity() or seen.isSet(inst.pc / 4)) continue;
+        const destination = scalar.scalarRegisterIndex(inst.dst) orelse continue;
+        if (inst.src0.kind != .sgpr or inst.src0.reg >= 127 or inst.data_words == 0 or
+            inst.data_words > 16 or destination + inst.data_words > 128 or inst.memory_offset < 0) continue;
+        if (output.len - end < inst.data_words) break;
+        var resolver = Resolver{ .bindings = bindings, .reader = reader, .instructions = instructions, .graph = graph, .snapshot = &empty, .definition_cache = cache };
+        var base: [2]u32 = undefined;
+        if (!(resolver.words(inst.src0.reg, inst.pc, &base) catch false) or base[1] > 0xffff) continue;
+        const pointer = @as(u64, base[0]) | (@as(u64, base[1]) << 32);
+        if (pointer == 0) continue;
+        var offset: [1]u32 = .{0};
+        if (scalar.scalarRegisterIndex(inst.src1)) |register| {
+            if (!(resolver.words(@intCast(register), inst.pc, &offset) catch false)) continue;
+        } else switch (inst.src1.kind) {
+            .null => {},
+            .integer_inline_constant, .literal_constant => offset[0] = inst.src1.value,
+            else => continue,
+        }
+        if (inst.src0.absolute or inst.src0.negate or inst.src0.dpp or
+            inst.src1.absolute or inst.src1.negate or inst.src1.dpp) continue;
+        const address = (pointer + @as(u64, offset[0]) + @as(u64, @intCast(inst.memory_offset))) & ~@as(u64, 3);
+        if (address + @as(u64, inst.data_words) * 4 > 0x1_0000_0000_0000) continue;
+        // MemoryReader.readWords is bounded to eight descriptor words; scalar
+        // constants also use s_load_dwordx16. Keep the complete payload here.
+        var bytes: [16 * @sizeOf(u32)]u8 = undefined;
+        reader.read(address, bytes[0 .. @as(usize, inst.data_words) * 4]) catch continue;
+        for (0..inst.data_words) |component| {
+            const value = std.mem.readInt(u32, bytes[component * 4 ..][0..4], .little);
+            output[end] = .{ .register = @intCast(destination + component), .value = value, .producer_pc = inst.pc };
+            end += 1;
+        }
+    }
+    return end;
+}
+
 pub const Resolver = struct {
     bindings: *const shaders.StageBindings,
     reader: shaders.MemoryReader,
@@ -172,6 +233,117 @@ pub const Resolver = struct {
         return try self.reader.readU32(byte);
     }
 };
+
+test "missing pointer constants follow branch definitions and stay draw-local" {
+    const M = struct {
+        coefficient: u32 = 0x3f800000,
+        fail: bool = false,
+        fn read(context: ?*anyopaque, address: u64, bytes: []u8) bool {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            if (self.fail or address < 0x1000 or address + bytes.len > 0x1100) return false;
+            for (0..bytes.len / 4) |word|
+                std.mem.writeInt(u32, bytes[word * 4 ..][0..4], self.coefficient + @as(u32, @intCast(word)), .little);
+            return true;
+        }
+    };
+    const original = [_]rdna2.Instruction{
+        .{ .pc = 0, .family = .sop1, .opcode = .s_mov_b64, .dst = .{ .kind = .sgpr, .reg = 94 }, .src0 = .{ .kind = .sgpr }, .word_count = 1 },
+        .{ .pc = 4, .family = .sopp, .opcode = .s_cbranch_execz, .branch_target = 20, .word_count = 1 },
+        .{ .pc = 8, .opcode = .s_load_dwordx2, .family = .smem, .dst = .{ .kind = .vcc_lo }, .src0 = .{ .kind = .sgpr, .reg = 94 }, .src1 = .{ .kind = .null }, .data_words = 2, .word_count = 2 },
+        .{ .pc = 16, .family = .sopp, .opcode = .s_branch, .branch_target = 32, .word_count = 1 },
+        .{ .pc = 20, .family = .sopp, .opcode = .s_nop, .word_count = 1 },
+        .{ .pc = 24, .opcode = .s_load_dwordx2, .family = .smem, .dst = .{ .kind = .vcc_lo }, .src0 = .{ .kind = .sgpr, .reg = 94 }, .src1 = .{ .kind = .null }, .memory_offset = 4, .data_words = 2, .word_count = 2 },
+        .{ .pc = 32, .family = .sopp, .opcode = .s_endpgm, .word_count = 1 },
+    };
+    var bindings = std.mem.zeroes(shaders.StageBindings);
+    bindings.user_data_count = 2;
+    bindings.user_data[0] = 0x1000;
+    bindings.resource_instruction_budget = 16384;
+    var memory = M{};
+    const reader = shaders.MemoryReader{ .context = &memory, .read_fn = M.read };
+    for (0..8) |variant| {
+        var instructions = original;
+        switch (variant) {
+            1 => instructions[4] = .{ .pc = 20, .opcode = .v_readfirstlane_b32, .dst = .{ .kind = .sgpr, .reg = 94 }, .src0 = .{ .kind = .vgpr }, .word_count = 1 },
+            2 => instructions[5].src1 = .{ .kind = .sgpr, .reg = 40 },
+            3 => { // A previous iteration can change the pointer.
+                instructions[4] = .{ .pc = 20, .opcode = .s_mov_b32, .dst = .{ .kind = .sgpr, .reg = 94 }, .src0 = .{ .kind = .integer_inline_constant, .value = 0x1080 }, .word_count = 1 };
+                instructions[6] = .{ .pc = 32, .opcode = .s_cbranch_scc1, .branch_target = 4, .word_count = 1 };
+            },
+            7 => {
+                instructions[3].branch_target = 24;
+                instructions[4] = .{ .pc = 20, .opcode = .s_mov_b32, .dst = .{ .kind = .sgpr, .reg = 94 }, .src0 = .{ .kind = .integer_inline_constant, .value = 0x1080 }, .word_count = 1 };
+            },
+            else => {},
+        }
+        var graph = try rdna2.control_flow.buildInstructions(std.testing.allocator, &instructions);
+        defer graph.deinit(std.testing.allocator);
+        var cache = definitions.ScalarDefinitionCache.init(std.testing.allocator, &instructions, &graph);
+        defer cache.deinit();
+        for (0..2) |draw| {
+            memory.coefficient = 0x3f800000 + @as(u32, @intCast(draw * 16));
+            memory.fail = variant == 4;
+            var output: [8]rdna2.spirv.ScalarRegister = undefined;
+            output[0] = .{ .register = 106, .value = 123, .producer_pc = 8 };
+            output[1] = .{ .register = 107, .value = 456, .producer_pc = 8 };
+            const end = appendMissingPointerLoads(&bindings, reader, &instructions, &graph, &cache, output[0..if (variant == 5) 3 else 8], 2, if (variant == 6) 24 else 64);
+            const recoverable = variant == 0 or variant == 3;
+            try std.testing.expectEqual(@as(usize, if (recoverable) 4 else 2), end);
+            try std.testing.expectEqual(@as(u32, 123), output[0].value);
+            if (variant == 3) {
+                var loop_output: [8]rdna2.spirv.ScalarRegister = undefined;
+                const loop_end = appendMissingPointerLoads(&bindings, reader, &instructions, &graph, &cache, &loop_output, 0, 64);
+                try std.testing.expectEqual(@as(usize, 2), loop_end);
+                try std.testing.expectEqual(@as(?u32, 24), loop_output[0].producer_pc);
+            }
+            if (recoverable) {
+                try std.testing.expectEqual(@as(?u32, 24), output[2].producer_pc);
+                try std.testing.expectEqual(@as(u32, 106), output[2].register);
+                try std.testing.expectEqual(memory.coefficient, output[2].value);
+                try std.testing.expectEqual(memory.coefficient + 1, output[3].value);
+            }
+        }
+    }
+    // The representative walk visits only the first arm of this diamond.
+    memory.fail = false;
+    const walked = scalar.evaluateDecodedResourceState(reader, &bindings, &original);
+    try std.testing.expectEqual(@as(usize, 1), walked.load_count);
+    try std.testing.expectEqual(@as(u32, 8), walked.loads[0].pc);
+}
+
+test "missing pointer recovery preserves all sixteen words and rejects partial reads" {
+    const M = struct {
+        readable: usize = 64,
+        fn read(context: ?*anyopaque, address: u64, bytes: []u8) bool {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            if (address != 0x1000 or bytes.len > self.readable) return false;
+            for (0..bytes.len / 4) |index|
+                std.mem.writeInt(u32, bytes[index * 4 ..][0..4], @as(u32, 0x3f800000) + @as(u32, @intCast(index)), .little);
+            return true;
+        }
+    };
+    const instructions = [_]rdna2.Instruction{
+        .{ .pc = 0, .family = .smem, .opcode = .s_load_dwordx16, .dst = .{ .kind = .sgpr, .reg = 32 }, .src0 = .{ .kind = .sgpr }, .src1 = .{ .kind = .null }, .data_words = 16, .word_count = 2 },
+        .{ .pc = 8, .family = .sopp, .opcode = .s_endpgm },
+    };
+    var graph = try rdna2.control_flow.buildInstructions(std.testing.allocator, &instructions);
+    defer graph.deinit(std.testing.allocator);
+    var bindings = std.mem.zeroes(shaders.StageBindings);
+    bindings.user_data_count = 2;
+    bindings.user_data[0] = 0x1000;
+    var memory = M{};
+    var output: [16]rdna2.spirv.ScalarRegister = undefined;
+    const reader = shaders.MemoryReader{ .context = &memory, .read_fn = M.read };
+    const count = appendMissingPointerLoads(&bindings, reader, &instructions, &graph, null, &output, 0, 16);
+    try std.testing.expectEqual(@as(usize, 16), count);
+    for (output, 0..) |entry, index| {
+        try std.testing.expectEqual(@as(u32, @intCast(32 + index)), entry.register);
+        try std.testing.expectEqual(@as(u32, 0x3f800000) + @as(u32, @intCast(index)), entry.value);
+        try std.testing.expectEqual(@as(?u32, 0), entry.producer_pc);
+    }
+    memory.readable = 60;
+    try std.testing.expectEqual(@as(usize, 0), appendMissingPointerLoads(&bindings, reader, &instructions, &graph, null, &output, 0, 16));
+}
 
 test "empty scalar buffers resolve independently of dynamic offsets" {
     const M = struct {
