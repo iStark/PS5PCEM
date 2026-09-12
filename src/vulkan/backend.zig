@@ -767,6 +767,11 @@ const SampledBackingKey = struct {
     }
 };
 
+const RecycledSampledBacking = struct {
+    image: OwnedImage,
+    alias_token: image_alias.Token,
+};
+
 const DrawUploadSlice = struct {
     buffer: vk.Buffer,
     offset: vk.DeviceSize,
@@ -20254,7 +20259,10 @@ pub const Renderer = struct {
         };
         const backing_key = SampledBackingKey.from(image_info);
         const recycled = if (@atomicLoad(bool, &sampled_backing_reuse, .monotonic)) self.recycleSampledBacking(backing_key) else null;
-        const image = recycled orelse try self.createImageBacking(image_info, true);
+        // Keep the prior alias alive until the new one inherits its epoch.
+        // Updating the same guest source must not reset its content generation.
+        defer if (recycled) |old| self.image_aliases.unregister(old.alias_token);
+        const image = if (recycled) |old| old.image else try self.createImageBacking(image_info, true);
         errdefer self.destroyImage(image);
         if (recycled == null) try self.registerTrackedImage(image.handle, vk.image_aspect_color_bit, mip_levels, upload_layers);
         errdefer self.image_states.forgetImage(image.handle);
@@ -20421,7 +20429,7 @@ pub const Renderer = struct {
         return .{ .image = image, .view = view, .sampler = sampler };
     }
 
-    fn recycleSampledBacking(self: *Renderer, requested: ?SampledBackingKey) ?OwnedImage {
+    fn recycleSampledBacking(self: *Renderer, requested: ?SampledBackingKey) ?RecycledSampledBacking {
         const key = requested orelse return null;
         if (self.sampled_image_cache_bytes > self.sampled_image_cache_budget_bytes) return null;
         const trim_started = hostTimestampNs();
@@ -20447,12 +20455,11 @@ pub const Renderer = struct {
         self.sampled_image_cache_bytes -= entry.image.allocation_bytes;
         self.destroyImageView(entry.view);
         self.invalidateResidentImageViews(entry.image.handle);
-        self.image_aliases.unregister(entry.alias_token);
         _ = self.sampled_image_cache.orderedRemove(index);
         self.sampled_image_index.invalidate();
         self.frame_profile.texture_evictions +|= 1;
         self.frame_profile.sampled_backing_reuses +|= 1;
-        return entry.image;
+        return .{ .image = entry.image, .alias_token = entry.alias_token };
     }
 
     fn retireSampledImage(self: *Renderer, index: usize) void {

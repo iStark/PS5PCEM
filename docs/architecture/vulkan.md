@@ -129,11 +129,14 @@ Vulkan creation parameters and would exceed the cache budget or entry limit.
 It preserves the image's tracked usage so transfer barriers order prior queued
 readers before the new upload. Old primary and alternate views retire with
 their consumers; new views preserve the requested swizzle and sampler.
+The previous alias remains registered until its replacement inherits the
+content epoch, including CPU updates to the same guest texture under pressure.
 No idle pool or extra memory allowance is introduced, and an incompatible
 oldest image follows the existing allocation and retirement path. The
 `reuses` counter distinguishes this path from fresh allocations. The budget
 probe checks queued original and swizzled reads before and after reuse, rejects
-different extents, and runs with both fence and timeline scheduling. Native
+different extents, preserves same-source update epochs, and runs with both
+fence and timeline scheduling. Native
 FPS and visual comparisons are still required before enabling this by default.
 
 The decoded shader cache holds 1,024 programs. Yotei's opening cinematic

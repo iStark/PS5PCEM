@@ -3398,12 +3398,13 @@ fn runSampledCacheBudgetProbe(allocator: std.mem.Allocator) !void {
         try runSampledCacheBudgetCase(allocator, .bounded_async, timeline);
         try runSampledCacheBudgetCase(allocator, .replace_sync, timeline);
         try runSampledCacheBudgetCase(allocator, .bounded_reuse, timeline);
+        try runSampledCacheBudgetCase(allocator, .bounded_reuse_revision, timeline);
         try runSampledCacheBudgetCase(allocator, .bounded_reuse_mismatch, timeline);
     }
 }
 
-fn runSampledCacheBudgetCase(allocator: std.mem.Allocator, mode: enum { one_byte, bounded_sync, bounded_async, replace_sync, bounded_reuse, bounded_reuse_mismatch }, timeline: bool) !void {
-    const reuse = mode == .bounded_reuse or mode == .bounded_reuse_mismatch;
+fn runSampledCacheBudgetCase(allocator: std.mem.Allocator, mode: enum { one_byte, bounded_sync, bounded_async, replace_sync, bounded_reuse, bounded_reuse_revision, bounded_reuse_mismatch }, timeline: bool) !void {
+    const reuse = mode == .bounded_reuse or mode == .bounded_reuse_revision or mode == .bounded_reuse_mismatch;
     const bounded_case = mode == .bounded_sync or mode == .bounded_async or reuse;
     const previous_reuse = vulkan.backend.sampled_backing_reuse;
     defer vulkan.backend.sampled_backing_reuse = previous_reuse;
@@ -3417,7 +3418,7 @@ fn runSampledCacheBudgetCase(allocator: std.mem.Allocator, mode: enum { one_byte
     const guest = try allocator.create(Memory);
     defer allocator.destroy(guest);
     guest.* = .{};
-    var renderer = try vulkan.Renderer.init(allocator, .{ .defer_small_storage_writes = true, .enable_timeline_scheduler = timeline });
+    var renderer = try vulkan.Renderer.init(allocator, .{ .defer_small_storage_writes = true, .enable_timeline_scheduler = timeline, .enable_canonical_image_aliases = mode == .bounded_reuse_revision });
     defer renderer.deinit();
     const Context = struct {
         guest: *Memory,
@@ -3462,7 +3463,7 @@ fn runSampledCacheBudgetCase(allocator: std.mem.Allocator, mode: enum { one_byte
     try state.writeRegister(.shader, 0x213, 24 << 1);
     const rounds: usize = if (bounded_case) 12 else 3;
     for (0..rounds) |round| {
-        const source: u32 = @intCast(0x20000 + (if (replace_contents) @as(usize, 0) else round) * 0x200);
+        const source: u32 = @intCast(0x20000 + (if (replace_contents) @as(usize, 0) else if (mode == .bounded_reuse_revision) round % 8 else round) * 0x200);
         guest.word(source, 0xff60_4020 + @as(u32, @intCast(round)));
         guest.word(source + 0x100, 0xffc0_a080 + @as(u32, @intCast(round)));
         const width: u16 = if (mode == .bounded_reuse_mismatch and round >= 8) 2 else 1;
@@ -3470,23 +3471,28 @@ fn runSampledCacheBudgetCase(allocator: std.mem.Allocator, mode: enum { one_byte
             guest.word(source + 4, 0xff60_4020 + @as(u32, @intCast(round)));
             guest.word(source + 0x104, 0xffc0_a080 + @as(u32, @intCast(round)));
         }
-        if (replace_contents) {
+        if (replace_contents or (mode == .bounded_reuse_revision and round >= 8)) {
             const first = guest.bytes[source..][0..4].*;
             const second = guest.bytes[source + 0x100 ..][0..4].*;
             try std.testing.expect(backend.vtable.write(backend.context, source, &first));
             try std.testing.expect(backend.vtable.write(backend.context, source + 0x100, &second));
         }
         context.advance_at = source + 0x100;
+        const source_epoch = renderer.image_aliases.generationForRange(.{ .address = source, .size = 4 });
         const userdata = sampledImageDescriptorWords(source, width, 1) ++
             sampledImageDescriptorWords(source + 0x100, width, 1) ++ [_]u32{ 0, 0, 0, 0, @intCast(0x10000 + round * 0x100), 0, 32, 0 };
         for (userdata, 0..) |word, i| try state.writeRegister(.shader, compute.userDataBase() + @as(u32, @intCast(i)), word);
         _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
+        if (mode == .bounded_reuse_revision and round >= 8) {
+            try std.testing.expect(source_epoch != 0);
+            try std.testing.expectEqual(source_epoch, renderer.image_aliases.generationForRange(.{ .address = source, .size = 4 }));
+        }
         try std.testing.expectEqual(if (bounded_case) @min((round + 1) * 2, 16) else @as(usize, 2), renderer.sampled_image_cache.items.len);
         var total: u64 = 0;
         for (renderer.sampled_image_cache.items) |entry| {
             try std.testing.expect(entry.image.allocation_bytes != 0);
             total += entry.image.allocation_bytes;
-            if (entry.guest_address >= source) try std.testing.expectEqual(renderer.sampled_image_batch, entry.last_used_batch);
+            if (entry.guest_address == source or entry.guest_address == source + 0x100) try std.testing.expectEqual(renderer.sampled_image_batch, entry.last_used_batch);
         }
         try std.testing.expectEqual(total, renderer.sampled_image_cache_bytes);
         try std.testing.expect(renderer.pending_command_buffers.items.len != 0);
@@ -3513,9 +3519,9 @@ fn runSampledCacheBudgetCase(allocator: std.mem.Allocator, mode: enum { one_byte
     if (replace_contents) try std.testing.expectEqual(@as(u64, 0), renderer.frame_profile.sampled_retire_wait_calls);
     if (deferred_retirement) try std.testing.expect(renderer.frame_profile.sampled_retire_wait_calls < renderer.frame_profile.texture_evictions);
     if (reuse) {
-        try std.testing.expectEqual(@as(u64, if (mode == .bounded_reuse) 8 else 0), renderer.frame_profile.sampled_backing_reuses);
-        try std.testing.expectEqual(@as(u64, if (mode == .bounded_reuse) 16 else 24), renderer.frame_profile.sampled_allocate_calls);
-        try std.testing.expectEqual(@as(u64, if (mode == .bounded_reuse) 0 else 8), renderer.frame_profile.sampled_retire_wait_calls);
+        try std.testing.expectEqual(@as(u64, if (mode == .bounded_reuse_mismatch) 0 else 8), renderer.frame_profile.sampled_backing_reuses);
+        try std.testing.expectEqual(@as(u64, if (mode == .bounded_reuse_mismatch) 24 else 16), renderer.frame_profile.sampled_allocate_calls);
+        try std.testing.expectEqual(@as(u64, if (mode == .bounded_reuse_mismatch) 8 else 0), renderer.frame_profile.sampled_retire_wait_calls);
     }
     for (0..rounds) |round| {
         var output: [32]u8 = undefined;
