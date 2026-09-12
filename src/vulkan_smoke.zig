@@ -9639,6 +9639,15 @@ pub fn main(init: std.process.Init) !void {
         }
         return;
     }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--deferred-flat-faults")) {
+        for ([_]bool{ false, true }) |persistent| for ([_]bool{ false, true }) |deferred| {
+            var renderer = try vulkan.Renderer.init(allocator, .{ .persistent_host_mappings = persistent, .enable_timeline_scheduler = true });
+            defer renderer.deinit();
+            try renderer.probeDeferredFlatFaults(deferred);
+            std.debug.print("FLAT checks passed: GPU-written records, slot reuse, spill retirement and observed faults; persistent={} deferred={}\n", .{ persistent, deferred });
+        };
+        return;
+    }
     if (args.len == 2 and (std.mem.eql(u8, args[1], "--draw-upload-rollover") or std.mem.eql(u8, args[1], "--draw-capture-resources"))) {
         const capture_resources = std.mem.eql(u8, args[1], "--draw-capture-resources");
         for ([_]bool{ false, true }) |persistent| {

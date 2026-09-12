@@ -3379,6 +3379,14 @@ pub const Renderer = struct {
     /// Command-processor writes and dispatches close the batch before they can
     /// invalidate these entries, so later draws may safely reuse each slice.
     draw_upload_cache: std.ArrayList(DrawUploadCacheEntry) = .empty,
+    /// Opt-in: check compact GPU fault records at timeline/batch boundaries.
+    defer_flat_memory_fault_checks: bool = false,
+    flat_fault_buffer: ?OwnedBuffer = null,
+    pending_flat_fault_checks: std.StaticBitSet(maximum_frame_descriptor_sets) = .initEmpty(),
+    flat_fault_programs: [maximum_frame_descriptor_sets]u64 = @splat(0),
+    flat_memory_fault_failed: bool = false,
+    flat_fault_checks_deferred: u64 = 0,
+    flat_fault_checks_completed: u64 = 0,
     gds_buffer: ?OwnedBuffer = null,
     /// Commands recorded by the current guest frame. Graphics work appends to
     /// this ring and reaches the Vulkan queue as one ordered submission at a
@@ -4355,7 +4363,7 @@ pub const Renderer = struct {
 
         renderer.draw_upload_buffer = try renderer.createBuffer(
             draw_upload_ring_bytes,
-            vk.buffer_usage_storage_buffer_bit | vk.buffer_usage_index_buffer_bit,
+            vk.buffer_usage_storage_buffer_bit | vk.buffer_usage_index_buffer_bit | vk.buffer_usage_transfer_src_bit,
             vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit,
         );
         errdefer renderer.destroyBuffer(renderer.draw_upload_buffer.?);
@@ -4481,6 +4489,7 @@ pub const Renderer = struct {
         self.draw_upload_cache.deinit(self.allocator);
         for (self.draw_upload_spills.items) |buffer| self.destroyBuffer(buffer);
         self.draw_upload_spills.deinit(self.allocator);
+        if (self.flat_fault_buffer) |buffer| self.destroyBuffer(buffer);
         if (self.linear_upload_buffer) |buffer| self.destroyBuffer(buffer);
         if (self.magnify_source_image) |image| self.destroyImage(image);
         if (self.draw_upload_buffer) |buffer| {
@@ -14616,6 +14625,74 @@ pub const Renderer = struct {
         try std.testing.expectEqual(@as(u64, 1), self.frame_profile.draw_upload_wraps);
     }
 
+    /// Validate deferred fault visibility, descriptor-slot reuse and spill lifetime.
+    pub fn probeDeferredFlatFaults(self: *Renderer, deferred: bool) anyerror!void {
+        self.defer_flat_memory_fault_checks = deferred;
+        var pipelines: [2]vk.Pipeline = undefined;
+        for (&pipelines, 0..) |*pipeline, fault| {
+            var program = rdna2.Program{ .code = &.{}, .instructions = .empty };
+            defer program.deinit(self.allocator);
+            try program.instructions.appendSlice(self.allocator, &.{
+                .{ .pc = 0, .opcode = .v_mov_b32, .dst = .{ .kind = .vgpr }, .src0 = .{ .kind = .integer_inline_constant, .value = @intCast(fault) } },
+                .{ .pc = 4, .opcode = .v_mov_b32, .dst = .{ .kind = .vgpr, .reg = 1 }, .src0 = .{ .kind = .integer_inline_constant, .value = 0 } },
+                .{ .pc = 8, .family = .mubuf, .opcode = .buffer_store_dword, .dst = .{ .kind = .vgpr }, .src0 = .{ .kind = .vgpr, .reg = 1 }, .src1 = .{ .kind = .sgpr, .reg = 8 }, .src2 = .{ .kind = .integer_inline_constant, .value = 0 }, .src_count = 3, .data_words = 1 },
+                .{ .pc = 12, .family = .sopp, .opcode = .s_endpgm },
+            });
+            var module = try rdna2.translateProgramSpirv(self.allocator, &program, .{
+                .stage = .compute,
+                .local_size = .{ 1, 1, 1 },
+                .storage_buffers = &.{.{ .resource_sgpr = 8, .descriptor_index = 0, .extent_bytes = 128 }},
+            });
+            defer module.deinit(self.allocator);
+            pipeline.* = (try self.getComputePipeline(module.words, null)).pipeline;
+        }
+        const resources = try ComputeResources.acquire(self);
+        defer resources.deinit(self);
+        try self.waitForSubmittedWork();
+        const initial_tick = self.submitted_tick;
+        const clean_count = maximum_frame_descriptor_sets + 4;
+        for (0..clean_count + 1) |index| {
+            const fault = index == clean_count;
+            if (fault) {
+                try self.finishDrawBatch();
+                try std.testing.expectEqual(@as(usize, 0), self.pending_flat_fault_checks.count());
+                try std.testing.expectEqual(@as(u64, if (deferred) clean_count else 0), self.flat_fault_checks_completed);
+            }
+            try self.beginFrameDraw();
+            if (index >= maximum_frame_descriptor_sets and !fault) {
+                // Exercise retirement of a source spill before its queued copy
+                // executes. Compact fault records must outlive that spill.
+                self.draw_upload_offset = draw_upload_ring_bytes;
+                self.draw_upload_batch_uses_ring = true;
+            }
+            const upload = try self.allocateDrawUpload(128);
+            const mapping = try self.mapDrawUpload(upload);
+            @memset(mapping.bytes, 0x99); // A CPU read before the shader is wrong.
+            std.mem.writeInt(u32, mapping.bytes[112..116], 0x1234, .little);
+            std.mem.writeInt(u64, mapping.bytes[116..124], 0xdeadbeef1234, .little);
+            std.mem.writeInt(u32, mapping.bytes[124..128], 3, .little);
+            mapping.release(self);
+            self.updateStorageDescriptorRange(0, upload.buffer, upload.offset, upload.size);
+            const commands = try self.beginOneShot();
+            defer self.releaseOneShot(commands);
+            self.device_functions.cmd_bind_pipeline(commands, vk.pipeline_bind_point_compute, pipelines[@intFromBool(fault)]);
+            self.device_functions.cmd_bind_descriptor_sets(commands, vk.pipeline_bind_point_compute, self.compute_pipeline_layout, 0, 1, @ptrCast(&self.descriptor_set), 0, null);
+            self.device_functions.cmd_dispatch(commands, 1, 1, 1);
+            try self.submitOneShot(commands);
+            resources.flat_memory_fault = upload;
+            if (fault and !deferred) {
+                try std.testing.expectError(Error.GuestMemoryReadFailed, self.checkFlatMemoryFault(resources, 0xabc, vk.pipeline_stage_compute_shader_bit));
+            } else {
+                try self.checkFlatMemoryFault(resources, 0xabc, vk.pipeline_stage_compute_shader_bit);
+                if (deferred and index < 8) try std.testing.expectEqual(initial_tick, self.submitted_tick);
+                if (fault) {
+                    try std.testing.expectError(Error.GuestMemoryReadFailed, self.finishDrawBatch());
+                    try std.testing.expectError(Error.GuestMemoryReadFailed, self.refreshGpuProgress());
+                }
+            }
+        }
+    }
+
     /// Measure the same GPU-to-host copy path used by image writebacks.
     pub fn probeHostReadback(self: *Renderer) anyerror!u64 {
         const size = 64 * 1024 * 1024;
@@ -19248,6 +19325,12 @@ pub const Renderer = struct {
 
     fn checkFlatMemoryFault(self: *Renderer, resources: *const ComputeResources, program_address: u64, source_stage: vk.Flags) anyerror!void {
         if (resources.flat_memory_fault) |fault| {
+            if (self.defer_flat_memory_fault_checks and self.draw_batch_active) {
+                if (self.current_descriptor_slot) |slot| {
+                    try self.deferFlatMemoryFault(fault, program_address, source_stage, slot);
+                    return;
+                }
+            }
             const command_buffer = try self.beginOneShot();
             defer self.releaseOneShot(command_buffer);
             const barrier = vk.BufferMemoryBarrier{
@@ -19272,6 +19355,72 @@ pub const Renderer = struct {
                 });
                 return Error.GuestMemoryReadFailed;
             }
+        }
+    }
+
+    fn deferFlatMemoryFault(self: *Renderer, fault: DrawUploadSlice, program_address: u64, source_stage: vk.Flags, slot: usize) anyerror!void {
+        if (self.flat_memory_fault_failed) return Error.GuestMemoryReadFailed;
+        // A descriptor slot owns its record until its timeline tick completes.
+        // Rechecking the same slot must not overwrite an unread fault.
+        if (self.pending_flat_fault_checks.isSet(slot)) try self.waitForSubmittedWork();
+        if (self.flat_fault_buffer == null) self.flat_fault_buffer = try self.createBuffer(
+            maximum_frame_descriptor_sets * 32,
+            vk.buffer_usage_transfer_dst_bit,
+            vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit,
+        );
+        const buffer = self.flat_fault_buffer.?;
+        const commands = try self.beginOneShot();
+        defer self.releaseOneShot(commands);
+        const source_barrier = vk.BufferMemoryBarrier{
+            .source_access_mask = vk.access_shader_write_bit,
+            .destination_access_mask = vk.access_transfer_read_bit,
+            .buffer = fault.buffer,
+            .offset = fault.offset,
+            .size = fault.size,
+        };
+        self.device_functions.cmd_pipeline_barrier(commands, source_stage, vk.pipeline_stage_transfer_bit, 0, 0, null, 1, @ptrCast(&source_barrier), 0, null);
+        const copies = [_]vk.BufferCopy{
+            .{ .source_offset = fault.offset, .destination_offset = slot * 32, .size = 4 },
+            .{ .source_offset = fault.offset + fault.size - 16, .destination_offset = slot * 32 + 16, .size = 16 },
+        };
+        self.device_functions.cmd_copy_buffer(commands, fault.buffer, buffer.handle, copies.len, &copies);
+        const destination_barrier = vk.BufferMemoryBarrier{
+            .source_access_mask = vk.access_transfer_write_bit,
+            .destination_access_mask = vk.access_host_read_bit,
+            .buffer = buffer.handle,
+            .offset = slot * 32,
+            .size = 32,
+        };
+        self.device_functions.cmd_pipeline_barrier(commands, vk.pipeline_stage_transfer_bit, vk.pipeline_stage_host_bit, 0, 0, null, 1, @ptrCast(&destination_barrier), 0, null);
+        try self.submitOneShot(commands);
+        self.flat_fault_programs[slot] = program_address;
+        self.pending_flat_fault_checks.set(slot);
+        self.flat_fault_checks_deferred += 1;
+    }
+
+    fn checkCompletedFlatMemoryFaults(self: *Renderer) Error!void {
+        if (self.flat_memory_fault_failed) return Error.GuestMemoryReadFailed;
+        if (self.pending_flat_fault_checks.count() == 0) return;
+        const buffer = self.flat_fault_buffer orelse return Error.GuestBufferNotStaged;
+        const mapping = try self.mapBufferRange(buffer, 0, @intCast(buffer.size));
+        defer mapping.release(self);
+        var pending = self.pending_flat_fault_checks.iterator(.{});
+        while (pending.next()) |slot| {
+            const tick = self.descriptor_slot_ticks[slot];
+            if (tick == command_buffer_pending_tick or tick > self.completed_tick) continue;
+            const bytes = mapping.bytes[slot * 32 ..][0..32];
+            const faults = std.mem.readInt(u32, bytes[0..4], .little);
+            self.pending_flat_fault_checks.unset(slot);
+            self.flat_fault_checks_completed += 1;
+            if (faults == 0) continue;
+            const record = bytes[16..32];
+            std.debug.print("[vulkan dcb] FLAT snapshot fault program=0x{x} unmapped_words={d} first_pc=0x{x} address=0x{x} component={d}\n", .{
+                self.flat_fault_programs[slot],                faults,
+                std.mem.readInt(u32, record[0..4], .little),   std.mem.readInt(u64, record[4..12], .little),
+                std.mem.readInt(u32, record[12..16], .little),
+            });
+            self.flat_memory_fault_failed = true;
+            return Error.GuestMemoryReadFailed;
         }
     }
 
@@ -20889,6 +21038,7 @@ pub const Renderer = struct {
         }
         if (result != vk.success) return Error.TimelineSemaphoreQueryFailed;
         self.completed_tick = @max(self.completed_tick, completed);
+        try self.checkCompletedFlatMemoryFaults();
         self.destroyDeferredVulkanObjects();
     }
 
@@ -20919,6 +21069,7 @@ pub const Renderer = struct {
             self.frame_profile.fence_wait_ns +%= wait_finished - wait_started;
         }
         self.completed_tick = @max(self.completed_tick, tick);
+        try self.checkCompletedFlatMemoryFaults();
         self.destroyDeferredVulkanObjects();
     }
 
@@ -21312,6 +21463,9 @@ pub const Renderer = struct {
 
     fn finishDrawBatch(self: *Renderer) Error!void {
         try self.flushQueuedCommands();
+        // Guest observation and completion boundaries must see every fault,
+        // including a read-only shader with no storage writeback to wait for.
+        if (self.pending_flat_fault_checks.count() != 0) try self.waitForSubmittedWork();
         self.retireDrawUploadSpills();
         self.draw_upload_batch_uses_ring = false;
         self.draw_batch_active = false;
@@ -21339,7 +21493,7 @@ pub const Renderer = struct {
             // that draw has been recorded; a later batch can wrap the ring.
             if (self.draw_upload_batch_uses_ring) {
                 self.draw_upload_spills.ensureUnusedCapacity(self.allocator, 1) catch return Error.MemoryAllocationFailed;
-                const spill = try self.createBuffer(bytes, vk.buffer_usage_storage_buffer_bit | vk.buffer_usage_index_buffer_bit, vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit);
+                const spill = try self.createBuffer(bytes, vk.buffer_usage_storage_buffer_bit | vk.buffer_usage_index_buffer_bit | vk.buffer_usage_transfer_src_bit, vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit);
                 self.draw_upload_spills.appendAssumeCapacity(spill);
                 self.frame_profile.draw_upload_spills +|= 1;
                 self.frame_profile.draw_upload_spill_bytes +|= bytes;
@@ -29982,6 +30136,8 @@ test "a descriptor reused after an intermediate flush remains reserved by queued
     renderer.timeline_semaphore = 1;
     renderer.submitted_tick = 7;
     renderer.completed_tick = 7;
+    renderer.flat_memory_fault_failed = false;
+    renderer.pending_flat_fault_checks = .initEmpty();
     renderer.guest_buffers = .empty;
     renderer.active_storage_buffers = @splat(0);
     renderer.draw_upload_spills = .empty;
