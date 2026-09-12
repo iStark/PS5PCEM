@@ -522,7 +522,23 @@ fn runSampledStorageRefreshCase(allocator: std.mem.Allocator, buffer_writer: boo
             if (repeat != 0) try std.testing.expectEqual(misses_before, renderer.texture_cache_misses);
         }
     }
-    std.debug.print("sampled storage refresh passed: {s} writer, cached UNORM view, pending/published writes, sampler change, unchanged-view reuse\n", .{if (buffer_writer) "buffer" else "image"});
+    if (buffer_writer) {
+        // Native CPU stores can bypass the command-processor write callback.
+        // A later SSBO upload observes this changed byte outside the texture's
+        // sparse probe and must invalidate the sampled view in this frame.
+        const cpu_value: u32 = 0xff80_c040;
+        guest.word(source + 8320, cpu_value);
+        _ = try renderer.stageGuestStorageBufferAt(31, source, 65536 * 4);
+        _ = try reader.execute(&stream);
+        var data: [16]u8 = undefined;
+        try renderer.readbackGuestStorageBuffer(output, &data);
+        for (0..4) |component| {
+            const value: f32 = @bitCast(std.mem.readInt(u32, data[component * 4 ..][0..4], .little));
+            const expected = @as(f32, @floatFromInt((cpu_value >> @intCast(component * 8)) & 255)) / 255.0;
+            try std.testing.expectApproxEqAbs(expected, value, 0.0001);
+        }
+    }
+    std.debug.print("sampled storage refresh passed: {s} writer, cached UNORM view, pending/published writes, sampler change, unchanged-view reuse and CPU upload\n", .{if (buffer_writer) "buffer" else "image"});
 }
 
 fn runPredicatedImageLoadProbe(allocator: std.mem.Allocator) !void {

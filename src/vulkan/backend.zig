@@ -5353,6 +5353,7 @@ pub const Renderer = struct {
         }
         if (!entry.gpu_dirty) {
             try self.flushGuestStorageImageRange(guest_address, size);
+            const previous_content_hash = entry.content_hash;
             const tracked_generation = if (memory.track_gpu_read) |track|
                 track(memory.context, guest_address, size)
             else
@@ -5418,6 +5419,8 @@ pub const Renderer = struct {
                             0;
                         if (observed_generation == 0) break;
                     }
+                    if (entry.content_hash == null or entry.content_hash != previous_content_hash)
+                        self.advanceGuestBufferContents(entry);
                     try self.uploadStorageBacking(entry, size);
                 } else {
                     self.frame_profile.resident_storage_bytes +%= size;
@@ -5461,6 +5464,7 @@ pub const Renderer = struct {
                 if (!memory.read(memory.context, guest_address, destination)) {
                     return Error.GuestMemoryReadFailed;
                 }
+                self.advanceGuestBufferContents(entry);
                 self.frame_profile.upload_bytes +%= size;
                 self.frame_profile.storage_upload_bytes +%= size;
                 self.buffer_uploads += 1;
@@ -5494,6 +5498,13 @@ pub const Renderer = struct {
             defer mapping.release(self);
             const read_ok = memory.read(memory.context, guest_address, mapping.bytes);
             if (!read_ok) return Error.GuestMemoryReadFailed;
+            if (size >= self.storage_fingerprint_min_bytes) {
+                const hash_started = hostTimestampNs();
+                entry.content_hash = gpu.parallel_copy.fingerprint(mapping.bytes);
+                self.frame_profile.buffer_fingerprint_ns +|= elapsedHostNanoseconds(hash_started);
+            }
+            if (entry.content_hash == null or entry.content_hash != previous_content_hash)
+                self.advanceGuestBufferContents(entry);
             self.frame_profile.upload_bytes +%= size;
             self.frame_profile.storage_upload_bytes +%= size;
             self.buffer_uploads += 1;
@@ -5555,6 +5566,15 @@ pub const Renderer = struct {
                 generation(memory.context, entry.guest_address, entry_size)
             else
                 0;
+            // Preserve the identity of the bytes actually resident on the GPU.
+            // A later read-only SSBO bind can then distinguish unchanged
+            // published output from a new native CPU write without reuploading
+            // the former or hiding the latter from sampled-image consumers.
+            if (size >= self.storage_fingerprint_min_bytes) {
+                const hash_started = hostTimestampNs();
+                entry.content_hash = gpu.parallel_copy.fingerprint(mapping.bytes);
+                self.frame_profile.buffer_fingerprint_ns +|= elapsedHostNanoseconds(hash_started);
+            }
         }
     }
 
@@ -9551,9 +9571,13 @@ pub const Renderer = struct {
         }
     }
 
-    fn markGuestBufferWritten(self: *Renderer, entry: *GuestBufferEntry) void {
+    fn advanceGuestBufferContents(self: *Renderer, entry: *GuestBufferEntry) void {
         self.guest_buffer_sequence +%= 1;
         entry.last_written_sequence = self.guest_buffer_sequence;
+    }
+
+    fn markGuestBufferWritten(self: *Renderer, entry: *GuestBufferEntry) void {
+        self.advanceGuestBufferContents(entry);
         entry.gpu_dirty = true;
         entry.content_hash = null;
         if (entry.size >= deferred_storage_write_min_bytes) return;

@@ -51,11 +51,13 @@ write. Exact-size resident hits remain on the GPU. The `--buffer-view-coherence`
 probe checks both cache modes, small deferred writes and large buffers, including
 preservation of the larger view's tail.
 
-Sampled views of raw storage buffers track the last GPU write separately from
-cache usage. Rebinding an unchanged buffer for reading preserves its sampled
-texture, while a later write invalidates the view even after publication to
-guest memory. The `--sampled-storage-refresh` probe verifies both updates and
-unchanged read bindings alongside storage-image writers and sampler changes.
+Sampled views of raw storage buffers track content changes separately from
+cache usage. Rebinding unchanged bytes preserves the sampled texture, while
+GPU writes and uploads of changed CPU bytes advance its content epoch. Full
+GPU publications retain a fingerprint of the resident bytes, avoiding redundant
+uploads on subsequent reads. The `--sampled-storage-refresh` probe verifies
+updates outside the sparse texture probe, including a native CPU write observed
+by SSBO staging, alongside unchanged bindings, image writers and sampler changes.
 
 Without page tracking, clean storage buffers of at least 64 bytes use a
 full-range content fingerprint. Unchanged small constant buffers can therefore
