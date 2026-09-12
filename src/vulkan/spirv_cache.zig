@@ -277,6 +277,24 @@ test "cache leases survive eviction and cache destruction without copying shader
     try std.testing.expectEqual(fresh.used_control_flow_fallback, third.view().used_control_flow_fallback);
 }
 
+test "host workgroup shape participates in the compute translation key" {
+    const a = std.testing.allocator;
+    var cache = Cache{};
+    defer cache.deinit(a);
+    var program = try rdna2.decodeProgram(a, &.{0xbf810000});
+    defer program.deinit(a);
+    var options = rdna2.spirv.Options{ .stage = .compute, .local_size = .{ 1, 1, 256 }, .physical_local_size = .{ 256, 1, 1 } };
+    const first = try cache.acquire(a, &program, options, .{});
+    defer first.release();
+    options.physical_local_size = .{ 128, 2, 1 };
+    const second = try cache.acquire(a, &program, options, .{});
+    defer second.release();
+    try std.testing.expect(first.view().words.ptr != second.view().words.ptr);
+    var fresh = try rdna2.translateProgramSpirvWithPipelineOptions(a, &program, options, .{});
+    defer fresh.deinit(a);
+    try std.testing.expectEqualSlices(u32, fresh.words, second.view().words);
+}
+
 test "owned translation leases preserve words and release them on allocation failure" {
     const a = std.testing.allocator;
     const words = try a.dupe(u32, &.{ 0x07230203, 17, 23 });

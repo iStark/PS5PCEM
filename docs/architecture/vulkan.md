@@ -36,6 +36,17 @@ cache is persisted as
 `vulkan_pipeline_cache.bin` between runs, with a 4 GiB size limit. Invalid,
 unreadable, or oversized data falls back to an empty driver cache, so it can only affect
 startup compilation time, never correctness.
+Compute dispatches check the device's per-axis and total workgroup limits.
+An oversized axis is reshaped without changing the number or linear order of
+invocations; SPIR-V reconstructs the guest X/Y/Z coordinates before seeding
+VGPRs. Guest wave indexing, LDS and group-size values retain that same linear
+order. The physical shape participates in the translation cache key.
+`--compute-workgroup-shape` verifies coordinates and group sizes on the GPU.
+Yotei's visibility shader used Z=256 on a device limited to Z=64. Shape
+remapping removes that invalid dispatch, but `yotei_visibility_gpu` remains
+false until full shader results match reference and native validation;
+its conservative visibility fallback is still the default.
+
 `stageGuestStorageBuffer` keys coherent allocations by exact guest address and
 size, with 64 slots and a 128 MiB per-range cap. Large writable ranges remain
 GPU-authoritative across descriptor-slot rebinding; a real guest consumer reads

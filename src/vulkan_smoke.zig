@@ -9467,6 +9467,18 @@ pub fn main(init: std.process.Init) !void {
         try runBufferContentCacheProbe(allocator, 0);
         return;
     }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--compute-workgroup-shape")) {
+        var guest = GuestMemory{};
+        var renderer = try vulkan.Renderer.init(allocator, .{});
+        defer renderer.deinit();
+        _ = renderer.dcbBackend(guest.interface());
+        for ([_][3]u32{ .{ 8, 4, 2 }, .{ 1, 1, 256 }, .{ 2, 1, 128 }, .{ 4, 2, 128 } }) |size| {
+            if (size[0] * size[1] * size[2] > renderer.device_info.max_compute_work_group_invocations) continue;
+            try renderer.probeComputeWorkgroupShape(0x2000, size);
+            std.debug.print("compute shape passed: guest={d}x{d}x{d}, six workgroups, exact xyz and group size\n", .{ size[0], size[1], size[2] });
+        }
+        return;
+    }
     if (args.len == 2 and (std.mem.eql(u8, args[1], "--draw-upload-rollover") or std.mem.eql(u8, args[1], "--draw-capture-resources"))) {
         const capture_resources = std.mem.eql(u8, args[1], "--draw-capture-resources");
         for ([_]bool{ false, true }) |persistent| {

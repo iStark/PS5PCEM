@@ -36,6 +36,8 @@ pub export var capture_vertex_program: u64 = 0;
 pub export var capture_vertex_flip: u64 = 0;
 pub export var capture_fragment_program: u64 = 0;
 pub export var capture_graphics_buffers: bool = true;
+// Diagnostic comparison until the full visibility pass is validated natively.
+pub export var yotei_visibility_gpu: bool = false;
 pub export var capture_graphics_target: u64 = 0;
 // Zero preserves synchronous retirement for baseline comparisons.
 pub export var sampled_retirement_slack_bytes: u64 = 0;
@@ -285,6 +287,8 @@ pub const DeviceInfo = struct {
     device_type: u32,
     sampled_image_capacity: u32 = 64,
     max_compute_shared_memory_size: u32 = 32768,
+    max_compute_work_group_invocations: u32 = 128,
+    max_compute_work_group_size: [3]u32 = .{ 128, 128, 64 },
 
     pub fn name(self: *const DeviceInfo) []const u8 {
         return self.name_bytes[0..self.name_length];
@@ -5719,7 +5723,11 @@ pub const Renderer = struct {
             self.noteComputeKind("covered-by-video");
             return .{ .pipeline_cache_hit = false, .group_count = group_count, .spirv_words = 0 };
         }
-        var module = try analysis.translateSpirv(self.allocator, .{ .stage = .compute, .local_size = local_size });
+        var module = try analysis.translateSpirv(self.allocator, .{
+            .stage = .compute,
+            .local_size = local_size,
+            .physical_local_size = try @import("compute_shape.zig").fit(local_size, self.device_info.max_compute_work_group_size, self.device_info.max_compute_work_group_invocations),
+        });
         defer module.deinit(self.allocator);
         return self.dispatchSpirv(module.words, group_count);
     }
@@ -5953,12 +5961,11 @@ pub const Renderer = struct {
         // through the first presentation without a device reset.
         // This visibility/statistics pass atomically ORs a 256-bit candidate
         // mask into one 32-byte transient result. Its 256-lane Z workgroup
-        // relies on EXEC convergence that the current scalar dispatcher cannot
-        // yet preserve, and submitting it resets NVIDIA devices before the
-        // title's first presentation. Resolve the exact writable V# on the CPU
-        // and conservatively keep every candidate visible; leaving the mask at
-        // zero makes all later scene-composition passes reject their inputs.
-        if (!self.translate_compute_only and self.device_info.vendor_id == 0x10de and matchesYoteiExposureStatisticsCompute(
+        // exceeded NVIDIA's per-axis limit before host shape remapping existed.
+        // The original wave reduction now passes a GPU/CPU-reference probe;
+        // retain the conservative fallback until the full pass is validated
+        // with native inputs. A zero mask rejects later composition inputs.
+        if (!self.translate_compute_only and !@atomicLoad(bool, &yotei_visibility_gpu, .monotonic) and self.device_info.vendor_id == 0x10de and matchesYoteiExposureStatisticsCompute(
             program_hash,
             group_count,
             local_size,
@@ -6563,6 +6570,7 @@ pub const Renderer = struct {
         const module_lease = self.compute_translations.acquirePrepared(self.allocator, &analysis.program, .{
             .stage = .compute,
             .local_size = local_size,
+            .physical_local_size = try @import("compute_shape.zig").fit(local_size, self.device_info.max_compute_work_group_size, self.device_info.max_compute_work_group_invocations),
             .maximum_dispatcher_iterations = if (yotei_environment_lighting) 2048 else if (yotei_atmosphere_multiscatter) 1024 else if (yotei_atmosphere_precompute) 512 else 256,
             .report_dispatcher_exhaustion = scene_collision_query,
             .wave32 = initiator & (1 << 15) != 0,
@@ -14403,6 +14411,59 @@ pub const Renderer = struct {
     }
 
     /// A rollover must preserve inputs of a draw that has not been recorded yet.
+    pub fn probeComputeWorkgroupShape(self: *Renderer, address: u64, local_size: [3]u32) anyerror!void {
+        const physical = try @import("compute_shape.zig").fit(local_size, self.device_info.max_compute_work_group_size, self.device_info.max_compute_work_group_invocations);
+        const count = local_size[0] * local_size[1] * local_size[2];
+        const bytes = try self.allocator.alloc(u8, count * 6 * 16);
+        defer self.allocator.free(bytes);
+        @memset(bytes, 0xcc);
+        const memory = self.guest_memory orelse return Error.GuestMemoryUnavailable;
+        if (!memory.write(memory.context, address, bytes)) return Error.GuestMemoryWriteFailed;
+        self.invalidateDmaDestination(address, bytes.len);
+        _ = try self.stageGuestStorageBufferAt(0, address, bytes.len);
+        const op = struct {
+            fn vg(reg: u32) rdna2.Operand {
+                return .{ .kind = .vgpr, .reg = reg };
+            }
+            fn sg(reg: u32) rdna2.Operand {
+                return .{ .kind = .sgpr, .reg = reg };
+            }
+            fn imm(value: u32) rdna2.Operand {
+                return .{ .kind = .integer_inline_constant, .value = value };
+            }
+        };
+        var program = rdna2.Program{ .code = &.{}, .instructions = .empty };
+        defer program.deinit(self.allocator);
+        try program.instructions.appendSlice(self.allocator, &.{
+            .{ .pc = 0, .family = .vop3, .opcode = .v_mul_lo_u32, .dst = op.vg(4), .src0 = op.vg(2), .src1 = op.imm(local_size[1]), .src_count = 2 },
+            .{ .pc = 4, .family = .vop2, .opcode = .v_add_nc_u32, .dst = op.vg(4), .src0 = op.vg(4), .src1 = op.vg(1), .src_count = 2 },
+            .{ .pc = 8, .family = .vop3, .opcode = .v_mul_lo_u32, .dst = op.vg(4), .src0 = op.vg(4), .src1 = op.imm(local_size[0]), .src_count = 2 },
+            .{ .pc = 12, .family = .vop2, .opcode = .v_add_nc_u32, .dst = op.vg(4), .src0 = op.vg(4), .src1 = op.vg(0), .src_count = 2 },
+            .{ .pc = 16, .family = .vop3, .opcode = .v_mul_lo_u32, .dst = op.vg(5), .src0 = op.sg(101), .src1 = op.imm(2), .src_count = 2 },
+            .{ .pc = 20, .family = .vop2, .opcode = .v_add_nc_u32, .dst = op.vg(5), .src0 = op.sg(100), .src1 = op.vg(5), .src_count = 2 },
+            .{ .pc = 24, .family = .vop3, .opcode = .v_mul_lo_u32, .dst = op.vg(5), .src0 = op.vg(5), .src1 = op.imm(count), .src_count = 2 },
+            .{ .pc = 28, .family = .vop2, .opcode = .v_add_nc_u32, .dst = op.vg(4), .src0 = op.vg(4), .src1 = op.vg(5), .src_count = 2 },
+            .{ .pc = 32, .family = .vop1, .opcode = .v_mov_b32, .dst = op.vg(3), .src0 = op.sg(103), .src_count = 1 },
+            .{ .pc = 36, .family = .mubuf, .opcode = .buffer_store_dwordx4, .dst = op.vg(0), .src0 = op.vg(4), .src1 = op.sg(4), .src2 = op.imm(0), .src_count = 3, .data_words = 4, .index_enable = true },
+            .{ .pc = 40, .family = .sopp, .opcode = .s_endpgm },
+        });
+        var module = try rdna2.spirv.translate(self.allocator, &program, .{
+            .stage = .compute,
+            .local_size = local_size,
+            .physical_local_size = physical,
+            .compute_inputs = .{ .workgroup_id_sgprs = .{ 100, 101, 102 }, .threadgroup_size_sgpr = 103, .local_invocation_id_components = 3 },
+            .storage_buffers = &.{.{ .resource_sgpr = 4, .descriptor_index = 0, .stride = 16, .extent_bytes = @intCast(bytes.len) }},
+        });
+        defer module.deinit(self.allocator);
+        _ = try self.dispatchSpirv(module.words, .{ 2, 3, 1 });
+        try self.readbackGuestStorageBuffer(address, bytes);
+        for (0..count * 6) |index| {
+            const local = index % count;
+            const expected = [4]u32{ @intCast(local % local_size[0]), @intCast(local / local_size[0] % local_size[1]), @intCast(local / local_size[0] / local_size[1]), count };
+            for (expected, 0..) |value, component| try std.testing.expectEqual(value, std.mem.readInt(u32, bytes[index * 16 + component * 4 ..][0..4], .little));
+        }
+    }
+
     pub fn probeDrawUploadRollover(self: *Renderer, capture_resources: bool) anyerror!void {
         var program = rdna2.Program{ .code = &.{}, .instructions = .empty };
         defer program.deinit(self.allocator);
@@ -28375,6 +28436,8 @@ fn choosePhysicalDevice(
         const properties: *const vk.PhysicalDevicePropertiesPrefix = @ptrCast(@alignCast(&raw_properties));
         const limits = properties.limits;
         info.max_compute_shared_memory_size = limits.max_compute_shared_memory_size;
+        info.max_compute_work_group_invocations = limits.max_compute_work_group_invocations;
+        info.max_compute_work_group_size = limits.max_compute_work_group_size;
         const other_descriptors = maximum_storage_descriptors + maximum_storage_images + 2;
         info.sampled_image_capacity = @min(
             maximum_sampled_images,

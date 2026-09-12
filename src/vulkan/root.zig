@@ -5,6 +5,7 @@
 
 pub const api = @import("api.zig");
 pub const backend = @import("backend.zig");
+pub const compute_shape = @import("compute_shape.zig");
 pub const detile_spirv = @import("detile_spirv.zig");
 pub const image_alias = @import("image_alias.zig");
 pub const image_state = @import("image_state.zig");
@@ -31,6 +32,7 @@ pub const graphics_probe_height = backend.graphics_probe_height;
 test {
     _ = api;
     _ = backend;
+    _ = compute_shape;
     _ = detile_spirv;
     _ = image_alias;
     _ = image_state;

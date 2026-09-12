@@ -297,6 +297,9 @@ fn colorExportValueType(color_type: ColorExportType) ValueType {
 pub const Options = struct {
     stage: Stage,
     local_size: [3]u32 = .{ 1, 1, 1 },
+    /// Host execution shape with the same number of invocations. Guest local
+    /// coordinates are reconstructed in x-major order before seeding VGPRs.
+    physical_local_size: ?[3]u32 = null,
     /// Bound unstructured control flow. Validated long-running kernels can
     /// request enough block visits to finish their loops without removing it.
     maximum_dispatcher_iterations: u32 = 256,
@@ -927,6 +930,7 @@ const Builder = struct {
     local_invocation_id_input: u32 = 0,
     compute_inputs: ?ComputeInputs,
     local_size: [3]u32,
+    physical_local_size: [3]u32,
     fragment_extent: [2]u32,
     vector2_type: u32 = 0,
     vector2_bits_type: u32 = 0,
@@ -1029,6 +1033,7 @@ const Builder = struct {
             .ngg_lds_exports = options.ngg_lds_exports,
             .compute_inputs = options.compute_inputs,
             .local_size = options.local_size,
+            .physical_local_size = options.physical_local_size orelse options.local_size,
             .workgroup_memory_storage_slot = options.workgroup_memory_storage_slot,
             .maximum_dispatcher_iterations = options.maximum_dispatcher_iterations,
             .report_dispatcher_exhaustion = options.report_dispatcher_exhaustion,
@@ -1118,6 +1123,17 @@ const Builder = struct {
                 return Error.InvalidStageInterface;
         }
         if (options.compute_inputs != null and options.stage != .compute) return Error.InvalidStageInterface;
+        if (options.physical_local_size) |physical| {
+            if (options.stage != .compute) return Error.InvalidStageInterface;
+            var guest_count: u64 = 1;
+            var host_count: u64 = 1;
+            for (options.local_size, physical) |guest, host| {
+                if (guest == 0 or host == 0) return Error.InvalidStageInterface;
+                guest_count = std.math.mul(u64, guest_count, guest) catch return Error.InvalidStageInterface;
+                host_count = std.math.mul(u64, host_count, host) catch return Error.InvalidStageInterface;
+            }
+            if (guest_count != host_count or guest_count > std.math.maxInt(u32)) return Error.InvalidStageInterface;
+        }
         switch (options.stage) {
             .vertex => {
                 self.vector4_type = self.id();
@@ -4702,10 +4718,31 @@ const Builder = struct {
         if (self.local_invocation_id_input != 0) {
             const vector = self.id();
             try self.emit(&self.body, 61, &.{ self.vector3_bits_type, vector, self.local_invocation_id_input }); // OpLoad
-            for (0..inputs.local_invocation_id_components) |component| {
-                const value = self.id();
-                try self.emit(&self.body, 81, &.{ self.bits_type, value, vector, @intCast(component) }); // OpCompositeExtract
-                self.registers[128 + component] = .{ .id = value, .value_type = .bits32 };
+            if (std.meta.eql(self.local_size, self.physical_local_size)) {
+                for (0..inputs.local_invocation_id_components) |component| {
+                    const value = self.id();
+                    try self.emit(&self.body, 81, &.{ self.bits_type, value, vector, @intCast(component) }); // OpCompositeExtract
+                    self.registers[128 + component] = .{ .id = value, .value_type = .bits32 };
+                }
+            } else {
+                var coordinates: [3]u32 = undefined;
+                for (&coordinates, 0..) |*value, component| {
+                    value.* = self.id();
+                    try self.emit(&self.body, 81, &.{ self.bits_type, value.*, vector, @intCast(component) });
+                }
+                const row = try self.addBits(coordinates[1], try self.multiplyBits(coordinates[2], try self.constant(.bits32, self.physical_local_size[1])));
+                var linear = try self.addBits(coordinates[0], try self.multiplyBits(row, try self.constant(.bits32, self.physical_local_size[0])));
+                for (0..inputs.local_invocation_id_components) |component| {
+                    const extent = try self.constant(.bits32, self.local_size[component]);
+                    const value = self.id();
+                    try self.emit(&self.body, 137, &.{ self.bits_type, value, linear, extent }); // OpUMod
+                    self.registers[128 + component] = .{ .id = value, .value_type = .bits32 };
+                    if (component + 1 < inputs.local_invocation_id_components) {
+                        const next = self.id();
+                        try self.emit(&self.body, 134, &.{ self.bits_type, next, linear, extent }); // OpUDiv
+                        linear = next;
+                    }
+                }
             }
         }
         if (inputs.threadgroup_size_sgpr) |register| {
@@ -11516,7 +11553,10 @@ fn assemble(allocator: std.mem.Allocator, builder: *Builder, options: Options) E
             if (builder.fragment_depth_output != 0)
                 try appendInstruction(allocator, &words, 16, &.{ builder.main_function, 12 }); // DepthReplacing
         },
-        .compute => try appendInstruction(allocator, &words, 16, &.{ builder.main_function, 17, options.local_size[0], options.local_size[1], options.local_size[2] }),
+        .compute => {
+            const physical = options.physical_local_size orelse options.local_size;
+            try appendInstruction(allocator, &words, 16, &.{ builder.main_function, 17, physical[0], physical[1], physical[2] });
+        },
         .vertex => {},
     }
     if (options.tessellation_inputs) |tess| {
@@ -13129,6 +13169,22 @@ test "attribute provenance preserves a guest-selected MUBUF index" {
 
 fn testSop1(opcode: u8, destination: u8, source: u9) u32 {
     return 0xbe80_0000 | (@as(u32, destination) << 16) | (@as(u32, opcode) << 8) | source;
+}
+
+test "physical compute shape rejects changed invocation counts and invalid dimensions" {
+    var program = try @import("decoder.zig").decodeProgram(std.testing.allocator, &.{0xbf810000});
+    defer program.deinit(std.testing.allocator);
+    for ([_][3]u32{ .{ 128, 1, 1 }, .{ 0, 1, 256 }, .{ 65536, 65536, 65536 } }) |physical| {
+        try std.testing.expectError(Error.InvalidStageInterface, translate(std.testing.allocator, &program, .{
+            .stage = .compute,
+            .local_size = .{ 1, 1, 256 },
+            .physical_local_size = physical,
+        }));
+    }
+    try std.testing.expectError(Error.InvalidStageInterface, translate(std.testing.allocator, &program, .{
+        .stage = .vertex,
+        .physical_local_size = .{ 1, 1, 1 },
+    }));
 }
 
 test "an indexed copy is held to its buffer bounds and its execution mask" {
