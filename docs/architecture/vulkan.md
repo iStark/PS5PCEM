@@ -310,6 +310,16 @@ A shared sampler is recovered only when every possible material load is in
 bounds and all four sampler words agree. The indirect-image probe checks this
 chain with 816-byte records, a VCC offset, changing indices, OOB loads and a
 conflicting sampler; conflicting values remain unsupported.
+Uniform image-loop bounds also recognize `CMP_LT -> CSELECT_B64(value, 0)`
+followed by intact 64-bit moves and a VCC/EXEC zero exit. Both initialization
+and every recurrence must pass that guard. Pointer and buffer tables use the
+recovered limit, including material records with a non-power-of-two stride.
+For unresolved loop exits, the scalar resource walk revisits once after
+forgetting loop-carried writes. Checkpoints inside the loop therefore cannot
+bind its first texture for every iteration, and varying SMEM loads cannot
+become first-iteration constants. Loads rebuilt from invariant inputs remain
+available. `--uniform-image-loop` checks direct and mask-based exits, changing
+limits, relocated tables, BC4 values and poisoned gaps between 440-byte records.
 Translation validates large sampled-image tables with exact hash keys for the
 T#/S#/instruction site and all eight candidate words. This avoids a quadratic
 scan while preserving duplicate rejection, including conflicts between a

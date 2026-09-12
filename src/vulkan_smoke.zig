@@ -8042,7 +8042,12 @@ fn runTypedIndexSelectionProbe(allocator: std.mem.Allocator, selection: bool) !v
     std.debug.print("typed index images passed: UINT/SINT byte and short indices, negative bounds and decoy fields\n", .{});
 }
 
-fn runCountedImageLoopProbe(allocator: std.mem.Allocator, uniform_limit: bool) !void {
+const ImageLoopMode = enum { counted, uniform_limit, masked_pointer, masked_buffer };
+
+fn runCountedImageLoopProbe(allocator: std.mem.Allocator, mode: ImageLoopMode) !void {
+    const uniform_limit = mode != .counted;
+    const masked = mode == .masked_pointer or mode == .masked_buffer;
+    const record_stride: u32 = if (mode == .masked_buffer) 440 else 32;
     var renderer = try vulkan.Renderer.init(allocator, .{ .trace_resource_failures = true });
     defer renderer.deinit();
     var guest = GuestMemory{};
@@ -8079,7 +8084,32 @@ fn runCountedImageLoopProbe(allocator: std.mem.Allocator, uniform_limit: bool) !
         0xbf82_ffef,
         0xbf81_0000,
     };
-    const code: []const u32 = if (uniform_limit) &uniform_code else &counted_code;
+    const masked_code = [_]u32{
+        0xbe90_0380, // 0: counter s16 = 0
+        0xf400_0440, 0xfa00_0100, // 1: limit s17 from root + 256
+        0xbe98_047e, // 3: preserve EXEC in s24:s25
+        0xf408_0500, 0xfa00_0110, // 4: table V# s20:s23 from root + 272
+        vop1(1, 0, 128), vop1(1, 1, 128), // 6: coordinates
+        0xbf0a_1110, // 8: s_cmp_lt_u32 s16, s17
+        0xbf80_0000,
+        0x859a_807e, // 10: s_cselect_b64 s26, EXEC, 0
+        0xbeea_041a, // 11: VCC = selected mask
+        0xbefe_041a, // 12: EXEC = selected mask
+        0xbf86_0010, // 13: VCCZ -> word 30
+        0x936a_ff10, record_stride, // 14: VCC_LO = counter * stride
+        if (mode == .masked_buffer) 0xf42c_010a else 0xf40c_0100, 0xd400_0000, // 16: T# s4
+        0xf000_0108, 0x0001_0200, // 18: image_load v2
+        0x97eb_ff10, 4096, // 20: coefficient offset
+        0xf400_0480, 0xd600_0000, // 22: coefficient s18
+        0x1004_0412, // 24: multiply
+        vop1(1, 4, 16), // 25: output index
+        0xe070_2000, 0x8003_0204, // 26: output store
+        0x8110_8110, // 28: increment
+        0xbf82_ffea, // 29: back to word 8
+        0xbefe_0418, // 30: restore EXEC
+        0xbf81_0000,
+    };
+    const code: []const u32 = if (masked) &masked_code else if (uniform_limit) &uniform_code else &counted_code;
     for (code, 0..) |word, index| guest.word(0x100 + index * 4, word);
     var state = gpu.State{};
     const compute = gpu.resources.ShaderStage.compute;
@@ -8091,17 +8121,22 @@ fn runCountedImageLoopProbe(allocator: std.mem.Allocator, uniform_limit: bool) !
         const table: u32 = if (pass == 1) 0x12fc0 else 0x10fc0;
         const limit: u32 = if (uniform_limit) limits[pass] else 6;
         const destination: u32 = 0x6000 + @as(u32, @intCast(pass)) * 256;
+        // Invalid descriptors between material fields must never become
+        // candidates once the counter's guard proves its reachable range.
+        if (masked) @memset(guest.bytes[table..][0 .. 6 * record_stride], 0xcd);
         for (0..6) |index| {
             const texture = if (pass == 0) index else 5 - index;
             const address: u32 = 0x8000 + @as(u32, @intCast(texture)) * 256;
             var image = sampledImageDescriptorWords(address, 4, 4);
             image[1] = (image[1] & ~@as(u32, 0x1ff00000)) | (175 << 20); // BC4 UNORM
-            for (image, 0..) |word, component| guest.word(table + index * 32 + component * 4, word);
+            for (image, 0..) |word, component| guest.word(table + index * record_stride + component * 4, word);
             guest.word(address, @intCast((texture + 1) * 20)); // all texels select the first endpoint
             guest.word(table + 4096 + index * 4, @bitCast(@as(f32, @floatFromInt(index + 1)) / 8.0));
         }
-        if (pass == 1) @memset(guest.bytes[table + 2 * 32 ..][0..32], 0);
+        if (pass == 1) @memset(guest.bytes[table + 2 * record_stride ..][0..32], 0);
         guest.word(table + 256, limit);
+        if (masked) for ([_]u32{ table, record_stride << 16, 6, 0 }, 0..) |word, component|
+            guest.word(table + 272 + component * 4, word);
         for (0..6) |index| guest.word(destination + index * 4, 0x42c6_0000); // 99.0, unwritten tail
         var userdata: [16]u32 = @splat(0);
         userdata[0] = table;
@@ -8118,7 +8153,7 @@ fn runCountedImageLoopProbe(allocator: std.mem.Allocator, uniform_limit: bool) !
             try std.testing.expectApproxEqAbs(expected, actual, 1.0 / 32767.0);
         }
     }
-    std.debug.print("{s} image loop passed: BC4 images, dynamic SMEM offsets, page crossing and relocation\n", .{if (uniform_limit) "uniform-limit (3, 1, 6)" else "counted (6, null descriptor)"});
+    std.debug.print("{s} image loop passed: BC4 images, dynamic SMEM offsets, page crossing and relocation\n", .{@tagName(mode)});
 }
 
 fn runHostImportProbe(allocator: std.mem.Allocator, retain: bool) !void {
@@ -9235,11 +9270,13 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--counted-image-loop")) {
-        try runCountedImageLoopProbe(allocator, false);
+        try runCountedImageLoopProbe(allocator, .counted);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--uniform-image-loop")) {
-        try runCountedImageLoopProbe(allocator, true);
+        try runCountedImageLoopProbe(allocator, .uniform_limit);
+        try runCountedImageLoopProbe(allocator, .masked_pointer);
+        try runCountedImageLoopProbe(allocator, .masked_buffer);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--large-indirect-images")) {

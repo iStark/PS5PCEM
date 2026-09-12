@@ -1037,6 +1037,46 @@ fn scalarLoopUpperBound(instructions: []const Instruction, graph: *const Graph, 
 
 pub const ScalarLoopLimit = struct { operand: rdna2.Operand, before_pc: u32 };
 
+/// Locate the comparison whose true result is required by this block's
+/// fallthrough. A nonzero mask selected as SCC ? value : 0 also proves SCC;
+/// both halves must follow the same MOV_B64 chain inside this block.
+fn fallthroughComparison(instructions: []const Instruction, first: usize, branch: usize) ?usize {
+    var before = branch;
+    switch (instructions[branch].opcode) {
+        .s_cbranch_scc0 => {},
+        .s_cbranch_vccz, .s_cbranch_execz => {
+            var register: usize = if (instructions[branch].opcode == .s_cbranch_vccz) 106 else 126;
+            while (true) {
+                const definition = found: {
+                    while (before > first) {
+                        before -= 1;
+                        if (writes(instructions[before], .{ .register = @intCast(register) }) or
+                            writes(instructions[before], .{ .register = @intCast(register + 1) })) break :found before;
+                    }
+                    return null;
+                };
+                const inst = instructions[definition];
+                if (@import("scalar_provenance.zig").scalarRegisterIndex(inst.dst) != register or
+                    inst.src0.negate or inst.src0.negate_hi or inst.src0.absolute or
+                    inst.src1.negate or inst.src1.negate_hi or inst.src1.absolute) return null;
+                if (inst.opcode == .s_cselect_b64) {
+                    if (immediate(inst.src1) != 0) return null;
+                    break;
+                }
+                if (inst.opcode != .s_mov_b64) return null;
+                register = @import("scalar_provenance.zig").scalarRegisterIndex(inst.src0) orelse return null;
+                if (register >= 127) return null;
+            }
+        },
+        else => return null,
+    }
+    while (before > first) {
+        before -= 1;
+        if (instructions[before].opcode != .s_nop) return before;
+    }
+    return null;
+}
+
 /// A zero-based, unit-increment while loop whose true comparison dominates
 /// every use, including the first iteration and all back edges. The caller
 /// must recover the uniform limit at before_pc and require 0 < limit <= INT_MAX:
@@ -1060,11 +1100,12 @@ pub fn scalarGuardedLoopLimit(instructions: []const Instruction, graph: *const G
         if (block.instruction_count < 2) continue;
         const branch_index = block.first_instruction + block.instruction_count - 1;
         if (branch_index <= initial_index or branch_index >= use) continue;
-        const compare = instructions[branch_index - 1];
-        if (instructions[branch_index].opcode != .s_cbranch_scc0 or
-            (compare.opcode != .s_cmp_lt_i32 and compare.opcode != .s_cmp_lt_u32) or
-            compare.src0.kind != .sgpr or compare.src0.reg != register) continue;
-        const compared = reachingDefinitions(instructions, graph, branch_index - 1, location) orelse continue;
+        const compare_index = fallthroughComparison(instructions, block.first_instruction, branch_index) orelse continue;
+        const compare = instructions[compare_index];
+        if ((compare.opcode != .s_cmp_lt_i32 and compare.opcode != .s_cmp_lt_u32) or
+            compare.src0.kind != .sgpr or compare.src0.reg != register or
+            compare.src0.negate or compare.src0.absolute or compare.src1.negate or compare.src1.absolute) continue;
+        const compared = reachingDefinitions(instructions, graph, compare_index, location) orelse continue;
         if (compared.entry or compared.count != 2 or @min(compared.items[0], compared.items[1]) != initial_index or
             @max(compared.items[0], compared.items[1]) != increment_index) continue;
         if (!requiresFallthrough(graph, initial_index, use, block.index) or
@@ -1105,6 +1146,54 @@ test "uniform while-loop limits guard initialization and every recurrence" {
     var bypass = try rdna2.control_flow.buildInstructions(std.testing.allocator, &instructions);
     defer bypass.deinit(std.testing.allocator);
     try std.testing.expect(scalarGuardedLoopLimit(&instructions, &bypass, 4, 17) == null);
+}
+
+test "uniform loop limits follow nonzero conditional masks with both halves intact" {
+    const counter = rdna2.Operand{ .kind = .sgpr, .reg = 68 };
+    const pair = rdna2.Operand{ .kind = .sgpr, .reg = 2 };
+    const exec = rdna2.Operand{ .kind = .exec_lo };
+    const vcc = rdna2.Operand{ .kind = .vcc_lo };
+    var instructions = [_]Instruction{
+        .{ .pc = 0, .opcode = .s_mov_b32, .dst = counter, .src0 = .{ .kind = .integer_inline_constant, .value = 0 } },
+        .{ .pc = 4, .opcode = .s_cbranch_execz, .branch_target = 52 },
+        .{ .pc = 8, .opcode = .s_cmp_lt_u32, .src0 = counter, .src1 = pair },
+        .{ .pc = 12, .opcode = .s_nop },
+        .{ .pc = 16, .opcode = .s_cselect_b64, .dst = pair, .src0 = exec, .src1 = .{ .kind = .integer_inline_constant, .value = 0 } },
+        .{ .pc = 20, .opcode = .s_mov_b64, .dst = vcc, .src0 = pair },
+        .{ .pc = 24, .opcode = .s_mov_b64, .dst = exec, .src0 = pair },
+        .{ .pc = 28, .opcode = .s_nop },
+        .{ .pc = 32, .opcode = .s_cbranch_vccz, .branch_target = 52 },
+        .{ .pc = 36, .opcode = .s_nop },
+        .{ .pc = 40, .opcode = .s_mul_i32, .dst = vcc, .src0 = counter, .src1 = .{ .kind = .literal_constant, .value = 440 } },
+        .{ .pc = 44, .opcode = .s_add_i32, .dst = counter, .src0 = counter, .src1 = .{ .kind = .integer_inline_constant, .value = 1 } },
+        .{ .pc = 48, .opcode = .s_branch, .branch_target = 4 },
+        .{ .pc = 52, .opcode = .s_endpgm },
+    };
+    var graph = try rdna2.control_flow.buildInstructions(std.testing.allocator, &instructions);
+    defer graph.deinit(std.testing.allocator);
+    for ([_]rdna2.Opcode{ .s_cbranch_vccz, .s_cbranch_execz }) |branch| {
+        instructions[8].opcode = branch;
+        const limit = scalarGuardedLoopLimit(&instructions, &graph, 10, 68).?;
+        try std.testing.expectEqual(@as(u32, 8), limit.before_pc);
+        try std.testing.expectEqual(pair, limit.operand);
+    }
+    instructions[8].opcode = .s_cbranch_vccz;
+    instructions[4].src1.value = 1; // nonzero no longer implies SCC
+    try std.testing.expect(scalarGuardedLoopLimit(&instructions, &graph, 10, 68) == null);
+    instructions[4].src1.value = 0;
+    instructions[7] = .{ .pc = 28, .opcode = .s_mov_b32, .dst = .{ .kind = .vcc_hi }, .src0 = pair };
+    try std.testing.expect(scalarGuardedLoopLimit(&instructions, &graph, 10, 68) == null);
+    instructions[7] = .{ .pc = 28, .opcode = .s_nop };
+    instructions[3] = .{ .pc = 12, .opcode = .s_and_b32, .dst = .{ .kind = .sgpr, .reg = 12 }, .src0 = pair, .src1 = pair }; // overwrites SCC
+    try std.testing.expect(scalarGuardedLoopLimit(&instructions, &graph, 10, 68) == null);
+    instructions[3] = .{ .pc = 12, .opcode = .s_nop };
+    instructions[5].src0 = exec; // bypasses the conditional select
+    try std.testing.expect(scalarGuardedLoopLimit(&instructions, &graph, 10, 68) == null);
+    instructions[5].src0 = pair;
+    instructions[12].branch_target = 36; // recurrence bypasses the guard
+    var bypass = try rdna2.control_flow.buildInstructions(std.testing.allocator, &instructions);
+    defer bypass.deinit(std.testing.allocator);
+    try std.testing.expect(scalarGuardedLoopLimit(&instructions, &bypass, 10, 68) == null);
 }
 
 test "counted scalar image loops require a bounded recurrence" {

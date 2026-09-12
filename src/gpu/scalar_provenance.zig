@@ -550,6 +550,7 @@ fn evaluate(
     var lane_spills = LaneSpills{};
     var setpc_follows: u8 = 0;
     var unknown_scalar_exits: std.StaticBitSet(64 * 1024) = .initEmpty();
+    var revisited_loop_edges: std.StaticBitSet(64 * 1024) = .initEmpty();
     const instruction_limit: u32 = if (follow_lane_mask_fallthrough) bindings.resource_instruction_budget else maximum_instructions;
     while (result.instruction_count < instruction_limit) {
         result.stop_pc = pc;
@@ -678,9 +679,11 @@ fn evaluate(
                         if (inst.opcode == .s_branch and resourceLoopHasUnresolvedExit(instructions, inst.branch_target, inst.pc, &unknown_scalar_exits)) {
                             // A scalar walk cannot advance a VGPR induction
                             // variable or a scalar mask obtained by readlane.
-                            // Capture one iteration's resource state, forget
-                            // loop-carried scalar writes, then recover the
-                            // independent descriptors after the loop.
+                            // Forget every loop-carried write, then revisit
+                            // once with arbitrary recurrence inputs. This
+                            // preserves loads rebuilt from invariant inputs
+                            // while merging away first-iteration constants
+                            // from resource checkpoints inside the loop.
                             const loop_begin = decodedInstructionIndexAtOrAfter(instructions, inst.branch_target);
                             for (instructions[loop_begin..]) |loop_inst| {
                                 if (loop_inst.pc >= inst.pc) break;
@@ -688,6 +691,21 @@ fn evaluate(
                                 lane_spills.invalidateInstruction(loop_inst);
                             }
                             scc = null;
+                            if (inst.pc / 4 < revisited_loop_edges.capacity() and !revisited_loop_edges.isSet(inst.pc / 4)) {
+                                revisited_loop_edges.set(inst.pc / 4);
+                                // These loads were observed only in the first
+                                // iteration. Rebuild proven invariant loads;
+                                // a varying address must stay a runtime load.
+                                var kept: usize = 0;
+                                for (result.loadSlice()) |load| {
+                                    if (load.pc >= inst.branch_target and load.pc < inst.pc) continue;
+                                    result.loads[kept] = load;
+                                    kept += 1;
+                                }
+                                result.load_count = @intCast(kept);
+                                pc = inst.branch_target;
+                                continue;
+                            }
                             pc += inst.word_count * 4;
                             continue;
                         }
@@ -2014,6 +2032,40 @@ test "resource checkpoints invalidate values that vary between loop iterations" 
     try std.testing.expect(!snapshots[0][8].known);
     try std.testing.expect(snapshots[0][0].known);
     try std.testing.expectEqual(@as(u32, 2), snapshots[1][8].value);
+}
+
+test "masked loop checkpoints and load constants forget the first iteration" {
+    var storage = [_]u8{0} ** 0x100;
+    var memory = TestMemory{ .base = 0x4000, .bytes = &storage };
+    for (0..5) |index| memory.write(0x4000 + index * 4, @intCast((index + 1) * 10));
+    const bindings = testBindings(0x3000, 0x4000);
+    const code = [_]u32{
+        0xbe88_0380, // s8 = 0
+        0xbf0a_8308, // s_cmp_lt_u32 s8, 3
+        0x8584_807e, // s4:s5 = SCC ? EXEC : 0
+        0xbeea_0404, // VCC = s4:s5
+        0xbf86_0006, // mask exit to pc44
+        0x8f0a_8208, // s10 = s8 * 4
+        0xf400_0300, 10 << 25, // s12 = table[s8]
+        0xbf80_0000, // pc32: first iteration's 10 is not a constant
+        0x8108_8108, // ++s8
+        0xbf82_fff6, // pc40 -> pc4
+        0xbf80_0000, // pc44: loop writes are unknown
+        0xf400_0300, (125 << 25) | 16, // independent later load = 50
+        0xbf81_0000,
+    };
+    var program = try rdna2.decodeProgram(std.testing.allocator, &code);
+    defer program.deinit(std.testing.allocator);
+    var snapshots: [3]ScalarRegisters = undefined;
+    const result = evaluateDecodedResourceStateAtCheckpoints(memory.reader(), &bindings, program.instructions.items, &.{ 32, 44, 56 }, &snapshots);
+    try std.testing.expectEqual(StopReason.end_program, result.stop_reason);
+    try std.testing.expect(!snapshots[0][8].known);
+    try std.testing.expect(!snapshots[0][12].known);
+    try std.testing.expect(snapshots[0][0].known);
+    try std.testing.expect(!snapshots[1][12].known);
+    try std.testing.expectEqual(@as(u32, 50), snapshots[2][12].value);
+    try std.testing.expectEqual(@as(usize, 1), result.loadSlice().len);
+    try std.testing.expectEqual(@as(u32, 48), result.loadSlice()[0].pc);
 }
 
 test "resource checkpoints recover after an unavailable scalar load" {

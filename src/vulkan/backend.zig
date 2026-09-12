@@ -26649,6 +26649,29 @@ fn maskedBufferIndexUpperBound(
     return std.math.add(u32, maximum, 1) catch null;
 }
 
+fn uniformScalarLoopUpperBound(
+    bindings: *const gpu.ShaderBindings,
+    reader: gpu.ShaderMemoryReader,
+    analysis: *const gpu.ShaderAnalysis,
+    scalar: *const gpu.ScalarEvaluation,
+    before: usize,
+    register: u32,
+) anyerror!?u32 {
+    const instructions = analysis.program.instructions.items;
+    const limit = gpu.index_bounds.scalarGuardedLoopLimit(instructions, &analysis.graph, before, register) orelse return null;
+    const value = if (gpu.scalar_provenance.scalarRegisterIndex(limit.operand)) |limit_register| value: {
+        var resolver = gpu.scalar_resources.Resolver{ .bindings = bindings, .reader = reader, .instructions = instructions, .graph = &analysis.graph, .snapshot = scalar, .definition_cache = analysis.scalar_definitions };
+        var word: [1]u32 = undefined;
+        if (!try resolver.words(@intCast(limit_register), limit.before_pc, &word)) return null;
+        break :value word[0];
+    } else switch (limit.operand.kind) {
+        .integer_inline_constant, .literal_constant => limit.operand.value,
+        else => return null,
+    };
+    if (value == 0 or value > std.math.maxInt(i32)) return null;
+    return value;
+}
+
 fn scalarPointerTablePlan(
     bindings: *const gpu.ShaderBindings,
     reader: gpu.ShaderMemoryReader,
@@ -26687,19 +26710,8 @@ fn scalarPointerTablePlan(
     };
     const source = gpu.scalar_provenance.scalarRegisterIndex(multiply.src0) orelse return null;
     var resolver = gpu.scalar_resources.Resolver{ .bindings = bindings, .reader = reader, .instructions = instructions, .graph = &analysis.graph, .snapshot = scalar, .definition_cache = analysis.scalar_definitions };
-    var count = analysis.scalarIndexUpperBound(multiply_index, @intCast(source)) orelse bound: {
-        const limit = gpu.index_bounds.scalarGuardedLoopLimit(instructions, &analysis.graph, multiply_index, @intCast(source)) orelse return null;
-        const value = if (gpu.scalar_provenance.scalarRegisterIndex(limit.operand)) |register| value: {
-            var word: [1]u32 = undefined;
-            if (!try resolver.words(@intCast(register), limit.before_pc, &word)) return null;
-            break :value word[0];
-        } else switch (limit.operand.kind) {
-            .integer_inline_constant, .literal_constant => limit.operand.value,
-            else => return null,
-        };
-        if (value == 0 or value > std.math.maxInt(i32)) return null;
-        break :bound value;
-    };
+    var count = analysis.scalarIndexUpperBound(multiply_index, @intCast(source)) orelse
+        (try uniformScalarLoopUpperBound(bindings, reader, analysis, scalar, multiply_index, @intCast(source))) orelse return null;
     if (try maskedBufferIndexUpperBound(bindings, reader, analysis, scalar, multiply_index, @intCast(source))) |bound|
         count = @min(count, bound);
     if (step == 0 or count == 0 or count > 16384) return null;
@@ -26927,6 +26939,8 @@ fn resolveBufferTablePlan(
             index_bound = analysis.scalarIndexUpperBound(index, @intCast(source_register));
             if (index_bound == null) if (bindings) |inputs| {
                 index_bound = try loadedScalarIndexUpperBound(inputs, reader, analysis, scalar, index, @intCast(source_register));
+                if (index_bound == null)
+                    index_bound = try uniformScalarLoopUpperBound(inputs, reader, analysis, scalar, index, @intCast(source_register));
             };
             if (bindings) |inputs| if (inputs.compute_dispatch) |dispatch| {
                 var entries: [3]gpu.index_bounds.EntryBound = undefined;
