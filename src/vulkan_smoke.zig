@@ -3392,6 +3392,15 @@ fn runSampledViewReuseProbe(allocator: std.mem.Allocator) !void {
 }
 
 fn runSampledCacheBudgetProbe(allocator: std.mem.Allocator) !void {
+    try runSampledCacheBudgetCase(allocator, false, false);
+    try runSampledCacheBudgetCase(allocator, true, false);
+    try runSampledCacheBudgetCase(allocator, true, true);
+}
+
+fn runSampledCacheBudgetCase(allocator: std.mem.Allocator, bounded_case: bool, deferred_retirement: bool) !void {
+    const previous_slack = vulkan.backend.sampled_retirement_slack_bytes;
+    defer vulkan.backend.sampled_retirement_slack_bytes = previous_slack;
+    vulkan.backend.sampled_retirement_slack_bytes = if (deferred_retirement) 64 * 1024 * 1024 else 0;
     const Memory = SizedGuestMemory(512 * 1024);
     const guest = try allocator.create(Memory);
     defer allocator.destroy(guest);
@@ -3439,7 +3448,8 @@ fn runSampledCacheBudgetProbe(allocator: std.mem.Allocator) !void {
     try state.writeRegister(.shader, compute.programRegisterBase(), 1);
     try state.writeRegister(.shader, compute.programRegisterBase() + 1, 0);
     try state.writeRegister(.shader, 0x213, 24 << 1);
-    for (0..3) |round| {
+    const rounds: usize = if (bounded_case) 12 else 3;
+    for (0..rounds) |round| {
         const source: u32 = @intCast(0x20000 + round * 0x200);
         guest.word(source, 0xff60_4020 + @as(u32, @intCast(round)));
         guest.word(source + 0x100, 0xffc0_a080 + @as(u32, @intCast(round)));
@@ -3448,19 +3458,24 @@ fn runSampledCacheBudgetProbe(allocator: std.mem.Allocator) !void {
             sampledImageDescriptorWords(source + 0x100, 1, 1) ++ [_]u32{ 0, 0, 0, 0, @intCast(0x10000 + round * 0x100), 0, 32, 0 };
         for (userdata, 0..) |word, i| try state.writeRegister(.shader, compute.userDataBase() + @as(u32, @intCast(i)), word);
         _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
-        try std.testing.expectEqual(@as(usize, 2), renderer.sampled_image_cache.items.len);
+        try std.testing.expectEqual(if (bounded_case) @min((round + 1) * 2, 16) else @as(usize, 2), renderer.sampled_image_cache.items.len);
         var total: u64 = 0;
         for (renderer.sampled_image_cache.items) |entry| {
             try std.testing.expect(entry.image.allocation_bytes != 0);
             total += entry.image.allocation_bytes;
-            try std.testing.expectEqual(renderer.sampled_image_batch, entry.last_used_batch);
+            if (entry.guest_address >= source) try std.testing.expectEqual(renderer.sampled_image_batch, entry.last_used_batch);
         }
         try std.testing.expectEqual(total, renderer.sampled_image_cache_bytes);
         try std.testing.expect(renderer.pending_command_buffers.items.len != 0);
+        // Size both comparison cases from real allocation requirements: sixteen
+        // resident images plus at most two retired images awaiting consumers.
+        if (bounded_case and round == 0) renderer.sampled_image_cache_budget_bytes = total * 8;
+        try std.testing.expect(renderer.pending_sampled_image_bytes <= renderer.sampled_image_cache_budget_bytes / 8);
     }
-    try std.testing.expectEqual(@as(usize, 3), context.advances);
-    try std.testing.expectEqual(@as(u64, 4), renderer.frame_profile.texture_evictions);
-    for (0..3) |round| {
+    try std.testing.expectEqual(rounds, context.advances);
+    try std.testing.expectEqual(@as(u64, if (bounded_case) 8 else 4), renderer.frame_profile.texture_evictions);
+    if (deferred_retirement) try std.testing.expect(renderer.frame_profile.sampled_retire_wait_calls < renderer.frame_profile.texture_evictions);
+    for (0..rounds) |round| {
         var output: [32]u8 = undefined;
         try renderer.readbackGuestStorageBuffer(0x10000 + round * 0x100, &output);
         for (0..8) |component| {
@@ -3472,7 +3487,8 @@ fn runSampledCacheBudgetProbe(allocator: std.mem.Allocator) !void {
             try std.testing.expectApproxEqAbs(expected, actual, 0.0001);
         }
     }
-    std.debug.print("sampled cache budget passed: queued consumers, current batch protection across frame publications and exact allocation accounting\n", .{});
+    try std.testing.expectEqual(@as(u64, 0), renderer.pending_sampled_image_bytes);
+    std.debug.print("sampled cache budget passed: deferred={any}, queued consumers, batch protection, exact allocation accounting, evictions={d} retirement waits={d}\n", .{ deferred_retirement, renderer.frame_profile.texture_evictions, renderer.frame_profile.sampled_retire_wait_calls });
 }
 
 fn runSampledViewReuseCase(allocator: std.mem.Allocator, canonical_aliases: bool) !void {

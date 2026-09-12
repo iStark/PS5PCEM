@@ -18,6 +18,7 @@ pub const Bool32 = u32;
 pub const DeviceSize = u64;
 
 pub const success: Result = 0;
+pub const error_out_of_device_memory: Result = -2;
 pub const error_device_lost: Result = -4;
 
 /// ABI prefix only; vkGetPhysicalDeviceProperties writes into a larger scratch

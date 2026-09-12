@@ -105,11 +105,23 @@ invalidate overlapping sampled copies even when the sparse content probe only
 sees unchanged padding; canonical image tracking also advances their epoch.
 
 The uploaded-texture cache also has a 2 GiB soft budget measured from Vulkan's
-actual image allocation requirements. It retires the oldest unused images and
-completes their queued consumers before allocating replacements. Images already
+actual image allocation requirements. It retires the oldest unused images and,
+by default, completes their queued consumers before allocating replacements.
+The diagnostic `sampled_retirement_slack_bytes` export allows a bounded amount
+of retired image memory to remain pending while replacements are allocated.
+The allowance is capped at one eighth of the cache budget. Completed resources
+are reclaimed without submitting more work; when the allowance is exceeded,
+only the earliest retirement tick needed to reduce it is awaited. Device-memory
+allocation failure drains pending sampled images and retries once. This is a
+fallback, not the memory-pressure policy: the driver can page memory before
+reporting allocation failure. The `[gpu sampled cache]` profile separates image
+creation, allocation, eviction CPU work and retirement fence waits. The export
+defaults to zero so native comparisons can retain the previous behavior.
+Images already
 selected for the current descriptor batch stay protected, even when publishing
 an intermediate colour target advances the frame counter. The
-`--sampled-cache-budget` smoke probe checks this lifetime and memory accounting.
+`--sampled-cache-budget` smoke probe checks this lifetime and memory accounting
+in both modes, including queued consumers whose images have been evicted.
 
 The decoded shader cache holds 1,024 programs. Yotei's opening cinematic
 exceeds the former 512-entry limit and otherwise repeatedly rebuilds shader

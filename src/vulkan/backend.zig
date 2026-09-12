@@ -36,6 +36,8 @@ pub export var capture_vertex_program: u64 = 0;
 pub export var capture_vertex_flip: u64 = 0;
 pub export var capture_fragment_program: u64 = 0;
 pub export var capture_graphics_target: u64 = 0;
+// Zero preserves synchronous retirement for baseline comparisons.
+pub export var sampled_retirement_slack_bytes: u64 = 0;
 const sampled_lookup_plan = @import("sampled_lookup_plan.zig");
 
 /// Set to true to enable verbose per-frame GPU debug logging.
@@ -759,6 +761,7 @@ const DrawUploadCacheEntry = struct {
 const DeferredVulkanObject = union(enum) {
     buffer: OwnedBuffer,
     image: OwnedImage,
+    sampled_image: OwnedImage,
     image_view: vk.ImageView,
     sampler: vk.Sampler,
     render_pass: vk.RenderPass,
@@ -2062,6 +2065,15 @@ const FrameProfile = struct {
     texture_hits: u64 = 0,
     texture_misses: u64 = 0,
     texture_evictions: u64 = 0,
+    sampled_create_calls: u64 = 0,
+    sampled_create_ns: u64 = 0,
+    sampled_allocate_calls: u64 = 0,
+    sampled_allocate_ns: u64 = 0,
+    sampled_allocation_retries: u64 = 0,
+    sampled_trim_ns: u64 = 0,
+    sampled_retire_wait_calls: u64 = 0,
+    sampled_retire_blocked_calls: u64 = 0,
+    sampled_retire_fence_ns: u64 = 0,
     feedback_snapshots: u64 = 0,
     feedback_snapshot_bytes: u64 = 0,
     storage_image_evictions: u64 = 0,
@@ -3329,6 +3341,7 @@ pub const Renderer = struct {
     draw_batch_active: bool = false,
     draw_uploads_enabled: bool = false,
     deferred_vulkan_objects: std.ArrayList(DeferredVulkanObjectEntry) = .empty,
+    pending_sampled_image_bytes: u64 = 0,
     compute_pipeline_layout: vk.PipelineLayout,
     detile_set_layout: vk.DescriptorSetLayout = 0,
     detile_pool: vk.DescriptorPool = 0,
@@ -17975,7 +17988,13 @@ pub const Renderer = struct {
 
     fn createImageBacking(self: *Renderer, create_info: vk.ImageCreateInfo, sampled_cache: bool) Error!OwnedImage {
         var handle: vk.Image = 0;
-        if (self.device_functions.create_image(self.device, &create_info, null, &handle) != vk.success) {
+        const create_started = hostTimestampNs();
+        const create_result = self.device_functions.create_image(self.device, &create_info, null, &handle);
+        if (sampled_cache) {
+            self.frame_profile.sampled_create_calls +|= 1;
+            self.frame_profile.sampled_create_ns +|= elapsedHostNanoseconds(create_started);
+        }
+        if (create_result != vk.success) {
             return Error.ImageCreationFailed;
         }
         errdefer self.device_functions.destroy_image(self.device, handle, null);
@@ -17990,7 +18009,14 @@ pub const Renderer = struct {
             .memory_type_index = memory_type_index,
         };
         var memory: vk.DeviceMemory = 0;
-        const allocation_result = self.device_functions.allocate_memory(self.device, &allocation_info, null, &memory);
+        var allocation_result = self.allocateImageMemory(&allocation_info, &memory, sampled_cache);
+        if (allocation_result == vk.error_out_of_device_memory and self.pending_sampled_image_bytes != 0) {
+            // Keep this as a fallback, not the normal pressure signal: Windows
+            // can page allocations before reporting device-memory exhaustion.
+            try self.waitForSampledImageRetirement(0);
+            if (sampled_cache) self.frame_profile.sampled_allocation_retries +|= 1;
+            allocation_result = self.allocateImageMemory(&allocation_info, &memory, sampled_cache);
+        }
         if (allocation_result != vk.success) {
             std.debug.print("[vulkan memory] image allocation failed result={d} bytes={d} type={d} sampled_cache={d}MiB/{d}MiB images={d}\n", .{
                 allocation_result,                                     requirements.size,                  memory_type_index, self.sampled_image_cache_bytes / (1024 * 1024),
@@ -18003,6 +18029,16 @@ pub const Renderer = struct {
             return Error.MemoryBindingFailed;
         }
         return .{ .handle = handle, .memory = memory, .allocation_bytes = requirements.size };
+    }
+
+    fn allocateImageMemory(self: *Renderer, info: *const vk.MemoryAllocateInfo, memory: *vk.DeviceMemory, sampled_cache: bool) vk.Result {
+        const started = hostTimestampNs();
+        const result = self.device_functions.allocate_memory(self.device, info, null, memory);
+        if (sampled_cache) {
+            self.frame_profile.sampled_allocate_calls +|= 1;
+            self.frame_profile.sampled_allocate_ns +|= elapsedHostNanoseconds(started);
+        }
+        return result;
     }
 
     fn createImage(self: *Renderer, width: u32, height: u32, format: u32, usage: vk.Flags) Error!OwnedImage {
@@ -20272,13 +20308,15 @@ pub const Renderer = struct {
         self.destroyImageView(entry.view);
         self.invalidateResidentImageViews(entry.image.handle);
         self.image_states.forgetImage(entry.image.handle);
-        self.destroyImage(entry.image);
+        self.pending_sampled_image_bytes += entry.image.allocation_bytes;
+        self.deferVulkanObject(.{ .sampled_image = entry.image });
         self.image_aliases.unregister(entry.alias_token);
         _ = self.sampled_image_cache.orderedRemove(index);
         self.sampled_image_index.invalidate();
     }
 
     fn trimSampledImageCache(self: *Renderer, incoming_bytes: u64) Error!void {
+        const trim_started = hostTimestampNs();
         var reclaimed = false;
         while (self.sampled_image_cache_bytes +| incoming_bytes > self.sampled_image_cache_budget_bytes or
             self.sampled_image_cache.items.len >= maximum_cached_sampled_images)
@@ -20305,9 +20343,39 @@ pub const Renderer = struct {
             self.frame_profile.texture_evictions +|= 1;
             reclaimed = true;
         }
-        // Retired images can still belong to queued draws. Complete those
-        // consumers and release their memory before admitting a replacement.
-        if (reclaimed) try self.waitForSubmittedWork();
+        self.frame_profile.sampled_trim_ns +|= elapsedHostNanoseconds(trim_started);
+        const slack = @min(@atomicLoad(u64, &sampled_retirement_slack_bytes, .monotonic), self.sampled_image_cache_budget_bytes / 8);
+        if (slack == 0 and reclaimed) {
+            const fence_before = self.frame_profile.fence_wait_ns;
+            self.frame_profile.sampled_retire_wait_calls +|= 1;
+            try self.waitForSubmittedWork();
+            const blocked = self.frame_profile.fence_wait_ns -| fence_before;
+            self.frame_profile.sampled_retire_fence_ns +|= blocked;
+            if (blocked != 0) self.frame_profile.sampled_retire_blocked_calls +|= 1;
+        } else if (self.pending_sampled_image_bytes != 0) {
+            try self.waitForSampledImageRetirement(slack);
+        }
+    }
+
+    fn waitForSampledImageRetirement(self: *Renderer, allowed_bytes: u64) Error!void {
+        try self.refreshGpuProgress();
+        while (self.pending_sampled_image_bytes > allowed_bytes) {
+            var earliest: u64 = std.math.maxInt(u64);
+            for (self.deferred_vulkan_objects.items) |entry| {
+                if (entry.object == .sampled_image) earliest = @min(earliest, entry.retire_tick);
+            }
+            // A failed host allocation in deferVulkanObject deliberately leaks
+            // its resource. It cannot be reclaimed by waiting for more work.
+            if (earliest == std.math.maxInt(u64)) return Error.MemoryAllocationFailed;
+            const fence_before = self.frame_profile.fence_wait_ns;
+            self.frame_profile.sampled_retire_wait_calls +|= 1;
+            if (earliest > self.submitted_tick) try self.flushQueuedCommands();
+            if (earliest > self.submitted_tick) return Error.MemoryAllocationFailed;
+            try self.waitForTick(earliest);
+            const blocked = self.frame_profile.fence_wait_ns -| fence_before;
+            self.frame_profile.sampled_retire_fence_ns +|= blocked;
+            if (blocked != 0) self.frame_profile.sampled_retire_blocked_calls +|= 1;
+        }
     }
 
     fn sampledSourceGeneration(self: *Renderer, address: u64, visible_bytes: usize) u64 {
@@ -20919,6 +20987,11 @@ pub const Renderer = struct {
                 }
             },
             .image => |image| {
+                self.device_functions.destroy_image(self.device, image.handle, null);
+                self.device_functions.free_memory(self.device, image.memory, null);
+            },
+            .sampled_image => |image| {
+                self.pending_sampled_image_bytes -= image.allocation_bytes;
                 self.device_functions.destroy_image(self.device, image.handle, null);
                 self.device_functions.free_memory(self.device, image.memory, null);
             },
@@ -22229,6 +22302,23 @@ pub const Renderer = struct {
             std.debug.print(
                 "[gpu storage images] flip={d} budget_mib={d} evictions={d}\n",
                 .{ self.flip_callbacks, self.storage_image_cache_limit / (1024 * 1024), profile.storage_image_evictions },
+            );
+            std.debug.print(
+                "[gpu sampled cache] flip={d} creates={d}/{d}us allocs={d}/{d}us retries={d} trim_us={d} retire_waits={d} blocked={d} retire_fence_us={d} pending_kib={d} slack_kib={d}\n",
+                .{
+                    self.flip_callbacks,
+                    profile.sampled_create_calls,
+                    profile.sampled_create_ns / std.time.ns_per_us,
+                    profile.sampled_allocate_calls,
+                    profile.sampled_allocate_ns / std.time.ns_per_us,
+                    profile.sampled_allocation_retries,
+                    profile.sampled_trim_ns / std.time.ns_per_us,
+                    profile.sampled_retire_wait_calls,
+                    profile.sampled_retire_blocked_calls,
+                    profile.sampled_retire_fence_ns / std.time.ns_per_us,
+                    self.pending_sampled_image_bytes / 1024,
+                    @min(@atomicLoad(u64, &sampled_retirement_slack_bytes, .monotonic), self.sampled_image_cache_budget_bytes / 8) / 1024,
+                },
             );
             std.debug.print(
                 "[gpu draw] flip={d} shader_check_ms={d} storage_ms={d} setup_ms={d} pipeline_lookup_ms={d} scalar_upload_ms={d} record_ms={d}\n",
