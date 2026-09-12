@@ -3392,12 +3392,16 @@ fn runSampledViewReuseProbe(allocator: std.mem.Allocator) !void {
 }
 
 fn runSampledCacheBudgetProbe(allocator: std.mem.Allocator) !void {
-    try runSampledCacheBudgetCase(allocator, false, false);
-    try runSampledCacheBudgetCase(allocator, true, false);
-    try runSampledCacheBudgetCase(allocator, true, true);
+    try runSampledCacheBudgetCase(allocator, .one_byte);
+    try runSampledCacheBudgetCase(allocator, .bounded_sync);
+    try runSampledCacheBudgetCase(allocator, .bounded_async);
+    try runSampledCacheBudgetCase(allocator, .replace_sync);
 }
 
-fn runSampledCacheBudgetCase(allocator: std.mem.Allocator, bounded_case: bool, deferred_retirement: bool) !void {
+fn runSampledCacheBudgetCase(allocator: std.mem.Allocator, mode: enum { one_byte, bounded_sync, bounded_async, replace_sync }) !void {
+    const bounded_case = mode == .bounded_sync or mode == .bounded_async;
+    const deferred_retirement = mode == .bounded_async;
+    const replace_contents = mode == .replace_sync;
     const previous_slack = vulkan.backend.sampled_retirement_slack_bytes;
     defer vulkan.backend.sampled_retirement_slack_bytes = previous_slack;
     vulkan.backend.sampled_retirement_slack_bytes = if (deferred_retirement) 64 * 1024 * 1024 else 0;
@@ -3427,10 +3431,10 @@ fn runSampledCacheBudgetCase(allocator: std.mem.Allocator, bounded_case: bool, d
         }
     };
     var context = Context{ .guest = guest, .renderer = &renderer };
-    _ = renderer.dcbBackend(.{ .context = &context, .read = Context.read, .write = Context.write });
+    const backend = renderer.dcbBackend(.{ .context = &context, .read = Context.read, .write = Context.write });
     // Two images prepared by one dispatch must survive even a one-byte soft
     // budget. Advancing the publication counter between them is not a batch end.
-    renderer.sampled_image_cache_budget_bytes = 1;
+    renderer.sampled_image_cache_budget_bytes = if (replace_contents) 1024 * 1024 else 1;
     const store_a = mubuf(0x1e, 0, 2, 0, 20);
     const store_b = mubuf(0x1e, 16, 6, 0, 20);
     const code = [_]u32{
@@ -3450,9 +3454,15 @@ fn runSampledCacheBudgetCase(allocator: std.mem.Allocator, bounded_case: bool, d
     try state.writeRegister(.shader, 0x213, 24 << 1);
     const rounds: usize = if (bounded_case) 12 else 3;
     for (0..rounds) |round| {
-        const source: u32 = @intCast(0x20000 + round * 0x200);
+        const source: u32 = @intCast(0x20000 + (if (replace_contents) @as(usize, 0) else round) * 0x200);
         guest.word(source, 0xff60_4020 + @as(u32, @intCast(round)));
         guest.word(source + 0x100, 0xffc0_a080 + @as(u32, @intCast(round)));
+        if (replace_contents) {
+            const first = guest.bytes[source..][0..4].*;
+            const second = guest.bytes[source + 0x100 ..][0..4].*;
+            try std.testing.expect(backend.vtable.write(backend.context, source, &first));
+            try std.testing.expect(backend.vtable.write(backend.context, source + 0x100, &second));
+        }
         context.advance_at = source + 0x100;
         const userdata = sampledImageDescriptorWords(source, 1, 1) ++
             sampledImageDescriptorWords(source + 0x100, 1, 1) ++ [_]u32{ 0, 0, 0, 0, @intCast(0x10000 + round * 0x100), 0, 32, 0 };
@@ -3470,10 +3480,13 @@ fn runSampledCacheBudgetCase(allocator: std.mem.Allocator, bounded_case: bool, d
         // Size both comparison cases from real allocation requirements: sixteen
         // resident images plus at most two retired images awaiting consumers.
         if (bounded_case and round == 0) renderer.sampled_image_cache_budget_bytes = total * 8;
-        try std.testing.expect(renderer.pending_sampled_image_bytes <= renderer.sampled_image_cache_budget_bytes / 8);
+        if (!replace_contents) try std.testing.expect(renderer.pending_sampled_image_bytes <= renderer.sampled_image_cache_budget_bytes / 8);
     }
     try std.testing.expectEqual(rounds, context.advances);
-    try std.testing.expectEqual(@as(u64, if (bounded_case) 8 else 4), renderer.frame_profile.texture_evictions);
+    try std.testing.expectEqual(@as(u64, if (replace_contents) 0 else if (bounded_case) 8 else 4), renderer.frame_profile.texture_evictions);
+    // Updating texture contents below the budget never forced retirement waits
+    // in the baseline, even when the old images still have queued consumers.
+    if (replace_contents) try std.testing.expectEqual(@as(u64, 0), renderer.frame_profile.sampled_retire_wait_calls);
     if (deferred_retirement) try std.testing.expect(renderer.frame_profile.sampled_retire_wait_calls < renderer.frame_profile.texture_evictions);
     for (0..rounds) |round| {
         var output: [32]u8 = undefined;
@@ -3488,7 +3501,7 @@ fn runSampledCacheBudgetCase(allocator: std.mem.Allocator, bounded_case: bool, d
         }
     }
     try std.testing.expectEqual(@as(u64, 0), renderer.pending_sampled_image_bytes);
-    std.debug.print("sampled cache budget passed: deferred={any}, queued consumers, batch protection, exact allocation accounting, evictions={d} retirement waits={d}\n", .{ deferred_retirement, renderer.frame_profile.texture_evictions, renderer.frame_profile.sampled_retire_wait_calls });
+    std.debug.print("sampled cache budget passed: mode={s}, queued consumers, batch protection, exact allocation accounting, evictions={d} retirement waits={d}\n", .{ @tagName(mode), renderer.frame_profile.texture_evictions, renderer.frame_profile.sampled_retire_wait_calls });
 }
 
 fn runSampledViewReuseCase(allocator: std.mem.Allocator, canonical_aliases: bool) !void {

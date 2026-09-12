@@ -20352,7 +20352,7 @@ pub const Renderer = struct {
             const blocked = self.frame_profile.fence_wait_ns -| fence_before;
             self.frame_profile.sampled_retire_fence_ns +|= blocked;
             if (blocked != 0) self.frame_profile.sampled_retire_blocked_calls +|= 1;
-        } else if (self.pending_sampled_image_bytes != 0) {
+        } else if (slack != 0 and self.pending_sampled_image_bytes != 0) {
             try self.waitForSampledImageRetirement(slack);
         }
     }
