@@ -142,6 +142,15 @@ captures must be disabled when measuring FPS. The separate
 divergent lanes, overlapping snapshots (last match wins), unaligned reads,
 relocation and per-word vector bounds/faults, including BVH-enabled options.
 
+Captured fragment shadow tables use root+64, a signed byte index with an
+optional cube face, and 116-byte records. The recognized material variants
+include the later cinematic reads at PCs 0x3474 and 0x369c, which previously
+rejected entire draws. `--fragment-shadow-pointers` renders known colors
+through all three probe variants, relocates the table between draws and
+checks both the last valid record and an unmapped negative index. This
+validates table access; character geometry and hair still require native
+scene validation.
+
 Graphics draws record until a real guest ordering packet, compute/readback
 dependency, or VideoOut flip closes the batch. Each draw binds
 an immutable descriptor set and scalar slice; read-only guest buffers and index

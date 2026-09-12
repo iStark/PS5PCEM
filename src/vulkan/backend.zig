@@ -8457,6 +8457,8 @@ pub const Renderer = struct {
             .{ .extract_pc = 0x1194, .extract = 0x943bff04, .cube_pc = 0x1288, .cube_sources = 0x04060500, .multiply_pc = 0x129c, .multiply_dst = 0xd5690033, .multiply_sources = 0x00025eff, .load_pc = 0x12a8, .read_pc = 0x12c0, .read_sources = 0x006a0033 },
             .{ .extract_pc = 0x35f8, .extract = 0x9402ff04, .cube_pc = 0x37e8, .cube_sources = 0x040a0300, .multiply_pc = 0x37fc, .multiply_dst = 0xd569005c, .multiply_sources = 0x0002b0ff, .load_pc = 0x3808, .read_pc = 0x3820, .read_sources = 0x006a005c },
             .{ .extract_pc = 0x3c30, .extract = 0x9457ff51, .cube_pc = 0x3d38, .cube_sources = 0x040a0300, .multiply_pc = 0x3d4c, .multiply_dst = 0xd5690064, .multiply_sources = 0x0002c2ff, .load_pc = 0x3d58, .read_pc = 0x3d70, .read_sources = 0x006a0064 },
+            .{ .extract_pc = 0x3334, .extract = 0x9457ff51, .cube_pc = 0x343c, .cube_sources = 0x040a0300, .multiply_pc = 0x3450, .multiply_dst = 0xd5690063, .multiply_sources = 0x0002c0ff, .load_pc = 0x345c, .read_pc = 0x3474, .read_sources = 0x006a0063 },
+            .{ .extract_pc = 0x3474, .extract = 0x9402ff0c, .cube_pc = 0x3664, .cube_sources = 0x040a0300, .multiply_pc = 0x3678, .multiply_dst = 0xd569005c, .multiply_sources = 0x0002b0ff, .load_pc = 0x3684, .read_pc = 0x369c, .read_sources = 0x006a005c },
         }) |shape| {
             if (programHasRawInstruction(analysis, shape.extract_pc, &.{ shape.extract, 0x00080010 }) and
                 programHasRawInstruction(analysis, shape.cube_pc, &.{ 0xd5440000, shape.cube_sources }) and

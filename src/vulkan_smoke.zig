@@ -7123,9 +7123,34 @@ fn runSceneFlatPointerProbe(allocator: std.mem.Allocator) !void {
     std.debug.print("Scene FLAT snapshots passed: nested descriptor walk, carry-out address chain, relocated records, count bounds and live unmapped-read rejection\n", .{});
 }
 
+const FragmentShadowProbeShape = struct {
+    extract_pc: usize,
+    extract: u32,
+    source_sgpr: u8,
+    index_sgpr: u8,
+    index_vgpr: u8,
+    cube_pc: usize,
+    cube_sources: u32,
+    multiply_pc: usize,
+    multiply: [3]u32,
+    load_pc: usize,
+    read_pc: usize,
+    read_sources: u32,
+};
+
 fn runFragmentShadowPointerProbe(allocator: std.mem.Allocator) !void {
     var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true });
     defer renderer.deinit();
+    for ([_]FragmentShadowProbeShape{
+        .{ .extract_pc = 0x1194, .extract = 0x943bff04, .source_sgpr = 4, .index_sgpr = 59, .index_vgpr = 47, .cube_pc = 0x1288, .cube_sources = 0x04060500, .multiply_pc = 0x129c, .multiply = .{ 0xd5690033, 0x00025eff, 116 }, .load_pc = 0x12a8, .read_pc = 0x12c0, .read_sources = 0x006a0033 },
+        // Captured material variants first used after the heroine lifts her
+        // head. Their signed index moves through different SGPR/VGPR pairs.
+        .{ .extract_pc = 0x3334, .extract = 0x9457ff51, .source_sgpr = 81, .index_sgpr = 87, .index_vgpr = 96, .cube_pc = 0x343c, .cube_sources = 0x040a0300, .multiply_pc = 0x3450, .multiply = .{ 0xd5690063, 0x0002c0ff, 116 }, .load_pc = 0x345c, .read_pc = 0x3474, .read_sources = 0x006a0063 },
+        .{ .extract_pc = 0x3474, .extract = 0x9402ff0c, .source_sgpr = 12, .index_sgpr = 2, .index_vgpr = 88, .cube_pc = 0x3664, .cube_sources = 0x040a0300, .multiply_pc = 0x3678, .multiply = .{ 0xd569005c, 0x0002b0ff, 116 }, .load_pc = 0x3684, .read_pc = 0x369c, .read_sources = 0x006a005c },
+    }) |shape| try runFragmentShadowPointerCase(allocator, &renderer, shape);
+}
+
+fn runFragmentShadowPointerCase(allocator: std.mem.Allocator, renderer: *vulkan.Renderer, shape: FragmentShadowProbeShape) !void {
     var guest = SizedGuestMemory(512 * 1024){};
     const vertex = [_]u32{
         vop1(6, 1, 261), vop1(1, 2, 255),  0x3f80_0000,      vop2(4, 3, 1, 2),
@@ -7135,27 +7160,31 @@ fn runFragmentShadowPointerProbe(allocator: std.mem.Allocator) !void {
         0xf800_08cf,     0x0807_0605,      0xbf81_0000,
     };
     for (vertex, 0..) |word, i| guest.word(0x700 + i * 4, word);
-    var code: [0x12d4 / 4]u32 = @splat(0xbf800000);
+    const code = try allocator.alloc(u32, (shape.read_pc + 20) / 4);
+    defer allocator.free(code);
+    @memset(code, 0xbf800000);
+    code[0] = sop1(3, shape.source_sgpr, 4);
     const Site = struct { pc: usize, words: []const u32 };
     for ([_]Site{
-        .{ .pc = 0x1194, .words = &.{ 0x943bff04, 0x00080010 } },
+        .{ .pc = shape.extract_pc, .words = &.{ shape.extract, 0x00080010 } },
         // Keep the real signed-index and CUBEID sites. The test supplies the
         // face explicitly so both ends of the recorded window are exercised.
-        .{ .pc = 0x1284, .words = &.{0xbf820002} },
-        .{ .pc = 0x1288, .words = &.{ 0xd5440000, 0x04060500 } },
-        .{ .pc = 0x1290, .words = &.{vop1(1, 1, 6)} },
-        .{ .pc = 0x1294, .words = &.{vop2Source(0x25, 47, 59, 1)} },
-        .{ .pc = 0x129c, .words = &.{ 0xd5690033, 0x00025eff, 116 } },
-        .{ .pc = 0x12a8, .words = &.{ 0xf4041a80, 0xfa000040 } },
-        .{ .pc = 0x12c0, .words = &.{ 0xdc3887b8, 0x006a0033 } },
-        .{ .pc = 0x12c8, .words = &.{ 0xf800080f, 0x03020100, 0xbf810000 } },
+        .{ .pc = shape.cube_pc - 4, .words = &.{0xbf820002} },
+        .{ .pc = shape.cube_pc, .words = &.{ 0xd5440000, shape.cube_sources } },
+        .{ .pc = shape.cube_pc + 8, .words = &.{vop1(1, 1, 6)} },
+        .{ .pc = shape.cube_pc + 12, .words = &.{vop2Source(0x25, shape.index_vgpr, shape.index_sgpr, 1)} },
+        .{ .pc = shape.multiply_pc, .words = &shape.multiply },
+        .{ .pc = shape.load_pc, .words = &.{ 0xf4041a80, 0xfa000040 } },
+        .{ .pc = shape.read_pc, .words = &.{ 0xdc3887b8, shape.read_sources } },
+        .{ .pc = shape.read_pc + 8, .words = &.{ 0xf800080f, 0x03020100, 0xbf810000 } },
     }) |site| @memcpy(code[site.pc / 4 ..][0..site.words.len], site.words);
-    for (code, 0..) |word, i| guest.word(0x1000 + i * 4, word);
+    // Longer material programs must not overlap the color target at 0x4000.
+    for (code, 0..) |word, i| guest.word(0x50000 + i * 4, word);
     var state = gpu.State{};
     const pixel = gpu.resources.ShaderStage.pixel;
     try state.writeRegister(.shader, gpu.resources.ShaderStage.vertex.programRegisterBase(), 7);
     try state.writeRegister(.shader, gpu.resources.ShaderStage.vertex.programRegisterBase() + 1, 0);
-    try state.writeRegister(.shader, pixel.programRegisterBase(), 0x10);
+    try state.writeRegister(.shader, pixel.programRegisterBase(), 0x500);
     try state.writeRegister(.shader, pixel.programRegisterBase() + 1, 0);
     try state.writeRegister(.shader, pixel.programRegisterBase() + 3, 8 << 1);
     try state.writeRegister(.shader, pixel.userDataBase(), 0x10000);
@@ -7194,7 +7223,7 @@ fn runFragmentShadowPointerProbe(allocator: std.mem.Allocator) !void {
     try state.writeRegister(.shader, pixel.userDataBase() + 6, 0);
     _ = try executor.execute(&stream);
     try std.testing.expectEqual(@as(?anyerror, error.GuestMemoryReadFailed), renderer.last_draw_error);
-    std.debug.print("fragment shadow records passed: rendered RGBA, live relocation, signed index, cube face range and unmapped-read rejection\n", .{});
+    std.debug.print("fragment shadow records pc=0x{x} passed: rendered RGBA, live relocation, signed index, cube face range and unmapped-read rejection\n", .{shape.read_pc});
 }
 
 fn runShadowRecordPointerProbe(allocator: std.mem.Allocator) !void {
