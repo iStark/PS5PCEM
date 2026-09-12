@@ -9467,12 +9467,13 @@ pub fn main(init: std.process.Init) !void {
         try runBufferContentCacheProbe(allocator, 0);
         return;
     }
-    if (args.len == 2 and std.mem.eql(u8, args[1], "--draw-upload-rollover")) {
+    if (args.len == 2 and (std.mem.eql(u8, args[1], "--draw-upload-rollover") or std.mem.eql(u8, args[1], "--draw-capture-resources"))) {
+        const capture_resources = std.mem.eql(u8, args[1], "--draw-capture-resources");
         for ([_]bool{ false, true }) |persistent| {
             var renderer = try vulkan.Renderer.init(allocator, .{ .persistent_host_mappings = persistent, .enable_timeline_scheduler = true });
             defer renderer.deinit();
-            try renderer.probeDrawUploadRollover();
-            std.debug.print("draw upload rollover passed: new/rebound inputs and queued spill retirement, persistent={}\n", .{persistent});
+            try renderer.probeDrawUploadRollover(capture_resources);
+            std.debug.print("draw upload rollover passed: new/rebound inputs and queued spill retirement, persistent={} capture={}\n", .{ persistent, capture_resources });
         }
         return;
     }

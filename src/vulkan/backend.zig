@@ -6702,12 +6702,12 @@ pub const Renderer = struct {
             try dumpDiagnosticBytes(self.allocator, capture_prefix, ".local", std.mem.asBytes(&local_size));
             try dumpDiagnosticBytes(self.allocator, capture_prefix, ".groups", std.mem.asBytes(&group_count));
             try self.captureStorageImages(resources, capture_prefix, "before");
-            try self.captureStorageBuffers(resources, capture_prefix, "before");
+            try self.captureStorageBuffers(resources, capture_prefix, "before", null);
         }
         const report = try self.dispatchSpirvWithGds(module.words, group_count, module_lease, uses_gds);
         if (capture_storage) {
             try self.captureStorageImages(resources, capture_prefix, "after");
-            try self.captureStorageBuffers(resources, capture_prefix, "after");
+            try self.captureStorageBuffers(resources, capture_prefix, "after", null);
         }
         if (resources.sampled_image_fault) |fault| {
             const command_buffer = try self.beginOneShot();
@@ -14401,7 +14401,7 @@ pub const Renderer = struct {
     }
 
     /// A rollover must preserve inputs of a draw that has not been recorded yet.
-    pub fn probeDrawUploadRollover(self: *Renderer) anyerror!void {
+    pub fn probeDrawUploadRollover(self: *Renderer, capture_resources: bool) anyerror!void {
         var program = rdna2.Program{ .code = &.{}, .instructions = .empty };
         defer program.deinit(self.allocator);
         try program.instructions.appendSlice(self.allocator, &.{
@@ -14450,6 +14450,33 @@ pub const Renderer = struct {
             }
             self.updateStorageDescriptorRange(1, second.buffer, second.offset, second.size);
             self.updateStorageDescriptorRange(2, output.handle, pass * 256, 8);
+            if (capture_resources and pass == 0) {
+                const vertex = try ComputeResources.acquire(self);
+                defer vertex.deinit(self);
+                vertex.occupied[0] = true;
+                vertex.addresses[0] = 0x1000;
+                vertex.sizes[0] = 16;
+                try self.draw_upload_cache.append(self.allocator, .{ .guest_address = 0x1000, .size = 16, .upload = first });
+                try self.captureStorageBuffers(vertex, "out/diagnostic-inheritance", "vertex", null);
+                // The target snapshot between vertex and fragment preparation
+                // submits a readback, clearing upload-cache metadata while the
+                // prepared vertex binding still belongs to this draw.
+                const snapshot = try self.beginOneShot();
+                defer self.releaseOneShot(snapshot);
+                try self.submitOneShot(snapshot);
+                try self.waitForSubmittedWork();
+                try std.testing.expectEqual(@as(usize, 0), self.draw_upload_cache.items.len);
+                const fragment = try ComputeResources.acquire(self);
+                defer fragment.deinit(self);
+                fragment.occupied[0] = true;
+                fragment.addresses[0] = vertex.addresses[0];
+                fragment.sizes[0] = vertex.sizes[0];
+                fragment.occupied[1] = true;
+                fragment.addresses[1] = 0x2000;
+                fragment.sizes[1] = 16;
+                try self.draw_upload_cache.append(self.allocator, .{ .guest_address = 0x2000, .size = 16, .upload = second });
+                try self.captureStorageBuffers(fragment, "out/diagnostic-inheritance", "fragment", vertex);
+            }
             const commands = try self.beginOneShot();
             defer self.releaseOneShot(commands);
             self.device_functions.cmd_bind_pipeline(commands, vk.pipeline_bind_point_compute, pipeline.pipeline);
@@ -15870,6 +15897,10 @@ pub const Renderer = struct {
                 @atomicLoad(u64, &capture_fragment_program, .monotonic) == fragment_address);
         var capture_prefix_buffer: [128]u8 = undefined;
         const capture_prefix = if (capture_draw) try std.fmt.bufPrint(&capture_prefix_buffer, "out/vertex-capture-{d}-{x}", .{ self.flip_callbacks + 1, vertex_address }) else "";
+        errdefer if (capture_draw) {
+            std.debug.print("[vulkan diagnostic] captured draw did not complete flip={d} vs=0x{x} ps=0x{x}\n", .{ self.flip_callbacks + 1, vertex_address, fragment_address });
+            dumpDiagnosticBytes(self.allocator, capture_prefix, ".capture-error", "draw returned an error\n") catch {};
+        };
         const capture_target = capture_draw and @atomicLoad(u64, &capture_graphics_target, .monotonic) == target.descriptor.address;
         defer if (capture_target) self.captureGraphicsTarget(target, capture_prefix, "after") catch |err| {
             std.debug.print("[vulkan diagnostic] target capture failed: {s}\n", .{@errorName(err)});
@@ -15883,7 +15914,7 @@ pub const Renderer = struct {
             try dumpDiagnosticBytes(self.allocator, prefix, ".mappings", std.mem.sliceAsBytes(vertex_storage.mappings[0..vertex_storage.mapping_count]));
             try dumpDiagnosticBytes(self.allocator, prefix, ".image-descriptors", std.mem.sliceAsBytes(graphics_resources.descriptors[0..graphics_resources.image_count]));
             try dumpDiagnosticBytes(self.allocator, prefix, ".image-mappings", std.mem.sliceAsBytes(graphics_resources.mappings[0..graphics_resources.mapping_count]));
-            try self.captureStorageBuffers(vertex_storage, prefix, "vertex");
+            try self.captureStorageBuffers(vertex_storage, prefix, "vertex", null);
             try self.captureGraphicsImages(graphics_resources, prefix);
             if (capture_target) try self.captureGraphicsTarget(target, prefix, "before");
         }
@@ -16328,7 +16359,7 @@ pub const Renderer = struct {
         if (capture_draw) {
             try dumpDiagnosticBytes(self.allocator, capture_prefix, ".fragment-scalars", std.mem.sliceAsBytes(fragment_scalar_regs[0..fragment_scalar_count]));
             try dumpDiagnosticBytes(self.allocator, capture_prefix, ".fragment-mappings", std.mem.sliceAsBytes(fragment_storage.mappings[0..fragment_storage.mapping_count]));
-            try self.captureStorageBuffers(fragment_storage, capture_prefix, "fragment");
+            try self.captureStorageBuffers(fragment_storage, capture_prefix, "fragment", vertex_storage);
         }
         if (self.shouldReportFragmentResources(fragment_address)) {
             std.debug.print(
@@ -19304,13 +19335,17 @@ pub const Renderer = struct {
         return null;
     }
 
-    fn captureStorageBuffers(self: *Renderer, resources: *const ComputeResources, prefix: []const u8, phase: []const u8) !void {
+    fn captureStorageBuffers(self: *Renderer, resources: *const ComputeResources, prefix: []const u8, phase: []const u8, already_captured: ?*const ComputeResources) !void {
         const bound = self.active_storage_buffers;
         var uploaded: [maximum_storage_descriptors]bool = @splat(false);
         var total: usize = 0;
         // A readback wait clears upload-cache metadata. Snapshot every bound
         // ring slice first, before waiting on the persistent allocations.
         for (resources.addresses, resources.sizes, 0..) |address, size, slot| {
+            // Fragment preparation inherits occupied vertex slots. Their
+            // snapshots were saved before the target readback cleared the
+            // upload lookup; the bindings remain pinned for the pending draw.
+            if (already_captured) |earlier| if (earlier.occupied[slot]) continue;
             if (address == 0 or size == 0) continue;
             const range = diagnosticBufferRange(address, size, phase) orelse continue;
             for (self.draw_upload_cache.items) |cached| {
@@ -19327,6 +19362,7 @@ pub const Renderer = struct {
             }
         }
         for (resources.addresses, resources.sizes, 0..) |address, size, slot| {
+            if (already_captured) |earlier| if (earlier.occupied[slot]) continue;
             if (address == 0 or size == 0 or uploaded[slot]) continue;
             const range = diagnosticBufferRange(address, size, phase) orelse continue;
             if (range.size > 64 * 1024 * 1024 or total + range.size > 512 * 1024 * 1024) return error.DiagnosticBufferLimit;

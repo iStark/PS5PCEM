@@ -181,7 +181,15 @@ and bounded resource readbacks under `out/`; the directory must exist.
 shader. `capture_graphics_target` selects the primary color attachment for raw
 before/after snapshots, preserving NaNs and infinities for shader diagnosis.
 Draw captures also include fragment constants, buffers and sampled-image
-descriptors. The attachment snapshots leave guest memory and resource
+descriptors. Slots inherited from vertex preparation use the already saved
+vertex buffer files: the intervening attachment readback clears the upload
+lookup without invalidating those pinned bindings. Capturing them again as
+fragment buffers could reject the draw with `GuestBufferNotStaged` and produce
+identical before/after images of a draw that never ran. A `.capture-error`
+file marks a captured draw that returns an error; its after image must not be
+treated as evidence of a completed draw. `--draw-capture-resources` exercises
+the two capture phases around a submit and verifies the queued GPU inputs.
+The attachment snapshots leave guest memory and resource
 generations unchanged and restore its color-attachment usage after copying.
 Readbacks preserve guest resource generations but add synchronization, so
 captures must be disabled when measuring FPS. The separate
