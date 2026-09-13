@@ -1445,6 +1445,11 @@ pub fn reportProfile(window_ns: u64) void {
             @atomicLoad(u64, &profile_ns[slot], .monotonic) / std.time.ns_per_ms,
         });
     }
+    // Totals say which entry points a window was spent in; they cannot say
+    // which are still holding threads when the window closes. The in-flight
+    // slots answer that directly, and a blocked thread is exactly the case
+    // the totals describe worst.
+    reportInFlightCalls();
     for (0..profile_slots) |slot| {
         @atomicStore(u64, &profile_calls[slot], 0, .monotonic);
         @atomicStore(u64, &profile_ns[slot], 0, .monotonic);
