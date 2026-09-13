@@ -2690,9 +2690,9 @@ const Builder = struct {
             right = inverted;
         }
         const spirv_op: u16 = switch (opcode) {
-            .s_andn2_b32, .s_nand_b32 => 199,
-            .s_orn2_b32, .s_nor_b32 => 197,
-            .s_xnor_b32 => 198,
+            .s_and_b32, .s_andn2_b32, .s_nand_b32 => 199,
+            .s_or_b32, .s_orn2_b32, .s_nor_b32 => 197,
+            .s_xor_b32, .s_xnor_b32 => 198,
             else => unreachable,
         };
         const combined = self.id();
@@ -2702,7 +2702,21 @@ const Builder = struct {
             try self.emit(&self.body, 200, &.{ self.bits_type, inverted, combined });
             break :blk inverted;
         } else combined;
-        try self.destination(inst.dst, .{ .id = result, .value_type = .bits32 });
+        try self.scalarLogicalResult32(inst.dst, result);
+    }
+
+    fn scalarLogicalResult32(self: *Builder, dst: operand.Operand, result: u32) Error!void {
+        // SALU Boolean operations write SCC even when SDST is NULL. Vector
+        // Boolean operations, MOV and BREV must preserve the preceding flag.
+        if (dst.kind != .null) try self.destination(dst, .{ .id = result, .value_type = .bits32 });
+        self.scc = try self.isNonZero(result);
+    }
+
+    fn not32(self: *Builder, inst: instruction.Instruction) Error!void {
+        const value = try self.source(inst.src0, .bits32);
+        const result = self.id();
+        try self.emit(&self.body, 200, &.{ self.bits_type, result, value }); // OpNot
+        try self.scalarLogicalResult32(inst.dst, result);
     }
 
     fn packHalves(self: *Builder, inst: instruction.Instruction, src0_high: bool, src1_high: bool) Error!void {
@@ -10087,17 +10101,18 @@ const Builder = struct {
             .s_mul_i32, .v_mul_lo_u32 => try self.binary(inst, 132, .bits32, false), // OpIMul
             .s_mul_hi_u32, .v_mul_hi_u32 => try self.multiplyHighUnsigned(inst),
             .v_mul_hi_i32 => try self.multiplyHighSigned(inst),
-            .s_and_b32, .v_and_b32 => try self.binary(inst, 199, .bits32, false),
-            .s_or_b32, .v_or_b32 => try self.binary(inst, 197, .bits32, false),
-            .s_xor_b32, .v_xor_b32 => try self.binary(inst, 198, .bits32, false),
-            .s_andn2_b32, .s_orn2_b32, .s_nand_b32, .s_nor_b32, .s_xnor_b32 => try self.bitwise32(inst, inst.opcode),
+            .v_and_b32 => try self.binary(inst, 199, .bits32, false),
+            .v_or_b32 => try self.binary(inst, 197, .bits32, false),
+            .v_xor_b32 => try self.binary(inst, 198, .bits32, false),
+            .s_and_b32, .s_or_b32, .s_xor_b32, .s_andn2_b32, .s_orn2_b32, .s_nand_b32, .s_nor_b32, .s_xnor_b32 => try self.bitwise32(inst, inst.opcode),
             .s_pack_ll_b32_b16 => try self.packHalves(inst, false, false),
             .s_pack_lh_b32_b16 => try self.packHalves(inst, false, true),
             .s_pack_hh_b32_b16 => try self.packHalves(inst, true, true),
             .s_abs_i32 => try self.absSigned(inst),
             .s_bfe_i32 => try self.scalarBitfieldExtractSigned(inst),
             .s_mulk_i32 => try self.binary(inst, 132, .bits32, false),
-            .s_not_b32, .v_not_b32 => try self.unary(inst, 200, .bits32), // OpNot
+            .s_not_b32 => try self.not32(inst),
+            .v_not_b32 => try self.unary(inst, 200, .bits32), // OpNot
             .s_brev_b32, .v_bfrev_b32 => try self.unary(inst, 204, .bits32), // OpBitReverse
             .s_cmp_eq_i32, .s_cmp_eq_u32 => try self.comparison(inst, 170, .bits32), // OpIEqual
             .s_cmp_lg_i32, .s_cmp_lg_u32 => try self.comparison(inst, 171, .bits32), // OpINotEqual

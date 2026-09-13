@@ -1419,6 +1419,80 @@ fn runWholeQuadModeProbe(allocator: std.mem.Allocator) !void {
     std.debug.print("whole quad mode passed: captured VCC high destination, preserved low word, SCC and changing input\n", .{});
 }
 
+fn runScalarLogicalSccProbe(allocator: std.mem.Allocator) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{});
+    defer renderer.deinit();
+    var guest = GuestMemory{};
+    _ = renderer.dcbBackend(guest.interface());
+    const operations = [_]u7{ 14, 16, 18, 20, 22, 24, 26, 28, 127 };
+    const inputs = [_][2]u32{ .{ 0, 0 }, .{ 0xffffffff, 0xffffffff }, .{ 0x80000000, 1 }, .{ 0x12345678, 0x87654321 } };
+    for (operations) |op| for ([_]u7{ 20, 106, 107, 126, 127, 125 }) |destination| {
+        const paired: u8 = if (destination == 106 or destination == 107) destination ^ 1 else if (destination == 126 or destination == 127) destination ^ 1 else 128;
+        const code = [_]u32{
+            sop1(3, 106, 255), 0x13572468,
+            sop1(3, 107, 255), 0x24681357,
+            0xf408_0202, 125 << 25, // load a, b and the previous SCC seed through s4:s5
+            0xbf06_810a, // s_cmp_eq_u32 s10, 1
+            if (op == 127) sop1(7, destination, 8) else sop2(op, destination, 8, 9),
+            sop2(10, 12, 129, 128), // capture SCC before restoring EXEC
+            sop1(3, 13, if (destination == 125) 128 else destination),
+            sop1(3, 14, paired), // preserve the other half of VCC/EXEC
+            sop1(4, 126, 193), // restore all EXEC lanes; MOV must preserve SCC
+            vop1(1, 1, 13),
+            vop1(1, 2, 12),
+            vop1(1, 4, 14),
+            0xbf84_0002, // SCC0 selects the second marker
+            vop1(1, 3, 129),
+            0xbf82_0001, // s_branch over the SCC0 marker
+            vop1(1, 3, 130),
+            0xe078_0000, 0x8000_0100, // store result, SCC, branch marker and preserved half
+            0xbf81_0000,
+        };
+        for (code, 0..) |word, index| guest.word(0x100 + index * 4, word);
+        var state = gpu.State{};
+        const stage = gpu.resources.ShaderStage.compute;
+        try state.writeRegister(.shader, stage.programRegisterBase(), 1);
+        try state.writeRegister(.shader, stage.programRegisterBase() + 1, 0);
+        try state.writeRegister(.shader, 0x213, 6 << 1);
+        for ([_]u32{ 0x10000, 0, 16, 0, 0x9000, 0 }, 0..) |word, index|
+            try state.writeRegister(.shader, stage.userDataBase() + @as(u32, @intCast(index)), word);
+        for (inputs) |input| for (0..2) |seed| {
+            guest.word(0x9000, input[0]);
+            guest.word(0x9004, input[1]);
+            guest.word(0x9008, @intCast(seed));
+            const a = input[0];
+            const b = input[1];
+            const result = switch (op) {
+                14 => a & b,
+                16 => a | b,
+                18 => a ^ b,
+                20 => a & ~b,
+                22 => a | ~b,
+                24 => ~(a & b),
+                26 => ~(a | b),
+                28 => ~(a ^ b),
+                127 => ~a,
+                else => unreachable,
+            };
+            _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
+            var output: [16]u8 = undefined;
+            try renderer.readbackGuestStorageBuffer(0x10000, &output);
+            const expected = [_]u32{
+                if (destination == 125) 0 else result,
+                @intFromBool(result != 0),
+                if (result != 0) 1 else 2,
+                if (destination == 106) 0x24681357 else if (destination == 107) 0x13572468 else if (destination == 126 or destination == 127) 0xffffffff else 0,
+            };
+            for (expected, 0..) |value, component| {
+                const actual = std.mem.readInt(u32, output[component * 4 ..][0..4], .little);
+                if (actual != value) std.debug.print("logical SCC op={d} destination={d} input={x}/{x} seed={d} component={d}: expected={x} actual={x}\n", .{ op, destination, a, b, seed, component, value, actual });
+                try std.testing.expectEqual(value, actual);
+            }
+        };
+    };
+    std.debug.print("scalar logical SCC passed: all 32-bit Boolean operations, zero/nonzero results, both old flags, SGPR/VCC/EXEC/NULL destinations and branch/select consumers\n", .{});
+}
+
 fn runGatherLodProbe(allocator: std.mem.Allocator) !void {
     var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true });
     defer renderer.deinit();
@@ -9817,6 +9891,10 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--buffer-atomics")) {
         try runBufferAtomicProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--scalar-logical-scc")) {
+        try runScalarLogicalSccProbe(allocator);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--scene-masks")) {

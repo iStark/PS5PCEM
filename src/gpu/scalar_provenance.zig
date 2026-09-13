@@ -252,6 +252,7 @@ pub fn pruneUniformBranches(
                     .s_nand_b32,
                     .s_nor_b32,
                     .s_xnor_b32,
+                    .s_not_b32,
                     .s_wqm_b32,
                     => executeScalar(&local, bindings.program_address, inst, &scc),
                     .s_nop, .s_waitcnt, .s_inst_prefetch, .s_branch, .s_endpgm, .s_code_end => {},
@@ -922,13 +923,13 @@ fn setpcDestinationPc(result: *const Evaluation, program_address: u64, inst: rdn
 }
 
 fn executeScalar(result: *Evaluation, program_address: u64, inst: rdna2.Instruction, scc: *?bool) void {
-    if (inst.opcode == .s_wqm_b32) {
+    if (inst.opcode == .s_wqm_b32 or inst.opcode == .s_not_b32) {
         const a = source(result, inst.src0) orelse {
             invalidateDestination(result, inst.dst, 1);
             scc.* = null;
             return;
         };
-        const value: u32 = @truncate(wholeQuadMode64(a.value));
+        const value: u32 = if (inst.opcode == .s_not_b32) ~a.value else @truncate(wholeQuadMode64(a.value));
         write(result, inst.dst, value, a.sources, inst.pc);
         scc.* = value != 0;
         return;
@@ -1016,7 +1017,6 @@ fn executeScalar(result: *Evaluation, program_address: u64, inst: rdna2.Instruct
     const bv = if (b) |value| value.value else 0;
     const value: ?u32 = switch (inst.opcode) {
         .s_mov_b32, .s_movk_i32 => a.value,
-        .s_not_b32 => ~a.value,
         .s_abs_i32 => absolute: {
             const signed: i32 = @bitCast(a.value);
             break :absolute if (signed < 0) (0 -% a.value) else a.value;
@@ -1663,15 +1663,15 @@ test "uniform bit guards prune only the selected dispatch branch" {
     };
     var graph = try rdna2.control_flow.buildInstructions(std.testing.allocator, &instructions);
     defer graph.deinit(std.testing.allocator);
-    for ([_]rdna2.Opcode{ .s_bitcmp0_b32, .s_bitcmp1_b32, .s_and_b32 }) |opcode| {
+    for ([_]rdna2.Opcode{ .s_bitcmp0_b32, .s_bitcmp1_b32, .s_and_b32, .s_not_b32 }) |opcode| {
         instructions[2].opcode = opcode;
         instructions[2].dst = .{ .kind = .sgpr, .reg = 10 };
         for ([_]u32{ 0, 31, 32, 63 }) |bit| {
             instructions[2].src1.value = if (opcode == .s_and_b32) @as(u32, 1) << @as(u5, @truncate(bit)) else bit;
-            for ([_]u32{ 0, 56, 1, 0x8000_0000 }) |flags| {
+            for ([_]u32{ 0, 56, 1, 0x8000_0000, 0xffff_ffff }) |flags| {
                 memory.write(0x1000, flags);
                 const set = (flags & (@as(u32, 1) << @as(u5, @truncate(bit)))) != 0;
-                const execute_flat = set == (opcode != .s_bitcmp0_b32);
+                const execute_flat = if (opcode == .s_not_b32) flags != 0xffff_ffff else set == (opcode != .s_bitcmp0_b32);
                 var specialized = (try pruneUniformBranches(std.testing.allocator, memory.reader(), &bindings, &instructions, &graph)).?;
                 defer specialized.deinit(std.testing.allocator);
                 try std.testing.expectEqual(if (execute_flat) rdna2.Opcode.flat_load_dword else .s_nop, specialized.items[4].opcode);
@@ -1683,6 +1683,8 @@ test "uniform bit guards prune only the selected dispatch branch" {
         memory.base = 0x3000;
         try std.testing.expect((try pruneUniformBranches(std.testing.allocator, memory.reader(), &bindings, &instructions, &graph)) == null);
         memory.base = 0x1000;
+        // The unary NOT has no bit selector.
+        if (opcode == .s_not_b32) continue;
         // The bit selector can be unknown independently of the flag word.
         instructions[2].src1 = .{ .kind = .sgpr, .reg = 9 };
         try std.testing.expect((try pruneUniformBranches(std.testing.allocator, memory.reader(), &bindings, &instructions, &graph)) == null);
@@ -1718,6 +1720,29 @@ test "scalar logical results update SCC and forget unknown operands" {
         executeScalar(&state, 0, inst, &scc);
         try std.testing.expectEqual(@as(?bool, null), scc);
         try std.testing.expect(state.register(8) == null);
+    }
+}
+
+test "scalar NOT replaces SCC for select consumers and unknown input" {
+    for ([_]u32{ 0, 0xffff_ffff, 0x1234_5678 }) |input| {
+        for ([_]rdna2.OperandKind{ .sgpr, .null }) |destination_kind| {
+            var state = Evaluation{};
+            var scc: ?bool = input == 0xffff_ffff;
+            var inst = rdna2.Instruction{ .opcode = .s_not_b32, .dst = .{ .kind = destination_kind, .reg = 8 }, .src0 = .{ .kind = .literal_constant, .value = input }, .src_count = 1 };
+            const select = rdna2.Instruction{ .opcode = .s_cselect_b32, .dst = .{ .kind = .sgpr, .reg = 10 }, .src0 = .{ .kind = .integer_inline_constant, .value = 11 }, .src1 = .{ .kind = .integer_inline_constant, .value = 22 }, .src_count = 2 };
+            executeScalar(&state, 0, inst, &scc);
+            try std.testing.expectEqual(@as(?bool, input != 0xffff_ffff), scc);
+            if (destination_kind == .sgpr) try std.testing.expectEqual(~input, state.register(8).?.value);
+            executeScalar(&state, 0, select, &scc);
+            try std.testing.expectEqual(@as(u32, if (input != 0xffff_ffff) 11 else 22), state.register(10).?.value);
+
+            inst.src0 = .{ .kind = .sgpr, .reg = 9 };
+            executeScalar(&state, 0, inst, &scc);
+            try std.testing.expectEqual(@as(?bool, null), scc);
+            try std.testing.expect(state.register(8) == null);
+            executeScalar(&state, 0, select, &scc);
+            try std.testing.expect(state.register(10) == null);
+        }
     }
 }
 
