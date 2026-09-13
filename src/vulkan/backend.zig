@@ -19651,6 +19651,7 @@ pub const Renderer = struct {
     }
 
     fn captureStorageBuffers(self: *Renderer, resources: *const ComputeResources, prefix: []const u8, phase: []const u8, already_captured: ?*const ComputeResources) !void {
+        try self.captureFlatMemoryBuffers(resources, prefix, phase);
         const bound = self.active_storage_buffers;
         const bound_offsets = self.active_storage_offsets;
         var uploaded: [maximum_storage_descriptors]bool = @splat(false);
@@ -19704,6 +19705,56 @@ pub const Renderer = struct {
             const suffix = try std.fmt.bufPrint(&suffix_buffer, "-{s}-buffer-{d}-{x}.bin", .{ phase, slot, address + range.offset });
             try dumpDiagnosticBytes(self.allocator, prefix, suffix, mapping.bytes[range_start..range_end]);
             total += range.size;
+        }
+    }
+
+    fn captureFlatMemoryBuffers(self: *Renderer, resources: *const ComputeResources, prefix: []const u8, phase: []const u8) !void {
+        const bindings = resources.flat_memories[0..resources.flat_memory_count];
+        if (bindings.len == 0) return;
+        // Anonymous FLAT regions carry their guest address and extent in a
+        // header instead of resources.addresses/sizes. Preserve that header
+        // and the GPU-written fault record for an exact diagnostic replay.
+        const command_buffer = try self.beginOneShot();
+        defer self.releaseOneShot(command_buffer);
+        var barriers: [maximum_storage_descriptors]vk.BufferMemoryBarrier = undefined;
+        for (bindings, barriers[0..bindings.len]) |binding, *barrier| {
+            const slot = binding.descriptor_index;
+            if (slot >= maximum_storage_descriptors or !resources.occupied[slot]) return Error.InvalidStorageDescriptor;
+            barrier.* = .{ .source_access_mask = vk.access_shader_write_bit, .destination_access_mask = vk.access_host_read_bit, .buffer = self.active_storage_buffers[slot], .offset = 0, .size = vk.whole_size };
+        }
+        self.device_functions.cmd_pipeline_barrier(command_buffer, vk.pipeline_stage_all_commands_bit, vk.pipeline_stage_host_bit, 0, 0, null, @intCast(bindings.len), &barriers, 0, null);
+        try self.submitOneShot(command_buffer);
+        try self.waitForSubmittedWork();
+        var suffix_buffer: [96]u8 = undefined;
+        const metadata_suffix = try std.fmt.bufPrint(&suffix_buffer, "-{s}.flat-bindings", .{phase});
+        try dumpDiagnosticBytes(self.allocator, prefix, metadata_suffix, std.mem.sliceAsBytes(bindings));
+        var total: usize = 0;
+        for (bindings) |binding| {
+            const slot = binding.descriptor_index;
+            if (slot >= maximum_storage_descriptors or !resources.occupied[slot]) return Error.InvalidStorageDescriptor;
+            const handle = self.active_storage_buffers[slot];
+            const offset = self.active_storage_offsets[slot];
+            const buffer = if (self.draw_upload_buffer != null and self.draw_upload_buffer.?.handle == handle)
+                self.draw_upload_buffer.?
+            else found: {
+                for (self.draw_upload_spills.items) |spill| if (spill.handle == handle) break :found spill;
+                return Error.GuestBufferNotStaged;
+            };
+            if (offset > buffer.size or 16 > buffer.size - offset) return Error.GuestBufferNotStaged;
+            const header = try self.mapDrawUpload(.{ .buffer = handle, .offset = offset, .size = 16 });
+            const address = std.mem.readInt(u64, header.bytes[0..8], .little);
+            const bytes: usize = std.mem.readInt(u32, header.bytes[12..16], .little);
+            header.release(self);
+            if (bytes > 8 * 1024 * 1024) return error.DiagnosticBufferLimit;
+            const size = bytes + 16 + @as(usize, if (binding.fault_record_word != null) 16 else 0);
+            if (binding.fault_record_word) |word| if (@as(usize, word) * 4 != bytes + 16) return Error.InvalidStorageDescriptor;
+            if (size > buffer.size - offset) return Error.GuestBufferNotStaged;
+            total += size;
+            if (total > 16 * 1024 * 1024) return error.DiagnosticBufferLimit;
+            const mapping = try self.mapDrawUpload(.{ .buffer = handle, .offset = offset, .size = size });
+            defer mapping.release(self);
+            const suffix = try std.fmt.bufPrint(&suffix_buffer, "-{s}-flat-{d}-{x}.bin", .{ phase, slot, address });
+            try dumpDiagnosticBytes(self.allocator, prefix, suffix, mapping.bytes);
         }
     }
 
