@@ -5076,7 +5076,9 @@ fn runQueuedBufferReuseProbe(allocator: std.mem.Allocator, use_waits: bool, reta
     renderer.descriptor_set = renderer.descriptor_sets[1];
     guest.word(0x2000, 0xdead_beef);
     _ = try renderer.stageGuestStorageBufferAt(2, 0x2000, 16);
-    if (use_waits) {
+    // A fresh device upload needs no CPU overwrite even when the direct
+    // host-visible path is configured to use the conservative global wait.
+    if (use_waits or device_budget != 0) {
         try std.testing.expectEqual(submitted_before, renderer.submitted_tick);
         try std.testing.expectEqual(pending_before + @as(usize, if (device_budget != 0) 1 else 0), renderer.pending_command_buffers.items.len);
     } else try std.testing.expect(renderer.submitted_tick > submitted_before);
@@ -5185,6 +5187,66 @@ fn runQueuedBufferReuseProbe(allocator: std.mem.Allocator, use_waits: bool, reta
         try std.testing.expectEqual(value, std.mem.readInt(u32, rebound_result[0..4], .little));
     }
     std.debug.print("compute module lifetime passed: cached/uncached translations, eviction, pipeline reuse and changing input bytes\n", .{});
+}
+
+fn runQueuedDeviceUploadProbe(allocator: std.mem.Allocator, fingerprint: bool, draw_uploads: bool) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{
+        .enable_timeline_scheduler = true,
+        .retain_clean_storage_buffers = true,
+        .device_storage_budget_bytes = 4 * 1024 * 1024,
+    });
+    defer renderer.deinit();
+    var guest = GuestMemory{};
+    var memory = guest.interface();
+    if (fingerprint) memory.fingerprint = GuestMemory.fingerprint;
+    _ = renderer.dcbBackend(memory);
+    renderer.storage_fingerprint_min_bytes = 16;
+    const code = [_]u32{ 0xe030_0000, 0x8002_0000, 0xe070_0000, 0x8003_0000, 0xbf81_0000 };
+    for (code, 0..) |word, i| guest.word(0x100 + i * 4, word);
+    var analysis = try gpu.shader_analysis.decode(allocator, .{ .context = &guest, .read_fn = GuestMemory.read }, 0x100, 16);
+    defer analysis.deinit(allocator);
+    var module = try analysis.translateSpirv(allocator, .{
+        .stage = .compute,
+        .storage_buffers = &.{
+            .{ .resource_sgpr = 8, .descriptor_index = 0, .extent_bytes = 16 },
+            .{ .resource_sgpr = 12, .descriptor_index = 1, .extent_bytes = 16 },
+        },
+    });
+    defer module.deinit(allocator);
+    for (0..8) |i| _ = try renderer.stageGuestStorageBufferAt(@intCast(i + 2), 0x2000 + i * 0x100, 16);
+    const source = try renderer.stageGuestStorageBufferAt(0, 0x1000, 16);
+    renderer.draw_uploads_enabled = draw_uploads;
+    for (0..2) |pass| {
+        renderer.draw_batch_active = true;
+        const submitted = renderer.submitted_tick;
+        const waits = renderer.frame_profile.storage_buffer_waits;
+        for (0..8) |i| {
+            renderer.current_descriptor_slot = i;
+            renderer.descriptor_set = renderer.descriptor_sets[i];
+            @memset(&renderer.active_storage_buffers, 0);
+            // Force a spill with queued ring readers; their sources must stay
+            // live without submitting them to make room for the new snapshot.
+            if (pass == 1 and i == 4) renderer.draw_upload_offset = 256 * 1024 * 1024 - 8;
+            guest.word(0x1000, @intCast(0x98760000 + pass * 0x100 + i));
+            const staged = try renderer.stageGuestStorageBufferAt(0, 0x1000, 16);
+            try std.testing.expectEqual(source.buffer, staged.buffer);
+            _ = try renderer.stageGuestStorageBufferAt(1, 0x2000 + i * 0x100, 16);
+            _ = try renderer.dispatchSpirv(module.words, .{ 1, 1, 1 });
+            try std.testing.expectEqual(submitted, renderer.submitted_tick);
+            try std.testing.expectEqual(waits, renderer.frame_profile.storage_buffer_waits);
+        }
+        if (pass == 1) try std.testing.expect(renderer.frame_profile.draw_upload_spills > 0);
+        for (0..8) |i| {
+            var result: [16]u8 = undefined;
+            try renderer.readbackGuestStorageBuffer(0x2000 + i * 0x100, &result);
+            try std.testing.expectEqual(@as(u32, @intCast(0x98760000 + pass * 0x100 + i)), std.mem.readInt(u32, result[0..4], .little));
+        }
+    }
+    renderer.draw_batch_active = false;
+    renderer.current_descriptor_slot = null;
+    renderer.descriptor_set = renderer.descriptor_sets[0];
+    try std.testing.expectEqual(@as(u64, 0), renderer.frame_profile.storage_buffer_renames);
+    std.debug.print("queued device uploads passed (fingerprint={any}, draw_uploads={any}): 16 ordered values, same device backing, zero upload waits/submissions, ring spill and GPU readback\n", .{ fingerprint, draw_uploads });
 }
 
 fn runStorageBufferRenameProbe(allocator: std.mem.Allocator, fingerprint: bool, draw_uploads: bool) !void {
@@ -10209,6 +10271,11 @@ pub fn main(init: std.process.Init) !void {
         try runStorageBufferRenameProbe(allocator, true, true);
         for ([_]usize{ 1, 4 * 1024 * 1024 }) |budget|
             try runQueuedBufferReuseProbe(allocator, true, false, 0, budget);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--queued-device-uploads")) {
+        for ([_]bool{ false, true }) |fingerprint| try runQueuedDeviceUploadProbe(allocator, fingerprint, false);
+        try runQueuedDeviceUploadProbe(allocator, true, true);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--parallel-copy")) {

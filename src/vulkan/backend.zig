@@ -5178,7 +5178,7 @@ pub const Renderer = struct {
         if (reclaimed) try self.waitForSubmittedWork();
     }
 
-    fn uploadStorageBacking(self: *Renderer, entry: *GuestBufferEntry, size: usize) (Error || std.mem.Allocator.Error)!void {
+    fn uploadStorageBacking(self: *Renderer, entry: *GuestBufferEntry, size: usize, upload: ?DrawUploadSlice) (Error || std.mem.Allocator.Error)!void {
         const transfer = entry.host_transfer orelse return;
         errdefer {
             entry.page_generation = 0;
@@ -5186,16 +5186,19 @@ pub const Renderer = struct {
         }
         const command_buffer = try self.beginOneShot();
         defer self.releaseOneShot(command_buffer);
+        const source_buffer = if (upload) |slice| slice.buffer else transfer.handle;
+        const source_offset = if (upload) |slice| slice.offset else 0;
         const before = [_]vk.BufferMemoryBarrier{
             .{ .source_access_mask = vk.access_memory_read_bit | vk.access_memory_write_bit, .destination_access_mask = vk.access_transfer_write_bit, .buffer = entry.device_local.handle, .offset = 0, .size = size },
-            .{ .source_access_mask = vk.access_host_write_bit, .destination_access_mask = vk.access_transfer_read_bit, .buffer = transfer.handle, .offset = 0, .size = size },
+            .{ .source_access_mask = vk.access_host_write_bit, .destination_access_mask = vk.access_transfer_read_bit, .buffer = source_buffer, .offset = source_offset, .size = size },
         };
         self.device_functions.cmd_pipeline_barrier(command_buffer, vk.pipeline_stage_all_commands_bit | vk.pipeline_stage_host_bit, vk.pipeline_stage_transfer_bit, 0, 0, null, before.len, &before, 0, null);
-        const copy = vk.BufferCopy{ .source_offset = 0, .destination_offset = 0, .size = size };
-        self.device_functions.cmd_copy_buffer(command_buffer, transfer.handle, entry.device_local.handle, 1, @ptrCast(&copy));
+        const copy = vk.BufferCopy{ .source_offset = source_offset, .destination_offset = 0, .size = size };
+        self.device_functions.cmd_copy_buffer(command_buffer, source_buffer, entry.device_local.handle, 1, @ptrCast(&copy));
         const ready = vk.BufferMemoryBarrier{ .source_access_mask = vk.access_transfer_write_bit, .destination_access_mask = vk.access_shader_read_bit | vk.access_shader_write_bit, .buffer = entry.device_local.handle, .offset = 0, .size = size };
         self.device_functions.cmd_pipeline_barrier(command_buffer, vk.pipeline_stage_transfer_bit, vk.pipeline_stage_all_commands_bit, 0, 0, null, 1, @ptrCast(&ready), 0, null);
-        // Protect the CPU mirror even before a shader binds the device copy.
+        // Track the copy's device-buffer use before a shader binds it. Ring
+        // slices retain their own lifetime; a reused mirror needs this too.
         entry.last_gpu_use = command_buffer_pending_tick;
         try self.submitOneShot(command_buffer);
     }
@@ -5455,11 +5458,18 @@ pub const Renderer = struct {
                 else
                     entry.content_hash != source_hash;
                 if (changed) {
-                    // The backing buffer may still be read by an older timeline
-                    // tick. Changed pages are uncommon; wait only on that path,
-                    // while unchanged draws bind the persistent copy directly.
-                    if (cache_hit or recycled_entry) try self.prepareStorageBufferHostWrite(entry, descriptor_index);
-                    const mapping = try self.mapBufferRange(entry.host_transfer orelse entry.device_local, 0, size);
+                    // Changed pages need a fresh snapshot while older timeline
+                    // ticks may still read the persistent backing. Unchanged
+                    // draws continue to bind that allocation directly.
+                    const upload: ?DrawUploadSlice = if (entry.host_transfer != null and self.current_descriptor_slot != null and self.draw_batch_active)
+                        try self.allocateDrawUpload(size)
+                    else
+                        null;
+                    // A fresh ring slice leaves earlier upload sources intact.
+                    // The copy barrier orders persistent device-buffer readers
+                    // before its overwrite without a CPU fence wait.
+                    if (upload == null and (cache_hit or recycled_entry)) try self.prepareStorageBufferHostWrite(entry, descriptor_index);
+                    const mapping = if (upload) |slice| try self.mapDrawUpload(slice) else try self.mapBufferRange(entry.host_transfer orelse entry.device_local, 0, size);
                     defer mapping.release(self);
                     const destination = mapping.bytes.ptr;
                     entry.page_generation = 0;
@@ -5504,7 +5514,7 @@ pub const Renderer = struct {
                     }
                     if (entry.content_hash == null or entry.content_hash != previous_content_hash)
                         self.advanceGuestBufferContents(entry);
-                    try self.uploadStorageBacking(entry, size);
+                    try self.uploadStorageBacking(entry, size, upload);
                 } else {
                     self.frame_profile.resident_storage_bytes +%= size;
                     if (source_hash != null) self.frame_profile.content_reused_bytes +%= size;
@@ -5575,10 +5585,14 @@ pub const Renderer = struct {
             // Compute uploads reuse the persistent allocation rather than the
             // draw upload ring. A clean cache entry can still be an input to
             // queued work: gpu_dirty tracks writes, not outstanding reads.
-            // Finish those readers before overwriting either an exact hit or
-            // a recycled allocation, also when page tracking is disabled.
-            if (cache_hit or recycled_entry) try self.prepareStorageBufferHostWrite(entry, descriptor_index);
-            const mapping = try self.mapBufferRange(entry.host_transfer orelse entry.device_local, 0, size);
+            // Direct host writes must finish those readers. Device-local
+            // uploads can instead order a fresh ring snapshot through the GPU.
+            const upload: ?DrawUploadSlice = if (entry.host_transfer != null and self.current_descriptor_slot != null and self.draw_batch_active)
+                try self.allocateDrawUpload(size)
+            else
+                null;
+            if (upload == null and (cache_hit or recycled_entry)) try self.prepareStorageBufferHostWrite(entry, descriptor_index);
+            const mapping = if (upload) |slice| try self.mapDrawUpload(slice) else try self.mapBufferRange(entry.host_transfer orelse entry.device_local, 0, size);
             defer mapping.release(self);
             const read_ok = memory.read(memory.context, guest_address, mapping.bytes);
             if (!read_ok) return Error.GuestMemoryReadFailed;
@@ -5592,7 +5606,7 @@ pub const Renderer = struct {
             self.frame_profile.upload_bytes +%= size;
             self.frame_profile.storage_upload_bytes +%= size;
             self.buffer_uploads += 1;
-            try self.uploadStorageBacking(entry, size);
+            try self.uploadStorageBacking(entry, size, upload);
         } else {
             self.frame_profile.resident_storage_bytes +%= size;
         }
