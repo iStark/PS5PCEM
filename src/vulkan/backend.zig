@@ -31,6 +31,7 @@ pub export var capture_storage_program: u64 = 0;
 pub export var capture_storage_flip: u64 = 0;
 pub export var capture_storage_address: u64 = 0;
 pub export var capture_storage_bytes: u64 = 0;
+pub export var capture_compute_sampled_images: bool = false;
 pub export var capture_storage_image_address: u64 = 0;
 pub export var capture_vertex_program: u64 = 0;
 pub export var capture_vertex_flip: u64 = 0;
@@ -6739,6 +6740,18 @@ pub const Renderer = struct {
             try dumpDiagnosticBytes(self.allocator, capture_prefix, ".scalars", std.mem.sliceAsBytes(resources.scalar_registers[0..resources.scalar_count]));
             try dumpDiagnosticBytes(self.allocator, capture_prefix, ".local", std.mem.asBytes(&local_size));
             try dumpDiagnosticBytes(self.allocator, capture_prefix, ".groups", std.mem.asBytes(&group_count));
+            if (@atomicLoad(bool, &capture_compute_sampled_images, .monotonic)) {
+                try dumpDiagnosticBytes(self.allocator, capture_prefix, ".buffer-mappings", std.mem.sliceAsBytes(resources.mappings[0..resources.mapping_count]));
+                try dumpDiagnosticBytes(self.allocator, capture_prefix, ".storage-mappings", std.mem.sliceAsBytes(resources.storage_image_mappings[0..resources.storage_image_mapping_count]));
+                const storage_descriptors = try self.allocator.alloc(gpu.ImageDescriptor, resources.storage_image_count);
+                defer self.allocator.free(storage_descriptors);
+                for (storage_descriptors, resources.storage_images[0..resources.storage_image_count]) |*descriptor, prepared| descriptor.* = prepared.descriptor;
+                try dumpDiagnosticBytes(self.allocator, capture_prefix, ".storage-descriptors", std.mem.sliceAsBytes(storage_descriptors));
+                try dumpDiagnosticBytes(self.allocator, capture_prefix, ".sampled-descriptors", std.mem.sliceAsBytes(resources.sampled_image_descriptors[0..resources.sampled_image_count]));
+                try dumpDiagnosticBytes(self.allocator, capture_prefix, ".sampled-samplers", std.mem.sliceAsBytes(resources.sampled_image_samplers[0..resources.sampled_image_count]));
+                try dumpDiagnosticBytes(self.allocator, capture_prefix, ".sampled-mappings", std.mem.sliceAsBytes(resources.sampled_image_mappings[0..resources.sampled_image_mapping_count]));
+                try self.captureSampledImages(resources.sampled_images[0..resources.sampled_image_count], resources.sampled_image_descriptors[0..resources.sampled_image_count], capture_prefix, null);
+            }
             try self.captureStorageImages(resources, capture_prefix, "before");
             try self.captureStorageBuffers(resources, capture_prefix, "before", null);
         }
@@ -19500,8 +19513,15 @@ pub const Renderer = struct {
     fn captureGraphicsImages(self: *Renderer, resources: *const GraphicsResources, prefix: []const u8) !void {
         const selected = @atomicLoad(u64, &capture_storage_image_address, .monotonic);
         if (selected == 0) return;
-        for (resources.images[0..resources.image_count], resources.descriptors[0..resources.image_count], 0..) |prepared, descriptor, slot| {
-            if (descriptor.address != selected) continue;
+        return self.captureSampledImages(resources.images[0..resources.image_count], resources.descriptors[0..resources.image_count], prefix, selected);
+    }
+
+    /// Read the bound images before dispatch as well as before graphics draws.
+    /// A compute replay needs sampled inputs alongside its storage images.
+    fn captureSampledImages(self: *Renderer, images: []const PreparedSampledImage, descriptors: []const gpu.ImageDescriptor, prefix: []const u8, selected: ?u64) !void {
+        var total: usize = 0;
+        for (images, descriptors, 0..) |prepared, descriptor, slot| {
+            if (selected) |address| if (descriptor.address != address) continue;
             if (descriptor.image_type != .color_2d or descriptor.samplesLog2() != 0 or
                 descriptor.viewBaseLevel() != 0 or descriptor.base_array != 0 or
                 (prepared.descriptor_layout != vk.image_layout_shader_read_only_optimal and prepared.descriptor_layout != vk.image_layout_general))
@@ -19513,7 +19533,8 @@ pub const Renderer = struct {
                 return error.UnsupportedDiagnosticSampledImage;
             if (previous_usage.layout != prepared.descriptor_layout) return error.UnsupportedDiagnosticSampledImage;
             const byte_count = @as(usize, descriptor.width) * descriptor.height * storageImageBytesPerTexel(descriptor.unified_format);
-            if (byte_count == 0 or byte_count > 64 * 1024 * 1024) return error.UnsupportedDiagnosticSampledImage;
+            if (byte_count == 0 or byte_count > 64 * 1024 * 1024 or total + byte_count > 512 * 1024 * 1024) return error.UnsupportedDiagnosticSampledImage;
+            total += byte_count;
             const readback = try self.createBuffer(byte_count, vk.buffer_usage_transfer_dst_bit, vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit);
             defer self.destroyBuffer(readback);
             const command_buffer = try self.beginOneShot();
