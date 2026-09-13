@@ -5471,7 +5471,15 @@ pub const Renderer = struct {
                     if (upload == null and (cache_hit or recycled_entry)) try self.prepareStorageBufferHostWrite(entry, descriptor_index);
                     const mapping = if (upload) |slice| try self.mapDrawUpload(slice) else try self.mapBufferRange(entry.host_transfer orelse entry.device_local, 0, size);
                     defer mapping.release(self);
-                    const destination = mapping.bytes.ptr;
+                    // The upload arena may be write-combined CPU memory.
+                    // Hash a cached snapshot, then copy those exact bytes to
+                    // the ring, rather than rereading a large uncached upload.
+                    var snapshot: ?@import("scratch_pool.zig").Pool.Lease = if (upload != null and tracked_generation == 0 and size >= @import("scratch_pool.zig").Pool.minimum_bytes)
+                        try self.image_scratch.acquire(self.allocator, size)
+                    else
+                        null;
+                    defer if (snapshot) |*lease| lease.release();
+                    const destination = if (snapshot) |lease| lease.bytes.ptr else mapping.bytes.ptr;
                     entry.page_generation = 0;
                     entry.content_hash = null;
                     var observed_generation = tracked_generation;
@@ -5512,6 +5520,7 @@ pub const Renderer = struct {
                             0;
                         if (observed_generation == 0) break;
                     }
+                    if (snapshot != null) @memcpy(mapping.bytes, destination[0..size]);
                     if (entry.content_hash == null or entry.content_hash != previous_content_hash)
                         self.advanceGuestBufferContents(entry);
                     try self.uploadStorageBacking(entry, size, upload);
@@ -5594,13 +5603,20 @@ pub const Renderer = struct {
             if (upload == null and (cache_hit or recycled_entry)) try self.prepareStorageBufferHostWrite(entry, descriptor_index);
             const mapping = if (upload) |slice| try self.mapDrawUpload(slice) else try self.mapBufferRange(entry.host_transfer orelse entry.device_local, 0, size);
             defer mapping.release(self);
-            const read_ok = memory.read(memory.context, guest_address, mapping.bytes);
+            var snapshot: ?@import("scratch_pool.zig").Pool.Lease = if (upload != null and size >= self.storage_fingerprint_min_bytes and size >= @import("scratch_pool.zig").Pool.minimum_bytes)
+                try self.image_scratch.acquire(self.allocator, size)
+            else
+                null;
+            defer if (snapshot) |*lease| lease.release();
+            const destination = if (snapshot) |lease| lease.bytes else mapping.bytes;
+            const read_ok = memory.read(memory.context, guest_address, destination);
             if (!read_ok) return Error.GuestMemoryReadFailed;
             if (size >= self.storage_fingerprint_min_bytes) {
                 const hash_started = hostTimestampNs();
-                entry.content_hash = gpu.parallel_copy.fingerprint(mapping.bytes);
+                entry.content_hash = gpu.parallel_copy.fingerprint(destination);
                 self.frame_profile.buffer_fingerprint_ns +|= elapsedHostNanoseconds(hash_started);
             }
+            if (snapshot != null) @memcpy(mapping.bytes, destination);
             if (entry.content_hash == null or entry.content_hash != previous_content_hash)
                 self.advanceGuestBufferContents(entry);
             self.frame_profile.upload_bytes +%= size;
@@ -21180,7 +21196,7 @@ pub const Renderer = struct {
         const budget = self.storage_buffer_rename_budget_bytes;
         if (budget == 0 or !self.storage_buffer_use_waits or self.current_descriptor_slot == null or
             entry.gpu_dirty or entry.host_transfer != null or
-            entry.device_local.host_mapping != null or entry.device_local.size > 1024 * 1024 or
+            entry.device_local.host_mapping != null or entry.size > 1024 * 1024 or
             entry.last_gpu_use <= self.completed_tick or
             self.storageBufferBoundElsewhere(entry.device_local.handle, descriptor_index)) return false;
 
@@ -21191,11 +21207,24 @@ pub const Renderer = struct {
         // keeps their descriptor snapshot valid until its original tick ends.
         try self.refreshGpuProgress();
         if (entry.last_gpu_use <= self.completed_tick) return false;
+        // Capacity recycling can leave a small range in a large allocation.
+        // Keep its old readers alive, but size the replacement to this upload.
+        // Once complete, oversized retired allocations cannot serve the small
+        // spare pool and must not permanently consume its byte budget.
+        var retired_index: usize = 0;
+        while (retired_index < self.retired_storage_buffers.items.len) {
+            const retired = self.retired_storage_buffers.items[retired_index];
+            if (retired.retire_tick <= self.completed_tick and retired.buffer.size > 1024 * 1024) {
+                _ = self.retired_storage_buffers.swapRemove(retired_index);
+                self.retired_storage_buffer_bytes -= retired.allocation_bytes;
+                self.destroyVulkanObject(.{ .buffer = retired.buffer });
+            } else retired_index += 1;
+        }
         var requirements: vk.MemoryRequirements = undefined;
         self.device_functions.get_buffer_memory_requirements(self.device, entry.device_local.handle, &requirements);
         var replacement_index: ?usize = null;
         for (self.retired_storage_buffers.items, 0..) |retired, index| {
-            if (retired.retire_tick <= self.completed_tick and retired.buffer.size == entry.device_local.size and
+            if (retired.retire_tick <= self.completed_tick and retired.buffer.size == entry.size and
                 self.retired_storage_buffer_bytes - retired.allocation_bytes +| requirements.size <= budget)
             {
                 replacement_index = index;
@@ -21211,7 +21240,7 @@ pub const Renderer = struct {
             if (self.retired_storage_buffers.items.len >= 256 or
                 self.retired_storage_buffer_bytes +| requirements.size > budget) return false;
             self.retired_storage_buffers.ensureUnusedCapacity(self.allocator, 1) catch return false;
-            const backing = self.createStorageBacking(@intCast(entry.device_local.size), false, entry.guest_address, null) catch return false;
+            const backing = self.createStorageBacking(entry.size, false, entry.guest_address, null) catch return false;
             break :allocate backing.device;
         };
         self.retired_storage_buffers.appendAssumeCapacity(.{
