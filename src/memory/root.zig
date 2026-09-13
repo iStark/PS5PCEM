@@ -1083,6 +1083,14 @@ pub const AddressSpace = struct {
     ///
     /// Returns `RangeNotMapped` when the range is not wholly inside one
     /// reservation, so the caller can fall back to ordinary fixed mapping.
+    /// How many intervals the table currently holds. Every mapping call
+    /// rebuilds the table, so this is the multiplier on a batch of them.
+    pub fn mappingCount(self: *AddressSpace) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.mappings.items.len;
+    }
+
     pub fn mapInReservation(
         self: *AddressSpace,
         address: u64,

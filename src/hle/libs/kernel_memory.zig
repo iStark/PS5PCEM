@@ -15,6 +15,7 @@
 
 const std = @import("std");
 const memory = @import("memory");
+const gpu = @import("gpu");
 const abi = @import("../abi.zig");
 const trace = @import("../trace.zig");
 const errno = @import("../errno.zig");
@@ -283,6 +284,9 @@ pub const Pool = struct {
 var pool: Pool = .{};
 var pool_gpa: ?std.mem.Allocator = null;
 var pool_lock: Lock = .{};
+var map_place_ns: u64 = 0;
+var map_metadata_ns: u64 = 0;
+var map_lock_ns: u64 = 0;
 var guest_address_space: ?*memory.AddressSpace = null;
 
 /// Installs the allocator the pool uses for its bookkeeping.
@@ -614,7 +618,9 @@ fn mapDirectMemory(
     if (!std.math.isPowerOfTwo(effective_alignment)) return KernelError.einval.raw();
     const map_flags: u32 = @bitCast(flags);
 
+    const lock_started = gpu.frame_timing.timestampNs();
     pool_lock.lock();
+    map_lock_ns +%= gpu.frame_timing.elapsedNs(lock_started);
     defer pool_lock.unlock();
 
     const memory_type: i32 = if (pool.findContainingRange(physical_address, len)) |reservation|
@@ -637,6 +643,7 @@ fn mapDirectMemory(
     // the address is nevertheless part of the ABI, not a best-effort hint.
     const explicit_fixed = map_flags & @as(u32, @intCast(map_fixed)) != 0;
     const device_request = requested_address != 0 and memory.device.contains(requested_address, len);
+    const place_started = gpu.frame_timing.timestampNs();
     const mapped_address = if (explicit_fixed or device_request) fixed: {
         if (requested_address == 0 or requested_address % effective_alignment != 0) {
             return KernelError.einval.raw();
@@ -693,6 +700,10 @@ fn mapDirectMemory(
         .direct_memory,
         physical_address,
     ) catch |err| return mapAddressSpaceError(err);
+
+    map_place_ns +%= gpu.frame_timing.elapsedNs(place_started);
+    const metadata_started = gpu.frame_timing.timestampNs();
+    defer map_metadata_ns +%= gpu.frame_timing.elapsedNs(metadata_started);
 
     address_space.setMetadata(mapped_address, len, .{
         .protection_bits = protection_bits,
@@ -1119,8 +1130,25 @@ fn batchMapCore(
         processed.* = 0;
     }
 
+    // A batch is a handful of calls per frame, so timing the whole of one is
+    // free, and a batch that runs for a large part of a frame is worth saying
+    // out loud: the guest is stalled inside it for that whole time.
+    const batch_started = gpu.frame_timing.timestampNs();
+    var mapped_bytes: u64 = 0;
+    const place_before = map_place_ns;
+    const metadata_before = map_metadata_ns;
+    const lock_before = map_lock_ns;
+    defer {
+        const elapsed = gpu.frame_timing.elapsedNs(batch_started);
+        if (elapsed >= 50 * std.time.ns_per_ms) std.debug.print(
+            "[batch map] entries={d} mapped_kib={d} elapsed_ms={d} place_ms={d} metadata_ms={d} lock_ms={d} intervals={d}\n",
+            .{ count, mapped_bytes / 1024, elapsed / std.time.ns_per_ms, (map_place_ns -% place_before) / std.time.ns_per_ms, (map_metadata_ns -% metadata_before) / std.time.ns_per_ms, (map_lock_ns -% lock_before) / std.time.ns_per_ms, if (guest_address_space) |space| space.mappingCount() else 0 },
+        );
+    }
+
     var processed: i32 = 0;
     for (entries[0..count], 0..) |*entry, index| {
+        mapped_bytes +|= entry.length;
         if (trace.announces("sceKernelBatchMap")) {
             std.debug.print(
                 "[batch map {d}] op={d} start=0x{x} offset=0x{x} length=0x{x} prot=0x{x} type=0x{x} flags=0x{x}\n",
