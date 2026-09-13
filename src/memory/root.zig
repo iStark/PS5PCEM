@@ -2052,7 +2052,15 @@ fn hostMappingViewSize(
             isAligned(size, windows_allocation_granularity) and
             isAligned(offset, windows_allocation_granularity))
         {
-            return windows_allocation_granularity;
+            // One view for the whole range. A section view may be any length
+            // once its address and section offset are granularity-aligned, and
+            // the range is contiguous in both, so cutting it into granularity
+            // pieces bought nothing and cost a placeholder split and a map
+            // call for each one. Windows charges those per call: a 128 KiB
+            // mapping was two of each, and a coalesced multi-megabyte run was
+            // dozens. Unmapping reads each view's real length back from the
+            // OS, so it follows whatever size was used here.
+            return size;
         }
     }
     return page_size;
