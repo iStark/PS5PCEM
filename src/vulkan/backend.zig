@@ -21222,14 +21222,37 @@ pub const Renderer = struct {
         }
         var requirements: vk.MemoryRequirements = undefined;
         self.device_functions.get_buffer_memory_requirements(self.device, entry.device_local.handle, &requirements);
+        if (requirements.size > budget) return false;
         var replacement_index: ?usize = null;
         for (self.retired_storage_buffers.items, 0..) |retired, index| {
-            if (retired.retire_tick <= self.completed_tick and retired.buffer.size == entry.size and
-                self.retired_storage_buffer_bytes - retired.allocation_bytes +| requirements.size <= budget)
-            {
+            if (retired.retire_tick <= self.completed_tick and retired.buffer.size == entry.size) {
                 replacement_index = index;
                 break;
             }
+        }
+        // Size classes from earlier scenes must not permanently fill the
+        // spare pool. Reserve a matching allocation, then reclaim only
+        // completed nonmatching spares until the old backing fits. Queued
+        // readers never require a submission just to make room here.
+        while (true) {
+            const reused_bytes = if (replacement_index) |index| self.retired_storage_buffers.items[index].allocation_bytes else 0;
+            if ((replacement_index != null or self.retired_storage_buffers.items.len < 256) and
+                self.retired_storage_buffer_bytes - reused_bytes +| requirements.size <= budget) break;
+            var victim_index: ?usize = null;
+            var oldest_tick: u64 = std.math.maxInt(u64);
+            for (self.retired_storage_buffers.items, 0..) |retired, index| {
+                if (replacement_index == index or retired.retire_tick > self.completed_tick) continue;
+                if (retired.retire_tick < oldest_tick) {
+                    victim_index = index;
+                    oldest_tick = retired.retire_tick;
+                }
+            }
+            const index = victim_index orelse return false;
+            const last_index = self.retired_storage_buffers.items.len - 1;
+            const retired = self.retired_storage_buffers.swapRemove(index);
+            if (replacement_index == last_index) replacement_index = index;
+            self.retired_storage_buffer_bytes -= retired.allocation_bytes;
+            self.destroyVulkanObject(.{ .buffer = retired.buffer });
         }
         const replacement = if (replacement_index) |index| take: {
             const retired = self.retired_storage_buffers.swapRemove(index);
@@ -21237,8 +21260,6 @@ pub const Renderer = struct {
             self.frame_profile.storage_buffer_rename_reuses += 1;
             break :take retired.buffer;
         } else allocate: {
-            if (self.retired_storage_buffers.items.len >= 256 or
-                self.retired_storage_buffer_bytes +| requirements.size > budget) return false;
             self.retired_storage_buffers.ensureUnusedCapacity(self.allocator, 1) catch return false;
             const backing = self.createStorageBacking(entry.size, false, entry.guest_address, null) catch return false;
             break :allocate backing.device;

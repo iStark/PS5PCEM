@@ -5411,6 +5411,82 @@ fn runStorageBufferRenameProbe(allocator: std.mem.Allocator, fingerprint: bool, 
     std.debug.print("storage buffer rename passed (fingerprint={any}, draw_uploads={any}, oversized={any}): 16 queued snapshots, no upload submissions, completed spare reuse, bounded allocations, descriptor aliases\n", .{ fingerprint, draw_uploads, oversized });
 }
 
+fn runStorageRenamePoolPressureProbe(allocator: std.mem.Allocator, byte_pressure: bool) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{
+        .enable_timeline_scheduler = true,
+        .retain_clean_storage_buffers = true,
+        .storage_buffer_rename_budget_bytes = 4 * 1024 * 1024,
+    });
+    defer renderer.deinit();
+    var guest = GuestMemory{};
+    _ = renderer.dcbBackend(guest.interface());
+    const code = [_]u32{ 0xe030_0000, 0x8002_0000, 0xe070_0000, 0x8003_0000, 0xbf81_0000 };
+    for (code, 0..) |word, index| guest.word(0x100 + index * 4, word);
+    var analysis = try gpu.shader_analysis.decode(allocator, .{ .context = &guest, .read_fn = GuestMemory.read }, 0x100, 16);
+    defer analysis.deinit(allocator);
+    var module = try analysis.translateSpirv(allocator, .{
+        .stage = .compute,
+        .local_size = .{ 1, 1, 1 },
+        .storage_buffers = &.{
+            .{ .resource_sgpr = 8, .descriptor_index = 0, .extent_bytes = 16 },
+            .{ .resource_sgpr = 12, .descriptor_index = 1, .extent_bytes = 16 },
+        },
+    });
+    defer module.deinit(allocator);
+    // Seed completed Vulkan allocations from old size classes. Transfer
+    // ownership out of the guest cache; none has an outstanding reader.
+    try renderer.retired_storage_buffers.ensureTotalCapacity(allocator, 256);
+    for (0..256) |index| {
+        const size: usize = if (byte_pressure and index == 255) 16 else 1024 + index * 16;
+        _ = try renderer.stageGuestStorageBufferAt(0, 0x4000, size);
+        try std.testing.expectEqual(@as(usize, 1), renderer.guest_buffers.items.len);
+        const entry = renderer.guest_buffers.pop().?;
+        renderer.guest_buffer_address_index.invalidate();
+        @memset(&renderer.active_storage_buffers, 0);
+        var requirements: vulkan.api.MemoryRequirements = undefined;
+        renderer.device_functions.get_buffer_memory_requirements(renderer.device, entry.device_local.handle, &requirements);
+        renderer.retired_storage_buffers.appendAssumeCapacity(.{
+            .buffer = entry.device_local,
+            .retire_tick = renderer.completed_tick,
+            .allocation_bytes = requirements.size,
+        });
+        renderer.retired_storage_buffer_bytes += requirements.size;
+    }
+    const matching_handle = renderer.retired_storage_buffers.items[255].buffer.handle;
+    if (byte_pressure) renderer.storage_buffer_rename_budget_bytes = 16 * 1024;
+    for (0..8) |index| _ = try renderer.stageGuestStorageBufferAt(@intCast(index + 2), 0x2000 + index * 0x100, 16);
+    const submitted = renderer.submitted_tick;
+    const waits = renderer.frame_profile.storage_buffer_waits;
+    renderer.draw_batch_active = true;
+    for (0..8) |index| {
+        renderer.current_descriptor_slot = index;
+        renderer.descriptor_set = renderer.descriptor_sets[index];
+        @memset(&renderer.active_storage_buffers, 0);
+        guest.word(0x1000, @intCast(0x12340000 + index));
+        _ = try renderer.stageGuestStorageBufferAt(0, 0x1000, 16);
+        if (byte_pressure and index == 1) try std.testing.expectEqual(matching_handle, renderer.active_storage_buffers[0]);
+        _ = try renderer.stageGuestStorageBufferAt(1, 0x2000 + index * 0x100, 16);
+        _ = try renderer.dispatchSpirv(module.words, .{ 1, 1, 1 });
+        try std.testing.expectEqual(submitted, renderer.submitted_tick);
+        try std.testing.expectEqual(waits, renderer.frame_profile.storage_buffer_waits);
+        try std.testing.expectEqual(index + 1, renderer.pending_command_buffers.items.len);
+        try std.testing.expectEqual(@as(u64, @intCast(index)), renderer.frame_profile.storage_buffer_renames);
+        try std.testing.expect(renderer.retired_storage_buffers.items.len <= 256);
+        if (index != 0) try std.testing.expect(renderer.retired_storage_buffer_bytes <= renderer.storage_buffer_rename_budget_bytes);
+    }
+    // Later evictions must not destroy any of the seven still-queued
+    // readers, even as swapRemove changes their pool positions.
+    for (0..8) |index| {
+        var result: [16]u8 = undefined;
+        try renderer.readbackGuestStorageBuffer(0x2000 + index * 0x100, &result);
+        try std.testing.expectEqual(@as(u32, @intCast(0x12340000 + index)), std.mem.readInt(u32, result[0..4], .little));
+    }
+    renderer.draw_batch_active = false;
+    renderer.current_descriptor_slot = null;
+    renderer.descriptor_set = renderer.descriptor_sets[0];
+    std.debug.print("storage rename pool pressure passed (bytes={any}): full 256-entry pool, matching spare preserved, eight exact queued reads, no upload waits/submissions\n", .{byte_pressure});
+}
+
 fn runDeviceStorageBudgetProbe(allocator: std.mem.Allocator) !void {
     var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true, .device_storage_budget_bytes = 32 });
     defer renderer.deinit();
@@ -10337,6 +10413,7 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--buffer-rename")) {
+        for ([_]bool{ false, true }) |byte_pressure| try runStorageRenamePoolPressureProbe(allocator, byte_pressure);
         inline for ([_]bool{ false, true }) |oversized| {
             for ([_]bool{ false, true }) |fingerprint| try runStorageBufferRenameProbe(allocator, fingerprint, false, oversized);
             try runStorageBufferRenameProbe(allocator, true, true, oversized);
