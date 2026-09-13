@@ -770,19 +770,7 @@ pub const AddressSpace = struct {
         defer self.mutex.unlock();
         if (!self.coversLocked(address, size, null)) return Error.RangeNotMapped;
 
-        var replacement: std.ArrayList(Mapping) = .empty;
-        errdefer replacement.deinit(self.allocator);
-        try replacement.ensureTotalCapacity(self.allocator, self.mappings.items.len + 2);
-        try appendMetadataTransformed(
-            self.allocator,
-            &replacement,
-            self.mappings.items,
-            address,
-            size,
-            metadata,
-        );
-        self.mappings.deinit(self.allocator);
-        self.mappings = replacement;
+        try updateMappingMetadata(self.allocator, &self.mappings, address, size, metadata);
     }
 
     /// Removes every mapping that views a physical direct-memory range.
@@ -1083,8 +1071,7 @@ pub const AddressSpace = struct {
     ///
     /// Returns `RangeNotMapped` when the range is not wholly inside one
     /// reservation, so the caller can fall back to ordinary fixed mapping.
-    /// How many intervals the table currently holds. Every mapping call
-    /// rebuilds the table, so this is the multiplier on a batch of them.
+    /// Number of guest-visible intervals, including semantic reservations.
     pub fn mappingCount(self: *AddressSpace) usize {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -1104,27 +1091,17 @@ pub const AddressSpace = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        const end = address + size;
-        for (self.mappings.items) |mapping| {
-            if (mapping.kind == .reserved and mapping.address <= address and end <= mapping.end()) break;
-        } else return Error.RangeNotMapped;
+        const index = firstOverlappingMapping(self.mappings.items, address);
+        if (index == self.mappings.items.len) return Error.RangeNotMapped;
+        const reservation = self.mappings.items[index];
+        if (reservation.kind != .reserved or reservation.address > address or
+            address + size > reservation.end()) return Error.RangeNotMapped;
 
-        var replacement: std.ArrayList(Mapping) = .empty;
-        errdefer replacement.deinit(self.allocator);
-        try replacement.ensureTotalCapacity(self.allocator, self.mappings.items.len + 2);
-        // Drop the reserved cover for this sub-range; anything of the
-        // reservation on either side stays reserved and still belongs to the
-        // guest.
-        try appendTransformed(
-            self.allocator,
-            &replacement,
-            self.mappings.items,
-            address,
-            size,
-            .none,
-            0,
-            true,
-        );
+        // Reserve only the two possible boundary splits before touching host
+        // memory. After a successful host map, publishing metadata cannot fail.
+        const extra: usize = @as(usize, @intFromBool(reservation.address < address)) +
+            @intFromBool(address + size < reservation.end());
+        try self.mappings.ensureUnusedCapacity(self.allocator, extra);
 
         // Guest reservations are metadata. A later reservation can coalesce
         // the remaining host placeholders, so query the actual host boundary
@@ -1151,8 +1128,7 @@ pub const AddressSpace = struct {
             errdefer hostDecommit(address, size) catch {};
         }
 
-        const index = insertionIndexIn(replacement.items, address);
-        try replacement.insert(self.allocator, index, .{
+        replaceReservationAssumeCapacity(&self.mappings, index, .{
             .address = address,
             .size = size,
             .protection = protection,
@@ -1166,9 +1142,6 @@ pub const AddressSpace = struct {
             .protection_bits = 0,
             .name = namedMapping("anon"),
         });
-
-        self.mappings.deinit(self.allocator);
-        self.mappings = replacement;
     }
 
     fn reserveFixedLocked(self: *AddressSpace, address: u64, size: u64) Error!void {
@@ -1359,17 +1332,21 @@ pub const AddressSpace = struct {
 
             var free_start = reservation.start;
             var free_end = reservation.end;
-            for (self.mappings.items) |mapping| {
+            const at = self.insertionIndex(address);
+            var before = at;
+            while (before > 0) {
+                before -= 1;
+                const mapping = self.mappings.items[before];
                 if (mapping.kind == .reserved) continue;
-                if (mapping.end() <= address) {
-                    free_start = @max(free_start, mapping.end());
-                    continue;
-                }
-                if (mapping.address >= requested_end) {
-                    free_end = @min(free_end, mapping.address);
-                    break;
-                }
-                return null;
+                if (mapping.end() > address) return null;
+                free_start = @max(free_start, mapping.end());
+                break;
+            }
+            for (self.mappings.items[at..]) |mapping| {
+                if (mapping.kind == .reserved) continue;
+                if (mapping.address < requested_end) return null;
+                free_end = @min(free_end, mapping.address);
+                break;
             }
             if (free_start <= address and requested_end <= free_end) {
                 return .{ .start = free_start, .end = free_end };
@@ -1395,7 +1372,7 @@ pub const AddressSpace = struct {
         const end = std.math.add(u64, address, size) catch return false;
         var cursor = address;
 
-        for (self.mappings.items) |mapping| {
+        for (self.mappings.items[firstOverlappingMapping(self.mappings.items, address)..]) |mapping| {
             if (mapping.end() <= cursor) continue;
             if (mapping.address > cursor) return false;
             if (expected_kind) |kind| {
@@ -1566,6 +1543,65 @@ fn offsetMapping(mapping: Mapping, new_address: u64, new_size: u64) Mapping {
     copy.address = new_address;
     copy.size = new_size;
     return copy;
+}
+
+/// First interval that could overlap a range starting at address. The table
+/// is sorted and disjoint, so only the lower bound or its predecessor fits.
+fn firstOverlappingMapping(mappings: []const Mapping, address: u64) usize {
+    const index = insertionIndexIn(mappings, address);
+    return if (index > 0 and mappings[index - 1].end() > address) index - 1 else index;
+}
+
+fn replaceReservationAssumeCapacity(mappings: *std.ArrayList(Mapping), index: usize, inserted: Mapping) void {
+    const original = mappings.items[index];
+    std.debug.assert(original.kind == .reserved and original.address <= inserted.address and inserted.end() <= original.end());
+    var parts: [3]Mapping = undefined;
+    var count: usize = 0;
+    if (original.address < inserted.address) {
+        parts[count] = offsetMapping(original, original.address, inserted.address - original.address);
+        count += 1;
+    }
+    parts[count] = inserted;
+    count += 1;
+    if (inserted.end() < original.end()) {
+        parts[count] = offsetMapping(original, inserted.end(), original.end() - inserted.end());
+        count += 1;
+    }
+    // One tail move, no copy of the unaffected prefix and no reallocation.
+    mappings.replaceRangeAssumeCapacity(index, 1, parts[0..count]);
+}
+
+/// Caller has checked complete coverage. Allocate before any metadata change;
+/// exact-boundary updates require no allocation or movement at all.
+fn updateMappingMetadata(allocator: std.mem.Allocator, mappings: *std.ArrayList(Mapping), address: u64, size: u64, metadata: MappingMetadata) std.mem.Allocator.Error!void {
+    const end = address + size;
+    const first = firstOverlappingMapping(mappings.items, address);
+    const last = insertionIndexIn(mappings.items, end);
+    std.debug.assert(first < last);
+    const leading = mappings.items[first];
+    const trailing = mappings.items[last - 1];
+    const prefix: usize = @intFromBool(leading.address < address);
+    const suffix: usize = @intFromBool(end < trailing.end());
+    const extra = prefix + suffix;
+    try mappings.ensureUnusedCapacity(allocator, extra);
+    if (extra != 0) {
+        // Move the untouched tail once for both splits. If the first interval
+        // splits too, move just the affected intervals into their final slots.
+        _ = mappings.addManyAtAssumeCapacity(last, extra);
+        if (prefix != 0) {
+            std.mem.copyBackwards(Mapping, mappings.items[first + 1 .. last + 1], mappings.items[first..last]);
+            mappings.items[first] = offsetMapping(leading, leading.address, address - leading.address);
+        }
+        if (suffix != 0) mappings.items[last + prefix] = offsetMapping(trailing, end, trailing.end() - end);
+    }
+    for (mappings.items[first + prefix .. last + prefix]) |*mapping| {
+        const start = @max(mapping.address, address);
+        const stop = @min(mapping.end(), end);
+        mapping.* = offsetMapping(mapping.*, start, stop - start);
+        if (metadata.protection_bits) |bits| mapping.protection_bits = bits;
+        if (metadata.memory_type) |memory_type| mapping.memory_type = memory_type;
+        if (metadata.name) |name| mapping.name = namedMapping(name);
+    }
 }
 
 /// Rebuilds a mapping list after a protect or unmap operation.
@@ -2444,4 +2480,162 @@ test "fill reservation after neighboring allocation changes host placeholder bou
     try testing.expectEqual(MappingKind.reserved, space.query(neighbor, false).?.kind);
     try testing.expectEqual(@as(u64, 4 * page_size), space.query(neighbor, false).?.size);
     try testing.expect(space.query(first + 8 * page_size, false) == null);
+}
+
+test "reservation edits match rebuilding at every pair of boundaries" {
+    const original = [_]Mapping{
+        .{ .address = 2 * page_size, .size = 2 * page_size, .kind = .direct_memory, .protection = .read_only, .backing_offset = 7 * page_size, .name = namedMapping("before") },
+        .{ .address = 5 * page_size, .size = 16 * page_size, .kind = .reserved, .protection = .none, .memory_type = 3, .name = namedMapping("reservation") },
+        .{ .address = 22 * page_size, .size = page_size, .kind = .flexible, .protection = .read_write, .name = namedMapping("after") },
+    };
+    for (0..16) |start| {
+        for (start + 1..17) |end| {
+            var actual: std.ArrayList(Mapping) = .empty;
+            defer actual.deinit(testing.allocator);
+            try actual.ensureTotalCapacity(testing.allocator, original.len + 2);
+            actual.appendSliceAssumeCapacity(&original);
+            const pointer = actual.items.ptr;
+            const inserted = Mapping{ .address = (5 + start) * page_size, .size = (end - start) * page_size, .kind = .direct_memory, .protection = .read_write, .backing_offset = 100 * page_size, .name = namedMapping("anon") };
+            var expected: std.ArrayList(Mapping) = .empty;
+            defer expected.deinit(testing.allocator);
+            try appendTransformed(testing.allocator, &expected, &original, inserted.address, inserted.size, .none, 0, true);
+            try expected.insert(testing.allocator, insertionIndexIn(expected.items, inserted.address), inserted);
+            replaceReservationAssumeCapacity(&actual, firstOverlappingMapping(actual.items, inserted.address), inserted);
+            try testing.expectEqual(pointer, actual.items.ptr);
+            try testing.expectEqualDeep(expected.items, actual.items);
+        }
+    }
+}
+
+test "metadata edits match rebuilding across offsets gaps and repeated splits" {
+    const base = system_managed.start;
+    const original = [_]Mapping{
+        .{ .address = base + 2 * page_size, .size = 5 * page_size, .kind = .direct_memory, .protection = .read_only, .backing_offset = 11 * page_size, .protection_bits = 0x11, .name = namedMapping("first") },
+        .{ .address = base + 7 * page_size, .size = 3 * page_size, .kind = .direct_memory, .protection = .read_write, .backing_offset = 40 * page_size, .memory_type = 7, .name = namedMapping("alias") },
+        .{ .address = base + 10 * page_size, .size = 4 * page_size, .kind = .reserved, .protection = .none, .name = namedMapping("reserve") },
+        .{ .address = base + 16 * page_size, .size = 5 * page_size, .kind = .flexible, .protection = .read_write, .name = namedMapping("after gap") },
+    };
+    const edits = [_]MappingMetadata{ .{}, .{ .name = "" }, .{ .memory_type = 0 }, .{ .protection_bits = 0x33, .memory_type = 5, .name = "changed" } };
+    for (0..23) |start| {
+        for (start + 1..24) |end| {
+            var space = AddressSpace{ .allocator = testing.allocator };
+            defer space.mappings.deinit(testing.allocator);
+            try space.mappings.appendSlice(testing.allocator, &original);
+            var expected: std.ArrayList(Mapping) = .empty;
+            defer expected.deinit(testing.allocator);
+            try expected.appendSlice(testing.allocator, &original);
+            var covered = true;
+            for (start..end) |page| {
+                const present = for (original) |mapping| {
+                    if (mapping.address <= base + page * page_size and base + page * page_size < mapping.end()) break true;
+                } else false;
+                covered = covered and present;
+            }
+            for (edits) |metadata| {
+                if (!covered) {
+                    try testing.expectError(Error.RangeNotMapped, space.setMetadata(base + start * page_size, (end - start) * page_size, metadata));
+                } else {
+                    var replacement: std.ArrayList(Mapping) = .empty;
+                    errdefer replacement.deinit(testing.allocator);
+                    try appendMetadataTransformed(testing.allocator, &replacement, expected.items, base + start * page_size, (end - start) * page_size, metadata);
+                    expected.deinit(testing.allocator);
+                    expected = replacement;
+                    try space.setMetadata(base + start * page_size, (end - start) * page_size, metadata);
+                }
+                try testing.expectEqualDeep(expected.items, space.mappings.items);
+            }
+        }
+    }
+}
+
+test "reserved mapping and exact metadata updates use preallocated table storage" {
+    var space = try AddressSpace.initWithDirectMemory(testing.allocator, 8 * page_size);
+    defer space.deinit();
+    const address = try space.reserve(.system_managed, 0x200000000, 4 * page_size, page_size);
+    try space.mappings.ensureUnusedCapacity(testing.allocator, 2);
+    const pointer = space.mappings.items.ptr;
+    var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    space.allocator = failing.allocator();
+    defer space.allocator = testing.allocator;
+    try space.mapInReservation(address + page_size, 2 * page_size, .read_write, .direct_memory, 3 * page_size);
+    try space.setMetadata(address + page_size, 2 * page_size, .{ .protection_bits = 0x33, .memory_type = 7, .name = "mapped" });
+    try testing.expectEqual(pointer, space.mappings.items.ptr);
+    try space.write(address + page_size, "intact");
+    var observed: [6]u8 = undefined;
+    try space.read(address + page_size, &observed);
+    try testing.expectEqualStrings("intact", &observed);
+    const middle = space.query(address + 2 * page_size, false).?;
+    try testing.expectEqual(@as(?u64, 3 * page_size), middle.backing_offset);
+    try testing.expectEqual(@as(i32, 0x33), middle.protection_bits);
+    try testing.expectEqualStrings("mapped", std.mem.sliceTo(&middle.name, 0));
+    try testing.expectEqual(MappingKind.reserved, space.query(address, false).?.kind);
+    try testing.expectEqual(MappingKind.reserved, space.query(address + 3 * page_size, false).?.kind);
+}
+
+test "failed reservation and metadata edits preserve the mapping table" {
+    var space = try AddressSpace.initWithDirectMemory(testing.allocator, 4 * page_size);
+    defer space.deinit();
+    const address = try space.reserve(.system_managed, 0x200000000, 4 * page_size, page_size);
+    // Force an exact-sized table, then fail the allocation needed for splits.
+    const snapshot = try testing.allocator.dupe(Mapping, space.mappings.items);
+    defer testing.allocator.free(snapshot);
+    const exact = try testing.allocator.dupe(Mapping, snapshot);
+    space.mappings.deinit(testing.allocator);
+    space.mappings = .fromOwnedSlice(exact);
+    var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    space.allocator = failing.allocator();
+    defer space.allocator = testing.allocator;
+    try testing.expectError(error.OutOfMemory, space.mapInReservation(address + page_size, page_size, .read_write, .direct_memory, 0));
+    try testing.expectEqualDeep(snapshot, space.mappings.items);
+    try testing.expectError(error.OutOfMemory, space.setMetadata(address + page_size, page_size, .{ .name = "split" }));
+    try testing.expectEqualDeep(snapshot, space.mappings.items);
+    if (builtin.os.tag == .windows) try testing.expect(!windowsRangeAccessible(address + page_size, page_size, .write));
+    space.allocator = testing.allocator;
+    try testing.expectError(Error.BackingOffsetInvalid, space.mapInReservation(address + page_size, page_size, .read_write, .direct_memory, 4 * page_size));
+    try testing.expectEqualDeep(snapshot, space.mappings.items);
+    // The failed host transaction must leave a placeholder usable by retry.
+    try space.mapInReservation(address + page_size, page_size, .read_write, .direct_memory, 0);
+    try space.write(address + page_size, "retry");
+    const committed = try testing.allocator.dupe(Mapping, space.mappings.items);
+    defer testing.allocator.free(committed);
+    try testing.expectError(Error.RangeNotMapped, space.mapInReservation(address, 3 * page_size, .read_write, .direct_memory, 0));
+    try testing.expectEqualDeep(committed, space.mappings.items);
+}
+
+test "host placeholder bounds match a full table scan around reserved runs" {
+    const mappings = [_]Mapping{
+        .{ .address = 2, .size = 2, .kind = .direct_memory, .protection = .read_write },
+        .{ .address = 4, .size = 3, .kind = .reserved, .protection = .none },
+        .{ .address = 8, .size = 2, .kind = .reserved, .protection = .none },
+        .{ .address = 10, .size = 4, .kind = .flexible, .protection = .read_write },
+        .{ .address = 16, .size = 2, .kind = .reserved, .protection = .none },
+        .{ .address = 18, .size = 2, .kind = .reserved, .protection = .none },
+        .{ .address = 22, .size = 3, .kind = .direct_memory, .protection = .read_only },
+    };
+    var owned = [_]Range{ .{ .start = 1, .end = 15 }, .{ .start = 16, .end = 30 } };
+    var space = AddressSpace{ .allocator = testing.allocator, .reservations = .{ .items = &owned, .capacity = owned.len } };
+    defer space.mappings.deinit(testing.allocator);
+    try space.mappings.appendSlice(testing.allocator, &mappings);
+    for (0..32) |start| {
+        for (start + 1..33) |end| {
+            const expected: ?Range = expected: {
+                for (owned) |reservation| {
+                    if (!reservation.contains(start, end - start)) continue;
+                    var free = reservation;
+                    for (mappings) |mapping| {
+                        if (mapping.kind == .reserved) continue;
+                        if (mapping.end() <= start) {
+                            free.start = @max(free.start, mapping.end());
+                        } else if (mapping.address >= end) {
+                            free.end = @min(free.end, mapping.address);
+                            break;
+                        } else break :expected null;
+                    }
+                    break :expected free;
+                }
+                break :expected null;
+            };
+            try testing.expectEqualDeep(expected, space.hostFreeRangeIgnoringReservationsLocked(start, end - start));
+        }
+    }
 }
