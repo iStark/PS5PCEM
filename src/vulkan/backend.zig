@@ -2137,6 +2137,8 @@ const FrameProfile = struct {
     compute_pipeline_build_ns: u64 = 0,
     compute_emulation_ns: u64 = 0,
     compute_resource_ns: u64 = 0,
+    compute_buffer_scan_ns: u64 = 0,
+    compute_image_scan_ns: u64 = 0,
     checkpoint_prepare_ns: u64 = 0,
     checkpoint_preparations: u64 = 0,
     checkpoint_plan_misses: u64 = 0,
@@ -9064,6 +9066,7 @@ pub const Renderer = struct {
         // Descriptor resolvers borrow this state read-only. Only the register
         // snapshot changes between checkpoints; the load history stays empty.
         var instruction_scalar = gpu.ScalarEvaluation{};
+        const buffer_scan_started = hostTimestampNs();
         for (instructions) |inst| {
             const is_store = switch (inst.opcode) {
                 .buffer_load_ubyte,
@@ -9314,6 +9317,9 @@ pub const Renderer = struct {
 
         try self.prepareScalarPointerMemory(result, bindings, reader, analysis, scalar_checkpoint_pcs, scalar_checkpoint_registers, result.scalar_registers[recovered_pointer_begin..result.scalar_count]);
 
+        self.frame_profile.compute_buffer_scan_ns +|= elapsedHostNanoseconds(buffer_scan_started);
+        const image_scan_started = hostTimestampNs();
+        defer self.frame_profile.compute_image_scan_ns +|= elapsedHostNanoseconds(image_scan_started);
         for (instructions) |inst| {
             const writable = switch (inst.opcode) {
                 .image_load => false,
@@ -23025,6 +23031,10 @@ pub const Renderer = struct {
             std.debug.print(
                 "[gpu buffers] flip={d} content_reused_kib={d} fingerprint_ms={d}\n",
                 .{ self.flip_callbacks, profile.content_reused_bytes / 1024, profile.buffer_fingerprint_ns / std.time.ns_per_ms },
+            );
+            std.debug.print(
+                "[gpu compute scan] flip={d} buffers_ms={d} images_ms={d} dispatches={d}\n",
+                .{ self.flip_callbacks, profile.compute_buffer_scan_ns / std.time.ns_per_ms, profile.compute_image_scan_ns / std.time.ns_per_ms, profile.dispatches },
             );
             if (profile.shader_metadata_candidates +| profile.shader_metadata_scans_skipped != 0) std.debug.print(
                 "[gpu shader reads] flip={d} metadata_candidates={d} scans_skipped={d}\n",
