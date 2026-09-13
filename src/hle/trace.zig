@@ -19,6 +19,7 @@
 //! bounded buffer costs a few stores rather than an ever-growing log.
 
 const std = @import("std");
+const gpu = @import("gpu");
 const builtin = @import("builtin");
 const abi = @import("abi.zig");
 const host_stack = @import("host_stack.zig");
@@ -904,6 +905,7 @@ fn takeStackSnapshot(comptime name: []const u8, caller: usize) void {
 /// This runs on the guest's own stack, before firmware moves to a stack of its
 /// own, which is what makes a snapshot of the caller possible at all.
 fn enter(comptime name: []const u8, arguments: []const u64, caller: usize) void {
+    profileEnter();
     noteInFlight(currentThreadOrdinal(), name, arguments);
     if (capture_armed.load(.acquire)) takeStackSnapshot(name, caller);
     if (!live.load(.acquire) or !isEnabled()) return;
@@ -930,16 +932,25 @@ fn resultIsStatus(comptime Result: type) bool {
 }
 
 fn finish(comptime name: []const u8, result: anytype, arguments: []const u64) @TypeOf(result) {
+    profileFinish(name);
     clearInFlight(currentThreadOrdinal());
-    const Result = @TypeOf(result);
-    var record = Record{ .name = name, .argument_count = @intCast(arguments.len) };
-    for (arguments, 0..) |value, index| record.arguments[index] = value;
-    if (Result != void) {
-        record.result = word(result);
-        record.returns_value = true;
-        record.result_is_status = resultIsStatus(Result);
+    // A Record is a few hundred bytes that has to be zeroed and filled before
+    // store() can decide it has nowhere to go. Titles reach the firmware a
+    // million times in ten seconds — mutex pairs alone account for most of
+    // that — so building one for a disabled ring is the single most repeated
+    // piece of wasted work in the HLE. The check store() makes anyway is what
+    // decides whether to build it at all.
+    if (isEnabled()) {
+        const Result = @TypeOf(result);
+        var record = Record{ .name = name, .argument_count = @intCast(arguments.len) };
+        for (arguments, 0..) |value, index| record.arguments[index] = value;
+        if (Result != void) {
+            record.result = word(result);
+            record.returns_value = true;
+            record.result_is_status = resultIsStatus(Result);
+        }
+        store(record);
     }
-    store(record);
     return result;
 }
 
@@ -1303,4 +1314,139 @@ test "an empty trace says so rather than printing nothing" {
     var w = std.Io.Writer.fixed(&buffer);
     try write(&w, 8);
     try testing.expect(std.mem.indexOf(u8, w.buffered(), "no firmware calls recorded") != null);
+}
+
+// ---------------------------------------------------------------------------
+// Firmware call profile
+//
+// A long guest frame says nothing about which firmware call consumed it. Every
+// entry point already funnels through `enter`/`finish`, so the two ends of that
+// pair are the one place a per-call total can be collected without touching the
+// hundreds of implementations. It stays off unless PS5_HLE_PROFILE is set: the
+// timestamp pair costs two counter reads on calls that are otherwise a few
+// instructions long.
+
+threadlocal var profile_started_ns: u64 = 0;
+threadlocal var profile_depth: u32 = 0;
+
+const profile_slots: usize = 512;
+var profile_names: [profile_slots]?[*]const u8 = @splat(null);
+var profile_name_lengths: [profile_slots]usize = @splat(0);
+var profile_calls: [profile_slots]u64 = @splat(0);
+var profile_ns: [profile_slots]u64 = @splat(0);
+var profile_enabled: std.atomic.Value(u8) = .init(0);
+
+/// Enables the profile and clears whatever a previous window accumulated.
+pub fn enableProfile() void {
+    for (0..profile_slots) |slot| {
+        @atomicStore(u64, &profile_calls[slot], 0, .monotonic);
+        @atomicStore(u64, &profile_ns[slot], 0, .monotonic);
+    }
+    profile_enabled.store(1, .release);
+}
+
+pub fn profileEnabled() bool {
+    return profile_enabled.load(.acquire) != 0;
+}
+
+/// Names are comptime string literals, so the pointer identifies the entry
+/// point and the table needs no hashing of the text itself.
+fn profileSlot(name: []const u8) ?usize {
+    const key = @intFromPtr(name.ptr);
+    var index = (key >> 3) % profile_slots;
+    for (0..profile_slots) |_| {
+        const existing = @atomicLoad(?[*]const u8, &profile_names[index], .acquire);
+        if (existing) |pointer| {
+            if (@intFromPtr(pointer) == key) return index;
+        } else {
+            // A race here can only duplicate a name into two slots, which
+            // splits one entry point's total rather than corrupting it.
+            @atomicStore(usize, &profile_name_lengths[index], name.len, .monotonic);
+            @atomicStore(?[*]const u8, &profile_names[index], name.ptr, .release);
+            return index;
+        }
+        index = (index + 1) % profile_slots;
+    }
+    return null;
+}
+
+fn profileEnter() void {
+    if (!profileEnabled()) return;
+    // Only the outermost call is timed. A guest callback re-entering the HLE
+    // would otherwise have its time counted against both entry points.
+    profile_depth += 1;
+    if (profile_depth == 1) profile_started_ns = gpu.frame_timing.timestampNs();
+}
+
+fn profileFinish(comptime name: []const u8) void {
+    if (!profileEnabled()) return;
+    if (profile_depth == 0) return;
+    profile_depth -= 1;
+    if (profile_depth != 0) return;
+    const elapsed = gpu.frame_timing.elapsedNs(profile_started_ns);
+    const slot = profileSlot(name) orelse return;
+    _ = @atomicRmw(u64, &profile_calls[slot], .Add, 1, .monotonic);
+    _ = @atomicRmw(u64, &profile_ns[slot], .Add, elapsed, .monotonic);
+    maybeReportProfile();
+}
+
+var profile_window_started_ns: u64 = 0;
+var profile_report_countdown: u64 = 0;
+var profile_reporting: std.atomic.Value(u8) = .init(0);
+const profile_window_ns: u64 = 10 * std.time.ns_per_s;
+
+/// Reports on a wall-clock cadence from whichever thread happens to close a
+/// call once the window is up. One reporter at a time; the rest keep counting.
+fn maybeReportProfile() void {
+    // Reading the clock on every call would cost more than the calls being
+    // measured. Firmware traffic is tens of thousands of calls a second, so
+    // sampling the cadence this coarsely still lands within a few ms of the
+    // window.
+    const ticks = @atomicRmw(u64, &profile_report_countdown, .Add, 1, .monotonic);
+    if (ticks % 4096 != 0) return;
+    const now = gpu.frame_timing.timestampNs();
+    if (now == 0) return;
+    const started = @atomicLoad(u64, &profile_window_started_ns, .monotonic);
+    if (started == 0) {
+        @atomicStore(u64, &profile_window_started_ns, now, .monotonic);
+        return;
+    }
+    if (now -| started < profile_window_ns) return;
+    if (profile_reporting.swap(1, .acquire) != 0) return;
+    defer profile_reporting.store(0, .release);
+    @atomicStore(u64, &profile_window_started_ns, now, .monotonic);
+    reportProfile(now - started);
+}
+
+/// Prints the heaviest entry points and starts a new window.
+pub fn reportProfile(window_ns: u64) void {
+    if (!profileEnabled()) return;
+    var order: [profile_slots]usize = undefined;
+    var listed: usize = 0;
+    for (0..profile_slots) |slot| {
+        if (@atomicLoad(?[*]const u8, &profile_names[slot], .acquire) == null) continue;
+        if (@atomicLoad(u64, &profile_calls[slot], .monotonic) == 0) continue;
+        order[listed] = slot;
+        listed += 1;
+    }
+    const totals = &profile_ns;
+    std.mem.sort(usize, order[0..listed], totals, struct {
+        fn lessThan(context: *const [profile_slots]u64, a: usize, b: usize) bool {
+            return context[a] > context[b];
+        }
+    }.lessThan);
+    std.debug.print("[hle profile] window_ms={d} entries={d}\n", .{ window_ns / std.time.ns_per_ms, listed });
+    for (order[0..@min(listed, 12)]) |slot| {
+        const pointer = @atomicLoad(?[*]const u8, &profile_names[slot], .acquire) orelse continue;
+        const name = pointer[0..@atomicLoad(usize, &profile_name_lengths[slot], .monotonic)];
+        std.debug.print("  {s} calls={d} total_ms={d}\n", .{
+            name,
+            @atomicLoad(u64, &profile_calls[slot], .monotonic),
+            @atomicLoad(u64, &profile_ns[slot], .monotonic) / std.time.ns_per_ms,
+        });
+    }
+    for (0..profile_slots) |slot| {
+        @atomicStore(u64, &profile_calls[slot], 0, .monotonic);
+        @atomicStore(u64, &profile_ns[slot], 0, .monotonic);
+    }
 }

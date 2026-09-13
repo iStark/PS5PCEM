@@ -22897,6 +22897,7 @@ pub const Renderer = struct {
         else
             0;
         self.last_flip_profile_ns = now;
+        const submit_split = gpu.frame_timing.take();
         const should_print = self.flip_callbacks <= 8 or
             self.flip_callbacks % 60 == 0 or
             interval_ns >= std.time.ns_per_s or
@@ -22947,6 +22948,20 @@ pub const Renderer = struct {
                     self.sampled_image_cache.items.len,
                     resident_storage_images,
                     self.storage_image_cache_bytes / (1024 * 1024),
+                },
+            );
+            // Renderer timers only cover work the renderer was asked to do.
+            // Printing the guest's share of the interval beside them says
+            // whether a long frame is this backend's to shorten at all.
+            const submit_ms = submit_split.submit_ns / std.time.ns_per_ms;
+            std.debug.print(
+                "[gpu frame split] flip={d} frame_ms={d} submit_ms={d} guest_ms={d} submits={d}\n",
+                .{
+                    self.flip_callbacks,
+                    interval_ns / std.time.ns_per_ms,
+                    submit_ms,
+                    (interval_ns / std.time.ns_per_ms) -| submit_ms,
+                    submit_split.submit_calls,
                 },
             );
             const elided_this_frame = self.elided_dispatches -| self.reported_elided_dispatches;

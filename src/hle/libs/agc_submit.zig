@@ -3392,6 +3392,8 @@ fn publishDcbCompletion(outcome: SubmitOutcome) void {
 /// Graphics work, described by one descriptor.
 fn submitDcb(descriptor: ?*const Submission) callconv(abi.guest) i32 {
     drainCompletionNotifications();
+    const submit_started = gpu.frame_timing.timestampNs();
+    defer gpu.frame_timing.noteSubmit(gpu.frame_timing.elapsedNs(submit_started));
     const submission = if (descriptor) |value| value.* else return errno.ok;
     if (trace.announces("sceAgcDriverSubmitDcb")) {
         const rbp = trace.currentGuestRbp();
@@ -3432,6 +3434,8 @@ fn submitDcb(descriptor: ?*const Submission) callconv(abi.guest) i32 {
 /// Compute work on a named queue.
 fn submitAcb(owner: u32, descriptor: ?*const Submission) callconv(abi.guest) i32 {
     drainCompletionNotifications();
+    const submit_started = gpu.frame_timing.timestampNs();
+    defer gpu.frame_timing.noteSubmit(gpu.frame_timing.elapsedNs(submit_started));
     const submission = descriptor orelse return errno.ok;
     const stream = streamOf(submission.address, submission.word_count) orelse return errno.ok;
     const completion_label = driverCompletionLabel(submission, submission.*, 1);
@@ -3459,6 +3463,8 @@ fn submitMultiDcbs(
 ) callconv(abi.guest) i32 {
     drainCompletionNotifications();
     if (count == 0) return errno.ok;
+    const submit_started = gpu.frame_timing.timestampNs();
+    defer gpu.frame_timing.noteSubmit(gpu.frame_timing.elapsedNs(submit_started));
     const buffers = addresses orelse return errno.KernelError.einval.raw();
     const sizes = word_counts orelse return errno.KernelError.einval.raw();
 
@@ -3477,6 +3483,8 @@ pub fn submitMultiAcbs(
 ) callconv(abi.guest) i32 {
     drainCompletionNotifications();
     if (count == 0) return errno.ok;
+    const submit_started = gpu.frame_timing.timestampNs();
+    defer gpu.frame_timing.noteSubmit(gpu.frame_timing.elapsedNs(submit_started));
     const buffers = addresses orelse return errno.KernelError.einval.raw();
     const sizes = word_counts orelse return errno.KernelError.einval.raw();
     for (0..count) |index| {
@@ -3492,6 +3500,8 @@ pub fn submitMultiAcbs(
 /// One buffer submitted directly, without a descriptor around it.
 fn submitCommandBuffer(_: u32, address: ?[*]const u32, word_count: u32) callconv(abi.guest) i32 {
     drainCompletionNotifications();
+    const submit_started = gpu.frame_timing.timestampNs();
+    defer gpu.frame_timing.noteSubmit(gpu.frame_timing.elapsedNs(submit_started));
     const stream = streamOf(address, word_count) orelse return errno.ok;
     publishDcbCompletion(acceptSubmitted("dcb", stream, null, 0));
     return errno.ok;

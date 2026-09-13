@@ -457,6 +457,17 @@ fn run(init: std.process.Init) !bool {
         }
     } else |_| {}
 
+    // Which firmware entry points a frame is actually spent inside. The
+    // renderer profiles its own work; this covers everything else.
+    if (init.minimal.environ.getAlloc(allocator, "PS5_HLE_PROFILE")) |text| {
+        defer allocator.free(text);
+        const request = std.mem.trim(u8, text, " \t\r\n");
+        if (request.len != 0 and !std.mem.eql(u8, request, "0")) {
+            runtime.firmware.trace.enableProfile();
+            try out.print("  profiling firmware call totals every 10s\n", .{});
+        }
+    } else |_| {}
+
     if (init.minimal.environ.getAlloc(allocator, "PS5_TRACE_FAILURES")) |text| {
         defer allocator.free(text);
         const request = std.mem.trim(u8, text, " \t\r\n");
