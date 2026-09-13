@@ -19503,8 +19503,15 @@ pub const Renderer = struct {
         for (resources.images[0..resources.image_count], resources.descriptors[0..resources.image_count], 0..) |prepared, descriptor, slot| {
             if (descriptor.address != selected) continue;
             if (descriptor.image_type != .color_2d or descriptor.samplesLog2() != 0 or
-                descriptor.viewBaseLevel() != 0 or descriptor.base_array != 0 or prepared.descriptor_layout != vk.image_layout_shader_read_only_optimal)
+                descriptor.viewBaseLevel() != 0 or descriptor.base_array != 0 or
+                (prepared.descriptor_layout != vk.image_layout_shader_read_only_optimal and prepared.descriptor_layout != vk.image_layout_general))
                 return error.UnsupportedDiagnosticSampledImage;
+            // Resident compute outputs are sampled in GENERAL. Restore the
+            // tracked access after copying so the already prepared descriptor
+            // remains valid for the captured draw and later producers.
+            const previous_usage = self.image_states.current(prepared.image.handle, vk.image_aspect_color_bit, 0, 0) orelse
+                return error.UnsupportedDiagnosticSampledImage;
+            if (previous_usage.layout != prepared.descriptor_layout) return error.UnsupportedDiagnosticSampledImage;
             const byte_count = @as(usize, descriptor.width) * descriptor.height * storageImageBytesPerTexel(descriptor.unified_format);
             if (byte_count == 0 or byte_count > 64 * 1024 * 1024) return error.UnsupportedDiagnosticSampledImage;
             const readback = try self.createBuffer(byte_count, vk.buffer_usage_transfer_dst_bit, vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit);
@@ -19525,7 +19532,7 @@ pub const Renderer = struct {
                 .size = readback.size,
             };
             self.device_functions.cmd_pipeline_barrier(command_buffer, vk.pipeline_stage_transfer_bit, vk.pipeline_stage_host_bit, 0, 0, null, 1, @ptrCast(&barrier), 0, null);
-            try self.transitionTrackedImage(command_buffer, prepared.image.handle, .{ .aspect_mask = vk.image_aspect_color_bit, .layer_count = 1 }, image_state.shader_read_usage);
+            try self.transitionTrackedImage(command_buffer, prepared.image.handle, .{ .aspect_mask = vk.image_aspect_color_bit, .layer_count = 1 }, previous_usage);
             try self.submitOneShot(command_buffer);
             try self.waitForSubmittedWork();
             const mapping = try self.mapBufferRange(readback, 0, byte_count);
