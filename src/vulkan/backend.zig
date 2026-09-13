@@ -21114,11 +21114,14 @@ pub const Renderer = struct {
     fn renameStorageBufferForHostWrite(self: *Renderer, entry: *GuestBufferEntry, descriptor_index: u32) Error!bool {
         const budget = self.storage_buffer_rename_budget_bytes;
         if (budget == 0 or !self.storage_buffer_use_waits or self.current_descriptor_slot == null or
-            self.draw_uploads_enabled or entry.gpu_dirty or entry.host_transfer != null or
+            entry.gpu_dirty or entry.host_transfer != null or
             entry.device_local.host_mapping != null or entry.device_local.size > 1024 * 1024 or
             entry.last_gpu_use <= self.completed_tick or
             self.storageBufferBoundElsewhere(entry.device_local.handle, descriptor_index)) return false;
 
+        // Fingerprinted cache hits still overwrite this persistent backing
+        // when draw uploads are enabled; the ring only handles the uncached
+        // path. Both callers here need the same protection for queued readers.
         // Do not submit queued readers just to recycle their input. A spare
         // keeps their descriptor snapshot valid until its original tick ends.
         try self.refreshGpuProgress();

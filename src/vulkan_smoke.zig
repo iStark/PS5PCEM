@@ -5187,7 +5187,7 @@ fn runQueuedBufferReuseProbe(allocator: std.mem.Allocator, use_waits: bool, reta
     std.debug.print("compute module lifetime passed: cached/uncached translations, eviction, pipeline reuse and changing input bytes\n", .{});
 }
 
-fn runStorageBufferRenameProbe(allocator: std.mem.Allocator, fingerprint: bool) !void {
+fn runStorageBufferRenameProbe(allocator: std.mem.Allocator, fingerprint: bool, draw_uploads: bool) !void {
     var renderer = try vulkan.Renderer.init(allocator, .{
         .enable_timeline_scheduler = true,
         .retain_clean_storage_buffers = true,
@@ -5213,6 +5213,14 @@ fn runStorageBufferRenameProbe(allocator: std.mem.Allocator, fingerprint: bool) 
     });
     defer module.deinit(allocator);
     for (0..8) |index| _ = try renderer.stageGuestStorageBufferAt(@intCast(index + 2), 0x2000 + index * 0x100, 16);
+    // With draw uploads enabled, only a fingerprinted persistent hit reaches
+    // the host-write path. Seed it before enabling the ring, as a prior
+    // compute upload would, then change the same resource between draws.
+    if (draw_uploads) {
+        std.debug.assert(fingerprint);
+        _ = try renderer.stageGuestStorageBufferAt(0, 0x1000, 16);
+        renderer.draw_uploads_enabled = true;
+    }
     // Leave every reader queued while updating the same guest source eight
     // times. Each command must observe its own upload, with no intervening
     // submission or wait. The second batch must reuse the completed spares.
@@ -5268,7 +5276,7 @@ fn runStorageBufferRenameProbe(allocator: std.mem.Allocator, fingerprint: bool) 
     renderer.draw_batch_active = false;
     renderer.current_descriptor_slot = null;
     renderer.descriptor_set = renderer.descriptor_sets[0];
-    std.debug.print("storage buffer rename passed (fingerprint={any}): 16 queued snapshots, no upload submissions, completed spare reuse, bounded allocations, descriptor aliases\n", .{fingerprint});
+    std.debug.print("storage buffer rename passed (fingerprint={any}, draw_uploads={any}): 16 queued snapshots, no upload submissions, completed spare reuse, bounded allocations, descriptor aliases\n", .{ fingerprint, draw_uploads });
 }
 
 fn runDeviceStorageBudgetProbe(allocator: std.mem.Allocator) !void {
@@ -10197,7 +10205,8 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--buffer-rename")) {
-        for ([_]bool{ false, true }) |fingerprint| try runStorageBufferRenameProbe(allocator, fingerprint);
+        for ([_]bool{ false, true }) |fingerprint| try runStorageBufferRenameProbe(allocator, fingerprint, false);
+        try runStorageBufferRenameProbe(allocator, true, true);
         for ([_]usize{ 1, 4 * 1024 * 1024 }) |budget|
             try runQueuedBufferReuseProbe(allocator, true, false, 0, budget);
         return;
