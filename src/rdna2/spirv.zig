@@ -5312,12 +5312,45 @@ const Builder = struct {
         return self.glsl_std_450;
     }
 
-    /// v_cvt_pkrtz_f16_f32: pack two f32 into one u32 as two IEEE f16 halves
-    /// (low = src0, high = src1). GLSL.std.450 performs the conversion without
-    /// requiring Float16 storage or arithmetic capabilities from the device.
+    /// Make finite f32 values exactly representable in f16 by discarding the
+    /// bits below its precision. This implements RTZ before PackHalf2x16,
+    /// whose conversion does not promise the guest's rounding mode.
+    fn truncateToHalfPrecision(self: *Builder, value: u32) Error!u32 {
+        const bits = try self.convert(.{ .id = value, .value_type = .float32 }, .bits32);
+        const magnitude = try self.andBits(bits, 0x7fffffff);
+        const sign = try self.andBits(bits, 0x80000000);
+        const exponent = try self.shiftRightBits(magnitude, 23);
+        const limited_exponent = try self.glslBinaryValue(38, .bits32, exponent, try self.constant(.bits32, 113)); // UMin
+        const discarded = self.id();
+        try self.emit(&self.body, 130, &.{ self.bits_type, discarded, try self.constant(.bits32, 126), limited_exponent });
+        const shift = try self.glslBinaryValue(38, .bits32, discarded, try self.constant(.bits32, 24));
+        const shifted = self.id();
+        try self.emit(&self.body, 194, &.{ self.bits_type, shifted, magnitude, shift });
+        const truncated = self.id();
+        try self.emit(&self.body, 196, &.{ self.bits_type, truncated, shifted, shift });
+        const underflow = self.id();
+        try self.emit(&self.body, 176, &.{ self.bool_type, underflow, magnitude, try self.constant(.bits32, 0x33800000) });
+        const small = self.id();
+        try self.emit(&self.body, 169, &.{ self.bits_type, small, underflow, try self.constant(.bits32, 0), truncated });
+        const finite = try self.glslBinaryValue(38, .bits32, small, try self.constant(.bits32, 0x477fe000)); // max finite f16
+        const nonfinite = self.id();
+        try self.emit(&self.body, 174, &.{ self.bool_type, nonfinite, magnitude, try self.constant(.bits32, 0x7f800000) });
+        const selected = self.id();
+        try self.emit(&self.body, 169, &.{ self.bits_type, selected, nonfinite, magnitude, finite });
+        const signed = self.id();
+        try self.emit(&self.body, 197, &.{ self.bits_type, signed, sign, selected });
+        return self.convert(.{ .id = signed, .value_type = .bits32 }, .float32);
+    }
+
+    /// Pack two f32 into IEEE f16 halves without requiring Float16 support.
+    /// Only CVT_PKRTZ overrides rounding; PACK_B32_F16 retains its old path.
     fn packHalf2x16(self: *Builder, inst: instruction.Instruction) Error!void {
-        const a = try self.source(inst.src0, .float32);
-        const b = try self.source(inst.src1, .float32);
+        var a = try self.source(inst.src0, .float32);
+        var b = try self.source(inst.src1, .float32);
+        if (inst.opcode == .v_cvt_pkrtz_f16_f32) {
+            a = try self.truncateToHalfPrecision(a);
+            b = try self.truncateToHalfPrecision(b);
+        }
         const vector_type = try self.ensureFloatVec2();
         const pair = self.id();
         try self.emit(&self.body, 80, &.{ vector_type, pair, a, b }); // OpCompositeConstruct

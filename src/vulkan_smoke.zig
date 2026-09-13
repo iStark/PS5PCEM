@@ -1419,6 +1419,70 @@ fn runWholeQuadModeProbe(allocator: std.mem.Allocator) !void {
     std.debug.print("whole quad mode passed: captured VCC high destination, preserved low word, SCC and changing input\n", .{});
 }
 
+fn runPackHalfRtzProbe(allocator: std.mem.Allocator) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{});
+    defer renderer.deinit();
+    const guest = try allocator.create(SizedGuestMemory(2 * 1024 * 1024));
+    defer allocator.destroy(guest);
+    guest.* = .{};
+    _ = renderer.dcbBackend(guest.interface());
+    // Three samples in every finite positive half interval, with the negative
+    // counterpart in the other packed component. Values above each midpoint
+    // distinguish RTZ from the driver's usual nearest-even packing.
+    const count = 0x7bff * 3 + 64;
+    const expected = try allocator.alloc(u32, count);
+    defer allocator.free(expected);
+    var index: usize = 0;
+    for (0..0x7bff) |half| {
+        const lo: f32 = @floatCast(@as(f16, @bitCast(@as(u16, @intCast(half)))));
+        const hi: f32 = @floatCast(@as(f16, @bitCast(@as(u16, @intCast(half + 1)))));
+        for ([_]f32{ 0, 0.5, 0.75 }) |fraction| {
+            const bits: u32 = @bitCast(lo + (hi - lo) * fraction);
+            guest.word(0x10000 + index * 8, bits);
+            guest.word(0x10004 + index * 8, bits | 0x80000000);
+            expected[index] = @as(u32, @intCast(half)) | ((@as(u32, @intCast(half)) | 0x8000) << 16);
+            index += 1;
+        }
+    }
+    const edges = [_][2]u32{
+        .{ 0x477fe000, 0x7bff }, .{ 0x477ff000, 0x7bff }, .{ 0x47800000, 0x7bff },
+        .{ 0x7f7fffff, 0x7bff }, .{ 0x7f800000, 0x7c00 }, .{ 0x00000001, 0 },
+        .{ 0x007fffff, 0 },      .{ 0x337fffff, 0 },      .{ 0x33800000, 1 },
+        .{ 0x387fffff, 0x3ff },
+    };
+    while (index < count) : (index += 1) {
+        const edge = edges[(index - 0x7bff * 3) % edges.len];
+        guest.word(0x10000 + index * 8, edge[0]);
+        guest.word(0x10004 + index * 8, edge[0] | 0x80000000);
+        expected[index] = edge[1] | ((edge[1] | 0x8000) << 16);
+    }
+    const code = [_]u32{
+        vop1(1, 3, 8), vop2Source(0x1a, 3, 134, 3), vop2(0x25, 0, 3, 0), // workgroup.x * 64 + local.x
+        0xe034_2000, 0x8000_0100, // indexed pair from V#s0
+        vop2(0x2f, 1, 1, 2), // aliased destination: both inputs must be read before packing
+        0xe070_2000, 0x8001_0100, // packed result to V#s4
+        0xbf81_0000,
+    };
+    for (code, 0..) |word, i| guest.word(0x100 + i * 4, word);
+    var state = gpu.State{};
+    const stage = gpu.resources.ShaderStage.compute;
+    try state.writeRegister(.shader, stage.programRegisterBase(), 1);
+    try state.writeRegister(.shader, stage.programRegisterBase() + 1, 0);
+    try state.writeRegister(.shader, 0x213, (8 << 1) | (1 << 7));
+    for ([_]u32{ 0x10000, 8 << 16, count, 0, 0x100000, 4 << 16, count, 0 }, 0..) |word, i|
+        try state.writeRegister(.shader, stage.userDataBase() + @as(u32, @intCast(i)), word);
+    _ = try renderer.dispatchRdna2State(&state, .{ 64, 1, 1 }, .{ (count + 63) / 64, 1, 1 });
+    const output = try allocator.alloc(u8, count * 4);
+    defer allocator.free(output);
+    try renderer.readbackGuestStorageBuffer(0x100000, output);
+    for (expected, 0..) |value, i| {
+        const actual = std.mem.readInt(u32, output[i * 4 ..][0..4], .little);
+        if (value != actual) std.debug.print("half RTZ case={d}: expected={x} actual={x}\n", .{ i, value, actual });
+        try std.testing.expectEqual(value, actual);
+    }
+    std.debug.print("half RTZ passed: {d} pairs, every finite interval, both signs, signed zero, subnormals, overflow, infinities and destination aliasing\n", .{count});
+}
+
 fn runScalarLogicalSccProbe(allocator: std.mem.Allocator) !void {
     var renderer = try vulkan.Renderer.init(allocator, .{});
     defer renderer.deinit();
@@ -9910,6 +9974,10 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--scalar-logical-scc")) {
         try runScalarLogicalSccProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--pack-half-rtz")) {
+        try runPackHalfRtzProbe(allocator);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--scene-masks")) {
