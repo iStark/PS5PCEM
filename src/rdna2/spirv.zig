@@ -1997,10 +1997,15 @@ const Builder = struct {
                 bits = selected;
             }
         }
-        if (self.dispatch_active) |active| {
-            const selected = self.id();
-            try self.emit(&self.body, 169, &.{ self.bits_type, selected, active, bits, try self.registerBits(index, 0) });
-            bits = selected;
+        // Ordinary VGPR writes already include dispatch_active in laneEnabled.
+        // Scalar writes and WRITELANE bypass EXEC and still need the separate
+        // scheduler guard to preserve an idle guest wave's registers.
+        if (op.kind != .vgpr or self.writing_lane) {
+            if (self.dispatch_active) |active| {
+                const selected = self.id();
+                try self.emit(&self.body, 169, &.{ self.bits_type, selected, active, bits, try self.registerBits(index, 0) });
+                bits = selected;
+            }
         }
         self.registers[index] = .{
             .id = bits,
