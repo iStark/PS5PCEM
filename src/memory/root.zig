@@ -1689,6 +1689,34 @@ fn namedMapping(name: []const u8) [maximum_name_length]u8 {
 
 /// Returns the complete free interval around a requested range. The mapping
 /// slice may be the current table or a prospective table built for `unmap`.
+/// Wall time spent inside host virtual-memory calls, so a slow mapping
+/// can be attributed to Windows rather than to this table.
+/// Local monotonic clock: this module has no dependencies to borrow one
+/// from, and the counter is only read around host calls.
+const timing = struct {
+    fn timestampNs() u64 {
+        if (comptime builtin.os.tag != .windows) return 0;
+        var counter: std.os.windows.LARGE_INTEGER = 0;
+        var frequency: std.os.windows.LARGE_INTEGER = 0;
+        if (!std.os.windows.ntdll.RtlQueryPerformanceCounter(&counter).toBool() or
+            !std.os.windows.ntdll.RtlQueryPerformanceFrequency(&frequency).toBool() or
+            frequency <= 0) return 0;
+        const ticks: u128 = @intCast(@max(counter, 0));
+        return @intCast(ticks * std.time.ns_per_s / @as(u128, @intCast(frequency)));
+    }
+    fn elapsedNs(started: u64) u64 {
+        if (started == 0) return 0;
+        const now = timestampNs();
+        return if (now >= started) now - started else 0;
+    }
+};
+
+var host_map_ns: u64 = 0;
+
+pub fn hostMapNanoseconds() u64 {
+    return @atomicLoad(u64, &host_map_ns, .monotonic);
+}
+
 /// A contiguous half-open run of interval indices.
 const MappingSpan = struct { first: usize, last: usize };
 
@@ -1925,6 +1953,8 @@ fn hostRelease(range: Range) void {
 }
 
 fn hostCommit(address: u64, size: u64, protection: Protection) Error!void {
+    const host_started = timing.timestampNs();
+    defer _ = @atomicRmw(u64, &host_map_ns, .Add, timing.elapsedNs(host_started), .monotonic);
     switch (builtin.os.tag) {
         .windows => {
             const windows = std.os.windows;
@@ -2036,6 +2066,8 @@ fn hostPrepareMappingPlaceholders(
     size: u64,
     view_size: u64,
 ) Error!void {
+    const host_started = timing.timestampNs();
+    defer _ = @atomicRmw(u64, &host_map_ns, .Add, timing.elapsedNs(host_started), .monotonic);
     if (builtin.os.tag != .windows) return;
 
     // Recycled thread stacks and TLS blocks normally already sit inside one
@@ -2142,6 +2174,8 @@ fn hostMapBacking(
     offset: u64,
     protection: Protection,
 ) Error!void {
+    const host_started = timing.timestampNs();
+    defer _ = @atomicRmw(u64, &host_map_ns, .Add, timing.elapsedNs(host_started), .monotonic);
     switch (builtin.os.tag) {
         .windows => {
             const windows = std.os.windows;

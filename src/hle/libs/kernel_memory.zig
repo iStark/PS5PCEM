@@ -1104,6 +1104,50 @@ const BatchOperation = enum(i32) {
 /// Applies mappings in order and reports how many completed before an error.
 /// The ABI is intentionally non-transactional: callers use the processed count
 /// to retain successful prefix operations when a later entry fails.
+/// Length of the maximal run starting at `entries[0]` whose members are
+/// adjacent in both guest address and physical offset and agree on operation,
+/// protection and memory type. Such a run describes exactly the same guest
+/// state as one entry spanning all of it.
+fn contiguousRun(entries: []const BatchMapEntry) usize {
+    var length: usize = 1;
+    while (length < entries.len) : (length += 1) {
+        const last = entries[length - 1];
+        const next = entries[length];
+        if (last.operation != next.operation or last.protection != next.protection or
+            last.memory_type != next.memory_type or next.length == 0) break;
+        const start_end = std.math.add(u64, last.start, last.length) catch break;
+        const offset_end = std.math.add(u64, last.offset, last.length) catch break;
+        if (start_end != next.start or offset_end != next.offset) break;
+    }
+    return length;
+}
+
+/// Applies a whole run as one host mapping, reporting whether it took.
+///
+/// Only the unambiguous operations are attempted. A chosen-address map writes
+/// the address it picked back into its entry, which a combined call cannot do
+/// for every member, so those are left to the per-entry path. A refusal here
+/// costs one failed call and changes nothing: the underlying operations undo
+/// their host work before returning an error.
+fn applyMappingRun(entries: []BatchMapEntry, flags: i32) bool {
+    const first = entries[0];
+    var total: u64 = 0;
+    for (entries) |member| total = std.math.add(u64, total, member.length) catch return false;
+    if (total == 0) return false;
+    const operation: BatchOperation = @enumFromInt(first.operation);
+    const result = switch (operation) {
+        .map_direct => direct: {
+            if (first.start == 0 or flags & map_fixed == 0) return false;
+            var address = first.start;
+            break :direct sceKernelMapDirectMemory(&address, total, first.protection, flags, first.offset, 0);
+        },
+        .unmap => sceKernelMunmap(first.start, total),
+        .protect, .type_protect => sceKernelMprotect(first.start, total, first.protection),
+        .map_flexible => return false,
+    };
+    return result == errno.ok;
+}
+
 fn batchMapCore(
     entries_pointer: ?[*]BatchMapEntry,
     entry_count: i32,
@@ -1136,19 +1180,52 @@ fn batchMapCore(
     const batch_started = gpu.frame_timing.timestampNs();
     var mapped_bytes: u64 = 0;
     const place_before = map_place_ns;
+    const host_before = memory.hostMapNanoseconds();
+    var runs: u32 = 0;
+    var previous: ?BatchMapEntry = null;
+    var coalesced_entries: u64 = 0;
     const metadata_before = map_metadata_ns;
     const lock_before = map_lock_ns;
     defer {
         const elapsed = gpu.frame_timing.elapsedNs(batch_started);
         if (elapsed >= 50 * std.time.ns_per_ms) std.debug.print(
-            "[batch map] entries={d} mapped_kib={d} elapsed_ms={d} place_ms={d} metadata_ms={d} lock_ms={d} intervals={d}\n",
-            .{ count, mapped_bytes / 1024, elapsed / std.time.ns_per_ms, (map_place_ns -% place_before) / std.time.ns_per_ms, (map_metadata_ns -% metadata_before) / std.time.ns_per_ms, (map_lock_ns -% lock_before) / std.time.ns_per_ms, if (guest_address_space) |space| space.mappingCount() else 0 },
+            "[batch map] entries={d} mapped_kib={d} elapsed_ms={d} place_ms={d} host_ms={d} metadata_ms={d} lock_ms={d} intervals={d} runs={d} coalesced={d}\n",
+            .{ count, mapped_bytes / 1024, elapsed / std.time.ns_per_ms, (map_place_ns -% place_before) / std.time.ns_per_ms, (memory.hostMapNanoseconds() -% host_before) / std.time.ns_per_ms, (map_metadata_ns -% metadata_before) / std.time.ns_per_ms, (map_lock_ns -% lock_before) / std.time.ns_per_ms, if (guest_address_space) |space| space.mappingCount() else 0, runs, coalesced_entries },
         );
     }
 
     var processed: i32 = 0;
-    for (entries[0..count], 0..) |*entry, index| {
+    var index: usize = 0;
+    while (index < count) : (index += 1) {
+        // Windows charges per call, not per byte: a 128 KiB view costs about
+        // four milliseconds once the process holds tens of thousands of
+        // mappings, because each one splits a placeholder and shoots down
+        // every thread's TLB. Titles stream assets as long runs of
+        // adjacent slices, so issuing a run as one call is the same guest
+        // state for a fraction of the host work. A run that will not take it
+        // falls through to the per-entry path below, unchanged.
+        const run = contiguousRun(entries[index..count]);
+        if (run > 1 and applyMappingRun(entries[index..][0..run], flags)) {
+            for (entries[index..][0..run]) |*member| mapped_bytes +|= member.length;
+            runs += 1;
+            previous = entries[index + run - 1];
+            processed += @intCast(run);
+            coalesced_entries +|= run;
+            index += run - 1;
+            continue;
+        }
+        const entry = &entries[index];
+        {
         mapped_bytes +|= entry.length;
+        // How few host calls the batch could need if adjacent entries were
+        // issued together: a run is a maximal group that is contiguous in
+        // guest address and physical offset and agrees on everything else.
+        if (previous) |last| {
+            if (last.start + last.length != entry.start or last.offset + last.length != entry.offset or
+                last.operation != entry.operation or last.protection != entry.protection or
+                last.memory_type != entry.memory_type) runs += 1;
+        } else runs += 1;
+        previous = entry.*;
         if (trace.announces("sceKernelBatchMap")) {
             std.debug.print(
                 "[batch map {d}] op={d} start=0x{x} offset=0x{x} length=0x{x} prot=0x{x} type=0x{x} flags=0x{x}\n",
@@ -1279,6 +1356,7 @@ fn batchMapCore(
             return result;
         }
         processed += 1;
+        }
     }
     if (processed_pointer) |output| output.* = processed;
     return errno.ok;
@@ -2780,4 +2858,63 @@ test "the library registers under the expected identifiers" {
     const found = db.findByName("sceKernelGetDirectMemorySize", .function) orelse
         return error.TestExpectedSymbol;
     try testing.expectEqualStrings("pO96TwzOm5E", &found.key.id);
+}
+
+test "contiguous runs stop at every discontinuity a combined mapping would hide" {
+    const base: u64 = 0x1000_0000;
+    const step: u64 = 0x2_0000;
+    const entry = struct {
+        fn at(start: u64, offset: u64, length: u64, operation: BatchOperation) BatchMapEntry {
+            return .{
+                .start = start,
+                .offset = offset,
+                .length = length,
+                .protection = 3,
+                .memory_type = 0,
+                .reserved = 0,
+                .operation = @intFromEnum(operation),
+            };
+        }
+    };
+    // Three adjacent slices of one streamed region become one run.
+    var adjacent = [_]BatchMapEntry{
+        entry.at(base, 0, step, .map_direct),
+        entry.at(base + step, step, step, .map_direct),
+        entry.at(base + 2 * step, 2 * step, step, .map_direct),
+    };
+    try std.testing.expectEqual(@as(usize, 3), contiguousRun(&adjacent));
+
+    // A gap in the guest address ends the run even though the physical
+    // offsets stay adjacent; mapping across it would cover memory the guest
+    // never asked for.
+    var address_gap = adjacent;
+    address_gap[2].start += step;
+    try std.testing.expectEqual(@as(usize, 2), contiguousRun(&address_gap));
+
+    // A gap in the physical offset ends it too: the combined view would hand
+    // the second half the wrong bytes.
+    var offset_gap = adjacent;
+    offset_gap[1].offset += step;
+    try std.testing.expectEqual(@as(usize, 1), contiguousRun(&offset_gap));
+
+    // Differing operation, protection or memory type each stand alone.
+    var mixed_operation = adjacent;
+    mixed_operation[1].operation = @intFromEnum(BatchOperation.unmap);
+    try std.testing.expectEqual(@as(usize, 1), contiguousRun(&mixed_operation));
+    var mixed_protection = adjacent;
+    mixed_protection[2].protection = 1;
+    try std.testing.expectEqual(@as(usize, 2), contiguousRun(&mixed_protection));
+    var mixed_type = adjacent;
+    mixed_type[1].memory_type = 3;
+    try std.testing.expectEqual(@as(usize, 1), contiguousRun(&mixed_type));
+
+    // A zero length is rejected by the per-entry path, so it must not be
+    // absorbed into a run that would give it a size.
+    var zero_length = adjacent;
+    zero_length[1].length = 0;
+    try std.testing.expectEqual(@as(usize, 1), contiguousRun(&zero_length));
+
+    // A run of one is what a lone entry reports, and the length never exceeds
+    // the slice it was given.
+    try std.testing.expectEqual(@as(usize, 1), contiguousRun(adjacent[2..]));
 }
