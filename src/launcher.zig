@@ -11,6 +11,7 @@ const std = @import("std");
 const input = @import("input");
 const builtin = @import("builtin");
 const display_mode = @import("display_mode.zig");
+const performance_mode = @import("performance_mode.zig");
 
 comptime {
     // The interface contains a fair amount of Cyrillic text converted to
@@ -76,6 +77,11 @@ const Phrase = enum {
     output_resolution,
     output_resolution_description,
     status_resolution_saved,
+    render_preset,
+    render_preset_description,
+    preset_speed,
+    preset_graphics,
+    status_preset_saved,
     compatibility,
     compatibility_text,
     author,
@@ -139,6 +145,7 @@ var current_window: Win32.Window = null;
 var sound_enabled = true;
 var show_fps = false;
 var output_mode = display_mode.default;
+var render_preset = performance_mode.default;
 var mapping = mapping_defaults;
 var capture_mapping: ?usize = null;
 var game_folder: [1024]u16 = [_]u16{0} ** 1024;
@@ -222,6 +229,11 @@ fn tr(phrase: Phrase) []const u8 {
             .output_resolution => "OUTPUT RESOLUTION",
             .output_resolution_description => "Window size and display profile; games choose their internal resolution. Applied on next launch.",
             .status_resolution_saved => "Output resolution saved for the next launch",
+            .render_preset => "PRESET",
+            .render_preset_description => "Speed favors framerate, Graphics fidelity. Applied on next launch.",
+            .preset_speed => "Speed",
+            .preset_graphics => "Graphics",
+            .status_preset_saved => "Rendering preset saved for the next launch",
             .compatibility => "Compatibility",
             .compatibility_text => "PS5PCEM is at an early stage. Not every title boots yet; advanced DualSense features, native PS5 keyboard/mouse and controller-to-keyboard conversion still need more HLE support.",
             .author => "Author: Artur Strazewicz · GitHub: iStark/PS5PCEM",
@@ -297,6 +309,11 @@ fn tr(phrase: Phrase) []const u8 {
             .output_resolution => "输出分辨率",
             .output_resolution_description => "设置窗口大小和显示模式；内部分辨率由游戏决定。下次启动时生效。",
             .status_resolution_saved => "输出分辨率已保存，下次启动时生效",
+            .render_preset => "预设",
+            .render_preset_description => "“速度”优先帧率，“画质”优先保真度。下次启动时生效。",
+            .preset_speed => "速度",
+            .preset_graphics => "画质",
+            .status_preset_saved => "渲染预设已保存，下次启动时生效",
             .compatibility => "兼容性",
             .compatibility_text => "PS5PCEM 仍处于早期开发阶段，部分游戏尚无法启动。DualSense 高级功能、PS5 原生键鼠和手柄转键盘功能仍需进一步完善 HLE 支持。",
             .author => "作者：Artur Strazewicz · GitHub：iStark/PS5PCEM",
@@ -372,6 +389,11 @@ fn tr(phrase: Phrase) []const u8 {
             .output_resolution => "RESOLUCIÓN DE SALIDA",
             .output_resolution_description => "Tamaño de ventana y perfil de pantalla; el juego decide la resolución interna. Se aplica al volver a iniciar.",
             .status_resolution_saved => "Resolución guardada para el próximo inicio",
+            .render_preset => "AJUSTE",
+            .render_preset_description => "Velocidad prioriza los fps; Gráficos, la fidelidad. Se aplica al reiniciar.",
+            .preset_speed => "Velocidad",
+            .preset_graphics => "Gráficos",
+            .status_preset_saved => "Ajuste de render guardado para el próximo inicio",
             .compatibility => "Compatibilidad",
             .compatibility_text => "PS5PCEM está en una fase temprana: algunos juegos no arrancan. Las funciones avanzadas de DualSense, el teclado y ratón nativos de PS5 y la conversión de mando a teclado aún necesitan más soporte HLE.",
             .author => "Autor: Artur Strazewicz · GitHub: iStark/PS5PCEM",
@@ -447,6 +469,11 @@ fn tr(phrase: Phrase) []const u8 {
             .output_resolution => "دقة الإخراج",
             .output_resolution_description => "حجم النافذة ووضع العرض؛ تختار اللعبة الدقة الداخلية. يُطبّق عند التشغيل التالي.",
             .status_resolution_saved => "تم حفظ دقة الإخراج للتشغيل التالي",
+            .render_preset => "النمط",
+            .render_preset_description => "«السرعة» للإطارات و«الرسوم» للدقة. يُطبّق عند التشغيل التالي.",
+            .preset_speed => "السرعة",
+            .preset_graphics => "الرسوم",
+            .status_preset_saved => "تم حفظ نمط العرض للتشغيل التالي",
             .compatibility => "التوافق",
             .compatibility_text => "لا يزال PS5PCEM في مرحلة مبكرة، وبعض الألعاب لا تعمل بعد. تحتاج ميزات DualSense المتقدمة ولوحة المفاتيح والفأرة الأصلية لـ PS5 وتحويل يد التحكم إلى لوحة مفاتيح إلى مزيد من دعم HLE.",
             .author => "المؤلف: Artur Strazewicz · GitHub: iStark/PS5PCEM",
@@ -522,6 +549,11 @@ fn tr(phrase: Phrase) []const u8 {
             .output_resolution => "RESOLUÇÃO DE SAÍDA",
             .output_resolution_description => "Tamanho da janela e perfil de tela; o jogo escolhe a resolução interna. Aplicado na próxima execução.",
             .status_resolution_saved => "Resolução salva para a próxima execução",
+            .render_preset => "PREDEFINIÇÃO",
+            .render_preset_description => "Velocidade prioriza os fps; Gráficos, a fidelidade. Aplicado na próxima execução.",
+            .preset_speed => "Velocidade",
+            .preset_graphics => "Gráficos",
+            .status_preset_saved => "Predefinição salva para a próxima execução",
             .compatibility => "Compatibilidade",
             .compatibility_text => "O PS5PCEM está em fase inicial: alguns jogos ainda não iniciam. Recursos avançados do DualSense, teclado e mouse nativos do PS5 e a conversão de controle para teclado precisam de mais suporte HLE.",
             .author => "Autor: Artur Strazewicz · GitHub: iStark/PS5PCEM",
@@ -597,6 +629,11 @@ fn tr(phrase: Phrase) []const u8 {
             .output_resolution => "РАЗРЕШЕНИЕ ВЫВОДА",
             .output_resolution_description => "Размер окна и режим дисплея; внутреннее разрешение выбирает игра. Применяется при следующем запуске.",
             .status_resolution_saved => "Разрешение сохранено для следующего запуска",
+            .render_preset => "ПРЕСЕТ",
+            .render_preset_description => "«Скорость» — ради кадров, «Графика» — ради точности. Применяется при следующем запуске.",
+            .preset_speed => "Скорость",
+            .preset_graphics => "Графика",
+            .status_preset_saved => "Пресет сохранён для следующего запуска",
             .compatibility => "Совместимость",
             .compatibility_text => "PS5PCEM находится на ранней стадии. Не все игры загружаются; функции DualSense, нативные PS5-клавиатура/мышь и преобразование геймпада в клавиши требуют дальнейшей HLE-поддержки.",
             .author => "Автор: Artur Strazewicz · GitHub: iStark/PS5PCEM",
@@ -672,6 +709,11 @@ fn tr(phrase: Phrase) []const u8 {
             .output_resolution => "AUSGABEAUFLÖSUNG",
             .output_resolution_description => "Fenstergröße und Anzeigeprofil; das Spiel wählt die interne Auflösung. Gilt ab dem nächsten Start.",
             .status_resolution_saved => "Auflösung für den nächsten Start gespeichert",
+            .render_preset => "PROFIL",
+            .render_preset_description => "Tempo bevorzugt die Bildrate, Grafik die Treue. Gilt ab dem nächsten Start.",
+            .preset_speed => "Tempo",
+            .preset_graphics => "Grafik",
+            .status_preset_saved => "Render-Profil für den nächsten Start gespeichert",
             .compatibility => "Kompatibilität",
             .compatibility_text => "PS5PCEM ist in einer frühen Phase. Nicht jedes Spiel startet; erweiterte DualSense-Funktionen, native PS5-Tastatur/Maus und Controller-zu-Tastatur benötigen weitere HLE-Unterstützung.",
             .author => "Autor: Artur Strazewicz · GitHub: iStark/PS5PCEM",
@@ -747,6 +789,11 @@ fn tr(phrase: Phrase) []const u8 {
             .output_resolution => "RÉSOLUTION DE SORTIE",
             .output_resolution_description => "Taille de fenêtre et profil d’affichage ; le jeu choisit sa résolution interne. Appliqué au prochain lancement.",
             .status_resolution_saved => "Résolution enregistrée pour le prochain lancement",
+            .render_preset => "PROFIL",
+            .render_preset_description => "Vitesse privilégie la fluidité ; Graphismes la fidélité. Appliqué au prochain lancement.",
+            .preset_speed => "Vitesse",
+            .preset_graphics => "Graphismes",
+            .status_preset_saved => "Profil de rendu enregistré pour le prochain lancement",
             .compatibility => "Compatibilité",
             .compatibility_text => "PS5PCEM est encore expérimental. Tous les jeux ne démarrent pas ; les fonctions DualSense avancées, le clavier/souris PS5 natif et la conversion manette-clavier demandent davantage de prise en charge HLE.",
             .author => "Auteur : Artur Strazewicz · GitHub : iStark/PS5PCEM",
@@ -1043,11 +1090,20 @@ const settings_toggle_rects = [_]Rect{
     .{ .left = 690, .top = 464, .right = 1086, .bottom = 548 },
 };
 
+// The resolution row was four cards across the full content width. The
+// preset belongs beside it rather than below: the settings page already
+// reaches the bottom of the window, and both are launch-time choices that
+// read naturally on one line. Four narrower cards leave room for two.
 const resolution_rects = [_]Rect{
-    .{ .left = 282, .top = 360, .right = 472, .bottom = 414 },
-    .{ .left = 486, .top = 360, .right = 676, .bottom = 414 },
-    .{ .left = 690, .top = 360, .right = 880, .bottom = 414 },
-    .{ .left = 894, .top = 360, .right = 1086, .bottom = 414 },
+    .{ .left = 282, .top = 360, .right = 398, .bottom = 414 },
+    .{ .left = 408, .top = 360, .right = 524, .bottom = 414 },
+    .{ .left = 534, .top = 360, .right = 650, .bottom = 414 },
+    .{ .left = 660, .top = 360, .right = 776, .bottom = 414 },
+};
+
+const preset_rects = [_]Rect{
+    .{ .left = 796, .top = 360, .right = 936, .bottom = 414 },
+    .{ .left = 946, .top = 360, .right = 1086, .bottom = 414 },
 };
 
 fn controllerSlotRect(index: usize) Rect {
@@ -1094,6 +1150,7 @@ fn clickableAt(x: i32, y: i32) bool {
         .saves => saves_open_rect.contains(x, y),
         .settings => indexOfRect(&language_rects, x, y) != null or
             indexOfRect(&resolution_rects, x, y) != null or
+            indexOfRect(&preset_rects, x, y) != null or
             indexOfRect(&settings_toggle_rects, x, y) != null,
     };
 }
@@ -1174,6 +1231,12 @@ fn handleSettingsClick(x: i32, y: i32) void {
         output_mode = display_mode.choices[index];
         saveSettings();
         setStatusPhrase(.status_resolution_saved, false);
+        return;
+    }
+    if (indexOfRect(&preset_rects, x, y)) |index| {
+        render_preset = performance_mode.Mode.fromIndex(index) orelse render_preset;
+        saveSettings();
+        setStatusPhrase(.status_preset_saved, false);
         return;
     }
     if (indexOfRect(&language_rects, x, y)) |index| {
@@ -1921,14 +1984,23 @@ fn drawSettings(dc: Win32.DeviceContext) void {
         drawLanguageCard(dc, @enumFromInt(index), rectangle, label);
     }
 
-    localizedText(dc, .output_resolution, .{ .left = 282, .top = 332, .right = 1086, .bottom = 354 }, 0x009b9088, small_font, Win32.dt_left | Win32.dt_end_ellipsis);
+    localizedText(dc, .output_resolution, .{ .left = 282, .top = 332, .right = 776, .bottom = 354 }, 0x009b9088, small_font, Win32.dt_left | Win32.dt_end_ellipsis);
     for (resolution_rects, display_mode.choices) |rectangle, mode| {
         const selected = output_mode == mode;
         roundFill(dc, rectangle, 10, if (selected) 0x0042362e else 0x00251f1b);
-        if (selected) roundFill(dc, .{ .left = rectangle.left + 14, .top = rectangle.top + 22, .right = rectangle.left + 24, .bottom = rectangle.top + 32 }, 5, 0x00ffac64);
-        textUtf8(dc, mode.label(), .{ .left = rectangle.left + 36, .top = rectangle.top + 17, .right = rectangle.right - 12, .bottom = rectangle.bottom - 10 }, 0x00f4f0ea, medium_font, Win32.dt_left);
+        if (selected) roundFill(dc, .{ .left = rectangle.left + 12, .top = rectangle.top + 22, .right = rectangle.left + 22, .bottom = rectangle.top + 32 }, 5, 0x00ffac64);
+        textUtf8(dc, mode.label(), .{ .left = rectangle.left + 32, .top = rectangle.top + 17, .right = rectangle.right - 8, .bottom = rectangle.bottom - 10 }, 0x00f4f0ea, medium_font, Win32.dt_left);
     }
-    localizedText(dc, .output_resolution_description, .{ .left = 282, .top = 420, .right = 1086, .bottom = 458 }, 0x009b9088, small_font, Win32.dt_left | Win32.dt_word_break);
+    localizedText(dc, .output_resolution_description, .{ .left = 282, .top = 420, .right = 776, .bottom = 458 }, 0x009b9088, small_font, Win32.dt_left | Win32.dt_word_break);
+
+    localizedText(dc, .render_preset, .{ .left = 796, .top = 332, .right = 1086, .bottom = 354 }, 0x009b9088, small_font, Win32.dt_left | Win32.dt_end_ellipsis);
+    for (preset_rects, performance_mode.choices, [_]Phrase{ .preset_speed, .preset_graphics }) |rectangle, mode, label| {
+        const selected = render_preset == mode;
+        roundFill(dc, rectangle, 10, if (selected) 0x0042362e else 0x00251f1b);
+        if (selected) roundFill(dc, .{ .left = rectangle.left + 12, .top = rectangle.top + 22, .right = rectangle.left + 22, .bottom = rectangle.top + 32 }, 5, 0x00ffac64);
+        localizedText(dc, label, .{ .left = rectangle.left + 32, .top = rectangle.top + 17, .right = rectangle.right - 8, .bottom = rectangle.bottom - 10 }, 0x00f4f0ea, medium_font, Win32.dt_left | Win32.dt_end_ellipsis);
+    }
+    localizedText(dc, .render_preset_description, .{ .left = 796, .top = 420, .right = 1086, .bottom = 458 }, 0x009b9088, small_font, Win32.dt_left | Win32.dt_word_break);
 
     for (settings_toggle_rects, [_]Phrase{ .sound_output, .fps_counter }, [_]Phrase{ .sound_output_description, .fps_counter_description }, [_]bool{ sound_enabled, show_fps }) |rectangle, heading, description, enabled| {
         card(dc, rectangle);
@@ -2118,6 +2190,7 @@ fn launchGame(owner: Win32.Window) void {
     const resolution_length = std.unicode.utf8ToUtf16Le(&resolution_value, output_mode.value()) catch unreachable;
     resolution_value[resolution_length] = 0;
     _ = Win32.SetEnvironmentVariableW(w(display_mode.environment_name), @ptrCast(&resolution_value));
+    _ = Win32.SetEnvironmentVariableW(w(performance_mode.environment_name), presetEnvironment());
     _ = Win32.SetEnvironmentVariableW(w("PS5_INPUT_MODE"), inputModeEnvironment());
     var controller_value = [_:0]u16{@as(u16, '0') + controller_index};
     _ = Win32.SetEnvironmentVariableW(w("PS5_CONTROLLER_INDEX"), &controller_value);
@@ -2205,6 +2278,14 @@ fn inputModeDescription() Phrase {
     };
 }
 
+/// The preset name game-run parses, as a wide literal.
+fn presetEnvironment() [*:0]const u16 {
+    return switch (render_preset) {
+        .speed => w("speed"),
+        .graphics => w("graphics"),
+    };
+}
+
 fn inputModeEnvironment() [*:0]const u16 {
     return switch (input_mode) {
         .controller => w("controller"),
@@ -2270,6 +2351,7 @@ fn loadSettings() void {
     sound_enabled = Win32.GetPrivateProfileIntW(w("launcher"), w("sound"), 1, @ptrCast(&ini_path)) != 0;
     show_fps = Win32.GetPrivateProfileIntW(w("launcher"), w("show_fps"), 0, @ptrCast(&ini_path)) != 0;
     output_mode = display_mode.Mode.fromHeight(Win32.GetPrivateProfileIntW(w("launcher"), w("output_resolution"), display_mode.default.height(), @ptrCast(&ini_path))) orelse display_mode.default;
+    render_preset = performance_mode.Mode.fromIndex(Win32.GetPrivateProfileIntW(w("launcher"), w("render_preset"), @intFromEnum(performance_mode.default), @ptrCast(&ini_path))) orelse performance_mode.default;
     const mode_value = Win32.GetPrivateProfileIntW(w("launcher"), w("input_mode"), 2, @ptrCast(&ini_path));
     if (mode_value <= 2) input_mode = @enumFromInt(mode_value);
     const language_value = Win32.GetPrivateProfileIntW(w("launcher"), w("language"), 0, @ptrCast(&ini_path));
@@ -2290,6 +2372,7 @@ fn saveSettings() void {
     writeIniInt(w("launcher"), w("sound"), @intFromBool(sound_enabled));
     writeIniInt(w("launcher"), w("show_fps"), @intFromBool(show_fps));
     writeIniInt(w("launcher"), w("output_resolution"), output_mode.height());
+    writeIniInt(w("launcher"), w("render_preset"), @intFromEnum(render_preset));
     writeIniInt(w("launcher"), w("input_mode"), @intFromEnum(input_mode));
     writeIniInt(w("launcher"), w("language"), @intFromEnum(language));
     writeIniInt(w("launcher"), w("controller_index"), controller_index);

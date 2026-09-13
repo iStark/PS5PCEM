@@ -12,6 +12,7 @@ const loader = @import("loader");
 const vulkan = @import("vulkan");
 const window = @import("window");
 const display_mode = @import("display_mode.zig");
+const performance_mode = @import("performance_mode.zig");
 
 fn acquireHostMemory(context: ?*anyopaque, address: u64, size: usize, identity: u64) ?vulkan.GuestMemory.HostMapping {
     const view = runtime.firmware.libs.agc_submit.pinDirectMemory(context, address, size, identity) orelse return null;
@@ -308,9 +309,20 @@ fn run(init: std.process.Init) !bool {
         };
     } else |_| display_mode.default;
     runtime.firmware.video_out.configureOutputResolution(output_mode.width(), output_mode.height());
+    const render_preset = if (init.minimal.environ.getAlloc(allocator, performance_mode.environment_name)) |value| mode: {
+        defer allocator.free(value);
+        break :mode performance_mode.Mode.parse(value) orelse {
+            try stderr.print("Invalid {s}='{s}'; using {s}\n", .{
+                performance_mode.environment_name, value, performance_mode.default.value(),
+            });
+            try stderr.flush();
+            break :mode performance_mode.default;
+        };
+    } else |_| performance_mode.default;
     try out.print("  Output  {d}x{d}, VideoOut class {d}; internal rendering is game-controlled\n", .{
         output_mode.width(), output_mode.height(), runtime.firmware.video_out.outputResolutionClass(),
     });
+    try out.print("  Preset  {s}\n", .{render_preset.label()});
     try out.flush();
 
     var preload_modules: std.ArrayList([]const u8) = .empty;
@@ -652,6 +664,24 @@ fn run(init: std.process.Init) !bool {
         defer allocator.free(text);
         break :parse @min(std.fmt.parseInt(usize, text, 10) catch 0, 256);
     } else |_| 0;
+
+    // What the rendering preset actually selects. Both of these trade a
+    // little fidelity margin for throughput once the sampled cache is over
+    // budget: reuse hands an evicted image's backing straight to its
+    // replacement, and the retirement slack lets retired images drain behind
+    // the GPU instead of stopping it at every eviction. Under `graphics` the
+    // conservative synchronous paths stay in force. Either can still be set
+    // explicitly, which overrides the preset in both directions.
+    const speed_preset = render_preset.favorsSpeed();
+    vulkan.backend.sampled_backing_reuse = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_SAMPLED_BACKING_REUSE")) |text| parse: {
+        defer allocator.free(text);
+        break :parse text.len != 0 and !std.mem.eql(u8, text, "0");
+    } else |_| speed_preset;
+    const default_retirement_slack_mib: u64 = if (speed_preset) 256 else 0;
+    vulkan.backend.sampled_retirement_slack_bytes = (if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_SAMPLED_RETIREMENT_SLACK_MIB")) |text| parse: {
+        defer allocator.free(text);
+        break :parse @min(std.fmt.parseInt(u64, text, 10) catch default_retirement_slack_mib, 1024);
+    } else |_| default_retirement_slack_mib) * 1024 * 1024;
     if (builtin.os.tag == .windows and !force_headless) live_gpu: {
         host_window.init(output_mode.width(), output_mode.height()) catch |err| {
             try stderr.print("live Vulkan window unavailable: {s}; continuing headless\n", .{@errorName(err)});
