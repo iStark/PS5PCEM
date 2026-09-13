@@ -4339,7 +4339,7 @@ fn runFragmentFirstActiveLaneProbe(allocator: std.mem.Allocator, scan_mask: bool
     for ([_]f32{ 4, 4, -4, 4, 1, 0 }, 0..) |value, i|
         try state.writeRegister(.context, 0x10f + @as(u32, @intCast(i)), @bitCast(value));
     var executor = gpu.DcbExecutor{ .state = &state, .backend = renderer.dcbBackend(guest.interface()), .allocator = allocator };
-    for (0..@as(usize, if (scan_mask) 4 else 1)) |mode| for ([_]u9{ 129, 128, 129 }) |selected| {
+    for (0..@as(usize, if (scan_mask) 5 else 1)) |mode| for ([_]u9{ 129, 128, 129 }) |selected| {
         var fragment = std.ArrayList(u32).empty;
         defer fragment.deinit(allocator);
         try fragment.appendSlice(allocator, &.{
@@ -4356,7 +4356,16 @@ fn runFragmentFirstActiveLaneProbe(allocator: std.mem.Allocator, scan_mask: bool
                 // mask provenance, including a partial pair overwrite.
                 try fragment.append(allocator, sop1(3, 24, 144)); // low=16; high retains saved mask
             }
-            if (mode == 3) try fragment.append(allocator, sop1(3, 30, 128));
+            if (mode == 4) try fragment.appendSlice(allocator, &.{
+                0xd7610010, 24 | (135 << 9), // spill mask low in v16 lane7
+                0xd7610010, 25 | (136 << 9), // spill high in lane8
+                sop1(4, 24, 128), // discard the scalar copy
+                0xd7600018,
+                272 | (135 << 9),
+                0xd7600019,
+                272 | (136 << 9),
+            });
+            if (mode == 3 or mode == 4) try fragment.append(allocator, sop1(3, 30, 128));
             const loop_start = fragment.items.len;
             try fragment.append(allocator, sop1(0x14, 12, 24)); // FF1 s12, saved mask
             if (mode == 1 or mode == 2) {
@@ -4364,9 +4373,15 @@ fn runFragmentFirstActiveLaneProbe(allocator: std.mem.Allocator, scan_mask: bool
                 try fragment.append(allocator, 0xbf060000 | (expected_bit << 8) | 12);
                 try fragment.append(allocator, 0x850c8081); // s12 = (scan == expected) ? 1 : 0
             } else try fragment.appendSlice(allocator, &.{ 0xd760000c, 262 | (12 << 9) }); // READLANE s12, v6, s12
-            if (mode == 3) {
+            if (mode == 3 or mode == 4) {
+                if (mode == 4) try fragment.appendSlice(allocator, &.{
+                    0xd7610010, 126 | (135 << 9),
+                    0xd7610010, 127 | (136 << 9),
+                    0xd760001a, 272 | (135 << 9), // restore EXEC in s26:s27
+                    0xd760001b, 272 | (136 << 9),
+                });
                 try fragment.appendSlice(allocator, &.{
-                    0x87987e18, // saved &= EXEC on the back edge
+                    if (mode == 4) 0x87981a18 else 0x87987e18, // saved &= restored EXEC on the back edge
                     0x801e811e, // counter++
                     0xbf06821e, // counter == 2
                 });
@@ -4396,7 +4411,7 @@ fn runFragmentFirstActiveLaneProbe(allocator: std.mem.Allocator, scan_mask: bool
             }
         }
     };
-    std.debug.print("Fragment first active lane passed: alternating masks, saved-mask scans, empty masks, integer overwrites and loop back edges\n", .{});
+    std.debug.print("Fragment first active lane passed: alternating masks, saved-mask scans, empty masks, integer overwrites, lane spills and loop back edges\n", .{});
 }
 
 fn runFragmentPositionProbe(allocator: std.mem.Allocator) !void {
