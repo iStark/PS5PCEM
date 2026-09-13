@@ -297,7 +297,10 @@ pub fn init(gpa: std.mem.Allocator) void {
 pub fn attachAddressSpace(address_space: ?*memory.AddressSpace) void {
     pool_lock.lock();
     defer pool_lock.unlock();
-    guest_address_space = address_space;
+    // Published atomically so read-only accessibility queries can observe the
+    // attachment without joining the pool's contention. Attach and detach
+    // happen once each, around the guest's whole lifetime.
+    @atomicStore(?*memory.AddressSpace, &guest_address_space, address_space, .release);
 }
 
 /// Whether a guest buffer is safe for firmware to touch.
@@ -361,9 +364,14 @@ pub fn isGuestRangeAccessible(address: u64, length: u64) bool {
     if (address == 0) return false;
     _ = std.math.add(u64, address, length) catch return false;
 
-    pool_lock.lock();
-    defer pool_lock.unlock();
-    const address_space = guest_address_space orelse return true;
+    // The pool lock guards the pool's own bookkeeping, none of which is read
+    // here; AddressSpace carries the lock for the interval table this asks
+    // about. Holding both put every firmware call that validates a guest
+    // pointer behind every direct-memory operation, and a title reaches this
+    // from scePthreadMutexLock alone hundreds of thousands of times in ten
+    // seconds. Publishing the attachment atomically leaves that query
+    // serialised only against the table it actually reads.
+    const address_space = @atomicLoad(?*memory.AddressSpace, &guest_address_space, .acquire) orelse return true;
     // AddressSpace mappings include virtual reservations so firmware queries
     // can report them. They are not safe native pointers until pages are
     // committed with CPU access; treating a reserve as readable turns a bad
