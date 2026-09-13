@@ -2160,6 +2160,10 @@ const FrameProfile = struct {
     scalar_provenance_ns: u64 = 0,
     shader_translate_ns: u64 = 0,
     graphics_resource_ns: u64 = 0,
+    graphics_fragment_resource_ns: u64 = 0,
+    graphics_append_resource_ns: u64 = 0,
+    graphics_descriptor_ns: u64 = 0,
+    graphics_sampled_scan_ns: u64 = 0,
     graphics_storage_ns: u64 = 0,
     shader_metadata_candidates: u64 = 0,
     shader_metadata_scans_skipped: u64 = 0,
@@ -16012,6 +16016,8 @@ pub const Renderer = struct {
             extra_colors,
         );
         defer graphics_resources.deinit(self);
+        self.frame_profile.graphics_fragment_resource_ns +|= elapsedHostNanoseconds(resource_started);
+        const append_started = hostTimestampNs();
         const fragment_mapping_count = graphics_resources.mapping_count;
         const fragment_image_count = graphics_resources.image_count;
         try self.appendGraphicsResources(
@@ -16022,10 +16028,13 @@ pub const Renderer = struct {
             target,
             extra_colors,
         );
+        self.frame_profile.graphics_append_resource_ns +|= elapsedHostNanoseconds(append_started);
+        const descriptor_started = hostTimestampNs();
         self.updateSampledImageDescriptors(
             graphics_resources.images[0..graphics_resources.image_count],
             graphics_resources.mappings[0..graphics_resources.mapping_count],
         );
+        self.frame_profile.graphics_descriptor_ns +|= elapsedHostNanoseconds(descriptor_started);
         self.frame_profile.graphics_resource_ns +|= elapsedHostNanoseconds(resource_started);
         if (self.traceCurrentGraphicsFrame()) {
             for (graphics_resources.mappings[0..graphics_resources.mapping_count]) |mapping| {
@@ -18087,6 +18096,8 @@ pub const Renderer = struct {
         const scalar_checkpoint_registers = checkpoints.snapshots;
 
         var sampled_scalar = gpu.ScalarEvaluation{};
+        const sampled_scan_started = hostTimestampNs();
+        defer self.frame_profile.graphics_sampled_scan_ns +|= elapsedHostNanoseconds(sampled_scan_started);
         for (instructions) |inst| {
             const image_fetch = inst.opcode == .image_load or inst.opcode == .image_load_mip;
             if (!gpu.resource_checkpoints.needsCheckpoint(inst, .sampled)) continue;
@@ -23035,6 +23046,10 @@ pub const Renderer = struct {
             std.debug.print(
                 "[gpu compute scan] flip={d} buffers_ms={d} images_ms={d} dispatches={d}\n",
                 .{ self.flip_callbacks, profile.compute_buffer_scan_ns / std.time.ns_per_ms, profile.compute_image_scan_ns / std.time.ns_per_ms, profile.dispatches },
+            );
+            std.debug.print(
+                "[gpu graphics res] flip={d} fragment_ms={d} sampled_scan_ms={d} append_ms={d} descriptors_ms={d} total_ms={d}\n",
+                .{ self.flip_callbacks, profile.graphics_fragment_resource_ns / std.time.ns_per_ms, profile.graphics_sampled_scan_ns / std.time.ns_per_ms, profile.graphics_append_resource_ns / std.time.ns_per_ms, profile.graphics_descriptor_ns / std.time.ns_per_ms, profile.graphics_resource_ns / std.time.ns_per_ms },
             );
             if (profile.shader_metadata_candidates +| profile.shader_metadata_scans_skipped != 0) std.debug.print(
                 "[gpu shader reads] flip={d} metadata_candidates={d} scans_skipped={d}\n",
