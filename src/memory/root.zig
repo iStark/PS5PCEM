@@ -608,32 +608,26 @@ pub const AddressSpace = struct {
 
         self.invalidateGpuTrackingLocked(address, size);
 
-        var replacement: std.ArrayList(Mapping) = .empty;
-        errdefer replacement.deinit(self.allocator);
-        try replacement.ensureTotalCapacity(self.allocator, self.mappings.items.len + 1);
-        try appendTransformed(
-            self.allocator,
-            &replacement,
-            self.mappings.items,
-            address,
-            size,
-            .none,
-            0,
-            true,
-        );
-
-        const free_range = freeRangeInMappings(
+        // Rebuilding the table here cost the whole of it per call, and a batch
+        // unmap is hundreds of calls against tens of thousands of intervals.
+        // Reserve the one interval a middle split can add before touching host
+        // state; after that the edit itself cannot fail, so a failed host
+        // transaction still leaves the table describing what is really mapped.
+        const end = address + size;
+        const span = overlappingMappingSpan(self.mappings.items, address, end);
+        const free_range = freeRangeAroundSpan(
             self.reservations.items,
-            replacement.items,
+            self.mappings.items,
+            span,
             address,
-            size,
+            end,
         ) orelse return Error.HostDecommitFailed;
+        try self.mappings.ensureUnusedCapacity(self.allocator, 1);
 
         try self.hostUnmapLocked(address, size);
         try hostCoalescePlaceholder(free_range);
 
-        self.mappings.deinit(self.allocator);
-        self.mappings = replacement;
+        removeMappingSpanAssumeCapacity(&self.mappings, span, address, end);
     }
 
     pub fn isMapped(self: *AddressSpace, address: u64, size: u64) bool {
@@ -1695,6 +1689,101 @@ fn namedMapping(name: []const u8) [maximum_name_length]u8 {
 
 /// Returns the complete free interval around a requested range. The mapping
 /// slice may be the current table or a prospective table built for `unmap`.
+/// A contiguous half-open run of interval indices.
+const MappingSpan = struct { first: usize, last: usize };
+
+/// The intervals a range overlaps, as a half-open index span. The table is
+/// sorted and disjoint, so the span is contiguous.
+fn overlappingMappingSpan(mappings: []const Mapping, address: u64, end: u64) MappingSpan {
+    const first = firstOverlappingMapping(mappings, address);
+    var last = first;
+    while (last < mappings.len and mappings[last].address < end) last += 1;
+    return .{ .first = first, .last = last };
+}
+
+/// The host range freed by removing `address..end`, read from the neighbours
+/// the removal leaves behind rather than from a rebuilt table.
+///
+/// `freeRangeInMappings` answers the same question by walking every interval,
+/// which is what made an unmap cost the whole table. A sorted table already
+/// says who the neighbours are: everything before the span ends at or below
+/// `address`, everything after starts at or above `end`, and the enclosing
+/// reservation bounds both sides.
+fn freeRangeAroundSpan(
+    reservations: []const Range,
+    mappings: []const Mapping,
+    span: MappingSpan,
+    address: u64,
+    end: u64,
+) ?Range {
+    for (reservations) |reservation| {
+        if (!reservation.contains(address, end - address)) continue;
+        var free_start = reservation.start;
+        var free_end = reservation.end;
+        // A partially covered interval at either boundary keeps its remainder,
+        // so the hole starts and ends exactly where the request did.
+        if (span.first < span.last and mappings[span.first].address < address) {
+            free_start = address;
+        } else if (span.first > 0) {
+            free_start = @max(free_start, mappings[span.first - 1].end());
+        }
+        if (span.first < span.last and mappings[span.last - 1].end() > end) {
+            free_end = end;
+        } else if (span.last < mappings.len) {
+            free_end = @min(free_end, mappings[span.last].address);
+        }
+        if (free_start <= address and end <= free_end) {
+            return .{ .start = free_start, .end = free_end };
+        }
+    }
+    return null;
+}
+
+/// Removes `address..end` from the table, keeping the remainders of the
+/// intervals it partially covers. Capacity for one extra interval must be
+/// reserved by the caller: a range strictly inside one mapping splits it in
+/// two. Nothing here can fail, so the caller commits host state first.
+fn removeMappingSpanAssumeCapacity(
+    mappings: *std.ArrayList(Mapping),
+    span: MappingSpan,
+    address: u64,
+    end: u64,
+) void {
+    if (span.first == span.last) return;
+    var parts: [2]Mapping = undefined;
+    var count: usize = 0;
+    const head = mappings.items[span.first];
+    if (head.address < address) {
+        parts[count] = offsetMapping(head, head.address, address - head.address);
+        count += 1;
+    }
+    const tail = mappings.items[span.last - 1];
+    if (tail.end() > end) {
+        parts[count] = offsetMapping(tail, end, tail.end() - end);
+        count += 1;
+    }
+    const removed = span.last - span.first;
+    const items = mappings.items;
+    if (count > removed) {
+        // One interval split in two: make room by moving the tail out once.
+        std.debug.assert(count == 2 and removed == 1);
+        mappings.items.len += 1;
+        std.mem.copyBackwards(
+            Mapping,
+            mappings.items[span.last + 1 ..],
+            items[span.last..items.len],
+        );
+    } else if (count < removed) {
+        std.mem.copyForwards(
+            Mapping,
+            mappings.items[span.first + count ..],
+            items[span.last..items.len],
+        );
+        mappings.items.len -= removed - count;
+    }
+    for (parts[0..count], 0..) |part, offset| mappings.items[span.first + offset] = part;
+}
+
 /// Where `address` belongs in an address-ordered mapping list.
 fn insertionIndexIn(mappings: []const Mapping, address: u64) usize {
     var low: usize = 0;
@@ -2638,4 +2727,67 @@ test "host placeholder bounds match a full table scan around reserved runs" {
             try testing.expectEqualDeep(expected, space.hostFreeRangeIgnoringReservationsLocked(start, end - start));
         }
     }
+}
+
+test "span removal and its free range match rebuilding at every pair of boundaries" {
+    const base = system_managed.start;
+    const original = [_]Mapping{
+        .{ .address = base + 2 * page_size, .size = 4 * page_size, .kind = .direct_memory, .protection = .read_only, .backing_offset = 7 * page_size, .name = namedMapping("first") },
+        .{ .address = base + 6 * page_size, .size = 3 * page_size, .kind = .flexible, .protection = .read_write, .name = namedMapping("second") },
+        // A gap here: removal must not invent coverage across it.
+        .{ .address = base + 11 * page_size, .size = 5 * page_size, .kind = .direct_memory, .protection = .read_write, .backing_offset = 64 * page_size, .name = namedMapping("third") },
+    };
+    const reservations = [_]Range{.{ .start = base, .end = base + 20 * page_size }};
+    for (0..19) |start| {
+        for (start + 1..20) |end| {
+            const address = base + start * page_size;
+            const finish = base + end * page_size;
+
+            var expected: std.ArrayList(Mapping) = .empty;
+            defer expected.deinit(testing.allocator);
+            try appendTransformed(testing.allocator, &expected, &original, address, finish - address, .none, 0, true);
+
+            var actual: std.ArrayList(Mapping) = .empty;
+            defer actual.deinit(testing.allocator);
+            try actual.ensureTotalCapacity(testing.allocator, original.len + 1);
+            actual.appendSliceAssumeCapacity(&original);
+            const pointer = actual.items.ptr;
+            const span = overlappingMappingSpan(actual.items, address, finish);
+
+            // The free range has to agree with the walk it replaces, which
+            // reads the table the removal produces.
+            const reference = freeRangeInMappings(&reservations, expected.items, address, finish - address);
+            const computed = freeRangeAroundSpan(&reservations, actual.items, span, address, finish);
+            try testing.expectEqualDeep(reference, computed);
+
+            removeMappingSpanAssumeCapacity(&actual, span, address, finish);
+            try testing.expectEqualDeep(expected.items, actual.items);
+            // One reserved interval is enough for the worst case, so the table
+            // never reallocates and no unaffected interval is copied.
+            try testing.expectEqual(pointer, actual.items.ptr);
+        }
+    }
+}
+
+test "unmapping a range inside one mapping splits it without rebuilding the table" {
+    const base = system_managed.start;
+    var space = AddressSpace{ .allocator = testing.allocator };
+    defer space.mappings.deinit(testing.allocator);
+    try space.mappings.ensureTotalCapacity(testing.allocator, 4);
+    space.mappings.appendAssumeCapacity(.{
+        .address = base,
+        .size = 8 * page_size,
+        .kind = .flexible,
+        .protection = .read_write,
+        .name = namedMapping("whole"),
+    });
+    const span = overlappingMappingSpan(space.mappings.items, base + 3 * page_size, base + 5 * page_size);
+    try testing.expectEqual(@as(usize, 0), span.first);
+    try testing.expectEqual(@as(usize, 1), span.last);
+    removeMappingSpanAssumeCapacity(&space.mappings, span, base + 3 * page_size, base + 5 * page_size);
+    try testing.expectEqual(@as(usize, 2), space.mappings.items.len);
+    try testing.expectEqual(base, space.mappings.items[0].address);
+    try testing.expectEqual(3 * page_size, space.mappings.items[0].size);
+    try testing.expectEqual(base + 5 * page_size, space.mappings.items[1].address);
+    try testing.expectEqual(3 * page_size, space.mappings.items[1].size);
 }
