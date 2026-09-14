@@ -20546,11 +20546,31 @@ pub const Renderer = struct {
         // publish its deferred writeback before hashing or staging guest bytes,
         // otherwise the cache would bind stale contents.
         self.frame_profile.sampled_slow_paths +|= 1;
+        // Cross-check the address index against a plain scan. If the scan
+        // finds a target the index did not offer, the index is stale; if
+        // neither finds one, the producer really is not resident.
+        var linear_targets: u32 = 0;
+        for (self.render_targets.items) |cached| {
+            if (cached.initialized and cached.target.descriptor.address == descriptor.address) linear_targets += 1;
+        }
+        var linear_storage: u32 = 0;
+        for (self.storage_image_cache.items) |cached| {
+            if (!cached.valid or cached.descriptor.address != descriptor.address) continue;
+            linear_storage += 1;
+            // What the resident producers actually look like, so a rejected
+            // alias can be read against what the consumer asked for.
+            if (self.reported_resident_rejects < 24) std.debug.print(
+                "    storage candidate: {d}x{d}x{d} fmt={d} type={s} levels={d}..{d} dirty={any}\n",
+                .{ cached.descriptor.width, cached.descriptor.height, cached.descriptor.depth_or_layers,
+                   cached.descriptor.unified_format, @tagName(cached.descriptor.image_type),
+                   cached.descriptor.viewBaseLevel(), cached.descriptor.viewBaseLevel() + cached.descriptor.viewMipLevels() - 1, cached.gpu_dirty },
+            );
+        }
         if (self.reported_resident_rejects < 24) {
             self.reported_resident_rejects += 1;
-            std.debug.print("[vulkan dcb] sampled readback fallback: resident_reject={d} rt_reject={d} depth_reject={d} depth_cache={d} addr=0x{x} {d}x{d}x{d} fmt={d} type={s} tile={f} levels={d}..{d}\n", .{
-                self.last_resident_reject, self.last_rt_reject, self.last_depth_reject, @as(u32, @intCast(self.depth_targets.items.len)), descriptor.address, descriptor.width, descriptor.height, descriptor.depth_or_layers,
-                descriptor.unified_format, @tagName(descriptor.image_type), descriptor.tile_mode, descriptor.base_level, descriptor.last_level,
+            std.debug.print("[vulkan dcb] sampled readback fallback: resident_reject={d} rt_reject={d} scan_rt={d} scan_simg={d} dcc={any} depth_reject={d} depth_cache={d} addr=0x{x} {d}x{d}x{d} fmt={d} type={s} tile={f} levels={d}..{d} want_levels={d}\n", .{
+                self.last_resident_reject, self.last_rt_reject, linear_targets, linear_storage, descriptor.dcc_enabled, self.last_depth_reject, @as(u32, @intCast(self.depth_targets.items.len)), descriptor.address, descriptor.width, descriptor.height, descriptor.depth_or_layers,
+                descriptor.unified_format, @tagName(descriptor.image_type), descriptor.tile_mode, descriptor.base_level, descriptor.last_level, descriptor.viewMipLevels(),
             });
         }
         const flush_started = hostTimestampNs();
