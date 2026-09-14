@@ -2139,6 +2139,10 @@ const FrameProfile = struct {
     compute_resource_ns: u64 = 0,
     compute_buffer_scan_ns: u64 = 0,
     compute_image_scan_ns: u64 = 0,
+    compute_instructions_walked: u64 = 0,
+    compute_images_resolved: u64 = 0,
+    compute_image_resolve_ns: u64 = 0,
+    compute_image_stage_ns: u64 = 0,
     checkpoint_prepare_ns: u64 = 0,
     checkpoint_preparations: u64 = 0,
     checkpoint_plan_misses: u64 = 0,
@@ -9324,7 +9328,30 @@ pub const Renderer = struct {
         self.frame_profile.compute_buffer_scan_ns +|= elapsedHostNanoseconds(buffer_scan_started);
         const image_scan_started = hostTimestampNs();
         defer self.frame_profile.compute_image_scan_ns +|= elapsedHostNanoseconds(image_scan_started);
-        for (instructions) |inst| {
+        // Which instructions carry a storage image follows from the
+        // decoded program alone, so the checkpoint plan already knows,
+        // and it is keyed on this exact instruction allocation. Walking
+        // every instruction to find them cost far more than resolving
+        // them: on Yotei a frame walked 224500 instructions to reach 483
+        // images, and the resolutions themselves did not reach a
+        // millisecond. An analysis carrying its own pruned instructions
+        // does not match the plan and still walks.
+        const storage_image_indices = if (analysis.resource_checkpoints) |*plan|
+            plan.storageImageIndices(instructions)
+        else
+            null;
+        self.frame_profile.compute_instructions_walked +|= if (storage_image_indices) |list| list.len else instructions.len;
+        var image_cursor: usize = 0;
+        while (true) {
+            const inst = if (storage_image_indices) |list| next: {
+                if (image_cursor == list.len) break;
+                defer image_cursor += 1;
+                break :next instructions[list[image_cursor]];
+            } else next: {
+                if (image_cursor == instructions.len) break;
+                defer image_cursor += 1;
+                break :next instructions[image_cursor];
+            };
             const writable = switch (inst.opcode) {
                 .image_load => false,
                 .image_store,
@@ -9367,6 +9394,8 @@ pub const Renderer = struct {
                 scalar_checkpoint_registers,
                 inst.pc,
             ).*;
+            self.frame_profile.compute_images_resolved +|= 1;
+            const resolve_started = hostTimestampNs();
             var descriptor = (try resolveComputeImageDescriptor(
                 bindings,
                 reader,
@@ -9398,6 +9427,7 @@ pub const Renderer = struct {
             // its T# exposes the complete mip chain. Vulkan storage views are
             // single-level, so bind that exact level instead of rejecting a
             // valid multi-mip resource descriptor.
+            self.frame_profile.compute_image_resolve_ns +|= elapsedHostNanoseconds(resolve_started);
             if (inst.opcode != .image_store_mip and descriptor.viewMipLevels() > 1) {
                 descriptor.last_level = descriptor.viewBaseLevel();
             }
@@ -9453,6 +9483,8 @@ pub const Renderer = struct {
                     return Error.StorageImageCapacityExceeded;
                 }
                 const index: u32 = @intCast(result.storage_image_count);
+                const stage_started = hostTimestampNs();
+                defer self.frame_profile.compute_image_stage_ns +|= elapsedHostNanoseconds(stage_started);
                 result.storage_images[result.storage_image_count] = self.stageStorageImage(
                     descriptor,
                     index,
@@ -23044,8 +23076,8 @@ pub const Renderer = struct {
                 .{ self.flip_callbacks, profile.content_reused_bytes / 1024, profile.buffer_fingerprint_ns / std.time.ns_per_ms },
             );
             std.debug.print(
-                "[gpu compute scan] flip={d} buffers_ms={d} images_ms={d} dispatches={d}\n",
-                .{ self.flip_callbacks, profile.compute_buffer_scan_ns / std.time.ns_per_ms, profile.compute_image_scan_ns / std.time.ns_per_ms, profile.dispatches },
+                "[gpu compute scan] flip={d} buffers_ms={d} images_ms={d} resolve_ms={d} stage_ms={d} dispatches={d} walked={d} images={d}\n",
+                .{ self.flip_callbacks, profile.compute_buffer_scan_ns / std.time.ns_per_ms, profile.compute_image_scan_ns / std.time.ns_per_ms, profile.compute_image_resolve_ns / std.time.ns_per_ms, profile.compute_image_stage_ns / std.time.ns_per_ms, profile.dispatches, profile.compute_instructions_walked, profile.compute_images_resolved },
             );
             std.debug.print(
                 "[gpu graphics res] flip={d} fragment_ms={d} sampled_scan_ms={d} append_ms={d} descriptors_ms={d} total_ms={d}\n",

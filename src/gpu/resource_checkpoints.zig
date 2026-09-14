@@ -15,17 +15,36 @@ pub const Plan = struct {
     instructions: []const rdna2.Instruction,
     resource: []const u32,
     sampled: []const u32,
+    /// Indices, not program counters: the storage-image pass needs the
+    /// instruction itself, and these never reach the checkpoint evaluator.
+    storage_images: []const u32,
 
     pub fn init(allocator: std.mem.Allocator, instructions: []const rdna2.Instruction) !Plan {
         const resource = try collect(allocator, instructions, .resource);
         errdefer allocator.free(resource);
-        return .{ .instructions = instructions, .resource = resource, .sampled = try collect(allocator, instructions, .sampled) };
+        const sampled = try collect(allocator, instructions, .sampled);
+        errdefer allocator.free(sampled);
+        return .{
+            .instructions = instructions,
+            .resource = resource,
+            .sampled = sampled,
+            .storage_images = try collectStorageImages(allocator, instructions),
+        };
     }
 
     pub fn deinit(self: *Plan, allocator: std.mem.Allocator) void {
         allocator.free(self.resource);
         allocator.free(self.sampled);
+        allocator.free(self.storage_images);
         self.* = undefined;
+    }
+
+    /// The storage-image instructions, in program order, when this plan was
+    /// built for exactly `instructions`. Null asks the caller to walk them
+    /// itself, which a branch-pruned analysis carrying its own instruction
+    /// allocation must do.
+    pub fn storageImageIndices(self: *const Plan, instructions: []const rdna2.Instruction) ?[]const u32 {
+        return if (self.matches(instructions)) self.storage_images else null;
     }
 
     pub fn matches(self: *const Plan, instructions: []const rdna2.Instruction) bool {
@@ -50,6 +69,39 @@ fn collect(allocator: std.mem.Allocator, instructions: []const rdna2.Instruction
     for (instructions) |inst| {
         if (!needsCheckpoint(inst, kind)) continue;
         result[index] = inst.pc;
+        index += 1;
+    }
+    return result;
+}
+
+/// Whether the storage-image pass looks at this instruction. It reads images
+/// through a T# in an SGPR and writes them, or reads one it may have to bind
+/// as storage because no sampled binding claimed it.
+pub fn isStorageImage(inst: rdna2.Instruction) bool {
+    return switch (inst.opcode) {
+        .image_load,
+        .image_store,
+        .image_store_mip,
+        .image_atomic_add,
+        .image_atomic_umin,
+        .image_atomic_umax,
+        .image_atomic_and,
+        .image_atomic_or,
+        .image_atomic_xor,
+        .image_atomic_fmax,
+        => true,
+        else => false,
+    };
+}
+
+fn collectStorageImages(allocator: std.mem.Allocator, instructions: []const rdna2.Instruction) ![]const u32 {
+    var count: usize = 0;
+    for (instructions) |inst| count += @intFromBool(isStorageImage(inst));
+    const result = try allocator.alloc(u32, count);
+    var index: usize = 0;
+    for (instructions, 0..) |inst, position| {
+        if (!isStorageImage(inst)) continue;
+        result[index] = @intCast(position);
         index += 1;
     }
     return result;
@@ -369,4 +421,42 @@ fn checkAllocationFailures(allocator: std.mem.Allocator) !void {
 
 test "checkpoint plan and scratch allocation failures release partial ownership" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, checkAllocationFailures, .{});
+}
+
+test "the storage-image list names exactly what a full walk would visit" {
+    const allocator = std.testing.allocator;
+    const opcodes = [_]rdna2.Opcode{
+        .s_load_dwordx4, .image_load,      .v_mov_b32,        .image_store,
+        .image_sample,   .image_store_mip, .s_nop,            .image_atomic_add,
+        .buffer_load_dword, .image_gather4, .image_atomic_fmax, .s_endpgm,
+    };
+    var instructions: [opcodes.len]rdna2.Instruction = undefined;
+    for (opcodes, 0..) |opcode, index| {
+        instructions[index] = .{ .opcode = opcode, .pc = @intCast(index * 4) };
+    }
+    var plan = try Plan.init(allocator, &instructions);
+    defer plan.deinit(allocator);
+
+    var expected: std.ArrayList(u32) = .empty;
+    defer expected.deinit(allocator);
+    for (instructions, 0..) |inst, index| {
+        if (isStorageImage(inst)) try expected.append(allocator, @intCast(index));
+    }
+    const listed = plan.storageImageIndices(&instructions).?;
+    try std.testing.expectEqualSlices(u32, expected.items, listed);
+    // Program order is what the pass depends on: slots are handed out as the
+    // instructions are met.
+    for (listed[1..], listed[0 .. listed.len - 1]) |after, before| {
+        try std.testing.expect(before < after);
+    }
+    // A sampled-only fetch is not a storage image, and neither is a buffer
+    // load that the resource list does claim.
+    try std.testing.expect(!isStorageImage(instructions[4]));
+    try std.testing.expect(!isStorageImage(instructions[8]));
+    try std.testing.expect(std.mem.indexOfScalar(u32, listed, 4) == null);
+
+    // Another instruction allocation with the same contents is a different
+    // program as far as the plan is concerned, so it refuses to answer.
+    var copy = instructions;
+    try std.testing.expectEqual(@as(?[]const u32, null), plan.storageImageIndices(&copy));
 }
