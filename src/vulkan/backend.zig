@@ -2143,6 +2143,13 @@ const FrameProfile = struct {
     compute_images_resolved: u64 = 0,
     compute_image_resolve_ns: u64 = 0,
     compute_image_stage_ns: u64 = 0,
+    compute_buffer_stage_ns: u64 = 0,
+    compute_pointer_memory_ns: u64 = 0,
+    compute_sampled_probe_ns: u64 = 0,
+    compute_sampled_probe_steps: u64 = 0,
+    compute_image_dedup_ns: u64 = 0,
+    compute_image_dedup_steps: u64 = 0,
+    compute_tail_ns: u64 = 0,
     checkpoint_prepare_ns: u64 = 0,
     checkpoint_preparations: u64 = 0,
     checkpoint_plan_misses: u64 = 0,
@@ -9248,6 +9255,8 @@ pub const Renderer = struct {
                     if (log_verbose_gpu) std.debug.print("[vulkan dcb] no free storage slot for V# s{d}; soft-skip\n", .{resource_sgpr});
                     continue;
                 };
+                const buffer_stage_started = hostTimestampNs();
+                defer self.frame_profile.compute_buffer_stage_ns +|= elapsedHostNanoseconds(buffer_stage_started);
                 _ = self.stageGuestStorageBufferAt(free, descriptor.address, size) catch |err| {
                     self.traceSkippedStorage(bindings, inst, @errorName(err), descriptor);
                     if (log_verbose_gpu) std.debug.print(
@@ -9323,11 +9332,13 @@ pub const Renderer = struct {
             if (is_store) result.writable[descriptor_index] = true;
         }
 
+        const pointer_memory_started = hostTimestampNs();
         try self.prepareScalarPointerMemory(result, bindings, reader, analysis, scalar_checkpoint_pcs, scalar_checkpoint_registers, result.scalar_registers[recovered_pointer_begin..result.scalar_count]);
+        self.frame_profile.compute_pointer_memory_ns +|= elapsedHostNanoseconds(pointer_memory_started);
 
         self.frame_profile.compute_buffer_scan_ns +|= elapsedHostNanoseconds(buffer_scan_started);
         const image_scan_started = hostTimestampNs();
-        defer self.frame_profile.compute_image_scan_ns +|= elapsedHostNanoseconds(image_scan_started);
+
         // Which instructions carry a storage image follows from the
         // decoded program alone, so the checkpoint plan already knows,
         // and it is keyed on this exact instruction allocation. Walking
@@ -9367,6 +9378,8 @@ pub const Renderer = struct {
                 else => continue,
             };
             if (!writable) {
+                const sampled_probe_started = hostTimestampNs();
+                self.frame_profile.compute_sampled_probe_steps +|= sampled_mappings.len;
                 var sampled = false;
                 for (sampled_mappings) |mapping| {
                     sampled = sampled or (mapping.instruction_pc == inst.pc and mapping.resource_sgpr == inst.src1.reg and mapping.sampler_sgpr == inst.src2.reg);
@@ -9374,6 +9387,7 @@ pub const Renderer = struct {
                 // Translation gives an exact sampled fetch precedence over a
                 // storage binding. Preparing both can reject a legal attachment
                 // snapshot and transitions an image the shader never uses.
+                self.frame_profile.compute_sampled_probe_ns +|= elapsedHostNanoseconds(sampled_probe_started);
                 if (sampled) continue;
             }
             if (inst.src1.kind != .sgpr) {
@@ -9457,6 +9471,9 @@ pub const Renderer = struct {
                 return Error.UnsupportedStorageImage;
             };
             var descriptor_index: ?u32 = null;
+            const dedup_started = hostTimestampNs();
+            self.frame_profile.compute_image_dedup_steps +|= result.storage_image_count;
+            defer self.frame_profile.compute_image_dedup_ns +|= elapsedHostNanoseconds(dedup_started);
             for (result.storage_images[0..result.storage_image_count], 0..) |*existing, index| {
                 if (existing.descriptor.address == descriptor.address and
                     existing.descriptor.width == descriptor.width and
@@ -9560,6 +9577,10 @@ pub const Renderer = struct {
             };
             result.storage_image_mapping_count += 1;
         }
+
+        self.frame_profile.compute_image_scan_ns +|= elapsedHostNanoseconds(image_scan_started);
+        const tail_started = hostTimestampNs();
+        defer self.frame_profile.compute_tail_ns +|= elapsedHostNanoseconds(tail_started);
 
         // Graphics already owns a combined VS/PS sampled-image table. Do not
         // overwrite its slots with this compute-only, per-stage table while
@@ -23076,8 +23097,8 @@ pub const Renderer = struct {
                 .{ self.flip_callbacks, profile.content_reused_bytes / 1024, profile.buffer_fingerprint_ns / std.time.ns_per_ms },
             );
             std.debug.print(
-                "[gpu compute scan] flip={d} buffers_ms={d} images_ms={d} resolve_ms={d} stage_ms={d} dispatches={d} walked={d} images={d}\n",
-                .{ self.flip_callbacks, profile.compute_buffer_scan_ns / std.time.ns_per_ms, profile.compute_image_scan_ns / std.time.ns_per_ms, profile.compute_image_resolve_ns / std.time.ns_per_ms, profile.compute_image_stage_ns / std.time.ns_per_ms, profile.dispatches, profile.compute_instructions_walked, profile.compute_images_resolved },
+                "[gpu compute scan] flip={d} buffers_ms={d}(stage={d},ptr={d}) images_ms={d} resolve_ms={d} stage_ms={d} probe={d}ms/{d} dedup={d}ms/{d} tail_ms={d} dispatches={d} walked={d} images={d}\n",
+                .{ self.flip_callbacks, profile.compute_buffer_scan_ns / std.time.ns_per_ms, profile.compute_buffer_stage_ns / std.time.ns_per_ms, profile.compute_pointer_memory_ns / std.time.ns_per_ms, profile.compute_image_scan_ns / std.time.ns_per_ms, profile.compute_image_resolve_ns / std.time.ns_per_ms, profile.compute_image_stage_ns / std.time.ns_per_ms, profile.compute_sampled_probe_ns / std.time.ns_per_ms, profile.compute_sampled_probe_steps, profile.compute_image_dedup_ns / std.time.ns_per_ms, profile.compute_image_dedup_steps, profile.compute_tail_ns / std.time.ns_per_ms, profile.dispatches, profile.compute_instructions_walked, profile.compute_images_resolved },
             );
             std.debug.print(
                 "[gpu graphics res] flip={d} fragment_ms={d} sampled_scan_ms={d} append_ms={d} descriptors_ms={d} total_ms={d}\n",
