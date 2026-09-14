@@ -54,6 +54,10 @@ pub export var assemble_resident_mip_chains: bool = false;
 // Say what the levels looked like even when assembly stays off: the survey is
 // the whole point of the first run.
 pub export var survey_resident_mip_chains: bool = false;
+// Ten render target readbacks a frame are the largest single item left in
+// the frame. Naming them is the only way to tell an unavoidable one from a
+// surface the sampler could have read in place.
+pub export var trace_materialized_targets: bool = false;
 const sampled_lookup_plan = @import("sampled_lookup_plan.zig");
 
 /// Set to true to enable verbose per-frame GPU debug logging.
@@ -2219,6 +2223,10 @@ const FrameProfile = struct {
     flush_storage_image_ns: u64 = 0,
     flush_storage_ns: u64 = 0,
     flush_target_ns: u64 = 0,
+    flush_htile_ns: u64 = 0,
+    materialize_target_calls: u64 = 0,
+    materialize_target_hits: u64 = 0,
+    target_readbacks: u64 = 0,
     checkpoint_prepare_ns: u64 = 0,
     checkpoint_preparations: u64 = 0,
     checkpoint_plan_misses: u64 = 0,
@@ -3797,6 +3805,8 @@ pub const Renderer = struct {
     assembled_mip_chains: std.ArrayList(AssembledMipChain) = .empty,
     reported_mip_assemblies: u32 = 0,
     reported_mip_surveys: u32 = 0,
+    reported_materializations: u32 = 0,
+    last_flush_caller: usize = 0,
     depth_target_count: u32 = 0,
     reported_resident_rejects: u32 = 0,
     frame_profile: FrameProfile = .{},
@@ -13063,6 +13073,10 @@ pub const Renderer = struct {
             try self.transitionRenderTargetToColorAttachment(index);
             return;
         }
+        // Past the generation check is the only place a readback is real. The
+        // call counter above cannot tell one from a layout transition, and the
+        // difference is the whole question.
+        self.frame_profile.target_readbacks +|= 1;
         const frame_bytes = try colorTargetFrameBytes(snapshot.target);
 
         const command_buffer = try self.beginOneShot();
@@ -13183,9 +13197,17 @@ pub const Renderer = struct {
     }
 
     fn materializeRenderTargetAt(self: *Renderer, address: u64) anyerror!bool {
+        self.frame_profile.materialize_target_calls +|= 1;
         var selected: ?usize = null;
         var selected_sequence: u64 = 0;
-        for (self.render_targets.items, 0..) |cached, index| {
+        // Every guest read of an address runs through here, so the walk has to
+        // be over candidates rather than the whole table. The index this array
+        // already maintains answers exactly this question; four other lookups
+        // use it and this one was still scanning all 128 entries to find
+        // nothing.
+        var candidates = self.render_target_address_index.candidatesBy(self.render_targets.items, address, CachedRenderTarget.address);
+        while (candidates.next()) |index| {
+            const cached = self.render_targets.items[index];
             if (!cached.initialized or cached.target.descriptor.address != address) continue;
             if (selected == null or cached.last_used_sequence > selected_sequence) {
                 selected = index;
@@ -13193,6 +13215,18 @@ pub const Renderer = struct {
             }
         }
         const index = selected orelse return false;
+        self.frame_profile.materialize_target_hits +|= 1;
+        // Ten of these a frame move ninety megabytes off the device. Name them:
+        // whether that readback is avoidable depends on which surface it is and
+        // how often the same one comes back.
+        if (@atomicLoad(bool, &trace_materialized_targets, .monotonic) and self.reported_materializations < 24) {
+            self.reported_materializations += 1;
+            const target = self.render_targets.items[index].target;
+            std.debug.print(
+                "[gpu materialize] flip={d} @0x{x} {d}x{d} fmt={d} caller=0x{x}\n",
+                .{ self.flip_callbacks, address, target.descriptor.width, target.descriptor.height, target.descriptor.format, self.last_flush_caller },
+            );
+        }
         try self.materializeRenderTarget(index);
         return true;
     }
@@ -14516,6 +14550,10 @@ pub const Renderer = struct {
     /// Publishes only the deferred writeback for one guest address, used
     /// before guest memory at that address is staged or read.
     fn flushPendingGuestWrite(self: *Renderer, address: u64, visible_bytes: usize) anyerror!void {
+        // Twenty call sites reach here and seven of them a frame pull ninety
+        // megabytes off the device. Record who asked rather than tagging every
+        // caller by hand; the address maps back through the PDB.
+        self.last_flush_caller = @returnAddress();
         var step = hostTimestampNs();
         try self.flushAliasedImageWrites(address, visible_bytes);
         self.frame_profile.flush_alias_ns +|= elapsedHostNanoseconds(step);
@@ -14527,8 +14565,12 @@ pub const Renderer = struct {
         self.frame_profile.flush_storage_ns +|= elapsedHostNanoseconds(step);
         step = hostTimestampNs();
         _ = try self.materializeRenderTargetAt(address);
-        _ = try self.materializeHtileTargetAt(address, visible_bytes);
+        // Split these two: they were one number, and an index that should have
+        // cut it moved nothing, which only says the cost is in the other half.
         self.frame_profile.flush_target_ns +|= elapsedHostNanoseconds(step);
+        step = hostTimestampNs();
+        _ = try self.materializeHtileTargetAt(address, visible_bytes);
+        self.frame_profile.flush_htile_ns +|= elapsedHostNanoseconds(step);
         for (self.completed_frames.items) |*cached| {
             if (!cached.needs_writeback or cached.guest_address != address) continue;
             const target = cached.target orelse continue;
@@ -23605,8 +23647,8 @@ pub const Renderer = struct {
                 .{ self.flip_callbacks,  profile.compute_buffer_scan_ns / std.time.ns_per_ms, profile.compute_buffer_stage_ns / std.time.ns_per_ms, profile.compute_pointer_memory_ns / std.time.ns_per_ms, profile.compute_image_scan_ns / std.time.ns_per_ms, profile.compute_image_resolve_ns / std.time.ns_per_ms, profile.compute_image_stage_ns / std.time.ns_per_ms, profile.compute_sampled_probe_ns / std.time.ns_per_ms, profile.compute_sampled_probe_steps, profile.compute_image_dedup_ns / std.time.ns_per_ms, profile.compute_image_dedup_steps, profile.compute_tail_ns / std.time.ns_per_ms, profile.compute_sampled_loop_ns / std.time.ns_per_ms, profile.compute_sampled_stage_ns / std.time.ns_per_ms, profile.compute_sampled_stages, profile.compute_descriptor_update_ns / std.time.ns_per_ms, profile.compute_flat_memory_ns / std.time.ns_per_ms, profile.compute_buffer_lookup_ns / std.time.ns_per_ms, profile.compute_sampled_lookup_ns / std.time.ns_per_ms, profile.dispatches, profile.compute_instructions_walked, profile.compute_images_resolved, profile.staged_buffers.distinct, profile.staged_buffers.total, profile.staged_images.distinct, profile.staged_images.total },
             );
             std.debug.print(
-                "[gpu sampled inner] flip={d} gen={d}ms/{d} prefix={d}ms resident={d}ms probe={d}ms/{d} page={d}ms/{d} paths(exact/view/slow)={d}/{d}/{d} flush(alias/simg/buf/tgt)={d}/{d}/{d}/{d}ms\n",
-                .{ self.flip_callbacks, profile.sampled_generation_scan_ns / std.time.ns_per_ms, profile.sampled_generation_calls, profile.sampled_prefix_ns / std.time.ns_per_ms, profile.sampled_resident_ns / std.time.ns_per_ms, profile.sampled_probe2_ns / std.time.ns_per_ms, profile.sampled_probe2_calls, profile.sampled_page_ns / std.time.ns_per_ms, profile.sampled_page_calls, profile.sampled_exact_hits, profile.sampled_view_hits, profile.sampled_slow_paths, profile.flush_alias_ns / std.time.ns_per_ms, profile.flush_storage_image_ns / std.time.ns_per_ms, profile.flush_storage_ns / std.time.ns_per_ms, profile.flush_target_ns / std.time.ns_per_ms },
+                "[gpu sampled inner] flip={d} gen={d}ms/{d} prefix={d}ms resident={d}ms probe={d}ms/{d} page={d}ms/{d} paths(exact/view/slow)={d}/{d}/{d} flush(alias/simg/buf/tgt/htile)={d}/{d}/{d}/{d}/{d}ms materialize={d}/{d} readbacks={d}/{d}KiB\n",
+                .{ self.flip_callbacks, profile.sampled_generation_scan_ns / std.time.ns_per_ms, profile.sampled_generation_calls, profile.sampled_prefix_ns / std.time.ns_per_ms, profile.sampled_resident_ns / std.time.ns_per_ms, profile.sampled_probe2_ns / std.time.ns_per_ms, profile.sampled_probe2_calls, profile.sampled_page_ns / std.time.ns_per_ms, profile.sampled_page_calls, profile.sampled_exact_hits, profile.sampled_view_hits, profile.sampled_slow_paths, profile.flush_alias_ns / std.time.ns_per_ms, profile.flush_storage_image_ns / std.time.ns_per_ms, profile.flush_storage_ns / std.time.ns_per_ms, profile.flush_target_ns / std.time.ns_per_ms, profile.flush_htile_ns / std.time.ns_per_ms, profile.materialize_target_hits, profile.materialize_target_calls, profile.target_readbacks, profile.target_readback_bytes / 1024 },
             );
             std.debug.print(
                 "[gpu graphics res] flip={d} fragment_ms={d} sampled_scan_ms={d} append_ms={d} descriptors_ms={d} total_ms={d}\n",

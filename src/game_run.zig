@@ -685,6 +685,10 @@ fn run(init: std.process.Init) !bool {
         defer allocator.free(text);
         break :parse text.len != 0 and !std.mem.eql(u8, text, "0");
     } else |_| false;
+    vulkan.backend.trace_materialized_targets = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_TRACE_MATERIALIZE")) |text| parse: {
+        defer allocator.free(text);
+        break :parse text.len != 0 and !std.mem.eql(u8, text, "0");
+    } else |_| false;
     vulkan.backend.assemble_resident_mip_chains = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_ASSEMBLE_MIPS")) |text| parse: {
         defer allocator.free(text);
         break :parse text.len != 0 and !std.mem.eql(u8, text, "0");
