@@ -2200,6 +2200,13 @@ const FrameProfile = struct {
     sampled_probe2_calls: u64 = 0,
     sampled_page_ns: u64 = 0,
     sampled_page_calls: u64 = 0,
+    sampled_exact_hits: u64 = 0,
+    sampled_view_hits: u64 = 0,
+    sampled_slow_paths: u64 = 0,
+    flush_alias_ns: u64 = 0,
+    flush_storage_image_ns: u64 = 0,
+    flush_storage_ns: u64 = 0,
+    flush_target_ns: u64 = 0,
     checkpoint_prepare_ns: u64 = 0,
     checkpoint_preparations: u64 = 0,
     checkpoint_plan_misses: u64 = 0,
@@ -14437,11 +14444,19 @@ pub const Renderer = struct {
     /// Publishes only the deferred writeback for one guest address, used
     /// before guest memory at that address is staged or read.
     fn flushPendingGuestWrite(self: *Renderer, address: u64, visible_bytes: usize) anyerror!void {
+        var step = hostTimestampNs();
         try self.flushAliasedImageWrites(address, visible_bytes);
+        self.frame_profile.flush_alias_ns +|= elapsedHostNanoseconds(step);
+        step = hostTimestampNs();
         try self.flushGuestStorageImageRange(address, visible_bytes);
+        self.frame_profile.flush_storage_image_ns +|= elapsedHostNanoseconds(step);
+        step = hostTimestampNs();
         try self.flushGuestStorageRange(address, visible_bytes);
+        self.frame_profile.flush_storage_ns +|= elapsedHostNanoseconds(step);
+        step = hostTimestampNs();
         _ = try self.materializeRenderTargetAt(address);
         _ = try self.materializeHtileTargetAt(address, visible_bytes);
+        self.frame_profile.flush_target_ns +|= elapsedHostNanoseconds(step);
         for (self.completed_frames.items) |*cached| {
             if (!cached.needs_writeback or cached.guest_address != address) continue;
             const target = cached.target orelse continue;
@@ -20433,6 +20448,7 @@ pub const Renderer = struct {
             }
             item.last_used_frame = self.frame_sequence;
             item.last_used_batch = self.sampled_image_batch;
+            self.frame_profile.sampled_exact_hits +|= 1;
             self.texture_cache_hits += 1;
             self.frame_profile.texture_hits +|= 1;
             return .{ .image = item.image, .view = item.view, .sampler = item.sampler };
@@ -20461,6 +20477,7 @@ pub const Renderer = struct {
             }
             item.last_used_frame = self.frame_sequence;
             item.last_used_batch = self.sampled_image_batch;
+            self.frame_profile.sampled_view_hits +|= 1;
             self.texture_cache_hits += 1;
             self.frame_profile.texture_hits +|= 1;
             return .{
@@ -20486,6 +20503,7 @@ pub const Renderer = struct {
         // A rendered target sampled as a texture must see the rendered frame:
         // publish its deferred writeback before hashing or staging guest bytes,
         // otherwise the cache would bind stale contents.
+        self.frame_profile.sampled_slow_paths +|= 1;
         const flush_started = hostTimestampNs();
         if (fixed_clear == null) self.flushPendingGuestWrite(descriptor.address, probe_span) catch |err| {
             if (log_verbose_gpu) std.debug.print(
@@ -23184,8 +23202,8 @@ pub const Renderer = struct {
                 .{ self.flip_callbacks,  profile.compute_buffer_scan_ns / std.time.ns_per_ms, profile.compute_buffer_stage_ns / std.time.ns_per_ms, profile.compute_pointer_memory_ns / std.time.ns_per_ms, profile.compute_image_scan_ns / std.time.ns_per_ms, profile.compute_image_resolve_ns / std.time.ns_per_ms, profile.compute_image_stage_ns / std.time.ns_per_ms, profile.compute_sampled_probe_ns / std.time.ns_per_ms, profile.compute_sampled_probe_steps, profile.compute_image_dedup_ns / std.time.ns_per_ms, profile.compute_image_dedup_steps, profile.compute_tail_ns / std.time.ns_per_ms, profile.compute_sampled_loop_ns / std.time.ns_per_ms, profile.compute_sampled_stage_ns / std.time.ns_per_ms, profile.compute_sampled_stages, profile.compute_descriptor_update_ns / std.time.ns_per_ms, profile.compute_flat_memory_ns / std.time.ns_per_ms, profile.compute_buffer_lookup_ns / std.time.ns_per_ms, profile.compute_sampled_lookup_ns / std.time.ns_per_ms, profile.dispatches, profile.compute_instructions_walked, profile.compute_images_resolved, profile.staged_buffers.distinct, profile.staged_buffers.total, profile.staged_images.distinct, profile.staged_images.total },
             );
             std.debug.print(
-                "[gpu sampled inner] flip={d} gen={d}ms/{d} prefix={d}ms resident={d}ms probe={d}ms/{d} page={d}ms/{d}\n",
-                .{ self.flip_callbacks, profile.sampled_generation_scan_ns / std.time.ns_per_ms, profile.sampled_generation_calls, profile.sampled_prefix_ns / std.time.ns_per_ms, profile.sampled_resident_ns / std.time.ns_per_ms, profile.sampled_probe2_ns / std.time.ns_per_ms, profile.sampled_probe2_calls, profile.sampled_page_ns / std.time.ns_per_ms, profile.sampled_page_calls },
+                "[gpu sampled inner] flip={d} gen={d}ms/{d} prefix={d}ms resident={d}ms probe={d}ms/{d} page={d}ms/{d} paths(exact/view/slow)={d}/{d}/{d} flush(alias/simg/buf/tgt)={d}/{d}/{d}/{d}ms\n",
+                .{ self.flip_callbacks, profile.sampled_generation_scan_ns / std.time.ns_per_ms, profile.sampled_generation_calls, profile.sampled_prefix_ns / std.time.ns_per_ms, profile.sampled_resident_ns / std.time.ns_per_ms, profile.sampled_probe2_ns / std.time.ns_per_ms, profile.sampled_probe2_calls, profile.sampled_page_ns / std.time.ns_per_ms, profile.sampled_page_calls, profile.sampled_exact_hits, profile.sampled_view_hits, profile.sampled_slow_paths, profile.flush_alias_ns / std.time.ns_per_ms, profile.flush_storage_image_ns / std.time.ns_per_ms, profile.flush_storage_ns / std.time.ns_per_ms, profile.flush_target_ns / std.time.ns_per_ms },
             );
             std.debug.print(
                 "[gpu graphics res] flip={d} fragment_ms={d} sampled_scan_ms={d} append_ms={d} descriptors_ms={d} total_ms={d}\n",
