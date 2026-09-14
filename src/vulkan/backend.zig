@@ -3940,6 +3940,13 @@ pub const Renderer = struct {
 
         const enumerate_layers = try loader.global(vk.PfnEnumerateInstanceLayerProperties, "vkEnumerateInstanceLayerProperties");
         const validation_enabled = options.enable_validation and layerAvailable(enumerate_layers, "VK_LAYER_KHRONOS_validation");
+        // Asking for validation and silently not getting it reads exactly
+        // like a clean run. The SDK on this machine registers its layers
+        // under a path that no longer exists, so this is not hypothetical.
+        if (options.enable_validation) std.debug.print(
+            "[vulkan] validation requested: layer {s}\n",
+            .{if (validation_enabled) "found, enabled" else "NOT found; continuing without it"},
+        );
         const validation_name: [*:0]const u8 = "VK_LAYER_KHRONOS_validation";
         const layer_names = [_][*:0]const u8{validation_name};
         const instance_extension_names = [_][*:0]const u8{
