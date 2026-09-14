@@ -677,6 +677,18 @@ fn run(init: std.process.Init) !bool {
         defer allocator.free(text);
         break :parse text.len != 0 and !std.mem.eql(u8, text, "0");
     } else |_| speed_preset;
+    // Both default off. The survey costs one block of prints and answers
+    // whether the per-level images even have the extents an assembled chain
+    // would need; assembly itself has faulted the device before and stays
+    // behind its own switch until that question has an answer.
+    vulkan.backend.survey_resident_mip_chains = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_MIP_SURVEY")) |text| parse: {
+        defer allocator.free(text);
+        break :parse text.len != 0 and !std.mem.eql(u8, text, "0");
+    } else |_| false;
+    vulkan.backend.assemble_resident_mip_chains = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_ASSEMBLE_MIPS")) |text| parse: {
+        defer allocator.free(text);
+        break :parse text.len != 0 and !std.mem.eql(u8, text, "0");
+    } else |_| false;
     const default_retirement_slack_mib: u64 = if (speed_preset) 256 else 0;
     vulkan.backend.sampled_retirement_slack_bytes = (if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_SAMPLED_RETIREMENT_SLACK_MIB")) |text| parse: {
         defer allocator.free(text);

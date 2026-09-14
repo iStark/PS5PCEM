@@ -46,6 +46,14 @@ pub export var capture_graphics_target: u64 = 0;
 pub export var sampled_retirement_slack_bytes: u64 = 0;
 // Opt-in until native comparisons establish visual correctness and benefit.
 pub export var sampled_backing_reuse: bool = false;
+// Rebuilding a guest-generated pyramid from its per-level resident images is
+// off until a run shows the levels really do have the extents the destination
+// needs. A copy wider than the level it lands in faults the device, and the
+// device tells us so only by losing itself, so measure before enabling.
+pub export var assemble_resident_mip_chains: bool = false;
+// Say what the levels looked like even when assembly stays off: the survey is
+// the whole point of the first run.
+pub export var survey_resident_mip_chains: bool = false;
 const sampled_lookup_plan = @import("sampled_lookup_plan.zig");
 
 /// Set to true to enable verbose per-frame GPU debug logging.
@@ -1017,6 +1025,10 @@ const maximum_compute_sampled_mappings = 16384;
 // Keep cross-draw retention independent of a shader's descriptor limit.
 // Raising the live table ceiling must not also double retained texture data.
 const maximum_cached_sampled_images = 8192;
+/// A 2D chain cannot exceed this, and the array of sources is on the stack.
+const maximum_assembled_mip_levels = 16;
+/// Chains are few: one per pyramid the frame samples.
+const maximum_assembled_mip_chains = 16;
 /// Storage images form long compute chains in modern Unity render graphs. A
 /// dispatch may write one image only for the next dispatch to read it; keeping
 /// those images resident avoids a GPU -> tiled guest memory -> GPU round trip
@@ -2581,6 +2593,25 @@ const CachedStorageImage = struct {
     }
 };
 
+/// One mip chain rebuilt from the per-level storage images a compute pass
+/// wrote. The guest generates a pyramid a level at a time, each level landing
+/// in its own resident image, and then samples the whole chain as one texture.
+/// Guest memory is not the meeting point for those two views: the levels are
+/// still on the device, so the readback that rebuilds them finds an allocation
+/// nothing has published and hands the shader a blank image.
+const AssembledMipChain = struct {
+    address: u64,
+    unified_format: u16,
+    width: u32,
+    height: u32,
+    levels: u32,
+    /// The source sequences this was built from. A level written again makes
+    /// the chain stale, and rebuilding is the only way to pick the write up.
+    signature: u64,
+    image: OwnedImage,
+    view: vk.ImageView,
+};
+
 const SampledImageKey = struct {
     image: gpu.ImageDescriptor,
     sampler: gpu.resources.SamplerDescriptor,
@@ -3763,6 +3794,9 @@ pub const Renderer = struct {
     last_resident_reject: u8 = 0,
     last_rt_reject: u8 = 0,
     last_depth_reject: u8 = 0,
+    assembled_mip_chains: std.ArrayList(AssembledMipChain) = .empty,
+    reported_mip_assemblies: u32 = 0,
+    reported_mip_surveys: u32 = 0,
     depth_target_count: u32 = 0,
     reported_resident_rejects: u32 = 0,
     frame_profile: FrameProfile = .{},
@@ -4559,6 +4593,8 @@ pub const Renderer = struct {
         for (self.analyzed_programs.items) |*entry| entry.analysis.deinit(self.allocator);
         self.analyzed_programs.deinit(self.allocator);
         self.tessellation_programs.deinit(self.allocator);
+        for (self.assembled_mip_chains.items) |chain| self.destroyImage(chain.image);
+        self.assembled_mip_chains.deinit(self.allocator);
         for (self.completed_frames.items) |*frame| frame.pixels.deinit(self.allocator);
         self.completed_frames.deinit(self.allocator);
         self.guest_frame_scratch.deinit(self.allocator);
@@ -20064,6 +20100,281 @@ pub const Renderer = struct {
     /// Samples a compute output directly from its resident Vulkan image.  A
     /// CPU readback followed by a detile and re-upload is both redundant and
     /// especially expensive for Unity's 4K intermediate surfaces.
+    /// Binds a mip chain the guest built one level at a time.
+    ///
+    /// Each level is its own resident storage image, so no single one can
+    /// satisfy a sampled read of the whole chain and the overlap test rejects
+    /// them all. Copying the levels into one mipped image is the only way to
+    /// answer that read from the device, and the alternative is what happens
+    /// now: a readback of an allocation the levels were never published to.
+    fn stageResidentStorageMipChain(
+        self: *Renderer,
+        descriptor: gpu.resources.ImageDescriptor,
+        sampler_descriptor: gpu.resources.SamplerDescriptor,
+        image_format: u32,
+        dimension: rdna2.spirv.SampledImageDimension,
+    ) anyerror!?PreparedSampledImage {
+        const levels = descriptor.viewMipLevels();
+        if (levels < 2 or dimension != .two_d or descriptor.image_type != .color_2d or
+            descriptor.depth_or_layers != 1 or descriptor.viewBaseLevel() != 0)
+        {
+            return null;
+        }
+        if (levels > maximum_assembled_mip_levels) return null;
+
+        // Every level has to be present and current. A partial chain would
+        // sample undefined texels in the levels it could not fill, which is a
+        // worse answer than the readback it replaces.
+        var sources: [maximum_assembled_mip_levels]usize = undefined;
+        // The guest regenerates this pyramid every frame, so the chain is
+        // stale exactly once a frame -- not once per binding. Keying the
+        // rebuild on the frame counter bounds it to one assembly per chain;
+        // keying it on the sources' use counters rebuilt on every sampled
+        // binding instead, which allocated an image per binding and stopped
+        // the renderer producing frames at all.
+        const signature: u64 = self.frame_sequence;
+        for (0..levels) |level| {
+            const found = found: {
+                var candidates = self.storage_image_address_index.candidatesBy(self.storage_image_cache.items, descriptor.address, CachedStorageImage.address);
+                while (candidates.next()) |index| {
+                    const cached = self.storage_image_cache.items[index];
+                    if (!cached.valid or cached.descriptor.address != descriptor.address) continue;
+                    if (cached.descriptor.viewBaseLevel() != level or cached.descriptor.viewMipLevels() != 1) continue;
+                    if (!storageImageFormatsCompatible(cached.descriptor.unified_format, descriptor.unified_format)) continue;
+                    if (cached.descriptor.depth_or_layers != 1) continue;
+                    break :found index;
+                }
+                break :found null;
+            } orelse return null;
+            sources[level] = found;
+        }
+
+        const storage_format = storageImageFormat(descriptor.unified_format) orelse return null;
+        if (!sampledViewFormatCompatible(storage_format.vulkan, image_format)) return null;
+
+        // A level's producer wrote whatever extent the guest asked for, which
+        // need not be the halving the destination level expects: a pyramid
+        // over an odd dimension can round either way, and a tiled producer can
+        // be padded out entirely. Copying a source into a level narrower than
+        // itself reads past the destination and faults the device, so survey
+        // the pairs before trusting them.
+        var extents_match = true;
+        var extents_usable = true;
+        for (0..levels) |level| {
+            const cached = self.storage_image_cache.items[sources[level]];
+            const shift: u5 = @intCast(level);
+            const level_width = @max(descriptor.width >> shift, 1);
+            const level_height = @max(descriptor.height >> shift, 1);
+            if (cached.subresource.width != level_width or cached.subresource.height != level_height)
+                extents_match = false;
+            // Short is fatal, over is not: the guest rounds a level extent up
+            // where Vulkan rounds down, so a producer can carry a row and a
+            // column the sampler never addresses at that level. Those are
+            // droppable. A source narrower than its level is not: the copy
+            // would leave real texels undefined.
+            if (cached.subresource.width < level_width or cached.subresource.height < level_height)
+                extents_usable = false;
+        }
+        if (@atomicLoad(bool, &survey_resident_mip_chains, .monotonic) and self.reported_mip_surveys < 4) {
+            self.reported_mip_surveys += 1;
+            std.debug.print(
+                "[gpu mip survey] @0x{x} {d}x{d} levels={d} match={any}\n",
+                .{ descriptor.address, descriptor.width, descriptor.height, levels, extents_match },
+            );
+            for (0..levels) |level| {
+                const cached = self.storage_image_cache.items[sources[level]];
+                const shift: u5 = @intCast(level);
+                std.debug.print(
+                    "    level {d}: source {d}x{d} padded {d}x{d} want {d}x{d}\n",
+                    .{
+                        level,                     cached.subresource.width,
+                        cached.subresource.height, cached.subresource.padded_width,
+                        cached.subresource.padded_height,
+                        @max(descriptor.width >> shift, 1),
+                        @max(descriptor.height >> shift, 1),
+                    },
+                );
+            }
+        }
+        if (!@atomicLoad(bool, &assemble_resident_mip_chains, .monotonic)) return null;
+        if (!extents_usable) return null;
+
+        for (self.assembled_mip_chains.items) |chain| {
+            if (chain.address != descriptor.address or chain.unified_format != descriptor.unified_format or
+                chain.width != descriptor.width or chain.height != descriptor.height or
+                chain.levels != levels) continue;
+            if (chain.signature != signature) break;
+            return .{
+                .image = chain.image,
+                .view = chain.view,
+                .sampler = try self.residentSampler(sampler_descriptor),
+            };
+        }
+        return self.buildAssembledMipChain(descriptor, sampler_descriptor, image_format, sources[0..levels], signature);
+    }
+
+    fn buildAssembledMipChain(
+        self: *Renderer,
+        descriptor: gpu.resources.ImageDescriptor,
+        sampler_descriptor: gpu.resources.SamplerDescriptor,
+        image_format: u32,
+        sources: []const usize,
+        signature: u64,
+    ) anyerror!?PreparedSampledImage {
+        const levels: u32 = @intCast(sources.len);
+        const destination = try self.createImageWithExtent(
+            descriptor.width,
+            descriptor.height,
+            1,
+            1,
+            vk.image_type_2d,
+            0,
+            image_format,
+            vk.image_usage_transfer_dst_bit | vk.image_usage_sampled_bit,
+            vk.sample_count_1_bit,
+            levels,
+        );
+        errdefer self.destroyImage(destination);
+
+        const command_buffer = try self.beginOneShot();
+        defer self.releaseOneShot(command_buffer);
+        const whole = vk.ImageSubresourceRange{
+            .aspect_mask = vk.image_aspect_color_bit,
+            .level_count = levels,
+            .layer_count = 1,
+        };
+        var to_destination = vk.ImageMemoryBarrier{
+            .source_access_mask = 0,
+            .destination_access_mask = vk.access_transfer_write_bit,
+            .old_layout = vk.image_layout_undefined,
+            .new_layout = vk.image_layout_transfer_dst_optimal,
+            .image = destination.handle,
+            .subresource_range = whole,
+        };
+        self.device_functions.cmd_pipeline_barrier(command_buffer, vk.pipeline_stage_top_of_pipe_bit, vk.pipeline_stage_transfer_bit, 0, 0, null, 0, null, 1, @ptrCast(&to_destination));
+
+        for (sources, 0..) |index, level| {
+            const cached = self.storage_image_cache.items[index];
+            try self.transitionTrackedImage(command_buffer, cached.image.handle, .{
+                .aspect_mask = vk.image_aspect_color_bit,
+                .layer_count = 1,
+            }, image_state.transfer_source_usage);
+            // Copy the extent the destination level actually has, not the one
+            // the producer wrote. A guest pyramid rounds a level up where
+            // Vulkan rounds down -- level 7 of a 960x540 chain arrives 8x5
+            // against a 7x4 level -- and a copy sized from the source writes
+            // past the image. The device reports that only by losing itself.
+            const shift: u5 = @intCast(level);
+            const level_width = @min(cached.subresource.width, @max(descriptor.width >> shift, 1));
+            const level_height = @min(cached.subresource.height, @max(descriptor.height >> shift, 1));
+            const copy = vk.ImageCopy{
+                .source_subresource = .{ .aspect_mask = vk.image_aspect_color_bit, .layer_count = 1 },
+                .destination_subresource = .{ .aspect_mask = vk.image_aspect_color_bit, .mip_level = @intCast(level), .layer_count = 1 },
+                .extent = .{
+                    .width = level_width,
+                    .height = level_height,
+                    .depth = 1,
+                },
+            };
+            self.device_functions.cmd_copy_image(
+                command_buffer,
+                cached.image.handle,
+                vk.image_layout_transfer_src_optimal,
+                destination.handle,
+                vk.image_layout_transfer_dst_optimal,
+                1,
+                @ptrCast(&copy),
+            );
+        }
+
+        var to_read = vk.ImageMemoryBarrier{
+            .source_access_mask = vk.access_transfer_write_bit,
+            .destination_access_mask = vk.access_shader_read_bit,
+            .old_layout = vk.image_layout_transfer_dst_optimal,
+            .new_layout = vk.image_layout_shader_read_only_optimal,
+            .image = destination.handle,
+            .subresource_range = whole,
+        };
+        self.device_functions.cmd_pipeline_barrier(command_buffer, vk.pipeline_stage_transfer_bit, vk.pipeline_stage_fragment_shader_bit | vk.pipeline_stage_compute_shader_bit, 0, 0, null, 0, null, 1, @ptrCast(&to_read));
+        for (sources) |index| {
+            const cached = self.storage_image_cache.items[index];
+            try self.transitionTrackedImage(command_buffer, cached.image.handle, .{
+                .aspect_mask = vk.image_aspect_color_bit,
+                .layer_count = 1,
+            }, image_state.storage_usage);
+        }
+        try self.submitOneShot(command_buffer);
+        // Nine source images are left carrying the pending tick this
+        // recording gave them. Anything that consults one before the
+        // submission resolves reads that marker as a real timeline value
+        // and waits for a counter the device will never reach, which ends
+        // the run in DeviceLost. The chain is built once a frame, so
+        // settling it here costs one wait per pyramid.
+        try self.waitForSubmittedWork();
+
+        const components = try sampledImageComponents(descriptor.dst_select);
+        const view = try self.residentImageViewLevels(
+            destination.handle,
+            vk.image_view_type_2d,
+            image_format,
+            components,
+            vk.image_aspect_color_bit,
+            1,
+            levels,
+        );
+        if (self.reported_mip_assemblies < 8) {
+            self.reported_mip_assemblies += 1;
+            std.debug.print(
+                "[vulkan dcb] assembled mip chain @0x{x} {d}x{d} levels={d} from resident storage\n",
+                .{ descriptor.address, descriptor.width, descriptor.height, levels },
+            );
+        }
+        try self.retainAssembledMipChain(.{
+            .address = descriptor.address,
+            .unified_format = descriptor.unified_format,
+            .width = descriptor.width,
+            .height = descriptor.height,
+            .levels = levels,
+            .signature = signature,
+            .image = destination,
+            .view = view,
+        });
+        return .{
+            .image = destination,
+            .view = view,
+            .sampler = try self.residentSampler(sampler_descriptor),
+        };
+    }
+
+    /// Retires a chain image together with every view onto it. The view cache
+    /// is keyed by image handle, so dropping the image alone leaves a view onto
+    /// freed memory, and the next image handed that handle inherits it. Every
+    /// other eviction path here pairs the two; this one did not.
+    fn retireAssembledMipChainImage(self: *Renderer, chain: AssembledMipChain) void {
+        self.invalidateResidentImageViews(chain.image.handle);
+        self.destroyImage(chain.image);
+    }
+
+    /// Replaces the chain this supersedes, or evicts the oldest when the small
+    /// table is full. The retired image is deferred like any other.
+    fn retainAssembledMipChain(self: *Renderer, chain: AssembledMipChain) !void {
+        for (self.assembled_mip_chains.items) |*existing| {
+            if (existing.address != chain.address or existing.unified_format != chain.unified_format or
+                existing.width != chain.width or existing.height != chain.height or
+                existing.levels != chain.levels) continue;
+            self.retireAssembledMipChainImage(existing.*);
+            existing.* = chain;
+            return;
+        }
+        if (self.assembled_mip_chains.items.len >= maximum_assembled_mip_chains) {
+            const victim = &self.assembled_mip_chains.items[0];
+            self.retireAssembledMipChainImage(victim.*);
+            victim.* = chain;
+            return;
+        }
+        try self.assembled_mip_chains.append(self.allocator, chain);
+    }
+
     fn stageResidentStorageImage(
         self: *Renderer,
         descriptor: gpu.resources.ImageDescriptor,
@@ -20319,6 +20630,10 @@ pub const Renderer = struct {
         }
         self.frame_profile.sampled_prefix_ns +|= elapsedHostNanoseconds(prefix_started);
         const resident_started = hostTimestampNs();
+        if (try self.stageResidentStorageMipChain(descriptor, sampler_descriptor, image_format, dimension)) |chain| {
+            self.frame_profile.sampled_resident_ns +|= elapsedHostNanoseconds(resident_started);
+            return chain;
+        }
         if (try self.stageResidentStorageImage(
             descriptor,
             sampler_descriptor,
@@ -20563,6 +20878,15 @@ pub const Renderer = struct {
             // An entry that exists but was invalidated is a different story
             // from one that was never cached: something dropped its content.
             if (cached.initialized) linear_targets += 1 else stale_targets += 1;
+        }
+        for (self.storage_image_cache.items) |cached| {
+            if (!cached.valid or cached.descriptor.address != descriptor.address) continue;
+            if (self.reported_resident_rejects < 8) std.debug.print(
+                "    resident storage: {d}x{d}x{d} fmt={d} type={s} base={d} mips={d} dirty={any}\n",
+                .{ cached.descriptor.width, cached.descriptor.height, cached.descriptor.depth_or_layers,
+                   cached.descriptor.unified_format, @tagName(cached.descriptor.image_type),
+                   cached.descriptor.viewBaseLevel(), cached.descriptor.viewMipLevels(), cached.gpu_dirty },
+            );
         }
         var linear_storage: u32 = 0;
         for (self.storage_image_cache.items) |cached| {
