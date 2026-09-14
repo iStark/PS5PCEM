@@ -20304,13 +20304,12 @@ pub const Renderer = struct {
             }, image_state.storage_usage);
         }
         try self.submitOneShot(command_buffer);
-        // Nine source images are left carrying the pending tick this
-        // recording gave them. Anything that consults one before the
-        // submission resolves reads that marker as a real timeline value
-        // and waits for a counter the device will never reach, which ends
-        // the run in DeviceLost. The chain is built once a frame, so
-        // settling it here costs one wait per pyramid.
-        try self.waitForSubmittedWork();
+        // No host wait here. The copies go to the same queue as the draw that
+        // samples the chain, and the barrier above orders transfer writes
+        // against that read. Stalling for the device was a guess at an earlier
+        // fault whose real cause was a copy sized past the destination level;
+        // with that fixed the wait bought nothing and cost a full pipeline
+        // drain per pyramid per frame.
 
         const components = try sampledImageComponents(descriptor.dst_select);
         const view = try self.residentImageViewLevels(
