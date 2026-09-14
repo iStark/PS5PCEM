@@ -2269,7 +2269,13 @@ fn hostUnmapBacking(address: u64, size: u64) Error!void {
             var cursor = address;
             while (cursor < end) {
                 const view = try windowsAllocationRange(cursor);
-                if (view.start != cursor or view.end > end) return Error.HostDecommitFailed;
+                if (view.start != cursor or view.end > end) {
+                    // A view wider than the range being removed cannot be
+                    // unmapped piecewise. Say so: it is the failure mode a
+                    // larger mapping view introduces.
+                    std.debug.print("[memory] partial unmap of wider view: request=0x{x}..0x{x} view=0x{x}..0x{x}\n", .{ address, end, view.start, view.end });
+                    return Error.HostDecommitFailed;
+                }
 
                 const status = std.os.windows.ntdll.NtUnmapViewOfSectionEx(
                     std.os.windows.GetCurrentProcess(),

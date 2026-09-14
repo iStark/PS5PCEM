@@ -2084,6 +2084,37 @@ const AnalyzedProgram = struct {
     last_used_sequence: u64 = 0,
 };
 
+/// Counts how many of a frame's staging calls name a resource the frame has
+/// already staged. Exact counts are not needed: this only has to say whether
+/// repeats dominate, so a fixed open-addressed table that drops on overflow
+/// is enough, and it costs one probe per call.
+const StagedResourceCensus = struct {
+    const capacity = 4096;
+    keys: [capacity]u64 = @splat(0),
+    distinct: u32 = 0,
+    total: u32 = 0,
+
+    fn note(self: *StagedResourceCensus, key: u64) void {
+        self.total += 1;
+        if (key == 0) return;
+        var index: usize = @intCast((key *% 0x9e37_79b9_7f4a_7c15) >> 52);
+        for (0..8) |_| {
+            if (self.keys[index] == key) return;
+            if (self.keys[index] == 0) {
+                self.keys[index] = key;
+                self.distinct += 1;
+                return;
+            }
+            index = (index + 1) % capacity;
+        }
+        self.distinct += 1;
+    }
+
+    fn reset(self: *StagedResourceCensus) void {
+        self.* = .{};
+    }
+};
+
 const FrameProfile = struct {
     draws: u64 = 0,
     dispatches: u64 = 0,
@@ -2150,6 +2181,25 @@ const FrameProfile = struct {
     compute_image_dedup_ns: u64 = 0,
     compute_image_dedup_steps: u64 = 0,
     compute_tail_ns: u64 = 0,
+    compute_sampled_loop_ns: u64 = 0,
+    compute_descriptor_update_ns: u64 = 0,
+    compute_flat_memory_ns: u64 = 0,
+    compute_buffer_lookup_ns: u64 = 0,
+    compute_sampled_lookup_ns: u64 = 0,
+    staged_buffers: StagedResourceCensus = .{},
+    staged_images: StagedResourceCensus = .{},
+    stage_materialize_ns: u64 = 0,
+    stage_views_ns: u64 = 0,
+    compute_sampled_stage_ns: u64 = 0,
+    compute_sampled_stages: u64 = 0,
+    sampled_generation_scan_ns: u64 = 0,
+    sampled_generation_calls: u64 = 0,
+    sampled_resident_ns: u64 = 0,
+    sampled_prefix_ns: u64 = 0,
+    sampled_probe2_ns: u64 = 0,
+    sampled_probe2_calls: u64 = 0,
+    sampled_page_ns: u64 = 0,
+    sampled_page_calls: u64 = 0,
     checkpoint_prepare_ns: u64 = 0,
     checkpoint_preparations: u64 = 0,
     checkpoint_plan_misses: u64 = 0,
@@ -5280,16 +5330,21 @@ pub const Renderer = struct {
         // view uploads guest bytes and must first observe the earlier writer.
         // Publish the whole old view so its dirty tail cannot later overwrite
         // a newer, narrower write when the cache finally retires it.
+        const views_started = hostTimestampNs();
         var previous_views = self.guest_buffer_address_index.candidates(self.guest_buffers.items, guest_address);
         while (previous_views.next()) |index| {
             const previous = self.guest_buffers.items[index];
             if (previous.guest_address == guest_address and previous.size != size and previous.gpu_dirty)
                 try self.flushGuestStorageBuffer(index);
         }
+        self.frame_profile.stage_views_ns +|= elapsedHostNanoseconds(views_started);
         // A raw V# may read or partially overwrite a colour allocation that
         // was last produced as an attachment. Preserve those pixels before
         // staging the buffer; otherwise a masked store starts from stale RAM.
-        if (try self.materializeRenderTargetAt(guest_address)) {
+        const materialize_started = hostTimestampNs();
+        const materialized = try self.materializeRenderTargetAt(guest_address);
+        self.frame_profile.stage_materialize_ns +|= elapsedHostNanoseconds(materialize_started);
+        if (materialized) {
             for (self.completed_frames.items) |*frame| {
                 if (frame.guest_address != guest_address or !frame.needs_writeback) continue;
                 const target = frame.target orelse continue;
@@ -9255,8 +9310,8 @@ pub const Renderer = struct {
                     if (log_verbose_gpu) std.debug.print("[vulkan dcb] no free storage slot for V# s{d}; soft-skip\n", .{resource_sgpr});
                     continue;
                 };
+                self.frame_profile.staged_buffers.note(descriptor.address ^ (@as(u64, size) << 48));
                 const buffer_stage_started = hostTimestampNs();
-                defer self.frame_profile.compute_buffer_stage_ns +|= elapsedHostNanoseconds(buffer_stage_started);
                 _ = self.stageGuestStorageBufferAt(free, descriptor.address, size) catch |err| {
                     self.traceSkippedStorage(bindings, inst, @errorName(err), descriptor);
                     if (log_verbose_gpu) std.debug.print(
@@ -9272,6 +9327,7 @@ pub const Renderer = struct {
                     );
                     continue;
                 };
+                self.frame_profile.compute_buffer_stage_ns +|= elapsedHostNanoseconds(buffer_stage_started);
                 result.occupied[free] = true;
                 result.addresses[free] = descriptor.address;
                 result.sizes[free] = size;
@@ -9500,8 +9556,8 @@ pub const Renderer = struct {
                     return Error.StorageImageCapacityExceeded;
                 }
                 const index: u32 = @intCast(result.storage_image_count);
+                self.frame_profile.staged_images.note(descriptor.address);
                 const stage_started = hostTimestampNs();
-                defer self.frame_profile.compute_image_stage_ns +|= elapsedHostNanoseconds(stage_started);
                 result.storage_images[result.storage_image_count] = self.stageStorageImage(
                     descriptor,
                     index,
@@ -9533,6 +9589,7 @@ pub const Renderer = struct {
                     );
                     return err;
                 };
+                self.frame_profile.compute_image_stage_ns +|= elapsedHostNanoseconds(stage_started);
                 result.storage_image_count += 1;
                 descriptor_index = index;
             }
@@ -9589,6 +9646,7 @@ pub const Renderer = struct {
             try self.prepareSceneFlatMemory(result, bindings, reader, analysis);
             return result;
         }
+        const sampled_loop_started = hostTimestampNs();
         for (instructions) |inst| {
             const image_fetch = inst.opcode == .image_load or inst.opcode == .image_load_mip;
             if (!image_fetch and inst.opcode != .image_sample and inst.opcode != .image_gather4) continue;
@@ -9722,6 +9780,8 @@ pub const Renderer = struct {
                     }
                     const physical_index: u32 = @intCast(result.sampled_image_count);
                     const sampled_started = hostTimestampNs();
+                    const sampled_stage_started = hostTimestampNs();
+                    self.frame_profile.compute_sampled_stages +|= 1;
                     const image = self.stageSampledImage(
                         image_descriptor,
                         sampler_descriptor,
@@ -9736,6 +9796,7 @@ pub const Renderer = struct {
                         );
                         return err;
                     };
+                    self.frame_profile.compute_sampled_stage_ns +|= elapsedHostNanoseconds(sampled_stage_started);
                     self.frame_profile.sampled_stage_ns +|= elapsedHostNanoseconds(sampled_started);
                     result.sampled_images[result.sampled_image_count] = image;
                     result.sampled_image_descriptors[result.sampled_image_count] = image_descriptor;
@@ -9759,13 +9820,22 @@ pub const Renderer = struct {
                 result.sampled_image_mapping_count += 1;
             }
         }
+        self.frame_profile.compute_sampled_loop_ns +|= elapsedHostNanoseconds(sampled_loop_started);
+        var lookup_started = hostTimestampNs();
         self.updateSampledImageDescriptors(
             result.sampled_images[0..result.sampled_image_count],
             result.sampled_image_mappings[0..result.sampled_image_mapping_count],
         );
+        self.frame_profile.compute_descriptor_update_ns +|= elapsedHostNanoseconds(lookup_started);
+        lookup_started = hostTimestampNs();
         try self.prepareSceneFlatMemory(result, bindings, reader, analysis);
+        self.frame_profile.compute_flat_memory_ns +|= elapsedHostNanoseconds(lookup_started);
+        lookup_started = hostTimestampNs();
         try self.prepareStorageBufferLookups(result);
+        self.frame_profile.compute_buffer_lookup_ns +|= elapsedHostNanoseconds(lookup_started);
+        lookup_started = hostTimestampNs();
         try self.prepareSampledImageLookups(result, result.sampled_image_mappings[0..result.sampled_image_mapping_count]);
+        self.frame_profile.compute_sampled_lookup_ns +|= elapsedHostNanoseconds(lookup_started);
         return result;
     }
 
@@ -10847,6 +10917,9 @@ pub const Renderer = struct {
         source_generation: u64,
         full_content: bool,
     ) u64 {
+        const sampled_probe2_started = hostTimestampNs();
+        defer self.frame_profile.sampled_probe2_ns +|= elapsedHostNanoseconds(sampled_probe2_started);
+        self.frame_profile.sampled_probe2_calls +|= 1;
         for (self.texture_probes[0..self.texture_probe_count]) |probe| {
             if (!probe.valid or probe.address != address or probe.span != span or
                 probe.full_content != full_content) continue;
@@ -10884,6 +10957,9 @@ pub const Renderer = struct {
     /// are serialized through dcbWrite and reset this table. Query each range
     /// once per frame instead of repeating the full walk for every draw.
     fn sampledPageGeneration(self: *Renderer, memory: GuestMemory, address: u64, span: usize) u64 {
+        const sampled_page_started = hostTimestampNs();
+        defer self.frame_profile.sampled_page_ns +|= elapsedHostNanoseconds(sampled_page_started);
+        self.frame_profile.sampled_page_calls +|= 1;
         for (self.texture_probes[0..self.texture_probe_count]) |probe| {
             if (probe.valid and probe.address == address and probe.span == span) {
                 return probe.page_generation;
@@ -20112,6 +20188,7 @@ pub const Renderer = struct {
         dimension: rdna2.spirv.SampledImageDimension,
         render_target_write: ?GuestColorTarget,
     ) anyerror!PreparedSampledImage {
+        const prefix_started = hostTimestampNs();
         const image_format = sampledImageFormat(
             descriptor.unified_format,
             sampler_descriptor.force_srgb,
@@ -20176,6 +20253,8 @@ pub const Renderer = struct {
                 },
             );
         }
+        self.frame_profile.sampled_prefix_ns +|= elapsedHostNanoseconds(prefix_started);
+        const resident_started = hostTimestampNs();
         if (try self.stageResidentStorageImage(
             descriptor,
             sampler_descriptor,
@@ -20196,6 +20275,7 @@ pub const Renderer = struct {
         if (dimension == .two_d and
             (descriptor.image_type == .color_2d or descriptor.tile_mode == .depth))
         {
+            self.frame_profile.sampled_resident_ns +|= elapsedHostNanoseconds(resident_started);
             if (try self.stageResidentDepthTarget(
                 descriptor,
                 sampler_descriptor,
@@ -21041,6 +21121,9 @@ pub const Renderer = struct {
     }
 
     fn sampledSourceGeneration(self: *Renderer, address: u64, visible_bytes: usize) u64 {
+        const generation_started = hostTimestampNs();
+        defer self.frame_profile.sampled_generation_scan_ns +|= elapsedHostNanoseconds(generation_started);
+        self.frame_profile.sampled_generation_calls +|= 1;
         var generation = self.image_aliases.generationForRange(aliasRange(address, visible_bytes));
         for (self.completed_frames.items) |cached| {
             if (cached.guest_address == address) generation = @max(generation, cached.sequence);
@@ -23093,12 +23176,16 @@ pub const Renderer = struct {
                 },
             );
             std.debug.print(
-                "[gpu buffers] flip={d} content_reused_kib={d} fingerprint_ms={d}\n",
-                .{ self.flip_callbacks, profile.content_reused_bytes / 1024, profile.buffer_fingerprint_ns / std.time.ns_per_ms },
+                "[gpu buffers] flip={d} content_reused_kib={d} fingerprint_ms={d} materialize_ms={d} views_ms={d}\n",
+                .{ self.flip_callbacks, profile.content_reused_bytes / 1024, profile.buffer_fingerprint_ns / std.time.ns_per_ms, profile.stage_materialize_ns / std.time.ns_per_ms, profile.stage_views_ns / std.time.ns_per_ms },
             );
             std.debug.print(
-                "[gpu compute scan] flip={d} buffers_ms={d}(stage={d},ptr={d}) images_ms={d} resolve_ms={d} stage_ms={d} probe={d}ms/{d} dedup={d}ms/{d} tail_ms={d} dispatches={d} walked={d} images={d}\n",
-                .{ self.flip_callbacks, profile.compute_buffer_scan_ns / std.time.ns_per_ms, profile.compute_buffer_stage_ns / std.time.ns_per_ms, profile.compute_pointer_memory_ns / std.time.ns_per_ms, profile.compute_image_scan_ns / std.time.ns_per_ms, profile.compute_image_resolve_ns / std.time.ns_per_ms, profile.compute_image_stage_ns / std.time.ns_per_ms, profile.compute_sampled_probe_ns / std.time.ns_per_ms, profile.compute_sampled_probe_steps, profile.compute_image_dedup_ns / std.time.ns_per_ms, profile.compute_image_dedup_steps, profile.compute_tail_ns / std.time.ns_per_ms, profile.dispatches, profile.compute_instructions_walked, profile.compute_images_resolved },
+                "[gpu compute scan] flip={d} buffers_ms={d}(stage={d},ptr={d}) images_ms={d} resolve_ms={d} stage_ms={d} probe={d}ms/{d} dedup={d}ms/{d} tail_ms={d}(loop={d}/stage={d}ms/{d},desc={d},flat={d},blk={d},slk={d}) dispatches={d} walked={d} images={d} distinct_buf={d}/{d} distinct_img={d}/{d}\n",
+                .{ self.flip_callbacks,  profile.compute_buffer_scan_ns / std.time.ns_per_ms, profile.compute_buffer_stage_ns / std.time.ns_per_ms, profile.compute_pointer_memory_ns / std.time.ns_per_ms, profile.compute_image_scan_ns / std.time.ns_per_ms, profile.compute_image_resolve_ns / std.time.ns_per_ms, profile.compute_image_stage_ns / std.time.ns_per_ms, profile.compute_sampled_probe_ns / std.time.ns_per_ms, profile.compute_sampled_probe_steps, profile.compute_image_dedup_ns / std.time.ns_per_ms, profile.compute_image_dedup_steps, profile.compute_tail_ns / std.time.ns_per_ms, profile.compute_sampled_loop_ns / std.time.ns_per_ms, profile.compute_sampled_stage_ns / std.time.ns_per_ms, profile.compute_sampled_stages, profile.compute_descriptor_update_ns / std.time.ns_per_ms, profile.compute_flat_memory_ns / std.time.ns_per_ms, profile.compute_buffer_lookup_ns / std.time.ns_per_ms, profile.compute_sampled_lookup_ns / std.time.ns_per_ms, profile.dispatches, profile.compute_instructions_walked, profile.compute_images_resolved, profile.staged_buffers.distinct, profile.staged_buffers.total, profile.staged_images.distinct, profile.staged_images.total },
+            );
+            std.debug.print(
+                "[gpu sampled inner] flip={d} gen={d}ms/{d} prefix={d}ms resident={d}ms probe={d}ms/{d} page={d}ms/{d}\n",
+                .{ self.flip_callbacks, profile.sampled_generation_scan_ns / std.time.ns_per_ms, profile.sampled_generation_calls, profile.sampled_prefix_ns / std.time.ns_per_ms, profile.sampled_resident_ns / std.time.ns_per_ms, profile.sampled_probe2_ns / std.time.ns_per_ms, profile.sampled_probe2_calls, profile.sampled_page_ns / std.time.ns_per_ms, profile.sampled_page_calls },
             );
             std.debug.print(
                 "[gpu graphics res] flip={d} fragment_ms={d} sampled_scan_ms={d} append_ms={d} descriptors_ms={d} total_ms={d}\n",
