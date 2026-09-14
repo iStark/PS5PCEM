@@ -20550,8 +20550,12 @@ pub const Renderer = struct {
         // finds a target the index did not offer, the index is stale; if
         // neither finds one, the producer really is not resident.
         var linear_targets: u32 = 0;
+        var stale_targets: u32 = 0;
         for (self.render_targets.items) |cached| {
-            if (cached.initialized and cached.target.descriptor.address == descriptor.address) linear_targets += 1;
+            if (cached.target.descriptor.address != descriptor.address) continue;
+            // An entry that exists but was invalidated is a different story
+            // from one that was never cached: something dropped its content.
+            if (cached.initialized) linear_targets += 1 else stale_targets += 1;
         }
         var linear_storage: u32 = 0;
         for (self.storage_image_cache.items) |cached| {
@@ -20568,8 +20572,8 @@ pub const Renderer = struct {
         }
         if (self.reported_resident_rejects < 24) {
             self.reported_resident_rejects += 1;
-            std.debug.print("[vulkan dcb] sampled readback fallback: resident_reject={d} rt_reject={d} scan_rt={d} scan_simg={d} dcc={any} depth_reject={d} depth_cache={d} addr=0x{x} {d}x{d}x{d} fmt={d} type={s} tile={f} levels={d}..{d} want_levels={d}\n", .{
-                self.last_resident_reject, self.last_rt_reject, linear_targets, linear_storage, descriptor.dcc_enabled, self.last_depth_reject, @as(u32, @intCast(self.depth_targets.items.len)), descriptor.address, descriptor.width, descriptor.height, descriptor.depth_or_layers,
+            std.debug.print("[vulkan dcb] sampled readback fallback: resident_reject={d} rt_reject={d} scan_rt={d} stale_rt={d} scan_simg={d} dcc={any} depth_reject={d} depth_cache={d} addr=0x{x} {d}x{d}x{d} fmt={d} type={s} tile={f} levels={d}..{d} want_levels={d}\n", .{
+                self.last_resident_reject, self.last_rt_reject, linear_targets, stale_targets, linear_storage, descriptor.dcc_enabled, self.last_depth_reject, @as(u32, @intCast(self.depth_targets.items.len)), descriptor.address, descriptor.width, descriptor.height, descriptor.depth_or_layers,
                 descriptor.unified_format, @tagName(descriptor.image_type), descriptor.tile_mode, descriptor.base_level, descriptor.last_level, descriptor.viewMipLevels(),
             });
         }
