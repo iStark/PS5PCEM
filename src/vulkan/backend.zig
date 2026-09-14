@@ -3758,6 +3758,11 @@ pub const Renderer = struct {
     graphics_pipeline_cache_hits: u64 = 0,
     graphics_pipeline_cache_misses: u64 = 0,
     graphics_pipeline_sequence: u64 = 0,
+    /// Why stageResidentStorageImage last declined, so a staging that then
+    /// falls back to a device readback can say what stopped the alias.
+    last_resident_reject: u8 = 0,
+    last_rt_reject: u8 = 0,
+    reported_resident_rejects: u32 = 0,
     frame_profile: FrameProfile = .{},
     last_flip_profile_ns: u64 = 0,
     reported_shader_failures: [64]?GraphicsShaderFailure = @splat(null),
@@ -11912,14 +11917,24 @@ pub const Renderer = struct {
     ) ?usize {
         var best: ?usize = null;
         var best_sequence: u64 = 0;
+        self.last_rt_reject = 1;
         var candidates = self.render_target_address_index.candidatesBy(self.render_targets.items, descriptor.address, CachedRenderTarget.address);
         while (candidates.next()) |index| {
             const cached = self.render_targets.items[index];
-            if (!cached.initialized or
-                cached.target.descriptor.fragments_log2 != 0 or
-                cached.target.descriptor.address != descriptor.address or
-                !self.renderTargetFormatCompatible(cached, image_format, descriptor))
-            {
+            if (!cached.initialized) {
+                self.last_rt_reject = 2;
+                continue;
+            }
+            if (cached.target.descriptor.fragments_log2 != 0) {
+                self.last_rt_reject = 3;
+                continue;
+            }
+            if (cached.target.descriptor.address != descriptor.address) {
+                self.last_rt_reject = 4;
+                continue;
+            }
+            if (!self.renderTargetFormatCompatible(cached, image_format, descriptor)) {
+                self.last_rt_reject = 5;
                 continue;
             }
             if (best != null and cached.last_used_sequence < best_sequence) continue;
@@ -20035,7 +20050,11 @@ pub const Renderer = struct {
         image_format: u32,
         dimension: rdna2.spirv.SampledImageDimension,
     ) anyerror!?PreparedSampledImage {
-        if (dimension != .two_d and dimension != .three_d and dimension != .two_d_array) return null;
+        if (dimension != .two_d and dimension != .three_d and dimension != .two_d_array) {
+            self.last_resident_reject = 1;
+            return null;
+        }
+        self.last_resident_reject = 2;
         var best_index: ?usize = null;
         var best_sequence: u64 = 0;
         var candidates = self.storage_image_address_index.candidatesBy(self.storage_image_cache.items, descriptor.address, CachedStorageImage.address);
@@ -20053,9 +20072,18 @@ pub const Renderer = struct {
             // A command-processor write can replace a previously uploaded or
             // published guest image. Its Vulkan allocation still exists, but
             // cannot supply texels until storage staging uploads the new data.
-            if (!cached.gpu_dirty and cached.depth_snapshot == null and !cached.guest_content_hash_valid) continue;
-            const storage_format = storageImageFormat(cached.descriptor.unified_format) orelse continue;
-            if (!sampledViewFormatCompatible(storage_format.vulkan, image_format)) continue;
+            if (!cached.gpu_dirty and cached.depth_snapshot == null and !cached.guest_content_hash_valid) {
+                self.last_resident_reject = 3;
+                continue;
+            }
+            const storage_format = storageImageFormat(cached.descriptor.unified_format) orelse {
+                self.last_resident_reject = 4;
+                continue;
+            };
+            if (!sampledViewFormatCompatible(storage_format.vulkan, image_format)) {
+                self.last_resident_reject = 5;
+                continue;
+            }
             if (best_index != null and cached.last_used_sequence < best_sequence) continue;
             best_index = index;
             best_sequence = cached.last_used_sequence;
@@ -20504,6 +20532,13 @@ pub const Renderer = struct {
         // publish its deferred writeback before hashing or staging guest bytes,
         // otherwise the cache would bind stale contents.
         self.frame_profile.sampled_slow_paths +|= 1;
+        if (self.reported_resident_rejects < 24) {
+            self.reported_resident_rejects += 1;
+            std.debug.print("[vulkan dcb] sampled readback fallback: resident_reject={d} rt_reject={d} addr=0x{x} {d}x{d}x{d} fmt={d} type={s} tile={f} levels={d}..{d}\n", .{
+                self.last_resident_reject, self.last_rt_reject, descriptor.address, descriptor.width, descriptor.height, descriptor.depth_or_layers,
+                descriptor.unified_format, @tagName(descriptor.image_type), descriptor.tile_mode, descriptor.base_level, descriptor.last_level,
+            });
+        }
         const flush_started = hostTimestampNs();
         if (fixed_clear == null) self.flushPendingGuestWrite(descriptor.address, probe_span) catch |err| {
             if (log_verbose_gpu) std.debug.print(
