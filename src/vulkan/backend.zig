@@ -3762,6 +3762,8 @@ pub const Renderer = struct {
     /// falls back to a device readback can say what stopped the alias.
     last_resident_reject: u8 = 0,
     last_rt_reject: u8 = 0,
+    last_depth_reject: u8 = 0,
+    depth_target_count: u32 = 0,
     reported_resident_rejects: u32 = 0,
     frame_profile: FrameProfile = .{},
     last_flip_profile_ns: u64 = 0,
@@ -12155,14 +12157,26 @@ pub const Renderer = struct {
         sampler_descriptor: gpu.resources.SamplerDescriptor,
         image_format: u32,
     ) anyerror!?PreparedSampledImage {
-        if (descriptor.tile_mode != .depth) return null;
+        if (descriptor.tile_mode != .depth) {
+            self.last_depth_reject = 1;
+            return null;
+        }
+        self.last_depth_reject = 2;
         for (self.depth_targets.items, 0..) |cached, index| {
-            if (!cached.initialized or
-                cached.target.address != descriptor.address or
-                cached.target.width != descriptor.width or
-                cached.target.height != descriptor.height or
-                !depthSampledFormatCompatible(cached.target.format, image_format))
-            {
+            if (!cached.initialized) {
+                self.last_depth_reject = 3;
+                continue;
+            }
+            if (cached.target.address != descriptor.address) {
+                self.last_depth_reject = 4;
+                continue;
+            }
+            if (cached.target.width != descriptor.width or cached.target.height != descriptor.height) {
+                self.last_depth_reject = 5;
+                continue;
+            }
+            if (!depthSampledFormatCompatible(cached.target.format, image_format)) {
+                self.last_depth_reject = 6;
                 continue;
             }
             if (self.resident_depth_sample_reports < 8 or self.traceCurrentGraphicsFrame()) {
@@ -20534,8 +20548,8 @@ pub const Renderer = struct {
         self.frame_profile.sampled_slow_paths +|= 1;
         if (self.reported_resident_rejects < 24) {
             self.reported_resident_rejects += 1;
-            std.debug.print("[vulkan dcb] sampled readback fallback: resident_reject={d} rt_reject={d} addr=0x{x} {d}x{d}x{d} fmt={d} type={s} tile={f} levels={d}..{d}\n", .{
-                self.last_resident_reject, self.last_rt_reject, descriptor.address, descriptor.width, descriptor.height, descriptor.depth_or_layers,
+            std.debug.print("[vulkan dcb] sampled readback fallback: resident_reject={d} rt_reject={d} depth_reject={d} depth_cache={d} addr=0x{x} {d}x{d}x{d} fmt={d} type={s} tile={f} levels={d}..{d}\n", .{
+                self.last_resident_reject, self.last_rt_reject, self.last_depth_reject, @as(u32, @intCast(self.depth_targets.items.len)), descriptor.address, descriptor.width, descriptor.height, descriptor.depth_or_layers,
                 descriptor.unified_format, @tagName(descriptor.image_type), descriptor.tile_mode, descriptor.base_level, descriptor.last_level,
             });
         }
