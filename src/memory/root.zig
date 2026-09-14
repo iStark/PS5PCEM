@@ -2052,15 +2052,14 @@ fn hostMappingViewSize(
             isAligned(size, windows_allocation_granularity) and
             isAligned(offset, windows_allocation_granularity))
         {
-            // One view for the whole range. A section view may be any length
-            // once its address and section offset are granularity-aligned, and
-            // the range is contiguous in both, so cutting it into granularity
-            // pieces bought nothing and cost a placeholder split and a map
-            // call for each one. Windows charges those per call: a 128 KiB
-            // mapping was two of each, and a coalesced multi-megabyte run was
-            // dozens. Unmapping reads each view's real length back from the
-            // OS, so it follows whatever size was used here.
-            return size;
+            // One view per granule. Mapping the whole aligned range as a
+            // single view is fewer calls and measurably faster on Yotei, but
+            // it costs Cat Quest III 2640 frames against 60 and takes the
+            // title into the stall watchdog, reproducibly, three runs of
+            // each. Whatever the wider view changes for that guest, it is not
+            // worth a title that no longer runs; the coalescing in the two
+            // commits around this one stays and carries most of the win.
+            return windows_allocation_granularity;
         }
     }
     return page_size;
