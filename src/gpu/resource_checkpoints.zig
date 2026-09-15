@@ -125,6 +125,10 @@ pub const Pool = struct {
         plan_reused: bool,
         scratch_reused: bool,
         cacheable: bool,
+        /// Instructions the scalar evaluator stepped through for this
+        /// preparation. The list of checkpoints is cached; this walk is not,
+        /// and it is what the preparation time is made of.
+        instructions_walked: u32 = 0,
 
         pub fn release(self: *Lease) void {
             if (self.owned_pcs) |pcs_| self.allocator.free(pcs_);
@@ -173,11 +177,13 @@ pub const Pool = struct {
         const scratch_reused = allocation != null;
         const storage = allocation orelse try allocator.alloc(scalar.ScalarRegisters, pcs.len);
         const snapshots = storage[0..pcs.len];
+        var walked: u32 = 0;
         if (pcs.len != 0) {
             // The evaluator overwrites visited snapshots and clears skipped
             // blocks before returning. No values live across preparations,
             // even after an early stop or failed read.
-            _ = scalar.evaluateDecodedResourceStateAtCheckpoints(reader, bindings, instructions, pcs, snapshots);
+            const evaluation = scalar.evaluateDecodedResourceStateAtCheckpoints(reader, bindings, instructions, pcs, snapshots);
+            walked = evaluation.instruction_count;
         }
         return .{
             .pcs = pcs,
@@ -189,6 +195,7 @@ pub const Pool = struct {
             .plan_reused = plan_reused,
             .scratch_reused = scratch_reused,
             .cacheable = cacheable,
+            .instructions_walked = walked,
         };
     }
 

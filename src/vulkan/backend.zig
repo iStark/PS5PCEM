@@ -861,7 +861,15 @@ const gds_slot_bytes = 64 * 1024;
 // complete modern-frame working set so repeated bindings remain snapshots.
 const draw_upload_ring_bytes = 256 * 1024 * 1024;
 const draw_upload_alignment = 256;
-const maximum_async_command_buffers = 512;
+// One per one-shot recording, and a sprite title records three or four of
+// those per draw: Jets 'n' Guns 2 gets through 1100 in a frame of 337 draws.
+// At 512 the pool ran dry once a frame, and running dry means submitting
+// whatever is pending and then blocking until the oldest tick completes --
+// measured at 7 ms of an 83 ms frame, a third of everything that frame spent
+// waiting on the device. These are command buffer handles from a pool that
+// already allocates in blocks of 32 and only grows on demand, so the ceiling
+// costs nothing until a title actually reaches for it.
+const maximum_async_command_buffers = 2048;
 const maximum_storage_mappings = 1024;
 
 fn reserveAlignedRange(cursor: *usize, capacity: usize, bytes: usize, alignment: usize) ?usize {
@@ -2137,6 +2145,8 @@ const FrameProfile = struct {
     submits: u64 = 0,
     command_buffers: u64 = 0,
     fence_wait_ns: u64 = 0,
+    command_pool_stalls: u64 = 0,
+    command_pool_stall_ns: u64 = 0,
     upload_bytes: u64 = 0,
     readback_bytes: u64 = 0,
     storage_upload_bytes: u64 = 0,
@@ -2229,6 +2239,7 @@ const FrameProfile = struct {
     target_readbacks: u64 = 0,
     checkpoint_prepare_ns: u64 = 0,
     checkpoint_preparations: u64 = 0,
+    checkpoint_instructions: u64 = 0,
     checkpoint_plan_misses: u64 = 0,
     checkpoint_scratch_misses: u64 = 0,
     compute_translate_ns: u64 = 0,
@@ -9100,6 +9111,7 @@ pub const Renderer = struct {
             bindings,
         );
         self.frame_profile.checkpoint_preparations += 1;
+        self.frame_profile.checkpoint_instructions +|= lease.instructions_walked;
         if (!lease.plan_reused) self.frame_profile.checkpoint_plan_misses += 1;
         if (lease.snapshots.len != 0 and !lease.scratch_reused) self.frame_profile.checkpoint_scratch_misses += 1;
         return lease;
@@ -21933,12 +21945,18 @@ pub const Renderer = struct {
             // A pathological batch can fill the pool before reaching a guest
             // synchronization packet. Submit it, then recycle the oldest slot
             // only when its timeline tick completes.
+            // Counted apart from the fence total: a frame that empties a
+            // 512-entry pool waits because it ran out of slots, not because
+            // the device had work worth waiting for.
+            self.frame_profile.command_pool_stalls +|= 1;
+            const stall_started = hostTimestampNs();
             try self.flushQueuedCommands();
             var oldest_tick: u64 = std.math.maxInt(u64);
             for (self.command_buffer_ticks.items) |tick| {
                 if (tick != command_buffer_pending_tick) oldest_tick = @min(oldest_tick, tick);
             }
             if (oldest_tick != std.math.maxInt(u64)) try self.waitForTick(oldest_tick);
+            self.frame_profile.command_pool_stall_ns +|= elapsedHostNanoseconds(stall_started);
             if (self.reusableCommandBuffer()) |index| return index;
             return Error.CommandBufferAllocationFailed;
         }
@@ -23663,8 +23681,15 @@ pub const Renderer = struct {
                 .{ self.flip_callbacks, profile.feedback_snapshots, profile.feedback_snapshot_bytes / 1024 },
             );
             std.debug.print(
-                "[gpu checkpoints] flip={d} prepare_us={d} calls={d} list_builds={d} scratch_allocations={d}\n",
-                .{ self.flip_callbacks, profile.checkpoint_prepare_ns / std.time.ns_per_us, profile.checkpoint_preparations, profile.checkpoint_plan_misses, profile.checkpoint_scratch_misses },
+                "[gpu checkpoints] flip={d} prepare_us={d} calls={d} walked={d} list_builds={d} scratch_allocations={d}\n",
+                .{ self.flip_callbacks, profile.checkpoint_prepare_ns / std.time.ns_per_us, profile.checkpoint_preparations, profile.checkpoint_instructions, profile.checkpoint_plan_misses, profile.checkpoint_scratch_misses },
+            );
+            // Separated from the fence total: waiting because the command
+            // buffer pool ran dry is a cost of how the frame was cut up, not
+            // of the work the device was given.
+            if (profile.command_pool_stalls != 0) std.debug.print(
+                "[gpu pool] flip={d} stalls={d} blocked_ms={d} buffers={d}\n",
+                .{ self.flip_callbacks, profile.command_pool_stalls, profile.command_pool_stall_ns / std.time.ns_per_ms, self.frame_command_buffers.items.len },
             );
             std.debug.print(
                 "[gpu targets] flip={d} cache={d}/{d} transfer_mib={d}\n",
