@@ -246,10 +246,17 @@ fn routeDevice(handle: i32, port: LegacyPort) bool {
         return false;
     };
     device_owner.store(handle, .release);
-    device_owner_last_signal_ms.store(audioClockMilliseconds(), .release);
-    std.debug.print(
-        "[audio] host route {d}->{d} {d}Hz ch={d} fmt={s}\n",
-        .{ previous, handle, port.frequency, port.channels, @tagName(port.samples) },
+    const routed_now = audioClockMilliseconds();
+    device_owner_last_signal_ms.store(routed_now, .release);
+    device_routed_at_ms.store(routed_now, .release);
+    // Every one of these is a device teardown, and printing from the audio
+    // path costs a blocking write. Report the first few and then only
+    // occasionally: enough to see routing happen, not enough to become the
+    // problem being reported.
+    const route_count = device_route_count.fetchAdd(1, .monotonic) + 1;
+    if (route_count <= 8 or route_count % 64 == 0) std.debug.print(
+        "[audio] host route #{d} {d}->{d} {d}Hz ch={d} fmt={s}\n",
+        .{ route_count, previous, handle, port.frequency, port.channels, @tagName(port.samples) },
     );
     return true;
 }
@@ -442,7 +449,30 @@ fn fillTestTone(port: LegacyPort, dest: []u8) void {
     audio_test_tone_phase = phase;
 }
 
-const audio_route_stale_ms: u64 = 100;
+/// How long an owner may go without signal before another port may claim the
+/// device.
+///
+/// This was 100 ms, which is inside one frame when a title runs slowly: Jets 'n'
+/// Guns 2 at 13 FPS submits every 70-92 ms, so a single long frame made the
+/// owner look abandoned. Two simultaneously active ports then took the device
+/// from each other several times per frame, and every exchange closes and
+/// reopens the host device -- the mix is not glitching, it is being torn down
+/// mid-playback, repeatedly.
+///
+/// A port that has genuinely stopped stays quiet far longer than this, so the
+/// reassignment this threshold exists for still happens.
+const audio_route_stale_ms: u64 = 500;
+
+/// Minimum time the device stays where it was just put.
+///
+/// The staleness rule alone cannot stop an exchange: both ports pass it at the
+/// same moment, and each hand-off makes the other side look stale in turn.
+/// Holding a fresh route briefly breaks that loop, and is short enough to be
+/// inaudible when a reassignment really is needed.
+const audio_route_hold_ms: u64 = 250;
+
+var device_routed_at_ms = std.atomic.Value(u64).init(0);
+var device_route_count = std.atomic.Value(u64).init(0);
 
 fn audioOutOutputImpl(handle: i32, data: ?*const anyopaque, fallback_pacing: bool, force_route: bool) i32 {
     const port = legacyPort(handle, .output) orelse return audio_out_error_invalid_port;
@@ -461,8 +491,11 @@ fn audioOutOutputImpl(handle: i32, data: ?*const anyopaque, fallback_pacing: boo
         const now = audioClockMilliseconds();
         const owner = device_owner.load(.acquire);
         const last_signal = device_owner_last_signal_ms.load(.acquire);
+        const routed_at = device_routed_at_ms.load(.acquire);
+        const settled = now -| routed_at >= audio_route_hold_ms;
         if (force_route or owner == -1 or
-            (owner != handle and source_peak >= 8 and now -| last_signal >= audio_route_stale_ms))
+            (owner != handle and settled and source_peak >= 8 and
+                now -| last_signal >= audio_route_stale_ms))
         {
             _ = routeDevice(handle, port);
         }
