@@ -200,4 +200,13 @@ pub const driver_exports = [_]symbols.Export{
     .{ .name = "sceAgcDriverUnknownWHIOMbbIIU", .function = trace.wrap("sceAgcDriverUnknownWHIOMbbIIU", &agc.accept), .id_override = "WHIOMbb+iIU" },
     .{ .name = "sceAgcDriverUnknownChJWZcNSzjk", .function = trace.wrap("sceAgcDriverUnknownChJWZcNSzjk", &agc.accept), .id_override = "chJWZcNSzjk" },
     .{ .name = "sceAgcDriverUnknownIAOE3jCnkk", .function = trace.wrap("sceAgcDriverUnknownIAOE3jCnkk", &agc.accept), .id_override = "+iAOE3jCnkk" },
+    // Dreaming Sarah imports these three. The jump patch is the one with
+    // known behaviour -- it points an INDIRECT_BUFFER at the buffer it should
+    // run -- so it is implemented rather than accepted; a jump left unpatched
+    // and reported as patched would run whatever the packet happened to hold.
+    // The other two have no published name, so they follow the convention the
+    // rest of this table already uses for that.
+    .{ .name = "sceAgcJumpPatchSetTarget", .function = trace.wrap("sceAgcJumpPatchSetTarget", &agc.jumpPatchSetTarget), .id_override = "2BS4EtAaF28" },
+    .{ .name = "sceAgcUnknownXb8VgcXQhvI", .function = trace.wrap("sceAgcUnknownXb8VgcXQhvI", &agc.accept), .id_override = "xb8VgcXQhvI" },
+    .{ .name = "sceAgcUnknownQmfvaYpsOcI", .function = trace.wrap("sceAgcUnknownQmfvaYpsOcI", &agc.accept), .id_override = "QmfvaYpsOcI" },
 };

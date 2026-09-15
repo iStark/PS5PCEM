@@ -691,6 +691,30 @@ pub fn zeroQuery(_: u64, _: u64, _: u64, _: u64, _: u64, _: u64) callconv(abi.gu
     return 0;
 }
 
+/// Points a jump the title has already written at the buffer it should run.
+///
+/// A title reserves the INDIRECT_BUFFER packet before the target exists and
+/// fills it in afterwards, so the address and the length arrive separately
+/// from the packet itself. Refusing anything that is not that packet matters:
+/// the words written here are the low and high halves of an address and a
+/// twenty-bit length, and writing them over some other command would leave a
+/// stream that reads as valid and jumps somewhere it was never meant to.
+pub fn jumpPatchSetTarget(
+    command: ?[*]u32,
+    target: u64,
+    size_in_dwords: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+) callconv(abi.guest) i32 {
+    const words = command orelse return errno.Posix.einval;
+    if (@as(u8, @truncate(words[0] >> 8)) != gpu.pm4.indirect_buffer) return errno.Posix.einval;
+    words[1] = @truncate(target);
+    words[2] = (words[2] & 0xffff_0000) | @as(u32, @truncate(target >> 32)) & 0xffff;
+    words[3] = (words[3] & 0xfff0_0000) | (@as(u32, @truncate(size_in_dwords)) & 0x000f_ffff);
+    return errno.ok;
+}
+
 /// Accepts a setting that changes nothing observable here.
 pub fn accept(_: u64, _: u64, _: u64, _: u64, _: u64, _: u64) callconv(abi.guest) i32 {
     return errno.ok;
