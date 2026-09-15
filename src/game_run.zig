@@ -136,6 +136,10 @@ fn resolveVideoOutBuffer(_: ?*anyopaque, flip: gpu.state.Flip) ?vulkan.DisplayBu
     };
 }
 
+fn listVideoOutAddresses(_: ?*anyopaque, out: []u64) usize {
+    return runtime.firmware.video_out.copyRegisteredAddresses(out);
+}
+
 fn updateHostWindowFps(context: ?*anyopaque, fps_tenths: u32) void {
     const host_window: *window.HostWindow = @ptrCast(@alignCast(context orelse return));
     host_window.updateFps(fps_tenths);
@@ -767,6 +771,7 @@ fn run(init: std.process.Init) !bool {
         renderer.setDisplayBufferResolver(.{
             .context = null,
             .resolve = resolveVideoOutBuffer,
+            .list_addresses = listVideoOutAddresses,
         });
         const address_space = &emu.address_space.?;
         if (enable_gpu_page_tracker) address_space.enableGpuMemoryTracking();
@@ -807,6 +812,7 @@ fn run(init: std.process.Init) !bool {
             native.width,
             native.height,
         });
+        try out.print("  scanout channel order uses the registered buffer set\n", .{});
         try out.print(
             "  GPU flags ir={d} ssa={d} async_pso={d} aliases={d} depth_io={d} image_state_opt={d} timeline={d} timeline_auto={d} defer_storage={d} defer_storage_auto={d} page_tracker={d} buffer_content_cache={d} copy_workers={d} render_targets={d} storage_image_mib={d} compute_translation_mib={d}\n",
             .{

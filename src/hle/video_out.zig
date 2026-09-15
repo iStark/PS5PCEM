@@ -328,6 +328,24 @@ fn labelByteRange(address: u64, length: usize) ?struct { start: usize, end: usiz
     return .{ .start = @intCast(offset), .end = @intCast(offset + length) };
 }
 
+/// Occupied display-buffer virtual addresses, in slot order.
+///
+/// Presentation consults the whole registered set when choosing a channel
+/// order, because titles rotate through these allocations and they must all
+/// be read the same way.
+pub fn copyRegisteredAddresses(out: []u64) usize {
+    lock.lock();
+    defer lock.unlock();
+    var count: usize = 0;
+    for (buffers) |slot| {
+        if (!slot.occupied or slot.data_address == 0) continue;
+        if (count == out.len) break;
+        out[count] = slot.data_address;
+        count += 1;
+    }
+    return count;
+}
+
 pub fn resolve(handle: u32, buffer_index: i32) ?Registration {
     lock.lock();
     defer lock.unlock();
@@ -427,6 +445,24 @@ pub fn status(handle: i32) ?FlipStatus {
     defer lock.unlock();
     if (handle != primary_handle or !opened) return null;
     return flip_status;
+}
+
+test "copyRegisteredAddresses lists occupied slots in order" {
+    reset();
+    defer reset();
+    try std.testing.expect(open(0));
+    var first: [4]u8 = @splat(0);
+    var second: [4]u8 = @splat(0);
+    const input = [_]Buffer{
+        .{ .data = &first, .metadata = null, .reserved = .{ null, null } },
+        .{ .data = &second, .metadata = null, .reserved = .{ null, null } },
+    };
+    try registerBuffers(0, 1, &input, .{ .width = 1, .height = 1 }, 0);
+    var addresses: [maximum_buffers]u64 = undefined;
+    const count = copyRegisteredAddresses(&addresses);
+    try std.testing.expectEqual(@as(usize, 2), count);
+    try std.testing.expectEqual(@as(u64, @intFromPtr(&first)), addresses[0]);
+    try std.testing.expectEqual(@as(u64, @intFromPtr(&second)), addresses[1]);
 }
 
 test "registered buffers resolve through a completed SetFlip" {

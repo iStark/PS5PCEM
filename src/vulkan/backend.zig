@@ -398,6 +398,9 @@ pub const DisplayBuffer = struct {
 pub const DisplayBufferResolver = struct {
     context: ?*anyopaque,
     resolve: *const fn (?*anyopaque, gpu.state.Flip) ?DisplayBuffer,
+    /// Optional: fill `out` with every registered scanout address. Presentation
+    /// uses the set, not one flip, when choosing a channel order.
+    list_addresses: ?*const fn (?*anyopaque, []u64) usize = null,
 };
 
 pub const StagedBuffer = struct {
@@ -3680,6 +3683,9 @@ pub const Renderer = struct {
     graphics_probe_colored_pixels: u32 = 0,
     graphics_probe_frame: [graphics_probe_bytes]u8 = @splat(0),
     render_targets: std.ArrayList(CachedRenderTarget) = .empty,
+    /// Latched when a registered scanout buffer turns out to hold texels no
+    /// colour export wrote. See scanoutSwapsRedBlue.
+    scanout_filled_by_copy: bool = false,
     render_target_address_index: @import("sampled_image_index.zig").Index(4096) = .{},
     render_target_cache_limit: usize = 64,
     color_passes: std.ArrayList(ColorPass) = .empty,
@@ -4981,8 +4987,25 @@ pub const Renderer = struct {
         if (!target.initialized or target.target.descriptor.fragments_log2 != 0) {
             return Error.MissingPresentedFrame;
         }
-        const bgra_source = if (target.target.format.vulkan == vk.format_r8g8b8a8_unorm and
-            self.scanoutSwapsRedBlue(target.target.descriptor.address, flip))
+        const swap_red_blue = target.target.format.vulkan == vk.format_r8g8b8a8_unorm and
+            self.scanoutSwapsRedBlue(
+                target.target.descriptor.address,
+                target.color_export_generation != 0,
+                flip,
+            );
+        if (self.flip_callbacks <= 24 or self.flip_callbacks % 64 == 0 or log_verbose_gpu) {
+            std.debug.print(
+                "[vulkan dcb] flip #{d} gpu blit swap={any} copy_set={any} export_gen={d} @0x{x}\n",
+                .{
+                    self.flip_callbacks,
+                    swap_red_blue,
+                    self.scanout_filled_by_copy,
+                    target.color_export_generation,
+                    target.target.descriptor.address,
+                },
+            );
+        }
+        const bgra_source = if (swap_red_blue)
             try self.acquireMagnifySourceImage(target.target.descriptor.width, target.target.descriptor.height, vk.format_b8g8r8a8_unorm)
         else
             null;
@@ -5121,12 +5144,119 @@ pub const Renderer = struct {
         if (presented != vk.success and presented != vk.suboptimal_khr) return Error.SwapchainPresentFailed;
     }
 
-    fn scanoutSwapsRedBlue(self: *Renderer, address: u64, flip: ?gpu.state.Flip) bool {
+    /// Whether a colour export wrote the texels currently cached at `address`.
+    ///
+    /// Several attachments can share one address. A DISABLE or zero-mask pass
+    /// leaves a gen=0 sibling beside a real export; treating that sibling as
+    /// copy-filled latched Cat Quest III into the Asterix path and the gfx
+    /// worker then walked a bad pointer. The address is exported once any
+    /// entry has a colour export. It is copy-filled only when every cached
+    /// entry is unexported, which is Asterix's two copy destinations.
+    /// `null` means nothing cached covers it yet, so it does not vote.
+    fn cachedScanoutExport(self: *const Renderer, address: u64) ?bool {
+        var saw_any = false;
+        var saw_export = false;
+        for (self.render_targets.items) |cached| {
+            if (cached.address() != address or !cached.initialized) continue;
+            saw_any = true;
+            if (cached.color_export_generation != 0) saw_export = true;
+        }
+        if (!saw_any) return null;
+        return saw_export;
+    }
+
+    /// Latch the registered scanout set as copy-filled once any member is.
+    ///
+    /// CB_COLOR_INFO.COMP_SWAP is applied on the way in, by the colour export
+    /// swizzle, so reinterpreting the scanout undoes it. A buffer a copy filled
+    /// was never permuted and has nothing to undo. Titles rotate through their
+    /// registered buffers, so the members must all be read the same way:
+    /// deciding per presented buffer made mean red and blue trade places as
+    /// the rotation advanced.
+    ///
+    /// Cat Quest III exports into every registered buffer and wants the undo.
+    /// Asterix & Obelix exports into one of three and fills the others by copy;
+    /// the order those copies carry is the order its export wants too, so the
+    /// whole set wants no undo. How a title composes its frame does not change
+    /// mid-run, so the first unexported member latches the set. Uncached
+    /// addresses do not vote: treating them as unexported would disable the
+    /// undo on Cat Quest III's first buffer, before the other two exist.
+    fn noteScanoutSetProvenance(self: *Renderer, current_address: u64, _: ?bool) void {
+        if (self.scanout_filled_by_copy) return;
+
+        var addresses: [16]u64 = undefined;
+        var count: usize = 0;
+        if (self.display_buffer_resolver) |resolver| {
+            if (resolver.list_addresses) |list_addresses| {
+                count = list_addresses(resolver.context, &addresses);
+            }
+        }
+        if (count == 0) {
+            addresses[0] = current_address;
+            count = 1;
+        }
+
+        var exported_count: u32 = 0;
+        var copy_count: u32 = 0;
+        var unseen_count: u32 = 0;
+        for (addresses[0..count]) |address| {
+            const exported = self.cachedScanoutExport(address) orelse {
+                unseen_count += 1;
+                continue;
+            };
+            if (exported) {
+                exported_count += 1;
+            } else {
+                copy_count += 1;
+            }
+        }
+        if (copy_count != 0) {
+            self.scanout_filled_by_copy = true;
+            std.debug.print(
+                "[vulkan dcb] scanout set is copy-filled; leaving VideoOut channel order as stored (flip #{d} n={d} exported={d} copy={d} unseen={d})\n",
+                .{ self.flip_callbacks, count, exported_count, copy_count, unseen_count },
+            );
+        } else if (self.flip_callbacks <= 24 or self.flip_callbacks % 64 == 0 or log_verbose_gpu) {
+            std.debug.print(
+                "[vulkan dcb] flip #{d} scanout set n={d} exported={d} copy={d} unseen={d} swap={any} @0x{x}\n",
+                .{
+                    self.flip_callbacks,
+                    count,
+                    exported_count,
+                    copy_count,
+                    unseen_count,
+                    !self.scanout_filled_by_copy,
+                    current_address,
+                },
+            );
+        }
+    }
+
+    fn reportPresentedChannelMeans(self: *const Renderer, pixels: []const u8) void {
+        if (self.flip_callbacks > 24 and !log_verbose_gpu) return;
+        const mean = meanRgb(pixels);
+        std.debug.print(
+            "[vulkan dcb] flip #{d} presented mean rgb={d},{d},{d} swap={any} copy_set={any}\n",
+            .{
+                self.flip_callbacks,
+                mean.r,
+                mean.g,
+                mean.b,
+                !self.scanout_filled_by_copy,
+                self.scanout_filled_by_copy,
+            },
+        );
+    }
+
+    fn scanoutSwapsRedBlue(self: *Renderer, address: u64, exported: ?bool, flip: ?gpu.state.Flip) bool {
         const resolver = self.display_buffer_resolver orelse return false;
         const buffer = resolver.resolve(resolver.context, flip orelse return false) orelse return false;
         // Offscreen compatibility layers and decoded movie surfaces have their
         // own colour interpretation; only the registered scanout uses VideoOut.
-        return buffer.address == address and buffer.pixel_format == 0x8000_0000_0000_0000;
+        if (buffer.address != address or buffer.pixel_format != 0x8000_0000_0000_0000)
+            return false;
+        self.noteScanoutSetProvenance(address, exported);
+        return !self.scanout_filled_by_copy;
     }
 
     /// Preserve physical texel bits while interpreting the scanout as BGRA.
@@ -23219,10 +23349,14 @@ pub const Renderer = struct {
     fn presentationPixels(self: *Renderer, frame: *const CachedFrame, flip: gpu.state.Flip) ?[]const u8 {
         const target = frame.target orelse return frame.pixels.items;
         if (target.format.vulkan == vk.format_r8g8b8a8_unorm) {
-            if (!self.scanoutSwapsRedBlue(frame.guest_address, flip)) return frame.pixels.items;
+            if (!self.scanoutSwapsRedBlue(frame.guest_address, null, flip)) {
+                self.reportPresentedChannelMeans(frame.pixels.items);
+                return frame.pixels.items;
+            }
             self.guest_frame_scratch.resize(self.allocator, frame.pixels.items.len) catch return null;
             @memcpy(self.guest_frame_scratch.items, frame.pixels.items);
             swapRedBlue(self.guest_frame_scratch.items);
+            self.reportPresentedChannelMeans(self.guest_frame_scratch.items);
             return self.guest_frame_scratch.items;
         }
         if (target.format.vulkan != vk.format_b10g11r11_ufloat_pack32 and
@@ -23381,7 +23515,9 @@ pub const Renderer = struct {
             }
         }
 
-        if (buffer.pixel_format == 0x8000_0000_0000_0000) swapRedBlue(self.guest_frame_scratch.items);
+        if (self.scanoutSwapsRedBlue(buffer.address, null, flip))
+            swapRedBlue(self.guest_frame_scratch.items);
+        self.reportPresentedChannelMeans(self.guest_frame_scratch.items);
         self.maybeDumpProgressFrame(
             self.guest_frame_scratch.items,
             buffer.width,
@@ -26297,6 +26433,26 @@ fn countNonzeroRgba(linear: []const u8) u32 {
         if (linear[i] != 0 or linear[i + 1] != 0 or linear[i + 2] != 0 or linear[i + 3] != 0) nonzero += 1;
     }
     return nonzero;
+}
+
+fn meanRgb(linear: []const u8) struct { r: u32, g: u32, b: u32 } {
+    var r: u64 = 0;
+    var g: u64 = 0;
+    var b: u64 = 0;
+    var n: u64 = 0;
+    var i: usize = 0;
+    while (i + 3 < linear.len) : (i += 4) {
+        r += linear[i];
+        g += linear[i + 1];
+        b += linear[i + 2];
+        n += 1;
+    }
+    if (n == 0) return .{ .r = 0, .g = 0, .b = 0 };
+    return .{
+        .r = @intCast(r / n),
+        .g = @intCast(g / n),
+        .b = @intCast(b / n),
+    };
 }
 
 fn countNonblackRgb(linear: []const u8) u32 {
@@ -32234,6 +32390,9 @@ test "RGBA occupancy preserves black alpha and destination alpha is explicit" {
     };
     try std.testing.expectEqual(@as(u32, 2), countNonzeroRgba(&pixels));
     try std.testing.expectEqual(@as(u32, 1), countNonblackRgb(&pixels));
+    try std.testing.expectEqual(@as(u32, 1), meanRgb(&pixels).r);
+    try std.testing.expectEqual(@as(u32, 0), meanRgb(&pixels).g);
+    try std.testing.expectEqual(@as(u32, 0), meanRgb(&pixels).b);
     forceDestinationAlphaOne(&pixels);
     try std.testing.expectEqualSlices(u8, &.{ 255, 255, 255 }, &.{ pixels[3], pixels[7], pixels[11] });
 }
