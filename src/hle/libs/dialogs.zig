@@ -277,6 +277,31 @@ fn signinDialogTerminate() callconv(abi.guest) i32 {
     return errno.ok;
 }
 
+// Login dialog -------------------------------------------------------------
+
+/// The shell's account sign-in prompt.
+///
+/// Quake II polls it without ever opening one, which is what a title does when
+/// it checks whether a sign-in it did not start is still up. There is no shell
+/// here to put one up, and the user service already reports a signed-in local
+/// user, so the dialog is finished and its outcome is the sign-in that already
+/// holds rather than the cancellation the signin dialog reports -- nothing was
+/// dismissed.
+fn loginDialogUpdateStatus() callconv(abi.guest) i32 {
+    return status_finished;
+}
+
+fn loginDialogGetResult(result: ?*[8]u8) callconv(abi.guest) i32 {
+    const output = result orelse return @bitCast(@as(u32, 0x8135_0003));
+    @memset(output, 0);
+    return errno.ok;
+}
+
+const login_dialog_exports = [_]symbols.Export{
+    .{ .name = "sceLoginDialogUpdateStatus", .function = trace.wrap("sceLoginDialogUpdateStatus", &loginDialogUpdateStatus), .expect_id = "2rc+egSfb5A" },
+    .{ .name = "sceLoginDialogGetResult", .function = trace.wrap("sceLoginDialogGetResult", &loginDialogGetResult), .expect_id = "Btkx21f1M8k" },
+};
+
 const signin_dialog_exports = [_]symbols.Export{
     .{ .name = "sceSigninDialogUpdateStatus", .function = trace.wrap("sceSigninDialogUpdateStatus", &signinDialogUpdateStatus), .expect_id = "Bw31liTFT3A" },
     .{ .name = "sceSigninDialogInitialize", .function = trace.wrap("sceSigninDialogInitialize", &signinDialogInitialize), .expect_id = "mlYGfmqE3fQ" },
@@ -645,6 +670,7 @@ pub fn register(db: *symbols.Database, gpa: std.mem.Allocator) symbols.Error!voi
     try db.addLibrary(gpa, .{ .name = "libSceMsgDialog.native" }, .{ .name = "libSceMsgDialog" }, &message_dialog_exports);
     try db.addLibrary(gpa, .{ .name = "libSceWebBrowserDialog" }, .{ .name = "libSceWebBrowserDialog" }, &browser_dialog_exports);
     try db.addLibrary(gpa, .{ .name = "libSceSigninDialog" }, .{ .name = "libSceSigninDialog" }, &signin_dialog_exports);
+    try db.addLibrary(gpa, .{ .name = "libSceLoginDialog" }, .{ .name = "libSceLoginDialog" }, &login_dialog_exports);
     try db.addLibrary(gpa, .{ .name = "libScePlayGoDialog" }, .{ .name = "libScePlayGoDialog" }, &playgo_dialog_exports);
     try db.addLibrary(gpa, .{ .name = "libSceCdlgPlayerReview" }, .{ .name = "libSceCdlgPlayerReview" }, &player_review_dialog_exports);
     try db.addLibrary(gpa, .{ .name = "libSceSaveDataDialog.native" }, .{ .name = "libSceSaveDataDialog" }, &save_dialog_exports);

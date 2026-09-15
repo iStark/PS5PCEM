@@ -459,6 +459,57 @@ pub const voiceqos_exports = [_]symbols.Export{
     .{ .name = "libSceVoiceQoS:cpC-zyHoMik", .function = trace.wrap("libSceVoiceQoS:cpC-zyHoMik", &services.offline), .id_override = "cpC-zyHoMik" },
 };
 
+/// Touchpad gesture recognition.
+///
+/// The recognizers are host-side state the firmware updates from touch
+/// reports; with no touches arriving there is nothing to recognize. Creating
+/// and updating a recognizer succeeds so a title's per-frame update loop runs
+/// as written, and the event count it then reads is zero. Fetching an event by
+/// index reports an invalid argument, which is what an index past the count
+/// deserves.
+pub const systemgesture_exports = [_]symbols.Export{
+    .{ .name = "sceSystemGestureOpen", .function = trace.wrap("sceSystemGestureOpen", &services.accept), .expect_id = "qpo-mEOwje0" },
+    .{ .name = "sceSystemGestureCreateTouchRecognizer", .function = trace.wrap("sceSystemGestureCreateTouchRecognizer", &services.accept), .expect_id = "FWF8zkhr854" },
+    .{ .name = "sceSystemGestureAppendTouchRecognizer", .function = trace.wrap("sceSystemGestureAppendTouchRecognizer", &services.accept), .expect_id = "1MMK0W-kMgA" },
+    .{ .name = "sceSystemGestureRemoveTouchRecognizer", .function = trace.wrap("sceSystemGestureRemoveTouchRecognizer", &services.accept), .expect_id = "ELvBVG-LKT0" },
+    .{ .name = "sceSystemGestureUpdatePrimitiveTouchRecognizer", .function = trace.wrap("sceSystemGestureUpdatePrimitiveTouchRecognizer", &services.accept), .expect_id = "GgFMb22sbbI" },
+    .{ .name = "sceSystemGestureUpdateAllTouchRecognizer", .function = trace.wrap("sceSystemGestureUpdateAllTouchRecognizer", &services.accept), .expect_id = "wPJGwI2RM2I" },
+    .{ .name = "sceSystemGestureGetTouchEventsCount", .function = trace.wrap("sceSystemGestureGetTouchEventsCount", &services.noEvents), .expect_id = "h8uongcBNVs" },
+    .{ .name = "sceSystemGestureGetTouchEventByIndex", .function = trace.wrap("sceSystemGestureGetTouchEventByIndex", &services.absent), .expect_id = "TSKvgSz5ChU" },
+    .{ .name = "sceSystemGestureClose", .function = trace.wrap("sceSystemGestureClose", &services.accept), .expect_id = "j4yXIA2jJ68" },
+    .{ .name = "sceSystemGestureInitializePrimitiveTouchRecognizer", .function = trace.wrap("sceSystemGestureInitializePrimitiveTouchRecognizer", &services.accept), .expect_id = "3pcAvmwKCvM" },
+    .{ .name = "sceSystemGestureFinalizePrimitiveTouchRecognizer", .function = trace.wrap("sceSystemGestureFinalizePrimitiveTouchRecognizer", &services.accept), .expect_id = "3QYCmMlOlCY" },
+    .{ .name = "sceSystemGestureResetPrimitiveTouchRecognizer", .function = trace.wrap("sceSystemGestureResetPrimitiveTouchRecognizer", &services.accept), .expect_id = "o11J529VaAE" },
+    .{ .name = "sceSystemGestureResetTouchRecognizer", .function = trace.wrap("sceSystemGestureResetTouchRecognizer", &services.accept), .expect_id = "oBuH3zFWYIg" },
+    .{ .name = "sceSystemGestureUpdateTouchRecognizer", .function = trace.wrap("sceSystemGestureUpdateTouchRecognizer", &services.accept), .expect_id = "j4h82CQWENo" },
+    .{ .name = "sceSystemGestureUpdateTouchRecognizerRectangle", .function = trace.wrap("sceSystemGestureUpdateTouchRecognizerRectangle", &services.accept), .expect_id = "4WOA1eTx3V8" },
+    .{ .name = "sceSystemGestureGetPrimitiveTouchEventsCount", .function = trace.wrap("sceSystemGestureGetPrimitiveTouchEventsCount", &services.noEvents), .expect_id = "JhwByySf9FY" },
+    .{ .name = "sceSystemGestureGetPrimitiveTouchEvents", .function = trace.wrap("sceSystemGestureGetPrimitiveTouchEvents", &services.noEvents), .expect_id = "L8YmemOeSNY" },
+    .{ .name = "sceSystemGestureGetTouchEvents", .function = trace.wrap("sceSystemGestureGetTouchEvents", &services.noEvents), .expect_id = "fLTseA7XiWY" },
+    .{ .name = "sceSystemGestureGetPrimitiveTouchEventByIndex", .function = trace.wrap("sceSystemGestureGetPrimitiveTouchEventByIndex", &services.absent), .expect_id = "KAeP0+cQPVU" },
+    .{ .name = "sceSystemGestureGetPrimitiveTouchEventByPrimitiveID", .function = trace.wrap("sceSystemGestureGetPrimitiveTouchEventByPrimitiveID", &services.absent), .expect_id = "yBaQ0h9m1NM" },
+    .{ .name = "sceSystemGestureGetTouchEventByEventID", .function = trace.wrap("sceSystemGestureGetTouchEventByEventID", &services.absent), .expect_id = "lpsXm7tzeoc" },
+    .{ .name = "sceSystemGestureGetTouchRecognizerInformation", .function = trace.wrap("sceSystemGestureGetTouchRecognizerInformation", &services.absent), .expect_id = "0KrW5eMnrwY" },
+};
+
+/// Voice chat. Quake II's party module links against it whether or not a
+/// party exists, so the graph needs these to resolve; there is no headset
+/// routed through a party here, so they answer as an unavailable service
+/// rather than handing back ports a title would then write audio into.
+pub const voice_exports = [_]symbols.Export{
+    .{ .name = "sceVoiceInit", .function = trace.wrap("sceVoiceInit", &services.offline), .expect_id = "9TrhuGzberQ" },
+    .{ .name = "sceVoiceEnd", .function = trace.wrap("sceVoiceEnd", &services.offline), .expect_id = "Oo0S5PH7FIQ" },
+    .{ .name = "sceVoiceStart", .function = trace.wrap("sceVoiceStart", &services.offline), .expect_id = "54phPH2LZls" },
+    .{ .name = "sceVoiceStop", .function = trace.wrap("sceVoiceStop", &services.offline), .expect_id = "Ao2YNSA7-Qo" },
+    .{ .name = "sceVoiceCreatePort", .function = trace.wrap("sceVoiceCreatePort", &services.offline), .expect_id = "nXpje5yNpaE" },
+    .{ .name = "sceVoiceDeletePort", .function = trace.wrap("sceVoiceDeletePort", &services.offline), .expect_id = "b7kJI+nx2hg" },
+    .{ .name = "sceVoiceConnectIPortToOPort", .function = trace.wrap("sceVoiceConnectIPortToOPort", &services.offline), .expect_id = "oV9GAdJ23Gw" },
+    .{ .name = "sceVoiceDisconnectIPortFromOPort", .function = trace.wrap("sceVoiceDisconnectIPortFromOPort", &services.offline), .expect_id = "ajVj3QG2um4" },
+    .{ .name = "sceVoiceGetPortInfo", .function = trace.wrap("sceVoiceGetPortInfo", &services.offline), .expect_id = "CrLqDwWLoXM" },
+    .{ .name = "sceVoiceReadFromOPort", .function = trace.wrap("sceVoiceReadFromOPort", &services.offline), .expect_id = "cQ6DGsQEjV4" },
+    .{ .name = "sceVoiceWriteToIPort", .function = trace.wrap("sceVoiceWriteToIPort", &services.offline), .expect_id = "YeJl6yDlhW0" },
+};
+
 pub const videodec2_exports = [_]symbols.Export{
     .{ .name = "sceVideodec2ReleaseComputeQueue", .function = trace.wrap("sceVideodec2ReleaseComputeQueue", &videodec2.releaseComputeQueue), .expect_id = "UvtA3FAiF4Y" },
     .{ .name = "sceVideodec2Reset", .function = trace.wrap("sceVideodec2Reset", &videodec2.reset), .expect_id = "wJXikG6QFN8" },
@@ -621,6 +672,8 @@ pub const all = [_]Table{
     .{ .library = "libSceShare", .module = "libSceShare", .exports = &share_exports },
     .{ .library = "libSceVideoOut", .module = "libSceVideoOut", .exports = &videoout_exports },
     .{ .library = "libSceVideodec2", .module = "libSceVideodec2", .exports = &videodec2_exports },
+    .{ .library = "libSceSystemGesture", .module = "libSceSystemGesture", .exports = &systemgesture_exports },
+    .{ .library = "libSceVoice", .module = "libSceVoice", .exports = &voice_exports },
     .{ .library = "libSceVoiceQoS", .module = "libSceVoiceQoS", .exports = &voiceqos_exports },
     .{ .library = "libSceConvertKeycode", .module = "libSceConvertKeycode", .exports = &convert_keycode_exports },
     .{ .library = "libSceVrTracker2", .module = "libSceVrTracker2", .exports = &vrtracker2_exports },

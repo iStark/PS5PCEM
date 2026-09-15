@@ -61,6 +61,14 @@ pub fn notAttached(_: u64, _: u64, _: u64, _: u64, _: u64, _: u64) callconv(abi.
     return 0;
 }
 
+/// A count of events that never arrive.
+///
+/// Kept apart from `accept` despite the identical zero: this one is a value the
+/// caller reads and loops over, not an acknowledgement it discards.
+pub fn noEvents(_: u64, _: u64, _: u64, _: u64, _: u64, _: u64) callconv(abi.guest) i32 {
+    return 0;
+}
+
 /// Bookkeeping that changes nothing observable and has nothing to report back.
 ///
 /// Kept apart from the refusals on purpose: refusing a title's attempt to, say,

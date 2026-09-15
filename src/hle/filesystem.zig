@@ -361,6 +361,11 @@ const OpenFile = struct {
     directory_iterator: ?std.Io.Dir.Iterator = null,
     /// The first two directory entries are synthesized as `.` and `..`.
     directory_index: u64 = 0,
+    /// An entry taken from the iterator that did not fit the caller's buffer.
+    /// The iterator cannot hand it back, so it waits here for the next call.
+    pending_name: [maximum_name]u8 = undefined,
+    pending_length: u16 = 0,
+    pending_directory: bool = false,
     device: ?Device = null,
     /// An offline POSIX socket. It owns only a descriptor slot; network
     /// operations decide whether to acknowledge local state or report ENETDOWN.
@@ -1366,8 +1371,20 @@ fn directoryEntryHash(name: []const u8) u32 {
 
 /// Writes one PS5/BSD directory record. The ABI uses a fixed 512-byte record:
 /// inode, record length, type, name length, then a zero-terminated name.
+/// Longest name a `SceKernelDirent` carries, and the size of the record that
+/// holds one. The guest reads `d_name` as a fixed 256-byte array, so a caller
+/// that copies the whole field must stay inside the record we reported.
+const maximum_name: usize = 255;
+const dirent_maximum: usize = direntLength(maximum_name);
+
+/// Record length for a name: the fixed header, the name, its terminator, and
+/// padding up to the eight-byte alignment the guest's own iteration assumes.
+fn direntLength(name_length: usize) usize {
+    return std.mem.alignForward(usize, 8 + name_length + 1, 8);
+}
+
 pub fn getDents(descriptor: i32, buffer: []u8, base_position: ?*u64) Error!usize {
-    if (buffer.len < 512) return Error.InvalidArgument;
+    if (buffer.len < dirent_maximum) return Error.InvalidArgument;
     const io = active_io orelse return Error.NotAttached;
 
     table_lock.lock();
@@ -1377,34 +1394,67 @@ pub fn getDents(descriptor: i32, buffer: []u8, base_position: ?*u64) Error!usize
     if (entry.directory == null and !entry.diagnostic_directory) return Error.InvalidArgument;
     if (base_position) |position| position.* = entry.directory_index;
 
-    var kind: std.Io.File.Kind = .directory;
-    const name: []const u8 = switch (entry.directory_index) {
-        0 => ".",
-        1 => "..",
-        else => blk: {
-            if (entry.diagnostic_directory) {
-                const child = if (std.ascii.eqlIgnoreCase(entry.path(), devlog_root)) "app" else "debug.log";
-                if (entry.directory_index > 2) return 0;
-                kind = if (std.ascii.eqlIgnoreCase(entry.path(), devlog_root)) .directory else .file;
-                break :blk child;
+    // Pack as many entries as the caller's buffer holds, each `d_reclen` long.
+    //
+    // One entry padded to a full record per call is a listing a caller can only
+    // read by looping, and a caller that reads a directory in a single call --
+    // Quake II reads /app0/baseq2 exactly once -- then sees a directory holding
+    // nothing but `.`, misses pak0.pak beside it, and fails on the first file
+    // it expected to find inside.
+    var written: usize = 0;
+    while (buffer.len - written >= dirent_maximum) {
+        var name_storage: [maximum_name]u8 = undefined;
+        var is_directory = true;
+        const name: []const u8 = blk: {
+            if (entry.pending_length != 0) {
+                const length = entry.pending_length;
+                is_directory = entry.pending_directory;
+                @memcpy(name_storage[0..length], entry.pending_name[0..length]);
+                entry.pending_length = 0;
+                break :blk name_storage[0..length];
             }
-            const iterator = if (entry.directory_iterator) |*value| value else return Error.IoFailed;
-            const child = iterator.next(io) catch return Error.IoFailed;
-            const found = child orelse return 0;
-            kind = found.kind;
-            break :blk found.name;
-        },
-    };
+            switch (entry.directory_index) {
+                0 => break :blk ".",
+                1 => break :blk "..",
+                else => {
+                    if (entry.diagnostic_directory) {
+                        if (entry.directory_index > 2) break;
+                        const devlog = std.ascii.eqlIgnoreCase(entry.path(), devlog_root);
+                        is_directory = devlog;
+                        break :blk if (devlog) "app" else "debug.log";
+                    }
+                    const iterator = if (entry.directory_iterator) |*value| value else return Error.IoFailed;
+                    const child = iterator.next(io) catch return Error.IoFailed;
+                    const found = child orelse break;
+                    is_directory = found.kind == .directory;
+                    const length = @min(found.name.len, maximum_name);
+                    @memcpy(name_storage[0..length], found.name[0..length]);
+                    break :blk name_storage[0..length];
+                },
+            }
+        };
 
-    const name_length = @min(name.len, 255);
-    @memset(buffer[0..512], 0);
-    std.mem.writeInt(u32, buffer[0..4], directoryEntryHash(name[0..name_length]), .little);
-    std.mem.writeInt(u16, buffer[4..6], 512, .little);
-    buffer[6] = if (kind == .directory) 4 else 8;
-    buffer[7] = @intCast(name_length);
-    @memcpy(buffer[8 .. 8 + name_length], name[0..name_length]);
-    entry.directory_index += 1;
-    return 512;
+        const record = direntLength(name.len);
+        if (buffer.len - written < record) {
+            // Hold the entry rather than drop it: the iterator has already
+            // moved past it and cannot produce it a second time.
+            entry.pending_length = @intCast(name.len);
+            entry.pending_directory = is_directory;
+            @memcpy(entry.pending_name[0..name.len], name);
+            break;
+        }
+
+        const slice = buffer[written..][0..record];
+        @memset(slice, 0);
+        std.mem.writeInt(u32, slice[0..4], directoryEntryHash(name), .little);
+        std.mem.writeInt(u16, slice[4..6], @intCast(record), .little);
+        slice[6] = if (is_directory) 4 else 8;
+        slice[7] = @intCast(name.len);
+        @memcpy(slice[8 .. 8 + name.len], name);
+        written += record;
+        entry.directory_index += 1;
+    }
+    return written;
 }
 
 /// The guest path a descriptor was opened with, for diagnostics.
@@ -1769,24 +1819,57 @@ test "missing files and bad descriptors are reported precisely" {
 }
 
 test "directory descriptors enumerate BSD dirent records" {
+    // Records are packed and variable-length, each `d_reclen` long, as many as
+    // the caller's buffer holds. Returning one entry per call padded to a fixed
+    // record is a listing only a looping caller can read, and a caller that
+    // reads a directory once -- Quake II reads /app0/baseq2 exactly once --
+    // then sees a directory holding nothing but `.`, misses the pak file
+    // beside it, and fails on the first thing it expected to find inside.
     var fixture = try Fixture.init("data");
     defer fixture.deinit();
 
     const fd = try open("/app0/sub", O.rdonly | O.directory);
     defer close(fd) catch {};
-    var record: [512]u8 = undefined;
+    var buffer: [512]u8 = undefined;
     var base: u64 = 99;
 
-    try testing.expectEqual(@as(usize, 512), try getDents(fd, &record, &base));
+    const written = try getDents(fd, &buffer, &base);
     try testing.expectEqual(@as(u64, 0), base);
-    try testing.expectEqualStrings(".", std.mem.sliceTo(record[8..], 0));
-    try testing.expectEqual(@as(u8, 4), record[6]);
 
-    _ = try getDents(fd, &record, null); // `..`
-    try testing.expectEqual(@as(usize, 512), try getDents(fd, &record, null));
-    try testing.expectEqualStrings("inner.txt", std.mem.sliceTo(record[8..], 0));
-    try testing.expectEqual(@as(u8, 8), record[6]);
-    try testing.expectEqual(@as(usize, 0), try getDents(fd, &record, null));
+    var names: [8][]const u8 = undefined;
+    var types: [8]u8 = undefined;
+    var count: usize = 0;
+    var offset: usize = 0;
+    var last_start: usize = 0;
+    while (offset < written) {
+        last_start = offset;
+        const record = std.mem.readInt(u16, buffer[offset + 4 ..][0..2], .little);
+        // A caller walks this buffer by stepping d_reclen, so a record short
+        // enough to loop for ever, or long enough to run past what we said we
+        // wrote, is worse than a missing entry.
+        try testing.expect(record >= 8 and record <= written - offset);
+        try testing.expectEqual(@as(usize, 0), record % 8);
+        const name_length = buffer[offset + 7];
+        try testing.expect(8 + @as(usize, name_length) < record);
+        names[count] = buffer[offset + 8 ..][0..name_length];
+        types[count] = buffer[offset + 6];
+        count += 1;
+        offset += record;
+    }
+
+    // `.`, `..` and the one file the fixture puts in sub/, in one call.
+    try testing.expectEqual(@as(usize, 3), count);
+    try testing.expectEqualStrings(".", names[0]);
+    try testing.expectEqual(@as(u8, 4), types[0]);
+    try testing.expectEqualStrings("..", names[1]);
+    try testing.expectEqualStrings("inner.txt", names[2]);
+    try testing.expectEqual(@as(u8, 8), types[2]);
+    // Each name stays terminated inside its own record, so a caller that reads
+    // d_name as a C string stops before the next entry rather than running on
+    // into it.
+    try testing.expectEqualStrings("inner.txt", std.mem.sliceTo(buffer[last_start + 8 ..], 0));
+
+    try testing.expectEqual(@as(usize, 0), try getDents(fd, &buffer, null));
 }
 
 test "descriptors are released and reused" {

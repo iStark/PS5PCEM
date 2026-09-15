@@ -455,6 +455,24 @@ fn httpAcceptOption(_: u64, _: u64, _: u64, _: u64, _: u64, _: u64) callconv(abi
     return errno.ok;
 }
 
+/// Reports that the requested field is not in the header.
+///
+/// Unlike the option setters this one owes the caller two output values, a
+/// pointer into the header and its length, and no response ever arrives here
+/// to point at. Succeeding without writing them would leave the title reading
+/// whatever those locals happened to hold, so say the field is absent.
+fn httpParseResponseHeader(
+    _: ?[*]const u8,
+    _: usize,
+    _: ?[*:0]const u8,
+    value: ?*?[*]const u8,
+    value_len: ?*usize,
+) callconv(abi.guest) i32 {
+    if (value) |out| out.* = null;
+    if (value_len) |out| out.* = 0;
+    return http_error_invalid_value;
+}
+
 fn validScheme(text: []const u8) bool {
     if (text.len == 0 or !std.ascii.isAlphabetic(text[0])) return false;
     for (text[1..]) |c| {
@@ -596,6 +614,8 @@ const http_exports = [_]symbols.Export{
     .{ .name = "sceHttpCreateConnection", .function = trace.wrap("sceHttpCreateConnection", &httpCreateTransportObject), .expect_id = "Kiwv9r4IZCc" },
     .{ .name = "sceHttpCreateRequest", .function = trace.wrap("sceHttpCreateRequest", &httpCreateTransportObject), .expect_id = "tsGVru3hCe8" },
     .{ .name = "sceHttpSetChunkedTransferEnabled", .function = trace.wrap("sceHttpSetChunkedTransferEnabled", &httpAcceptOption), .expect_id = "PDxS48xGQLs" },
+    .{ .name = "sceHttpParseResponseHeader", .function = trace.wrap("sceHttpParseResponseHeader", &httpParseResponseHeader), .expect_id = "hPTXo3bICzI" },
+    .{ .name = "sceHttpSetRequestContentLength", .function = trace.wrap("sceHttpSetRequestContentLength", &httpAcceptOption), .expect_id = "PTiFIUxCpJc" },
     .{ .name = "sceHttpUnsetEpoll", .function = trace.wrap("sceHttpUnsetEpoll", &httpAcceptOption), .expect_id = "59tL1AQBb8U" },
     .{ .name = "sceHttpsSetSslCallback", .function = trace.wrap("sceHttpsSetSslCallback", &httpAcceptOption), .expect_id = "htyBOoWeS58" },
     .{ .name = "sceHttpsUnloadCert", .function = trace.wrap("sceHttpsUnloadCert", &httpAcceptOption), .expect_id = "zXqcE0fizz0" },

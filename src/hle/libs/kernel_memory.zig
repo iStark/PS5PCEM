@@ -223,6 +223,42 @@ pub const Pool = struct {
         return error.OutOfDirectMemory;
     }
 
+    /// Largest run of unreserved memory inside a search window, as the guest
+    /// would receive it: aligned up to `alignment`, and clipped to the pool.
+    ///
+    /// Walked the same way `reserve` places a request, one aligned step at a
+    /// time, so what this reports is what an allocation of that size would
+    /// actually find rather than a total that no single request could use.
+    pub fn largestFree(
+        self: *const Pool,
+        search_start: u64,
+        search_end: u64,
+        alignment: u64,
+    ) ?struct { start: u64, len: u64 } {
+        const step = @max(alignment, page_size);
+        const limit = @min(search_end, self.size);
+        var best_start: u64 = 0;
+        var best_len: u64 = 0;
+
+        var candidate = std.mem.alignForward(u64, search_start, step);
+        while (candidate < limit) {
+            if (!self.isFree(candidate, page_size)) {
+                candidate += step;
+                continue;
+            }
+            const run_start = candidate;
+            while (candidate < limit and self.isFree(candidate, page_size)) candidate += page_size;
+            const run_len = candidate - run_start;
+            if (run_len > best_len) {
+                best_start = run_start;
+                best_len = run_len;
+            }
+            candidate = std.mem.alignForward(u64, candidate + page_size, step);
+        }
+        if (best_len == 0) return null;
+        return .{ .start = best_start, .len = best_len };
+    }
+
     /// Releases part or all of a previously reserved range.
     ///
     /// Titles allocate physical memory in pieces and hand it back in different
@@ -522,6 +558,32 @@ fn sceKernelReleaseDirectMemory(start: u64, len: u64) callconv(abi.guest) i32 {
         error.NotReserved => KernelError.einval.raw(),
         else => KernelError.enomem.raw(),
     };
+    return errno.ok;
+}
+
+/// Largest allocatable run in a search window, with where it begins.
+///
+/// Titles call this to size a pool before reserving it, so answering with the
+/// total free bytes would promise a single allocation that fragmentation
+/// cannot satisfy. Report the largest contiguous run instead.
+fn sceKernelAvailableDirectMemorySize(
+    search_start: u64,
+    search_end: u64,
+    alignment: u64,
+    out_start: ?*u64,
+    out_size: ?*u64,
+) callconv(abi.guest) i32 {
+    if (out_start == null or out_size == null) return KernelError.efault.raw();
+    if (alignment != 0 and !std.math.isPowerOfTwo(alignment)) return KernelError.einval.raw();
+    if (search_end <= search_start) return KernelError.einval.raw();
+
+    pool_lock.lock();
+    defer pool_lock.unlock();
+
+    const found = pool.largestFree(search_start, search_end, alignment) orelse
+        return KernelError.eagain.raw();
+    out_start.?.* = found.start;
+    out_size.?.* = found.len;
     return errno.ok;
 }
 
@@ -1687,6 +1749,11 @@ pub const exports = [_]symbols.Export{
         .name = "sceKernelReleaseDirectMemory",
         .function = trace.wrap("sceKernelReleaseDirectMemory", &sceKernelReleaseDirectMemory),
         .expect_id = "MBuItvba6z8",
+    },
+    .{
+        .name = "sceKernelAvailableDirectMemorySize",
+        .function = trace.wrap("sceKernelAvailableDirectMemorySize", &sceKernelAvailableDirectMemorySize),
+        .expect_id = "C0f7TJcbfac",
     },
     .{
         .name = "sceKernelGetDirectMemorySize",

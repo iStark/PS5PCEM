@@ -2072,6 +2072,15 @@ fn clockGettime(clock_id: i32, output: ?*Timespec) callconv(abi.guest) i32 {
     return writeTimespec(clock_id, output, false);
 }
 
+/// Both guest clocks are read from a nanosecond counter, so either resolves to
+/// one nanosecond. POSIX allows a null `output`, where the call only reports
+/// that the clock exists, so that is success here rather than the EINVAL a
+/// null clock_gettime destination earns.
+fn clockGetres(_: i32, output: ?*Timespec) callconv(abi.guest) i32 {
+    if (output) |value| value.* = .{ .seconds = 0, .nanoseconds = 1 };
+    return errno.ok;
+}
+
 fn kernelClockGettime(clock_id: i32, output: ?*Timespec) callconv(abi.guest) i32 {
     return writeTimespec(clock_id, output, true);
 }
@@ -2295,6 +2304,7 @@ pub const exports = [_]symbols.Export{
     .{ .name = "sceKernelGetProcessTime", .function = trace.wrap("sceKernelGetProcessTime", &getProcessTime), .expect_id = "4J2sUJmuHZQ" },
     .{ .name = "sceKernelConvertUtcToLocaltime", .function = trace.wrap("sceKernelConvertUtcToLocaltime", &convertUtcToLocaltime), .expect_id = "-o5uEDpN+oY" },
     .{ .name = "clock_gettime", .function = trace.wrap("clock_gettime", &clockGettime), .expect_id = "lLMT9vJAck0" },
+    .{ .name = "clock_getres", .function = trace.wrap("clock_getres", &clockGetres), .expect_id = "smIj7eqzZE8" },
     .{ .name = "sceKernelClockGettime", .function = trace.wrap("sceKernelClockGettime", &kernelClockGettime), .expect_id = "QBi7HCK03hw" },
     .{ .name = "sceKernelClose", .function = trace.wrap("sceKernelClose", &kernelUnsupported), .expect_id = "UK2Tl2DWUns" },
     .{ .name = "sceKernelOpen", .function = trace.wrap("sceKernelOpen", &kernelUnsupported), .expect_id = "1G3lF1Gg1k8" },
