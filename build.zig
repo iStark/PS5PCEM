@@ -2,9 +2,22 @@
 // Copyright (C) 2026 Artur Strazewicz
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 pub fn build(b: *std.Build) void {
-    const target = b.standardTargetOptions(.{});
+    // A release binary is built on one machine and run on many. Zig resolves an
+    // unspecified CPU to the build machine's own, so a release produced on a
+    // host with AVX-512 emits AVX-512 and dies on a Zen 3 with
+    // STATUS_ILLEGAL_INSTRUCTION before it reaches a window, a Vulkan call, or
+    // any code that could report why -- which reads to the person running it as
+    // nothing happening at all. Pin a baseline instead: x86-64-v3 is AVX2, BMI2
+    // and FMA, which every CPU able to drive this emulator has had since 2013.
+    // `-Dcpu=` and `-Dtarget=` still override it.
+    const default_target: std.Target.Query = if (builtin.cpu.arch == .x86_64)
+        .{ .cpu_model = .{ .explicit = &std.Target.x86.cpu.x86_64_v3 } }
+    else
+        .{};
+    const target = b.standardTargetOptions(.{ .default_target = default_target });
     // An emulator interprets guest instructions, translates guest shaders and
     // converts guest pixels, and it does all of that per frame. An unoptimized
     // build of that work is not a slower version of the same program, it is a
