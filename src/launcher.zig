@@ -19,6 +19,7 @@ comptime {
     @setEvalBranchQuota(20_000);
 }
 
+const site_url = "https://ps5pcem.com";
 const github_url = "https://github.com/iStark/PS5PCEM";
 const boosty_url = "https://boosty.to/ps5pcem";
 const window_width = 1180;
@@ -57,6 +58,9 @@ const Phrase = enum {
     hybrid_description,
     configure_layout,
     core_ready,
+    vulkan_missing,
+    vulkan_no_device,
+    vulkan_too_old,
     launch_game,
     input_heading,
     input_subtitle,
@@ -209,6 +213,9 @@ fn tr(phrase: Phrase) []const u8 {
             .hybrid_description => "Both input sources work at the same time",
             .configure_layout => "Configure bindings  →",
             .core_ready => "Core ready · Vulkan VideoOut · Windows x86-64",
+            .vulkan_missing => "Vulkan runtime not found · install your GPU driver",
+            .vulkan_no_device => "No Vulkan device · check your GPU driver",
+            .vulkan_too_old => "Vulkan below 1.2 · update your GPU driver",
             .launch_game => "Launch game  ▶",
             .input_heading => "Controls",
             .input_subtitle => "Choose an input source and map keyboard keys to DualSense buttons",
@@ -289,6 +296,9 @@ fn tr(phrase: Phrase) []const u8 {
             .hybrid_description => "同时使用手柄和键盘",
             .configure_layout => "配置按键  →",
             .core_ready => "核心已就绪 · Vulkan VideoOut · Windows x86-64",
+            .vulkan_missing => "未找到 Vulkan 运行时 · 请安装显卡驱动",
+            .vulkan_no_device => "未发现 Vulkan 设备 · 请检查显卡驱动",
+            .vulkan_too_old => "Vulkan 低于 1.2 · 请更新显卡驱动",
             .launch_game => "启动游戏  ▶",
             .input_heading => "控制设置",
             .input_subtitle => "选择输入方式，并将键盘按键映射到 DualSense 按钮",
@@ -369,6 +379,9 @@ fn tr(phrase: Phrase) []const u8 {
             .hybrid_description => "Ambas fuentes funcionan a la vez",
             .configure_layout => "Configurar teclas  →",
             .core_ready => "Núcleo listo · Vulkan VideoOut · Windows x86-64",
+            .vulkan_missing => "No se encontró Vulkan · instala el controlador de tu GPU",
+            .vulkan_no_device => "Sin dispositivo Vulkan · revisa el controlador de tu GPU",
+            .vulkan_too_old => "Vulkan inferior a 1.2 · actualiza el controlador de tu GPU",
             .launch_game => "Iniciar juego  ▶",
             .input_heading => "Controles",
             .input_subtitle => "Elige una fuente de entrada y asigna teclas a los botones de DualSense",
@@ -449,6 +462,9 @@ fn tr(phrase: Phrase) []const u8 {
             .hybrid_description => "يعمل مصدرا الإدخال في الوقت نفسه",
             .configure_layout => "تخصيص المفاتيح  ←",
             .core_ready => "النواة جاهزة · Vulkan VideoOut · Windows x86-64",
+            .vulkan_missing => "لم يُعثر على Vulkan · ثبّت تعريف بطاقتك",
+            .vulkan_no_device => "لا يوجد جهاز Vulkan · تحقق من تعريف بطاقتك",
+            .vulkan_too_old => "إصدار Vulkan أقدم من 1.2 · حدّث تعريف بطاقتك",
             .launch_game => "تشغيل اللعبة  ▶",
             .input_heading => "التحكم",
             .input_subtitle => "اختر مصدر الإدخال واربط مفاتيح لوحة المفاتيح بأزرار DualSense",
@@ -529,6 +545,9 @@ fn tr(phrase: Phrase) []const u8 {
             .hybrid_description => "As duas fontes funcionam ao mesmo tempo",
             .configure_layout => "Configurar teclas  →",
             .core_ready => "Núcleo pronto · Vulkan VideoOut · Windows x86-64",
+            .vulkan_missing => "Vulkan não encontrado · instale o driver da sua GPU",
+            .vulkan_no_device => "Nenhum dispositivo Vulkan · verifique o driver da sua GPU",
+            .vulkan_too_old => "Vulkan abaixo de 1.2 · atualize o driver da sua GPU",
             .launch_game => "Iniciar jogo  ▶",
             .input_heading => "Controles",
             .input_subtitle => "Escolha uma fonte de entrada e associe teclas aos botões do DualSense",
@@ -609,6 +628,9 @@ fn tr(phrase: Phrase) []const u8 {
             .hybrid_description => "Оба источника работают одновременно",
             .configure_layout => "Настроить раскладку  →",
             .core_ready => "Ядро готово · Vulkan VideoOut · Windows x86-64",
+            .vulkan_missing => "Vulkan не найден · установите драйвер видеокарты",
+            .vulkan_no_device => "Нет устройства Vulkan · проверьте драйвер видеокарты",
+            .vulkan_too_old => "Vulkan ниже 1.2 · обновите драйвер видеокарты",
             .launch_game => "Запустить игру  ▶",
             .input_heading => "Управление",
             .input_subtitle => "Выберите источник и назначьте клавиши на кнопки DualSense",
@@ -689,6 +711,9 @@ fn tr(phrase: Phrase) []const u8 {
             .hybrid_description => "Beide Eingabequellen arbeiten gleichzeitig",
             .configure_layout => "Tasten belegen  →",
             .core_ready => "Core bereit · Vulkan VideoOut · Windows x86-64",
+            .vulkan_missing => "Vulkan nicht gefunden · GPU-Treiber installieren",
+            .vulkan_no_device => "Kein Vulkan-Gerät · GPU-Treiber prüfen",
+            .vulkan_too_old => "Vulkan älter als 1.2 · GPU-Treiber aktualisieren",
             .launch_game => "Spiel starten  ▶",
             .input_heading => "Steuerung",
             .input_subtitle => "Eingabequelle wählen und Tasten den DualSense-Buttons zuweisen",
@@ -769,6 +794,9 @@ fn tr(phrase: Phrase) []const u8 {
             .hybrid_description => "Les deux sources fonctionnent simultanément",
             .configure_layout => "Configurer les touches  →",
             .core_ready => "Cœur prêt · Vulkan VideoOut · Windows x86-64",
+            .vulkan_missing => "Vulkan introuvable · installez le pilote de votre GPU",
+            .vulkan_no_device => "Aucun périphérique Vulkan · vérifiez le pilote de votre GPU",
+            .vulkan_too_old => "Vulkan antérieur à 1.2 · mettez à jour le pilote de votre GPU",
             .launch_game => "Lancer le jeu  ▶",
             .input_heading => "Commandes",
             .input_subtitle => "Choisissez une source et associez les touches aux boutons DualSense",
@@ -842,6 +870,9 @@ pub fn main(_: std.process.Init) !void {
 
     initializeIniPath();
     loadSettings();
+    // Once, before the window exists: the answer never changes while the
+    // launcher runs, and asking per repaint would load the loader every frame.
+    probeVulkan();
     defer destroyRecentGames();
     createFonts();
     defer destroyFonts();
@@ -1026,6 +1057,8 @@ const nav_rects = [_]Rect{
     .{ .left = 20, .top = 184, .right = 202, .bottom = 232 },
     .{ .left = 20, .top = 242, .right = 202, .bottom = 290 },
     .{ .left = 20, .top = 300, .right = 202, .bottom = 348 },
+    // The project site, under the PROJECT heading and above the Boosty pill.
+    .{ .left = 20, .top = 584, .right = 202, .bottom = 616 },
     .{ .left = 20, .top = 626, .right = 202, .bottom = 670 },
     .{ .left = 20, .top = 680, .right = 202, .bottom = 724 },
 };
@@ -1162,7 +1195,8 @@ fn handleClick(window: Win32.Window, x: i32, y: i32) void {
             1 => current_page = .input,
             2 => current_page = .saves,
             3 => current_page = .settings,
-            4 => openBoosty(window),
+            4 => openSite(window),
+            5 => openBoosty(window),
             else => openGithub(window),
         }
         if (current_page != .library) {
@@ -1298,10 +1332,51 @@ fn drawNavigation(dc: Win32.DeviceContext) void {
     drawNavItem(dc, .input, 184, .nav_input, "02");
     drawNavItem(dc, .saves, 242, .nav_saves, "03");
     drawNavItem(dc, .settings, 300, .nav_settings, "04");
-    localizedText(dc, .project, .{ .left = 28, .top = 596, .right = 190, .bottom = 616 }, 0x007c716a, small_font, Win32.dt_left | Win32.dt_end_ellipsis);
+    drawVulkanStatus(dc);
+    localizedText(dc, .project, .{ .left = 28, .top = 560, .right = 190, .bottom = 580 }, 0x007c716a, small_font, Win32.dt_left | Win32.dt_end_ellipsis);
     roundFill(dc, .{ .left = 20, .top = 626, .right = 202, .bottom = 670 }, 10, 0x003d3029);
     localizedText(dc, .support_boosty, .{ .left = 32, .top = 639, .right = 192, .bottom = 660 }, 0x00ffac64, small_font, Win32.dt_left | Win32.dt_end_ellipsis);
     text(dc, w("GitHub · iStark  ↗"), -1, .{ .left = 28, .top = 690, .right = 198, .bottom = 716 }, 0x00b9afa8, regular_font, Win32.dt_left);
+    text(dc, w("ps5pcem.com  ↗"), -1, .{ .left = 28, .top = 588, .right = 198, .bottom = 612 }, 0x00ffac64, regular_font, Win32.dt_left);
+}
+
+/// Says what the probe found, in the place that used to assert success.
+///
+/// A ready line names the device, because "Vulkan 1.3 · NVIDIA GeForce RTX
+/// 3070 Ti" tells someone reporting a problem what this machine resolved to,
+/// and a version alone does not. The failures are phrased as what to do, since
+/// each of them is fixed by the same person at the same keyboard.
+/// Draws a runtime string. The localized path takes a phrase, and a device
+/// name is not one: it comes from the driver and is the same in every language.
+fn drawAscii(dc: Win32.DeviceContext, value: []const u8, area: Rect, color: u32, font: Win32.Font, flags: u32) void {
+    var wide: [320]u16 = undefined;
+    if (value.len == 0 or value.len >= wide.len) return;
+    const length = std.unicode.utf8ToUtf16Le(&wide, value) catch return;
+    wide[length] = 0;
+    text(dc, @ptrCast(&wide), @intCast(length), area, color, font, flags);
+}
+
+fn drawVulkanStatus(dc: Win32.DeviceContext) void {
+    const area = Rect{ .left = 28, .top = 498, .right = 198, .bottom = 520 };
+    const second = Rect{ .left = 28, .top = 518, .right = 198, .bottom = 540 };
+    const dim: u32 = 0x007c716a;
+    const warn: u32 = 0x006f8cff;
+    const flags = Win32.dt_left | Win32.dt_end_ellipsis;
+    switch (vulkan_report.state) {
+        .ready => {
+            var line: [64]u8 = undefined;
+            const version = std.fmt.bufPrint(&line, "Vulkan {d}.{d} ready", .{
+                vulkan_report.major,
+                vulkan_report.minor,
+            }) catch return;
+            drawAscii(dc, version, area, 0x0074c98a, small_font, flags);
+            drawAscii(dc, vulkan_report.deviceName(), second, dim, small_font, flags);
+        },
+        .no_loader => localizedText(dc, .vulkan_missing, area, warn, small_font, flags),
+        .no_device => localizedText(dc, .vulkan_no_device, area, warn, small_font, flags),
+        .too_old => localizedText(dc, .vulkan_too_old, area, warn, small_font, flags),
+        .unchecked => {},
+    }
 }
 
 fn drawNavItem(dc: Win32.DeviceContext, page: Page, top: i32, label: Phrase, comptime index: []const u8) void {
@@ -2258,6 +2333,10 @@ fn openGithub(owner: Win32.Window) void {
     _ = Win32.ShellExecuteW(owner, w("open"), w(github_url), null, null, Win32.show_normal);
 }
 
+fn openSite(owner: Win32.Window) void {
+    _ = Win32.ShellExecuteW(owner, w("open"), w(site_url), null, null, Win32.show_normal);
+}
+
 fn openBoosty(owner: Win32.Window) void {
     _ = Win32.ShellExecuteW(owner, w("open"), w(boosty_url), null, null, Win32.show_normal);
 }
@@ -2447,6 +2526,136 @@ fn w(comptime value: []const u8) [*:0]const u16 {
     return std.unicode.utf8ToUtf16LeStringLiteral(value);
 }
 
+/// What the host can actually do, rather than what the launcher hopes.
+///
+/// The status line asserted "Vulkan VideoOut" unconditionally. A machine with
+/// no loader, no device, or a driver below the 1.2 the renderer requires read
+/// exactly the same, and the person only found out when the emulator exited
+/// without a window. Ask the loader instead, once, at startup.
+const VulkanReport = struct {
+    const State = enum { unchecked, no_loader, no_device, too_old, ready };
+
+    state: State = .unchecked,
+    device: [256]u8 = @splat(0),
+    device_length: usize = 0,
+    major: u32 = 0,
+    minor: u32 = 0,
+
+    fn deviceName(self: *const VulkanReport) []const u8 {
+        return self.device[0..self.device_length];
+    }
+};
+
+var vulkan_report: VulkanReport = .{};
+
+const VulkanApplicationInfo = extern struct {
+    s_type: u32 = 0,
+    p_next: ?*const anyopaque = null,
+    application_name: ?[*:0]const u8 = null,
+    application_version: u32 = 0,
+    engine_name: ?[*:0]const u8 = null,
+    engine_version: u32 = 0,
+    api_version: u32,
+};
+
+const VulkanInstanceCreateInfo = extern struct {
+    s_type: u32 = 1,
+    p_next: ?*const anyopaque = null,
+    flags: u32 = 0,
+    application_info: ?*const VulkanApplicationInfo,
+    enabled_layer_count: u32 = 0,
+    enabled_layer_names: ?[*]const [*:0]const u8 = null,
+    enabled_extension_count: u32 = 0,
+    enabled_extension_names: ?[*]const [*:0]const u8 = null,
+};
+
+/// Only the prefix, because only the prefix is read here. The full structure
+/// carries every device limit, and transcribing those to reach a name and a
+/// version would be a second copy of a table this program has no other use for.
+const VulkanPropertiesPrefix = extern struct {
+    api_version: u32,
+    driver_version: u32,
+    vendor_id: u32,
+    device_id: u32,
+    device_type: u32,
+    device_name: [256]u8,
+};
+
+fn probeVulkan() void {
+    if (builtin.os.tag != .windows) return;
+    const library = Win32.LoadLibraryW(w("vulkan-1.dll")) orelse {
+        vulkan_report.state = .no_loader;
+        return;
+    };
+    const get_instance_proc = @as(
+        ?*const fn (usize, [*:0]const u8) callconv(.c) ?*anyopaque,
+        @ptrCast(Win32.GetProcAddress(library, "vkGetInstanceProcAddr")),
+    ) orelse {
+        vulkan_report.state = .no_loader;
+        return;
+    };
+    const create_instance = @as(
+        ?*const fn (*const VulkanInstanceCreateInfo, ?*anyopaque, *usize) callconv(.c) i32,
+        @ptrCast(get_instance_proc(0, "vkCreateInstance")),
+    ) orelse {
+        vulkan_report.state = .no_loader;
+        return;
+    };
+
+    // 1.2 is what the renderer itself requires, so asking for less here would
+    // report a machine as ready that the emulator then refuses.
+    const application = VulkanApplicationInfo{ .api_version = (1 << 22) | (2 << 12) };
+    const create_info = VulkanInstanceCreateInfo{ .application_info = &application };
+    var instance: usize = 0;
+    if (create_instance(&create_info, null, &instance) != 0 or instance == 0) {
+        vulkan_report.state = .too_old;
+        return;
+    }
+    defer {
+        if (@as(
+            ?*const fn (usize, ?*anyopaque) callconv(.c) void,
+            @ptrCast(get_instance_proc(instance, "vkDestroyInstance")),
+        )) |destroy| destroy(instance, null);
+    }
+
+    const enumerate = @as(
+        ?*const fn (usize, *u32, ?[*]usize) callconv(.c) i32,
+        @ptrCast(get_instance_proc(instance, "vkEnumeratePhysicalDevices")),
+    ) orelse {
+        vulkan_report.state = .no_device;
+        return;
+    };
+    var count: u32 = 0;
+    if (enumerate(instance, &count, null) != 0 or count == 0) {
+        vulkan_report.state = .no_device;
+        return;
+    }
+    var devices: [8]usize = @splat(0);
+    count = @min(count, devices.len);
+    if (enumerate(instance, &count, &devices) != 0 or count == 0) {
+        vulkan_report.state = .no_device;
+        return;
+    }
+
+    vulkan_report.state = .ready;
+    const properties_of = @as(
+        ?*const fn (usize, *VulkanPropertiesPrefix) callconv(.c) void,
+        @ptrCast(get_instance_proc(instance, "vkGetPhysicalDeviceProperties")),
+    ) orelse return;
+    var properties: VulkanPropertiesPrefix = undefined;
+    properties_of(devices[0], &properties);
+    vulkan_report.major = (properties.api_version >> 22) & 0x7f;
+    vulkan_report.minor = (properties.api_version >> 12) & 0x3ff;
+    for (properties.device_name, 0..) |byte, index| {
+        if (byte == 0) {
+            vulkan_report.device_length = index;
+            break;
+        }
+        vulkan_report.device[index] = byte;
+        vulkan_report.device_length = index + 1;
+    }
+}
+
 const Win32 = if (builtin.os.tag == .windows) struct {
     const Window = ?*anyopaque;
     const Instance = ?*anyopaque;
@@ -2607,6 +2816,8 @@ const Win32 = if (builtin.os.tag == .windows) struct {
     const source_copy: u32 = 0x00cc_0020;
     const dpi_awareness_per_monitor_v2: ?*anyopaque = @ptrFromInt(@as(usize, @bitCast(@as(isize, -4))));
 
+    extern "kernel32" fn LoadLibraryW(name: [*:0]const u16) callconv(.winapi) Instance;
+    extern "kernel32" fn GetProcAddress(module: Instance, name: [*:0]const u8) callconv(.winapi) ?*const anyopaque;
     extern "kernel32" fn GetModuleHandleW(name: ?[*:0]const u16) callconv(.winapi) Instance;
     extern "kernel32" fn GetModuleFileNameW(module: Instance, output: [*]u16, size: u32) callconv(.winapi) u32;
     extern "kernel32" fn GetFileAttributesW(path: [*:0]const u16) callconv(.winapi) u32;
