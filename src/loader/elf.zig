@@ -194,6 +194,17 @@ pub const Image = struct {
         for (self.program_headers) |ph| {
             const segment_type = ph.segmentType();
             if (segment_type == .sce_dynlibdata or segment_type == .sce_dynlibdata_ps5) {
+                // A module can carry this header with nothing behind it.
+                // libc.prx in Dreaming Sarah places the segment at its own
+                // last byte and claims 26 more, in the untouched file as
+                // much as in the patched one, so there is provably nothing
+                // stored and an empty view is the honest answer. Only a bare
+                // ELF can say this: its p_offset and the image length are the
+                // same measure. A SELF keeps the error, and so does any
+                // segment that starts inside the image and runs off the end,
+                // which is a truncated file rather than an absent table.
+                if (self.self_layout == null and ph.offset >= self.bytes.len)
+                    return self.bytes[0..0];
                 return try self.fileRange(ph);
             }
         }
@@ -292,7 +303,10 @@ pub const Image = struct {
 
     fn physicalRange(self: Image, offset: u64, size: u64) Error![]const u8 {
         const end = std.math.add(u64, offset, size) catch return Error.MalformedSelf;
-        if (end > self.bytes.len) return Error.TruncatedSelf;
+        if (end > self.bytes.len) {
+            std.debug.print("[self] truncated: want 0x{x}..0x{x} of 0x{x} (short by {d})\n", .{ offset, end, self.bytes.len, end - self.bytes.len });
+            return Error.TruncatedSelf;
+        }
         return self.bytes[@intCast(offset)..@intCast(end)];
     }
 
