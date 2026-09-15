@@ -70,6 +70,16 @@ and keeps portable settings and savedata beside the application.
       <sub>REANIMAL — animated title menu (option labels incomplete)</sub>
     </td>
   </tr>
+  <tr>
+    <td width="50%" align="center">
+      <img src="docs/images/yotei-difficulty.png" alt="Ghost of Yotei difficulty selection rendered over a 3D scene by PS5PCEM"><br>
+      <sub>Ghost of Yotei &mdash; difficulty selection over a loaded 3D scene (0.6 FPS; not playable yet)</sub>
+    </td>
+    <td width="50%" align="center">
+      <img src="docs/images/dreaming-sarah-gameplay.png" alt="Dreaming Sarah forest scene with an NPC rendered by PS5PCEM"><br>
+      <sub>Dreaming Sarah &mdash; world scene with an NPC</sub>
+    </td>
+  </tr>
 </table>
 
 See the
