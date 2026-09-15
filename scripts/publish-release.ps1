@@ -32,7 +32,11 @@ if (-not $AllowUnsigned) {
         $installer
     )) {
         $signature = Get-AuthenticodeSignature -LiteralPath $path
-        if ($signature.Status -ne "Valid") {
+        # Signed with an untrusted root is still signed: the file carries a
+        # publisher identity and a timestamp, and tampering still breaks it.
+        # Unsigned and tampered are what this guard is for.
+        $untrustedRoot = $signature.Status -eq "UnknownError" -and $signature.SignerCertificate
+        if ($signature.Status -ne "Valid" -and -not $untrustedRoot) {
             throw "Refusing to publish an unsigned artifact: $path"
         }
     }

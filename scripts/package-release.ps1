@@ -97,8 +97,19 @@ function Sign-ReleaseFile([string] $Path) {
         return
     }
     $signature = Set-AuthenticodeSignature -LiteralPath $Path -Certificate $certificate -HashAlgorithm SHA256 -TimestampServer $TimestampServer -IncludeChain All
-    if ($signature.Status -ne "Valid") {
+    # A self-signed certificate can never report Valid: the chain ends at a root
+    # no machine trusts, and that is a property of the certificate rather than a
+    # fault in the signature. Accept exactly that case -- signed, by the
+    # certificate we were handed, untrusted root -- and nothing else. A missing
+    # signature, a tampered file or a different signer still stops the build.
+    $signedByUs = $signature.Status -eq "UnknownError" -and
+        $signature.SignerCertificate -and
+        $signature.SignerCertificate.Thumbprint -eq $certificate.Thumbprint
+    if ($signature.Status -ne "Valid" -and -not $signedByUs) {
         throw "Authenticode signing failed for $Path`: $($signature.StatusMessage)"
+    }
+    if ($signedByUs) {
+        Write-Warning "Signed with an untrusted root; Windows will report an unknown publisher: $Path"
     }
 }
 
