@@ -575,13 +575,25 @@ pub fn build(b: *std.Build) void {
     // user preferences and starts game-run with the corresponding environment.
     var launcher: ?*std.Build.Step.Compile = null;
     if (target.result.os.tag == .windows) {
+        // The launcher prints the release it belongs to. It reads the same
+        // file the packaging and publishing scripts read, so a build cannot
+        // claim a version the archive around it disagrees with.
+        const launcher_options = b.addOptions();
+        launcher_options.addOption(
+            []const u8,
+            "release_version",
+            std.mem.trim(u8, @embedFile("VERSION"), " \t\r\n"),
+        );
         const native_launcher = b.addExecutable(.{
             .name = "ps5pcem",
             .root_module = b.createModule(.{
                 .root_source_file = b.path("src/launcher.zig"),
                 .target = target,
                 .optimize = optimize,
-                .imports = &.{.{ .name = "input", .module = input }},
+                .imports = &.{
+                    .{ .name = "input", .module = input },
+                    .{ .name = "build_options", .module = launcher_options.createModule() },
+                },
             }),
         });
         native_launcher.subsystem = .windows;

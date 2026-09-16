@@ -9,6 +9,7 @@
 
 const std = @import("std");
 const input = @import("input");
+const build_options = @import("build_options");
 const builtin = @import("builtin");
 const display_mode = @import("display_mode.zig");
 const performance_mode = @import("performance_mode.zig");
@@ -160,7 +161,11 @@ var mapping = mapping_defaults;
 var capture_mapping: ?usize = null;
 var game_folder: [1024]u16 = [_]u16{0} ** 1024;
 var game_folder_length: usize = 0;
-const maximum_recent_games = 8;
+/// Four pages of eight. The grid shows one page at a time, so the ceiling is
+/// about how many titles are worth keeping, not about how many fit on screen.
+const maximum_recent_games = 32;
+/// One page of the library grid: four columns by two rows.
+const library_page_size = 8;
 const RecentGame = struct {
     folder: [1024]u16 = @splat(0),
     folder_length: usize = 0,
@@ -174,6 +179,8 @@ var recent_games: [maximum_recent_games]RecentGame = @splat(.{});
 var recent_game_count: usize = 0;
 var hovered_recent_game: ?usize = null;
 var hovered_recent_remove = false;
+var library_page: usize = 0;
+var hovered_library_arrow: ?u1 = null;
 var tracking_mouse_leave = false;
 /// The product code the selected title publishes about itself. Saves are keyed
 /// by it, so without one there is no directory to show.
@@ -1028,10 +1035,18 @@ fn windowProcedure(
             const x: i32 = @as(i16, @bitCast(@as(u16, @truncate(@as(usize, @bitCast(long_parameter))))));
             const y: i32 = @as(i16, @bitCast(@as(u16, @truncate(@as(usize, @bitCast(long_parameter)) >> 16))));
             const next_game = if (current_page == .library) recentGameAt(x, y) else null;
-            const next_remove = if (next_game) |index| recentRemoveRect(index).contains(x, y) else false;
-            if (next_game != hovered_recent_game or next_remove != hovered_recent_remove) {
+            const next_remove = if (next_game) |index| blk: {
+                const slot = librarySlotOf(index) orelse break :blk false;
+                break :blk recentRemoveRect(slot).contains(x, y);
+            } else false;
+            const next_arrow = if (current_page == .library) libraryArrowAt(x, y) else null;
+            if (next_game != hovered_recent_game or
+                next_remove != hovered_recent_remove or
+                next_arrow != hovered_library_arrow)
+            {
                 hovered_recent_game = next_game;
                 hovered_recent_remove = next_remove;
+                hovered_library_arrow = next_arrow;
                 _ = Win32.InvalidateRect(window, null, 0);
             }
             if (!tracking_mouse_leave) {
@@ -1045,11 +1060,25 @@ fn windowProcedure(
             }
             return 0;
         },
+        Win32.wm_mouse_wheel => {
+            if (current_page == .library) {
+                const delta: i16 = @bitCast(@as(u16, @truncate(word_parameter >> 16)));
+                // Away from the user is back towards the first page, the
+                // direction a list scrolls under the same gesture everywhere
+                // else. Pages are the only unit this grid has, so a notch is
+                // a page.
+                if (delta != 0 and stepLibraryPage(if (delta < 0) 1 else -1)) {
+                    _ = Win32.InvalidateRect(window, null, 0);
+                }
+            }
+            return 0;
+        },
         Win32.wm_mouse_leave => {
             tracking_mouse_leave = false;
-            if (hovered_recent_game != null or hovered_recent_remove) {
+            if (hovered_recent_game != null or hovered_recent_remove or hovered_library_arrow != null) {
                 hovered_recent_game = null;
                 hovered_recent_remove = false;
+                hovered_library_arrow = null;
                 _ = Win32.InvalidateRect(window, null, 0);
             }
             return 0;
@@ -1121,16 +1150,44 @@ const library_browse_rect = Rect{ .left = 282, .top = 646, .right = 500, .bottom
 const library_extract_rect = Rect{ .left = 516, .top = 646, .right = 760, .bottom = 700 };
 const library_launch_rect = Rect{ .left = 776, .top = 646, .right = 1086, .bottom = 700 };
 
-fn libraryGameRect(index: usize) Rect {
-    const column: i32 = @intCast(index % 4);
-    const row: i32 = @intCast(index / 4);
+// The arrows sit in the margins either side of the grid rather than inside
+// it, so a second page costs the artwork none of its width.
+const library_prev_rect = Rect{ .left = 236, .top = 298, .right = 270, .bottom = 354 };
+const library_next_rect = Rect{ .left = 1085, .top = 298, .right = 1119, .bottom = 354 };
+
+/// Pages the library needs. Always at least one, so an empty library still
+/// has a page to be on.
+fn libraryPageCount() usize {
+    if (recent_game_count == 0) return 1;
+    return (recent_game_count + library_page_size - 1) / library_page_size;
+}
+
+/// Where a game sits on the page being shown, or null when it is on another.
+fn librarySlotOf(index: usize) ?usize {
+    const first = library_page * library_page_size;
+    if (index < first or index - first >= library_page_size) return null;
+    return index - first;
+}
+
+/// Keeps the shown page inside the list after games are added or removed.
+/// A page past the end would draw empty with nothing on it to get back from.
+fn clampLibraryPage() void {
+    const pages = libraryPageCount();
+    if (library_page >= pages) library_page = pages - 1;
+}
+
+/// Rectangles are addressed by slot on the page, not by position in the list:
+/// the grid has eight places and the list can be longer than that.
+fn libraryGameRect(slot: usize) Rect {
+    const column: i32 = @intCast(slot % 4);
+    const row: i32 = @intCast(slot / 4);
     const left = 282 + column * 201;
     const top = 142 + row * 190;
     return .{ .left = left, .top = top, .right = left + 188, .bottom = top + 178 };
 }
 
-fn recentRemoveRect(index: usize) Rect {
-    const game = libraryGameRect(index);
+fn recentRemoveRect(slot: usize) Rect {
+    const game = libraryGameRect(slot);
     return .{
         .left = game.right - 34,
         .top = game.top + 8,
@@ -1139,16 +1196,67 @@ fn recentRemoveRect(index: usize) Rect {
     };
 }
 
+/// A dot per page under the grid. The hit area is wider than the dot it
+/// draws, because an eight-pixel target is not one a pointer can be asked to
+/// hit.
+fn libraryDotRect(page: usize) Rect {
+    const pages: i32 = @intCast(libraryPageCount());
+    const step: i32 = 20;
+    const span: i32 = (pages - 1) * step;
+    const x: i32 = 678 - @divTrunc(span, 2) + @as(i32, @intCast(page)) * step;
+    return .{ .left = x - 10, .top = 513, .right = x + 10, .bottom = 533 };
+}
+
+fn libraryArrowAt(x: i32, y: i32) ?u1 {
+    if (libraryPageCount() < 2) return null;
+    if (library_prev_rect.contains(x, y)) return 0;
+    if (library_next_rect.contains(x, y)) return 1;
+    return null;
+}
+
+fn libraryDotAt(x: i32, y: i32) ?usize {
+    const pages = libraryPageCount();
+    if (pages < 2) return null;
+    for (0..pages) |page| {
+        if (libraryDotRect(page).contains(x, y)) return page;
+    }
+    return null;
+}
+
+/// Moves by whole pages and stops at the ends. Reports whether anything
+/// moved, so a wheel notch at the last page does not repaint the window.
+fn stepLibraryPage(delta: i32) bool {
+    const pages: i32 = @intCast(libraryPageCount());
+    const next = @as(i32, @intCast(library_page)) + delta;
+    if (next < 0 or next >= pages) return false;
+    showLibraryPage(@intCast(next));
+    return true;
+}
+
+/// The hover belongs to a slot, and the same slot holds a different game
+/// after the page turns; leaving it set would highlight the newcomer.
+fn showLibraryPage(page: usize) void {
+    library_page = page;
+    hovered_recent_game = null;
+    hovered_recent_remove = false;
+}
+
 fn recentGameAt(x: i32, y: i32) ?usize {
-    for (0..recent_game_count) |index| {
-        if (libraryGameRect(index).contains(x, y)) return index;
+    const first = library_page * library_page_size;
+    for (0..library_page_size) |slot| {
+        const index = first + slot;
+        if (index >= recent_game_count) break;
+        if (libraryGameRect(slot).contains(x, y)) return index;
     }
     return null;
 }
 
 fn recentRemoveAt(x: i32, y: i32) ?usize {
-    for (0..recent_game_count) |index| {
-        if (recentRemoveRect(index).contains(x, y)) return index;
+    const first = library_page * library_page_size;
+    for (0..library_page_size) |slot| {
+        const index = first + slot;
+        if (index >= recent_game_count) break;
+        if (recentRemoveRect(slot).contains(x, y)) return index;
     }
     return null;
 }
@@ -1222,6 +1330,8 @@ fn clickableAt(x: i32, y: i32) bool {
     if (indexOfRect(&nav_rects, x, y) != null) return true;
     return switch (current_page) {
         .library => recentGameAt(x, y) != null or
+            libraryArrowAt(x, y) != null or
+            libraryDotAt(x, y) != null or
             library_browse_rect.contains(x, y) or
             library_extract_rect.contains(x, y) or
             library_launch_rect.contains(x, y),
@@ -1269,6 +1379,14 @@ fn handleClick(window: Win32.Window, x: i32, y: i32) void {
 }
 
 fn handleLibraryClick(window: Win32.Window, x: i32, y: i32) void {
+    if (libraryArrowAt(x, y)) |arrow| {
+        _ = stepLibraryPage(if (arrow == 0) -1 else 1);
+        return;
+    }
+    if (libraryDotAt(x, y)) |page| {
+        if (page != library_page) showLibraryPage(page);
+        return;
+    }
     if (recentRemoveAt(x, y)) |index| {
         removeRecentGame(index);
         return;
@@ -1451,9 +1569,13 @@ fn drawLibrary(dc: Win32.DeviceContext) void {
         localizedText(dc, .folder_prompt, .{ .left = 330, .top = 300, .right = 1038, .bottom = 332 }, 0x00f4f0ea, title_font, Win32.dt_center | Win32.dt_end_ellipsis);
         localizedText(dc, .folder_empty, .{ .left = 330, .top = 350, .right = 1038, .bottom = 376 }, 0x008b817a, regular_font, Win32.dt_center | Win32.dt_end_ellipsis);
     } else {
-        for (recent_games[0..recent_game_count], 0..) |game, index| {
-            drawLibraryGame(dc, game, index);
+        const first = library_page * library_page_size;
+        for (0..library_page_size) |slot| {
+            const index = first + slot;
+            if (index >= recent_game_count) break;
+            drawLibraryGame(dc, recent_games[index], index, slot);
         }
+        drawLibraryPager(dc);
     }
 
     card(dc, .{ .left = 282, .top = 536, .right = 1086, .bottom = 622 });
@@ -1466,12 +1588,64 @@ fn drawLibrary(dc: Win32.DeviceContext) void {
 
     button(dc, library_browse_rect, .choose_folder, false);
     button(dc, library_extract_rect, .extract_pkg, false);
-    localizedText(dc, .legal_notice, .{ .left = 282, .top = 708, .right = 1086, .bottom = 730 }, 0x007e746d, small_font, Win32.dt_center | Win32.dt_end_ellipsis);
+    drawLegalNotice(dc);
     button(dc, library_launch_rect, .launch_game, game_folder_length == 0);
 }
 
-fn drawLibraryGame(dc: Win32.DeviceContext, game: RecentGame, index: usize) void {
-    const rectangle = libraryGameRect(index);
+/// The notice the library has always carried, with the build's own version
+/// after it. A screenshot of a problem nearly always carries this line, and a
+/// version that has to be asked for arrives a day late.
+fn drawLegalNotice(dc: Win32.DeviceContext) void {
+    const area = Rect{ .left = 282, .top = 708, .right = 1086, .bottom = 730 };
+    const format = languageTextFormat(language, Win32.dt_center | Win32.dt_end_ellipsis);
+    var line: [512]u8 = undefined;
+    const composed: []const u8 = std.fmt.bufPrint(
+        &line,
+        "{s} · v{s}",
+        .{ tr(.legal_notice), build_options.release_version },
+    ) catch tr(.legal_notice);
+    textUtf8(dc, composed, area, 0x007e746d, small_font, format);
+}
+
+/// Arrows beside the grid and a dot for each page under it, drawn only once
+/// the library outgrows one page. A library that fits on one page shows no
+/// controls at all, which is the state most of them stay in.
+fn drawLibraryPager(dc: Win32.DeviceContext) void {
+    const pages = libraryPageCount();
+    if (pages < 2) return;
+    drawLibraryArrow(dc, library_prev_rect, w("‹"), library_page > 0, hovered_library_arrow == 0);
+    drawLibraryArrow(dc, library_next_rect, w("›"), library_page + 1 < pages, hovered_library_arrow == 1);
+    for (0..pages) |page| {
+        const dot = libraryDotRect(page);
+        const centre_x = @divTrunc(dot.left + dot.right, 2);
+        const centre_y = @divTrunc(dot.top + dot.bottom, 2);
+        const current = page == library_page;
+        const radius: i32 = if (current) 5 else 4;
+        roundFill(dc, .{
+            .left = centre_x - radius,
+            .top = centre_y - radius,
+            .right = centre_x + radius,
+            .bottom = centre_y + radius,
+        }, radius * 2, if (current) 0x00ffac64 else 0x00403934);
+    }
+}
+
+fn drawLibraryArrow(dc: Win32.DeviceContext, rectangle: Rect, glyph: [*:0]const u16, enabled: bool, hovered: bool) void {
+    const background: u32 = if (!enabled) 0x001f1a16 else if (hovered) 0x004a3a2e else 0x00251f1b;
+    roundFill(dc, rectangle, 16, background);
+    // An end of the list keeps its arrow and greys it, so the controls do not
+    // change width as the pages turn.
+    const color: u32 = if (!enabled) 0x00463c35 else if (hovered) 0x00fff8f1 else 0x00a39890;
+    text(dc, glyph, -1, .{
+        .left = rectangle.left,
+        .top = rectangle.top + 10,
+        .right = rectangle.right,
+        .bottom = rectangle.bottom,
+    }, color, title_font, Win32.dt_center);
+}
+
+fn drawLibraryGame(dc: Win32.DeviceContext, game: RecentGame, index: usize, slot: usize) void {
+    const rectangle = libraryGameRect(slot);
     const selected = sameFolder(game.folder[0..game.folder_length], game_folder[0..game_folder_length]);
     roundFill(dc, rectangle, 12, if (selected) 0x0049362b else 0x00251f1b);
     const artwork = Rect{
@@ -1492,7 +1666,7 @@ fn drawLibraryGame(dc: Win32.DeviceContext, game: RecentGame, index: usize) void
         text(dc, &game.identifier, @intCast(game.identifier_length), .{ .left = rectangle.left + 10, .top = rectangle.top + 151, .right = rectangle.right - 10, .bottom = rectangle.bottom - 6 }, 0x00a39890, small_font, Win32.dt_center | Win32.dt_end_ellipsis);
     }
     if (hovered_recent_game == index) {
-        const remove = recentRemoveRect(index);
+        const remove = recentRemoveRect(slot);
         roundFill(dc, remove, 13, if (hovered_recent_remove) 0x004848d8 else 0x00403934);
         text(dc, w("×"), -1, .{ .left = remove.left, .top = remove.top + 2, .right = remove.right, .bottom = remove.bottom }, 0x00f4f0ea, medium_font, Win32.dt_center);
     }
@@ -1961,6 +2135,7 @@ fn rememberGameFolder(folder: []const u16, persist: bool) void {
         while (cursor > 0) : (cursor -= 1) recent_games[cursor] = recent_games[cursor - 1];
     }
     recent_games[0] = candidate;
+    showLibraryPage(0);
     if (persist) saveRecentGames();
 }
 
@@ -1980,6 +2155,7 @@ fn loadRecentGames() void {
 }
 
 fn destroyRecentGames() void {
+    showLibraryPage(0);
     for (recent_games[0..recent_game_count]) |game| {
         if (game.icon != null) _ = Win32.DeleteObject(game.icon);
     }
@@ -2004,6 +2180,8 @@ fn removeRecentGame(index: usize) void {
     recent_games[recent_game_count] = .{};
     hovered_recent_game = null;
     hovered_recent_remove = false;
+    // Emptying the last page leaves the view on one that no longer exists.
+    clampLibraryPage();
     saveRecentGames();
 
     if (removed_selected) {
@@ -2940,6 +3118,7 @@ const Win32 = if (builtin.os.tag == .windows) struct {
     const wm_erase_background: u32 = 0x0014;
     const wm_timer: u32 = 0x0113;
     const wm_mouse_move: u32 = 0x0200;
+    const wm_mouse_wheel: u32 = 0x020a;
     const wm_mouse_leave: u32 = 0x02a3;
     const wm_device_change: u32 = 0x0219;
     const hit_test_client: u16 = 1;
