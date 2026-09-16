@@ -447,6 +447,17 @@ pub const ColorControl = struct {
             else => false,
         };
     }
+
+    /// Colour attachment writes are legal in NORMAL mode, and also when
+    /// MODE=DISABLE still names a non-zero TARGET_MASK. Quake II's deferred
+    /// frames leave MODE stuck at DISABLE after a context roll while the
+    /// G-buffer and scanout keep a live mask; Yotei's metadata G-buffer
+    /// prep uses DISABLE with TARGET_MASK=0 and must not export zeros.
+    pub fn allowsAttachmentWrites(self: ColorControl, target_mask: u32, stencil_enabled: bool) bool {
+        if (target_mask == 0 and stencil_enabled) return false;
+        if (self.mode == 1) return true;
+        return self.mode == 0 and target_mask != 0;
+    }
 };
 
 pub const RenderState = struct {
@@ -840,6 +851,15 @@ test "missing color control uses AGC normal mode but explicit disable is preserv
         try state.writeRegister(.context, 0x202, 0x00cc0000 | (@as(u32, mode) << 4));
         try testing.expectEqual(mode, decodeColorControl(&state).mode);
     }
+}
+
+test "DISABLE with a live target mask still writes colour" {
+    const disable = ColorControl{ .mode = 0, .logic_operation = 0xcc };
+    const normal = ColorControl{ .mode = 1, .logic_operation = 0xcc };
+    try testing.expect(normal.allowsAttachmentWrites(0xf, false));
+    try testing.expect(disable.allowsAttachmentWrites(0xf, false));
+    try testing.expect(!disable.allowsAttachmentWrites(0, false));
+    try testing.expect(!normal.allowsAttachmentWrites(0, true));
 }
 
 pub fn decodeColorTarget(state: *const gpu_state.State, slot: u8, target_mask: u32) ?ColorTarget {

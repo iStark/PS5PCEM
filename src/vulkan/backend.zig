@@ -1554,9 +1554,13 @@ fn colorTargetFormat(descriptor: gpu.resources.ColorTarget) ?ColorTargetFormat {
             .{ .vulkan = vk.format_a2b10g10r10_unorm_pack32, .bytes_per_texel = 4 }
         else
             null,
-        // DATA_FORMAT_8_8_8_8. Preserve the existing UNORM attachment path
-        // for the number-type variants titles have already exercised.
-        10 => .{ .vulkan = vk.format_r8g8b8a8_unorm, .bytes_per_texel = 4 },
+        // DATA_FORMAT_8_8_8_8. NUMBER_TYPE 1 is SNORM: Quake II's deferred
+        // G-buffer stores packed normals that way and later samples them as
+        // unified format 57. Other number types keep the UNORM path.
+        10 => switch (descriptor.number_type) {
+            1 => .{ .vulkan = vk.format_r8g8b8a8_snorm, .bytes_per_texel = 4 },
+            else => .{ .vulkan = vk.format_r8g8b8a8_unorm, .bytes_per_texel = 4 },
+        },
         // DATA_FORMAT_16_16_16_16 + NUMBER_FORMAT_FLOAT.
         12 => if (descriptor.number_type == 7)
             .{ .vulkan = vk.format_r16g16b16a16_sfloat, .bytes_per_texel = 8 }
@@ -10723,14 +10727,16 @@ pub const Renderer = struct {
             if (slot >= gpu.resources.color_target_count) continue;
             highest = @max(highest, slot);
             result.color_attachment_formats[slot] = color.format.vulkan;
-            // CB_COLOR_CONTROL.MODE=0 is DISABLE: the bound shaders are a
-            // launch vehicle for metadata. Honouring the register write mask
-            // anyway lets Yotei's G-buffer PS export zeros over the scene.
-            // A zero mask during stencil draws is intentional (Unity UI
-            // mask push/pop), even when the legacy G-buffer recovery has
-            // enabled the bound descriptor's mask. Never paint that mask.
-            result.color_write_masks[slot] = if (render.color_control.mode == 1 and
-                !(render.target_mask == 0 and render.depth_control.stencil_enabled))
+            // NORMAL always writes. DISABLE with a live TARGET_MASK is the
+            // Quake II deferred/scanout case (MODE stuck after a context
+            // roll). DISABLE with TARGET_MASK=0 is Yotei metadata and must
+            // not export zeros. A zero mask during stencil draws is a Unity
+            // UI mask push/pop even when G-buffer recovery enabled the
+            // descriptor mask.
+            result.color_write_masks[slot] = if (render.color_control.allowsAttachmentWrites(
+                render.target_mask,
+                render.depth_control.stencil_enabled,
+            ))
                 mapColorWriteMask(
                     color.descriptor.write_mask,
                     colorTargetExportMapping(color.descriptor),
@@ -16370,6 +16376,27 @@ pub const Renderer = struct {
         // VS's explicit UV location instead of synthesizing interpolation in PS.
         var probe_parameter_mask: u32 = if (vertex_parameter_mask == 0 and fragment_attribute_mask == 1) 1 else 0;
         if (probe_parameter_mask != 0) fragment_input_controls[0] = 0;
+        // Quake II's deferred G-buffer is filled by mesh draws, then a
+        // 4-vertex NGG rect (VS 0xbf8400, no PARAM exports) writes all five
+        // MRTs. Hardware synthesizes UVs for that rect; without them the PS
+        // stamps a 256×256 atlas over the scene, so the world looks like HUD
+        // textures floating on black. Keep the mesh G-buffer until that
+        // export is translated.
+        const blend_slot = target.descriptor.slot;
+        if (vertex_parameter_mask == 0 and
+            @popCount(fragment_attribute_mask) > 1 and
+            extra_colors.len >= 3 and
+            blend_slot < render_state.blends.len and
+            !render_state.blends[blend_slot].enabled)
+        {
+            if (self.traceCurrentGraphicsFrame() or self.reported_interface_pairs < 8) {
+                std.debug.print(
+                    "[vulkan dcb] skipped NGG G-buffer stamp without interpolators VS=0x{x} PS=0x{x} attrs=0x{x} mrts={d}\n",
+                    .{ vertex_address, fragment_address, fragment_attribute_mask, extra_colors.len + 1 },
+                );
+            }
+            return;
+        }
         var paired_parameter_mask = if (probe_parameter_mask != 0)
             probe_parameter_mask
         else
@@ -26870,6 +26897,7 @@ fn sampledImageFormat(unified_format: u16, force_srgb: bool) ?u32 {
         36 => vk.format_b10g11r11_ufloat_pack32,
         50 => vk.format_a2b10g10r10_unorm_pack32,
         56 => if (force_srgb) vk.format_r8g8b8a8_srgb else vk.format_r8g8b8a8_unorm,
+        57 => vk.format_r8g8b8a8_snorm,
         60 => vk.format_r8g8b8a8_uint,
         62 => vk.format_r32g32_uint,
         65 => vk.format_r16g16b16a16_unorm,
@@ -26900,7 +26928,9 @@ fn sampledImageFormat(unified_format: u16, force_srgb: bool) ?u32 {
 fn sampledViewFormatCompatible(image_format: u32, view_format: u32) bool {
     if (image_format == view_format) return true;
     return (image_format == vk.format_r8g8b8a8_unorm and view_format == vk.format_r8g8b8a8_srgb) or
-        (image_format == vk.format_r8g8b8a8_srgb and view_format == vk.format_r8g8b8a8_unorm);
+        (image_format == vk.format_r8g8b8a8_srgb and view_format == vk.format_r8g8b8a8_unorm) or
+        (image_format == vk.format_r8g8b8a8_unorm and view_format == vk.format_r8g8b8a8_snorm) or
+        (image_format == vk.format_r8g8b8a8_snorm and view_format == vk.format_r8g8b8a8_unorm);
 }
 
 const StorageImageFormat = struct {
@@ -31846,6 +31876,11 @@ test "sampled image views honor sRGB and destination selectors" {
     try std.testing.expectEqual(@as(u8, 4), storageImageBytesPerTexel(50));
     try std.testing.expectEqual(vk.format_r8g8b8a8_unorm, sampledImageFormat(56, false).?);
     try std.testing.expectEqual(vk.format_r8g8b8a8_srgb, sampledImageFormat(56, true).?);
+    try std.testing.expectEqual(vk.format_r8g8b8a8_snorm, sampledImageFormat(57, false).?);
+    try std.testing.expect(sampledViewFormatCompatible(
+        vk.format_r8g8b8a8_unorm,
+        vk.format_r8g8b8a8_snorm,
+    ));
     try std.testing.expectEqual(vk.format_r16g16b16a16_unorm, sampledImageFormat(65, false).?);
     try std.testing.expectEqual(vk.format_r16g16b16a16_unorm, sampledImageFormat(65, true).?);
     try std.testing.expectEqual(@as(u8, 8), storageImageBytesPerTexel(65));
