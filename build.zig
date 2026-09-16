@@ -552,6 +552,25 @@ pub fn build(b: *std.Build) void {
     const game_run_step = b.step("game-run", "Load and execute a decrypted PS5 title");
     game_run_step.dependOn(&game_run_cmd.step);
 
+    const pkg = b.addModule("pkg", .{
+        .root_source_file = b.path("src/pkg/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const pkgextractor = b.addExecutable(.{
+        .name = "pkgextractor",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/pkgextractor.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "pkg", .module = pkg }},
+        }),
+    });
+    const install_pkgextractor = b.addInstallArtifact(pkgextractor, .{});
+    b.getInstallStep().dependOn(&install_pkgextractor.step);
+    const build_pkgextractor_step = b.step("build-pkgextractor", "Build only the PS5 package extractor");
+    build_pkgextractor_step.dependOn(&install_pkgextractor.step);
+
     // Zero-dependency native launcher. It selects the title directory, stores
     // user preferences and starts game-run with the corresponding environment.
     var launcher: ?*std.Build.Step.Compile = null;
@@ -570,7 +589,7 @@ pub fn build(b: *std.Build) void {
             .file = b.path("assets/windows/ps5pcem-launcher.rc"),
             .include_paths = &.{b.path("assets/windows")},
         });
-        inline for (&.{ "user32", "gdi32", "gdiplus", "shell32", "ole32", "dwmapi", "setupapi", "hid" }) |library| {
+        inline for (&.{ "user32", "gdi32", "gdiplus", "shell32", "ole32", "comdlg32", "dwmapi", "setupapi", "hid" }) |library| {
             native_launcher.root_module.linkSystemLibrary(library, .{});
         }
         const install_native_launcher = b.addInstallArtifact(native_launcher, .{});
@@ -637,6 +656,7 @@ pub fn build(b: *std.Build) void {
     const check_step = b.step("check", "Compile every module without running tests");
     check_step.dependOn(&vulkan_smoke.step);
     if (launcher) |native_launcher| check_step.dependOn(&native_launcher.step);
+    check_step.dependOn(&pkgextractor.step);
     for ([_]*std.Build.Module{
         memory,
         mod,
@@ -644,6 +664,7 @@ pub fn build(b: *std.Build) void {
         vulkan,
         window,
         input,
+        pkg,
         hle,
         cpu,
         loader,

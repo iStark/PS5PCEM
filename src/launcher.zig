@@ -44,6 +44,8 @@ const Phrase = enum {
     folder_prompt,
     folder_empty,
     choose_folder,
+    extract_pkg,
+    extract_pkg_dialog,
     legal_notice,
     sound,
     enabled,
@@ -110,6 +112,10 @@ const Phrase = enum {
     status_folder_selected,
     status_choose_folder,
     status_eboot_missing,
+    status_extractor_missing,
+    status_extract_failed,
+    status_extracted,
+    status_extract_retail,
     status_runner_missing,
     status_launch_failed,
     status_launched,
@@ -199,6 +205,8 @@ fn tr(phrase: Phrase) []const u8 {
             .folder_prompt => "Select the directory that contains eboot.bin",
             .folder_empty => "No folder selected",
             .choose_folder => "Choose folder",
+            .extract_pkg => "Extract PKG",
+            .extract_pkg_dialog => "Select a PS5 package (.pkg)",
             .legal_notice => "Game content is not included · use only files you are legally allowed to access",
             .sound => "SOUND",
             .enabled => "Enabled",
@@ -265,6 +273,10 @@ fn tr(phrase: Phrase) []const u8 {
             .status_folder_selected => "Folder selected · ready to launch",
             .status_choose_folder => "Choose a game folder first",
             .status_eboot_missing => "eboot.bin was not found in the selected folder or decrypted subfolder",
+            .status_extractor_missing => "pkgextractor.exe was not found · run zig build first",
+            .status_extract_failed => "Could not extract the package",
+            .status_extracted => "Package metadata extracted · folder selected",
+            .status_extract_retail => "Retail packages cannot be extracted",
             .status_runner_missing => "game-run.exe was not found · run zig build first",
             .status_launch_failed => "Could not start game-run.exe",
             .status_launched => "Game launched in a separate process",
@@ -282,6 +294,8 @@ fn tr(phrase: Phrase) []const u8 {
             .folder_prompt => "选择包含 eboot.bin 的文件夹",
             .folder_empty => "尚未选择文件夹",
             .choose_folder => "选择文件夹",
+            .extract_pkg => "解包 PKG",
+            .extract_pkg_dialog => "选择 PS5 安装包 (.pkg)",
             .legal_notice => "不包含游戏内容 · 请仅使用您有权访问的文件",
             .sound => "声音",
             .enabled => "已启用",
@@ -348,6 +362,10 @@ fn tr(phrase: Phrase) []const u8 {
             .status_folder_selected => "已选择文件夹 · 可以启动游戏",
             .status_choose_folder => "请先选择游戏文件夹",
             .status_eboot_missing => "所选文件夹或 decrypted 子文件夹中未找到 eboot.bin",
+            .status_extractor_missing => "未找到 pkgextractor.exe · 请先 zig build",
+            .status_extract_failed => "无法解包该安装包",
+            .status_extracted => "已提取安装包元数据 · 已选中文件夹",
+            .status_extract_retail => "无法解包零售版安装包",
             .status_runner_missing => "未找到 game-run.exe · 请先运行 zig build",
             .status_launch_failed => "无法启动 game-run.exe",
             .status_launched => "游戏已在独立进程中启动",
@@ -365,6 +383,8 @@ fn tr(phrase: Phrase) []const u8 {
             .folder_prompt => "Selecciona la carpeta que contiene eboot.bin",
             .folder_empty => "No se ha seleccionado ninguna carpeta",
             .choose_folder => "Elegir carpeta",
+            .extract_pkg => "Extraer PKG",
+            .extract_pkg_dialog => "Selecciona un paquete PS5 (.pkg)",
             .legal_notice => "No se incluyen juegos · usa solo archivos a los que tengas acceso legal",
             .sound => "SONIDO",
             .enabled => "Activado",
@@ -431,6 +451,10 @@ fn tr(phrase: Phrase) []const u8 {
             .status_folder_selected => "Carpeta seleccionada · listo para iniciar",
             .status_choose_folder => "Elige primero una carpeta de juego",
             .status_eboot_missing => "No se encontró eboot.bin en la carpeta seleccionada ni en la subcarpeta decrypted",
+            .status_extractor_missing => "No se encontró pkgextractor.exe · ejecuta zig build primero",
+            .status_extract_failed => "No se pudo extraer el paquete",
+            .status_extracted => "Metadatos extraídos · carpeta seleccionada",
+            .status_extract_retail => "Los paquetes retail no se pueden extraer",
             .status_runner_missing => "No se encontró game-run.exe · ejecuta zig build primero",
             .status_launch_failed => "No se pudo iniciar game-run.exe",
             .status_launched => "Juego iniciado en un proceso independiente",
@@ -448,6 +472,8 @@ fn tr(phrase: Phrase) []const u8 {
             .folder_prompt => "اختر المجلد الذي يحتوي على eboot.bin",
             .folder_empty => "لم يتم اختيار مجلد",
             .choose_folder => "اختيار مجلد",
+            .extract_pkg => "استخراج PKG",
+            .extract_pkg_dialog => "اختر حزمة PS5 (.pkg)",
             .legal_notice => "الألعاب غير مرفقة · استخدم فقط الملفات التي يحق لك الوصول إليها",
             .sound => "الصوت",
             .enabled => "مفعّل",
@@ -514,6 +540,10 @@ fn tr(phrase: Phrase) []const u8 {
             .status_folder_selected => "تم اختيار المجلد · جاهز للتشغيل",
             .status_choose_folder => "اختر مجلد اللعبة أولًا",
             .status_eboot_missing => "لم يتم العثور على eboot.bin في المجلد المختار أو المجلد الفرعي decrypted",
+            .status_extractor_missing => "pkgextractor.exe غير موجود · شغّل zig build أولاً",
+            .status_extract_failed => "تعذر استخراج الحزمة",
+            .status_extracted => "تم استخراج بيانات الحزمة · تم اختيار المجلد",
+            .status_extract_retail => "لا يمكن استخراج الحزم التجارية",
             .status_runner_missing => "لم يتم العثور على game-run.exe · شغّل zig build أولًا",
             .status_launch_failed => "تعذّر تشغيل game-run.exe",
             .status_launched => "تم تشغيل اللعبة في عملية منفصلة",
@@ -531,6 +561,8 @@ fn tr(phrase: Phrase) []const u8 {
             .folder_prompt => "Selecione a pasta que contém eboot.bin",
             .folder_empty => "Nenhuma pasta selecionada",
             .choose_folder => "Escolher pasta",
+            .extract_pkg => "Extrair PKG",
+            .extract_pkg_dialog => "Selecione um pacote PS5 (.pkg)",
             .legal_notice => "Jogos não incluídos · use apenas arquivos aos quais tenha acesso legal",
             .sound => "SOM",
             .enabled => "Ativado",
@@ -597,6 +629,10 @@ fn tr(phrase: Phrase) []const u8 {
             .status_folder_selected => "Pasta selecionada · pronto para iniciar",
             .status_choose_folder => "Escolha primeiro uma pasta de jogo",
             .status_eboot_missing => "eboot.bin não foi encontrado na pasta selecionada nem na subpasta decrypted",
+            .status_extractor_missing => "pkgextractor.exe não encontrado · execute zig build primeiro",
+            .status_extract_failed => "Não foi possível extrair o pacote",
+            .status_extracted => "Metadados extraídos · pasta selecionada",
+            .status_extract_retail => "Pacotes de varejo não podem ser extraídos",
             .status_runner_missing => "game-run.exe não foi encontrado · execute zig build primeiro",
             .status_launch_failed => "Não foi possível iniciar game-run.exe",
             .status_launched => "Jogo iniciado em um processo separado",
@@ -614,6 +650,8 @@ fn tr(phrase: Phrase) []const u8 {
             .folder_prompt => "Укажите каталог, в котором находится eboot.bin",
             .folder_empty => "Папка пока не выбрана",
             .choose_folder => "Выбрать папку",
+            .extract_pkg => "Распаковать PKG",
+            .extract_pkg_dialog => "Выберите пакет PS5 (.pkg)",
             .legal_notice => "Контент игр не входит в проект · используйте только законно полученные файлы",
             .sound => "ЗВУК",
             .enabled => "Включён",
@@ -680,6 +718,10 @@ fn tr(phrase: Phrase) []const u8 {
             .status_folder_selected => "Папка выбрана · готово к запуску",
             .status_choose_folder => "Сначала выберите папку с игрой",
             .status_eboot_missing => "В выбранной папке не найден eboot.bin (проверены корень и decrypted)",
+            .status_extractor_missing => "pkgextractor.exe не найден · сначала zig build",
+            .status_extract_failed => "Не удалось распаковать пакет",
+            .status_extracted => "Метаданные пакета извлечены · папка выбрана",
+            .status_extract_retail => "Розничные пакеты извлечь нельзя",
             .status_runner_missing => "Не найден game-run.exe · сначала выполните zig build",
             .status_launch_failed => "Не удалось запустить game-run.exe",
             .status_launched => "Игра запущена в отдельном процессе",
@@ -697,6 +739,8 @@ fn tr(phrase: Phrase) []const u8 {
             .folder_prompt => "Wähle das Verzeichnis mit eboot.bin",
             .folder_empty => "Noch kein Ordner ausgewählt",
             .choose_folder => "Ordner wählen",
+            .extract_pkg => "PKG entpacken",
+            .extract_pkg_dialog => "PS5-Paket (.pkg) auswählen",
             .legal_notice => "Spielinhalte sind nicht enthalten · verwende nur rechtmäßig zugängliche Dateien",
             .sound => "TON",
             .enabled => "Ein",
@@ -763,6 +807,10 @@ fn tr(phrase: Phrase) []const u8 {
             .status_folder_selected => "Ordner gewählt · startbereit",
             .status_choose_folder => "Zuerst einen Spielordner wählen",
             .status_eboot_missing => "eboot.bin wurde im Ordner und Unterordner decrypted nicht gefunden",
+            .status_extractor_missing => "pkgextractor.exe fehlt · zuerst zig build ausführen",
+            .status_extract_failed => "Paket konnte nicht entpackt werden",
+            .status_extracted => "Paketmetadaten entpackt · Ordner ausgewählt",
+            .status_extract_retail => "Retail-Pakete können nicht entpackt werden",
             .status_runner_missing => "game-run.exe fehlt · zuerst zig build ausführen",
             .status_launch_failed => "game-run.exe konnte nicht gestartet werden",
             .status_launched => "Spiel in einem separaten Prozess gestartet",
@@ -780,6 +828,8 @@ fn tr(phrase: Phrase) []const u8 {
             .folder_prompt => "Sélectionnez le répertoire contenant eboot.bin",
             .folder_empty => "Aucun dossier sélectionné",
             .choose_folder => "Choisir le dossier",
+            .extract_pkg => "Extraire le PKG",
+            .extract_pkg_dialog => "Sélectionnez un paquet PS5 (.pkg)",
             .legal_notice => "Les jeux ne sont pas inclus · utilisez uniquement des fichiers obtenus légalement",
             .sound => "SON",
             .enabled => "Activé",
@@ -846,6 +896,10 @@ fn tr(phrase: Phrase) []const u8 {
             .status_folder_selected => "Dossier sélectionné · prêt à lancer",
             .status_choose_folder => "Choisissez d'abord un dossier de jeu",
             .status_eboot_missing => "eboot.bin est introuvable dans le dossier ou le sous-dossier decrypted",
+            .status_extractor_missing => "pkgextractor.exe introuvable · lancez zig build d'abord",
+            .status_extract_failed => "Impossible d'extraire le paquet",
+            .status_extracted => "Métadonnées extraites · dossier sélectionné",
+            .status_extract_retail => "Les paquets retail ne peuvent pas être extraits",
             .status_runner_missing => "game-run.exe est introuvable · exécutez d'abord zig build",
             .status_launch_failed => "Impossible de lancer game-run.exe",
             .status_launched => "Jeu lancé dans un processus séparé",
@@ -1063,8 +1117,9 @@ const nav_rects = [_]Rect{
     .{ .left = 20, .top = 680, .right = 202, .bottom = 724 },
 };
 
-const library_browse_rect = Rect{ .left = 282, .top = 646, .right = 548, .bottom = 700 };
-const library_launch_rect = Rect{ .left = 812, .top = 646, .right = 1086, .bottom = 700 };
+const library_browse_rect = Rect{ .left = 282, .top = 646, .right = 500, .bottom = 700 };
+const library_extract_rect = Rect{ .left = 516, .top = 646, .right = 760, .bottom = 700 };
+const library_launch_rect = Rect{ .left = 776, .top = 646, .right = 1086, .bottom = 700 };
 
 fn libraryGameRect(index: usize) Rect {
     const column: i32 = @intCast(index % 4);
@@ -1168,6 +1223,7 @@ fn clickableAt(x: i32, y: i32) bool {
     return switch (current_page) {
         .library => recentGameAt(x, y) != null or
             library_browse_rect.contains(x, y) or
+            library_extract_rect.contains(x, y) or
             library_launch_rect.contains(x, y),
         .input => blk: {
             if (pad_presence.connected and pad_test_rect.contains(x, y)) break :blk true;
@@ -1222,6 +1278,7 @@ fn handleLibraryClick(window: Win32.Window, x: i32, y: i32) void {
         return;
     }
     if (library_browse_rect.contains(x, y)) chooseGameFolder(window);
+    if (library_extract_rect.contains(x, y)) extractPackage(window);
     if (library_launch_rect.contains(x, y)) launchGame(window);
 }
 
@@ -1408,7 +1465,8 @@ fn drawLibrary(dc: Win32.DeviceContext) void {
     }
 
     button(dc, library_browse_rect, .choose_folder, false);
-    localizedText(dc, .legal_notice, .{ .left = 566, .top = 666, .right = 794, .bottom = 688 }, 0x007e746d, small_font, Win32.dt_center | Win32.dt_end_ellipsis);
+    button(dc, library_extract_rect, .extract_pkg, false);
+    localizedText(dc, .legal_notice, .{ .left = 282, .top = 708, .right = 1086, .bottom = 730 }, 0x007e746d, small_font, Win32.dt_center | Win32.dt_end_ellipsis);
     button(dc, library_launch_rect, .launch_game, game_folder_length == 0);
 }
 
@@ -2241,6 +2299,99 @@ fn chooseGameFolder(owner: Win32.Window) void {
     setStatusPhrase(.status_folder_selected, false);
 }
 
+fn extractPackage(owner: Win32.Window) void {
+    var extractor: [1024]u16 = [_]u16{0} ** 1024;
+    const extractor_len = siblingExecutable("pkgextractor.exe", &extractor);
+    if (extractor_len == 0 or Win32.GetFileAttributesW(@ptrCast(&extractor)) == Win32.invalid_file_attributes) {
+        setStatusPhrase(.status_extractor_missing, true);
+        return;
+    }
+
+    var filter: [96]u16 = @splat(0);
+    var filter_len: usize = 0;
+    const filter_parts = [_][]const u8{ "PS5 PKG (*.pkg)", "*.pkg" };
+    for (filter_parts) |part| {
+        const converted = std.unicode.utf8ToUtf16Le(filter[filter_len..], part) catch return;
+        filter_len += converted;
+        filter[filter_len] = 0;
+        filter_len += 1;
+    }
+
+    var dialog_title: [256]u16 = @splat(0);
+    const dialog_title_length = std.unicode.utf8ToUtf16Le(&dialog_title, tr(.extract_pkg_dialog)) catch return;
+    dialog_title[dialog_title_length] = 0;
+
+    var pkg_path: [1024]u16 = @splat(0);
+    var ofn = Win32.OpenFileNameW{
+        .size = @sizeOf(Win32.OpenFileNameW),
+        .owner = owner,
+        .filter = @ptrCast(&filter),
+        .file = &pkg_path,
+        .max_file = pkg_path.len,
+        .title = @ptrCast(&dialog_title),
+        .flags = Win32.ofn_explorer | Win32.ofn_file_must_exist | Win32.ofn_path_must_exist | Win32.ofn_hide_readonly,
+        .def_ext = w("pkg"),
+    };
+    if (Win32.GetOpenFileNameW(&ofn) == 0) return;
+
+    var out_path: [1024]u16 = @splat(0);
+    const pkg_len = wideLength(@ptrCast(&pkg_path));
+    @memcpy(out_path[0..pkg_len], pkg_path[0..pkg_len]);
+    var out_len = pkg_len;
+    while (out_len > 0 and out_path[out_len - 1] != '.') : (out_len -= 1) {}
+    if (out_len == 0) {
+        out_len = pkg_len;
+    } else {
+        out_len -= 1;
+    }
+    out_path[out_len] = 0;
+
+    var command: [4096]u16 = [_]u16{0} ** 4096;
+    var length: usize = 0;
+    appendWide(&command, &length, w("\""));
+    appendWideSlice(&command, &length, extractor[0..extractor_len]);
+    appendWide(&command, &length, w("\" \""));
+    appendWideSlice(&command, &length, pkg_path[0..pkg_len]);
+    appendWide(&command, &length, w("\" -o \""));
+    appendWideSlice(&command, &length, out_path[0..out_len]);
+    appendWide(&command, &length, w("\""));
+    command[length] = 0;
+
+    var startup = Win32.StartupInfoW{ .size = @sizeOf(Win32.StartupInfoW) };
+    var process: Win32.ProcessInformation = undefined;
+    if (Win32.CreateProcessW(
+        @ptrCast(&extractor),
+        @ptrCast(&command),
+        null,
+        null,
+        0,
+        Win32.create_new_console,
+        null,
+        null,
+        &startup,
+        &process,
+    ) == 0) {
+        setStatusPhrase(.status_extract_failed, true);
+        return;
+    }
+    _ = Win32.WaitForSingleObject(process.process, Win32.infinite);
+    var exit_code: u32 = 1;
+    _ = Win32.GetExitCodeProcess(process.process, &exit_code);
+    _ = Win32.CloseHandle(process.thread);
+    _ = Win32.CloseHandle(process.process);
+    if (exit_code != 0) {
+        setStatusPhrase(if (exit_code == 2) .status_extract_retail else .status_extract_failed, true);
+        return;
+    }
+    @memcpy(game_folder[0..out_len], out_path[0..out_len]);
+    game_folder[out_len] = 0;
+    game_folder_length = out_len;
+    refreshTitleIdentifier();
+    rememberGameFolder(game_folder[0..game_folder_length], true);
+    saveSettings();
+    setStatusPhrase(.status_extracted, false);
+}
+
 fn launchGame(owner: Win32.Window) void {
     if (game_folder_length == 0) {
         setStatusPhrase(.status_choose_folder, true);
@@ -2726,6 +2877,31 @@ const Win32 = if (builtin.os.tag == .windows) struct {
         l_param: isize,
         image: i32,
     };
+    const OpenFileNameW = extern struct {
+        size: u32 = 0,
+        owner: Window = null,
+        instance: Instance = null,
+        filter: ?[*]const u16 = null,
+        custom_filter: ?[*]u16 = null,
+        max_custom_filter: u32 = 0,
+        filter_index: u32 = 0,
+        file: ?[*]u16 = null,
+        max_file: u32 = 0,
+        file_title: ?[*]u16 = null,
+        max_file_title: u32 = 0,
+        initial_dir: ?[*:0]const u16 = null,
+        title: ?[*:0]const u16 = null,
+        flags: u32 = 0,
+        file_offset: u16 = 0,
+        file_extension: u16 = 0,
+        def_ext: ?[*:0]const u16 = null,
+        cust_data: usize = 0,
+        hook: ?*anyopaque = null,
+        template_name: ?[*:0]const u16 = null,
+        reserved: ?*anyopaque = null,
+        reserved_flags: u32 = 0,
+        flags_ex: u32 = 0,
+    };
     const StartupInfoW = extern struct {
         size: u32 = 0,
         reserved: ?[*]u16 = null,
@@ -2811,6 +2987,11 @@ const Win32 = if (builtin.os.tag == .windows) struct {
     const coinit_apartment_threaded: u32 = 0x0002;
     const invalid_file_attributes: u32 = 0xffff_ffff;
     const create_new_console: u32 = 0x0000_0010;
+    const ofn_explorer: u32 = 0x0008_0000;
+    const ofn_file_must_exist: u32 = 0x0000_1000;
+    const ofn_path_must_exist: u32 = 0x0000_0800;
+    const ofn_hide_readonly: u32 = 0x0000_0004;
+    const infinite: u32 = 0xffff_ffff;
     const cstr_equal: i32 = 2;
     const halftone: i32 = 4;
     const source_copy: u32 = 0x00cc_0020;
@@ -2824,7 +3005,10 @@ const Win32 = if (builtin.os.tag == .windows) struct {
     extern "kernel32" fn GetLastError() callconv(.winapi) u32;
     extern "kernel32" fn SetEnvironmentVariableW(name: [*:0]const u16, value: ?[*:0]const u16) callconv(.winapi) i32;
     extern "kernel32" fn CreateProcessW(application: ?[*:0]const u16, command: ?[*:0]u16, process_attributes: ?*anyopaque, thread_attributes: ?*anyopaque, inherit: i32, flags: u32, environment: ?*anyopaque, directory: ?[*:0]const u16, startup: *StartupInfoW, process: *ProcessInformation) callconv(.winapi) i32;
+    extern "kernel32" fn WaitForSingleObject(handle: Handle, milliseconds: u32) callconv(.winapi) u32;
+    extern "kernel32" fn GetExitCodeProcess(handle: Handle, exit_code: *u32) callconv(.winapi) i32;
     extern "kernel32" fn CloseHandle(handle: Handle) callconv(.winapi) i32;
+    extern "comdlg32" fn GetOpenFileNameW(ofn: *OpenFileNameW) callconv(.winapi) i32;
     extern "kernel32" fn CompareStringOrdinal([*]const u16, i32, [*]const u16, i32, i32) callconv(.winapi) i32;
     extern "kernel32" fn GetPrivateProfileStringW(section: [*:0]const u16, key: [*:0]const u16, default: [*:0]const u16, output: [*]u16, size: u32, file: [*:0]const u16) callconv(.winapi) u32;
     extern "kernel32" fn GetPrivateProfileIntW(section: [*:0]const u16, key: [*:0]const u16, default: u32, file: [*:0]const u16) callconv(.winapi) u32;
