@@ -35,7 +35,9 @@
 
 The launcher remembers up to eight recent titles, reads artwork from each
 title's local `sce_sys/icon0.png`, detects DualSense and DualShock controllers,
-and keeps portable settings and savedata beside the application.
+and keeps portable settings and savedata beside the application. It reports
+whether the host can run Vulkan before a title is started, naming the device it
+found, and can invoke the package extractor on a debug package directly.
 
 ## See it running
 
