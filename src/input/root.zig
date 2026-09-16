@@ -130,13 +130,16 @@ fn mergeKeyboard(state: *State, keys: Mapping) void {
         if (keyDown(binding.key)) state.buttons |= binding.mask;
     }
 
-    // WASD is the left stick. The arrow keys remain available as both the
-    // directional buttons and, with Alt held, the right stick.
-    state.left_stick_x = axis(keyDown('A'), keyDown('D'));
-    state.left_stick_y = axis(keyDown('W'), keyDown('S'));
+    // WASD is the left stick. Only write an axis when a key is actually
+    // held: automatic and hybrid modes poll the controller first, and
+    // unconditionally centering WASD here wiped the physical left stick
+    // (Quake II could look with the right stick but could not walk).
+    // Arrow keys remain the d-pad and, with Alt held, the right stick.
+    state.left_stick_x = mergeDigitalAxis(state.left_stick_x, keyDown('A'), keyDown('D'));
+    state.left_stick_y = mergeDigitalAxis(state.left_stick_y, keyDown('W'), keyDown('S'));
     if (keyDown(0x12)) { // Alt
-        state.right_stick_x = axis(keyDown(0x25), keyDown(0x27));
-        state.right_stick_y = axis(keyDown(0x26), keyDown(0x28));
+        state.right_stick_x = mergeDigitalAxis(state.right_stick_x, keyDown(0x25), keyDown(0x27));
+        state.right_stick_y = mergeDigitalAxis(state.right_stick_y, keyDown(0x26), keyDown(0x28));
     }
     if (keyDown(keys.l2)) state.analog_l2 = 255;
     if (keyDown(keys.r2)) state.analog_r2 = 255;
@@ -269,6 +272,11 @@ fn axis(negative: bool, positive: bool) u8 {
     return if (negative) 0 else 255;
 }
 
+fn mergeDigitalAxis(current: u8, negative: bool, positive: bool) u8 {
+    if (!negative and !positive) return current;
+    return axis(negative, positive);
+}
+
 fn stickAxis(value: i16) u8 {
     const shifted: i32 = @as(i32, value) + 32768;
     return @intCast(@divTrunc(shifted * 255, 65535));
@@ -320,6 +328,13 @@ test "stick axes preserve the centre and endpoints" {
     try std.testing.expectEqual(@as(u8, 0), stickAxis(-32768));
     try std.testing.expectEqual(@as(u8, 127), stickAxis(0));
     try std.testing.expectEqual(@as(u8, 255), stickAxis(32767));
+}
+
+test "keyboard axes do not recenter an already-set stick" {
+    try std.testing.expectEqual(@as(u8, 200), mergeDigitalAxis(200, false, false));
+    try std.testing.expectEqual(@as(u8, 0), mergeDigitalAxis(200, true, false));
+    try std.testing.expectEqual(@as(u8, 255), mergeDigitalAxis(200, false, true));
+    try std.testing.expectEqual(@as(u8, 128), mergeDigitalAxis(200, true, true));
 }
 
 test "keyboard mapping parser changes only named keys" {
