@@ -40,6 +40,7 @@ pub fn extractInnerTree(
     allocator: std.mem.Allocator,
     image_offset: u64,
     image_size: u64,
+    image_limit: u64,
     naps_blob: []const u8,
     dest: std.Io.Dir,
 ) Error!InnerStats {
@@ -59,6 +60,23 @@ pub fn extractInnerTree(
         if (b.kraken) stats.kraken_blocks += 1 else stats.stored_blocks += 1;
     }
 
+    // The inode's size for pfs_image.dat can stop short of the blocks its own
+    // layout points at. Big Helmet Heroes keeps the inode table and every
+    // directory entry in the last 1.4 MB, past that declared end; reading only
+    // the declared extent leaves those blocks zero, so the file tree cannot be
+    // read and every name comes out positional -- file_0001, prx_00.prx --
+    // which no loader can resolve a module from. The map knows how far the
+    // image reaches, and the outer PFS is what bounds it.
+    var image_extent = image_size;
+    for (blocks.items) |b| {
+        const end = @as(u64, b.on_disk) +| @as(u64, b.comp);
+        if (end > image_extent) image_extent = end;
+    }
+    if (image_extent > image_limit) image_extent = image_limit;
+    if (image_extent != image_size) {
+        std.debug.print("  image reaches 0x{x}, past the declared 0x{x}\n", .{ image_extent, image_size });
+    }
+
     const meta_base_logical = blk: {
         var best: u64 = 0;
         for (layout.file_offsets) |entry| {
@@ -68,12 +86,12 @@ pub fn extractInnerTree(
         }
         break :blk best;
     };
-    const meta = try decodeTail(allocator, src, io, image_offset, image_size, blocks.items, meta_base_logical);
+    const meta = try decodeTail(allocator, src, io, image_offset, image_extent, blocks.items, meta_base_logical);
     defer allocator.free(meta.buf);
 
-    const sb_off = findSuperblock(meta.buf) orelse blk: {
-        tryKrakenPhysicalTail(allocator, src, io, image_offset, image_size, meta.buf);
-        if (findSuperblock(meta.buf)) |off| break :blk off;
+    const sb_off = findSuperblock(meta.buf, mount) orelse blk: {
+        tryKrakenPhysicalTail(allocator, src, io, image_offset, image_extent, meta.buf);
+        if (findSuperblock(meta.buf, mount)) |off| break :blk off;
         var dump: usize = 0;
         while (dump + 16 <= meta.buf.len and dump < 0x40000) : (dump += 0x10000) {
             std.debug.print("  tail+0x{x} {x:0>2}{x:0>2}{x:0>2}{x:0>2} {x:0>2}{x:0>2}{x:0>2}{x:0>2}\n", .{
@@ -95,7 +113,7 @@ pub fn extractInnerTree(
         src,
         io,
         image_offset,
-        image_size,
+        image_extent,
         blocks.items,
         meta.buf,
         meta.logical_base,
@@ -112,7 +130,7 @@ pub fn extractInnerTree(
 
     for (files) |file| {
         if (file.path.len == 0) continue;
-        writeFileFromBlocks(src, io, allocator, image_offset, image_size, blocks.items, ubuf, dest, file) catch |err| switch (err) {
+        writeFileFromBlocks(src, io, allocator, image_offset, image_extent, blocks.items, ubuf, dest, file) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => continue,
         };
@@ -285,7 +303,7 @@ fn tryKrakenPhysicalTail(
         std.debug.print("  tail 128k flag=0x{x} {s} head {x:0>2}{x:0>2}{x:0>2}{x:0>2} {x:0>2}{x:0>2}{x:0>2}{x:0>2}\n", .{
             flag, @tagName(st), dst[0], dst[1], dst[2], dst[3], dst[8], dst[9], dst[10], dst[11],
         });
-        if (st == .success and findSuperblock(dst[0..out128]) != null) return;
+        if (st == .success and findSuperblock(dst[0..out128], 0) != null) return;
     }
     const out256 = @min(dst.len, naps.ublock_size);
     const flags256 = [_]u32{ 0x22, 0x02, 0x12, 0x32, 0x23, 0x03 };
@@ -299,34 +317,37 @@ fn tryKrakenPhysicalTail(
                 std.debug.print("  tail 256k flag=0x{x} fc={d} success head {x:0>2}{x:0>2}{x:0>2}{x:0>2} {x:0>2}{x:0>2}{x:0>2}{x:0>2}\n", .{
                     flag, fc, dst[0], dst[1], dst[2], dst[3], dst[8], dst[9], dst[10], dst[11],
                 });
-                if (findSuperblock(dst[0..out256]) != null) return;
+                if (findSuperblock(dst[0..out256], 0) != null) return;
             }
         }
     }
 }
 
-fn findSuperblock(buf: []const u8) ?usize {
+/// The superblock this image agrees with, not merely the first one present.
+/// A version-2 header appears more than once in the metadata -- a mount keeps
+/// a copy of its own -- and picking the wrong one reads an inode table that
+/// belongs to something else: five inodes where the image has eighty-two. The
+/// one that belongs here is the one whose block count covers the image
+/// exactly.
+fn findSuperblock(buf: []const u8, mount_size: u64) ?usize {
+    var fallback: ?usize = null;
     var off: usize = 0;
-    while (off + 16 <= buf.len) {
-        if (off % 0x10000 == 0) {
-            const ver = std.mem.readInt(i64, buf[off..][0..8], .little);
-            const magic = std.mem.readInt(i64, buf[off + 8 ..][0..8], .little);
-            if (ver == 2 and magic == pfs_magic) return off;
-        }
-        off += 0x10000;
+    while (off + 0x40 <= buf.len) : (off += 0x10000) {
+        const ver = std.mem.readInt(i64, buf[off..][0..8], .little);
+        const magic = std.mem.readInt(i64, buf[off + 8 ..][0..8], .little);
+        if (ver != 2 or magic != pfs_magic) continue;
+        const blocksz = std.mem.readInt(u32, buf[off + 0x20 ..][0..4], .little);
+        const ndinode = std.mem.readInt(i64, buf[off + 0x30 ..][0..8], .little);
+        const ndblock = std.mem.readInt(i64, buf[off + 0x38 ..][0..8], .little);
+        const covers: u64 = if (ndblock > 0 and blocksz != 0)
+            @as(u64, @intCast(ndblock)) *% blocksz
+        else
+            0;
+        std.debug.print("  [sb] +0x{x} blocksz=0x{x} ndinode={d} covers=0x{x}\n", .{ off, blocksz, ndinode, covers });
+        if (covers == mount_size and ndinode > 0) return off;
+        if (fallback == null) fallback = off;
     }
-    // scan every 64K from the end
-    if (buf.len >= 0x10000) {
-        var p = (buf.len - 0x10000) & ~@as(usize, 0xFFFF);
-        while (true) {
-            const ver = std.mem.readInt(i64, buf[p..][0..8], .little);
-            const magic = std.mem.readInt(i64, buf[p + 8 ..][0..8], .little);
-            if (ver == 2 and magic == pfs_magic) return p;
-            if (p < 0x10000) break;
-            p -= 0x10000;
-        }
-    }
-    return null;
+    return fallback;
 }
 
 const InnerInode = struct {
@@ -408,7 +429,21 @@ fn readFileTree(
     }
     var seen = std.AutoHashMap(u32, void).init(allocator);
     defer seen.deinit();
-    walkDir(allocator, src, io, image_offset, image_size, blocks, mount, logical_base, nodes, 0, "", false, &files, &seen) catch {};
+    {
+        var dirs: usize = 0;
+        var regs: usize = 0;
+        for (nodes) |n| {
+            if (n.dir()) dirs += 1;
+            if (n.mode & 0xF000 == 0x8000) regs += 1;
+        }
+        std.debug.print("  [tree] inodes={d} dirs={d} files={d} root(mode=0x{x} size={d} logical=0x{x})\n", .{
+            nodes.len, dirs, regs, nodes[0].mode, nodes[0].size, nodes[0].logical,
+        });
+    }
+    walkDir(allocator, src, io, image_offset, image_size, blocks, mount, logical_base, nodes, 0, "", false, &files, &seen) catch |err| {
+        std.debug.print("  [tree] walk stopped: {s}\n", .{@errorName(err)});
+    };
+    std.debug.print("  [tree] collected {d} path(s)\n", .{files.items.len});
     return files.toOwnedSlice(allocator) catch return error.OutOfMemory;
 }
 

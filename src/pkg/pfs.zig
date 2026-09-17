@@ -443,7 +443,14 @@ pub fn extractAppFiles(
 
     if (loadNamedOuter(file, io, allocator, pfs_offset, sb, inodes, "naps_pkg_layout.dat")) |naps_blob| {
         defer allocator.free(naps_blob);
-        const inner_stats = inner.extractInnerTree(file, io, allocator, image_offset, image_size, naps_blob, dest) catch |err| {
+        // How far the package actually reaches after the image starts. The
+        // inner reader needs it because its own block map can point past the
+        // size the inode records for pfs_image.dat.
+        const image_limit = if (pfs_offset + pfs_size > image_offset)
+            pfs_offset + pfs_size - image_offset
+        else
+            image_size;
+        const inner_stats = inner.extractInnerTree(file, io, allocator, image_offset, image_size, image_limit, naps_blob, dest) catch |err| {
             std.debug.print("inner file tree unpack failed ({s})\n", .{@errorName(err)});
             return stats;
         };
