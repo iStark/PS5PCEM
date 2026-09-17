@@ -167,11 +167,59 @@ pub fn nextDirent(buf: []const u8, offset: *usize) ?Dirent {
 pub fn parseSelfHeader(buf: []const u8) ?struct { file_size: u64, elf_type: u16 } {
     if (buf.len < self_elf_offset + 18) return null;
     if (std.mem.readInt(u32, buf[0..4], .little) != self_magic) return null;
-    const file_size = std.mem.readInt(u64, buf[0x10..0x18], .little);
+    const header_size = std.mem.readInt(u64, buf[0x10..0x18], .little);
     if (!std.mem.eql(u8, buf[self_elf_offset..][0..4], &elf_magic)) return null;
     const elf_type = std.mem.readInt(u16, buf[self_elf_offset + 16 ..][0..2], .little);
-    if (file_size < self_elf_offset + 64) return null;
-    return .{ .file_size = file_size, .elf_type = elf_type };
+    if (header_size < self_elf_offset + 64) return null;
+    return .{ .file_size = extendSelfFileSize(buf, header_size), .elf_type = elf_type };
+}
+
+/// Some decrypted PS5 SELFs keep `PT_SCE_DYNLIBDATA` off the SELF segment
+/// table. The header `file_size` then ends at the last blocked payload, and
+/// the loader reads the table from the bytes immediately after it.
+fn extendSelfFileSize(buf: []const u8, header_size: u64) u64 {
+    if (buf.len < 0x20) return header_size;
+    const segment_count = std.mem.readInt(u16, buf[0x18..0x1A], .little);
+    if (segment_count == 0 or segment_count > 64) return header_size;
+    const table_end: usize = 32 + @as(usize, segment_count) * 32;
+    if (table_end + 64 > buf.len) return header_size;
+
+    var last_blocked_end: u64 = 0;
+    var i: usize = 0;
+    while (i < segment_count) : (i += 1) {
+        const rec = buf[32 + i * 32 ..][0..32];
+        const typ = std.mem.readInt(u64, rec[0..8], .little);
+        const off = std.mem.readInt(u64, rec[8..16], .little);
+        const decompressed = std.mem.readInt(u64, rec[24..32], .little);
+        if (typ & 0x800 == 0) continue;
+        const end = off + decompressed;
+        if (end > last_blocked_end) last_blocked_end = end;
+    }
+    if (last_blocked_end == 0) return header_size;
+
+    const elf_off = table_end;
+    if (elf_off + 64 > buf.len) return header_size;
+    if (!std.mem.eql(u8, buf[elf_off..][0..4], &elf_magic)) return header_size;
+    const phoff = std.mem.readInt(u64, buf[elf_off + 32 ..][0..8], .little);
+    const phentsize = std.mem.readInt(u16, buf[elf_off + 54 ..][0..2], .little);
+    const phnum = std.mem.readInt(u16, buf[elf_off + 56 ..][0..2], .little);
+    if (phentsize < 56 or phnum == 0 or phnum > 128) return header_size;
+    const ph_base = std.math.add(u64, elf_off, phoff) catch return header_size;
+
+    const pt_dynlib_ps5: u32 = 0x6fff_ff01;
+    var dynlib_filesz: u64 = 0;
+    var j: u16 = 0;
+    while (j < phnum) : (j += 1) {
+        const poff_u = std.math.add(u64, ph_base, @as(u64, j) * phentsize) catch break;
+        const poff: usize = std.math.cast(usize, poff_u) orelse break;
+        if (poff + 56 > buf.len) break;
+        const ptype = std.mem.readInt(u32, buf[poff..][0..4], .little);
+        const filesz = std.mem.readInt(u64, buf[poff + 32 ..][0..8], .little);
+        if (ptype == pt_dynlib_ps5 and filesz > dynlib_filesz) dynlib_filesz = filesz;
+    }
+    if (dynlib_filesz == 0) return header_size;
+    const need = last_blocked_end + dynlib_filesz;
+    return @max(header_size, need);
 }
 
 fn readExact(file: std.Io.File, io: std.Io, dest: []u8, offset: u64) Error!void {
@@ -503,4 +551,27 @@ test "parseSelfHeader recognises SCE_DYNEXEC" {
     const hdr = parseSelfHeader(&buf).?;
     try std.testing.expectEqual(@as(u64, 0x7e2cdb0), hdr.file_size);
     try std.testing.expectEqual(et_sce_dynexec, hdr.elf_type);
+}
+
+test "parseSelfHeader includes an unlisted dynlib-data tail" {
+    var buf: [0x400]u8 = @splat(0);
+    std.mem.writeInt(u32, buf[0..4], self_magic, .little);
+    std.mem.writeInt(u16, buf[0xC..0xE], 32, .little);
+    std.mem.writeInt(u64, buf[0x10..0x18], 0x1000, .little);
+    std.mem.writeInt(u16, buf[0x18..0x1A], 12, .little);
+    // Blocked payload occupying [0x800, 0x800+0x200).
+    std.mem.writeInt(u64, buf[0x20..0x28], 0x800, .little);
+    std.mem.writeInt(u64, buf[0x28..0x30], 0x800, .little);
+    std.mem.writeInt(u64, buf[0x30..0x38], 0x200, .little);
+    std.mem.writeInt(u64, buf[0x38..0x40], 0x200, .little);
+    @memcpy(buf[self_elf_offset..][0..4], &elf_magic);
+    std.mem.writeInt(u16, buf[self_elf_offset + 16 ..][0..2], et_sce_dynexec, .little);
+    std.mem.writeInt(u64, buf[self_elf_offset + 32 ..][0..8], 0x40, .little);
+    std.mem.writeInt(u16, buf[self_elf_offset + 54 ..][0..2], 56, .little);
+    std.mem.writeInt(u16, buf[self_elf_offset + 56 ..][0..2], 1, .little);
+    const ph = self_elf_offset + 0x40;
+    std.mem.writeInt(u32, buf[ph..][0..4], 0x6fff_ff01, .little);
+    std.mem.writeInt(u64, buf[ph + 32 ..][0..8], 0x1eb6, .little);
+    const hdr = parseSelfHeader(&buf).?;
+    try std.testing.expectEqual(@as(u64, 0x800 + 0x200 + 0x1eb6), hdr.file_size);
 }
