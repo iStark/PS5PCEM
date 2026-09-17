@@ -711,6 +711,7 @@ const audio_in_exports = [_]symbols.Export{
     // SDK 11 imports the close entry under a new identifier while retaining
     // the same one-handle ABI.
     .{ .name = "libSceAudioIn:X+4jdIS75P0", .function = trace.wrap("sceAudioInCloseGen5", &audioInClose), .id_override = "X+4jdIS75P0" },
+    .{ .name = "sceAudioInAsyncOpen", .function = trace.wrap("sceAudioInAsyncOpen", &audioInOpen), .expect_id = "3YQ1qY5ePUk" },
 };
 
 // libSceAudioOut2 ----------------------------------------------------------
@@ -3255,6 +3256,17 @@ fn ajmBatchJobDecodeSplit(
     return appendAjmJob(info, job_size);
 }
 
+fn ajmBatchJobSetResampleParameters(
+    info: ?*AjmBatchInfo,
+    instance: u32,
+    _: f32,
+    _: u32,
+    result: ?[*]u8,
+) callconv(abi.guest) i32 {
+    writeAjmBasicResult(result, if (isAjmInstance(instance)) ajm_codec.result_unsupported_flag else ajm_result_invalid_parameter, 0);
+    return appendAjmJob(info, 72);
+}
+
 fn ajmBatchJobSetResampleParametersEx(
     info: ?*AjmBatchInfo,
     instance: u32,
@@ -3457,6 +3469,7 @@ const ajm_exports = [_]symbols.Export{
     .{ .name = "sceAjmBatchJobDecode", .function = trace.wrap("sceAjmBatchJobDecode", &ajmBatchJobDecode), .expect_id = "39WxhR-ePew" },
     .{ .name = "sceAjmBatchJobDecodeSplit", .function = trace.wrap("sceAjmBatchJobDecodeSplit", &ajmBatchJobDecodeSplit), .expect_id = "SJ3i0DXP8vg" },
     .{ .name = "sceAjmBatchJobClearContext", .function = trace.wrap("sceAjmBatchJobClearContext", &ajmBatchJobClearContext), .expect_id = "uJ3m8INuikg" },
+    .{ .name = "sceAjmBatchJobSetResampleParameters", .function = trace.wrap("sceAjmBatchJobSetResampleParameters", &ajmBatchJobSetResampleParameters), .expect_id = "81HsnXFbWS4" },
     .{ .name = "sceAjmBatchJobSetResampleParametersEx", .function = trace.wrap("sceAjmBatchJobSetResampleParametersEx", &ajmBatchJobSetResampleParametersEx), .expect_id = "5ldnD16rYZw" },
     .{ .name = "sceAjmBatchJobGetResampleInfo", .function = trace.wrap("sceAjmBatchJobGetResampleInfo", &ajmBatchJobGetResampleInfo), .expect_id = "JkdNCocpu1M" },
     .{ .name = "sceAjmBatchJobGetStatistics", .function = trace.wrap("sceAjmBatchJobGetStatistics", &ajmBatchJobGetStatistics), .expect_id = "3cAg7xN995U" },
