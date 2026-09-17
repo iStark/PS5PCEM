@@ -37,7 +37,8 @@ pub const Counts = struct {
     }
 
     pub fn numFileOffsets(self: Counts) u32 {
-        return self.num_files + 1;
+        // The count includes the terminal mount-size entry (type 0x40).
+        return self.num_files;
     }
 };
 
@@ -51,8 +52,6 @@ pub const CblockInfo = struct {
     coffset_mod: u32,
     uoffset_start: u32,
     clen_even_minus1: u32,
-    even: u1,
-    odd: u1,
     kde_predictor: u8,
     shuffle_idx: u8,
     tweak_idx_start: u32,
@@ -60,16 +59,21 @@ pub const CblockInfo = struct {
     coffset_start_256k: u32,
 
     pub fn evenComp(self: CblockInfo) u32 {
-        return self.clen_even_minus1 / 2 + 1;
+        return self.clen_even_minus1 + 1;
     }
 
     pub fn kraken(self: CblockInfo) bool {
-        return self.kde_predictor == 2;
+        return self.kde_predictor & 2 != 0;
     }
 
-    /// Sony debug FPKG run-base: 18-bit tweak after bit 2, times 32 KiB.
-    pub fn runOnDisk(self: CblockInfo) u64 {
-        return @as(u64, self.tweak_idx_start) << 15;
+    pub fn krakenFlags(self: CblockInfo) u32 {
+        return @as(u32, self.kde_predictor) | (@as(u32, self.shuffle_idx) << 4);
+    }
+
+    /// Runs encode twice the physical 256 KiB block index. The following
+    /// data record supplies the byte offset within that block.
+    pub fn runOnDisk(self: CblockInfo, first: CblockInfo) u64 {
+        return @as(u64, self.coffset_start_256k / 2) * ublock_size + first.coffset_mod;
     }
 };
 
@@ -84,13 +88,10 @@ pub const Layout = struct {
     }
 
     pub fn mountSize(self: Layout) u64 {
-        var best: u64 = 0;
         for (self.file_offsets) |entry| {
-            if (entry.uncompressed_offset > 0 and entry.uncompressed_offset & 0xFFFF == 0) {
-                best = @max(best, entry.uncompressed_offset);
-            }
+            if (entry.kind == 0x40) return entry.uncompressed_offset;
         }
-        return best;
+        return 0;
     }
 
     pub fn nextBoundary(self: Layout, cur: u64, mount: u64) u64 {
@@ -126,18 +127,14 @@ pub fn decodeCblock(raw: []const u8) Error!CblockInfo {
     var i: usize = 0;
     while (i < 8) : (i += 1) lo |= @as(u64, raw[i]) << @intCast(8 * i);
     const hi: u64 = raw[8];
-    // Commercial debug FPKGs flag a run-base with bit 2. LibProsperoPkg's own
-    // encoder uses bit 18; those records also have bytes 1..8 clear.
-    const is_run = (raw[0] & 4) != 0 or ((lo >> 18) & 1 != 0 and raw[1] == 0 and raw[2] == 0);
+    const is_run = (lo >> 18) & 1 != 0;
     const coff: u32 = @truncate(lo & 0x3FFFF);
     if (!is_run) {
         return .{
             .is_run_base = false,
             .coffset_mod = coff,
-            .uoffset_start = @truncate((lo >> 19) & 0x3FFFF),
-            .clen_even_minus1 = @truncate((lo >> 37) & 0x1FFFF),
-            .even = @truncate((lo >> 54) & 1),
-            .odd = @truncate((lo >> 55) & 1),
+            .uoffset_start = @truncate((lo >> 20) & 0x3FFFF),
+            .clen_even_minus1 = @truncate((lo >> 38) & 0x1FFFF),
             .kde_predictor = @truncate((lo >> 56) & 7),
             .shuffle_idx = @truncate((lo >> 59) & 0xF),
             .tweak_idx_start = 0,
@@ -145,18 +142,14 @@ pub fn decodeCblock(raw: []const u8) Error!CblockInfo {
             .coffset_start_256k = 0,
         };
     }
-    const sony_tweak: u32 = @truncate((lo >> 3) & 0x3FFFF);
-    const lib_tweak: u32 = @truncate((lo >> 19) & 0xFFFFFFF);
     return .{
         .is_run_base = true,
         .coffset_mod = coff,
         .uoffset_start = 0,
         .clen_even_minus1 = 0,
-        .even = 0,
-        .odd = 0,
         .kde_predictor = 0,
         .shuffle_idx = 0,
-        .tweak_idx_start = if (raw[0] & 4 != 0) sony_tweak else lib_tweak,
+        .tweak_idx_start = @truncate((lo >> 19) & 0xFFFFFFF),
         .key_table_idx = @truncate((lo >> 47) & 3),
         .coffset_start_256k = @truncate(((lo >> 49) & 0x7FFF) | ((hi & 0x1FF) << 15)),
     };
@@ -164,13 +157,15 @@ pub fn decodeCblock(raw: []const u8) Error!CblockInfo {
 
 pub fn parse(allocator: std.mem.Allocator, blob: []const u8) Error!Layout {
     const counts = try decodeHeader(blob);
-    const fidx_n = deriveFidxCount(counts, blob.len);
+    const fidx_n = counts.numFileOffsets();
     const map_end = sectionEnd(counts, fidx_n);
     if (blob.len < map_end) return error.TruncatedNaps;
 
     var pos: usize = header_size;
     pos += @as(usize, counts.num_outer_blocks) * outer_stride;
+    pos = std.mem.alignForward(usize, pos, 16);
     pos += @as(usize, counts.num_shuffle) * shuffle_stride;
+    pos = std.mem.alignForward(usize, pos, 16);
 
     const file_offsets = allocator.alloc(FileOffset, fidx_n) catch return error.TruncatedNaps;
     errdefer allocator.free(file_offsets);
@@ -183,7 +178,9 @@ pub fn parse(allocator: std.mem.Allocator, blob: []const u8) Error!Layout {
         file_offsets[i] = .{ .kind = rec[5], .uncompressed_offset = off };
     }
     pos += fidx_n * file_offset_stride;
+    pos = std.mem.alignForward(usize, pos, 16);
     pos += @as(usize, counts.numU2c()) * u2c_stride;
+    pos = std.mem.alignForward(usize, pos, 16);
 
     const cblocks = allocator.alloc(CblockInfo, counts.num_cblock_info) catch return error.TruncatedNaps;
     errdefer allocator.free(cblocks);
@@ -197,32 +194,12 @@ pub fn parse(allocator: std.mem.Allocator, blob: []const u8) Error!Layout {
     return .{ .counts = counts, .file_offsets = file_offsets, .cblocks = cblocks };
 }
 
-fn deriveFidxCount(counts: Counts, blob_len: usize) usize {
-    const fixed_before = header_size
-        + @as(usize, counts.num_outer_blocks) * outer_stride
-        + @as(usize, counts.num_shuffle) * shuffle_stride
-        + @as(usize, counts.numU2c()) * u2c_stride;
-    const cblock_bytes = @as(usize, counts.num_cblock_info) * cblock_stride;
-    if (blob_len >= cblock_bytes) {
-        const cblock_start = blob_len - cblock_bytes;
-        if (cblock_start >= fixed_before) {
-            const fidx_bytes = cblock_start - fixed_before;
-            if (fidx_bytes % file_offset_stride == 0) {
-                const derived = fidx_bytes / file_offset_stride;
-                if (derived >= 1) return derived;
-            }
-        }
-    }
-    return counts.numFileOffsets();
-}
-
 fn sectionEnd(counts: Counts, fidx_n: usize) usize {
-    return header_size
-        + @as(usize, counts.num_outer_blocks) * outer_stride
-        + @as(usize, counts.num_shuffle) * shuffle_stride
-        + fidx_n * file_offset_stride
-        + @as(usize, counts.numU2c()) * u2c_stride
-        + @as(usize, counts.num_cblock_info) * cblock_stride;
+    var pos = std.mem.alignForward(usize, header_size + @as(usize, counts.num_outer_blocks) * outer_stride, 16);
+    pos = std.mem.alignForward(usize, pos + @as(usize, counts.num_shuffle) * shuffle_stride, 16);
+    pos = std.mem.alignForward(usize, pos + fidx_n * file_offset_stride, 16);
+    pos = std.mem.alignForward(usize, pos + @as(usize, counts.numU2c()) * u2c_stride, 16);
+    return pos + @as(usize, counts.num_cblock_info) * cblock_stride;
 }
 
 test "decodeHeader reads packed naps fields" {
@@ -250,9 +227,39 @@ test "decodeCblock distinguishes std and run-base" {
     try std.testing.expectEqual(@as(u32, 1), std_info.coffset_mod);
 
     var run_rec: [9]u8 = @splat(0);
-    run_rec[0] = 0x14; // bit 2 set, (0x14 >> 3) = 2 → on-disk 0x10000
+    run_rec[2] = 0x14; // run bit 18, tweak 2
     const run_info = try decodeCblock(&run_rec);
     try std.testing.expectEqual(true, run_info.is_run_base);
     try std.testing.expectEqual(@as(u32, 2), run_info.tweak_idx_start);
-    try std.testing.expectEqual(@as(u64, 0x10000), run_info.runOnDisk());
+    var first = std_info;
+    first.coffset_mod = 0x10000;
+    try std.testing.expectEqual(@as(u64, 0x10000), run_info.runOnDisk(first));
+}
+
+test "NAPS padding does not become file offsets or shift CblockInfo" {
+    var blob: [96]u8 = @splat(0);
+    // Two fidx entries, one outer block, one ublock and two CblockInfo records.
+    std.mem.writeInt(u64, blob[0..8], 1 | (@as(u64, 1) << 32), .little);
+    std.mem.writeInt(u64, blob[8..16], 1, .little);
+    // Outer digests end at 24; fidx starts at the next 16-byte boundary.
+    blob[40] = 4; // mount size 0x40000 in the second 40-bit offset
+    blob[43] = 0x40;
+    // fidx ends at 44, u2c occupies 48..58, cblocks start at 64.
+    blob[66] = 4; // run marker: bit 18, not bit 2
+    var layout = try parse(std.testing.allocator, &blob);
+    defer layout.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), layout.file_offsets.len);
+    try std.testing.expectEqual(@as(u64, 0x40000), layout.mountSize());
+    try std.testing.expect(layout.cblocks[0].is_run_base);
+    try std.testing.expect(!layout.cblocks[1].is_run_base);
+    try std.testing.expectError(error.TruncatedNaps, parse(std.testing.allocator, blob[0..81]));
+}
+
+test "NAPS preserves the high bit of the first Kraken chunk length" {
+    const rec = try decodeCblock(&.{ 0x09, 0x72, 0xa1, 0x48, 0x0e, 0xe2, 0xc9, 0x12, 0x00 });
+    try std.testing.expect(!rec.is_run_base);
+    try std.testing.expectEqual(@as(u32, 75657), rec.evenComp());
+    try std.testing.expectEqual(@as(u32, 0x22), rec.krakenFlags());
+    const stored = try decodeCblock(&.{ 0x0a, 0x00, 0xa2, 0x24, 0xc3, 0xff, 0xff, 0x04, 0x00 });
+    try std.testing.expectEqual(@as(u32, 0x20000), stored.evenComp());
 }

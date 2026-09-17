@@ -9,10 +9,8 @@
 //! sits at the start of the PFS (classic) or near the end (data-first),
 //! and `PPRPLAIN-NOAUTH!` packages leave the file data in the clear.
 //!
-//! This reader locates `pfs_image.dat` and copies uncompressed SELF
-//! modules out of it. `ET_SCE_DYNEXEC` becomes `eboot.bin`; other SELF
-//! files land under `sce_module/`. Kraken-compressed asset payloads are
-//! not unpacked.
+//! This reader locates `pfs_image.dat` and its NAPS layout, then extracts
+//! the application tree. Images without NAPS can only yield scanned SELFs.
 
 const std = @import("std");
 const inner = @import("inner.zig");
@@ -36,6 +34,8 @@ pub const Error = error{
     NoPfsImage,
     Io,
     OutOfMemory,
+    UnsupportedPfs,
+    InvalidCompressedBlock,
 };
 
 pub const Superblock = struct {
@@ -439,25 +439,17 @@ pub fn extractAppFiles(
         "outer PFS  block={d}  inodes={d}  pfs_image.dat {d} bytes at 0x{x}\n",
         .{ sb.image_block, inodes.len, image_size, image_offset },
     );
-    var stats = try extractSelfs(file, io, image_offset, image_size, dest);
-
     if (loadNamedOuter(file, io, allocator, pfs_offset, sb, inodes, "naps_pkg_layout.dat")) |naps_blob| {
         defer allocator.free(naps_blob);
-        // How far the package actually reaches after the image starts. The
-        // inner reader needs it because its own block map can point past the
-        // size the inode records for pfs_image.dat.
         const image_limit = if (pfs_offset + pfs_size > image_offset)
             pfs_offset + pfs_size - image_offset
         else
             image_size;
-        const inner_stats = inner.extractInnerTree(file, io, allocator, image_offset, image_size, image_limit, naps_blob, dest) catch |err| {
-            std.debug.print("inner file tree unpack failed ({s})\n", .{@errorName(err)});
-            return stats;
-        };
-        stats.files = inner_stats.files;
-        if (inner_stats.files != 0) stats.eboot = true;
+        const stats = try inner.extractInnerTree(file, io, allocator, image_offset, image_size, image_limit, naps_blob, dest);
+        return .{ .files = stats.files, .eboot = stats.eboot, .modules = stats.modules };
     }
-    return stats;
+    std.debug.print("NAPS layout missing; extracting SELF modules only (application content is incomplete)\n", .{});
+    return extractSelfs(file, io, image_offset, image_size, dest);
 }
 
 fn loadNamedOuter(

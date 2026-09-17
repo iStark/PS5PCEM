@@ -9,7 +9,8 @@
 //! icons, PlayGo tables, …) into an `sce_sys` tree, and unpacks uncompressed
 //! SELF modules (`eboot.bin`, `sce_module/*.prx`) from the nested
 //! `pfs_image.dat` of a debug / passcode image. Retail images (signed byte
-//! `0x80`) are refused. Kraken-compressed inner assets are not unpacked.
+//! `0x80`) are refused. NAPS describes the stored and Kraken-compressed
+//! application payloads and the inner filesystem metadata.
 
 const std = @import("std");
 
@@ -17,6 +18,10 @@ pub const pfs = @import("pfs.zig");
 pub const naps = @import("naps.zig");
 pub const kraken = @import("kraken.zig");
 pub const inner = @import("inner.zig");
+
+test {
+    std.testing.refAllDecls(@This());
+}
 
 pub const fih_magic = [4]u8{ 0x7f, 'F', 'I', 'H' };
 pub const cnt_magic = [4]u8{ 0x7f, 'C', 'N', 'T' };

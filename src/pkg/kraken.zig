@@ -235,14 +235,10 @@ fn unpackOffsets(
     len_out: []i32,
 ) bool {
     @setRuntimeSafety(false);
-    // Sony excess chunks pad the offset bitstream with 0xFF. Those bytes are
-    // not extra-distance bits; the backward reader must start before them.
-    var bwd_end = bs_end;
-    if (excess_flag) {
-        while (bwd_end > bs_begin + 1 and src[bwd_end - 1] == 0xFF) bwd_end -= 1;
-    }
     var a = BitReader.forward(src, bs_begin, bs_end);
-    var b = BitReader.backward(src, bs_begin, bwd_end);
+    // Trailing 0xFF bytes still carry distance bits. The excess framing has
+    // already removed its separate length stream from bs_end.
+    var b = BitReader.backward(src, bs_begin, bs_end);
     var u32_len: usize = 0;
     if (!excess_flag) {
         if (a.bits < 0x2000 and b.bits < 0x2000) {
@@ -1257,4 +1253,13 @@ test "type-0 entropy array expands a memcpy payload" {
     var dst: [4]u8 = undefined;
     try std.testing.expectEqual(Status.success, decodeBareEntropy(std.testing.allocator, &src, &dst));
     try std.testing.expectEqualSlices(u8, &.{ 9, 8, 7, 6 }, &dst);
+}
+
+test "excess framing preserves trailing FF distance bits" {
+    // Scaled offset code 8 consumes one bit: -(16 | bit) + 8.
+    // The backward distance must consume the high bit of the final FF.
+    var offsets: [2]i32 = undefined;
+    var lengths: [0]i32 = .{};
+    try std.testing.expect(unpackOffsets(&.{ 0, 0, 0, 0xff }, 0, 4, true, 0, &.{ 8, 8 }, 1, &.{}, &.{}, &offsets, &lengths));
+    try std.testing.expectEqualSlices(i32, &.{ -8, -9 }, &offsets);
 }

@@ -187,12 +187,12 @@ pub fn main(init: std.process.Init) !void {
         },
     );
     if (pfs_size != 0) {
-        const app = pkg.pfs.extractAppFiles(file, io, arena, pfs_offset, pfs_size, superblock_abs, dest) catch |err| {
+        const app = pkg.pfs.extractAppFiles(file, io, std.heap.page_allocator, pfs_offset, pfs_size, superblock_abs, dest) catch |err| {
             std.debug.print(
-                "inner PFS unpack failed ({s}); eboot.bin was not written\n",
+                "inner PFS unpack failed ({s}); output is incomplete\n",
                 .{@errorName(err)},
             );
-            return;
+            return err;
         };
         if (app.eboot) {
             std.debug.print("unpacked eboot.bin, {d} module(s), {d} inner file(s)\n", .{ app.modules, app.files });
