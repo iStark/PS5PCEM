@@ -15,6 +15,7 @@
 //! not unpacked.
 
 const std = @import("std");
+const inner = @import("inner.zig");
 
 pub const pfs_magic: i64 = 20130315;
 pub const self_magic: u32 = 0xEEF51454;
@@ -94,6 +95,7 @@ pub const Dirent = struct {
 pub const ExtractStats = struct {
     eboot: bool = false,
     modules: u32 = 0,
+    files: u32 = 0,
 };
 
 pub fn parseSuperblock(buf: []const u8, image_block: u64) Error!Superblock {
@@ -389,7 +391,53 @@ pub fn extractAppFiles(
         "outer PFS  block={d}  inodes={d}  pfs_image.dat {d} bytes at 0x{x}\n",
         .{ sb.image_block, inodes.len, image_size, image_offset },
     );
-    return extractSelfs(file, io, image_offset, image_size, dest);
+    var stats = try extractSelfs(file, io, image_offset, image_size, dest);
+
+    if (loadNamedOuter(file, io, allocator, pfs_offset, sb, inodes, "naps_pkg_layout.dat")) |naps_blob| {
+        defer allocator.free(naps_blob);
+        const inner_stats = inner.extractInnerTree(file, io, allocator, image_offset, image_size, naps_blob, dest) catch |err| {
+            std.debug.print("inner file tree unpack failed ({s})\n", .{@errorName(err)});
+            return stats;
+        };
+        stats.files = inner_stats.files;
+        if (inner_stats.files != 0) stats.eboot = true;
+    }
+    return stats;
+}
+
+fn loadNamedOuter(
+    file: std.Io.File,
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    pfs_offset: u64,
+    sb: Superblock,
+    inodes: []const Inode,
+    name: []const u8,
+) ?[]u8 {
+    var dir_buf: [0x10000]u8 = undefined;
+    for (inodes) |inode| {
+        if (!inode.directory()) continue;
+        const start = inode.startBlock();
+        if (start < 0) continue;
+        const abs = pfs_offset + @as(u64, @intCast(start)) * sb.block_size;
+        const n = @min(dir_buf.len, @as(usize, @intCast(@min(inode.size, sb.block_size))));
+        readExact(file, io, dir_buf[0..n], abs) catch continue;
+        var offset: usize = 0;
+        while (nextDirent(dir_buf[0..n], &offset)) |ent| {
+            if (!std.mem.eql(u8, ent.name, name) or ent.ino >= inodes.len) continue;
+            const file_inode = inodes[ent.ino];
+            const fstart = file_inode.startBlock();
+            if (fstart < 0 or file_inode.size == 0 or file_inode.size > 32 * 1024 * 1024) return null;
+            const buf = allocator.alloc(u8, @intCast(file_inode.size)) catch return null;
+            const foff = pfs_offset + @as(u64, @intCast(fstart)) * sb.block_size;
+            readExact(file, io, buf, foff) catch {
+                allocator.free(buf);
+                return null;
+            };
+            return buf;
+        }
+    }
+    return null;
 }
 
 test "parseSuperblock reads a PS5 data-first header" {

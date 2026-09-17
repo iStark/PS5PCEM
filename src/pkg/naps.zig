@@ -66,6 +66,11 @@ pub const CblockInfo = struct {
     pub fn kraken(self: CblockInfo) bool {
         return self.kde_predictor == 2;
     }
+
+    /// Sony debug FPKG run-base: 18-bit tweak after bit 2, times 32 KiB.
+    pub fn runOnDisk(self: CblockInfo) u64 {
+        return @as(u64, self.tweak_idx_start) << 15;
+    }
 };
 
 pub const Layout = struct {
@@ -121,7 +126,9 @@ pub fn decodeCblock(raw: []const u8) Error!CblockInfo {
     var i: usize = 0;
     while (i < 8) : (i += 1) lo |= @as(u64, raw[i]) << @intCast(8 * i);
     const hi: u64 = raw[8];
-    const is_run = (lo >> 18) & 1 != 0;
+    // Commercial debug FPKGs flag a run-base with bit 2. LibProsperoPkg's own
+    // encoder uses bit 18; those records also have bytes 1..8 clear.
+    const is_run = (raw[0] & 4) != 0 or ((lo >> 18) & 1 != 0 and raw[1] == 0 and raw[2] == 0);
     const coff: u32 = @truncate(lo & 0x3FFFF);
     if (!is_run) {
         return .{
@@ -138,6 +145,8 @@ pub fn decodeCblock(raw: []const u8) Error!CblockInfo {
             .coffset_start_256k = 0,
         };
     }
+    const sony_tweak: u32 = @truncate((lo >> 3) & 0x3FFFF);
+    const lib_tweak: u32 = @truncate((lo >> 19) & 0xFFFFFFF);
     return .{
         .is_run_base = true,
         .coffset_mod = coff,
@@ -147,7 +156,7 @@ pub fn decodeCblock(raw: []const u8) Error!CblockInfo {
         .odd = 0,
         .kde_predictor = 0,
         .shuffle_idx = 0,
-        .tweak_idx_start = @truncate((lo >> 19) & 0xFFFFFFF),
+        .tweak_idx_start = if (raw[0] & 4 != 0) sony_tweak else lib_tweak,
         .key_table_idx = @truncate((lo >> 47) & 3),
         .coffset_start_256k = @truncate(((lo >> 49) & 0x7FFF) | ((hi & 0x1FF) << 15)),
     };
@@ -235,16 +244,15 @@ test "decodeHeader reads packed naps fields" {
 test "decodeCblock distinguishes std and run-base" {
     var std_rec: [9]u8 = @splat(0);
     // coff=20, not run
-    std_rec[0] = 20;
+    std_rec[0] = 1;
     const std_info = try decodeCblock(&std_rec);
     try std.testing.expectEqual(false, std_info.is_run_base);
-    try std.testing.expectEqual(@as(u32, 20), std_info.coffset_mod);
+    try std.testing.expectEqual(@as(u32, 1), std_info.coffset_mod);
 
     var run_rec: [9]u8 = @splat(0);
-    const lo: u64 = (1 << 18) | (@as(u64, 2) << 19);
-    var i: usize = 0;
-    while (i < 8) : (i += 1) run_rec[i] = @truncate(lo >> @intCast(8 * i));
+    run_rec[0] = 0x14; // bit 2 set, (0x14 >> 3) = 2 → on-disk 0x10000
     const run_info = try decodeCblock(&run_rec);
     try std.testing.expectEqual(true, run_info.is_run_base);
     try std.testing.expectEqual(@as(u32, 2), run_info.tweak_idx_start);
+    try std.testing.expectEqual(@as(u64, 0x10000), run_info.runOnDisk());
 }

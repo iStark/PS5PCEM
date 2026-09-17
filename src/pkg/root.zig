@@ -16,6 +16,7 @@ const std = @import("std");
 pub const pfs = @import("pfs.zig");
 pub const naps = @import("naps.zig");
 pub const kraken = @import("kraken.zig");
+pub const inner = @import("inner.zig");
 
 pub const fih_magic = [4]u8{ 0x7f, 'F', 'I', 'H' };
 pub const cnt_magic = [4]u8{ 0x7f, 'C', 'N', 'T' };

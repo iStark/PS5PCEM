@@ -9,8 +9,8 @@
 //! Unencrypted CNT entries (param.json, icons, PlayGo tables, trophies) are
 //! written under `sce_sys/`. Debug / passcode packages also unpack
 //! uncompressed SELF modules from the nested `pfs_image.dat` (`eboot.bin`
-//! and `sce_module/*.prx`). Kraken-compressed game assets stay packed;
-//! retail packages are refused.
+//! and `sce_module/*.prx`) plus the inner uroot file payloads. Retail
+//! packages are refused.
 
 const std = @import("std");
 const pkg = @import("pkg");
@@ -19,10 +19,9 @@ const usage =
     \\pkgextractor <game.pkg> [-o <output-dir>]
     \\
     \\Reads a PS5 debug package (FIH FPKG) and writes unencrypted metadata
-    \\into output-dir/sce_sys plus uncompressed SELF modules (eboot.bin,
-    \\sce_module/*.prx) from the inner PFS image.
-    \\Retail packages cannot be extracted. Kraken-compressed game assets
-    \\are not unpacked yet.
+    \\into output-dir/sce_sys plus inner application files (eboot.bin,
+    \\sce_module/*.prx, keystone, and uroot payloads) from the nested PFS.
+    \\Retail packages cannot be extracted.
     \\
 ;
 
@@ -196,11 +195,11 @@ pub fn main(init: std.process.Init) !void {
             return;
         };
         if (app.eboot) {
-            std.debug.print("unpacked eboot.bin and {d} module(s)\n", .{app.modules});
+            std.debug.print("unpacked eboot.bin, {d} module(s), {d} inner file(s)\n", .{ app.modules, app.files });
         } else {
             std.debug.print(
-                "inner PFS had no SCE_DYNEXEC eboot.bin ({d} other SELF module(s))\n",
-                .{app.modules},
+                "inner PFS had no SCE_DYNEXEC eboot.bin ({d} other SELF module(s), {d} inner file(s))\n",
+                .{ app.modules, app.files },
             );
         }
     }
