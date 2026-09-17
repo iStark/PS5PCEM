@@ -116,6 +116,7 @@ const Phrase = enum {
     status_extractor_missing,
     status_extract_failed,
     status_extracted,
+    status_extracted_no_eboot,
     status_extract_retail,
     status_runner_missing,
     status_launch_failed,
@@ -282,7 +283,8 @@ fn tr(phrase: Phrase) []const u8 {
             .status_eboot_missing => "eboot.bin was not found in the selected folder or decrypted subfolder",
             .status_extractor_missing => "pkgextractor.exe was not found · run zig build first",
             .status_extract_failed => "Could not extract the package",
-            .status_extracted => "Package metadata extracted · folder selected",
+            .status_extracted => "Package extracted · ready to launch",
+            .status_extracted_no_eboot => "Metadata extracted · eboot.bin was not in the inner image",
             .status_extract_retail => "Retail packages cannot be extracted",
             .status_runner_missing => "game-run.exe was not found · run zig build first",
             .status_launch_failed => "Could not start game-run.exe",
@@ -371,7 +373,8 @@ fn tr(phrase: Phrase) []const u8 {
             .status_eboot_missing => "所选文件夹或 decrypted 子文件夹中未找到 eboot.bin",
             .status_extractor_missing => "未找到 pkgextractor.exe · 请先 zig build",
             .status_extract_failed => "无法解包该安装包",
-            .status_extracted => "已提取安装包元数据 · 已选中文件夹",
+            .status_extracted => "安装包已提取 · 可以启动",
+            .status_extracted_no_eboot => "已提取元数据 · 内部镜像中没有 eboot.bin",
             .status_extract_retail => "无法解包零售版安装包",
             .status_runner_missing => "未找到 game-run.exe · 请先运行 zig build",
             .status_launch_failed => "无法启动 game-run.exe",
@@ -460,7 +463,8 @@ fn tr(phrase: Phrase) []const u8 {
             .status_eboot_missing => "No se encontró eboot.bin en la carpeta seleccionada ni en la subcarpeta decrypted",
             .status_extractor_missing => "No se encontró pkgextractor.exe · ejecuta zig build primero",
             .status_extract_failed => "No se pudo extraer el paquete",
-            .status_extracted => "Metadatos extraídos · carpeta seleccionada",
+            .status_extracted => "Paquete extraído · listo para iniciar",
+            .status_extracted_no_eboot => "Metadatos extraídos · eboot.bin no está en la imagen interna",
             .status_extract_retail => "Los paquetes retail no se pueden extraer",
             .status_runner_missing => "No se encontró game-run.exe · ejecuta zig build primero",
             .status_launch_failed => "No se pudo iniciar game-run.exe",
@@ -549,7 +553,8 @@ fn tr(phrase: Phrase) []const u8 {
             .status_eboot_missing => "لم يتم العثور على eboot.bin في المجلد المختار أو المجلد الفرعي decrypted",
             .status_extractor_missing => "pkgextractor.exe غير موجود · شغّل zig build أولاً",
             .status_extract_failed => "تعذر استخراج الحزمة",
-            .status_extracted => "تم استخراج بيانات الحزمة · تم اختيار المجلد",
+            .status_extracted => "تم استخراج الحزمة · جاهز للتشغيل",
+            .status_extracted_no_eboot => "تم استخراج البيانات · eboot.bin غير موجود في الصورة الداخلية",
             .status_extract_retail => "لا يمكن استخراج الحزم التجارية",
             .status_runner_missing => "لم يتم العثور على game-run.exe · شغّل zig build أولًا",
             .status_launch_failed => "تعذّر تشغيل game-run.exe",
@@ -638,7 +643,8 @@ fn tr(phrase: Phrase) []const u8 {
             .status_eboot_missing => "eboot.bin não foi encontrado na pasta selecionada nem na subpasta decrypted",
             .status_extractor_missing => "pkgextractor.exe não encontrado · execute zig build primeiro",
             .status_extract_failed => "Não foi possível extrair o pacote",
-            .status_extracted => "Metadados extraídos · pasta selecionada",
+            .status_extracted => "Pacote extraído · pronto para iniciar",
+            .status_extracted_no_eboot => "Metadados extraídos · eboot.bin não está na imagem interna",
             .status_extract_retail => "Pacotes de varejo não podem ser extraídos",
             .status_runner_missing => "game-run.exe não foi encontrado · execute zig build primeiro",
             .status_launch_failed => "Não foi possível iniciar game-run.exe",
@@ -727,7 +733,8 @@ fn tr(phrase: Phrase) []const u8 {
             .status_eboot_missing => "В выбранной папке не найден eboot.bin (проверены корень и decrypted)",
             .status_extractor_missing => "pkgextractor.exe не найден · сначала zig build",
             .status_extract_failed => "Не удалось распаковать пакет",
-            .status_extracted => "Метаданные пакета извлечены · папка выбрана",
+            .status_extracted => "Пакет распакован · можно запускать",
+            .status_extracted_no_eboot => "Метаданные извлечены · eboot.bin нет во внутреннем образе",
             .status_extract_retail => "Розничные пакеты извлечь нельзя",
             .status_runner_missing => "Не найден game-run.exe · сначала выполните zig build",
             .status_launch_failed => "Не удалось запустить game-run.exe",
@@ -816,7 +823,8 @@ fn tr(phrase: Phrase) []const u8 {
             .status_eboot_missing => "eboot.bin wurde im Ordner und Unterordner decrypted nicht gefunden",
             .status_extractor_missing => "pkgextractor.exe fehlt · zuerst zig build ausführen",
             .status_extract_failed => "Paket konnte nicht entpackt werden",
-            .status_extracted => "Paketmetadaten entpackt · Ordner ausgewählt",
+            .status_extracted => "Paket entpackt · bereit zum Start",
+            .status_extracted_no_eboot => "Metadaten entpackt · eboot.bin fehlt im inneren Image",
             .status_extract_retail => "Retail-Pakete können nicht entpackt werden",
             .status_runner_missing => "game-run.exe fehlt · zuerst zig build ausführen",
             .status_launch_failed => "game-run.exe konnte nicht gestartet werden",
@@ -905,7 +913,8 @@ fn tr(phrase: Phrase) []const u8 {
             .status_eboot_missing => "eboot.bin est introuvable dans le dossier ou le sous-dossier decrypted",
             .status_extractor_missing => "pkgextractor.exe introuvable · lancez zig build d'abord",
             .status_extract_failed => "Impossible d'extraire le paquet",
-            .status_extracted => "Métadonnées extraites · dossier sélectionné",
+            .status_extracted => "Paquet extrait · prêt à lancer",
+            .status_extracted_no_eboot => "Métadonnées extraites · eboot.bin absent de l'image interne",
             .status_extract_retail => "Les paquets retail ne peuvent pas être extraits",
             .status_runner_missing => "game-run.exe est introuvable · exécutez d'abord zig build",
             .status_launch_failed => "Impossible de lancer game-run.exe",
@@ -2567,7 +2576,12 @@ fn extractPackage(owner: Win32.Window) void {
     refreshTitleIdentifier();
     rememberGameFolder(game_folder[0..game_folder_length], true);
     saveSettings();
-    setStatusPhrase(.status_extracted, false);
+    var eboot: [1024]u16 = [_]u16{0} ** 1024;
+    if (findGameExecutable(&eboot)) {
+        setStatusPhrase(.status_extracted, false);
+    } else {
+        setStatusPhrase(.status_extracted_no_eboot, true);
+    }
 }
 
 fn launchGame(owner: Win32.Window) void {

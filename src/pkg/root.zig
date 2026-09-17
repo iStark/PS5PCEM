@@ -4,13 +4,16 @@
 //! PS5 package (PKG) inspection and metadata extraction.
 //!
 //! Debug finalized images (`\x7FFIH`, signed byte 0x00) wrap a `\x7FCNT`
-//! metadata container and an AES-XTS outer PFS. This module reads the FIH
-//! header, parses the embedded CNT, and copies unencrypted CNT entries
-//! (param.json, icons, PlayGo tables, …) into an `sce_sys` tree. Inner PFS
-//! application files (`eboot.bin` and the rest of `/app0`) stay encrypted;
-//! retail images (signed byte 0x80) are refused.
+//! metadata container and an outer PFS. This module reads the FIH header,
+//! parses the embedded CNT, copies unencrypted CNT entries (param.json,
+//! icons, PlayGo tables, …) into an `sce_sys` tree, and unpacks uncompressed
+//! SELF modules (`eboot.bin`, `sce_module/*.prx`) from the nested
+//! `pfs_image.dat` of a debug / passcode image. Retail images (signed byte
+//! `0x80`) are refused. Kraken-compressed inner assets are not unpacked.
 
 const std = @import("std");
+
+pub const pfs = @import("pfs.zig");
 
 pub const fih_magic = [4]u8{ 0x7f, 'F', 'I', 'H' };
 pub const cnt_magic = [4]u8{ 0x7f, 'C', 'N', 'T' };
@@ -31,6 +34,7 @@ pub const FihHeader = struct {
     format_version: u16,
     pfs_offset: u64,
     pfs_size: u64,
+    superblock_offset: u64,
     cnt_offset: u64,
     file_size: u64,
 
@@ -84,6 +88,7 @@ pub fn parseFih(header: []const u8, file_size: u64) Error!FihHeader {
         .format_version = std.mem.readInt(u16, header[6..8], .little),
         .pfs_offset = std.mem.readInt(u64, header[0x10..0x18], .little),
         .pfs_size = std.mem.readInt(u64, header[0x18..0x20], .little),
+        .superblock_offset = std.mem.readInt(u64, header[0x20..0x28], .little),
         .cnt_offset = std.mem.readInt(u64, header[0x58..0x60], .little),
         .file_size = file_size,
     };
@@ -224,11 +229,13 @@ test "parseFih reads little-endian segment offsets" {
     std.mem.writeInt(u16, header[6..8], 3, .little);
     std.mem.writeInt(u64, header[0x10..0x18], 0x10000, .little);
     std.mem.writeInt(u64, header[0x18..0x20], 0x20000, .little);
+    std.mem.writeInt(u64, header[0x20..0x28], 0x1f000, .little);
     std.mem.writeInt(u64, header[0x58..0x60], 0x30000, .little);
     const fih = try parseFih(&header, 0x40000);
     try std.testing.expectEqual(@as(u64, 0x10000), fih.pfs_offset);
     try std.testing.expectEqual(@as(u64, 0x20000), fih.pfs_size);
     try std.testing.expectEqual(@as(u64, 0x30000), fih.cnt_offset);
+    try std.testing.expectEqual(@as(u64, 0x1f000), fih.superblock_offset);
     try std.testing.expectEqual(Kind.fih_debug, fih.kind());
 }
 

@@ -7,8 +7,10 @@
 //!   pkgextractor <game.pkg> [-o <output-dir>]
 //!
 //! Unencrypted CNT entries (param.json, icons, PlayGo tables, trophies) are
-//! written under `sce_sys/`. Inner PFS application files including eboot.bin
-//! remain in the AES-XTS image; retail packages are refused.
+//! written under `sce_sys/`. Debug / passcode packages also unpack
+//! uncompressed SELF modules from the nested `pfs_image.dat` (`eboot.bin`
+//! and `sce_module/*.prx`). Kraken-compressed game assets stay packed;
+//! retail packages are refused.
 
 const std = @import("std");
 const pkg = @import("pkg");
@@ -17,8 +19,9 @@ const usage =
     \\pkgextractor <game.pkg> [-o <output-dir>]
     \\
     \\Reads a PS5 debug package (FIH FPKG) and writes unencrypted metadata
-    \\into output-dir/sce_sys (param.json, icon0.png, PlayGo tables, …).
-    \\Retail packages cannot be extracted. Inner PFS game files (eboot.bin)
+    \\into output-dir/sce_sys plus uncompressed SELF modules (eboot.bin,
+    \\sce_module/*.prx) from the inner PFS image.
+    \\Retail packages cannot be extracted. Kraken-compressed game assets
     \\are not unpacked yet.
     \\
 ;
@@ -126,6 +129,7 @@ pub fn main(init: std.process.Init) !void {
     var cnt_size: u64 = file_size;
     var pfs_offset: u64 = 0;
     var pfs_size: u64 = 0;
+    var superblock_abs: u64 = 0;
     if (kind != .cnt) {
         const fih = pkg.parseFih(&header, file_size) catch |err| {
             try stderr.print("invalid FIH header: {s}\n", .{@errorName(err)});
@@ -136,9 +140,10 @@ pub fn main(init: std.process.Init) !void {
         cnt_size = file_size - fih.cnt_offset;
         pfs_offset = fih.pfs_offset;
         pfs_size = fih.pfs_size;
+        superblock_abs = fih.superblock_offset;
         std.debug.print(
-            "FIH debug  format={d}  pfs=0x{x}+0x{x}  cnt=0x{x}\n",
-            .{ fih.format_version, pfs_offset, pfs_size, cnt_offset },
+            "FIH debug  format={d}  pfs=0x{x}+0x{x}  sb=0x{x}  cnt=0x{x}\n",
+            .{ fih.format_version, pfs_offset, pfs_size, superblock_abs, cnt_offset },
         );
     }
 
@@ -183,9 +188,20 @@ pub fn main(init: std.process.Init) !void {
         },
     );
     if (pfs_size != 0) {
-        std.debug.print(
-            "inner PFS image 0x{x}+0x{x} is AES-XTS; eboot.bin is not unpacked yet\n",
-            .{ pfs_offset, pfs_size },
-        );
+        const app = pkg.pfs.extractAppFiles(file, io, arena, pfs_offset, pfs_size, superblock_abs, dest) catch |err| {
+            std.debug.print(
+                "inner PFS unpack failed ({s}); eboot.bin was not written\n",
+                .{@errorName(err)},
+            );
+            return;
+        };
+        if (app.eboot) {
+            std.debug.print("unpacked eboot.bin and {d} module(s)\n", .{app.modules});
+        } else {
+            std.debug.print(
+                "inner PFS had no SCE_DYNEXEC eboot.bin ({d} other SELF module(s))\n",
+                .{app.modules},
+            );
+        }
     }
 }
