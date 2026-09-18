@@ -2838,16 +2838,20 @@ fn driverCompletionLabel(
     var node_bytes: [8]u8 = undefined;
     if (!readGuestMemory(null, node_slot, &node_bytes)) return null;
     const node = std.mem.readInt(u64, &node_bytes, .little);
-    if (node == 0 or !memory.isGuestRangeAccessible(node, 0x98)) return null;
+    if (node == 0 or !memory.isGuestRangeAccessible(node, 0xb9)) return null;
 
-    var fields: [0x98]u8 = undefined;
+    var fields: [0xb9]u8 = undefined;
     if (!readGuestMemory(null, node, &fields)) return null;
     const node_stream = std.mem.readInt(u64, fields[0x08..0x10], .little);
     const node_words = std.mem.readInt(u32, fields[0x10..0x14], .little);
-    const node_type = std.mem.readInt(u32, fields[0x90..0x94], .little);
+    // The submit worker chooses DCB/ACB from the byte at +0xb8 (1/2).
+    // +0x90 belongs to the node's resource list and changes as scene work
+    // accumulates. Treating it as a queue type only accepted early nodes
+    // whose unused list happened to be zero, leaving later busy labels set.
+    const node_type = fields[0xb8];
     const completion_label = std.mem.readInt(u64, fields[0x20..0x28], .little);
     if (node_stream != @intFromPtr(submission.address) or
-        node_words != submission.word_count or node_type != queue_type or
+        node_words != submission.word_count or node_type != queue_type + 1 or
         completion_label == 0 or
         !memory.isGuestRangeAccessible(completion_label, @sizeOf(u64)))
     {
@@ -2862,7 +2866,7 @@ fn driverCompletionLabel(
                     node_stream,
                     submission.word_count,
                     node_words,
-                    queue_type,
+                    queue_type + 1,
                     node_type,
                     completion_label,
                 },
@@ -4311,6 +4315,36 @@ test "SDK11 inline submission labels retain their packet generation" {
     try testing.expectEqual(@as(?u64, page + 0x4a0), inlineDescriptorCompletionLabel(@intFromPtr(submission), submission.*));
     try testing.expect(driverCompletionLabel(submission, submission.*, 1) == null);
     try testing.expectEqual(@as(u64, 5), std.mem.readInt(u64, labels[0x4a0..0x4a8], .little));
+}
+
+test "private submission retirement uses the queue tag after resource lists grow" {
+    var busy: u64 = 1;
+    var words = [_]u32{ command(gpu.pm4.nop, 1), 0 };
+    var node: [0xc0]u8 align(8) = @splat(0);
+    std.mem.writeInt(u64, node[0x08..0x10], @intFromPtr(&words), .little);
+    std.mem.writeInt(u32, node[0x10..0x14], words.len, .little);
+    std.mem.writeInt(u64, node[0x20..0x28], @intFromPtr(&busy), .little);
+    std.mem.writeInt(u32, node[0x90..0x94], 0x17e, .little);
+    var descriptor: [0x60]u8 align(8) = @splat(0);
+    std.mem.writeInt(u64, descriptor[0..8], @intFromPtr(&words), .little);
+    std.mem.writeInt(u32, descriptor[8..12], words.len, .little);
+    std.mem.writeInt(u64, descriptor[0x50..0x58], @intFromPtr(&node), .little);
+    const submission: *const Submission = @ptrCast(&descriptor);
+
+    node[0xb8] = 1;
+    const graphics_label = driverCompletionLabel(submission, submission.*, 0);
+    try testing.expectEqual(@as(?u64, @intFromPtr(&busy)), graphics_label);
+    try testing.expect(driverCompletionLabel(submission, submission.*, 1) == null);
+    publishDriverCompletionLabel(graphics_label.?);
+    try testing.expectEqual(@as(u64, 0), busy);
+
+    busy = 1;
+    node[0xb8] = 2;
+    try testing.expectEqual(@as(?u64, @intFromPtr(&busy)), driverCompletionLabel(submission, submission.*, 1));
+    try testing.expect(driverCompletionLabel(submission, submission.*, 0) == null);
+    std.mem.writeInt(u32, node[0x10..0x14], words.len + 1, .little);
+    try testing.expect(driverCompletionLabel(submission, submission.*, 1) == null);
+    try testing.expectEqual(@as(u64, 1), busy);
 }
 
 test "SDK11 completed ACB retires its own generation with or without a packet label" {

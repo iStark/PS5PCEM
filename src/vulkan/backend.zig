@@ -3234,15 +3234,33 @@ fn vertexAttributeBufferFormat(format: u16) u16 {
 
 const maximum_vertex_attributes = 32;
 
+fn vertexFetchScalarOffset(operand: gpu.ShaderOperand, registers: *const gpu.scalar_provenance.ScalarRegisters) ?u32 {
+    if (gpu.scalar_provenance.scalarRegisterIndex(operand)) |index| {
+        return if (registers[index].known) registers[index].value else null;
+    }
+    return switch (operand.kind) {
+        .null => 0,
+        .integer_inline_constant, .literal_constant => operand.value,
+        else => null,
+    };
+}
+
 fn matchVertexAttribute(
     table: *const gpu.VertexBindings,
     used: *[maximum_vertex_attributes]bool,
     descriptor: gpu.BufferDescriptor,
+    scalar_offset: ?u32,
 ) ?gpu.VertexAttribute {
     var best_index: ?usize = null;
     var best_score: u8 = 0;
     for (table.slice(), 0..) |attribute, index| {
         if (used[index] or attribute.buffer.address != descriptor.address) continue;
+        // Interleaved position and UV can share both their V# and format.
+        // The shader's instruction-local SOFFSET identifies which one this
+        // fetch reads; table order cannot disambiguate them.
+        if (scalar_offset) |offset| {
+            if (attribute.offset_bytes != offset) continue;
+        }
         var score: u8 = 1;
         if (attribute.buffer.stride == descriptor.stride) score += 2;
         if (vertexAttributeBufferFormat(attribute.attribute_format) == descriptor.unified_format) score += 4;
@@ -3266,6 +3284,41 @@ fn takeNextVertexAttribute(
         return attribute;
     }
     return null;
+}
+
+test "interleaved vertex attributes follow SOFFSET instead of matching format order" {
+    var descriptor = std.mem.zeroes(gpu.BufferDescriptor);
+    descriptor.address = 0x10000;
+    descriptor.stride = 44;
+    descriptor.size_bytes = 176;
+    descriptor.unified_format = 64;
+    var table = gpu.VertexBindings{
+        .attribute_table_address = 0x20000,
+        .buffer_table_address = 0x30000,
+        .attribute_count = 2,
+    };
+    for (0..2) |index| {
+        table.attributes[index] = std.mem.zeroes(gpu.VertexAttribute);
+        table.attributes[index].buffer = descriptor;
+        table.attributes[index].attribute_format = 257;
+        table.attributes[index].offset_bytes = if (index == 0) 16 else 24;
+    }
+    var used: [maximum_vertex_attributes]bool = @splat(false);
+    var registers: gpu.scalar_provenance.ScalarRegisters = @splat(.{});
+    registers[32] = .{ .known = true, .value = 24 };
+    const position_offset = vertexFetchScalarOffset(.{ .kind = .sgpr, .reg = 32 }, &registers);
+    const position = matchVertexAttribute(&table, &used, descriptor, position_offset).?;
+    try std.testing.expectEqual(@as(u16, 24), position.offset_bytes);
+    registers[107] = .{ .known = true, .value = 16 };
+    const uv_offset = vertexFetchScalarOffset(.{ .kind = .vcc_hi }, &registers);
+    const uv = matchVertexAttribute(&table, &used, descriptor, uv_offset).?;
+    try std.testing.expectEqual(@as(u16, 16), uv.offset_bytes);
+
+    used = @splat(false);
+    try std.testing.expect(matchVertexAttribute(&table, &used, descriptor, 8) == null);
+    try std.testing.expect(!used[0] and !used[1]);
+    try std.testing.expect(vertexFetchScalarOffset(.{ .kind = .sgpr, .reg = 33 }, &registers) == null);
+    try std.testing.expectEqual(@as(u16, 16), matchVertexAttribute(&table, &used, descriptor, null).?.offset_bytes);
 }
 
 fn dumpComputeSpirv(allocator: std.mem.Allocator, program_address: u64, words: []const u32) void {
@@ -9459,7 +9512,12 @@ pub const Renderer = struct {
             );
             const vertex_attribute: ?gpu.VertexAttribute = if (resolved_descriptor) |resolved|
                 if (vertex_table) |*table|
-                    matchVertexAttribute(table, &used_vertex_attributes, resolved)
+                    matchVertexAttribute(
+                        table,
+                        &used_vertex_attributes,
+                        resolved,
+                        if (formatted_vertex_fetch) vertexFetchScalarOffset(inst.src2, &instruction_scalar.registers) else null,
+                    )
                 else
                     null
             else if (formatted_vertex_fetch)
@@ -13209,6 +13267,10 @@ pub const Renderer = struct {
     /// outside the GPU needs it (flip, CPU visibility, or texture staging).
     /// Consecutive draws therefore stay resident and compose in-order.
     fn materializeRenderTarget(self: *Renderer, index: usize) anyerror!void {
+        return self.readbackRenderTarget(index, false);
+    }
+
+    fn readbackRenderTarget(self: *Renderer, index: usize, require_cached_frame: bool) anyerror!void {
         const profile_started = hostTimestampNs();
         defer self.frame_profile.target_materialize_ns +|= elapsedHostNanoseconds(profile_started);
         if (index >= self.render_targets.items.len) return Error.MissingPresentedFrame;
@@ -13218,8 +13280,19 @@ pub const Renderer = struct {
         // guest resolve packet publishes the 1x destination instead.
         if (snapshot.target.descriptor.fragments_log2 != 0) return;
         if (snapshot.gpu_generation == snapshot.host_generation) {
-            try self.transitionRenderTargetToColorAttachment(index);
-            return;
+            // A published generation can outlive its entry in the bounded
+            // completed-frame cache. Presentation still needs those pixels;
+            // a diagnostic capture of other targets can evict them even when
+            // the guest keeps displaying an unchanged menu.
+            const cached_frame_available = for (self.completed_frames.items) |frame| {
+                if (frame.target) |target| {
+                    if (sameRenderTarget(target, snapshot.target)) break true;
+                }
+            } else false;
+            if (!require_cached_frame or cached_frame_available) {
+                try self.transitionRenderTargetToColorAttachment(index);
+                return;
+            }
         }
         // Past the generation check is the only place a readback is real. The
         // call counter above cannot tell one from a layout transition, and the
@@ -23431,7 +23504,7 @@ pub const Renderer = struct {
         // materializeRenderTarget intentionally skips multisampled attachments:
         // only a resolve can turn one into a presentable single-sample frame.
         if (self.render_targets.items[target_index].target.descriptor.fragments_log2 != 0) return false;
-        try self.materializeRenderTarget(target_index);
+        try self.readbackRenderTarget(target_index, true);
         const target = self.render_targets.items[target_index].target;
         var selected: ?usize = null;
         var selected_sequence: u64 = 0;
@@ -24119,8 +24192,13 @@ pub const Renderer = struct {
                     var ui_index: ?usize = null;
                     var ui_sequence: u64 = 0;
                     for (self.render_targets.items, 0..) |candidate, candidate_index| {
+                        // A post-process shader can also match an offscreen
+                        // pass. Its smaller scene buffer must not replace
+                        // the full VideoOut image containing the final UI.
                         if (!candidate.initialized or
-                            candidate.target.descriptor.address != ui_address)
+                            candidate.target.descriptor.address != ui_address or
+                            candidate.target.descriptor.width != requested.?.width or
+                            candidate.target.descriptor.height != requested.?.height)
                         {
                             continue;
                         }
