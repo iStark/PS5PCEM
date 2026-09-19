@@ -20,9 +20,13 @@ pub const exports = [_]symbols.Export{
     .{ .name = "sceAgcGetDefaultCxStateFlat", .function = trace.wrap("sceAgcGetDefaultCxStateFlat", &agc.zeroQuery), .expect_id = "AAeX-U5-P3M" },
     .{ .name = "sceAgcSetAmmSemaphoreMemory", .function = trace.wrap("sceAgcSetAmmSemaphoreMemory", &agc.accept), .expect_id = "OQTgEXyihvA" },
     .{ .name = "sceAgcBranchPatchSetCompareAddress", .function = trace.wrap("sceAgcBranchPatchSetCompareAddress", &agc.patchCommand), .expect_id = "GXBlM-ekzrI" },
-    .{ .name = "sceAgcSetShRegIndirectPatchSetNumRegisters", .function = trace.wrap("sceAgcSetShRegIndirectPatchSetNumRegisters", &agc.patchCommand), .expect_id = "nCUgItdN2ms" },
-    .{ .name = "sceAgcSetCxRegIndirectPatchSetNumRegisters", .function = trace.wrap("sceAgcSetCxRegIndirectPatchSetNumRegisters", &agc.patchCommand), .expect_id = "whb1RL7K4Ss" },
-    .{ .name = "sceAgcSetUcRegIndirectPatchSetNumRegisters", .function = trace.wrap("sceAgcSetUcRegIndirectPatchSetNumRegisters", &agc.patchCommand), .expect_id = "fRG-JOH5+sI" },
+    // sceAgcSetShRegIndirectPatchSetNumRegisters (nCUgItdN2ms),
+    // sceAgcSetCxRegIndirectPatchSetNumRegisters (whb1RL7K4Ss) and
+    // sceAgcSetUcRegIndirectPatchSetNumRegisters (fRG-JOH5+sI) are registered
+    // by bootstrap_services, next to the writer whose word they edit. A
+    // generic entry here would shadow them: this table registers first and a
+    // lookup takes the first match, so the accepting placeholder would win and
+    // the register count would never be patched.
     .{ .name = "sceAgcCondExecPatchSetEnd", .function = trace.wrap("sceAgcCondExecPatchSetEnd", &agc.patchCondExecEnd), .expect_id = "ORWsxIbk4TE" },
     .{ .name = "sceAgcCondExecPatchSetCommandAddress", .function = trace.wrap("sceAgcCondExecPatchSetCommandAddress", &agc.patchCondExecCommandAddress), .expect_id = "YWTKOju587o" },
     .{ .name = "sceAgcAsyncCondExecPatchSetEnd", .function = trace.wrap("sceAgcAsyncCondExecPatchSetEnd", &agc.patchCondExecEnd), .expect_id = "k-JpyR2dYAM" },
@@ -33,8 +37,10 @@ pub const exports = [_]symbols.Export{
     .{ .name = "sceAgcSetRangePredication", .function = trace.wrap("sceAgcSetRangePredication", &agc.accept), .expect_id = "n8vgpaQg6dA" },
     .{ .name = "sceAgcGetPacketSize", .function = trace.wrap("sceAgcGetPacketSize", &agc.packetSize), .expect_id = "Lkf86B98qPc" },
     .{ .name = "sceAgcGetDataPacketPayloadRange", .function = trace.wrap("sceAgcGetDataPacketPayloadRange", &agc.zeroQuery), .expect_id = "s+VGAMDQ0AQ" },
-    .{ .name = "sceAgcDmaDataPatchSetDstAddressOrOffset", .function = trace.wrap("sceAgcDmaDataPatchSetDstAddressOrOffset", &agc.patchCommand), .expect_id = "IxYiarKlXxM" },
-    .{ .name = "sceAgcDmaDataPatchSetSrcAddressOrOffsetOrImmediate", .function = trace.wrap("sceAgcDmaDataPatchSetSrcAddressOrOffsetOrImmediate", &agc.patchCommand), .expect_id = "cdDRpqcFGbU" },
+    // The two DMA_DATA address patches (IxYiarKlXxM, cdDRpqcFGbU) likewise
+    // belong with the DMA_DATA writer in bootstrap_services: the words they
+    // overwrite are fixed by the layout that writer emits, so the patch and
+    // the packet have to change together.
     .{ .name = "sceAgcWriteDataPatchSetCachePolicy", .function = trace.wrap("sceAgcWriteDataPatchSetCachePolicy", &agc.patchCommand), .expect_id = "eAy8eGNsCuU" },
     .{ .name = "sceAgcWriteDataPatchSetDst", .function = trace.wrap("sceAgcWriteDataPatchSetDst", &agc.patchCommand), .expect_id = "tmy-+rBpspY" },
     .{ .name = "sceAgcWaitRegMemPatchCompareFunction", .function = trace.wrap("sceAgcWaitRegMemPatchCompareFunction", &agc.patchWaitRegMemCompareFunction), .expect_id = "n485EBnIWmk" },
@@ -121,7 +127,9 @@ pub const exports = [_]symbols.Export{
     .{ .name = "sceAgcDcbWriteDataGetSize", .function = trace.wrap("sceAgcDcbWriteDataGetSize", &agc.writeDataGetSize), .expect_id = "p9tI+yTvx68" },
     .{ .name = "sceAgcDcbQueueEndOfShaderActionGetSize", .function = trace.wrap("sceAgcDcbQueueEndOfShaderActionGetSize", &agc.commandSize), .expect_id = "zg6u-N6Otxs" },
     .{ .name = "sceAgcDcbDispatchIndirectGetSize", .function = trace.wrap("sceAgcDcbDispatchIndirectGetSize", &agc.dispatchIndirectGetSize), .expect_id = "w8HVkEeXPv8" },
-    .{ .name = "sceAgcDcbDrawIndexAutoGetSize", .function = trace.wrap("sceAgcDcbDrawIndexAutoGetSize", &agc.commandSize), .expect_id = "WrdP9Zxx3lQ" },
+    // sceAgcDcbDrawIndexAutoGetSize (WrdP9Zxx3lQ) is registered by
+    // bootstrap_services, which answers the three words its DRAW_INDEX_AUTO
+    // actually occupies rather than the generic four.
     .{ .name = "sceAgcDcbDrawIndexGetSize", .function = trace.wrap("sceAgcDcbDrawIndexGetSize", &agc.commandSize), .expect_id = "6ee9Hd3EWXQ" },
     .{ .name = "sceAgcDcbDrawIndirectGetSize", .function = trace.wrap("sceAgcDcbDrawIndirectGetSize", &agc.drawIndirectGetSize), .expect_id = "cxPZ4Wgvdj8" },
     .{ .name = "sceAgcDcbDrawIndirectMultiGetSize", .function = trace.wrap("sceAgcDcbDrawIndirectMultiGetSize", &agc.drawIndirectMultiGetSize), .expect_id = "pYoKs3lPy88" },
