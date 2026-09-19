@@ -42,7 +42,6 @@ pub export var yotei_visibility_gpu: bool = false;
 // Compare exact depth-filtered, packed-coordinate lists with the legacy fallback.
 pub export var yotei_gds_culling_gpu: bool = false;
 pub export var capture_graphics_target: u64 = 0;
-// Temporary live diagnosis: scoped depth/stencil, culling and fragment overrides.
 // Zero preserves synchronous retirement for baseline comparisons.
 pub export var sampled_retirement_slack_bytes: u64 = 0;
 // Opt-in until native comparisons establish visual correctness and benefit.
@@ -13125,6 +13124,11 @@ pub const Renderer = struct {
         if (!snapshot.initialized) if (cached.stencil_alias_token) |token| {
             _ = self.image_aliases.markWrite(token);
         };
+        // Clears participate in the same ordering as attachment writes.
+        // Otherwise acquiring an older inferred-size view can restore a
+        // pre-clear plane over this allocation's freshly cleared contents.
+        self.depth_target_sequence +%= 1;
+        cached.last_used_sequence = self.depth_target_sequence;
         if (self.reported_htile_resolves < 4 or self.traceCurrentGraphicsFrame()) {
             self.reported_htile_resolves +|= 1;
             std.debug.print("[vulkan dcb] resident HTILE clear depth@0x{x} {d}x{d} meta@0x{x} value={d}\n", .{
@@ -15733,6 +15737,14 @@ pub const Renderer = struct {
         try self.transitionDepthTargetToShaderRead(expanded);
         try std.testing.expectEqual([2]f32{ 0.5, 0.75 }, try self.readDepthProbeValues(expanded, false));
         try std.testing.expectEqual([2]u8{ 0x55, 0x23 }, try self.readDepthProbeValues(expanded, true));
+        // A fast clear is a new producer even when the smaller attachment
+        // was not the most recently bound view of this allocation.
+        _ = try self.acquireDepthTarget(larger);
+        try self.clearDepthFromHtile(restored, 0);
+        _ = try self.acquireDepthTarget(original);
+        try std.testing.expectEqual([2]f32{ 0, 0 }, try self.readDepthProbeValues(restored, false));
+        try self.transitionDepthTargetToShaderRead(expanded);
+        try std.testing.expectEqual([2]f32{ 0, 0.75 }, try self.readDepthProbeValues(expanded, false));
     }
 
     pub fn probeDepthStencilValues(self: *Renderer) anyerror!struct { depth: f32, stencil: u8 } {
@@ -20276,6 +20288,11 @@ pub const Renderer = struct {
             const depth_target: ?GuestDepthTarget = for (self.depth_targets.items) |cached| {
                 if (cached.image.handle == prepared.image.handle) break cached.target;
             } else null;
+            // Uploaded immutable textures only have SAMPLED | TRANSFER_DST
+            // usage. Restrict native readback to resident GPU producers, which
+            // are created with TRANSFER_SRC; copying uploads is invalid Vulkan.
+            if (depth_target == null and prepared.render_target_index == null and
+                prepared.storage_cache_index == null) continue;
             const copy_aspect: u32 = if (depth_target != null) vk.image_aspect_depth_bit else vk.image_aspect_color_bit;
             const range = vk.ImageSubresourceRange{ .aspect_mask = if (depth_target) |target| target.aspectMask() else vk.image_aspect_color_bit, .layer_count = 1 };
             const previous_usage = self.image_states.current(prepared.image.handle, copy_aspect, 0, 0) orelse

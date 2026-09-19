@@ -607,6 +607,56 @@ fn runPredicatedImageLoadProbe(allocator: std.mem.Allocator) !void {
     std.debug.print("predicated image loads passed: 64 lanes, CMPX copy, complementary clear, and refreshed input\n", .{});
 }
 
+fn runFloatRoundingProbe(allocator: std.mem.Allocator) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{});
+    defer renderer.deinit();
+    var guest = GuestMemory{};
+    _ = renderer.dcbBackend(guest.interface());
+    const lanes = 64;
+    // Cancellation distinguishes two roundings (MAD/MAC/MUL+ADD) from FMA.
+    // Load operands from memory so the host cannot fold the expressions.
+    const cases = [_][3]f32{
+        .{ 0x1.000002p0, 0x1.fffffcp-1, -1 },
+        .{ 4097, 4097, -16785408 },
+        .{ -4097, 4097, 16785408 },
+        .{ 1.5, 2, 0.25 },
+    };
+    const separate = [_]f32{ 0, 0, 0, 3.25 };
+    const fused = [_]f32{ -0x1p-46, 1, -1, 3.25 };
+    const load = mubuf(0x0e, 0, 1, 0, 0);
+    const store = mubuf(0x1e, 0, 8, 0, 4);
+    const sources = 257 | (258 << 9) | (259 << 18);
+    const words = [_]u32{
+        load[0], load[1],
+        0xd5410008, sources, // MAD v8, v1, v2, v3
+        vop1(1, 9, 259), vop2(0x1f, 9, 1, 2), // MAC v9, v1, v2
+        vop2(0x08, 10, 1, 2), vop2(0x03, 10, 10, 3), // MUL then ADD
+        0xd54b000b, sources, // explicit FMA v11, v1, v2, v3
+        store[0],   store[1],
+        0xbf810000,
+    };
+    for (words, 0..) |word, index| guest.word(0x1000 + index * 4, word);
+    var state = gpu.State{};
+    try state.writeRegister(.shader, 0x20c, 0x10);
+    try state.writeRegister(.shader, 0x20d, 0);
+    try state.writeRegister(.shader, 0x213, 8 << 1);
+    for ([_]u32{ 0x5000, 16 << 16, lanes, 0, 0x6000, 16 << 16, lanes, 0 }, 0..) |word, index|
+        try state.writeRegister(.shader, 0x240 + @as(u32, @intCast(index)), word);
+    for (0..2) |pass| {
+        for (0..lanes) |lane| for (cases[(lane + pass) % cases.len], 0..) |value, component|
+            guest.word(0x5000 + lane * 16 + component * 4, @bitCast(value));
+        _ = try renderer.dispatchRdna2State(&state, .{ lanes, 1, 1 }, .{ 1, 1, 1 });
+        var output: [lanes * 16]u8 = undefined;
+        try renderer.readbackGuestStorageBuffer(0x6000, &output);
+        for (0..lanes) |lane| for (0..4) |component| {
+            const index = (lane + pass) % cases.len;
+            const expected: u32 = @bitCast(if (component == 3) fused[index] else separate[index]);
+            try std.testing.expectEqual(expected, std.mem.readInt(u32, output[lane * 16 + component * 4 ..][0..4], .little));
+        };
+    }
+    std.debug.print("float rounding passed: MAD, MAC, MUL+ADD and FMA, 64 lanes and changed inputs\n", .{});
+}
+
 fn runTrigonometricProbe(allocator: std.mem.Allocator) !void {
     var renderer = try vulkan.Renderer.init(allocator, .{});
     defer renderer.deinit();
@@ -2237,7 +2287,9 @@ fn runLdsWaveMemoryProbe(allocator: std.mem.Allocator) !void {
     const lanes = 64;
     const groups = 64;
     const bytes = lanes * groups * 8;
-    for ([_]bool{ false, true }) |explicit_barrier| {
+    for (0..3) |mode| {
+        const explicit_barrier = mode == 1;
+        const branched = mode == 2;
         const load = mubuf(0x0d, 0, 4, 8, 0);
         const store = mubuf(0x1d, 0, 6, 8, 4);
         const code = [_]u32{
@@ -2259,7 +2311,12 @@ fn runLdsWaveMemoryProbe(allocator: std.mem.Allocator) !void {
             store[1],
             0xbf81_0000,
         };
-        for (code, 0..) |word, index| guest.word(0x100 + index * 4, word);
+        // Half the workgroups take a scalar branch around the LDS exchange.
+        // The remaining wave64 groups still require cross-half ordering even
+        // though the guest program now has more than one control-flow block.
+        guest.word(0x100, if (branched) 0xbf09_a008 else 0xbf80_0000); // s_cmp_ge_u32 s8, 32
+        guest.word(0x104, if (branched) 0xbf85_0000 | @as(u32, code.len - 1) else 0xbf80_0000);
+        for (code, 0..) |word, index| guest.word(0x108 + index * 4, word);
         var analysis = try gpu.shader_analysis.decode(allocator, .{ .context = &guest, .read_fn = GuestMemory.read }, 0x100, 64);
         defer analysis.deinit(allocator);
         var module = try analysis.translateSpirv(allocator, .{
@@ -2286,7 +2343,10 @@ fn runLdsWaveMemoryProbe(allocator: std.mem.Allocator) !void {
             try renderer.readbackGuestStorageBuffer(0x18000, &output);
             for (0..lanes * groups) |index| {
                 for (0..2) |word| {
-                    const expected: u32 = @intCast(1 + (index ^ 32) * 2 + word + iteration * 100000);
+                    const expected: u32 = if (branched and index / lanes >= 32)
+                        0xaaaa_aaaa
+                    else
+                        @intCast(1 + (index ^ 32) * 2 + word + iteration * 100000);
                     const actual = std.mem.readInt(u32, output[index * 8 + word * 4 ..][0..4], .little);
                     if (actual != expected) std.debug.print("LDS wave memory barrier={} iteration={d} lane={d} word={d}\n", .{ explicit_barrier, iteration, index, word });
                     try std.testing.expectEqual(expected, actual);
@@ -2294,7 +2354,7 @@ fn runLdsWaveMemoryProbe(allocator: std.mem.Allocator) !void {
             }
         }
     }
-    std.debug.print("LDS wave memory passed: 64 workgroups, cross-half B64 exchange after buffer loads, changed inputs and explicit wave32 barrier\n", .{});
+    std.debug.print("LDS wave memory passed: 64 workgroups, cross-half B64 exchange, scalar branches, changed inputs and explicit wave32 barrier\n", .{});
 }
 
 fn runSpilledLdsProbe(allocator: std.mem.Allocator) !void {
@@ -10320,6 +10380,10 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--trigonometry")) {
         try runTrigonometricProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--float-rounding")) {
+        try runFloatRoundingProbe(allocator);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--quad-mode")) {

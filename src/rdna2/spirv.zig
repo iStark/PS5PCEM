@@ -911,7 +911,7 @@ const Builder = struct {
     wave_exchange_double_buffer: bool = true,
     converged_workgroup_dispatch: bool = false,
     dispatch_active: ?u32 = null,
-    synchronize_linear_wave64_lds: bool = false,
+    synchronize_wave64_lds: bool = false,
     wave_scratch: u32 = 0,
     wave_exchange_phase: u32 = 0,
     wave32: bool = false,
@@ -1050,6 +1050,8 @@ const Builder = struct {
             .maximum_dispatcher_iterations = options.maximum_dispatcher_iterations,
             .report_dispatcher_exhaustion = options.report_dispatcher_exhaustion,
             .wave64_workgroup = options.wave64_workgroup,
+            .synchronize_wave64_lds = options.wave64_workgroup and
+                @as(u64, options.local_size[0]) * options.local_size[1] * options.local_size[2] == 64,
             .wave_exchange_double_buffer = options.wave_exchange_double_buffer,
             .converged_workgroup_dispatch = options.wave64_workgroup and @as(u64, options.local_size[0]) * options.local_size[1] * options.local_size[2] > 64,
             .wave32 = options.wave32,
@@ -1661,6 +1663,14 @@ const Builder = struct {
     }
 
     fn emit(self: *Builder, list: *std.ArrayList(u32), opcode: u16, args: []const u32) Error!void {
+        // Guest ADD/MUL/MAD/MAC instructions round at their defined operation
+        // boundaries. Allowing the host to contract or reassociate these makes
+        // the depth prepass and material vertex shaders disagree on position.
+        // Explicit guest FMA instructions still use GLSL.std.450 Fma.
+        switch (opcode) {
+            129, 131, 133, 136, 140, 141 => try self.emit(&self.annotations, 71, &.{ args[1], 42 }), // NoContraction
+            else => {},
+        }
         // A cached SSA predicate must dominate its uses. Internal bounds and
         // lookup branches introduce labels inside a single guest block too.
         if (opcode == 248 and list == &self.body) {
@@ -9911,7 +9921,7 @@ const Builder = struct {
     }
 
     fn lower(self: *Builder, source_inst: instruction.Instruction) Error!void {
-        if (self.synchronize_linear_wave64_lds and source_inst.family == .ds and !source_inst.gds) {
+        if (self.synchronize_wave64_lds and source_inst.family == .ds and !source_inst.gds) {
             switch (source_inst.opcode) {
                 .ds_swizzle_b32, .ds_append, .ds_consume => {},
                 else => try self.controlBarrier(),
@@ -11775,6 +11785,7 @@ fn translateInstructions(
     var cross_half_read = false;
     var uses_gds = false;
     var scans_wave_mask = false;
+    var uses_lds = false;
     for (effective.ngg_lds_exports) |ngg_export| {
         if (effective.stage == .vertex and effective.vertex_parameter_sources.len == 0 and ngg_export.target >= 0x20 and ngg_export.target < 0x40) {
             effective.parameter_mask |= @as(u32, 1) << @intCast(ngg_export.target - 0x20);
@@ -11787,6 +11798,8 @@ fn translateInstructions(
             if (constantWaveLane(candidate.src1)) |lane| cross_half_read = cross_half_read or lane >= 32;
         }
         uses_gds = uses_gds or candidate.gds;
+        uses_lds = uses_lds or (candidate.family == .ds and !candidate.gds and
+            candidate.opcode != .ds_swizzle_b32);
         scans_wave_mask = scans_wave_mask or candidate.opcode == .s_bcnt1_i32_b64 or
             candidate.opcode == .s_ff1_i32_b64;
         if (candidate.dst.kind == .exec_lo or candidate.dst.kind == .exec_hi or
@@ -11878,7 +11891,11 @@ fn translateInstructions(
     // Multi-wave GDS kernels retain their existing path until their global
     // wave operations can participate in the converged dispatcher as well.
     const single_wave_mask_scan = invocation_count == 64 and scans_wave_mask and effective.uses_execution_mask;
-    if (!effective.wave32 and effective.stage == .compute and invocation_count >= 64 and invocation_count <= 1024 and invocation_count % 64 == 0 and (cross_half_read or uses_gds or single_wave_mask_scan) and (!uses_gds or invocation_count == 64)) {
+    // Wave-synchronous LDS scans also cross the host's 32-lane subgroup
+    // boundary. Keep scalar branches uniform across the complete guest wave
+    // so every invocation reaches the rendezvous before each LDS access.
+    const single_wave_lds = invocation_count == 64 and uses_lds;
+    if (!effective.wave32 and effective.stage == .compute and invocation_count >= 64 and invocation_count <= 1024 and invocation_count % 64 == 0 and (cross_half_read or uses_gds or single_wave_mask_scan or single_wave_lds) and (!uses_gds or invocation_count == 64)) {
         effective.wave64_workgroup = true;
         effective.uses_lane_identity = true;
         effective.uses_execution_mask = true;
@@ -11908,7 +11925,7 @@ fn translateInstructions(
         // 32-lane host it spans two independently scheduled subgroups, so
         // their shared-memory accesses need an explicit rendezvous. A
         // straight-line block guarantees every invocation reaches it.
-        builder.synchronize_linear_wave64_lds = effective.stage == .compute and !effective.wave32 and
+        builder.synchronize_wave64_lds = effective.stage == .compute and !effective.wave32 and
             @as(u64, effective.local_size[0]) * effective.local_size[1] * effective.local_size[2] == 64;
         try builder.emit(&builder.body, 248, &.{builder.label});
         try builder.initializeStageInputs();
