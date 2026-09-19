@@ -581,6 +581,12 @@ fn run(init: std.process.Init) !bool {
     const sparse_graphics_draws = init.minimal.environ.containsUnempty(allocator, "PS5_SPARSE_GRAPHICS") catch false;
     const translate_compute_only = init.minimal.environ.containsUnempty(allocator, "PS5_COMPUTE_TRANSLATE_ONLY") catch false;
     const prefer_integrated_gpu = init.minimal.environ.containsUnempty(allocator, "PS5_VULKAN_PREFER_INTEGRATED") catch false;
+    // Big Helmet Heroes' packed menu scanout has been checked against the
+    // CPU conversion. Avoid reading its 4K attachment back every flip.
+    vulkan.backend.gpu_packed_scanout = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_PACKED_SCANOUT")) |text| enabled: {
+        defer allocator.free(text);
+        break :enabled !std.mem.eql(u8, std.mem.trim(u8, text, " \t\r\n"), "0");
+    } else |_| std.ascii.eqlIgnoreCase(title_identifier, "PPSA19943");
     const dump_compute_spirv = init.minimal.environ.containsUnempty(allocator, "PS5_DUMP_COMPUTE_SPIRV") catch false;
     const dump_graphics_spirv = init.minimal.environ.containsUnempty(allocator, "PS5_DUMP_GRAPHICS_SPIRV") catch false;
     const trace_resource_failures = init.minimal.environ.containsUnempty(allocator, "PS5_TRACE_RESOURCE_FAILURES") catch false;

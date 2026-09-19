@@ -10271,6 +10271,13 @@ pub fn main(init: std.process.Init) !void {
         try runConstantBufferFetchProbe(allocator);
         return;
     }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--packed-scanout")) {
+        var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true });
+        defer renderer.deinit();
+        try renderer.probePackedScanout();
+        std.debug.print("packed scanout passed: GPU RGB10A2/R11G11B10 conversion matches CPU including black, channels and alpha\n", .{});
+        return;
+    }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--inferred-depth-resize")) {
         var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true });
         defer renderer.deinit();

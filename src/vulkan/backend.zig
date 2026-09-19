@@ -58,6 +58,7 @@ pub export var survey_resident_mip_chains: bool = false;
 // the frame. Naming them is the only way to tell an unavoidable one from a
 // surface the sampler could have read in place.
 pub export var trace_materialized_targets: bool = false;
+pub export var gpu_packed_scanout: bool = false;
 const sampled_lookup_plan = @import("sampled_lookup_plan.zig");
 
 /// Set to true to enable verbose per-frame GPU debug logging.
@@ -5074,18 +5075,15 @@ pub const Renderer = struct {
             vulkan_format == vk.format_b10g11r11_ufloat_pack32;
     }
 
-    /// Packed 10-bit scanout cannot go through `vkCmdBlitImage` onto an 8-bit
-    /// swapchain: NVIDIA leaves that blit black, and other drivers unpack
-    /// opaque A2B10 black (`0xC0000000`) as B=1008 — a solid blue window of a
-    /// frame whose CPU conversion is honest RGB-black. The materialized path
-    /// already has a tested RGBA8 conversion.
+    /// Validated title profiles can convert packed scanout directly on the
+    /// GPU. Keep the materialized path for titles requiring CPU conversion.
     fn presentWindowRenderTarget(
         self: *Renderer,
         target_index: usize,
         flip: gpu.state.Flip,
     ) anyerror!bool {
         if (target_index >= self.render_targets.items.len) return false;
-        if (packedHdrSwapchainFormat(self.render_targets.items[target_index].target.format.vulkan)) {
+        if (!gpu_packed_scanout and packedHdrSwapchainFormat(self.render_targets.items[target_index].target.format.vulkan)) {
             return self.presentResidentTarget(target_index, flip);
         }
         try self.blitRenderTargetToSwapchain(target_index, flip);
@@ -15477,6 +15475,46 @@ pub const Renderer = struct {
         return self.readDepthProbeValues(index, false);
     }
 
+    pub fn probePackedScanout(self: *Renderer) anyerror!void {
+        const samples = [_][8]u32{
+            .{ 0xc0000000, 0xc00003ff, 0xc00ffc00, 0xfff00000, 0xffffffff, 0x955aaa55, 0x40000000, 0 },
+            .{ 0, 0x3c0, 0x3c0 << 11, 0x1e0 << 22, 0x781e03c0, 0x701c0380, 0x841f8400, 1 },
+        };
+        for (samples, 0..) |words, pass| {
+            var color = std.mem.zeroes(gpu.resources.ColorTarget);
+            color.address = 0x1000 + pass * 0x2000;
+            color.width = 8;
+            color.height = 1;
+            color.pitch = 8;
+            color.depth = 1;
+            color.format = if (pass == 0) 9 else 6;
+            color.number_type = if (pass == 0) 0 else 7;
+            color.write_mask = 15;
+            color.tile_mode = .linear;
+            const source = try self.uploadLinearColorTarget(try guestColorTarget(color), std.mem.asBytes(&words));
+            color.address += 0x1000;
+            color.format = 10;
+            color.number_type = 0;
+            const destination = (try self.blitResidentColorTarget(source, try guestColorTarget(color), false)).?;
+            try std.testing.expectEqual(@as(u64, 0), self.frame_profile.target_readback_bytes);
+            try self.materializeRenderTarget(destination);
+            const frame = &self.completed_frames.items[self.latest_frame_index.?];
+            var expected: [32]u8 = undefined;
+            if (pass == 0) convertA2B10G10R10ToRgba8(std.mem.asBytes(&words), &expected) else convertR11G11B10ToRgba8(std.mem.asBytes(&words), &expected);
+            // Float-to-UNORM blits may round a half-way value down instead
+            // of the CPU converter's round-up. Channel order and endpoints
+            // remain exact; intermediate channels differ by at most one ULP.
+            for (expected, frame.pixels.items) |want, got| {
+                if (want == 0 or want == 255) {
+                    try std.testing.expectEqual(want, got);
+                } else {
+                    try std.testing.expect(@abs(@as(i16, want) - @as(i16, got)) <= 1);
+                }
+            }
+            self.frame_profile.reset();
+        }
+    }
+
     pub fn probeFeedbackSnapshots(self: *Renderer) anyerror!void {
         var color = std.mem.zeroes(gpu.resources.ColorTarget);
         color.address = 0x1000;
@@ -24456,10 +24494,8 @@ pub const Renderer = struct {
                     }
                     if (ui_index) |target_index| {
                         const resident_format = self.render_targets.items[target_index].target.format.vulkan;
-                        const needs_synchronized_scanout =
-                            self.reported_rgb10_menu_postprocess_fallback or
-                            resident_format == vk.format_a2b10g10r10_unorm_pack32 or
-                            resident_format == vk.format_b10g11r11_ufloat_pack32;
+                        const needs_synchronized_scanout = self.reported_rgb10_menu_postprocess_fallback or (!gpu_packed_scanout and (resident_format == vk.format_a2b10g10r10_unorm_pack32 or
+                            resident_format == vk.format_b10g11r11_ufloat_pack32));
                         // Transfer blits of REANIMAL's packed 10-bit menu are
                         // accepted by the driver but produce an all-black
                         // swapchain image on NVIDIA.  The materialized path
