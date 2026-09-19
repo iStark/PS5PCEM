@@ -430,10 +430,11 @@ pub const DcbExecutor = struct {
             }
         } else {
             const compare_address = (@as(u64, body[2]) << 32) | body[1];
-            if (compare_address == 0) return Error.InvalidPacket;
+            if (function != 0 and compare_address == 0) return Error.InvalidPacket;
             const mask = (@as(u64, body[4]) << 32) | body[3];
             const reference = (@as(u64, body[6]) << 32) | body[5];
-            const observed = try self.readU64(compare_address);
+            // ALWAYS branches link command arenas without a readable predicate.
+            const observed = if (function == 0) 0 else try self.readU64(compare_address);
             const take_then = compareWait(observed, reference, mask, function);
             if (take_then) {
                 selected_address = then_address;

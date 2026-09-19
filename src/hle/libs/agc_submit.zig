@@ -165,7 +165,7 @@ const orphan_arena_quiet_ns: u64 = 2 * std.time.ns_per_s;
 
 /// Some SDK revisions append `DcbSetFlip` through the command-builder cursor
 /// after freezing the descriptor's public word count.  Keep that constructed
-/// packet until the following graphics submission has drained.  If the packet
+/// packet until its owning graphics submission has drained. If the packet
 /// was part of the executed stream, `backendFlip` acknowledges it; otherwise
 /// the submission boundary supplies the missing ordered presentation edge.
 const ConstructedFlip = struct {
@@ -1661,35 +1661,48 @@ pub fn noteConstructedFlip(
     };
 }
 
-/// Executes the command-builder DCB which owns the constructed flip.  SDK 11
-/// titles can submit a small driver-retirement DCB separately from this final
-/// graphics buffer; treating only the public 53-word descriptor as the frame
-/// drops the draw/dispatches immediately preceding `R_FLIP`.
-fn submitConstructedGraphicsStream() void {
+/// A recorded flip may extend a submitted root, but an unrelated submission
+/// must never consume a frame that the producer is still building.
+fn constructedFlipTail(pending: ConstructedFlip, submission: Submission) ?[]const u32 {
+    const submitted = submission.address orelse return null;
+    if (@intFromPtr(submitted) != pending.stream_address or submission.word_count == 0 or
+        submission.word_count >= pending.stream_word_count) return null;
+    const submitted_end = std.math.add(u64, pending.stream_address, @as(u64, submission.word_count) * 4) catch return null;
+    const stream_end = std.math.add(u64, pending.stream_address, @as(u64, pending.stream_word_count) * 4) catch return null;
+    const flip_end = std.math.add(u64, pending.command_address, 6 * 4) catch return null;
+    if (pending.command_address < submitted_end or flip_end != stream_end) return null;
+    const stream = streamOf(@ptrFromInt(pending.stream_address), pending.stream_word_count) orelse return null;
+    return stream[submission.word_count..];
+}
+
+/// Recover only the appended part of this submission. Replaying the complete
+/// builder repeats its draw/dispatch work; using the latest global builder
+/// without checking its owner presents the next frame before it is submitted.
+fn submitConstructedGraphicsStream(submission: Submission) bool {
     constructed_flip_lock.lock();
     const pending = pending_constructed_flip orelse {
         constructed_flip_lock.unlock();
-        return;
+        return false;
     };
     constructed_flip_lock.unlock();
-
-    if (pending.stream_address == 0 or pending.stream_word_count == 0) return;
-    const byte_length = @as(u64, pending.stream_word_count) * @sizeOf(u32);
-    const stream_end = std.math.add(u64, pending.stream_address, byte_length) catch return;
-    const flip_end = std.math.add(u64, pending.command_address, 6 * @sizeOf(u32)) catch return;
-    if (pending.command_address < pending.stream_address or flip_end > stream_end) return;
-
-    const stream_pointer: [*]const u32 = @ptrFromInt(pending.stream_address);
-    const stream = streamOf(stream_pointer, pending.stream_word_count) orelse return;
+    const tail = constructedFlipTail(pending, submission) orelse return false;
+    const snapshot = std.heap.page_allocator.dupe(u32, tail) catch return false;
+    defer std.heap.page_allocator.free(snapshot);
+    const commands = submittedCommandPrefixForRange(snapshot, @intFromPtr(tail.ptr), false);
+    if (commands.len != snapshot.len) return false;
     if (recovered_constructed_flip_reports < 16) {
-        std.debug.print(
-            "[agc flip] submitting constructed graphics DCB @0x{x}/{d} through packet=0x{x}\n",
-            .{ pending.stream_address, pending.stream_word_count, pending.command_address },
-        );
+        std.debug.print("[agc flip] submitting appended graphics DCB @0x{x}/{d} through packet=0x{x}\n", .{ @intFromPtr(tail.ptr), tail.len, pending.command_address });
         recovered_constructed_flip_reports += 1;
     }
-    announce("dcb builder", stream);
-    _ = executeAcceptedStream("dcb builder", stream, null, 0);
+    rememberSubmissionRange(tail, false);
+    markBuilderArenaExecuted(@intFromPtr(tail.ptr), tail.len * @sizeOf(u32));
+    execution_lock.lock();
+    defer execution_lock.unlock();
+    beginCompletionBatch();
+    // This is the same guest retirement node as the submitted prefix.
+    defer discardCompletionBatch();
+    const outcome = executeSubmittedLocked("dcb builder", commands);
+    return outcome.accepted and outcome.completed;
 }
 
 fn presentUnconsumedConstructedFlip(submission: Submission, outcome: SubmitOutcome) void {
@@ -1700,6 +1713,10 @@ fn presentUnconsumedConstructedFlip(submission: Submission, outcome: SubmitOutco
         constructed_flip_lock.unlock();
         return;
     };
+    if (constructedFlipTail(pending, submission) == null) {
+        constructed_flip_lock.unlock();
+        return;
+    }
     pending_constructed_flip = null;
     constructed_flip_lock.unlock();
 
@@ -1894,6 +1911,7 @@ pub const SubmitOutcome = struct {
     accepted: bool = false,
     completed: bool = false,
     queued_interrupt: bool = false,
+    presented: bool = false,
     last_release: ?gpu.state.ReleaseMem = null,
 };
 
@@ -2374,6 +2392,7 @@ fn executeAcceptedStream(
         outcome.completed = prefix_outcome.accepted and prefix_outcome.completed;
         outcome.queued_interrupt = hasQueuedInterrupt(commands);
         outcome.last_release = prefix_outcome.last_release;
+        outcome.presented = prefix_outcome.presented;
     }
 
     if (std.mem.eql(u8, label, "dcb") and outcome.accepted) {
@@ -2494,6 +2513,7 @@ fn executeSubmittedLockedForQueue(label: []const u8, stream: []const u32, event_
     else
         .graphics;
     const release_count_before = submission_scheduler.state(kind).release_count;
+    const flip_count_before = submission_scheduler.state(kind).flip_count;
     var backend = executor_backend;
     backend.context = if (event_id == 0) null else @ptrFromInt(event_id);
     var report = submission_scheduler.submitWithBackend(kind, stream, backend) catch |err| {
@@ -2598,6 +2618,7 @@ fn executeSubmittedLockedForQueue(label: []const u8, stream: []const u32, event_
     return .{
         .accepted = true,
         .completed = completed,
+        .presented = final_state.flip_count != flip_count_before,
         .last_release = if (final_state.release_count != release_count_before)
             final_state.last_release
         else
@@ -3418,16 +3439,10 @@ fn submitDcb(descriptor: ?*const Submission) callconv(abi.guest) i32 {
     sdk11_dcb_release_candidate = null;
     sdk11_dcb_release_capture = true;
     const outcome = submitOne("dcb", descriptor, completion_label);
-    // The SDK 11 retirement DCB can indirectly reach the command-builder
-    // stream which owns R_FLIP.  Let that submitted chain consume the pending
-    // flip first; eagerly executing the builder here duplicated its tail,
-    // producing two presentations and replaying roughly sixty compute passes
-    // for every guest frame.  If this SDK really supplied only the small
-    // retirement buffer, the pending flip remains and the recovery path still
-    // executes the builder before this HLE call returns.
-    submitConstructedGraphicsStream();
+    const recovered_tail = outcome.accepted and outcome.completed and !outcome.presented and
+        submitConstructedGraphicsStream(submission);
     sdk11_dcb_release_capture = false;
-    presentUnconsumedConstructedFlip(submission, outcome);
+    if (recovered_tail) presentUnconsumedConstructedFlip(submission, outcome);
     if (sdk11_dcb_release_candidate orelse outcome.last_release) |release| {
         publishSdk11DcbDriverGeneration(submission, release);
     }
@@ -4049,8 +4064,9 @@ test "appended DCB ranges do not invent allocation headers" {
     try testing.expect(!writeGuestMemory(null, @intFromPtr(&allocation[2]), std.mem.asBytes(&value)));
     const commands = [_]u32{
         command(gpu.pm4.write_data, 4), 1 << 8,
-        @truncate(target), @truncate(target >> 32), value,
-        command(gpu.pm4.nop, 1), 0,
+        @truncate(target),              @truncate(target >> 32),
+        value,                          command(gpu.pm4.nop, 1),
+        0,
     };
     const continuation = @intFromPtr(&allocation[12]);
     try testing.expectEqual(@as(usize, 0), submittedCommandPrefixForArena(&commands, continuation).len);

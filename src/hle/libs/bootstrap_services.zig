@@ -4160,6 +4160,124 @@ test "bootstrap AGC emits a backend-visible flip packet" {
     try std.testing.expect((try walker.next()) == null);
 }
 
+test "recording the next AGC flip does not submit it with the previous frame" {
+    // The native SDK probes retirement metadata after the public descriptor.
+    // Provide an empty envelope instead of unrelated unit-test stack values.
+    const Descriptor = extern struct {
+        submission: agc_submit.Submission,
+        padding: [0x50]u8 = @splat(0),
+    };
+    const Probe = struct {
+        arguments: [2]i64 = @splat(0),
+        count: usize = 0,
+        events: usize = 0,
+
+        fn read(_: ?*anyopaque, _: u64, _: []u8) bool {
+            return false;
+        }
+        fn write(_: ?*anyopaque, _: u64, _: []const u8) bool {
+            return false;
+        }
+        fn event(context: ?*anyopaque, _: gpu.state.EventWrite) bool {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.events += 1;
+            return true;
+        }
+        fn flip(context: ?*anyopaque, value: gpu.state.Flip) bool {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            if (self.count >= self.arguments.len) return false;
+            self.arguments[self.count] = value.argument;
+            self.count += 1;
+            return true;
+        }
+    };
+    const vtable = gpu.DcbBackend.VTable{ .read = Probe.read, .write = Probe.write, .flip = Probe.flip, .event = Probe.event };
+    const submit: *const fn (?*const agc_submit.Submission) callconv(abi.guest) i32 = comptime blk: {
+        for (agc_submit.exports) |entry| {
+            if (std.mem.eql(u8, entry.name, "sceAgcDriverSubmitDcb")) break :blk @ptrCast(entry.function);
+        }
+        @compileError("missing SubmitDcb export");
+    };
+    agc_submit.reset();
+    video_out.reset();
+    defer agc_submit.reset();
+    defer video_out.reset();
+    try std.testing.expect(video_out.open(0));
+    var display: [64]u8 = @splat(0);
+    const buffers = [_]video_out.Buffer{.{ .data = &display, .metadata = null, .reserved = .{ null, null } }};
+    try video_out.registerBuffers(0, 0, &buffers, .{ .width = 4, .height = 4, .pitch_in_pixels = 4 }, 0);
+    var probe = Probe{};
+    agc_submit.attachBackend(.{ .context = &probe, .vtable = &vtable });
+
+    var frames: [2][6]u32 = @splat(@splat(0));
+    for (&frames, 0..) |*words, index| {
+        var command_buffer = AgcCommandBuffer{
+            .bottom = words[0..].ptr,
+            .top = words[0..].ptr + words.len,
+            .cursor_up = words[0..].ptr,
+            .cursor_down = null,
+            .callback = null,
+            .user_data = null,
+            .reserved_dwords = 0,
+        };
+        try std.testing.expect(agcSetFlip(&command_buffer, 1, 0, 1, @intCast(index + 40)) != null);
+    }
+    try std.testing.expectEqual(@as(usize, 0), probe.count);
+    // The producer has recorded frame 41 before the consumer submits 40.
+    // Completing 40 must neither execute nor present the unsubmitted 41.
+    for (&frames, 0..) |*words, index| {
+        var descriptor: Descriptor = .{ .submission = .{ .address = words[0..].ptr, .word_count = words.len, .reserved = 0 } };
+        try std.testing.expectEqual(errno.ok, submit(&descriptor.submission));
+        try std.testing.expectEqual(index + 1, probe.count);
+        try std.testing.expectEqual(@as(i64, @intCast(index + 40)), probe.arguments[index]);
+        try std.testing.expectEqual(@as(u64, @intCast(index + 1)), video_out.status(1).?.count);
+    }
+    // Two frames may also share one arena. A flip already consumed by the
+    // submitted prefix forbids recovery of the next frame in that allocation.
+    probe.count = 0;
+    var shared: [12]u32 = @splat(0);
+    var shared_builder = AgcCommandBuffer{
+        .bottom = &shared,
+        .top = shared[0..].ptr + shared.len,
+        .cursor_up = &shared,
+        .cursor_down = null,
+        .callback = null,
+        .user_data = null,
+        .reserved_dwords = 0,
+    };
+    try std.testing.expect(agcSetFlip(&shared_builder, 1, 0, 1, 50) != null);
+    try std.testing.expect(agcSetFlip(&shared_builder, 1, 0, 1, 51) != null);
+    var first: Descriptor = .{ .submission = .{ .address = &shared, .word_count = 6, .reserved = 0 } };
+    try std.testing.expectEqual(errno.ok, submit(&first.submission));
+    try std.testing.expectEqual(@as(usize, 1), probe.count);
+    var second: Descriptor = .{ .submission = .{ .address = shared[0..].ptr + 6, .word_count = 6, .reserved = 0 } };
+    try std.testing.expectEqual(errno.ok, submit(&second.submission));
+    try std.testing.expectEqualSlices(i64, &.{ 50, 51 }, &probe.arguments);
+    try std.testing.expectEqual(@as(usize, 2), probe.count);
+
+    // Keep the SDK workaround for a descriptor frozen before its appended
+    // flip, and execute the prefix event exactly once rather than replaying it.
+    probe.count = 0;
+    var appended: [8]u32 = @splat(0);
+    appended[0] = pm4Header(gpu.pm4.event_write, 1);
+    appended[1] = 0x20;
+    var appended_builder = AgcCommandBuffer{
+        .bottom = &appended,
+        .top = appended[0..].ptr + appended.len,
+        .cursor_up = appended[0..].ptr + 2,
+        .cursor_down = null,
+        .callback = null,
+        .user_data = null,
+        .reserved_dwords = 0,
+    };
+    try std.testing.expect(agcSetFlip(&appended_builder, 1, 0, 1, 60) != null);
+    var prefix: Descriptor = .{ .submission = .{ .address = &appended, .word_count = 2, .reserved = 0 } };
+    try std.testing.expectEqual(errno.ok, submit(&prefix.submission));
+    try std.testing.expectEqual(@as(usize, 1), probe.events);
+    try std.testing.expectEqual(@as(usize, 1), probe.count);
+    try std.testing.expectEqual(@as(i64, 60), probe.arguments[0]);
+}
+
 test "bootstrap AGC shader range uses its exact variable packet size" {
     var words: [24]u32 = @splat(0xdead_beef);
     var values: [16]u32 = undefined;

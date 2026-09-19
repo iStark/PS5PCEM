@@ -133,11 +133,48 @@ pub fn condExecGetSize() callconv(abi.guest) u32 {
     return 5 * @sizeOf(u32);
 }
 
+/// Links command-buffer segments, optionally selecting a target with a 64-bit
+/// memory comparison. The targets include stack arguments in the guest ABI.
+pub fn branch(
+    buffer: ?*CommandBuffer,
+    mode: u8,
+    compare_function: u8,
+    compare_address: u64,
+    mask: u64,
+    reference: u64,
+    then_cache_policy: u8,
+    then_address: u64,
+    then_words: u32,
+    else_cache_policy: u8,
+    else_address: u64,
+    else_words: u32,
+) callconv(abi.guest) ?[*]u32 {
+    const body = [_]u32{
+        (@as(u32, mode) & 3) | ((@as(u32, compare_function) & 7) << 8),
+        @as(u32, @truncate(compare_address)) & 0xffff_fff8,
+        @truncate(compare_address >> 32),
+        @truncate(mask),
+        @truncate(mask >> 32),
+        @truncate(reference),
+        @truncate(reference >> 32),
+        @as(u32, @truncate(then_address)) & 0xffff_fffc,
+        @truncate(then_address >> 32),
+        (then_words & 0x000f_ffff) | ((@as(u32, then_cache_policy) & 3) << 28),
+        @as(u32, @truncate(else_address)) & 0xffff_fffc,
+        @truncate(else_address >> 32),
+        (else_words & 0x000f_ffff) | ((@as(u32, else_cache_policy) & 3) << 28),
+    };
+    return writePacket(buffer, gpu.pm4.indirect_buffer, 0, &body);
+}
+
+pub fn branchGetSize() callconv(abi.guest) u32 {
+    return 14 * @sizeOf(u32);
+}
+
 fn availableDwords(buffer: *const CommandBuffer) u32 {
     const cursor = buffer.cursor_up orelse buffer.bottom orelse return 0;
-    // SDK 11 command buffers reserve the tail between cursor_down and top for
-    // the grow callback's chain packet.  Older wrappers only populated top,
-    // so retaining it as a fallback keeps those buffers usable.
+    // The downward cursor separates command space from tail allocations.
+    // Older wrappers only populated top, so keep it as a fallback.
     const end_cursor = buffer.cursor_down orelse buffer.top orelse return 0;
     const at = @intFromPtr(cursor);
     const end = @intFromPtr(end_cursor);
@@ -148,9 +185,8 @@ fn availableDwords(buffer: *const CommandBuffer) u32 {
 }
 
 /// Reserves command words, asking the title to attach another arena when the
-/// current one is exhausted.  The callback also writes the chain packet into
-/// the reserved tail of the old arena, so bypassing it loses every command
-/// emitted after the first segment.
+/// current one is exhausted. The title retains the old segment and links it
+/// to the continuation when finalizing the submission.
 pub fn reserveDwords(state: ?*CommandBuffer, words: u32) ?[*]u32 {
     const buffer = state orelse return null;
     if (words == 0) return null;
@@ -1153,4 +1189,54 @@ test "indexed multi-instance draw emits Prospero preamble packet" {
     try testing.expectEqual(@as(u32, 7), packet.body[6]);
     try testing.expectEqual(@as(u32, 0xa0), packet.body[7]);
     try testing.expect((try walker.next()) == null);
+}
+
+test "AGC branch export executes a continuation and selects conditional targets" {
+    const Host = struct {
+        bytes: [256]u8 = @splat(0),
+        fn read(context: ?*anyopaque, address: u64, destination: []u8) bool {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            if (address < 0x1000) return false;
+            const offset = address - 0x1000;
+            if (offset > self.bytes.len or destination.len > self.bytes.len - offset) return false;
+            @memcpy(destination, self.bytes[@intCast(offset)..][0..destination.len]);
+            return true;
+        }
+        fn write(_: ?*anyopaque, _: u64, _: []const u8) bool {
+            return false;
+        }
+    };
+    const branch_export: *const @TypeOf(branch) = comptime blk: {
+        for (exports) |entry| {
+            if (std.mem.eql(u8, entry.name, "sceAgcCbBranch")) break :blk @ptrCast(entry.function);
+        }
+        @compileError("missing AGC branch export");
+    };
+    var host = Host{};
+    const then_commands = [_]u32{ 0xc0017900, 9, 0xbeef };
+    const else_commands = [_]u32{ 0xc0017900, 9, 0xcafe };
+    @memcpy(host.bytes[0x20..][0..@sizeOf(@TypeOf(then_commands))], std.mem.sliceAsBytes(&then_commands));
+    @memcpy(host.bytes[0x40..][0..@sizeOf(@TypeOf(else_commands))], std.mem.sliceAsBytes(&else_commands));
+    var state = gpu.state.State{};
+    const vtable = gpu.DcbBackend.VTable{ .read = Host.read, .write = Host.write };
+    var executor = gpu.DcbExecutor{ .state = &state, .backend = .{ .context = &host, .vtable = &vtable }, .allocator = testing.allocator };
+    var words: [14]u32 = @splat(0);
+    var buffer = fixture(&words);
+    // The continuation lives in argument eight, on the guest stack. ALWAYS
+    // has no predicate storage, as when a grow callback splits one DCB.
+    try testing.expect(branch_export(&buffer, 1, 0, 0, 0, 0, 2, 0x1020, then_commands.len, 0, 0, 0) != null);
+    try testing.expectEqual(@as(u32, @sizeOf(@TypeOf(words))), branchGetSize());
+    try testing.expectEqual(words[0..].ptr + words.len, buffer.cursor_up.?);
+    try testing.expectEqual(@as(u32, 0x2000_0003), words[10]);
+    _ = try executor.execute(&words);
+    try testing.expectEqual(@as(?u32, 0xbeef), state.readRegister(.uconfig, 9));
+
+    buffer = fixture(&words);
+    try testing.expect(branch_export(&buffer, 2, 3, 0x1000, 0xffff_ffff_ffff_ffff, 7, 0, 0x1020, then_commands.len, 3, 0x1040, else_commands.len) != null);
+    std.mem.writeInt(u64, host.bytes[0..8], 8, .little);
+    _ = try executor.execute(&words);
+    try testing.expectEqual(@as(?u32, 0xcafe), state.readRegister(.uconfig, 9));
+    std.mem.writeInt(u64, host.bytes[0..8], 7, .little);
+    _ = try executor.execute(&words);
+    try testing.expectEqual(@as(?u32, 0xbeef), state.readRegister(.uconfig, 9));
 }
