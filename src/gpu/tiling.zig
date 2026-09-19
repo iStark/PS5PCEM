@@ -649,6 +649,8 @@ pub const HtileLayout = struct {
 };
 
 pub const Layout = struct {
+    /// Volume attachments use the same 3D swizzle as their sampled image.
+    volume: ?SubresourceLayout = null,
     block: BlockLayout,
     width: u32,
     height: u32,
@@ -757,6 +759,19 @@ pub const Layout = struct {
         if (target.samples_log2 != 0 or target.fragments_log2 != 0) {
             return Error.UnsupportedMultisample;
         }
+        if (target.resource_type == 2) {
+            const texture = try TextureLayout.fromColorTarget(target);
+            const volume = try texture.subresource(target.mip_level, 0, 1);
+            var layout = try init(.{
+                .tile_mode = .linear,
+                .width = volume.width,
+                .height = volume.height,
+                .layers = volume.depth_or_layers,
+            }, bytes);
+            layout.volume = volume;
+            layout.required_source_bytes = volume.required_source_bytes;
+            return layout;
+        }
         const layers: u32 = if (target.last_array_slice >= target.base_array_slice)
             @as(u32, target.last_array_slice) - target.base_array_slice + 1
         else
@@ -801,6 +816,7 @@ pub const Layout = struct {
     }
 
     pub fn sourceByteOffset(self: Layout, x: u32, y: u32, layer: u32) Error!u64 {
+        if (self.volume) |volume| return volume.sourceByteOffset(x, y, layer, 0);
         if (x >= self.width or y >= self.height or layer >= self.layers) {
             return Error.CoordinateOutOfRange;
         }
@@ -844,6 +860,7 @@ pub const Layout = struct {
 
     /// Copies guest tiled bytes into tightly packed layer-major staging bytes.
     pub fn detile(self: Layout, source: []const u8, destination: []u8) Error!void {
+        if (self.volume) |volume| return volume.detile(source, destination);
         try self.validateCopies(source.len, destination.len);
         return switch (self.block.bytes_per_element) {
             1 => self.copyElements(false, 1, source, destination),
@@ -858,6 +875,7 @@ pub const Layout = struct {
     /// Copies tightly packed staging bytes back to guest layout. Padding and
     /// slices outside the view are intentionally left untouched.
     pub fn tile(self: Layout, source: []const u8, destination: []u8) Error!void {
+        if (self.volume) |volume| return volume.tile(source, destination);
         if (@as(u64, source.len) < self.staging_bytes) return Error.SourceTooSmall;
         if (@as(u64, destination.len) < self.required_source_bytes) return Error.DestinationTooSmall;
         return switch (self.block.bytes_per_element) {
@@ -940,6 +958,7 @@ pub const Layout = struct {
     /// Reads directly from checked guest memory without allocating an
     /// intermediate copy of the tiled allocation.
     pub fn stage(self: Layout, reader: shaders.MemoryReader, address: u64, destination: []u8) StageError!void {
+        if (self.volume) |volume| return volume.stage(reader, address, destination);
         if (@as(u64, destination.len) < self.staging_bytes) return Error.DestinationTooSmall;
         _ = try self.sourceRange(address);
         const bytes = self.block.bytes_per_element;
@@ -1104,10 +1123,11 @@ pub const TextureLayout = struct {
             1;
         return init(.{
             .tile_mode = target.tile_mode,
+            .kind = if (target.resource_type == 2) .volume_3d else .array_2d,
             .width = target.width,
             .height = target.height,
-            .depth_or_layers = layers,
-            .first_slice = target.base_array_slice,
+            .depth_or_layers = if (target.resource_type == 2) @max(target.depth, 1) else layers,
+            .first_slice = if (target.resource_type == 2) 0 else target.base_array_slice,
             .mip_levels = @max(target.maximum_mip + 1, 1),
             .samples_log2 = target.fragments_log2,
             .row_pitch_elements = if (target.maximum_mip == 0) target.pitch else 0,
@@ -3333,5 +3353,33 @@ test "compute source offsets match CPU detile for standard 64 KiB textures" {
                 computeSourceOffset(plan.params, x, y, 0, 0),
             );
         }
+    }
+}
+
+test "volume color attachments and sampled images share all slice addresses" {
+    for ([_]resources.TileMode{ .linear, .standard_4kb, .render_target }) |mode| {
+        var target = std.mem.zeroes(resources.ColorTarget);
+        target.width = 32;
+        target.height = 32;
+        target.depth = 32;
+        target.resource_type = 2;
+        target.format = 9;
+        target.tile_mode = mode;
+        var image = std.mem.zeroInit(resources.ImageDescriptor, .{ .image_type = .color_3d });
+        image.width = 32;
+        image.height = 32;
+        image.depth_or_layers = 32;
+        image.image_type = .color_3d;
+        image.unified_format = 50;
+        image.tile_mode = mode;
+        image.extended = true;
+        const attachment = try Layout.fromColorTarget(target);
+        const sampled = try (try TextureLayout.fromImage(image)).base();
+        try testing.expectEqual(@as(u32, 32), attachment.layers);
+        try testing.expectEqual(try sampled.stagingBytes(), attachment.staging_bytes);
+        try testing.expectEqual(sampled.required_source_bytes, attachment.required_source_bytes);
+        for (0..32) |z| for (0..32) |y| for (0..32) |x| {
+            try testing.expectEqual(try sampled.sourceByteOffset(@intCast(x), @intCast(y), @intCast(z), 0), try attachment.sourceByteOffset(@intCast(x), @intCast(y), @intCast(z)));
+        };
     }
 }

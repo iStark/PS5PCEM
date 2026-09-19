@@ -623,6 +623,12 @@ pub const ImageViewCreateInfo = extern struct {
     subresource_range: ImageSubresourceRange,
 };
 
+pub const ImageViewUsageCreateInfo = extern struct {
+    s_type: u32 = 1000117002,
+    p_next: ?*const anyopaque = null,
+    usage: Flags,
+};
+
 pub const MemoryRequirements = extern struct {
     size: DeviceSize,
     alignment: DeviceSize,

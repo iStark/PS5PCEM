@@ -3229,7 +3229,18 @@ fn runSdwaProbe(allocator: std.mem.Allocator) !void {
             }
         }
     }
-    std.debug.print("SDWA passed: byte/word destinations, padding/sign/preservation, A16 coordinate packing, F16 math/modifiers and inactive EXEC\n", .{});
+    // Full-width SDWA V_MOV is how fullscreen vertex shaders negate clip Y.
+    // Check the payload exactly: arithmetic negation and float conversions
+    // both corrupt some of these values (including signed zero and NaNs).
+    for ([_]u32{ 0x3f80_0000, 0xc040_0000, 0, 0x8000_0000, 0x7fc1_2345, 0xffc1_2345, 0xdead_beef }, 0..) |payload, payload_index| {
+        for (0..4) |modifiers| {
+            var expected_bits = payload;
+            if (modifiers & 2 != 0) expected_bits &= 0x7fff_ffff;
+            if (modifiers & 1 != 0) expected_bits ^= 0x8000_0000;
+            try Runner.check(&renderer, &guest, &state, 210 + payload_index * 4 + modifiers, .{ 0, payload, 0 }, &.{ vop1(1, 0, 249), 0x0006_0601 | (@as(u32, @intCast(modifiers)) << 20) }, expected_bits);
+        }
+    }
+    std.debug.print("SDWA passed: byte/word destinations, padding/sign/preservation, A16 coordinate packing, F16 math/modifiers, V_MOV float sign bits and inactive EXEC\n", .{});
     std.debug.print("conditional float selection passed: both sources, ABS/NEG combinations and exact zero/NaN/integer payload bits\n", .{});
 }
 
@@ -3924,13 +3935,104 @@ fn runDepthStorageProbe(allocator: std.mem.Allocator) !void {
     std.debug.print("depth storage passed: current D32/S8 reads, repeated clears and compute writes returned to the attachment\n", .{});
 }
 
-fn runResetDepthExtentProbe(allocator: std.mem.Allocator) !void {
-    try runResetDepthExtentCase(allocator, false);
-    try runResetDepthExtentCase(allocator, true);
-    std.debug.print("Reset depth-only extents passed: viewport/scissor recovery, raster/MRTZ depth, changing scalars and depth samples across the attachment\n", .{});
+fn runLayeredVolumeProbe(allocator: std.mem.Allocator) !void {
+    for ([_]u5{ 0, 27 }) |tile_mode| {
+        var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true });
+        defer renderer.deinit();
+        const guest = try allocator.create(SizedGuestMemory(4 * 1024 * 1024));
+        defer allocator.destroy(guest);
+        guest.* = .{};
+        // A fullscreen triangle, with the instance ID exported as POS1.z.
+        const vertex = [_]u32{
+            0x34020a81,      0x36040a82, 0x36020282, 0x7e040d02, 0x7e060d01,
+            0xd5410001,      0x03ce04f4, 0xd5410002, 0x03ce06f4, vop1(1, 0, 128),
+            vop1(1, 3, 242),
+            0xf80000d4, 0x00080000, // EXP POS1.z = instance v8
+            0xf80008cf, 0x03000102,
+            0xbf810000,
+        };
+        const fragment = [_]u32{
+            vop2Source(0x16, 2, 144, 2), // ancillary >> 16
+            vop1(6, 2, 258),  vop1(1, 3, 255),  0x3d000000, // 1/32
+            vop2(8, 0, 0, 3), vop2(8, 1, 1, 3), vop2(8, 2, 2, 3),
+            vop1(1, 3, 242),  0xf800080f,       0x03020100,
+            0xbf810000,
+        };
+        for (vertex, 0..) |word, i| guest.word(0x700 + i * 4, word);
+        for (fragment, 0..) |word, i| guest.word(0x900 + i * 4, word);
+        var state = gpu.State{};
+        for ([_]gpu.resources.ShaderStage{ .vertex, .pixel }, [_]u32{ 7, 9 }) |stage, program| {
+            try state.writeRegister(.shader, stage.programRegisterBase(), program);
+            try state.writeRegister(.shader, stage.programRegisterBase() + 1, 0);
+        }
+        const inputs = (1 << 8) | (1 << 9) | (1 << 13);
+        const context = [_][2]u32{
+            .{ 0x08e, 0xf },             .{ 0x200, 0 },                                            .{ 0x204, 1 << 19 },               .{ 0x205, 0 },               .{ 0x202, 0xcc0010 },
+            .{ 0x318, 0x100 },           .{ 0x390, 0 },                                            .{ 0x31c, (10 << 2) | (1 << 28) }, .{ 0x325, 0x3f00 },          .{ 0x3a8, 0 },
+            .{ 0x3b0, (31 << 14) | 31 }, .{ 0x3b8, (2 << 24) | (@as(u32, tile_mode) << 14) | 31 }, .{ 0x1b4, inputs },                .{ 0x1b3, inputs },          .{ 0x1e0, 0 },
+            .{ 0x00c, 0 },               .{ 0x00d, 32 | (32 << 16) },                              .{ 0x094, 1 << 31 },               .{ 0x095, 32 | (32 << 16) },
+        };
+        for (context) |entry| try state.writeRegister(.context, entry[0], entry[1]);
+        for ([_]f32{ 16, 16, -16, 16, 1, 0 }, 0..) |value, i|
+            try state.writeRegister(.context, 0x10f + @as(u32, @intCast(i)), @bitCast(value));
+        var executor = gpu.DcbExecutor{ .state = &state, .backend = renderer.dcbBackend(guest.interface()), .allocator = allocator };
+        _ = try executor.execute(&.{ command(gpu.pm4.num_instances, 1), 32, command(gpu.pm4.draw_index_auto, 2), 3, 0 });
+        if (renderer.last_draw_error) |err| return err;
+        try renderer.flushPendingGuestWrites();
+        try std.testing.expectEqual(@as(usize, 1), renderer.render_targets.items.len);
+        const target = renderer.render_targets.items[0].target;
+        try std.testing.expectEqual(@as(u32, 32), target.layout.layers);
+        const linear = try allocator.alloc(u8, @intCast(target.layout.staging_bytes));
+        defer allocator.free(linear);
+        try target.layout.detile(guest.bytes[0x10000..], linear);
+        for (0..32) |z| for (0..32) |y| for (0..32) |x| {
+            const pixel = linear[((z * 32 + y) * 32 + x) * 4 ..][0..4];
+            const expected = [4]u8{ @intFromFloat(@round((@as(f32, @floatFromInt(x)) + 0.5) * 255 / 32)), @intFromFloat(@round((@as(f32, @floatFromInt(y)) + 0.5) * 255 / 32)), @intFromFloat(@round(@as(f32, @floatFromInt(z)) * 255 / 32)), 255 };
+            for (expected, pixel) |want, got| try std.testing.expect(@abs(@as(i16, want) - got) <= 1);
+        };
+        // DCC clears recur every frame without writing the base surface.
+        // They must clear every resident layer before additive volume draws.
+        const metadata = try allocator.alloc(u8, @intCast((target.layout.required_source_bytes + 255) / 256));
+        defer allocator.free(metadata);
+        @memset(metadata, 0);
+        try std.testing.expect(executor.backend.vtable.write(executor.backend.context, 0x3f0000, metadata));
+        try renderer.flushPendingGuestWrites();
+        try target.layout.detile(guest.bytes[0x10000..], linear);
+        try std.testing.expect(std.mem.allEqual(u8, linear, 0));
+        _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 0 });
+        const native_clear = [_]u32{
+            0xd7460004, 8 | (134 << 9) | (256 << 18),
+            0x7e000204, 0x7e020205,
+            0x7e040206, 0x7e060207,
+            0xe01c2000, 0x80000004,
+            0xbf800000, 0xbf810000,
+        };
+        for (native_clear, 0..) |word, i| guest.word(0xb00 + i * 4, word);
+        var compute = gpu.State{};
+        try compute.writeRegister(.shader, 0x20c, 0xb);
+        try compute.writeRegister(.shader, 0x20d, 0);
+        try compute.writeRegister(.shader, 0x213, (8 << 1) | (1 << 7));
+        const clear_data = [_]u32{ 0x3f0000, 16 << 16, @intCast(metadata.len / 16), (75 << 12) | 0xfac, 0, 0, 0, 0 };
+        for (clear_data, 0..) |word, i| try compute.writeRegister(.shader, 0x240 + @as(u32, @intCast(i)), word);
+        renderer.defer_small_storage_writes_enabled = true;
+        const fills_before = renderer.emulated_buffer_clear_dispatches;
+        _ = try renderer.dispatchRdna2State(&compute, .{ 64, 1, 1 }, .{ @intCast((metadata.len + 1023) / 1024), 1, 1 });
+        try std.testing.expectEqual(fills_before, renderer.emulated_buffer_clear_dispatches);
+        try renderer.flushPendingGuestWrites();
+        try target.layout.detile(guest.bytes[0x10000..], linear);
+        try std.testing.expect(std.mem.allEqual(u8, linear, 0));
+    }
+    std.debug.print("layered volume passed: 32 distinct layers, ancillary input, full raster coverage and 3D guest swizzle\n", .{});
 }
 
-fn runResetDepthExtentCase(allocator: std.mem.Allocator, fragment_depth: bool) !void {
+fn runResetDepthExtentProbe(allocator: std.mem.Allocator) !void {
+    try runResetDepthExtentCase(allocator, false, false);
+    try runResetDepthExtentCase(allocator, true, false);
+    try runResetDepthExtentCase(allocator, false, true);
+    std.debug.print("Reset depth-only extents passed: viewport/scissor recovery, raster/MRTZ depth, absent PS with stale color, changing scalars and depth samples across the attachment\n", .{});
+}
+
+fn runResetDepthExtentCase(allocator: std.mem.Allocator, fragment_depth: bool, no_fragment: bool) !void {
     for ([_]bool{ true, false }) |with_viewport| {
         var renderer = try vulkan.Renderer.init(allocator, .{});
         defer renderer.deinit();
@@ -3962,6 +4064,17 @@ fn runResetDepthExtentCase(allocator: std.mem.Allocator, fragment_depth: bool) !
             .{ 0x095, 32 | (32 << 16) },
         };
         for (context) |entry| try state.writeRegister(.context, entry[0], entry[1]);
+        if (no_fragment) {
+            try state.writeRegister(.shader, gpu.resources.ShaderStage.pixel.programRegisterBase(), 0);
+            // A larger attachment and a live target mask retained from a prior
+            // pass must not change the extent or receive this depth draw.
+            const stale_color = [_][2]u32{
+                .{ 0x202, 0 },       .{ 0x08e, 0xf },             .{ 0x318, 0xa0 },    .{ 0x319, 7 },
+                .{ 0x31c, 10 << 2 }, .{ 0x3b0, (63 << 14) | 63 }, .{ 0x3b8, 1 << 24 },
+            };
+            for (stale_color) |entry| try state.writeRegister(.context, entry[0], entry[1]);
+            @memset(guest.bytes[0xa000..0xe000], 0xa5);
+        }
         if (fragment_depth) try state.writeRegister(.context, 0x200, 6 | (7 << 4)); // ALWAYS permits rising and falling depth.
         if (with_viewport) {
             for ([_]f32{ 16, 16, -16, 16, 1, 0 }, 0..) |value, i|
@@ -3987,12 +4100,32 @@ fn runResetDepthExtentCase(allocator: std.mem.Allocator, fragment_depth: bool) !
         for (userdata, 0..) |word, i| try state.writeRegister(.shader, 0x240 + @as(u32, @intCast(i)), word);
         const depths: []const f32 = if (fragment_depth) &.{ 0.75, 0.25, 0.5, 0, 0.75 } else &.{ 0.5, 0.25 };
         for (depths) |z| {
+            const query_address = 0x9000;
+            if (no_fragment) {
+                @memset(guest.bytes[query_address .. query_address + 256], 0);
+                _ = try executor.execute(&.{ command(gpu.pm4.event_write, 3), 0x139, query_address, 0 });
+                for (0..16) |db| {
+                    const pair = guest.bytes[query_address + db * 16 ..][0..16];
+                    try std.testing.expect(std.mem.readInt(u64, pair[0..8], .little) >> 63 == 1);
+                    try std.testing.expectEqual(@as(u64, 0), std.mem.readInt(u64, pair[8..16], .little));
+                }
+            }
             // MRTZ must replace the triangle's fixed zero depth. Cached
             // pipelines must see current scalar data, including authored zero.
             try state.writeRegister(.shader, gpu.resources.ShaderStage.vertex.userDataBase(), @bitCast(if (fragment_depth) @as(f32, 0) else z));
             try state.writeRegister(.shader, gpu.resources.ShaderStage.pixel.userDataBase(), @bitCast(z));
             _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 0 });
             if (renderer.last_draw_error) |err| return err;
+            if (no_fragment) {
+                _ = try executor.execute(&.{ command(gpu.pm4.event_write, 3), 0x139, query_address + 8, 0 });
+                for (0..16) |db| {
+                    const pair = guest.bytes[query_address + db * 16 ..][0..16];
+                    const begin = std.mem.readInt(u64, pair[0..8], .little);
+                    const end = std.mem.readInt(u64, pair[8..16], .little);
+                    try std.testing.expect(end >> 63 == 1);
+                    try std.testing.expectEqual(@as(u64, 1), end - begin);
+                }
+            }
             try std.testing.expectEqual(@as(usize, 1), renderer.depth_targets.items.len);
             try std.testing.expectEqual(@as(u32, 32), renderer.depth_targets.items[0].target.width);
             try std.testing.expectEqual(@as(u32, 32), renderer.depth_targets.items[0].target.height);
@@ -4000,6 +4133,10 @@ fn runResetDepthExtentCase(allocator: std.mem.Allocator, fragment_depth: bool) !
             var bytes: [points.len * 4]u8 = undefined;
             try renderer.readbackGuestStorageBuffer(0x8000, &bytes);
             for (points, 0..) |_, i| try std.testing.expectEqual(@as(u32, @bitCast(if (fragment_depth) z else z / 2)), std.mem.readInt(u32, bytes[i * 4 ..][0..4], .little));
+            if (no_fragment) {
+                try renderer.flushPendingGuestWrites();
+                try std.testing.expect(std.mem.allEqual(u8, guest.bytes[0xa000..0xe000], 0xa5));
+            }
         }
     }
 }
@@ -5908,6 +6045,37 @@ fn runPackedChannelOrderProbe(allocator: std.mem.Allocator) !void {
         }
     }
     std.debug.print("Packed channel order passed: animation and tree SNORM, signed endpoints, UNORM and both mini-float layouts\n", .{});
+}
+
+fn runConstantBufferFetchProbe(allocator: std.mem.Allocator) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{});
+    defer renderer.deinit();
+    var guest = SizedGuestMemory(256 * 1024){};
+    _ = renderer.dcbBackend(guest.interface());
+    guest.word(0x10000, 0x8123_2979);
+    guest.word(0x10004, 0x7654_3210);
+    const compute = gpu.resources.ShaderStage.compute;
+    var state = gpu.State{};
+    try state.writeRegister(.shader, 0x213, 8 << 1);
+    const code = [_]u32{
+        0xe000_2000, 0x8000_0100, // format_x, v0 index (stride zero), v1 result
+        0xe070_2000, 0x8001_0100, // output[v0] = v1
+        0xbf81_0000,
+    };
+    for (code, 0..) |word, index| guest.word(0x100 + index * 4, word);
+    try state.writeRegister(.shader, compute.programRegisterBase(), 1);
+    try state.writeRegister(.shader, compute.programRegisterBase() + 1, 0);
+    for ([_]u32{ 0, 2, 3 }, 0..) |bounds, case_index| {
+        const destination: u32 = 0x11000 + @as(u32, @intCast(case_index)) * 0x1000;
+        for ([_]u32{ 0x10000, 0, 1, (bounds << 28) | (20 << 12) | 4, destination, 4 << 16, 64, 0 }, 0..) |word, index|
+            try state.writeRegister(.shader, compute.userDataBase() + @as(u32, @intCast(index)), word);
+        _ = try renderer.dispatchRdna2State(&state, .{ 64, 1, 1 }, .{ 1, 1, 1 });
+        var output: [256]u8 = undefined;
+        try renderer.readbackGuestStorageBuffer(destination, &output);
+        for (0..64) |lane|
+            try std.testing.expectEqual(@as(u32, if (bounds == 2) 0x8123_2979 else 0), std.mem.readInt(u32, output[lane * 4 ..][0..4], .little));
+    }
+    std.debug.print("constant buffer fetch: disabled bounds preserve all 32 primitive-ID bits\n", .{});
 }
 
 fn runPackedBufferProbe(allocator: std.mem.Allocator) !void {
@@ -10037,6 +10205,21 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--depth-storage")) {
         try runDepthStorageProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--constant-buffer-fetch")) {
+        try runConstantBufferFetchProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--inferred-depth-resize")) {
+        var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true });
+        defer renderer.deinit();
+        try renderer.probeInferredDepthResize();
+        std.debug.print("inferred depth resize passed: depth/stencil preserved through viewport/allocation extent changes\n", .{});
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--layered-volume")) {
+        try runLayeredVolumeProbe(allocator);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--reset-depth-extent")) {

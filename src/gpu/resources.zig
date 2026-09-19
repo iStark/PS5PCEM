@@ -448,15 +448,13 @@ pub const ColorControl = struct {
         };
     }
 
-    /// Colour attachment writes are legal in NORMAL mode, and also when
-    /// MODE=DISABLE still names a non-zero TARGET_MASK. Quake II's deferred
-    /// frames leave MODE stuck at DISABLE after a context roll while the
-    /// G-buffer and scanout keep a live mask; Yotei's metadata G-buffer
-    /// prep uses DISABLE with TARGET_MASK=0 and must not export zeros.
+    /// CB_DISABLE suppresses color exports even when TARGET_MASK retains the
+    /// preceding draw's channels. Depth/metadata utility draws often keep both
+    /// those channels and the preceding pixel program bound.
     pub fn allowsAttachmentWrites(self: ColorControl, target_mask: u32, stencil_enabled: bool) bool {
         if (target_mask == 0 and stencil_enabled) return false;
         if (self.mode == 1) return true;
-        return self.mode == 0 and target_mask != 0;
+        return false;
     }
 };
 
@@ -853,11 +851,11 @@ test "missing color control uses AGC normal mode but explicit disable is preserv
     }
 }
 
-test "DISABLE with a live target mask still writes colour" {
+test "DISABLE suppresses colour even with a live target mask" {
     const disable = ColorControl{ .mode = 0, .logic_operation = 0xcc };
     const normal = ColorControl{ .mode = 1, .logic_operation = 0xcc };
     try testing.expect(normal.allowsAttachmentWrites(0xf, false));
-    try testing.expect(disable.allowsAttachmentWrites(0xf, false));
+    try testing.expect(!disable.allowsAttachmentWrites(0xf, false));
     try testing.expect(!disable.allowsAttachmentWrites(0, false));
     try testing.expect(!normal.allowsAttachmentWrites(0, true));
 }

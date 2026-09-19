@@ -263,6 +263,16 @@ pub const FragmentInputs = struct {
     /// floating point +1/-1 for the front/back face input.
     front_face_all_bits: bool = false,
 
+    pub fn ancillaryRegister(self: FragmentInputs) ?u8 {
+        if (self.allocated & self.enabled & (1 << 13) == 0) return null;
+        var next: u8 = 0;
+        for (0..13) |input| {
+            if (self.allocated & (@as(u16, 1) << @intCast(input)) == 0) continue;
+            next += if (input == 3) @as(u8, 3) else if (input < 7) 2 else 1;
+        }
+        return next;
+    }
+
     pub fn frontFaceRegister(self: FragmentInputs) ?u8 {
         if (self.allocated & self.enabled & (1 << 12) == 0) return null;
         var next: u8 = 0;
@@ -313,6 +323,7 @@ pub const Options = struct {
     /// interface is unavailable. The backend supplies the active color target.
     fragment_extent: [2]u32 = .{ 1280, 720 },
     fragment_inputs: FragmentInputs = .{},
+    layered_rendering: bool = false,
     /// Optional host feature for raw per-vertex attributes and manual VINTRP.
     allow_fragment_barycentric: bool = false,
     fragment_custom_interpolation_mask: u32 = 0,
@@ -860,6 +871,7 @@ const Builder = struct {
     vertex_index_input: u32 = 0,
     instance_index_input: u32 = 0,
     position_output: u32 = 0,
+    layer_variable: u32 = 0,
     fragment_depth_output: u32 = 0,
     color_outputs: [8]u32 = @splat(0),
     color_export_mappings: [8]u8,
@@ -1133,6 +1145,17 @@ const Builder = struct {
                 host_count = std.math.mul(u64, host_count, host) catch return Error.InvalidStageInterface;
             }
             if (guest_count != host_count or guest_count > std.math.maxInt(u32)) return Error.InvalidStageInterface;
+        }
+        if (options.layered_rendering and (options.stage == .vertex or
+            (options.stage == .fragment and options.fragment_inputs.ancillaryRegister() != null)))
+        {
+            const pointer = self.id();
+            self.layer_variable = self.id();
+            const storage: u32 = if (options.stage == .vertex) 3 else 1;
+            try self.emit(&self.annotations, 71, &.{ self.layer_variable, 11, 9 }); // BuiltIn Layer
+            if (options.stage == .fragment) try self.emit(&self.annotations, 71, &.{ self.layer_variable, 14 }); // Flat
+            try self.emit(&self.declarations, 32, &.{ pointer, storage, self.signed_type });
+            try self.emit(&self.declarations, 59, &.{ pointer, self.layer_variable, storage });
         }
         switch (options.stage) {
             .vertex => {
@@ -4591,6 +4614,20 @@ const Builder = struct {
                     next += count;
                 }
             }
+            if (self.fragment_inputs.ancillaryRegister()) |vgpr| {
+                // SPI ancillary contains RT array index in bits 16..26.
+                var value = try self.constant(.bits32, 0);
+                if (self.layer_variable != 0) {
+                    const layer = self.id();
+                    try self.emit(&self.body, 61, &.{ self.signed_type, layer, self.layer_variable });
+                    const bits = try self.convert(.{ .id = layer, .value_type = .sint32 }, .bits32);
+                    const masked = self.id();
+                    try self.emit(&self.body, 199, &.{ self.bits_type, masked, bits, try self.constant(.bits32, 0x7ff) });
+                    value = self.id();
+                    try self.emit(&self.body, 196, &.{ self.bits_type, value, masked, try self.constant(.bits32, 16) });
+                }
+                self.registers[128 + @as(usize, vgpr)] = .{ .id = value, .value_type = .bits32 };
+            }
             const positions = self.fragment_inputs.positionRegisters();
             if (self.fragment_inputs.frontFaceRegister()) |vgpr| {
                 const facing = self.id();
@@ -4652,6 +4689,7 @@ const Builder = struct {
                 zero_float,
             }); // OpCompositeConstruct
             try self.emit(&self.body, 62, &.{ self.position_output, zero_vector });
+            if (self.layer_variable != 0) try self.emit(&self.body, 62, &.{ self.layer_variable, try self.constant(.sint32, 0) });
             for (self.parameter_variables) |variable| {
                 if (variable != 0) try self.emit(&self.body, 62, &.{ variable, zero_vector });
             }
@@ -5384,6 +5422,18 @@ const Builder = struct {
                 depth = selected;
             }
             try self.emit(&self.body, 62, &.{ self.fragment_depth_output, depth });
+            return;
+        }
+        if (self.stage == .vertex and self.layer_variable != 0 and inst.export_target == 0x0d and inst.export_enable & 4 != 0) {
+            var layer = try self.source(inst.src2, .sint32);
+            if (try self.laneEnabled()) |enabled| {
+                const previous = self.id();
+                const selected = self.id();
+                try self.emit(&self.body, 61, &.{ self.signed_type, previous, self.layer_variable });
+                try self.emit(&self.body, 169, &.{ self.signed_type, selected, enabled, layer, previous });
+                layer = selected;
+            }
+            try self.emit(&self.body, 62, &.{ self.layer_variable, layer });
             return;
         }
         if (self.vector4_type == 0) return Error.UnsupportedOpcode;
@@ -9919,7 +9969,11 @@ const Builder = struct {
             // Branches are handled by structured CF or skipped in the linear fallback.
             .s_branch, .s_cbranch_scc0, .s_cbranch_scc1, .s_cbranch_vccz, .s_cbranch_vccnz, .s_cbranch_execz, .s_cbranch_execnz => {},
             .s_setpc_b64 => try self.exportNggLdsRecord(),
-            .s_mov_b32, .s_movk_i32, .v_mov_b32 => try self.unary(inst, 83, .bits32), // OpCopyObject
+            .s_mov_b32, .s_movk_i32 => try self.unary(inst, 83, .bits32), // OpCopyObject
+            // V_MOV's ABS/NEG modifiers operate on the floating-point sign
+            // bit, including the SDWA form used to flip clip-space Y. Integer
+            // negation of the payload turns 1.0 into -4.0 and -3.0 into 1.5.
+            .v_mov_b32 => try self.unary(inst, 83, if (inst.src0.absolute or inst.src0.negate or inst.dst.omod != 0 or inst.dst.clamp) .float32 else .bits32),
             .v_readfirstlane_b32 => try self.readFirstLane(inst),
             .v_readlane_b32 => try self.readLane(inst),
             .v_writelane_b32 => try self.writeLane(inst),
@@ -11486,6 +11540,9 @@ fn assemble(allocator: std.mem.Allocator, builder: *Builder, options: Options) E
         0,
     });
     try appendInstruction(allocator, &words, 17, &.{1}); // OpCapability Shader
+    if (builder.layer_variable != 0) {
+        try appendInstruction(allocator, &words, 17, &.{if (options.stage == .vertex) @as(u32, 5254) else 2});
+    }
     if (options.tessellation_inputs != null) try appendInstruction(allocator, &words, 17, &.{3}); // Tessellation
     if (builder.uses_nonuniform_sampled_images or builder.uses_nonuniform_storage_buffers) {
         try appendInstruction(allocator, &words, 17, &.{5301}); // ShaderNonUniform
@@ -11526,6 +11583,12 @@ fn assemble(allocator: std.mem.Allocator, builder: *Builder, options: Options) E
         if (!storageImageNeedsExtendedFormats(binding.format)) continue;
         try appendInstruction(allocator, &words, 17, &.{49}); // OpCapability StorageImageExtendedFormats
         break;
+    }
+    if (builder.layer_variable != 0 and options.stage == .vertex) {
+        const name = "SPV_EXT_shader_viewport_index_layer\x00";
+        var encoded: [name.len / 4]u32 = undefined;
+        for (&encoded, 0..) |*word, index| word.* = std.mem.readInt(u32, name[index * 4 ..][0..4], .little);
+        try appendInstruction(allocator, &words, 10, &encoded);
     }
     if (builder.fragment_per_vertex_mask != 0) {
         const name = "SPV_KHR_fragment_shader_barycentric\x00\x00";
@@ -11590,6 +11653,7 @@ fn assemble(allocator: std.mem.Allocator, builder: *Builder, options: Options) E
     if (builder.patch_id_input != 0) try entry_point.append(allocator, builder.patch_id_input);
     if (builder.frag_coord_input != 0) try entry_point.append(allocator, builder.frag_coord_input);
     if (builder.front_face_input != 0) try entry_point.append(allocator, builder.front_face_input);
+    if (builder.layer_variable != 0) try entry_point.append(allocator, builder.layer_variable);
     for (builder.barycentric_inputs) |variable| if (variable != 0) {
         try entry_point.append(allocator, variable);
     };

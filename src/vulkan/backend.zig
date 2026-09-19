@@ -42,6 +42,7 @@ pub export var yotei_visibility_gpu: bool = false;
 // Compare exact depth-filtered, packed-coordinate lists with the legacy fallback.
 pub export var yotei_gds_culling_gpu: bool = false;
 pub export var capture_graphics_target: u64 = 0;
+// Temporary live diagnosis: scoped depth/stencil, culling and fragment overrides.
 // Zero preserves synchronous retirement for baseline comparisons.
 pub export var sampled_retirement_slack_bytes: u64 = 0;
 // Opt-in until native comparisons establish visual correctness and benefit.
@@ -1561,11 +1562,15 @@ fn colorTargetFormat(descriptor: gpu.resources.ColorTarget) ?ColorTargetFormat {
             1 => .{ .vulkan = vk.format_r8g8b8a8_snorm, .bytes_per_texel = 4 },
             else => .{ .vulkan = vk.format_r8g8b8a8_unorm, .bytes_per_texel = 4 },
         },
-        // DATA_FORMAT_16_16_16_16 + NUMBER_FORMAT_FLOAT.
-        12 => if (descriptor.number_type == 7)
-            .{ .vulkan = vk.format_r16g16b16a16_sfloat, .bytes_per_texel = 8 }
-        else
-            null,
+        // DATA_FORMAT_16_16_16_16.
+        12 => switch (descriptor.number_type) {
+            0 => .{ .vulkan = vk.format_r16g16b16a16_unorm, .bytes_per_texel = 8 },
+            1 => .{ .vulkan = vk.format_r16g16b16a16_snorm, .bytes_per_texel = 8 },
+            4 => .{ .vulkan = vk.format_r16g16b16a16_uint, .bytes_per_texel = 8 },
+            5 => .{ .vulkan = vk.format_r16g16b16a16_sint, .bytes_per_texel = 8 },
+            7 => .{ .vulkan = vk.format_r16g16b16a16_sfloat, .bytes_per_texel = 8 },
+            else => null,
+        },
         // DATA_FORMAT_32_32_32_32 + NUMBER_FORMAT_FLOAT. Unity uses this for
         // tiny exposure/luminance render targets that feed the final tonemap.
         14 => if (descriptor.number_type == 7)
@@ -1717,13 +1722,34 @@ fn recoverResetDepthExtent(
     if (!bound.htile_enabled or bound.htile_address == 0) {
         if (!render_state.depth_control.test_enabled or !render_state.depth_control.write_enabled or
             bound.write_address == 0 or bound.depth_read_only) return false;
-        for (render_state.color_targets) |candidate| {
-            if (candidate) |color| if (color.isActive()) return false;
+        if (render_state.color_control.allowsAttachmentWrites(render_state.target_mask, render_state.depth_control.stencil_enabled)) {
+            for (render_state.color_targets) |candidate| {
+                if (candidate) |color| if (color.isActive()) return false;
+            }
         }
     }
+    var max_color_width: u32 = 0;
+    var max_color_height: u32 = 0;
+    for (render_state.color_targets) |candidate| {
+        if (candidate) |color| {
+            if (render_state.color_control.allowsAttachmentWrites(render_state.target_mask, render_state.depth_control.stencil_enabled) and
+                color.isActive() and color.width > 1 and color.height > 1)
+            {
+                if (color.width > max_color_width) max_color_width = color.width;
+                if (color.height > max_color_height) max_color_height = color.height;
+            }
+        }
+    }
+    if (max_color_width > 1 and max_color_height > 1 and
+        max_color_width <= 16384 and max_color_height <= 16384)
+    {
+        bound.width = max_color_width;
+        bound.height = max_color_height;
+        return true;
+    }
     if (render_state.viewport) |viewport| {
-        const viewport_width = @abs(viewport.x_scale * 2.0);
-        const viewport_height = @abs(viewport.y_scale * 2.0);
+        const viewport_width = @max(@abs(viewport.x_scale * 2.0), viewport.x_offset + @abs(viewport.x_scale));
+        const viewport_height = @max(@abs(viewport.y_scale * 2.0), viewport.y_offset + @abs(viewport.y_scale));
         if (std.math.isFinite(viewport_width) and std.math.isFinite(viewport_height) and
             viewport_width > 1 and viewport_height > 1 and
             viewport_width <= 16384 and viewport_height <= 16384)
@@ -1734,8 +1760,8 @@ fn recoverResetDepthExtent(
         }
     }
     if (render_state.scissor) |scissor| {
-        const scissor_width = @as(u32, scissor.right) -| @as(u32, scissor.left);
-        const scissor_height = @as(u32, scissor.bottom) -| @as(u32, scissor.top);
+        const scissor_width = @as(u32, scissor.right);
+        const scissor_height = @as(u32, scissor.bottom);
         if (scissor_width > 1 and scissor_height > 1 and
             scissor_width <= 16384 and scissor_height <= 16384)
         {
@@ -1833,7 +1859,7 @@ fn guestColorTarget(descriptor_: gpu.resources.ColorTarget) anyerror!GuestColorT
     layout_descriptor.samples_log2 = 0;
     layout_descriptor.fragments_log2 = 0;
     const layout = try gpu.SurfaceLayout.fromColorTarget(layout_descriptor);
-    if (layout.layers != 1 or layout.block.bytes_per_element != format.bytes_per_texel) {
+    if ((layout.layers != 1 and layout.volume == null) or layout.block.bytes_per_element != format.bytes_per_texel) {
         return Error.UnsupportedColorTarget;
     }
     return .{ .descriptor = descriptor, .layout = layout, .format = format };
@@ -1923,6 +1949,8 @@ const GuestDepthTarget = struct {
     has_stencil: bool = false,
     clear_depth: f32,
     clear_stencil: u8 = 0,
+    /// Dimensions recovered from reset DB size registers, not an explicit allocation change.
+    inferred_extent: bool = false,
 
     fn sameAllocation(self: GuestDepthTarget, other: GuestDepthTarget) bool {
         return self.address == other.address and
@@ -3245,6 +3273,34 @@ fn vertexFetchScalarOffset(operand: gpu.ShaderOperand, registers: *const gpu.sca
     };
 }
 
+fn constantBufferFetchExtent(descriptor: gpu.BufferDescriptor, inst: gpu.ShaderInstruction, registers: *const gpu.scalar_provenance.ScalarRegisters) u64 {
+    // OOB_SELECT=2 only tests whether NUM_RECORDS is zero. A zero-stride
+    // constant attribute can therefore hold one R32_UINT even when its
+    // nominal byte count is one. Stage the statically addressed element;
+    // otherwise the host range check silently replaces the primitive ID.
+    if (descriptor.out_of_bounds_select != 2 or descriptor.record_count == 0 or
+        descriptor.stride != 0 or inst.offset_enable or inst.memory_offset < 0)
+        return descriptor.size_bytes;
+    const formatted = switch (inst.opcode) {
+        .buffer_load_format_x,
+        .buffer_load_format_xy,
+        .buffer_load_format_xyz,
+        .buffer_load_format_xyzw,
+        .buffer_load_format_d16_x,
+        .buffer_load_format_d16_xy,
+        .buffer_load_format_d16_xyz,
+        .buffer_load_format_d16_xyzw,
+        => true,
+        else => false,
+    };
+    if (!formatted) return descriptor.size_bytes;
+    const element = gpu.elementLayoutForUnifiedFormat(descriptor.unified_format) orelse return descriptor.size_bytes;
+    const scalar_offset = vertexFetchScalarOffset(inst.src2, registers) orelse return descriptor.size_bytes;
+    const end = @as(u64, scalar_offset) + @as(u64, @intCast(inst.memory_offset)) + element.bytes;
+    if (end > maximum_staged_buffer_bytes) return descriptor.size_bytes;
+    return @max(descriptor.size_bytes, end);
+}
+
 fn matchVertexAttribute(
     table: *const gpu.VertexBindings,
     used: *[maximum_vertex_attributes]bool,
@@ -3476,6 +3532,8 @@ fn colorTargetAliasSignature(target: GuestColorTarget) image_alias.Signature {
         .format = target.format.vulkan,
         .width = target.descriptor.width,
         .height = target.descriptor.height,
+        .depth = if (target.layout.volume != null) target.layout.layers else 1,
+        .layers = if (target.layout.volume != null) 1 else @intCast(target.layout.layers),
         .tile_mode = @intFromEnum(target.descriptor.tile_mode),
         .samples_log2 = target.descriptor.fragments_log2,
     };
@@ -3613,6 +3671,7 @@ pub const Renderer = struct {
     storage_fingerprint_min_bytes: usize = 64,
     loader_api_version: u32,
     device_info: DeviceInfo,
+    shader_layer_available: bool = false,
     geometry_shaders_available: bool,
     tessellation_shaders_available: bool,
     cube_arrays_available: bool,
@@ -3795,6 +3854,7 @@ pub const Renderer = struct {
     write_data_callbacks: u64 = 0,
     dma_data_callbacks: u64 = 0,
     event_callbacks: u64 = 0,
+    occlusion_dump_counter: u63 = 0,
     flip_callbacks: u64 = 0,
     /// Host presents issued immediately after a guest color writeback, so a
     /// frame is visible even if the title crashes before SetFlip.
@@ -4129,6 +4189,7 @@ pub const Renderer = struct {
             candidate.physical_device,
             "VK_EXT_shader_atomic_float2",
         );
+        const shader_layer = physicalDeviceSupportsExtension(allocator, &instance_functions, candidate.physical_device, "VK_EXT_shader_viewport_index_layer");
         const barycentric_extension = physicalDeviceSupportsExtension(allocator, &instance_functions, candidate.physical_device, "VK_KHR_fragment_shader_barycentric");
         var barycentric_support = vk.PhysicalDeviceFragmentShaderBarycentricFeaturesKHR{};
         var shader_atomic_float2_support = vk.PhysicalDeviceShaderAtomicFloat2FeaturesEXT{
@@ -4231,8 +4292,12 @@ pub const Renderer = struct {
             var properties = external_host.Properties2{ .p_next = &host_properties };
             get_properties(candidate.physical_device, &properties);
         }
-        var device_extension_names: [5][*:0]const u8 = undefined;
+        var device_extension_names: [6][*:0]const u8 = undefined;
         var device_extension_count: u32 = 0;
+        if (shader_layer) {
+            device_extension_names[device_extension_count] = "VK_EXT_shader_viewport_index_layer";
+            device_extension_count += 1;
+        }
         if (host_import) {
             device_extension_names[device_extension_count] = "VK_EXT_external_memory_host";
             device_extension_count += 1;
@@ -4507,6 +4572,7 @@ pub const Renderer = struct {
             .loader_api_version = loader_api_version,
             .device_info = candidate.info,
             .geometry_shaders_available = geometry_shaders,
+            .shader_layer_available = shader_layer,
             .tessellation_shaders_available = tessellation_shaders,
             .cube_arrays_available = cube_arrays,
             .shader_float64_available = shader_float64,
@@ -6132,6 +6198,13 @@ pub const Renderer = struct {
     /// stages every declared buffer table entry into the fixed Vulkan array,
     /// maps each executable MUBUF V# to its array element, then writes modified
     /// storage ranges back to guest memory after the synchronous submission.
+    fn readEmptyFragmentProgram(_: ?*anyopaque, address: u64, bytes: []u8) bool {
+        const end_program = [_]u8{ 0, 0, 0x81, 0xbf }; // s_endpgm
+        if (address > end_program.len or bytes.len > end_program.len - address) return false;
+        @memcpy(bytes, end_program[@intCast(address)..][0..bytes.len]);
+        return true;
+    }
+
     fn readShaderMemory(context: ?*anyopaque, address: u64, bytes: []u8) bool {
         const self: *Renderer = @ptrCast(@alignCast(context.?));
         const memory = self.guest_memory orelse return false;
@@ -9567,7 +9640,8 @@ pub const Renderer = struct {
                 );
                 continue;
             }
-            const size = std.math.cast(usize, descriptor.size_bytes) orelse {
+            const staged_extent = constantBufferFetchExtent(descriptor, inst, &instruction_scalar.registers);
+            const size = std.math.cast(usize, staged_extent) orelse {
                 self.traceSkippedStorage(bindings, inst, "descriptor size", descriptor);
                 if (log_verbose_gpu) std.debug.print(
                     "[vulkan dcb] GuestBufferTooLarge: V# s{d} size_bytes=0x{x}; soft-skip\n",
@@ -9653,7 +9727,7 @@ pub const Renderer = struct {
                 // The descriptor already says how far the buffer goes, so the
                 // shader can be held to it instead of being trusted to stay
                 // inside on its own.
-                .extent_bytes = std.math.cast(u32, descriptor.size_bytes),
+                .extent_bytes = std.math.cast(u32, staged_extent),
             };
             result.mapping_count += 1;
             if (is_store) result.writable[descriptor_index] = true;
@@ -10124,6 +10198,7 @@ pub const Renderer = struct {
                 self.markGuestBufferWritten(entry);
                 break slot;
             } else return Error.GuestBufferNotStaged;
+            try self.flushComputedMetadata(buffer_index);
             if (self.defer_small_storage_writes_enabled or
                 resources.sizes[index] >= deferred_storage_write_min_bytes)
             {
@@ -10131,6 +10206,39 @@ pub const Renderer = struct {
             }
             try self.flushGuestStorageBuffer(buffer_index);
         }
+    }
+
+    /// Metadata is an input to the attachment caches even when no shader reads
+    /// it as a buffer. Publish compute-written clears at the producer boundary.
+    fn flushComputedMetadata(self: *Renderer, buffer_index: usize) anyerror!void {
+        const entry = self.guest_buffers.items[buffer_index];
+        var needed: usize = 0;
+        for (self.depth_targets.items) |cached| {
+            const size = uniformHtileBytes(cached.target) orelse continue;
+            const address = cached.target.descriptor.htile_address;
+            // As in flushGuestStorageRange, an oversized V# spanning unrelated
+            // allocations does not prove that the kernel wrote their metadata.
+            if (address != entry.guest_address or size > entry.size) continue;
+            needed = @max(needed, size);
+        }
+        for (self.render_targets.items) |cached| {
+            const target = cached.target;
+            if (!target.descriptor.dcc_enabled or target.descriptor.dcc_address == 0) continue;
+            const address = target.descriptor.dcc_address;
+            if (address != entry.guest_address) continue;
+            const size = std.math.divCeil(u64, target.layout.required_source_bytes, dcc_block_bytes) catch continue;
+            if (size > entry.size) continue;
+            needed = @max(needed, std.math.cast(usize, size) orelse continue);
+        }
+        if (needed == 0) return;
+        try self.flushGuestStoragePrefix(buffer_index, needed);
+        const memory = self.guest_memory orelse return Error.GuestMemoryUnavailable;
+        const bytes = try self.allocator.alloc(u8, needed);
+        defer self.allocator.free(bytes);
+        if (!memory.read(memory.context, entry.guest_address, bytes)) return Error.GuestMemoryReadFailed;
+        self.prepareHtileWrite(entry.guest_address, needed);
+        try self.applyUniformHtileWrite(entry.guest_address, bytes);
+        try self.applyUniformDccWrite(entry.guest_address, bytes);
     }
 
     fn advanceGuestBufferContents(self: *Renderer, entry: *GuestBufferEntry) void {
@@ -10710,6 +10818,7 @@ pub const Renderer = struct {
         samples: u32,
         width: u32,
         height: u32,
+        layers: u32,
     ) anyerror!ColorPass {
         self.color_pass_sequence +%= 1;
         for (self.color_passes.items) |*existing| {
@@ -10744,6 +10853,7 @@ pub const Renderer = struct {
             .attachments = &views,
             .width = width,
             .height = height,
+            .layers = layers,
         };
         var framebuffer: vk.Framebuffer = 0;
         if (self.device_functions.create_framebuffer(self.device, &framebuffer_info, null, &framebuffer) != vk.success) {
@@ -10785,12 +10895,8 @@ pub const Renderer = struct {
             if (slot >= gpu.resources.color_target_count) continue;
             highest = @max(highest, slot);
             result.color_attachment_formats[slot] = color.format.vulkan;
-            // NORMAL always writes. DISABLE with a live TARGET_MASK is the
-            // Quake II deferred/scanout case (MODE stuck after a context
-            // roll). DISABLE with TARGET_MASK=0 is Yotei metadata and must
-            // not export zeros. A zero mask during stencil draws is a Unity
-            // UI mask push/pop even when G-buffer recovery enabled the
-            // descriptor mask.
+            // A retained target mask does not enable exports in CB_DISABLE.
+            // Stencil-only draws also keep their color attachment untouched.
             result.color_write_masks[slot] = if (render.color_control.allowsAttachmentWrites(
                 render.target_mask,
                 render.depth_control.stencil_enabled,
@@ -10804,10 +10910,7 @@ pub const Renderer = struct {
             const blend = render.blends[slot];
             // Integer attachments reject colour blending; Yotei's ID plane is
             // R32_UINT and the G-buffer pass that fills it has blend off already.
-            const integer_color = color.format.vulkan == vk.format_r32_uint or
-                color.format.vulkan == vk.format_r32_sint or
-                color.format.vulkan == vk.format_r16_uint or
-                color.format.vulkan == vk.format_r8g8_uint;
+            const integer_color = colorTargetExportType(color.descriptor) != .float32;
             result.blend_enables[slot] = @intFromBool(blend.enabled and !integer_color);
             if (!blend.enabled) continue;
             result.source_color_blend_factors[slot] = try vulkanBlendFactor(blend.color_source);
@@ -11419,6 +11522,8 @@ pub const Renderer = struct {
         return a.descriptor.address == b.descriptor.address and
             a.descriptor.width == b.descriptor.width and
             a.descriptor.height == b.descriptor.height and
+            a.descriptor.depth == b.descriptor.depth and
+            a.descriptor.resource_type == b.descriptor.resource_type and
             same_pitch and
             a.descriptor.format == b.descriptor.format and
             a.descriptor.tile_mode == b.descriptor.tile_mode and
@@ -11596,7 +11701,7 @@ pub const Renderer = struct {
         reader: gpu.ShaderMemoryReader,
         frame: []u8,
     ) anyerror!void {
-        if (target.layout.block.tile_mode.isLinear()) {
+        if (target.layout.volume == null and target.layout.block.tile_mode.isLinear()) {
             try target.layout.stage(reader, target.descriptor.address, frame);
             return;
         }
@@ -11978,6 +12083,7 @@ pub const Renderer = struct {
     }
 
     fn createCachedRenderTarget(self: *Renderer, target: GuestColorTarget) anyerror!CachedRenderTarget {
+        if (target.layout.layers > 1 and !self.shader_layer_available) return Error.UnsupportedColorTarget;
         const frame_bytes = try colorTargetFrameBytes(target);
         const samples = rasterSampleCount(target.descriptor.fragments_log2) orelse
             return Error.UnsupportedColorTarget;
@@ -11985,7 +12091,7 @@ pub const Renderer = struct {
             target.descriptor.width,
             target.descriptor.height,
             1,
-            1,
+            target.layout.layers,
             vk.image_type_2d,
             vk.image_create_mutable_format_bit,
             target.format.vulkan,
@@ -11998,13 +12104,14 @@ pub const Renderer = struct {
             1,
         );
         errdefer self.destroyImage(image);
-        try self.registerTrackedImage(image.handle, vk.image_aspect_color_bit, 1, 1);
+        try self.registerTrackedImage(image.handle, vk.image_aspect_color_bit, 1, target.layout.layers);
         errdefer self.image_states.forgetImage(image.handle);
 
         const view_info = vk.ImageViewCreateInfo{
             .image = image.handle,
+            .view_type = if (target.layout.layers > 1) vk.image_view_type_2d_array else vk.image_view_type_2d,
             .format = target.format.vulkan,
-            .subresource_range = .{ .aspect_mask = vk.image_aspect_color_bit },
+            .subresource_range = .{ .aspect_mask = vk.image_aspect_color_bit, .layer_count = target.layout.layers },
         };
         var view: vk.ImageView = 0;
         if (self.device_functions.create_image_view(self.device, &view_info, null, &view) != vk.success) {
@@ -12020,6 +12127,7 @@ pub const Renderer = struct {
             .attachments = @ptrCast(&view),
             .width = target.descriptor.width,
             .height = target.descriptor.height,
+            .layers = target.layout.layers,
         };
         var framebuffer: vk.Framebuffer = 0;
         if (self.device_functions.create_framebuffer(self.device, &framebuffer_info, null, &framebuffer) != vk.success) {
@@ -12092,7 +12200,7 @@ pub const Renderer = struct {
         try self.transitionTrackedImage(
             command_buffer,
             snapshot.image.handle,
-            .{ .aspect_mask = vk.image_aspect_color_bit },
+            .{ .aspect_mask = vk.image_aspect_color_bit, .layer_count = snapshot.target.layout.layers },
             image_state.shader_read_usage,
         );
         try self.submitOneShot(command_buffer);
@@ -12108,7 +12216,7 @@ pub const Renderer = struct {
         try self.transitionTrackedImage(
             command_buffer,
             snapshot.image.handle,
-            .{ .aspect_mask = vk.image_aspect_color_bit },
+            .{ .aspect_mask = vk.image_aspect_color_bit, .layer_count = snapshot.target.layout.layers },
             image_state.color_attachment_usage,
         );
         try self.submitOneShot(command_buffer);
@@ -12124,7 +12232,7 @@ pub const Renderer = struct {
         try self.transitionTrackedImage(
             command_buffer,
             snapshot.image.handle,
-            .{ .aspect_mask = vk.image_aspect_color_bit },
+            .{ .aspect_mask = vk.image_aspect_color_bit, .layer_count = snapshot.target.layout.layers },
             image_state.storage_usage,
         );
         try self.submitOneShot(command_buffer);
@@ -12297,6 +12405,7 @@ pub const Renderer = struct {
         image_format: u32,
         dimension: rdna2.spirv.SampledImageDimension,
     ) anyerror!?PreparedSampledImage {
+        if (descriptor.image_type == .color_3d) return null;
         const latest = self.latestRenderTargetAtAddress(descriptor, image_format) orelse return null;
         const exact = self.findResidentRenderTargetIndex(descriptor, image_format);
         const index = if (exact) |exact_index| blk: {
@@ -12396,6 +12505,7 @@ pub const Renderer = struct {
 
     fn transitionDepthTargetToShaderRead(self: *Renderer, index: usize) anyerror!void {
         if (index >= self.depth_targets.items.len) return Error.MissingPresentedFrame;
+        _ = try self.inheritDepthPlanes(index);
         const snapshot = self.depth_targets.items[index];
         if (!snapshot.initialized or snapshot.shader_read_layout) return;
         const command_buffer = try self.beginOneShot();
@@ -12857,8 +12967,10 @@ pub const Renderer = struct {
             if (candidate_index == index or !candidate.initialized or
                 candidate.last_used_sequence <= destination.last_used_sequence) continue;
             const other = candidate.target;
-            if (other.format != target.format or other.width != target.width or
-                other.height != target.height or other.samples_log2 != target.samples_log2 or
+            const matching_extent = other.width == target.width and other.height == target.height;
+            if (other.format != target.format or
+                (!matching_extent and !(other.inferred_extent and target.inferred_extent)) or
+                other.tile_mode != target.tile_mode or other.samples_log2 != target.samples_log2 or
                 other.base_array_slice != target.base_array_slice or other.mip_level != target.mip_level) continue;
             const shared = [2]bool{
                 target.guest_format != 0 and target.address != 0 and target.address == other.address,
@@ -12883,16 +12995,18 @@ pub const Renderer = struct {
         for (sources, 0..) |source_index, plane| {
             const source = self.depth_targets.items[source_index orelse continue];
             const source_range = vk.ImageSubresourceRange{ .aspect_mask = source.target.aspectMask() };
+            const source_aspect: u32 = if (source.target.guest_format != 0) vk.image_aspect_depth_bit else vk.image_aspect_stencil_bit;
+            const source_usage = self.image_states.current(source.image.handle, source_aspect, 0, 0) orelse image_state.depth_attachment_usage;
             try self.transitionTrackedImage(command_buffer, source.image.handle, source_range, image_state.transfer_source_usage);
             const aspect: u32 = if (plane == 0) vk.image_aspect_depth_bit else vk.image_aspect_stencil_bit;
             const copy = vk.ImageCopy{
                 .source_subresource = .{ .aspect_mask = aspect },
                 .destination_subresource = .{ .aspect_mask = aspect },
-                .extent = .{ .width = target.width, .height = target.height, .depth = 1 },
+                .extent = .{ .width = @min(target.width, source.target.width), .height = @min(target.height, source.target.height), .depth = 1 },
             };
             self.device_functions.cmd_copy_image(command_buffer, source.image.handle, vk.image_layout_transfer_src_optimal, destination.image.handle, vk.image_layout_transfer_dst_optimal, 1, @ptrCast(&copy));
-            try self.transitionTrackedImage(command_buffer, source.image.handle, source_range, image_state.depth_attachment_usage);
-            self.depth_targets.items[source_index.?].shader_read_layout = false;
+            try self.transitionTrackedImage(command_buffer, source.image.handle, source_range, source_usage);
+            self.depth_targets.items[source_index.?].shader_read_layout = source_usage.layout == vk.image_layout_shader_read_only_optimal;
         }
         try self.transitionTrackedImage(command_buffer, destination.image.handle, range, image_state.depth_attachment_usage);
         try self.submitOneShot(command_buffer);
@@ -12900,6 +13014,9 @@ pub const Renderer = struct {
         cached.initialized = true;
         cached.shader_read_layout = false;
         cached.gpu_generation +%= 1;
+        for (sources) |source_index| {
+            if (source_index) |source| cached.last_used_sequence = @max(cached.last_used_sequence, self.depth_targets.items[source].last_used_sequence);
+        }
         return true;
     }
 
@@ -12912,6 +13029,7 @@ pub const Renderer = struct {
             cached.target.clear_depth = target.clear_depth;
             cached.target.clear_stencil = target.clear_stencil;
             cached.target.descriptor = target.descriptor;
+            cached.target.inferred_extent = target.inferred_extent;
             _ = try self.inheritDepthPlanes(index);
             self.depth_target_sequence +%= 1;
             cached.last_used_sequence = self.depth_target_sequence;
@@ -13050,7 +13168,7 @@ pub const Renderer = struct {
             const target = snapshot.target;
             const descriptor = target.descriptor;
             if (!snapshot.initialized or !descriptor.dcc_enabled or descriptor.dcc_address == 0 or
-                descriptor.samples_log2 != 0 or descriptor.fragments_log2 != 0 or target.layout.layers != 1 or
+                descriptor.samples_log2 != 0 or descriptor.fragments_log2 != 0 or
                 address > descriptor.dcc_address) continue;
             const offset = std.math.cast(usize, descriptor.dcc_address - address) orelse continue;
             const size = std.math.cast(usize, std.math.divCeil(u64, target.layout.required_source_bytes, dcc_block_bytes) catch continue) orelse continue;
@@ -13074,10 +13192,10 @@ pub const Renderer = struct {
             }
             const command_buffer = try self.beginOneShot();
             defer self.releaseOneShot(command_buffer);
-            const range = vk.ImageSubresourceRange{ .aspect_mask = vk.image_aspect_color_bit };
-            try self.transitionTrackedImage(command_buffer, snapshot.image.handle, .{ .aspect_mask = vk.image_aspect_color_bit }, image_state.transfer_destination_usage);
+            const range = vk.ImageSubresourceRange{ .aspect_mask = vk.image_aspect_color_bit, .layer_count = target.layout.layers };
+            try self.transitionTrackedImage(command_buffer, snapshot.image.handle, range, image_state.transfer_destination_usage);
             self.device_functions.cmd_clear_color_image(command_buffer, snapshot.image.handle, vk.image_layout_transfer_dst_optimal, &clear, 1, @ptrCast(&range));
-            try self.transitionTrackedImage(command_buffer, snapshot.image.handle, .{ .aspect_mask = vk.image_aspect_color_bit }, image_state.color_attachment_usage);
+            try self.transitionTrackedImage(command_buffer, snapshot.image.handle, range, image_state.color_attachment_usage);
             try self.submitOneShot(command_buffer);
             const cached = &self.render_targets.items[index];
             cached.shader_read_layout = false;
@@ -13305,11 +13423,11 @@ pub const Renderer = struct {
         try self.transitionTrackedImage(
             command_buffer,
             snapshot.image.handle,
-            .{ .aspect_mask = vk.image_aspect_color_bit },
+            .{ .aspect_mask = vk.image_aspect_color_bit, .layer_count = snapshot.target.layout.layers },
             image_state.transfer_source_usage,
         );
         const copy = vk.BufferImageCopy{
-            .image_subresource = .{ .aspect_mask = vk.image_aspect_color_bit },
+            .image_subresource = .{ .aspect_mask = vk.image_aspect_color_bit, .layer_count = snapshot.target.layout.layers },
             .image_extent = .{
                 .width = snapshot.target.descriptor.width,
                 .height = snapshot.target.descriptor.height,
@@ -13346,7 +13464,7 @@ pub const Renderer = struct {
         try self.transitionTrackedImage(
             command_buffer,
             snapshot.image.handle,
-            .{ .aspect_mask = vk.image_aspect_color_bit },
+            .{ .aspect_mask = vk.image_aspect_color_bit, .layer_count = snapshot.target.layout.layers },
             image_state.color_attachment_usage,
         );
         try self.submitOneShot(command_buffer);
@@ -13731,6 +13849,10 @@ pub const Renderer = struct {
         draw: GuestDraw,
     ) anyerror!void {
         const setup_started = hostTimestampNs();
+        if (target.layout.layers > 1 and depth != null) return Error.UnsupportedGraphicsState;
+        for (extra_colors) |extra| {
+            if (extra.layout.layers != target.layout.layers) return Error.UnsupportedGraphicsState;
+        }
         const target_index = try self.acquireRenderTarget(target);
         self.render_targets.items[target_index].pin_count += 1;
         defer self.releaseRenderTarget(target_index);
@@ -13858,6 +13980,7 @@ pub const Renderer = struct {
                 pipeline_state.rasterization_samples,
                 pipeline_state.width,
                 pipeline_state.height,
+                target.layout.layers,
             );
             break :blk null;
         };
@@ -13894,11 +14017,11 @@ pub const Renderer = struct {
             try self.transitionTrackedImage(
                 command_buffer,
                 cached_snapshot.image.handle,
-                .{ .aspect_mask = vk.image_aspect_color_bit },
+                .{ .aspect_mask = vk.image_aspect_color_bit, .layer_count = target.layout.layers },
                 image_state.transfer_destination_usage,
             );
             const upload_copy = vk.BufferImageCopy{
-                .image_subresource = .{ .aspect_mask = vk.image_aspect_color_bit },
+                .image_subresource = .{ .aspect_mask = vk.image_aspect_color_bit, .layer_count = target.layout.layers },
                 .image_extent = .{
                     .width = target.descriptor.width,
                     .height = target.descriptor.height,
@@ -13916,14 +14039,14 @@ pub const Renderer = struct {
             try self.transitionTrackedImage(
                 command_buffer,
                 cached_snapshot.image.handle,
-                .{ .aspect_mask = vk.image_aspect_color_bit },
+                .{ .aspect_mask = vk.image_aspect_color_bit, .layer_count = target.layout.layers },
                 image_state.color_attachment_usage,
             );
         } else if (!cached_snapshot.initialized) {
             try self.transitionTrackedImage(
                 command_buffer,
                 cached_snapshot.image.handle,
-                .{ .aspect_mask = vk.image_aspect_color_bit },
+                .{ .aspect_mask = vk.image_aspect_color_bit, .layer_count = target.layout.layers },
                 image_state.color_attachment_usage,
             );
         }
@@ -13934,11 +14057,11 @@ pub const Renderer = struct {
                 try self.transitionTrackedImage(
                     command_buffer,
                     extra_cached.image.handle,
-                    .{ .aspect_mask = vk.image_aspect_color_bit },
+                    .{ .aspect_mask = vk.image_aspect_color_bit, .layer_count = extra.layout.layers },
                     image_state.transfer_destination_usage,
                 );
                 const upload_copy = vk.BufferImageCopy{
-                    .image_subresource = .{ .aspect_mask = vk.image_aspect_color_bit },
+                    .image_subresource = .{ .aspect_mask = vk.image_aspect_color_bit, .layer_count = extra.layout.layers },
                     .image_extent = .{
                         .width = extra.descriptor.width,
                         .height = extra.descriptor.height,
@@ -13956,14 +14079,14 @@ pub const Renderer = struct {
                 try self.transitionTrackedImage(
                     command_buffer,
                     extra_cached.image.handle,
-                    .{ .aspect_mask = vk.image_aspect_color_bit },
+                    .{ .aspect_mask = vk.image_aspect_color_bit, .layer_count = extra.layout.layers },
                     image_state.color_attachment_usage,
                 );
             } else if (!extra_cached.initialized) {
                 try self.transitionTrackedImage(
                     command_buffer,
                     extra_cached.image.handle,
-                    .{ .aspect_mask = vk.image_aspect_color_bit },
+                    .{ .aspect_mask = vk.image_aspect_color_bit, .layer_count = extra.layout.layers },
                     image_state.color_attachment_usage,
                 );
             }
@@ -14090,6 +14213,7 @@ pub const Renderer = struct {
             vk.sample_count_1_bit,
             depth.width,
             depth.height,
+            1,
         );
         var state = pipeline_state;
         state.color_attachment_count = 0;
@@ -15580,6 +15704,37 @@ pub const Renderer = struct {
         try std.testing.expectEqual(@as(u8, 0x23), (try self.readDepthProbeValues(second, true))[0]);
     }
 
+    pub fn probeInferredDepthResize(self: *Renderer) anyerror!void {
+        try self.probeDepthStencilClear(0.25, 0x48);
+        self.depth_targets.items[0].target.inferred_extent = true;
+        const original = self.depth_targets.items[0].target;
+        var larger = original;
+        larger.width = 64;
+        larger.height = 64;
+        larger.allocation_bytes *= 4;
+        larger.stencil_allocation_bytes *= 4;
+        larger.clear_depth = 1;
+        larger.clear_stencil = 0;
+        const expanded = try self.acquireDepthTarget(larger);
+        try std.testing.expectEqual([2]f32{ 0.25, 1 }, try self.readDepthProbeValues(expanded, false));
+        try std.testing.expectEqual([2]u8{ 0x48, 0 }, try self.readDepthProbeValues(expanded, true));
+        larger.clear_depth = 0.75;
+        larger.clear_stencil = 0x23;
+        try self.clearDepthProbeTarget(larger);
+        const restored = try self.acquireDepthTarget(original);
+        try std.testing.expectEqual([2]f32{ 0.75, 0.75 }, try self.readDepthProbeValues(restored, false));
+        try std.testing.expectEqual([2]u8{ 0x23, 0x23 }, try self.readDepthProbeValues(restored, true));
+        var smaller = original;
+        smaller.clear_depth = 0.5;
+        smaller.clear_stencil = 0x55;
+        try self.clearDepthProbeTarget(smaller);
+        // Sampling an older, larger view must observe the latest producer,
+        // even when that view has not been rebound as a depth attachment.
+        try self.transitionDepthTargetToShaderRead(expanded);
+        try std.testing.expectEqual([2]f32{ 0.5, 0.75 }, try self.readDepthProbeValues(expanded, false));
+        try std.testing.expectEqual([2]u8{ 0x55, 0x23 }, try self.readDepthProbeValues(expanded, true));
+    }
+
     pub fn probeDepthStencilValues(self: *Renderer) anyerror!struct { depth: f32, stencil: u8 } {
         for (self.depth_targets.items, 0..) |cached, index| {
             if (cached.target.address != 0x1000 or !cached.target.has_stencil) continue;
@@ -15592,16 +15747,16 @@ pub const Renderer = struct {
         const Value = if (stencil) u8 else f32;
         const aspect = if (stencil) vk.image_aspect_stencil_bit else vk.image_aspect_depth_bit;
         const cached = self.depth_targets.items[index];
-        try std.testing.expectEqual(@as(u32, 32), cached.target.width);
-        try std.testing.expectEqual(@as(u32, 32), cached.target.height);
-        const readback = try self.createBuffer(32 * 32 * @sizeOf(Value), vk.buffer_usage_transfer_dst_bit, vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit);
+        const width = cached.target.width;
+        const height = cached.target.height;
+        const readback = try self.createBuffer(@as(u64, width) * height * @sizeOf(Value), vk.buffer_usage_transfer_dst_bit, vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit);
         defer self.destroyBuffer(readback);
         const command_buffer = try self.beginOneShot();
         defer self.releaseOneShot(command_buffer);
         try self.transitionTrackedImage(command_buffer, cached.image.handle, .{ .aspect_mask = cached.target.aspectMask() }, image_state.transfer_source_usage);
         const copy = vk.BufferImageCopy{
             .image_subresource = .{ .aspect_mask = aspect },
-            .image_extent = .{ .width = 32, .height = 32, .depth = 1 },
+            .image_extent = .{ .width = width, .height = height, .depth = 1 },
         };
         self.device_functions.cmd_copy_image_to_buffer(command_buffer, cached.image.handle, vk.image_layout_transfer_src_optimal, readback.handle, 1, @ptrCast(&copy));
         const barrier = vk.BufferMemoryBarrier{
@@ -15614,9 +15769,10 @@ pub const Renderer = struct {
         self.device_functions.cmd_pipeline_barrier(command_buffer, vk.pipeline_stage_transfer_bit, vk.pipeline_stage_host_bit, 0, 0, null, 1, @ptrCast(&barrier), 0, null);
         try self.transitionTrackedImage(command_buffer, cached.image.handle, .{ .aspect_mask = cached.target.aspectMask() }, image_state.depth_attachment_usage);
         try self.submitOneShot(command_buffer);
-        var values: [32 * 32]Value = undefined;
-        try self.readMapped(readback, std.mem.sliceAsBytes(&values));
-        return .{ values[0], values[16 * 32 + 16] };
+        const values = try self.allocator.alloc(Value, @as(usize, width) * height);
+        defer self.allocator.free(values);
+        try self.readMapped(readback, std.mem.sliceAsBytes(values));
+        return .{ values[0], values[(height / 2) * width + width / 2] };
     }
 
     pub fn probeHtileDepthClears(self: *Renderer) anyerror!void {
@@ -15716,6 +15872,21 @@ pub const Renderer = struct {
         dma.byte_count = @intCast(size);
         try std.testing.expect(dcbDmaData(self, dma));
         try std.testing.expectEqual([2]f32{ 1, 1 }, try self.readDepthProbeValues(index, false));
+        if (stencil)
+            try std.testing.expectEqual([2]u8{ 0x5a, 0x5a }, try self.readDepthProbeValues(index, true));
+        // An extra NOP prevents the packed-fill shortcut. The real GPU kernel
+        // must invalidate resident depth even with deferred buffer writeback.
+        const native_code = code[0 .. code.len - 1].* ++ [_]u32{ 0xbf80_0000, 0xbf81_0000 };
+        if (!memory.write(memory.context, 0x200, std.mem.sliceAsBytes(&native_code))) return error.TestFailed;
+        try compute.writeRegister(.shader, 0x20c, 2);
+        try compute.writeRegister(.shader, 0x240, 0x18000);
+        const old_defer = self.defer_small_storage_writes_enabled;
+        self.defer_small_storage_writes_enabled = true;
+        defer self.defer_small_storage_writes_enabled = old_defer;
+        const native_fills_before = self.emulated_buffer_clear_dispatches;
+        _ = try self.dispatchRdna2State(&compute, .{ 64, 1, 1 }, .{ @intCast(size / (16 * 64)), 1, 1 });
+        try std.testing.expectEqual(native_fills_before, self.emulated_buffer_clear_dispatches);
+        try std.testing.expectEqual([2]f32{ 0, 0 }, try self.readDepthProbeValues(index, false));
         if (stencil)
             try std.testing.expectEqual([2]u8{ 0x5a, 0x5a }, try self.readDepthProbeValues(index, true));
     }
@@ -15980,8 +16151,10 @@ pub const Renderer = struct {
             // Yotei leaves DB_DEPTH_SIZE_XY at 1x1 for HTILE surfaces and
             // uncompressed depth-only passes. Plain stale UI bindings still
             // reach the undersized-attachment check below.
+            var inferred_extent = false;
             if (bound.width == 1 and bound.height == 1) {
-                if (recoverResetDepthExtent(&bound, render_state) and
+                inferred_extent = recoverResetDepthExtent(&bound, render_state);
+                if (inferred_extent and
                     (self.traceCurrentGraphicsFrame() or self.reset_depth_extent_reports < 8))
                 {
                     std.debug.print(
@@ -15995,7 +16168,9 @@ pub const Renderer = struct {
                     self.reset_depth_extent_reports +|= 1;
                 }
             }
-            break :blk guestDepthTarget(bound);
+            var plane = guestDepthTarget(bound) orelse break :blk null;
+            plane.inferred_extent = inferred_extent;
+            break :blk plane;
         } else null;
         if (depth_wanted and depth_plane == null) {
             if (log_verbose_gpu) std.debug.print(
@@ -16011,6 +16186,7 @@ pub const Renderer = struct {
             bound_color_count = 1;
         } else {
             for (render_state.color_targets) |candidate| {
+                if (!render_state.color_control.allowsAttachmentWrites(render_state.target_mask, render_state.depth_control.stencil_enabled)) break;
                 const descriptor = candidate orelse continue;
                 if (!descriptor.isActive()) {
                     if (self.skipped_extra_color_reports < 8) {
@@ -16285,9 +16461,11 @@ pub const Renderer = struct {
         const vertex_address = vertex_stage.programAddress(state) orelse {
             return Error.MissingGraphicsProgram;
         };
-        const fragment_address = gpu.resources.ShaderStage.pixel.programAddress(state) orelse {
-            return Error.MissingGraphicsProgram;
-        };
+        // Depth prepasses and visibility draws can rasterize with no PS. An
+        // empty host fragment stage keeps the shared translation path while
+        // leaving fixed-function depth/stencil tests and writes active.
+        const fragment_address = gpu.resources.ShaderStage.pixel.programAddress(state) orelse
+            if (depth_only) @as(u64, 0) else return Error.MissingGraphicsProgram;
         if (self.traceCurrentGraphicsFrame()) {
             std.debug.print(
                 "[vulkan dcb] draw trace next_flip={d} draw={d} target=0x{x} VS=0x{x} PS=0x{x} indices={any} vertices={d} viewport={d}x{d} scissor={d},{d}+{d}x{d} discard={d} write=0x{x} blend={d} color_mode={d} target_mask=0x{x} clip={any} cb0={any}/{any}/{any}/{any}/{any}\n",
@@ -16332,12 +16510,29 @@ pub const Renderer = struct {
             traceShaderAnalysisFailure(reader, vertex_stage, vertex_address, vertex_header, err);
             return err;
         };
-        var fragment_analysis = self.analyzedProgram(reader, fragment_address, fragment_header) catch |err| {
+        const fragment_reader = if (fragment_address == 0)
+            gpu.ShaderMemoryReader{ .context = null, .read_fn = readEmptyFragmentProgram }
+        else
+            reader;
+        var fragment_analysis = self.analyzedProgram(fragment_reader, fragment_address, fragment_header) catch |err| {
             traceShaderAnalysisFailure(reader, .pixel, fragment_address, fragment_header, err);
             return err;
         };
         const vertex_bindings = try gpu.ShaderBindings.capture(state, vertex_stage, vertex_header, reader);
-        const fragment_bindings = try gpu.ShaderBindings.capture(state, .pixel, fragment_header, reader);
+        const fragment_bindings = if (fragment_address != 0)
+            try gpu.ShaderBindings.capture(state, .pixel, fragment_header, reader)
+        else
+            gpu.ShaderBindings{
+                .stage = .pixel,
+                .user_data_stage = .pixel,
+                .program_address = 0,
+                .user_data_count = 0,
+                .scalar_user_data_base = 0,
+                .user_data = @splat(0),
+                .metadata = null,
+                .srt_address = null,
+                .direct_pointers = .{},
+            };
         var fragment_specialization = if (@atomicLoad(bool, &graphics_uniform_specialization, .monotonic))
             try fragment_analysis.acquireUniformSpecialization(self.allocator, reader, &fragment_bindings, self.uniform_specialization_cache_enabled)
         else
@@ -16420,11 +16615,12 @@ pub const Renderer = struct {
             parameter_components[parameter] |= fragment_attribute_components[attribute];
         }
 
-        var ngg_lds_exports: [33]gpu.ShaderSpirvNggLdsExport = undefined;
+        var ngg_lds_exports: [34]gpu.ShaderSpirvNggLdsExport = undefined;
         const ngg_lds_export_count = inferNggLdsExports(
             vertex_instructions,
             &parameter_components,
             &ngg_lds_exports,
+            target.layout.volume != null,
         );
         if (ngg_lds_export_count != 0) {
             for (ngg_lds_exports[0..ngg_lds_export_count]) |ngg_export| {
@@ -16769,7 +16965,8 @@ pub const Renderer = struct {
         // Preserve that resident image for these exact pixel-program shapes;
         // the UI remains interactive while the missing blur is preferable to
         // an unreadable frame.
-        if (full_color_write and fragment_image_count == 1 and pipeline_state.blend_enables[0] == 0 and
+        if (target.format.vulkan == vk.format_a2b10g10r10_unorm_pack32 and
+            full_color_write and fragment_image_count == 1 and pipeline_state.blend_enables[0] == 0 and
             hasFullscreenSampleBlitGeometry(draw) and
             matchesRgb10MenuPostProcess(fragment_analysis.program.instructions.items) and
             try self.emulateFullscreenSampleBlit(
@@ -17191,6 +17388,7 @@ pub const Renderer = struct {
         const fragment_translate_started = hostTimestampNs();
         const fragment_lease = self.graphics_translations.acquirePrepared(self.allocator, &fragment_analysis.program, .{
             .stage = .fragment,
+            .layered_rendering = target.layout.layers > 1,
             // FragCoord is measured in visible render-target pixels. Dividing
             // X by the NV12 allocation pitch (2048 for a 1920-wide movie)
             // maps the last visible pixel to the last visible luma column and
@@ -17571,6 +17769,7 @@ pub const Renderer = struct {
                     .storage_buffers = vertex_storage.mappings[0..vertex_storage.mapping_count],
                     .sampled_images = graphics_resources.mappings[fragment_mapping_count..graphics_resources.mapping_count],
                     .ngg_lds_exports = ngg_lds_exports[0..ngg_lds_export_count],
+                    .layered_rendering = target.layout.layers > 1,
                     .parameter_mask = paired_parameter_mask,
                     .vertex_parameter_sources = &fragment_input_controls,
                     .descriptor_array_length = maximum_storage_descriptors,
@@ -20019,8 +20218,6 @@ pub const Renderer = struct {
         }
     }
 
-    /// Diagnostic snapshots read the bound VkImage itself without publishing
-    /// guest memory or changing resource generations. Disabled by default.
     fn captureGraphicsTarget(self: *Renderer, target: GuestColorTarget, prefix: []const u8, phase: []const u8) !void {
         if (target.descriptor.fragments_log2 != 0) return error.UnsupportedDiagnosticColorTarget;
         const cached = for (self.render_targets.items) |entry| {
@@ -20032,10 +20229,10 @@ pub const Renderer = struct {
         defer self.destroyBuffer(readback);
         const command_buffer = try self.beginOneShot();
         defer self.releaseOneShot(command_buffer);
-        const range = vk.ImageSubresourceRange{ .aspect_mask = vk.image_aspect_color_bit, .layer_count = 1 };
+        const range = vk.ImageSubresourceRange{ .aspect_mask = vk.image_aspect_color_bit, .layer_count = target.layout.layers };
         try self.transitionTrackedImage(command_buffer, cached.image.handle, range, image_state.transfer_source_usage);
         const copy = vk.BufferImageCopy{
-            .image_subresource = .{ .aspect_mask = vk.image_aspect_color_bit, .layer_count = 1 },
+            .image_subresource = .{ .aspect_mask = vk.image_aspect_color_bit, .layer_count = target.layout.layers },
             .image_extent = .{ .width = target.descriptor.width, .height = target.descriptor.height, .depth = 1 },
         };
         self.device_functions.cmd_copy_image_to_buffer(command_buffer, cached.image.handle, vk.image_layout_transfer_src_optimal, readback.handle, 1, @ptrCast(&copy));
@@ -20060,7 +20257,7 @@ pub const Renderer = struct {
     fn captureGraphicsImages(self: *Renderer, resources: *const GraphicsResources, prefix: []const u8) !void {
         const selected = @atomicLoad(u64, &capture_storage_image_address, .monotonic);
         if (selected == 0) return;
-        return self.captureSampledImages(resources.images[0..resources.image_count], resources.descriptors[0..resources.image_count], prefix, selected);
+        return self.captureSampledImages(resources.images[0..resources.image_count], resources.descriptors[0..resources.image_count], prefix, if (selected == std.math.maxInt(u64)) null else selected);
     }
 
     /// Read the bound images before dispatch as well as before graphics draws.
@@ -20069,27 +20266,34 @@ pub const Renderer = struct {
         var total: usize = 0;
         for (images, descriptors, 0..) |prepared, descriptor, slot| {
             if (selected) |address| if (descriptor.address != address) continue;
-            if (descriptor.image_type != .color_2d or descriptor.samplesLog2() != 0 or
+            if ((descriptor.image_type != .color_2d and descriptor.image_type != .color_3d) or descriptor.samplesLog2() != 0 or
                 descriptor.viewBaseLevel() != 0 or descriptor.base_array != 0 or
                 (prepared.descriptor_layout != vk.image_layout_shader_read_only_optimal and prepared.descriptor_layout != vk.image_layout_general))
                 return error.UnsupportedDiagnosticSampledImage;
             // Resident compute outputs are sampled in GENERAL. Restore the
             // tracked access after copying so the already prepared descriptor
             // remains valid for the captured draw and later producers.
-            const previous_usage = self.image_states.current(prepared.image.handle, vk.image_aspect_color_bit, 0, 0) orelse
+            const depth_target: ?GuestDepthTarget = for (self.depth_targets.items) |cached| {
+                if (cached.image.handle == prepared.image.handle) break cached.target;
+            } else null;
+            const copy_aspect: u32 = if (depth_target != null) vk.image_aspect_depth_bit else vk.image_aspect_color_bit;
+            const range = vk.ImageSubresourceRange{ .aspect_mask = if (depth_target) |target| target.aspectMask() else vk.image_aspect_color_bit, .layer_count = 1 };
+            const previous_usage = self.image_states.current(prepared.image.handle, copy_aspect, 0, 0) orelse
                 return error.UnsupportedDiagnosticSampledImage;
             if (previous_usage.layout != prepared.descriptor_layout) return error.UnsupportedDiagnosticSampledImage;
-            const byte_count = @as(usize, descriptor.width) * descriptor.height * storageImageBytesPerTexel(descriptor.unified_format);
+            const depth = if (descriptor.image_type == .color_3d) descriptor.depth_or_layers else 1;
+            const texel_bytes = if (depth_target) |target| (if (target.format == vk.format_d16_unorm) @as(u32, 2) else 4) else storageImageBytesPerTexel(descriptor.unified_format);
+            const byte_count = @as(usize, descriptor.width) * descriptor.height * depth * texel_bytes;
             if (byte_count == 0 or byte_count > 64 * 1024 * 1024 or total + byte_count > 512 * 1024 * 1024) return error.UnsupportedDiagnosticSampledImage;
             total += byte_count;
             const readback = try self.createBuffer(byte_count, vk.buffer_usage_transfer_dst_bit, vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit);
             defer self.destroyBuffer(readback);
             const command_buffer = try self.beginOneShot();
             defer self.releaseOneShot(command_buffer);
-            try self.transitionTrackedImage(command_buffer, prepared.image.handle, .{ .aspect_mask = vk.image_aspect_color_bit, .layer_count = 1 }, image_state.transfer_source_usage);
+            try self.transitionTrackedImage(command_buffer, prepared.image.handle, range, image_state.transfer_source_usage);
             const copy = vk.BufferImageCopy{
-                .image_subresource = .{ .aspect_mask = vk.image_aspect_color_bit, .layer_count = 1 },
-                .image_extent = .{ .width = descriptor.width, .height = descriptor.height, .depth = 1 },
+                .image_subresource = .{ .aspect_mask = copy_aspect, .layer_count = 1 },
+                .image_extent = .{ .width = descriptor.width, .height = descriptor.height, .depth = depth },
             };
             self.device_functions.cmd_copy_image_to_buffer(command_buffer, prepared.image.handle, vk.image_layout_transfer_src_optimal, readback.handle, 1, @ptrCast(&copy));
             const barrier = vk.BufferMemoryBarrier{
@@ -20100,7 +20304,7 @@ pub const Renderer = struct {
                 .size = readback.size,
             };
             self.device_functions.cmd_pipeline_barrier(command_buffer, vk.pipeline_stage_transfer_bit, vk.pipeline_stage_host_bit, 0, 0, null, 1, @ptrCast(&barrier), 0, null);
-            try self.transitionTrackedImage(command_buffer, prepared.image.handle, .{ .aspect_mask = vk.image_aspect_color_bit, .layer_count = 1 }, previous_usage);
+            try self.transitionTrackedImage(command_buffer, prepared.image.handle, range, previous_usage);
             try self.submitOneShot(command_buffer);
             try self.waitForSubmittedWork();
             const mapping = try self.mapBufferRange(readback, 0, byte_count);
@@ -20471,10 +20675,9 @@ pub const Renderer = struct {
                 std.debug.print(
                     "    level {d}: source {d}x{d} padded {d}x{d} want {d}x{d}\n",
                     .{
-                        level,                     cached.subresource.width,
-                        cached.subresource.height, cached.subresource.padded_width,
-                        cached.subresource.padded_height,
-                        @max(descriptor.width >> shift, 1),
+                        level,                               cached.subresource.width,
+                        cached.subresource.height,           cached.subresource.padded_width,
+                        cached.subresource.padded_height,    @max(descriptor.width >> shift, 1),
                         @max(descriptor.height >> shift, 1),
                     },
                 );
@@ -21166,9 +21369,7 @@ pub const Renderer = struct {
             if (!cached.valid or cached.descriptor.address != descriptor.address) continue;
             if (self.reported_resident_rejects < 8) std.debug.print(
                 "    resident storage: {d}x{d}x{d} fmt={d} type={s} base={d} mips={d} dirty={any}\n",
-                .{ cached.descriptor.width, cached.descriptor.height, cached.descriptor.depth_or_layers,
-                   cached.descriptor.unified_format, @tagName(cached.descriptor.image_type),
-                   cached.descriptor.viewBaseLevel(), cached.descriptor.viewMipLevels(), cached.gpu_dirty },
+                .{ cached.descriptor.width, cached.descriptor.height, cached.descriptor.depth_or_layers, cached.descriptor.unified_format, @tagName(cached.descriptor.image_type), cached.descriptor.viewBaseLevel(), cached.descriptor.viewMipLevels(), cached.gpu_dirty },
             );
         }
         var linear_storage: u32 = 0;
@@ -21179,15 +21380,13 @@ pub const Renderer = struct {
             // alias can be read against what the consumer asked for.
             if (self.reported_resident_rejects < 24) std.debug.print(
                 "    storage candidate: {d}x{d}x{d} fmt={d} type={s} levels={d}..{d} dirty={any}\n",
-                .{ cached.descriptor.width, cached.descriptor.height, cached.descriptor.depth_or_layers,
-                   cached.descriptor.unified_format, @tagName(cached.descriptor.image_type),
-                   cached.descriptor.viewBaseLevel(), cached.descriptor.viewBaseLevel() + cached.descriptor.viewMipLevels() - 1, cached.gpu_dirty },
+                .{ cached.descriptor.width, cached.descriptor.height, cached.descriptor.depth_or_layers, cached.descriptor.unified_format, @tagName(cached.descriptor.image_type), cached.descriptor.viewBaseLevel(), cached.descriptor.viewBaseLevel() + cached.descriptor.viewMipLevels() - 1, cached.gpu_dirty },
             );
         }
         if (self.reported_resident_rejects < 24) {
             self.reported_resident_rejects += 1;
             std.debug.print("[vulkan dcb] sampled readback fallback: resident_reject={d} rt_reject={d} scan_rt={d} stale_rt={d} scan_simg={d} dcc={any} depth_reject={d} depth_cache={d} addr=0x{x} {d}x{d}x{d} fmt={d} type={s} tile={f} levels={d}..{d} want_levels={d}\n", .{
-                self.last_resident_reject, self.last_rt_reject, linear_targets, stale_targets, linear_storage, descriptor.dcc_enabled, self.last_depth_reject, @as(u32, @intCast(self.depth_targets.items.len)), descriptor.address, descriptor.width, descriptor.height, descriptor.depth_or_layers,
+                self.last_resident_reject, self.last_rt_reject,             linear_targets,       stale_targets,         linear_storage,        descriptor.dcc_enabled,     self.last_depth_reject, @as(u32, @intCast(self.depth_targets.items.len)), descriptor.address, descriptor.width, descriptor.height, descriptor.depth_or_layers,
                 descriptor.unified_format, @tagName(descriptor.image_type), descriptor.tile_mode, descriptor.base_level, descriptor.last_level, descriptor.viewMipLevels(),
             });
         }
@@ -21933,7 +22132,12 @@ pub const Renderer = struct {
                 return cached.view;
             }
         }
+        // A mutable UNORM allocation can also be written as a storage image.
+        // Its sRGB sampled view cannot inherit STORAGE usage: sRGB formats do
+        // not support typed image stores (VUID-usage-02275).
+        const sampled_usage = vk.ImageViewUsageCreateInfo{ .usage = vk.image_usage_sampled_bit };
         const info = vk.ImageViewCreateInfo{
+            .p_next = if (format == vk.format_r8g8b8a8_srgb) &sampled_usage else null,
             .image = image,
             .view_type = view_type,
             .format = format,
@@ -23322,6 +23526,10 @@ pub const Renderer = struct {
     fn dcbEvent(context: ?*anyopaque, event: gpu.state.EventWrite) bool {
         const self = fromContext(context);
         self.event_callbacks += 1;
+        if (self.traceCurrentGraphicsFrame()) std.debug.print(
+            "[vulkan dcb] event trace type=0x{x} index={d} address={?x}\n",
+            .{ event.event_type, event.event_index, event.address },
+        );
         // The common one-dword EVENT_WRITE only flushes/invalidate GPU caches;
         // it does not publish memory to the CPU. Preserve it as an in-queue
         // ordering point instead of submitting and waiting after every draw.
@@ -23329,7 +23537,27 @@ pub const Renderer = struct {
         // remain a conservative host synchronization boundary.
         if (event.address != null) {
             if (!self.synchronizeDrawBatch("addressed event")) return false;
-            return self.publishDeferredSmallStorageWrites();
+            if (!self.publishDeferredSmallStorageWrites()) return false;
+            if (event.event_type == 0x39 and event.event_index == 1) {
+                // PIXEL_PIPE_STAT_DUMP: PS5 has 16 DB counters, with begin
+                // and end values interleaved at a 16-byte stride. Bit 63 is
+                // availability, not part of the count. Until native host
+                // occlusion queries are supported, increasing snapshots keep
+                // visibility conservative instead of culling missing results.
+                const address = event.address.?;
+                if (address == 0) return false;
+                var results: [16 * 16 - 8]u8 = undefined;
+                if (!dcbRead(context, address, &results)) return false;
+                const value = (@as(u64, 1) << 63) | @as(u64, self.occlusion_dump_counter);
+                for (0..16) |db| std.mem.writeInt(u64, results[db * 16 ..][0..8], value, .little);
+                if (!dcbWrite(context, address, &results)) return false;
+                if (self.occlusion_dump_counter == 0) std.debug.print(
+                    "[vulkan dcb] occlusion queries use conservative visible results (native sample counts unavailable)\n",
+                    .{},
+                );
+                self.occlusion_dump_counter +%= 1;
+            }
+            return true;
         }
         self.last_sync_error = null;
         return true;
@@ -23733,6 +23961,8 @@ pub const Renderer = struct {
             ) catch continue;
             if (target.format.vulkan == vk.format_a2b10g10r10_unorm_pack32) {
                 dumpA2B10G10R10FramePpm(path.ptr, frame.width, frame.height, frame.pixels.items);
+            } else if (target.format.vulkan == vk.format_b10g11r11_ufloat_pack32) {
+                dumpR11G11B10FramePpm(path.ptr, frame.width, frame.height, frame.pixels.items);
             } else if (target.format.bytes_per_texel == 4) {
                 dumpFramePpm(path.ptr, frame.width, frame.height, frame.pixels.items);
             } else {
@@ -23898,7 +24128,7 @@ pub const Renderer = struct {
             );
             std.debug.print(
                 "[gpu compute scan] flip={d} buffers_ms={d}(stage={d},ptr={d}) images_ms={d} resolve_ms={d} stage_ms={d} probe={d}ms/{d} dedup={d}ms/{d} tail_ms={d}(loop={d}/stage={d}ms/{d},desc={d},flat={d},blk={d},slk={d}) dispatches={d} walked={d} images={d} distinct_buf={d}/{d} distinct_img={d}/{d}\n",
-                .{ self.flip_callbacks,  profile.compute_buffer_scan_ns / std.time.ns_per_ms, profile.compute_buffer_stage_ns / std.time.ns_per_ms, profile.compute_pointer_memory_ns / std.time.ns_per_ms, profile.compute_image_scan_ns / std.time.ns_per_ms, profile.compute_image_resolve_ns / std.time.ns_per_ms, profile.compute_image_stage_ns / std.time.ns_per_ms, profile.compute_sampled_probe_ns / std.time.ns_per_ms, profile.compute_sampled_probe_steps, profile.compute_image_dedup_ns / std.time.ns_per_ms, profile.compute_image_dedup_steps, profile.compute_tail_ns / std.time.ns_per_ms, profile.compute_sampled_loop_ns / std.time.ns_per_ms, profile.compute_sampled_stage_ns / std.time.ns_per_ms, profile.compute_sampled_stages, profile.compute_descriptor_update_ns / std.time.ns_per_ms, profile.compute_flat_memory_ns / std.time.ns_per_ms, profile.compute_buffer_lookup_ns / std.time.ns_per_ms, profile.compute_sampled_lookup_ns / std.time.ns_per_ms, profile.dispatches, profile.compute_instructions_walked, profile.compute_images_resolved, profile.staged_buffers.distinct, profile.staged_buffers.total, profile.staged_images.distinct, profile.staged_images.total },
+                .{ self.flip_callbacks, profile.compute_buffer_scan_ns / std.time.ns_per_ms, profile.compute_buffer_stage_ns / std.time.ns_per_ms, profile.compute_pointer_memory_ns / std.time.ns_per_ms, profile.compute_image_scan_ns / std.time.ns_per_ms, profile.compute_image_resolve_ns / std.time.ns_per_ms, profile.compute_image_stage_ns / std.time.ns_per_ms, profile.compute_sampled_probe_ns / std.time.ns_per_ms, profile.compute_sampled_probe_steps, profile.compute_image_dedup_ns / std.time.ns_per_ms, profile.compute_image_dedup_steps, profile.compute_tail_ns / std.time.ns_per_ms, profile.compute_sampled_loop_ns / std.time.ns_per_ms, profile.compute_sampled_stage_ns / std.time.ns_per_ms, profile.compute_sampled_stages, profile.compute_descriptor_update_ns / std.time.ns_per_ms, profile.compute_flat_memory_ns / std.time.ns_per_ms, profile.compute_buffer_lookup_ns / std.time.ns_per_ms, profile.compute_sampled_lookup_ns / std.time.ns_per_ms, profile.dispatches, profile.compute_instructions_walked, profile.compute_images_resolved, profile.staged_buffers.distinct, profile.staged_buffers.total, profile.staged_images.distinct, profile.staged_images.total },
             );
             std.debug.print(
                 "[gpu sampled inner] flip={d} gen={d}ms/{d} prefix={d}ms resident={d}ms probe={d}ms/{d} page={d}ms/{d} paths(exact/view/slow)={d}/{d}/{d} flush(alias/simg/buf/tgt/htile)={d}/{d}/{d}/{d}/{d}ms materialize={d}/{d} readbacks={d}/{d}KiB\n",
@@ -24867,10 +25097,18 @@ pub const Renderer = struct {
             );
         }
 
-        // Vertex-only or pixel-only draws show up in pre-passes before both
-        // stages are bound. Rejecting them aborts the DCB; accepting as a no-op
-        // lets the queue reach a complete pair (and later the flip).
-        if (has_vertex != has_fragment) {
+        const current_render_state = gpu.resources.decodeRenderState(state);
+        const depth_work = current_render_state.depth_target != null and
+            (current_render_state.depth_control.test_enabled or current_render_state.depth_control.write_enabled or
+                current_render_state.depth_control.clear_enabled or current_render_state.depth_control.stencil_enabled or
+                current_render_state.depth_control.stencil_clear_enabled);
+        const color_writes = current_render_state.color_control.allowsAttachmentWrites(
+            current_render_state.target_mask,
+            current_render_state.depth_control.stencil_enabled,
+        );
+        const vertex_only_depth = has_vertex and !has_fragment and depth_work and
+            (!color_writes or current_render_state.active_color_count == 0);
+        if (has_vertex != has_fragment and !vertex_only_depth) {
             self.last_draw_error = Error.MissingGraphicsProgram;
             if (self.shouldReportDrawError(Error.MissingGraphicsProgram)) {
                 std.debug.print(
@@ -24922,7 +25160,11 @@ pub const Renderer = struct {
                     return true;
                 }
             }
-            const targetless = render_state.active_color_count == 0;
+            if (!color_writes and !depth_work) {
+                self.last_draw_error = null;
+                return true;
+            }
+            const targetless = !color_writes or render_state.active_color_count == 0;
             const targetless_depth_work = targetless and render_state.depth_target != null and
                 (render_state.depth_control.test_enabled or
                     render_state.depth_control.write_enabled or
@@ -26362,11 +26604,14 @@ fn shaderOperandConstantBefore(
 /// Reconstruct the compact ES-to-NGG LDS record used by PS5 passthrough
 /// shaders. The observed ABI stores POS.xy first, enabled PARAM components
 /// next, POS.zw after them, and a final primitive bookkeeping dword. The
-/// terminal `S_SETPC_B64 s[6:7]` invokes the hardware exporter for that record.
+/// Layered records instead place PARAMs before contiguous POS.xyzw and the
+/// render-target layer dword. The terminal `S_SETPC_B64 s[6:7]` invokes the
+/// hardware exporter for that record.
 fn inferNggLdsExports(
     instructions: []const gpu.ShaderInstruction,
     parameter_components: *const [32]u4,
-    output: *[33]gpu.ShaderSpirvNggLdsExport,
+    output: *[34]gpu.ShaderSpirvNggLdsExport,
+    layered: bool,
 ) usize {
     var terminal_index: ?usize = null;
     for (instructions, 0..) |inst, index| {
@@ -26451,14 +26696,15 @@ fn inferNggLdsExports(
         .target = 0x0c,
         .enable = 0xf,
         .sources = .{
-            words[0].source,
-            words[1].source,
+            words[if (layered) zw - 2 else 0].source,
+            words[if (layered) zw - 1 else 1].source,
             words[zw].source,
             words[zw + 1].source,
         },
     };
     var output_count: usize = 1;
-    var parameter_word: usize = 2;
+    var parameter_word: usize = if (layered) 0 else 2;
+    const parameter_end = if (layered) zw - 2 else zw;
     for (parameter_components, 0..) |component_mask, parameter| {
         if (component_mask == 0) continue;
         var sources: [4]gpu.ShaderOperand = @splat(.{});
@@ -26466,7 +26712,7 @@ fn inferNggLdsExports(
         for (0..4) |component| {
             const bit: u4 = @as(u4, 1) << @intCast(component);
             if (component_mask & bit == 0) continue;
-            if (parameter_word >= zw or !words[parameter_word].present) return 0;
+            if (parameter_word >= parameter_end or !words[parameter_word].present) return 0;
             sources[component] = words[parameter_word].source;
             enable |= bit;
             parameter_word += 1;
@@ -26478,7 +26724,12 @@ fn inferNggLdsExports(
         };
         output_count += 1;
     }
-    if (parameter_word != zw) return 0;
+    if (parameter_word != parameter_end) return 0;
+    if (layered) {
+        if (zw + 2 >= words.len or !words[zw + 2].present) return 0;
+        output[output_count] = .{ .target = 0x0d, .enable = 4, .sources = .{ .{}, .{}, words[zw + 2].source, .{} } };
+        output_count += 1;
+    }
     return output_count;
 }
 
@@ -28224,6 +28475,37 @@ fn dumpR11G11B10FrameThumbnailPpm(
         }
     }
     dumpFramePpm(path, output_width, output_height, output);
+}
+
+fn dumpR11G11B10FramePpm(
+    path: [*:0]const u8,
+    width: u32,
+    height: u32,
+    source_packed: []const u8,
+) void {
+    const pixel_count = @as(usize, width) * @as(usize, height);
+    if (width == 0 or height == 0 or source_packed.len < pixel_count * 4) return;
+    const rgba8 = std.heap.page_allocator.alloc(u8, pixel_count * 4) catch return;
+    defer std.heap.page_allocator.free(rgba8);
+
+    for (0..pixel_count) |pixel| {
+        const source_offset = pixel * 4;
+        const word = std.mem.readInt(u32, source_packed[source_offset..][0..4], .little);
+        const linear = [3]f32{
+            decodeUnsignedMiniFloat(word & 0x7ff, 11),
+            decodeUnsignedMiniFloat((word >> 11) & 0x7ff, 11),
+            decodeUnsignedMiniFloat((word >> 22) & 0x3ff, 10),
+        };
+        for (linear, 0..) |value, component| {
+            const mapped = if (std.math.isFinite(value) and value > 0)
+                value / (1.0 + value)
+            else
+                0;
+            rgba8[pixel * 4 + component] = @intFromFloat(@round(@min(mapped, 1.0) * 255.0));
+        }
+        rgba8[pixel * 4 + 3] = 255;
+    }
+    dumpFramePpm(path, width, height, rgba8);
 }
 
 fn dumpA2B10G10R10FrameThumbnailPpm(
@@ -30976,14 +31258,32 @@ test "NGG LDS export inference accepts dynamic clip depth" {
     };
     var parameter_components: [32]u4 = @splat(0);
     parameter_components[0] = 0x7;
-    var exports: [33]gpu.ShaderSpirvNggLdsExport = undefined;
-    const count = inferNggLdsExports(&instructions, &parameter_components, &exports);
+    var exports: [34]gpu.ShaderSpirvNggLdsExport = undefined;
+    const count = inferNggLdsExports(&instructions, &parameter_components, &exports, false);
     try std.testing.expectEqual(@as(usize, 2), count);
     try std.testing.expectEqual(@as(u32, 10), exports[0].sources[0].reg);
     try std.testing.expectEqual(@as(u32, 11), exports[0].sources[1].reg);
     try std.testing.expectEqual(@as(u32, 15), exports[0].sources[2].reg);
     try std.testing.expectEqual(@as(u32, 16), exports[0].sources[3].reg);
     try std.testing.expectEqual(@as(u8, 0x7), exports[1].enable);
+}
+
+test "layered NGG LDS exports retain contiguous position and RT layer" {
+    const instructions = [_]gpu.ShaderInstruction{
+        .{ .opcode = .ds_write_b128, .src0 = .{ .kind = .vgpr, .reg = 0 }, .src1 = .{ .kind = .vgpr, .reg = 10 }, .memory_offset = 0 },
+        .{ .opcode = .ds_write_b96, .src0 = .{ .kind = .vgpr, .reg = 0 }, .src1 = .{ .kind = .vgpr, .reg = 14 }, .memory_offset = 16 },
+        .{ .opcode = .s_setpc_b64, .src0 = .{ .kind = .sgpr, .reg = 6 } },
+    };
+    var components: [32]u4 = @splat(0);
+    components[0] = 3;
+    var exports: [34]gpu.ShaderSpirvNggLdsExport = undefined;
+    try std.testing.expectEqual(@as(usize, 3), inferNggLdsExports(&instructions, &components, &exports, true));
+    for (0..4) |i| try std.testing.expectEqual(@as(u32, @intCast(12 + i)), exports[0].sources[i].reg);
+    try std.testing.expectEqual(@as(u32, 10), exports[1].sources[0].reg);
+    try std.testing.expectEqual(@as(u32, 11), exports[1].sources[1].reg);
+    try std.testing.expectEqual(@as(u6, 0x0d), exports[2].target);
+    try std.testing.expectEqual(@as(u4, 4), exports[2].enable);
+    try std.testing.expectEqual(@as(u32, 16), exports[2].sources[2].reg);
 }
 
 test "RGBA8 integer scaling preserves every source pixel" {
@@ -32545,10 +32845,55 @@ test "HTILE depth reset extent expands while stale UI depth remains undersized" 
     try std.testing.expectEqual(@as(u32, 1920), bound.width);
     try std.testing.expectEqual(@as(u32, 1080), bound.height);
 
+    bound.width = 1;
+    bound.height = 1;
+    var color = std.mem.zeroes(gpu.resources.ColorTarget);
+    color.address = 0x6454f50000;
+    color.width = 2848;
+    color.height = 1600;
+    color.format = 9;
+    color.write_mask = 0xf;
+    render.color_targets[0] = color;
+    render.color_control.mode = 1;
+    render.target_mask = 0xf;
+    try std.testing.expect(recoverResetDepthExtent(&bound, render));
+    try std.testing.expectEqual(@as(u32, 2848), bound.width);
+    try std.testing.expectEqual(@as(u32, 1600), bound.height);
+
+    // A depth utility pass can retain larger color attachments and masks.
+    // They must not replace the depth viewport's extent when CB is disabled.
+    bound.width = 1;
+    bound.height = 1;
+    render.color_control.mode = 0;
+    try std.testing.expect(recoverResetDepthExtent(&bound, render));
+    try std.testing.expectEqual(@as(u32, 1920), bound.width);
+    try std.testing.expectEqual(@as(u32, 1080), bound.height);
+
     bound.width = 64;
     bound.height = 64;
     try std.testing.expect(!recoverResetDepthExtent(&bound, render));
     try std.testing.expectEqual(@as(u32, 64), bound.width);
+}
+
+test "reset shadow atlas extent includes viewport and scissor offsets" {
+    var bound = std.mem.zeroes(gpu.resources.DepthTarget);
+    bound.width = 1;
+    bound.height = 1;
+    bound.write_address = 0x1000;
+    var render = std.mem.zeroes(gpu.resources.RenderState);
+    render.depth_control.test_enabled = true;
+    render.depth_control.write_enabled = true;
+    render.viewport = .{ .x_scale = 1024, .x_offset = 3072, .y_scale = -1024, .y_offset = 1024, .z_scale = 1, .z_offset = 0 };
+    try std.testing.expect(recoverResetDepthExtent(&bound, render));
+    try std.testing.expectEqual(@as(u32, 4096), bound.width);
+    try std.testing.expectEqual(@as(u32, 2048), bound.height);
+    bound.width = 1;
+    bound.height = 1;
+    render.viewport = null;
+    render.scissor = .{ .left = 2048, .top = 0, .right = 4096, .bottom = 2048 };
+    try std.testing.expect(recoverResetDepthExtent(&bound, render));
+    try std.testing.expectEqual(@as(u32, 4096), bound.width);
+    try std.testing.expectEqual(@as(u32, 2048), bound.height);
 }
 
 test "uncompressed depth-only writers recover reset extents without expanding UI depth" {
@@ -32557,6 +32902,7 @@ test "uncompressed depth-only writers recover reset extents without expanding UI
     bound.height = 1;
     bound.write_address = 0x1000;
     var render = std.mem.zeroes(gpu.resources.RenderState);
+    render.color_control.mode = 1;
     render.depth_control.test_enabled = true;
     render.depth_control.write_enabled = true;
     render.scissor = .{ .left = 0, .top = 0, .right = 1024, .bottom = 1024 };
@@ -32564,6 +32910,12 @@ test "uncompressed depth-only writers recover reset extents without expanding UI
     color.write_mask = 0xf;
     render.color_targets[0] = color;
     try std.testing.expect(!recoverResetDepthExtent(&bound, render));
+    render.color_control.mode = 0;
+    try std.testing.expect(recoverResetDepthExtent(&bound, render));
+    try std.testing.expectEqual(@as(u32, 1024), bound.width);
+    bound.width = 1;
+    bound.height = 1;
+    render.color_control.mode = 1;
     color.write_mask = 0;
     render.color_targets[0] = color;
     bound.depth_read_only = true;
