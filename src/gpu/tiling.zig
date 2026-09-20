@@ -2244,6 +2244,12 @@ fn rbPlus64kOffset(
     bytes: u8,
     samples_log2: u8,
 ) u32 {
+    // Single-sample colour surfaces use the Gen5/Navi1x equation. RB+ moves
+    // both microtile bits and pipe XORs: applying it to guest-uploaded R_X
+    // volumes reads padding instead of texels (including half a 16^3 LUT).
+    if (kind == .render_target and samples_log2 == 0) {
+        return renderTarget64kOffset(x, y, z, bytes);
+    }
     const bytes_log2 = std.math.log2_int(u8, bytes);
     var offset: u32 = if (kind == .render_target)
         renderMsaaLowOffset(x, y, bytes)
@@ -2259,6 +2265,36 @@ fn rbPlus64kOffset(
         }
     }
     return offset;
+}
+
+/// AMD AddrLib GFX10_SW_64K_R_X_1xaa_PATINFO, 16-pipe Navi1x rows:
+/// nibble01 = {28, 1, 2, 6, 7}, nibble2 = 74, nibble3 = {1, 30, 31, 32, 33}.
+/// Keep full coordinates: pipe XORs include bits above the local block extent
+/// and the absolute array/depth slice. Guest BHH volume uploads agree with
+/// these equations, rather than the similarly named RBPLUS table.
+fn renderTarget64kOffset(x: u32, y: u32, z: u32, bytes: u8) u32 {
+    const low: u32 = switch (bytes) {
+        1 => (x & 7) | bit(y, 1, 3) | bit(y, 0, 4) | bit(y, 2, 5) |
+            bit(x, 3, 6) | bit(y, 4, 7),
+        2 => ((x << 1) & 0x0e) | ((y << 4) & 0x70) | bit(x, 3, 7),
+        4 => ((x << 2) & 0x0c) | ((y << 4) & 0x70) | bit(x, 2, 7),
+        8 => bit(x, 0, 3) | bit(y, 0, 4) | ((x << 4) & 0x60) | bit(y, 1, 7),
+        16 => bit(x, 0, 4) | bit(y, 0, 5) | bit(x, 1, 6) | bit(y, 1, 7),
+        else => unreachable,
+    };
+    const pipes = bit(x, 3, 8) ^ bit(y, 3, 8) ^ bit(z, 3, 8) ^
+        bit(x, 4, 9) ^ bit(y, 4, 9) ^ bit(z, 2, 9) ^
+        bit(x, 6, 10) ^ bit(y, 5, 10) ^ bit(z, 1, 10) ^
+        bit(x, 5, 11) ^ bit(y, 6, 11) ^ bit(z, 0, 11);
+    const high: u32 = switch (bytes) {
+        1 => bit(y, 6, 12) | bit(x, 6, 13) | bit(y, 7, 14) | bit(x, 7, 15),
+        2 => bit(y, 4, 12) | bit(x, 6, 13) | bit(y, 6, 14) | bit(x, 7, 15),
+        4 => bit(y, 3, 12) | bit(x, 4, 13) | bit(y, 6, 14) | bit(x, 6, 15),
+        8 => bit(y, 2, 12) | bit(x, 3, 13) | bit(y, 4, 14) | bit(x, 6, 15),
+        16 => bit(y, 2, 12) | bit(x, 2, 13) | bit(y, 3, 14) | bit(x, 4, 15),
+        else => unreachable,
+    };
+    return low | pipes | high;
 }
 
 /// GFX10_CMASK_SW_PATTERN[15], expressed as the nibble rather than byte
@@ -2536,7 +2572,7 @@ test "block layouts and fixed AddrLib vectors match PS5 Gen5" {
     try testing.expectEqual(@as(u32, 0x8000), try standard.byteOffset(64, 0));
     try testing.expectEqual(@as(u32, 0x8100), try prt.byteOffset(64, 0));
     try testing.expectEqual(@as(u32, 0x0800), try color.blockXor(0, 0, 1));
-    try testing.expectEqual(@as(u32, 0x0008), try color_bytes.byteOffset(8, 0));
+    try testing.expectEqual(@as(u32, 0x0140), try color_bytes.byteOffset(8, 0));
     try testing.expectEqual(@as(u32, 0x0600), try depth.blockXor(0, 0, 15));
     try testing.expectEqual(@as(u32, 0x009c), try depth.byteOffset(3, 5));
     try testing.expectError(Error.UnsupportedElementSize, BlockLayout.init(.depth, 16));
@@ -3030,7 +3066,7 @@ test "Oberon RB+ MSAA keeps color planes and depth samples exact" {
     }
 }
 
-test "RB+ single-sample pattern decoder preserves the established PS5 vectors" {
+test "single-sample block and subresource address paths agree" {
     for ([_]resources.TileMode{ .render_target, .depth }) |mode| {
         for ([_]u8{ 1, 2, 4, 8 }) |bytes| {
             const legacy = try BlockLayout.init(mode, bytes);
@@ -3045,6 +3081,68 @@ test "RB+ single-sample pattern decoder preserves the established PS5 vectors" {
                     );
                 }
             }
+        }
+    }
+}
+
+test "Gen5 single-sample color addresses match independent AddrLib vectors" {
+    // GFX10_SW_64K_R_X_1xaa_PATINFO's 16-pipe rows, evaluated independently
+    // of this module. Exercise microtile boundaries, pipe XORs and Z3.
+    const coordinates = [_][3]u32{
+        .{ 4, 0, 0 }, .{ 0, 4, 0 },  .{ 8, 0, 0 },    .{ 0, 8, 0 },
+        .{ 0, 0, 1 }, .{ 13, 9, 5 }, .{ 143, 71, 9 }, .{ 439, 4, 4 },
+    };
+    const expected = [5][8]u32{
+        .{ 0x0004, 0x0020, 0x0140, 0x0100, 0x0800, 0x0a55, 0x907f, 0x8827 },
+        .{ 0x0008, 0x0040, 0x0180, 0x0100, 0x0800, 0x0a9a, 0xc0fe, 0x884e },
+        .{ 0x0080, 0x0040, 0x0100, 0x1100, 0x0800, 0x1a94, 0x40fc, 0x28cc },
+        .{ 0x0040, 0x1000, 0x2100, 0x0100, 0x0800, 0x2a58, 0x30f8, 0x1868 },
+        .{ 0x2000, 0x1000, 0x0100, 0x4100, 0x0800, 0x6a30, 0x30f0, 0xb850 },
+    };
+    for ([_]u8{ 1, 2, 4, 8, 16 }, 0..) |bytes, row| {
+        const block = try SwizzleBlock.init(.render_target, bytes, false, 0);
+        for (coordinates, expected[row]) |xyz, offset| {
+            try testing.expectEqual(offset, try block.byteOffset(xyz[0], xyz[1], xyz[2], 0));
+        }
+    }
+}
+
+test "color volume uploads read texels instead of poisoned padding" {
+    const layout = try TextureLayout.init(.{
+        .tile_mode = .render_target,
+        .kind = .volume_3d,
+        .width = 440,
+        .height = 5,
+        .depth_or_layers = 5,
+    }, 4);
+    const view = try layout.base();
+    const source = try testing.allocator.alloc(u8, @intCast(view.required_source_bytes));
+    defer testing.allocator.free(source);
+    const linear = try testing.allocator.alloc(u8, @intCast(try view.stagingBytes()));
+    defer testing.allocator.free(linear);
+    const points = [_]struct { xyz: [3]u32, offset: usize }{
+        .{ .xyz = .{ 0, 0, 0 }, .offset = 0x000000 },
+        .{ .xyz = .{ 4, 1, 0 }, .offset = 0x000090 },
+        .{ .xyz = .{ 8, 4, 0 }, .offset = 0x000140 },
+        .{ .xyz = .{ 17, 2, 1 }, .offset = 0x042a24 },
+        .{ .xyz = .{ 127, 4, 2 }, .offset = 0x08abcc },
+        .{ .xyz = .{ 128, 0, 3 }, .offset = 0x0d0c00 },
+        .{ .xyz = .{ 439, 4, 4 }, .offset = 0x1328cc },
+    };
+    const plan = try view.computePlan(0, 0);
+    // Different stale allocations must not change the addressed texels.
+    for ([_]u8{ 0x80, 0xff }) |padding| {
+        @memset(source, padding);
+        for (points, 0..) |point, index| {
+            std.mem.writeInt(u32, source[point.offset..][0..4], 0x01000000 + @as(u32, @intCast(index)), .little);
+        }
+        try view.detile(source, linear);
+        for (points, 0..) |point, index| {
+            const x, const y, const z = point.xyz;
+            try testing.expectEqual(point.offset, try view.sourceByteOffset(x, y, z, 0));
+            try testing.expectEqual(point.offset, computeSourceOffset(plan.params, x, y, z, 0));
+            const dest = (@as(usize, z) * 5 * 440 + y * 440 + x) * 4;
+            try testing.expectEqual(0x01000000 + @as(u32, @intCast(index)), std.mem.readInt(u32, linear[dest..][0..4], .little));
         }
     }
 }
