@@ -3622,6 +3622,11 @@ fn agcCreateShader(
 
 const shader_special_vgt_stages_offset: usize = 0x08;
 const spi_shader_pgm_chksum_gs: u32 = 0x80;
+const spi_shader_pgm_chksum_hs: u32 = 0x100;
+const spi_shader_pgm_rsrc1_gs: u32 = 0x8a;
+const spi_shader_pgm_rsrc2_gs: u32 = 0x8b;
+const spi_shader_pgm_rsrc1_hs: u32 = 0x10a;
+const spi_shader_pgm_rsrc2_hs: u32 = 0x10b;
 const spi_shader_pgm_lo_es: u32 = 0x0c8;
 const spi_shader_pgm_lo_ls: u32 = 0x148;
 const fused_shader_scratch_align: u64 = 4;
@@ -3656,12 +3661,42 @@ fn agcGetFusedShaderSize(
     return errno.ok;
 }
 
-fn agcFuseShaderHalves(
+/// Raises `destination`'s field to whichever half asks for more of it.
+///
+/// The fused shader runs both halves, so every resource field has to satisfy
+/// the hungrier one. Only the named bits move: the rest of the word carries
+/// float mode, rounding, priority and the debug flags, and a half that asked
+/// for more registers has no business changing those.
+fn mergeMaxShaderField(
+    destination: *align(1) ShaderRegister,
+    source: *align(1) const ShaderRegister,
+    shift: u5,
+    mask: u32,
+) void {
+    const in_destination = (destination.value >> shift) & mask;
+    const in_source = (source.value >> shift) & mask;
+    const wanted = @max(in_destination, in_source);
+    destination.value = (destination.value & ~(mask << shift)) | (wanted << shift);
+}
+
+/// Joins a front and a back shader half into the single object a draw binds.
+///
+/// `recompute_shared_vgprs` is the whole difference between the two exports
+/// that reach this. The newer one reallocates the shared VGPR block from the
+/// two halves' totals and hands back an object with no user data, because it
+/// expects the caller to supply its own. The older one takes whichever half
+/// already asked for more shared VGPRs and keeps the front half's user data, so
+/// an object fused by it can still be drawn on its own. A title picks one or
+/// the other and depends on which it got; aliasing them would leave the newer
+/// callers with a shared VGPR count computed for a different allocation and the
+/// older ones with no user data at all.
+fn fuseShaderHalves(
     fused: ?*anyopaque,
     front: ?*const anyopaque,
     back: ?*const anyopaque,
     scratch: ?*anyopaque,
-) callconv(abi.guest) i32 {
+    recompute_shared_vgprs: bool,
+) i32 {
     const fused_address = @intFromPtr(fused orelse return invalid_argument);
     const front_address = @intFromPtr(front orelse return invalid_argument);
     const back_address = @intFromPtr(back orelse return invalid_argument);
@@ -3679,7 +3714,11 @@ fn agcFuseShaderHalves(
     if (!isFusableShaderPair(front_type, back_type)) return graphics_error_invalid_shader_halves;
 
     const is_geometry = front_type == 4;
-    // Wave32 enable bits in VGT_SHADER_STAGES_EN must agree across halves.
+
+    // The wave size lives in VGT_SHADER_STAGES_EN, one bit per stage: 22 for
+    // the geometry pair, 21 for the hull pair. Two halves compiled for
+    // different wave sizes share registers that mean different things, so the
+    // pair is refused rather than fused into something neither half expects.
     const front_specials = readGuestU64(front_address + shader_specials_offset);
     const back_specials = readGuestU64(back_address + shader_specials_offset);
     if (front_specials != 0 and back_specials != 0) {
@@ -3699,8 +3738,11 @@ fn agcFuseShaderHalves(
     const back_src: [*]const u8 = @ptrFromInt(back_address);
     @memcpy(fused_bytes[0..shader_structure_size], back_src[0..shader_structure_size]);
     fused_bytes[shader_type_offset] = if (is_geometry) 2 else 3;
-    writeGuestU64(fused_address + shader_user_data_offset, 0);
 
+    // Scratch is where the caller puts a private copy of the back half's
+    // register array, sized by GetFusedShaderSize as one entry per back
+    // register. Without it the merge below would edit the back half in place,
+    // and a back half is shared between every front it is fused with.
     const back_registers_address = readGuestU64(back_address + shader_sh_registers_offset);
     const register_count = back_bytes[shader_sh_register_count_offset];
     var fused_registers_address = back_registers_address;
@@ -3720,37 +3762,119 @@ fn agcFuseShaderHalves(
     writeGuestU64(fused_address + shader_sh_registers_offset, fused_registers_address);
 
     const front_code = readGuestU64(front_address + shader_code_offset);
+    const front_registers_address = readGuestU64(front_address + shader_sh_registers_offset);
+    const front_count = front_bytes[shader_sh_register_count_offset];
+
     if (fused_registers_address != 0 and register_count != 0) {
         if (!accessible(fused_registers_address, @as(usize, register_count) * @sizeOf(ShaderRegister))) {
             return errno.KernelError.efault.raw();
         }
         const fused_regs: [*]align(1) ShaderRegister = @ptrFromInt(fused_registers_address);
-        if (is_geometry) {
-            const front_registers_address = readGuestU64(front_address + shader_sh_registers_offset);
-            const front_count = front_bytes[shader_sh_register_count_offset];
-            if (front_registers_address != 0 and front_count != 0 and
-                accessible(front_registers_address, @as(usize, front_count) * @sizeOf(ShaderRegister)))
-            {
-                const front_regs: [*]align(1) ShaderRegister = @ptrFromInt(front_registers_address);
-                for (0..2) |occurrence| {
-                    const dst = findShaderRegister(fused_regs, register_count, spi_shader_pgm_chksum_gs, @intCast(occurrence));
-                    const src = findShaderRegister(front_regs, front_count, spi_shader_pgm_chksum_gs, @intCast(occurrence));
-                    if (dst) |d| {
-                        if (src) |s| d.value = s.value;
-                    }
+
+        const checksum_offset: u32 = if (is_geometry) spi_shader_pgm_chksum_gs else spi_shader_pgm_chksum_hs;
+        const rsrc1_offset: u32 = if (is_geometry) spi_shader_pgm_rsrc1_gs else spi_shader_pgm_rsrc1_hs;
+        const rsrc2_offset: u32 = if (is_geometry) spi_shader_pgm_rsrc2_gs else spi_shader_pgm_rsrc2_hs;
+
+        if (front_registers_address != 0 and front_count != 0 and
+            accessible(front_registers_address, @as(usize, front_count) * @sizeOf(ShaderRegister)))
+        {
+            const front_regs: [*]align(1) ShaderRegister = @ptrFromInt(front_registers_address);
+
+            // The checksum identifies the code that will run, and after fusing
+            // that is the front half's program. Both occurrences carry it.
+            for (0..2) |occurrence| {
+                const dst = findShaderRegister(fused_regs, register_count, checksum_offset, @intCast(occurrence));
+                const src = findShaderRegister(front_regs, front_count, checksum_offset, @intCast(occurrence));
+                if (dst) |d| {
+                    if (src) |s| d.value = s.value;
                 }
             }
-            patchShaderRegisterAddress(fused_regs, register_count, spi_shader_pgm_lo_es, front_code);
-        } else {
-            patchShaderRegisterAddress(fused_regs, register_count, spi_shader_pgm_lo_ls, front_code);
+
+            const front_rsrc1 = findShaderRegister(front_regs, front_count, rsrc1_offset, 0);
+            const front_rsrc2 = findShaderRegister(front_regs, front_count, rsrc2_offset, 0);
+            const fused_rsrc1 = findShaderRegister(fused_regs, register_count, rsrc1_offset, 0);
+            const fused_rsrc2 = findShaderRegister(fused_regs, register_count, rsrc2_offset, 0);
+
+            if (front_rsrc1 != null and front_rsrc2 != null and fused_rsrc1 != null and fused_rsrc2 != null) {
+                const f1 = front_rsrc1.?;
+                const f2 = front_rsrc2.?;
+                const d1 = fused_rsrc1.?;
+                const d2 = fused_rsrc2.?;
+
+                if (recompute_shared_vgprs) {
+                    // Read before the VGPR count below is merged: the block is
+                    // sized from what each half asked for on its own.
+                    const front_vgprs = ((f1.value & 0x3f) + 1) * 4;
+                    const back_vgprs = ((d1.value & 0x3f) + 1) * 4;
+                    const front_total = front_vgprs + (f2.value >> 28) * 8;
+                    const back_total = back_vgprs + (d2.value >> 28) * 8;
+                    const largest_total = @max(front_total, back_total);
+                    const shared: u32 = if (@max(front_vgprs, back_vgprs) >= largest_total)
+                        0
+                    else
+                        (largest_total - @min(front_total, back_total) + 7) / 64;
+                    d2.value = (d2.value & 0x0fff_ffff) | ((shared & 0xf) << 28);
+                } else {
+                    mergeMaxShaderField(d2, f2, 28, 0xf);
+                }
+
+                // Vector register count, in units of four.
+                mergeMaxShaderField(d1, f1, 0, 0x3f);
+                if (is_geometry) {
+                    mergeMaxShaderField(d1, f1, 29, 0x3); // GS_VGPR_COMP_CNT
+                    mergeMaxShaderField(d2, f2, 16, 0x3); // ES_VGPR_COMP_CNT
+                    // OC_LDS_EN belongs to the front half outright: it says
+                    // whether the export stage reads off-chip LDS, and only
+                    // the front half knows.
+                    d2.value = (d2.value & 0xfffb_ffff) | (f2.value & 0x0004_0000);
+                } else {
+                    mergeMaxShaderField(d1, f1, 28, 0x3); // LS_VGPR_COMP_CNT
+                }
+                // User SGPR count and its high bit come from the front half,
+                // because the front half is the one that reads them. Scratch
+                // enable and LDS size stay as the back half set them.
+                d2.value = (d2.value & 0xf7ff_ffc1) | (f2.value & 0x0800_003e);
+            }
         }
+
+        patchShaderRegisterAddress(
+            fused_regs,
+            register_count,
+            if (is_geometry) spi_shader_pgm_lo_es else spi_shader_pgm_lo_ls,
+            front_code,
+        );
     }
 
+    // The newer export leaves user data to the caller; the older one keeps the
+    // front half's, so an object fused by it is complete on its own.
+    writeGuestU64(
+        fused_address + shader_user_data_offset,
+        if (recompute_shared_vgprs) 0 else readGuestU64(front_address + shader_user_data_offset),
+    );
+
     // Draw-time lookup keys off the export program address (front code). The
-    // front header still owns user_data / attribute tables after user_data is
-    // cleared on the fused object.
+    // front header still owns user_data / attribute tables whether or not the
+    // fused object carries a copy of the pointer.
     if (front_code != 0) _ = agc_shader_registry.record(front_code, front_address);
     return errno.ok;
+}
+
+fn agcFuseShaderHalves(
+    fused: ?*anyopaque,
+    front: ?*const anyopaque,
+    back: ?*const anyopaque,
+    scratch: ?*anyopaque,
+) callconv(abi.guest) i32 {
+    return fuseShaderHalves(fused, front, back, scratch, true);
+}
+
+fn agcFuseShaderHalvesKeepingUserData(
+    fused: ?*anyopaque,
+    front: ?*const anyopaque,
+    back: ?*const anyopaque,
+    scratch: ?*anyopaque,
+) callconv(abi.guest) i32 {
+    return fuseShaderHalves(fused, front, back, scratch, false);
 }
 
 fn agcCreatePrimState(
@@ -3917,6 +4041,7 @@ const agc_exports = [_]symbols.Export{
     .{ .name = "sceAgcCreateShader", .function = trace.wrap("sceAgcCreateShader", &agcCreateShader), .expect_id = "f3dg2CSgRKY" },
     .{ .name = "sceAgcUnknownGetFusedShaderSize", .function = trace.wrap("sceAgcUnknownGetFusedShaderSize", &agcGetFusedShaderSize), .id_override = "dolOmWH+huQ" },
     .{ .name = "sceAgcUnknownFuseShaderHalves", .function = trace.wrap("sceAgcUnknownFuseShaderHalves", &agcFuseShaderHalves), .id_override = "fd5Bp5tGTgo" },
+    .{ .name = "sceAgcUnknownFuseShaderHalvesKeepingUserData", .function = trace.wrap("sceAgcUnknownFuseShaderHalvesKeepingUserData", &agcFuseShaderHalvesKeepingUserData), .id_override = "nApJjpKNBl4" },
     .{ .name = "sceAgcSetCxRegIndirectPatchSetAddress", .function = trace.wrap("sceAgcSetCxRegIndirectPatchSetAddress", &agcSetCxRegIndirectPatchSetAddress), .expect_id = "vcmNN+AAXnY" },
     .{ .name = "sceAgcSetShRegIndirectPatchSetAddress", .function = trace.wrap("sceAgcSetShRegIndirectPatchSetAddress", &agcSetShRegIndirectPatchSetAddress), .expect_id = "Qrj4c+61z4A" },
     .{ .name = "sceAgcSetUcRegIndirectPatchSetAddress", .function = trace.wrap("sceAgcSetUcRegIndirectPatchSetAddress", &agcSetUcRegIndirectPatchSetAddress), .expect_id = "6lNcCp+fxi4" },

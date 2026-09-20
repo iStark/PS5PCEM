@@ -1962,3 +1962,359 @@ test "a COPY_DATA this does not move yet copies nothing and says so" {
     try testing.expectEqual(@as(u64, 1), state.copy_data_unsupported_count);
     try testing.expectEqual(gpu.state.CopyData.Selector.gds, state.last_copy.?.source);
 }
+
+// ---------------------------------------------------------------------------
+// Fusing shader halves
+//
+// A geometry or hull shader arrives as two objects and is drawn as one. Two
+// exports do the joining and differ in exactly two places, so these drive both
+// through the registry and compare them against each other rather than against
+// a transcription of either.
+
+const AgcFuse = fn (
+    ?*anyopaque,
+    ?*const anyopaque,
+    ?*const anyopaque,
+    ?*anyopaque,
+) callconv(abi.guest) i32;
+
+const AgcFusedSize = fn (?*anyopaque, ?*const anyopaque, ?*const anyopaque) callconv(abi.guest) i32;
+
+/// The shader header, as the library lays it out.
+const shader_bytes: usize = 0x60;
+const user_data_at: usize = 0x08;
+const code_at: usize = 0x10;
+const sh_registers_at: usize = 0x20;
+const specials_at: usize = 0x28;
+const type_at: usize = 0x5a;
+const sh_register_count_at: usize = 0x5c;
+
+/// Binary types: the two halves of each pair, and what they fuse into.
+const gs_front: u8 = 4;
+const gs_back: u8 = 6;
+const hs_front: u8 = 5;
+const hs_back: u8 = 7;
+const gs_fused: u8 = 2;
+const hs_fused: u8 = 3;
+
+const chksum_gs: u32 = 0x80;
+const rsrc1_gs: u32 = 0x8a;
+const rsrc2_gs: u32 = 0x8b;
+const lo_es: u32 = 0xc8;
+const chksum_hs: u32 = 0x100;
+const rsrc1_hs: u32 = 0x10a;
+const rsrc2_hs: u32 = 0x10b;
+const lo_ls: u32 = 0x148;
+
+const FuseRegister = extern struct { offset: u32, value: u32 };
+
+const ShaderHeader = extern struct {
+    bytes: [shader_bytes]u8 align(8) = @splat(0),
+
+    fn address(self: *ShaderHeader) usize {
+        return @intFromPtr(&self.bytes);
+    }
+
+    fn put(self: *ShaderHeader, offset: usize, value: u64) void {
+        const std = @import("std");
+        std.mem.writeInt(u64, self.bytes[offset..][0..8], value, .little);
+    }
+
+    fn get(self: *const ShaderHeader, offset: usize) u64 {
+        const std = @import("std");
+        return std.mem.readInt(u64, self.bytes[offset..][0..8], .little);
+    }
+
+    fn describe(
+        self: *ShaderHeader,
+        binary_type: u8,
+        registers: []FuseRegister,
+        specials: ?*const anyopaque,
+        code: ?*const anyopaque,
+    ) void {
+        self.bytes[type_at] = binary_type;
+        self.bytes[sh_register_count_at] = @intCast(registers.len);
+        self.put(sh_registers_at, @intFromPtr(registers.ptr));
+        self.put(specials_at, if (specials) |s| @intFromPtr(s) else 0);
+        self.put(code_at, if (code) |c| @intFromPtr(c) else 0);
+    }
+};
+
+/// VGT_SHADER_STAGES_EN sits at +0x08 of the specials array, so the wave-size
+/// bit lands in the second register's value.
+const Specials = extern struct {
+    entries: [8]FuseRegister = @splat(.{ .offset = 0, .value = 0 }),
+
+    fn withStages(value: u32) Specials {
+        var self = Specials{};
+        self.entries[1] = .{ .offset = 0, .value = value };
+        return self;
+    }
+};
+
+fn findFused(registers: []const FuseRegister, offset: u32) ?FuseRegister {
+    for (registers) |entry| {
+        if (entry.offset == offset) return entry;
+    }
+    return null;
+}
+
+test "both fuse exports join a geometry pair and differ only where they should" {
+    const std = @import("std");
+    const testing = std.testing;
+
+    var db = Database{};
+    defer db.deinit(testing.allocator);
+    try registerAll(&db, testing.allocator);
+
+    const reallocating = try agcEntryPoint(&db, "fd5Bp5tGTgo", AgcFuse);
+    const keeping = try agcEntryPoint(&db, "nApJjpKNBl4", AgcFuse);
+
+    for ([_]struct { fuse: *const AgcFuse, recomputes: bool }{
+        .{ .fuse = reallocating, .recomputes = true },
+        .{ .fuse = keeping, .recomputes = false },
+    }) |form| {
+        var code: [16]u8 align(256) = @splat(0);
+        var user_data: [8]u64 = @splat(0);
+
+        // The front half wants more vector registers and more shared ones; the
+        // back half wants more of the export component count. A fused object
+        // has to satisfy both.
+        var front_registers = [_]FuseRegister{
+            .{ .offset = chksum_gs, .value = 0x1111_1111 },
+            .{ .offset = chksum_gs, .value = 0x2222_2222 },
+            // VGPRS = 7, GS_VGPR_COMP_CNT = 2, plus float-mode bits that must
+            // survive untouched.
+            .{ .offset = rsrc1_gs, .value = 0x4000_5007 | (@as(u32, 2) << 29) },
+            // USER_SGPR = 9, OC_LDS_EN set, ES comp = 1, and a large shared
+            // block so the two exports visibly disagree about it.
+            .{ .offset = rsrc2_gs, .value = (9 << 1) | (1 << 18) | (15 << 28) | (1 << 16) },
+        };
+        var back_registers = [_]FuseRegister{
+            .{ .offset = lo_es, .value = 0 },
+            .{ .offset = lo_es + 1, .value = 0 },
+            .{ .offset = chksum_gs, .value = 0 },
+            .{ .offset = chksum_gs, .value = 0 },
+            // VGPRS = 3, comp count 0, different float mode bits.
+            .{ .offset = rsrc1_gs, .value = 0x0080_9003 },
+            // USER_SGPR = 2, no OC_LDS, SHARED_VGPR_CNT = 1, ES comp = 3,
+            // LDS_SIZE and SCRATCH_EN set so they can be shown to survive.
+            .{ .offset = rsrc2_gs, .value = 1 | (2 << 1) | (3 << 16) | (0x5a << 19) | (1 << 28) },
+        };
+
+        const stages = Specials.withStages(1 << 22);
+        var front = ShaderHeader{};
+        var back = ShaderHeader{};
+        var fused = ShaderHeader{};
+        front.describe(gs_front, &front_registers, &stages, &code);
+        front.put(user_data_at, @intFromPtr(&user_data));
+        back.describe(gs_back, &back_registers, &stages, null);
+
+        var scratch: [back_registers.len]FuseRegister = undefined;
+        try testing.expectEqual(errno.ok, form.fuse(&fused.bytes, &front.bytes, &back.bytes, &scratch));
+
+        // The fused object is a geometry shader built on the scratch copy, so
+        // the back half's own registers are untouched and can be fused again.
+        try testing.expectEqual(gs_fused, fused.bytes[type_at]);
+        try testing.expectEqual(@as(u64, @intFromPtr(&scratch)), fused.get(sh_registers_at));
+        try testing.expectEqual(@as(u32, 0x0080_9003), back_registers[4].value);
+
+        // Checksums name the code that will run, which is the front half's.
+        try testing.expectEqual(@as(u32, 0x1111_1111), scratch[2].value);
+        try testing.expectEqual(@as(u32, 0x2222_2222), scratch[3].value);
+
+        const rsrc1 = findFused(&scratch, rsrc1_gs).?;
+        const rsrc2 = findFused(&scratch, rsrc2_gs).?;
+
+        // Vector count and component counts take whichever half asked for more.
+        try testing.expectEqual(@as(u32, 7), rsrc1.value & 0x3f);
+        try testing.expectEqual(@as(u32, 2), (rsrc1.value >> 29) & 0x3);
+        try testing.expectEqual(@as(u32, 3), (rsrc2.value >> 16) & 0x3);
+        // The back half's unrelated RSRC1 bits are still there. Masked to the
+        // span between the vector count and the component count, because those
+        // two are exactly what the merge above is allowed to touch.
+        try testing.expectEqual(@as(u32, 0x0080_9000), rsrc1.value & 0x1fff_ffc0);
+        // User SGPR count comes from the front half; OC_LDS_EN with it.
+        try testing.expectEqual(@as(u32, 9), (rsrc2.value >> 1) & 0x1f);
+        try testing.expectEqual(@as(u32, 1), (rsrc2.value >> 18) & 0x1);
+        // Scratch enable and LDS size belong to the back half and stay.
+        try testing.expectEqual(@as(u32, 1), rsrc2.value & 0x1);
+        try testing.expectEqual(@as(u32, 0x5a), (rsrc2.value >> 19) & 0xff);
+        // The export program address is the front half's code.
+        try testing.expectEqual(@as(u32, @truncate(@intFromPtr(&code) >> 8)), scratch[0].value);
+
+        // And here the two exports part company.
+        const shared = (rsrc2.value >> 28) & 0xf;
+        if (form.recomputes) {
+            // The front half needs 32 vector registers plus a 15-unit shared
+            // block, so 152 in total; the back half needs 16 plus one unit, so
+            // 24. Neither half's plain count covers 152 on its own, and the
+            // shortfall rounds up to two units of the shared block.
+            try testing.expectEqual(@as(u32, 2), shared);
+            try testing.expectEqual(@as(u64, 0), fused.get(user_data_at));
+        } else {
+            // No recomputation: whichever half already asked for more.
+            try testing.expectEqual(@as(u32, 15), shared);
+            try testing.expectEqual(@as(u64, @intFromPtr(&user_data)), fused.get(user_data_at));
+        }
+    }
+}
+
+test "both fuse exports join a hull pair through its own registers" {
+    const std = @import("std");
+    const testing = std.testing;
+
+    var db = Database{};
+    defer db.deinit(testing.allocator);
+    try registerAll(&db, testing.allocator);
+
+    inline for ([_]*const [nid.encoded_len:0]u8{ "fd5Bp5tGTgo", "nApJjpKNBl4" }) |id| {
+        const fuse = try agcEntryPoint(&db, id, AgcFuse);
+
+        var code: [16]u8 align(256) = @splat(0);
+        var front_registers = [_]FuseRegister{
+            .{ .offset = chksum_hs, .value = 0xabcd_ef01 },
+            .{ .offset = chksum_hs, .value = 0x2345_6789 },
+            // LS_VGPR_COMP_CNT lives at bit 28 for a hull pair, not 29.
+            .{ .offset = rsrc1_hs, .value = 5 | (@as(u32, 3) << 28) },
+            .{ .offset = rsrc2_hs, .value = 4 << 1 },
+        };
+        var back_registers = [_]FuseRegister{
+            .{ .offset = lo_ls, .value = 0 },
+            .{ .offset = lo_ls + 1, .value = 0 },
+            .{ .offset = chksum_hs, .value = 0 },
+            .{ .offset = chksum_hs, .value = 0 },
+            .{ .offset = rsrc1_hs, .value = 9 },
+            .{ .offset = rsrc2_hs, .value = 0 },
+        };
+
+        const stages = Specials.withStages(1 << 21);
+        var front = ShaderHeader{};
+        var back = ShaderHeader{};
+        var fused = ShaderHeader{};
+        front.describe(hs_front, &front_registers, &stages, &code);
+        back.describe(hs_back, &back_registers, &stages, null);
+
+        var scratch: [back_registers.len]FuseRegister = undefined;
+        try testing.expectEqual(errno.ok, fuse(&fused.bytes, &front.bytes, &back.bytes, &scratch));
+
+        try testing.expectEqual(hs_fused, fused.bytes[type_at]);
+        // The hull checksum register, not the geometry one.
+        try testing.expectEqual(@as(u32, 0xabcd_ef01), scratch[2].value);
+        try testing.expectEqual(@as(u32, 0x2345_6789), scratch[3].value);
+
+        const rsrc1 = findFused(&scratch, rsrc1_hs).?;
+        try testing.expectEqual(@as(u32, 9), rsrc1.value & 0x3f);
+        try testing.expectEqual(@as(u32, 3), (rsrc1.value >> 28) & 0x3);
+        // Bit 29 is part of the hull component count; bit 31 is not touched.
+        try testing.expectEqual(@as(u32, 0), (rsrc1.value >> 30) & 0x3);
+        // The hull program address goes to LO_LS.
+        try testing.expectEqual(@as(u32, @truncate(@intFromPtr(&code) >> 8)), scratch[0].value);
+    }
+}
+
+test "the fused object reports the scratch it needs and works without it" {
+    const std = @import("std");
+    const testing = std.testing;
+
+    var db = Database{};
+    defer db.deinit(testing.allocator);
+    try registerAll(&db, testing.allocator);
+
+    const size_of = try agcEntryPoint(&db, "dolOmWH+huQ", AgcFusedSize);
+    const fuse = try agcEntryPoint(&db, "nApJjpKNBl4", AgcFuse);
+
+    var front_registers = [_]FuseRegister{.{ .offset = rsrc1_gs, .value = 1 }};
+    var back_registers = [_]FuseRegister{
+        .{ .offset = lo_es, .value = 0 },
+        .{ .offset = lo_es + 1, .value = 0 },
+        .{ .offset = rsrc1_gs, .value = 7 },
+    };
+
+    var front = ShaderHeader{};
+    var back = ShaderHeader{};
+    var fused = ShaderHeader{};
+    front.describe(gs_front, &front_registers, null, null);
+    back.describe(gs_back, &back_registers, null, null);
+
+    // One entry per back register, four-byte aligned: the scratch is a private
+    // copy of the back half's array and nothing else.
+    const SizeAlign = extern struct { size: u64, align_bytes: u64 };
+    var reported: SizeAlign = .{ .size = 0, .align_bytes = 0 };
+    try testing.expectEqual(errno.ok, size_of(&reported, &front.bytes, &back.bytes));
+    try testing.expectEqual(@as(u64, back_registers.len * @sizeOf(FuseRegister)), reported.size);
+    try testing.expectEqual(@as(u64, 4), reported.align_bytes);
+
+    // Given none, the merge lands in the back half's own array, which the
+    // caller then owns the consequences of.
+    try testing.expectEqual(errno.ok, fuse(&fused.bytes, &front.bytes, &back.bytes, null));
+    try testing.expectEqual(@as(u64, @intFromPtr(&back_registers)), fused.get(sh_registers_at));
+    try testing.expectEqual(@as(u32, 7), back_registers[2].value & 0x3f);
+
+    // Given scratch of the reported size, the back half is left alone.
+    back_registers[2].value = 7;
+    var scratch: [back_registers.len]FuseRegister = undefined;
+    try testing.expectEqual(errno.ok, fuse(&fused.bytes, &front.bytes, &back.bytes, &scratch));
+    try testing.expectEqual(@as(u64, @intFromPtr(&scratch)), fused.get(sh_registers_at));
+    try testing.expectEqual(@as(u32, 7), back_registers[2].value);
+}
+
+test "halves that do not belong together are refused by both exports" {
+    const std = @import("std");
+    const testing = std.testing;
+
+    var db = Database{};
+    defer db.deinit(testing.allocator);
+    try registerAll(&db, testing.allocator);
+
+    const size_of = try agcEntryPoint(&db, "dolOmWH+huQ", AgcFusedSize);
+    const invalid_halves: i32 = @bitCast(@as(u32, 0x8a6c_0008));
+
+    inline for ([_]*const [nid.encoded_len:0]u8{ "fd5Bp5tGTgo", "nApJjpKNBl4" }) |id| {
+        const fuse = try agcEntryPoint(&db, id, AgcFuse);
+
+        var registers = [_]FuseRegister{.{ .offset = rsrc1_gs, .value = 0 }};
+        var front = ShaderHeader{};
+        var back = ShaderHeader{};
+        var fused = ShaderHeader{};
+
+        // A geometry front with a hull back, and the two crossings of that.
+        const mismatches = [_]struct { front: u8, back: u8 }{
+            .{ .front = gs_front, .back = hs_back },
+            .{ .front = hs_front, .back = gs_back },
+            .{ .front = gs_back, .back = gs_back },
+            .{ .front = gs_front, .back = gs_front },
+        };
+        for (mismatches) |pair| {
+            front.describe(pair.front, &registers, null, null);
+            back.describe(pair.back, &registers, null, null);
+            try testing.expectEqual(invalid_halves, fuse(&fused.bytes, &front.bytes, &back.bytes, null));
+            try testing.expectEqual(invalid_halves, size_of(&fused.bytes, &front.bytes, &back.bytes));
+        }
+
+        // A matched pair compiled for different wave sizes is refused too: the
+        // stage bit says wave32 on one half and wave64 on the other, and the
+        // registers below it would mean different things.
+        const wave32 = Specials.withStages(1 << 22);
+        const wave64 = Specials{};
+        front.describe(gs_front, &registers, &wave32, null);
+        back.describe(gs_back, &registers, &wave64, null);
+        try testing.expectEqual(invalid_halves, fuse(&fused.bytes, &front.bytes, &back.bytes, null));
+
+        // The same pair agreeing on the wave size fuses.
+        back.describe(gs_back, &registers, &wave32, null);
+        try testing.expectEqual(errno.ok, fuse(&fused.bytes, &front.bytes, &back.bytes, null));
+
+        // A hull pair is checked on its own bit, so the geometry bit differing
+        // does not refuse it.
+        const hull_stages = Specials.withStages(1 << 21);
+        const hull_other = Specials.withStages((1 << 21) | (1 << 22));
+        front.describe(hs_front, &registers, &hull_stages, null);
+        back.describe(hs_back, &registers, &hull_other, null);
+        try testing.expectEqual(errno.ok, fuse(&fused.bytes, &front.bytes, &back.bytes, null));
+
+        try testing.expectEqual(errno.KernelError.einval.raw(), fuse(null, &front.bytes, &back.bytes, null));
+        try testing.expectEqual(errno.KernelError.einval.raw(), fuse(&fused.bytes, null, &back.bytes, null));
+        try testing.expectEqual(errno.KernelError.einval.raw(), fuse(&fused.bytes, &front.bytes, null, null));
+    }
+}
