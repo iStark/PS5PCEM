@@ -3946,6 +3946,83 @@ fn agcFuseShaderHalvesKeepingUserData(
     return fuseShaderHalves(fused, front, back, scratch, false);
 }
 
+/// The topology a geometry stage emits for a given input topology.
+///
+/// The two are different fields with different encodings, and treating them as
+/// the same number is the mistake this table exists to prevent: a point list is
+/// input 1 and output 0, a rectangle list is input 7 and output 3, and the
+/// legacy rectangle list is input 17 and output 4. Everything that is not a
+/// point, a line or a rectangle emits triangles.
+fn gsOutputPrimitiveType(primitive_type: u32) u32 {
+    return switch (primitive_type) {
+        1 => 0, // point list -> points
+        // Every line form, adjacent or looped, still emits lines.
+        2, 3, 10, 11, 18 => 1,
+        7 => 3, // rectangle list -> 2D rectangle
+        17 => 4, // legacy rectangle list -> rectangle list
+        else => 2, // triangles, patches, quads and polygons
+    };
+}
+
+/// Whether the hardware has a name for this input topology.
+///
+/// The field is five bits wide, so an unnamed value would not be rejected by
+/// the register write -- it would alias onto a topology the title did not ask
+/// for. Refusing it says so instead.
+fn isKnownPrimitiveType(primitive_type: u32) bool {
+    return switch (primitive_type) {
+        0...7, 9...13, 17...21 => true,
+        else => false,
+    };
+}
+
+/// VGT_SHADER_STAGES_EN: HS_EN at bit 2, GS_EN at bit 5.
+const shader_stages_owning_output: u32 = 0x24;
+
+/// Re-points an existing primitive state at a different topology.
+///
+/// The arrays are the ones `sceAgcCreatePrimState` filled: two context
+/// registers, VGT_SHADER_STAGES_EN then VGT_GS_OUT_PRIM_TYPE, and three
+/// uconfig registers ending in VGT_PRIMITIVE_TYPE. Only the topology fields
+/// move; the register offsets and every other bit in those words are what the
+/// creating call worked out from the shaders and must survive.
+///
+/// The output topology is only rewritten when no stage owns it. A geometry
+/// shader emits whatever it was compiled to emit, and a hull shader hands the
+/// tessellator's output on, so with either enabled the input topology says
+/// nothing about what leaves the pipeline.
+fn agcUpdatePrimState(
+    cx_registers: ?[*]ShaderRegister,
+    uc_registers: ?[*]ShaderRegister,
+    primitive_type: u32,
+) callconv(abi.guest) i32 {
+    if (!isKnownPrimitiveType(primitive_type)) return invalid_argument;
+
+    // Both arrays are checked before either is touched, so a caller that
+    // passes one good array and one bad one gets an error and an unchanged
+    // state rather than half an update.
+    if (cx_registers) |cx| {
+        if (!accessible(@intFromPtr(cx), 2 * @sizeOf(ShaderRegister))) {
+            return errno.KernelError.efault.raw();
+        }
+    }
+    if (uc_registers) |uc| {
+        if (!accessible(@intFromPtr(uc), 3 * @sizeOf(ShaderRegister))) {
+            return errno.KernelError.efault.raw();
+        }
+    }
+
+    if (cx_registers) |cx| {
+        if (cx[0].value & shader_stages_owning_output == 0) {
+            cx[1].value = (cx[1].value & ~@as(u32, 0x7)) | gsOutputPrimitiveType(primitive_type);
+        }
+    }
+    if (uc_registers) |uc| {
+        uc[2].value = (uc[2].value & ~@as(u32, 0x1f)) | primitive_type;
+    }
+    return errno.ok;
+}
+
 fn agcCreatePrimState(
     cx_registers: ?[*]ShaderRegister,
     uc_registers: ?[*]ShaderRegister,
@@ -4188,6 +4265,7 @@ const agc_exports = [_]symbols.Export{
     // outright rather than derived from a guess at the name.
     .{ .name = "sceAgcDcbContextStateOp", .function = trace.wrap("sceAgcDcbContextStateOp", &agcDcbContextStateOp), .id_override = "qj7QZpgr9Uw" },
     .{ .name = "sceAgcDcbContextStateOpGetSize", .function = trace.wrap("sceAgcDcbContextStateOpGetSize", &agcDcbContextStateOpGetSize), .expect_id = "H6vHS5cidSA" },
+    .{ .name = "sceAgcUpdatePrimState", .function = trace.wrap("sceAgcUpdatePrimState", &agcUpdatePrimState), .expect_id = "Y3ymLfZ1384" },
     .{ .name = "sceAgcDcbCopyDataGetSize", .function = trace.wrap("sceAgcDcbCopyDataGetSize", &agcCopyDataGetSize), .expect_id = "b5u0Jzm8TF8" },
     .{ .name = "sceAgcAcbCopyDataGetSize", .function = trace.wrap("sceAgcAcbCopyDataGetSize", &agcCopyDataGetSize), .expect_id = "CbQh3DKMSno" },
     .{ .name = "sceAgcCbSetShRegistersDirectGetSize", .function = trace.wrap("sceAgcCbSetShRegistersDirectGetSize", &agcSetRegistersDirectGetSize), .expect_id = "yUBESvCCJ4I" },

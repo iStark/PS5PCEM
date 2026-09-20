@@ -2764,3 +2764,330 @@ test "context stack faults stop the submission before an outer pop or draw" {
         try testing.expectEqual(@as(usize, 0), scheduler.pendingCount(.graphics));
     }
 }
+
+// ---------------------------------------------------------------------------
+// Primitive state
+//
+// The state a draw runs under is two small register arrays the title fills
+// once and re-points at a new topology as it goes. These check the arrays and
+// then check that what ends up in front of a draw is what the arrays said.
+
+const AgcUpdatePrim = fn (
+    ?[*]PrimRegister,
+    ?[*]PrimRegister,
+    u32,
+) callconv(abi.guest) i32;
+
+const PrimRegister = extern struct { offset: u32, value: u32 };
+
+/// VGT_SHADER_STAGES_EN is context 0x2d5; HS_EN is bit 2 and GS_EN is bit 5.
+const stages_register: u32 = 0x2d5;
+const hull_stage_enabled: u32 = 1 << 2;
+const geometry_stage_enabled: u32 = 1 << 5;
+/// VGT_GS_OUT_PRIM_TYPE, as `sceAgcCreatePrimState` leaves it.
+const gs_out_register: u32 = 0x29b;
+/// VGT_PRIMITIVE_TYPE.
+const primitive_register: u32 = 0x242;
+
+/// Context and uconfig arrays with recognisable bits around the fields that
+/// the update is allowed to move.
+fn primContext(stages: u32) [2]PrimRegister {
+    return .{
+        .{ .offset = stages_register, .value = stages },
+        .{ .offset = gs_out_register, .value = 0xabcd_ef00 | 2 },
+    };
+}
+
+fn primUconfig(primitive_type: u32) [3]PrimRegister {
+    return .{
+        .{ .offset = 0x2ff, .value = 0x1111_1111 },
+        .{ .offset = 0x2fe, .value = 0x2222_2222 },
+        .{ .offset = primitive_register, .value = 0x7654_3200 | primitive_type },
+    };
+}
+
+test "updating primitive state rewrites both topologies and nothing else" {
+    const std = @import("std");
+    const testing = std.testing;
+
+    var db = Database{};
+    defer db.deinit(testing.allocator);
+    try registerAll(&db, testing.allocator);
+
+    const update = try agcEntryPoint(&db, "Y3ymLfZ1384", AgcUpdatePrim);
+
+    // Input topology and the geometry output it implies. The two columns are
+    // deliberately different numbers.
+    const cases = [_]struct { input: u32, gs_out: u32 }{
+        .{ .input = 1, .gs_out = 0 }, // points
+        .{ .input = 2, .gs_out = 1 }, // line list
+        .{ .input = 3, .gs_out = 1 }, // line strip
+        .{ .input = 18, .gs_out = 1 }, // line loop
+        .{ .input = 10, .gs_out = 1 }, // line list with adjacency
+        .{ .input = 4, .gs_out = 2 }, // triangle list
+        .{ .input = 6, .gs_out = 2 }, // triangle strip
+        .{ .input = 12, .gs_out = 2 }, // triangle list with adjacency
+        .{ .input = 9, .gs_out = 2 }, // patches
+        .{ .input = 7, .gs_out = 3 }, // rectangle list
+        .{ .input = 17, .gs_out = 4 }, // legacy rectangle list
+        .{ .input = 21, .gs_out = 2 }, // polygon
+    };
+
+    for (cases) |case| {
+        var cx = primContext(0);
+        var uc = primUconfig(4);
+        try testing.expectEqual(errno.ok, update(&cx, &uc, case.input));
+
+        try testing.expectEqual(case.gs_out, cx[1].value & 0x7);
+        try testing.expectEqual(case.input, uc[2].value & 0x1f);
+
+        // Offsets and every bit outside the two fields are untouched.
+        try testing.expectEqual(stages_register, cx[0].offset);
+        try testing.expectEqual(gs_out_register, cx[1].offset);
+        try testing.expectEqual(primitive_register, uc[2].offset);
+        try testing.expectEqual(@as(u32, 0), cx[0].value);
+        try testing.expectEqual(@as(u32, 0xabcd_ef00), cx[1].value & ~@as(u32, 0x7));
+        try testing.expectEqual(@as(u32, 0x7654_3200), uc[2].value & ~@as(u32, 0x1f));
+        try testing.expectEqual(@as(u32, 0x1111_1111), uc[0].value);
+        try testing.expectEqual(@as(u32, 0x2222_2222), uc[1].value);
+    }
+}
+
+test "a stage that owns the output topology keeps it" {
+    const std = @import("std");
+    const testing = std.testing;
+
+    var db = Database{};
+    defer db.deinit(testing.allocator);
+    try registerAll(&db, testing.allocator);
+
+    const update = try agcEntryPoint(&db, "Y3ymLfZ1384", AgcUpdatePrim);
+
+    // A geometry shader emits what it was compiled to emit, and a hull shader
+    // hands the tessellator's output on. In both cases the input topology says
+    // nothing about what leaves the pipeline, so the field must not move.
+    for ([_]u32{
+        geometry_stage_enabled,
+        hull_stage_enabled,
+        geometry_stage_enabled | hull_stage_enabled,
+    }) |stages| {
+        var cx = primContext(stages);
+        var uc = primUconfig(4);
+        const before = cx[1].value;
+
+        try testing.expectEqual(errno.ok, update(&cx, &uc, 1));
+        try testing.expectEqual(before, cx[1].value);
+        // The input topology still changes: that is what the draw is issued as.
+        try testing.expectEqual(@as(u32, 1), uc[2].value & 0x1f);
+    }
+
+    // With other stage bits set but neither of those two, the field moves.
+    var cx = primContext(0x0220_2000 | (1 << 3));
+    var uc = primUconfig(4);
+    try testing.expectEqual(errno.ok, update(&cx, &uc, 1));
+    try testing.expectEqual(@as(u32, 0), cx[1].value & 0x7);
+}
+
+test "primitive state refuses arguments it cannot honour" {
+    const std = @import("std");
+    const testing = std.testing;
+
+    var db = Database{};
+    defer db.deinit(testing.allocator);
+    try registerAll(&db, testing.allocator);
+
+    const update = try agcEntryPoint(&db, "Y3ymLfZ1384", AgcUpdatePrim);
+
+    // Either array on its own is enough, and neither is required.
+    var cx = primContext(0);
+    var uc = primUconfig(4);
+    try testing.expectEqual(errno.ok, update(&cx, null, 1));
+    try testing.expectEqual(@as(u32, 0), cx[1].value & 0x7);
+    try testing.expectEqual(errno.ok, update(null, &uc, 2));
+    try testing.expectEqual(@as(u32, 2), uc[2].value & 0x1f);
+    try testing.expectEqual(errno.ok, update(null, null, 4));
+
+    // The field is five bits wide, so an unnamed topology would alias onto one
+    // the title did not ask for. It is refused, and nothing is written.
+    for ([_]u32{ 8, 14, 15, 16, 22, 32, 0xffff_ffff }) |unknown| {
+        var guard_cx = primContext(0);
+        var guard_uc = primUconfig(4);
+        const cx_before = guard_cx[1].value;
+        const uc_before = guard_uc[2].value;
+        try testing.expectEqual(errno.KernelError.einval.raw(), update(&guard_cx, &guard_uc, unknown));
+        try testing.expectEqual(cx_before, guard_cx[1].value);
+        try testing.expectEqual(uc_before, guard_uc[2].value);
+    }
+
+    // Every named topology is accepted.
+    for ([_]u32{ 0, 1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 17, 18, 19, 20, 21 }) |known| {
+        var ok_cx = primContext(0);
+        var ok_uc = primUconfig(4);
+        try testing.expectEqual(errno.ok, update(&ok_cx, &ok_uc, known));
+    }
+}
+
+test "a bad second array leaves the first one alone" {
+    const std = @import("std");
+    const guest_memory = @import("memory");
+    const kernel_memory = libs.kernel_memory;
+    const testing = std.testing;
+
+    var db = Database{};
+    defer db.deinit(testing.allocator);
+    try registerAll(&db, testing.allocator);
+
+    const update = try agcEntryPoint(&db, "Y3ymLfZ1384", AgcUpdatePrim);
+    const efault = errno.KernelError.efault.raw();
+
+    // A real address space, because without one every pointer is readable and
+    // the check under test never fires. One mapped page, and arrays placed
+    // against its far edge so the second one runs off the end.
+    var address_space = try guest_memory.AddressSpace.initWithDirectMemory(
+        testing.allocator,
+        16 * kernel_memory.page_size,
+    );
+    defer address_space.deinit();
+    kernel_memory.init(testing.allocator);
+    defer kernel_memory.deinit();
+    kernel_memory.attachAddressSpace(&address_space);
+    defer kernel_memory.attachAddressSpace(null);
+
+    const page = kernel_memory.page_size;
+    const base = guest_memory.user.start;
+    try address_space.mapFixed(base, page, .{ .read = true, .write = true }, .direct_memory, 0);
+
+    const entry_size = @sizeOf(PrimRegister);
+
+    // The context array sits comfortably inside the page.
+    const cx: [*]PrimRegister = @ptrFromInt(base);
+    cx[0] = .{ .offset = stages_register, .value = 0 };
+    cx[1] = .{ .offset = gs_out_register, .value = 0xabcd_ef00 | 2 };
+    const cx_before = cx[1].value;
+
+    // The uconfig array starts one entry short of the end, so its third entry
+    // is past the mapping: readable memory that is not long enough.
+    const truncated: [*]PrimRegister = @ptrFromInt(base + page - entry_size);
+    try testing.expectEqual(efault, update(cx, truncated, 1));
+    try testing.expectEqual(cx_before, cx[1].value);
+
+    // The other way round: a truncated context array must not let the uconfig
+    // one be written either.
+    const uc: [*]PrimRegister = @ptrFromInt(base + 0x100);
+    uc[0] = .{ .offset = 0x2ff, .value = 0x1111_1111 };
+    uc[1] = .{ .offset = 0x2fe, .value = 0x2222_2222 };
+    uc[2] = .{ .offset = primitive_register, .value = 0x7654_3200 | 4 };
+    const uc_before = uc[2].value;
+    try testing.expectEqual(efault, update(truncated, uc, 1));
+    try testing.expectEqual(uc_before, uc[2].value);
+
+    // Wholly unmapped memory is refused the same way.
+    const unmapped: [*]PrimRegister = @ptrFromInt(base + 8 * page);
+    try testing.expectEqual(efault, update(cx, unmapped, 1));
+    try testing.expectEqual(cx_before, cx[1].value);
+
+    // And with both arrays whole, the same call goes through.
+    try testing.expectEqual(errno.ok, update(cx, uc, 1));
+    try testing.expectEqual(@as(u32, 0), cx[1].value & 0x7);
+    try testing.expectEqual(@as(u32, 1), uc[2].value & 0x1f);
+}
+
+/// Records the state each draw was issued under.
+const TopologyProbe = struct {
+    const gpu_module = @import("gpu");
+
+    seen: [8]u32 = @splat(0),
+    count: usize = 0,
+
+    fn read(_: ?*anyopaque, address: u64, bytes: []u8) bool {
+        if (address == 0) return false;
+        const source: [*]const u8 = @ptrFromInt(address);
+        @memcpy(bytes, source[0..bytes.len]);
+        return true;
+    }
+
+    fn write(_: ?*anyopaque, address: u64, bytes: []const u8) bool {
+        if (address == 0) return false;
+        const target: [*]u8 = @ptrFromInt(address);
+        @memcpy(target[0..bytes.len], bytes);
+        return true;
+    }
+
+    fn draw(
+        context: ?*anyopaque,
+        state: *const gpu_module.State,
+        _: gpu_module.pm4.Packet,
+    ) bool {
+        const self: *TopologyProbe = @ptrCast(@alignCast(context.?));
+        if (self.count < self.seen.len) {
+            // Exactly what the renderer reads when it picks a pipeline.
+            self.seen[self.count] = state.readRegister(.uconfig, primitive_register) orelse 0xffff;
+            self.count += 1;
+        }
+        return true;
+    }
+
+    const vtable = gpu_module.DcbBackend.VTable{ .read = read, .write = write, .draw = draw };
+
+    fn backend(self: *TopologyProbe) gpu_module.DcbBackend {
+        return .{ .context = self, .vtable = &vtable };
+    }
+};
+
+test "each draw runs under the topology set before it" {
+    const std = @import("std");
+    const gpu = @import("gpu");
+    const testing = std.testing;
+
+    var db = Database{};
+    defer db.deinit(testing.allocator);
+    try registerAll(&db, testing.allocator);
+
+    const update = try agcEntryPoint(&db, "Y3ymLfZ1384", AgcUpdatePrim);
+    const set_uc_indirect = try agcEntryPoint(&db, "hvUfkUIQcOE", AgcWrite);
+    const draw = try agcEntryPoint(&db, "Yw0jKSqop+E", AgcWrite);
+
+    // The arrays the title keeps, written into the buffer by reference: the
+    // command carries their address, so the values the draw sees are the ones
+    // left in them at execution time. Two copies, because both draws are in
+    // one stream and the second update must not reach back into the first.
+    var first_uc = primUconfig(4);
+    var second_uc = primUconfig(4);
+    var cx = primContext(0);
+
+    var words: [64]u32 = @splat(0);
+    var buffer = sizedBuffer(&words);
+
+    // Point list, draw; then rectangle list, draw.
+    try testing.expectEqual(errno.ok, update(&cx, &first_uc, 1));
+    _ = set_uc_indirect(&buffer, @intFromPtr(&first_uc), first_uc.len, 0, 0, 0).?;
+    _ = draw(&buffer, 3, 0, 0, 0, 0).?;
+
+    try testing.expectEqual(errno.ok, update(&cx, &second_uc, 7));
+    _ = set_uc_indirect(&buffer, @intFromPtr(&second_uc), second_uc.len, 0, 0, 0).?;
+    _ = draw(&buffer, 4, 0, 0, 0, 0).?;
+
+    const used = (@intFromPtr(buffer.cursor_up.?) - @intFromPtr(words[0..].ptr)) / @sizeOf(u32);
+
+    var probe = TopologyProbe{};
+    var state = gpu.State{};
+    var runner = gpu.DcbExecutor{
+        .state = &state,
+        .backend = probe.backend(),
+        .allocator = testing.allocator,
+    };
+    _ = try runner.execute(words[0..used]);
+
+    // Two draws, each under its own topology, read from the register file the
+    // way the renderer reads it.
+    try testing.expectEqual(@as(usize, 2), probe.count);
+    try testing.expectEqual(@as(u32, 0x7654_3200 | 1), probe.seen[0]);
+    try testing.expectEqual(@as(u32, 0x7654_3200 | 7), probe.seen[1]);
+
+    // And the state left behind is the second one, low five bits being what
+    // the renderer turns into a host topology.
+    try testing.expectEqual(
+        @as(?u32, 0x7654_3200 | 7),
+        state.readRegister(.uconfig, primitive_register),
+    );
+}
