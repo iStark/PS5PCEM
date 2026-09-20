@@ -556,3 +556,443 @@ test "SubmitMultiCommandBuffers resumes past a wait without replaying it" {
     try testing.expectEqual(@as(usize, 3), probe.mark_count);
     try testing.expectEqualSlices(u32, &.{ 44, 55, 66 }, probe.marks[0..3]);
 }
+
+// ---------------------------------------------------------------------------
+// AGC size contracts
+//
+// These go through the registry, because the contract a title sees is the pair
+// of functions the dynamic linker hands it: whatever the two halves agree on
+// inside one file does not matter if a different entry point is the one that
+// gets resolved.
+//
+// Sizes are checked in BYTES, which is what every GetSize answers in, and
+// packet widths in DWORDS, which is what a PM4 header encodes. The conversion
+// is written out at each comparison rather than folded into a helper, so a
+// mismatched unit shows up in the test as plainly as in the code.
+
+/// A size query. All of them answer in bytes; the fixed-width ones ignore
+/// their arguments, so one signature serves the whole family.
+const AgcGetSize = fn (u64, u64, u64, u64, u64, u64) callconv(abi.guest) u32;
+
+/// A command constructor. Every one takes the buffer first.
+const AgcWrite = fn (
+    ?*libs.agc.CommandBuffer,
+    u64,
+    u64,
+    u64,
+    u64,
+    u64,
+) callconv(abi.guest) ?[*]u32;
+
+/// Reads a packet that already exists and answers in dwords.
+const AgcPacketSize = fn (?[*]const u32, u64, u64, u64, u64, u64) callconv(abi.guest) u32;
+
+const guard_word: u32 = 0xa5a5_a5a5;
+
+/// A command buffer over `words`, with no grow callback attached.
+fn sizedBuffer(words: []u32) libs.agc.CommandBuffer {
+    return .{
+        .bottom = words.ptr,
+        .top = words.ptr + words.len,
+        .cursor_up = words.ptr,
+        .cursor_down = null,
+        .callback = null,
+        .user_data = null,
+        .reserved_dwords = 0,
+    };
+}
+
+const SizeCase = struct {
+    what: []const u8,
+    size_id: *const [nid.encoded_len:0]u8,
+    write_id: *const [nid.encoded_len:0]u8,
+    /// Index into `arguments` that must be replaced with a readable address.
+    address_argument: ?usize = null,
+    arguments: [5]u64,
+};
+
+test "every fixed-width AGC command fits the size it reports" {
+    const std = @import("std");
+    const gpu = @import("gpu");
+    const testing = std.testing;
+
+    var db = Database{};
+    defer db.deinit(testing.allocator);
+    try registerAll(&db, testing.allocator);
+
+    // Something for the address-taking constructors to point at. The contents
+    // are never read by them, only the address.
+    var payload: [16]u32 = @splat(0);
+    const payload_address = @intFromPtr(&payload);
+
+    const cases = [_]SizeCase{
+        .{ .what = "DcbDrawIndex", .size_id = "6ee9Hd3EWXQ", .write_id = "q88lQ+GP5Yk", .address_argument = 1, .arguments = .{ 3, 0, 0, 0, 0 } },
+        .{ .what = "DcbDrawIndexAuto", .size_id = "WrdP9Zxx3lQ", .write_id = "Yw0jKSqop+E", .arguments = .{ 3, 0, 0, 0, 0 } },
+        .{ .what = "CbDispatch", .size_id = "Abendgtz+3o", .write_id = "k3GhuSNmBLU", .arguments = .{ 1, 1, 1, 0, 0 } },
+        .{ .what = "DcbSetIndexBuffer", .size_id = "j4emHHndCPY", .write_id = "l4fM9K-Lyks", .address_argument = 0, .arguments = .{ 0, 0, 0, 0, 0 } },
+        .{ .what = "DcbSetIndexCount", .size_id = "mljzuGDZRQ4", .write_id = "8N2tmT3jmC8", .arguments = .{ 3, 0, 0, 0, 0 } },
+        .{ .what = "DcbSetIndexSize", .size_id = "ca4KPvp0qLQ", .write_id = "GIIW2J37e70", .arguments = .{ 1, 0, 0, 0, 0 } },
+        .{ .what = "DcbSetNumInstances", .size_id = "6DFuRKT4C9w", .write_id = "tSBxhAPyytQ", .arguments = .{ 2, 0, 0, 0, 0 } },
+        .{ .what = "DcbSetCxRegistersIndirect", .size_id = "GBCh3zCihoU", .write_id = "ZvwO9euwYzc", .address_argument = 0, .arguments = .{ 0, 4, 0, 0, 0 } },
+        .{ .what = "DcbSetCxRegisterDirect", .size_id = "1DeUNpRIDDA", .write_id = "LHFXRrlTPD8", .arguments = .{ (@as(u64, 0x1234) << 32) | 0x318, 0, 0, 0, 0 } },
+        .{ .what = "DcbJump", .size_id = "VEGu4dixjUg", .write_id = "xSAR0LTcRKM", .address_argument = 2, .arguments = .{ 0, 0, 0, 4, 0 } },
+        .{ .what = "AcbJump", .size_id = "b-oySn+G2tE", .write_id = "e1DFTg+Sd8U", .address_argument = 1, .arguments = .{ 0, 0, 4, 0, 0 } },
+        .{ .what = "DcbStallCommandBufferParser", .size_id = "+u6dKSLWM2o", .write_id = "u2T2DiA5hRI", .arguments = .{ 0, 0, 0, 0, 0 } },
+    };
+
+    inline for (cases) |case| {
+        const get_size = try agcEntryPoint(&db, case.size_id, AgcGetSize);
+        const write = try agcEntryPoint(&db, case.write_id, AgcWrite);
+
+        const announced_bytes = get_size(0, 0, 0, 0, 0, 0);
+        errdefer std.debug.print("case {s}\n", .{case.what});
+        try testing.expect(announced_bytes != 0);
+        try testing.expectEqual(@as(u32, 0), announced_bytes % @sizeOf(u32));
+        const announced_words = announced_bytes / @sizeOf(u32);
+
+        var arguments = case.arguments;
+        if (case.address_argument) |index| arguments[index] = payload_address;
+
+        // A buffer of exactly the announced size, with guard words after it
+        // that the command must not reach.
+        var storage: [64]u32 = @splat(guard_word);
+        var buffer = sizedBuffer(storage[0..announced_words]);
+
+        try testing.expect(write(
+            &buffer,
+            arguments[0],
+            arguments[1],
+            arguments[2],
+            arguments[3],
+            arguments[4],
+        ) != null);
+
+        // Exactly filled: the cursor sits at the end of the announced span.
+        try testing.expectEqual(
+            @as(usize, announced_bytes),
+            @intFromPtr(buffer.cursor_up.?) - @intFromPtr(storage[0..].ptr),
+        );
+        for (storage[announced_words..]) |word| try testing.expectEqual(guard_word, word);
+
+        // What landed is one packet of exactly that width, and it says so to a
+        // caller stepping over it.
+        var walker = gpu.pm4.Walker.init(storage[0..announced_words]);
+        const packet = (try walker.next()).?;
+        try testing.expectEqual(@as(usize, announced_words), packet.wordCount());
+        try testing.expect((try walker.next()) == null);
+
+        // The size was not padded either: one word less is not enough, and a
+        // refused write leaves the buffer as it found it.
+        var tight: [64]u32 = @splat(guard_word);
+        var short = sizedBuffer(tight[0 .. announced_words - 1]);
+        try testing.expect(write(
+            &short,
+            arguments[0],
+            arguments[1],
+            arguments[2],
+            arguments[3],
+            arguments[4],
+        ) == null);
+        for (tight) |word| try testing.expectEqual(guard_word, word);
+    }
+}
+
+test "AGC event write is sized by the event it carries" {
+    const std = @import("std");
+    const gpu = @import("gpu");
+    const testing = std.testing;
+
+    var db = Database{};
+    defer db.deinit(testing.allocator);
+    try registerAll(&db, testing.allocator);
+
+    const get_size = try agcEntryPoint(&db, "C4l9fB17t8w", AgcGetSize);
+    const write = try agcEntryPoint(&db, "aJf+j5yntiU", AgcWrite);
+
+    var label: [2]u32 = @splat(0);
+    const label_address = @intFromPtr(&label);
+
+    // The timestamp events carry an address and are twice as wide as the ones
+    // that do not, so a single fixed width is wrong for one of the two groups.
+    const events = [_]struct { event_type: u64, words: u32 }{
+        .{ .event_type = 0x38, .words = 4 },
+        .{ .event_type = 0x39, .words = 4 },
+        .{ .event_type = 0x04, .words = 2 },
+        .{ .event_type = 0x07, .words = 2 },
+        .{ .event_type = 0x16, .words = 2 },
+    };
+
+    for (events) |event| {
+        const announced = get_size(event.event_type, 0, 0, 0, 0, 0);
+        try testing.expectEqual(event.words * @sizeOf(u32), announced);
+
+        var storage: [16]u32 = @splat(guard_word);
+        var buffer = sizedBuffer(storage[0..event.words]);
+        try testing.expect(write(&buffer, event.event_type, label_address, 0, 0, 0) != null);
+        try testing.expectEqual(
+            @as(usize, announced),
+            @intFromPtr(buffer.cursor_up.?) - @intFromPtr(storage[0..].ptr),
+        );
+        for (storage[event.words..]) |word| try testing.expectEqual(guard_word, word);
+
+        var walker = gpu.pm4.Walker.init(storage[0..event.words]);
+        const packet = (try walker.next()).?;
+        try testing.expectEqual(gpu.pm4.event_write, packet.opcode);
+        try testing.expectEqual(@as(usize, event.words), packet.wordCount());
+        try testing.expect((try walker.next()) == null);
+    }
+
+    // An event the constructor refuses is sized at zero rather than at a width
+    // nothing will occupy.
+    try testing.expectEqual(@as(u32, 0), get_size(0x40, 0, 0, 0, 0, 0));
+}
+
+test "AGC nop is written at the width the caller chose" {
+    const std = @import("std");
+    const gpu = @import("gpu");
+    const testing = std.testing;
+
+    var db = Database{};
+    defer db.deinit(testing.allocator);
+    try registerAll(&db, testing.allocator);
+
+    const get_size = try agcEntryPoint(&db, "t7PlZ9nt5Lc", AgcGetSize);
+    const write = try agcEntryPoint(&db, "LtTouSCZjHM", AgcWrite);
+
+    for ([_]u32{ 2, 3, 5, 17, 40 }) |requested| {
+        try testing.expectEqual(requested * @sizeOf(u32), get_size(requested, 0, 0, 0, 0, 0));
+
+        var storage: [64]u32 = @splat(guard_word);
+        var buffer = sizedBuffer(storage[0..requested]);
+        try testing.expect(write(&buffer, requested, 0, 0, 0, 0) != null);
+        try testing.expectEqual(
+            @as(usize, requested) * @sizeOf(u32),
+            @intFromPtr(buffer.cursor_up.?) - @intFromPtr(storage[0..].ptr),
+        );
+        for (storage[requested..]) |word| try testing.expectEqual(guard_word, word);
+
+        var walker = gpu.pm4.Walker.init(storage[0..requested]);
+        const packet = (try walker.next()).?;
+        try testing.expectEqual(gpu.pm4.nop, packet.opcode);
+        try testing.expectEqual(@as(usize, requested), packet.wordCount());
+        try testing.expect((try walker.next()) == null);
+    }
+
+    // Widths no packet can express are refused by both halves alike, so a
+    // caller that sizes first never reserves room for a command that will not
+    // appear.
+    try testing.expectEqual(@as(u32, 0), get_size(0, 0, 0, 0, 0, 0));
+    try testing.expectEqual(@as(u32, 0), get_size(1, 0, 0, 0, 0, 0));
+    try testing.expectEqual(@as(u32, 0), get_size(0x4001, 0, 0, 0, 0, 0));
+
+    var storage: [8]u32 = @splat(guard_word);
+    var buffer = sizedBuffer(&storage);
+    try testing.expect(write(&buffer, 1, 0, 0, 0, 0) == null);
+    for (storage) |word| try testing.expectEqual(guard_word, word);
+}
+
+test "GetPacketSize walks a run of packets of differing widths" {
+    const std = @import("std");
+    const gpu = @import("gpu");
+    const testing = std.testing;
+
+    var db = Database{};
+    defer db.deinit(testing.allocator);
+    try registerAll(&db, testing.allocator);
+
+    const packet_size = try agcEntryPoint(&db, "Lkf86B98qPc", AgcPacketSize);
+    const nop = try agcEntryPoint(&db, "LtTouSCZjHM", AgcWrite);
+    const set_index_count = try agcEntryPoint(&db, "8N2tmT3jmC8", AgcWrite);
+    const draw_auto = try agcEntryPoint(&db, "Yw0jKSqop+E", AgcWrite);
+
+    var storage: [32]u32 = @splat(0);
+    var buffer = sizedBuffer(&storage);
+
+    // Two, three and five dwords in a row, so a caller that assumed one width
+    // would land inside a packet instead of on the next one.
+    try testing.expect(set_index_count(&buffer, 7, 0, 0, 0, 0) != null);
+    try testing.expect(draw_auto(&buffer, 3, 0, 0, 0, 0) != null);
+    try testing.expect(nop(&buffer, 5, 0, 0, 0, 0) != null);
+    const used = (@intFromPtr(buffer.cursor_up.?) - @intFromPtr(storage[0..].ptr)) / @sizeOf(u32);
+    try testing.expectEqual(@as(usize, 2 + 3 + 5), used);
+
+    // Stepping with GetPacketSize alone reaches the same boundaries the command
+    // walker does, and lands on the end rather than past it.
+    const widths = [_]u32{ 2, 3, 5 };
+    var offset: usize = 0;
+    var walker = gpu.pm4.Walker.init(storage[0..used]);
+    for (widths) |width| {
+        const reported = packet_size(storage[offset..].ptr, 0, 0, 0, 0, 0);
+        try testing.expectEqual(width, reported);
+        const packet = (try walker.next()).?;
+        try testing.expectEqual(@as(usize, width), packet.wordCount());
+        offset += reported;
+    }
+    try testing.expectEqual(used, offset);
+    try testing.expect((try walker.next()) == null);
+
+    // Alignment filler carries no body and is one dword, whatever follows it.
+    var padded = [_]u32{ @as(u32, 2) << 30, 0, 0 };
+    try testing.expectEqual(@as(u32, 1), packet_size(padded[0..].ptr, 0, 0, 0, 0, 0));
+
+    // A packet that cannot be read is answered with zero, not with a guess.
+    try testing.expectEqual(@as(u32, 0), packet_size(null, 0, 0, 0, 0, 0));
+}
+
+/// The arena the grow callback hands over, and the count of times it ran.
+var grow_arena: []u32 = &.{};
+var grow_calls: u32 = 0;
+
+/// Stands in for the CPU backend that would dispatch the title's callback.
+///
+/// `reserveDwords` calls the guest with the buffer, the dwords still needed and
+/// the user data. A real title attaches another arena and returns non-zero;
+/// this does the same thing directly, which is enough to exercise the branch in
+/// `reserveDwords` that decides whether the write may proceed.
+fn growCall(_: ?*anyopaque, request: libs.kernel_threading.GuestCall) libs.kernel_threading.BackendError!u64 {
+    grow_calls += 1;
+    if (request.argument_count < 2) return 0;
+    const buffer: *libs.agc.CommandBuffer = @ptrFromInt(request.arguments[0]);
+    const needed = request.arguments[1];
+    if (needed > grow_arena.len) return 0;
+    buffer.bottom = grow_arena.ptr;
+    buffer.top = grow_arena.ptr + grow_arena.len;
+    buffer.cursor_up = grow_arena.ptr;
+    buffer.cursor_down = null;
+    return 1;
+}
+
+fn growStart(_: ?*anyopaque, _: libs.kernel_threading.StartRequest) libs.kernel_threading.BackendError!void {
+    return error.Unsupported;
+}
+
+test "a command larger than its arena is written after the grow callback" {
+    const std = @import("std");
+    const gpu = @import("gpu");
+    const threading = libs.kernel_threading;
+    const testing = std.testing;
+
+    var db = Database{};
+    defer db.deinit(testing.allocator);
+    try registerAll(&db, testing.allocator);
+
+    const get_size = try agcEntryPoint(&db, "t7PlZ9nt5Lc", AgcGetSize);
+    const write = try agcEntryPoint(&db, "LtTouSCZjHM", AgcWrite);
+
+    var second: [16]u32 = @splat(guard_word);
+    grow_arena = &second;
+    grow_calls = 0;
+
+    var manager = threading.Manager{};
+    manager.backend = .{ .context = null, .start_fn = growStart, .call_fn = growCall };
+    threading.attachManager(&manager);
+    defer threading.attachManager(null);
+
+    const requested: u32 = 12;
+    const announced = get_size(requested, 0, 0, 0, 0, 0);
+    try testing.expectEqual(requested * @sizeOf(u32), announced);
+
+    // An arena with room for four dwords, asked for twelve.
+    var first: [4]u32 = @splat(guard_word);
+    var buffer = sizedBuffer(&first);
+    buffer.callback = @ptrFromInt(0x1000);
+
+    try testing.expect(write(&buffer, requested, 0, 0, 0, 0) != null);
+    try testing.expectEqual(@as(u32, 1), grow_calls);
+
+    // The command landed in the arena the callback attached, at its full width,
+    // and the arena it would not fit in was left untouched.
+    try testing.expectEqual(
+        @as(usize, announced),
+        @intFromPtr(buffer.cursor_up.?) - @intFromPtr(second[0..].ptr),
+    );
+    for (first) |word| try testing.expectEqual(guard_word, word);
+    for (second[requested..]) |word| try testing.expectEqual(guard_word, word);
+
+    var walker = gpu.pm4.Walker.init(second[0..requested]);
+    const packet = (try walker.next()).?;
+    try testing.expectEqual(gpu.pm4.nop, packet.opcode);
+    try testing.expectEqual(@as(usize, requested), packet.wordCount());
+
+    // A callback that cannot satisfy the request refuses the write rather than
+    // letting it run past the end of the arena it has.
+    grow_arena = second[0..4];
+    grow_calls = 0;
+    var tight: [4]u32 = @splat(guard_word);
+    var tight_buffer = sizedBuffer(&tight);
+    tight_buffer.callback = @ptrFromInt(0x1000);
+    try testing.expect(write(&tight_buffer, requested, 0, 0, 0, 0) == null);
+    try testing.expectEqual(@as(u32, 1), grow_calls);
+    for (tight) |word| try testing.expectEqual(guard_word, word);
+
+    grow_arena = &.{};
+}
+
+test "a direct register list never writes past the size it was given" {
+    const std = @import("std");
+    const gpu = @import("gpu");
+    const testing = std.testing;
+
+    var db = Database{};
+    defer db.deinit(testing.allocator);
+    try registerAll(&db, testing.allocator);
+
+    const get_size = try agcEntryPoint(&db, "yUBESvCCJ4I", AgcGetSize);
+    const write = try agcEntryPoint(&db, "UZbQjYAwwXM", AgcWrite);
+
+    const Register = extern struct { offset: u32, value: u32 };
+
+    // One ascending run costs the least, and a list with no two neighbours
+    // adjacent costs the most. The query cannot see which it was handed, so it
+    // has to cover the worse of the two.
+    const consecutive = [_]Register{
+        .{ .offset = 0x100, .value = 1 },
+        .{ .offset = 0x101, .value = 2 },
+        .{ .offset = 0x102, .value = 3 },
+        .{ .offset = 0x103, .value = 4 },
+    };
+    const scattered = [_]Register{
+        .{ .offset = 0x100, .value = 1 },
+        .{ .offset = 0x200, .value = 2 },
+        .{ .offset = 0x300, .value = 3 },
+        .{ .offset = 0x400, .value = 4 },
+    };
+
+    const announced = get_size(consecutive.len, 0, 0, 0, 0, 0);
+    try testing.expectEqual(@as(u32, consecutive.len * 3 * @sizeOf(u32)), announced);
+    const announced_words = announced / @sizeOf(u32);
+
+    for ([_][]const Register{ &consecutive, &scattered }) |list| {
+        var storage: [64]u32 = @splat(guard_word);
+        var buffer = sizedBuffer(storage[0..announced_words]);
+        try testing.expect(write(&buffer, @intFromPtr(list.ptr), list.len, 0, 0, 0) != null);
+
+        const used = @intFromPtr(buffer.cursor_up.?) - @intFromPtr(storage[0..].ptr);
+        // Never more than announced, and the guard words past the announced
+        // span are untouched whichever shape the list had.
+        try testing.expect(used <= announced);
+        for (storage[announced_words..]) |word| try testing.expectEqual(guard_word, word);
+
+        // Whatever it wrote is a walkable run of complete packets.
+        var walker = gpu.pm4.Walker.init(storage[0 .. used / @sizeOf(u32)]);
+        var seen: usize = 0;
+        while (try walker.next()) |packet| {
+            try testing.expectEqual(gpu.pm4.set_sh_reg, packet.opcode);
+            seen += packet.wordCount();
+        }
+        try testing.expectEqual(used / @sizeOf(u32), seen);
+    }
+
+    // The scattered list is the one that needs the whole reservation; the
+    // consecutive one needs less. That is the spread the query has to cover.
+    var compact: [64]u32 = @splat(guard_word);
+    var compact_buffer = sizedBuffer(compact[0..announced_words]);
+    try testing.expect(write(&compact_buffer, @intFromPtr(&consecutive), consecutive.len, 0, 0, 0) != null);
+    const compact_used = @intFromPtr(compact_buffer.cursor_up.?) - @intFromPtr(compact[0..].ptr);
+    try testing.expectEqual(@as(usize, (consecutive.len + 2) * @sizeOf(u32)), compact_used);
+    try testing.expect(compact_used < announced);
+
+    // Counts the constructor refuses are sized at zero.
+    try testing.expectEqual(@as(u32, 0), get_size(0, 0, 0, 0, 0, 0));
+    try testing.expectEqual(@as(u32, 0), get_size(0x1001, 0, 0, 0, 0, 0));
+}

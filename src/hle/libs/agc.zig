@@ -526,6 +526,66 @@ pub fn drawIndexIndirectMultiGetSize() callconv(abi.guest) u32 {
 /// Accepted and does nothing. The command being edited is a no-operation, so
 /// there is no field whose value would change anything, and a title doing this
 /// is doing something ordinary that there is no reason to stop.
+/// One register written straight into the command buffer.
+///
+/// The guest passes a `{ offset, value }` pair by value, which the calling
+/// convention packs into a single register: the offset in the low half and
+/// the value in the high half. The packet is three dwords -- header, offset,
+/// value -- and the executor writes it into the queue register file through
+/// `registerSpaceOf`, so the writer, the size below and the execution all
+/// describe the same three words.
+fn setRegisterDirect(state: ?*CommandBuffer, entry: u64, opcode: u8) ?[*]u32 {
+    const body = [_]u32{
+        @as(u32, @truncate(entry)) & 0xffff,
+        @truncate(entry >> 32),
+    };
+    return writePacket(state, opcode, 0, &body);
+}
+
+pub fn setCxRegisterDirect(
+    state: ?*CommandBuffer,
+    entry: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+) callconv(abi.guest) ?[*]u32 {
+    return setRegisterDirect(state, entry, gpu.pm4.set_context_reg);
+}
+
+pub fn setShRegisterDirect(
+    state: ?*CommandBuffer,
+    entry: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+) callconv(abi.guest) ?[*]u32 {
+    return setRegisterDirect(state, entry, gpu.pm4.set_sh_reg);
+}
+
+pub fn setUcRegisterDirect(
+    state: ?*CommandBuffer,
+    entry: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+) callconv(abi.guest) ?[*]u32 {
+    return setRegisterDirect(state, entry, gpu.pm4.set_uconfig_reg);
+}
+
+/// Bytes one `Set*RegisterDirect` packet occupies.
+pub fn registerDirectGetSize(
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+) callconv(abi.guest) u32 {
+    return 3 * @sizeOf(u32);
+}
 pub fn patchCommand(_: u64, _: u64, _: u64, _: u64, _: u64, _: u64) callconv(abi.guest) i32 {
     return errno.ok;
 }
@@ -718,8 +778,33 @@ pub fn patchQueueEndOfPipeType(command_address: u64, destination: u32) callconv(
 /// Has to agree with what the writer actually consumes, or a title that
 /// reserves space by asking here will either overrun its buffer or leave a hole
 /// in it that nothing accounts for.
-pub fn packetSize(_: u64, _: u64, _: u64, _: u64, _: u64, _: u64) callconv(abi.guest) u32 {
-    return command_words;
+/// The length of a packet that has already been written, in DWORDS.
+///
+/// This is the one size query in the library that does not answer in bytes.
+/// The GetSize family says how much room a command will need before it is
+/// written, and answers in bytes; this reads a packet that already exists and
+/// says how many dwords to step over to reach the next one, which is what a
+/// caller walking a buffer needs. The two units are not interchangeable and
+/// the distinction is the reason this lives apart from `commandSize`.
+///
+/// The rule matches the command walker in `gpu.pm4` exactly, including its
+/// treatment of alignment filler, so a caller stepping through a buffer with
+/// this lands on the same packet boundaries the executor will.
+pub fn packetSize(
+    packet: ?[*]const u32,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+) callconv(abi.guest) u32 {
+    const words = packet orelse return 0;
+    if (!kernel_memory.isGuestRangeAccessible(@intFromPtr(words), @sizeOf(u32))) return 0;
+    const header = words[0];
+    // Type-2 padding carries no body, and the all-ones NOP header is the
+    // filler a builder emits to realign; both occupy exactly one dword.
+    if (header >> 30 == 2 or header == 0xffff_1000) return 1;
+    return ((header >> 16) & 0x3fff) + 2;
 }
 
 /// Answers "how many" and "which" with nothing.
@@ -978,15 +1063,23 @@ test "COND_EXEC has its hardware width and patchable fields" {
 
 test "the size a title is told matches what a write consumes" {
     // A title reserves space by asking first. If the two disagree it either
-    // overruns its buffer or leaves a hole nothing accounts for.
+    // overruns its buffer or leaves a hole nothing accounts for. The query
+    // answers in bytes, so the comparison is made in bytes.
     var storage: [64]u32 = @splat(0);
     var buffer = fixture(&storage);
-    const announced = packetSize(0, 0, 0, 0, 0, 0);
+    const announced_bytes = commandSize(0, 0, 0, 0, 0, 0);
 
     const before = @intFromPtr(buffer.cursor_up.?);
-    _ = writeCommand(&buffer, 0, 0, 0, 0, 0);
-    const consumed = (@intFromPtr(buffer.cursor_up.?) - before) / @sizeOf(u32);
-    try testing.expectEqual(@as(usize, announced), consumed);
+    const written = writeCommand(&buffer, 0, 0, 0, 0, 0).?;
+    const consumed_bytes = @intFromPtr(buffer.cursor_up.?) - before;
+    try testing.expectEqual(@as(usize, announced_bytes), consumed_bytes);
+
+    // And the packet that was written reports the same span, in dwords, to a
+    // caller stepping over it afterwards.
+    try testing.expectEqual(
+        @as(u32, @intCast(consumed_bytes / @sizeOf(u32))),
+        packetSize(written, 0, 0, 0, 0, 0),
+    );
 }
 
 test "AGC wait patches update address reference and comparison in place" {

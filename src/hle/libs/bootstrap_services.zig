@@ -2178,10 +2178,238 @@ fn writeAgcCustomPacket(buffer: ?*AgcCommandBuffer, code: u6, body: []const u32)
     return cursor;
 }
 
-fn agcCommand(buffer: ?*AgcCommandBuffer, _: u64, _: u64, _: u64, _: u64, _: u64) callconv(abi.guest) ?[*]u32 {
-    const body = [_]u32{0} ** 15;
-    return writeAgcPacket(buffer, gpu.pm4.nop, &body);
+// Sizes are reported in BYTES, because that is what a title adds to a cursor
+// when it reserves room. Packet widths are counted in DWORDS, because that is
+// what a PM4 header encodes. Every GetSize below therefore states a dword
+// count taken from the writer beside it and multiplies once, at the end.
+
+/// A no-operation of a width the caller chooses.
+///
+/// The width is the whole point of this command: a title uses it to pad a
+/// buffer to an alignment it needs, so a fixed size would pad by the wrong
+/// amount. Two dwords is the narrowest a NOP can be -- a header plus the one
+/// body word its length field must describe.
+fn agcCbNop(
+    buffer: ?*AgcCommandBuffer,
+    size_in_dwords: u32,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+) callconv(abi.guest) ?[*]u32 {
+    if (size_in_dwords < 2 or size_in_dwords > 0x4000) return null;
+    const cursor = reserveAgcDwords(buffer, size_in_dwords) orelse return null;
+    cursor[0] = pm4Header(gpu.pm4.nop, size_in_dwords - 1);
+    @memset(cursor[1..size_in_dwords], 0);
+    return cursor;
 }
+
+/// Bytes `agcCbNop` will occupy for the same argument.
+///
+/// Zero for a width the writer refuses, so that a caller which sizes first and
+/// writes second never reserves room for a command that will not appear.
+fn agcCbNopGetSize(size_in_dwords: u32) callconv(abi.guest) u32 {
+    if (size_in_dwords < 2 or size_in_dwords > 0x4000) return 0;
+    return size_in_dwords * @sizeOf(u32);
+}
+
+/// Continues a compute queue in another buffer.
+///
+/// The compute form takes one argument fewer than the graphics form: there is
+/// no mode selector, so the packet always carries the same fixed control bits
+/// and the cache policy sits above them. Sharing the graphics writer would
+/// read the target address out of the size argument.
+fn agcAcbJump(
+    buffer: ?*AgcCommandBuffer,
+    cache_policy: u64,
+    target_address: u64,
+    size_in_dwords: u64,
+    _: u64,
+    _: u64,
+) callconv(abi.guest) ?[*]u32 {
+    if (target_address == 0 or target_address & 0x3 != 0) return null;
+    const body = [_]u32{
+        @as(u32, @truncate(target_address)) & 0xffff_fffc,
+        @truncate(target_address >> 32),
+        0x0f90_0000 |
+            ((@as(u32, @truncate(cache_policy)) & 0x3) << 28) |
+            (@as(u32, @truncate(size_in_dwords)) & 0x000f_ffff),
+    };
+    return writeExactAgcPacket(buffer, gpu.pm4.indirect_buffer, &body);
+}
+
+/// Four dwords: header, target low, target high, control. Both jump forms.
+fn agcJumpGetSize() callconv(abi.guest) u32 {
+    return 4 * @sizeOf(u32);
+}
+
+/// Returns the graphics queue to its initial register state.
+///
+/// CLEAR_STATE is executed: the executor drops the queue register file, so
+/// leaving this as a no-operation kept stale registers alive across a reset a
+/// title had explicitly asked for.
+fn agcDcbResetQueue(
+    buffer: ?*AgcCommandBuffer,
+    _: u64,
+    state: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+) callconv(abi.guest) ?[*]u32 {
+    const body = [_]u32{@as(u32, @truncate(state)) & 0xf};
+    return writeExactAgcPacket(buffer, gpu.pm4.clear_state, &body);
+}
+
+/// The compute queue equivalent, which is a marker rather than CLEAR_STATE:
+/// a compute queue has no context register file to drop.
+fn agcAcbResetQueue(
+    buffer: ?*AgcCommandBuffer,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+) callconv(abi.guest) ?[*]u32 {
+    const body = [_]u32{0};
+    return writeAgcCustomPacket(buffer, gpu.pm4.custom.dispatch_reset, &body);
+}
+
+fn agcResetQueueGetSize() callconv(abi.guest) u32 {
+    return 2 * @sizeOf(u32);
+}
+
+/// Holds the command parser until work already issued has drained.
+///
+/// The executor runs one packet at a time and does not reorder, so there is
+/// nothing for this to wait on and it is counted as an ignored command. That
+/// is the correct execution of a barrier on a serialised parser; what matters
+/// here is that the two dwords it occupies are the two dwords reserved.
+fn agcStallCommandBufferParser(
+    buffer: ?*AgcCommandBuffer,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+) callconv(abi.guest) ?[*]u32 {
+    const body = [_]u32{0};
+    return writeExactAgcPacket(buffer, gpu.pm4.pfp_sync_me, &body);
+}
+
+fn agcStallCommandBufferParserGetSize() callconv(abi.guest) u32 {
+    return 2 * @sizeOf(u32);
+}
+
+/// Debug scope markers. They annotate a capture and carry no GPU effect, so a
+/// marker NOP is the whole command rather than a placeholder for one.
+fn agcPushMarker(
+    buffer: ?*AgcCommandBuffer,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+) callconv(abi.guest) ?[*]u32 {
+    const body = [_]u32{0};
+    return writeAgcCustomPacket(buffer, gpu.pm4.custom.push_marker, &body);
+}
+
+fn agcPopMarker(
+    buffer: ?*AgcCommandBuffer,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+) callconv(abi.guest) ?[*]u32 {
+    const body = [_]u32{0};
+    return writeAgcCustomPacket(buffer, gpu.pm4.custom.pop_marker, &body);
+}
+
+/// Parks the queue until the named display buffer is no longer being scanned.
+///
+/// The executor treats this as already satisfied, which is what lets a second
+/// frame be built during bring-up; the packet is written at its real width so
+/// the buffer it sits in stays walkable either way.
+fn agcWaitUntilSafeForRendering(
+    buffer: ?*AgcCommandBuffer,
+    video_out_handle: u32,
+    display_buffer_index: u32,
+    _: u64,
+    _: u64,
+    _: u64,
+) callconv(abi.guest) ?[*]u32 {
+    const body = [_]u32{ video_out_handle, display_buffer_index, 0, 0, 0, 0 };
+    return writeAgcCustomPacket(buffer, gpu.pm4.custom.wait_flip_done, &body);
+}
+
+// --- Size queries for commands whose writers are already implemented -------
+
+/// DRAW_INDEX_2: header, index count, address low, address high, count, initiator.
+fn agcDrawIndexGetSize() callconv(abi.guest) u32 {
+    return 6 * @sizeOf(u32);
+}
+
+/// DISPATCH_DIRECT: header, three group counts, initiator.
+fn agcDispatchGetSize() callconv(abi.guest) u32 {
+    return 5 * @sizeOf(u32);
+}
+
+/// INDEX_BASE: header, address low, address high.
+fn agcSetIndexBufferGetSize() callconv(abi.guest) u32 {
+    return 3 * @sizeOf(u32);
+}
+
+/// INDEX_BUFFER_SIZE: header, count.
+fn agcSetIndexCountGetSize() callconv(abi.guest) u32 {
+    return 2 * @sizeOf(u32);
+}
+
+/// INDEX_TYPE: header, type.
+fn agcSetIndexSizeGetSize() callconv(abi.guest) u32 {
+    return 2 * @sizeOf(u32);
+}
+
+/// NUM_INSTANCES: header, count.
+fn agcSetNumInstancesGetSize() callconv(abi.guest) u32 {
+    return 2 * @sizeOf(u32);
+}
+
+/// SET_*_REG_INDIRECT: header, list low, list high, control, count.
+fn agcSetRegistersIndirectGetSize() callconv(abi.guest) u32 {
+    return 5 * @sizeOf(u32);
+}
+
+/// Worst case for a direct register list, whose real width depends on the
+/// list itself.
+///
+/// `agcSetRegistersDirect` emits one packet per run of consecutive register
+/// offsets: a list that is one ascending run costs `count + 2` dwords, while a
+/// list with no two neighbours adjacent costs three per register. A size query
+/// is not given the list, so it cannot tell those apart and must answer the
+/// larger one -- a caller that reserves too much wastes buffer, and a caller
+/// that reserves too little corrupts it.
+///
+/// The argument is taken to be the register count, the position it occupies in
+/// the constructor. Counts the constructor refuses are answered with zero.
+fn agcSetRegistersDirectGetSize(register_count: u32) callconv(abi.guest) u32 {
+    if (register_count == 0 or register_count > 0x1000) return 0;
+    return register_count * 3 * @sizeOf(u32);
+}
+
+/// EVENT_WRITE, whose width depends on the event.
+///
+/// The timestamp-carrying events take an address and are four dwords wide;
+/// every other event is two. The condition is the one `agcEventWrite` itself
+/// branches on, so the two cannot drift apart, and a type that writer refuses
+/// is answered with zero rather than with a width nothing will occupy.
+fn agcEventWriteGetSize(event_type_raw: u64) callconv(abi.guest) u32 {
+    if (event_type_raw > 0x3f) return 0;
+    const event_type: u32 = @truncate(event_type_raw);
+    const dwords: u32 = if ((event_type & 0x3e) == 0x38) 4 else 2;
+    return dwords * @sizeOf(u32);
+}
+
 
 fn agcJump(
     buffer: ?*AgcCommandBuffer,
@@ -3517,41 +3745,58 @@ const agc_exports = [_]symbols.Export{
     .{ .name = "sceAgcUnknownIkfdtRIqCE", .function = trace.wrap("sceAgcUnknownIkfdtRIqCE", &agcPatch), .id_override = "Ikfdt-rIqCE" },
     .{ .name = "sceAgcGetDataPacketPayloadAddress", .function = trace.wrap("sceAgcGetDataPacketPayloadAddress", &agcGetDataPacketPayloadAddress), .id_override = "V++UgBtQhn0" },
 
-    .{ .name = "sceAgcCbNop", .function = trace.wrap("sceAgcCbNop", &agcCommand), .expect_id = "LtTouSCZjHM" },
+    .{ .name = "sceAgcCbNop", .function = trace.wrap("sceAgcCbNop", &agcCbNop), .expect_id = "LtTouSCZjHM" },
     .{ .name = "sceAgcCbDispatch", .function = trace.wrap("sceAgcCbDispatch", &agcDispatch), .expect_id = "k3GhuSNmBLU" },
     .{ .name = "sceAgcCbSetShRegisterRangeDirect", .function = trace.wrap("sceAgcCbSetShRegisterRangeDirect", &agcSetShRegisterRangeDirect), .expect_id = "n2fD4A+pb+g" },
     .{ .name = "sceAgcCbSetShRegistersDirect", .function = trace.wrap("sceAgcCbSetShRegistersDirect", &agcSetShRegistersDirect), .expect_id = "UZbQjYAwwXM" },
     .{ .name = "sceAgcCbSetUcRegistersDirect", .function = trace.wrap("sceAgcCbSetUcRegistersDirect", &agcSetUcRegistersDirect), .expect_id = "03RZmELWWzw" },
     .{ .name = "sceAgcCbReleaseMem", .function = trace.wrap("sceAgcCbReleaseMem", &agcReleaseMem), .expect_id = "wr23dPKyWc0" },
 
-    .{ .name = "sceAgcAcbResetQueue", .function = trace.wrap("sceAgcAcbResetQueue", &agcCommand), .expect_id = "JrtiDtKeS38" },
+    .{ .name = "sceAgcAcbResetQueue", .function = trace.wrap("sceAgcAcbResetQueue", &agcAcbResetQueue), .expect_id = "JrtiDtKeS38" },
     .{ .name = "sceAgcAcbDispatchIndirect", .function = trace.wrap("sceAgcAcbDispatchIndirect", &agc.dispatchIndirectAbsolute), .expect_id = "j3EtxFkSIhQ" },
-    .{ .name = "sceAgcAcbWaitUntilSafeForRendering", .function = trace.wrap("sceAgcAcbWaitUntilSafeForRendering", &agcCommand), .expect_id = "GPbUp9jXQa8" },
+    .{ .name = "sceAgcAcbWaitUntilSafeForRendering", .function = trace.wrap("sceAgcAcbWaitUntilSafeForRendering", &agcWaitUntilSafeForRendering), .expect_id = "GPbUp9jXQa8" },
     .{ .name = "sceAgcAcbWaitRegMem", .function = trace.wrap("sceAgcAcbWaitRegMem", &agcAcbWaitRegMem), .expect_id = "htn36gPnBk4" },
     .{ .name = "sceAgcAcbAcquireMem", .function = trace.wrap("sceAgcAcbAcquireMem", &agcAcbAcquireMem), .expect_id = "KT-hTp-Ch14" },
     .{ .name = "sceAgcAcbDmaData", .function = trace.wrap("sceAgcAcbDmaData", &agcAcbDmaData), .expect_id = "-RnpfpxIhec" },
-    .{ .name = "sceAgcAcbCopyData", .function = trace.wrap("sceAgcAcbCopyData", &agcCommand), .expect_id = "qzMN2XKGA4k" },
+    .{ .name = "sceAgcAcbCopyData", .function = trace.wrap("sceAgcAcbCopyData", &agc.writeCommand), .expect_id = "qzMN2XKGA4k" },
     .{ .name = "sceAgcAcbWriteData", .function = trace.wrap("sceAgcAcbWriteData", &agc.writeDataAcb), .expect_id = "eZ4+17OQz4Q" },
     .{ .name = "sceAgcAcbEventWrite", .function = trace.wrap("sceAgcAcbEventWrite", &agcEventWrite), .expect_id = "cFazmnXpJOE" },
-    .{ .name = "sceAgcAcbJump", .function = trace.wrap("sceAgcAcbJump", &agcCommand), .expect_id = "e1DFTg+Sd8U" },
-    .{ .name = "sceAgcAcbPushMarker", .function = trace.wrap("sceAgcAcbPushMarker", &agcCommand), .expect_id = "cpCILPya5Zk" },
-    .{ .name = "sceAgcAcbPopMarker", .function = trace.wrap("sceAgcAcbPopMarker", &agcCommand), .expect_id = "6mFxkVqdmbQ" },
+    .{ .name = "sceAgcAcbJump", .function = trace.wrap("sceAgcAcbJump", &agcAcbJump), .expect_id = "e1DFTg+Sd8U" },
+    .{ .name = "sceAgcAcbPushMarker", .function = trace.wrap("sceAgcAcbPushMarker", &agcPushMarker), .expect_id = "cpCILPya5Zk" },
+    .{ .name = "sceAgcAcbPopMarker", .function = trace.wrap("sceAgcAcbPopMarker", &agcPopMarker), .expect_id = "6mFxkVqdmbQ" },
 
-    .{ .name = "sceAgcDcbResetQueue", .function = trace.wrap("sceAgcDcbResetQueue", &agcCommand), .expect_id = "TRO721eVt4g" },
-    .{ .name = "sceAgcDcbWaitUntilSafeForRendering", .function = trace.wrap("sceAgcDcbWaitUntilSafeForRendering", &agcCommand), .expect_id = "MWiElSNE8j8" },
+    .{ .name = "sceAgcDcbResetQueue", .function = trace.wrap("sceAgcDcbResetQueue", &agcDcbResetQueue), .expect_id = "TRO721eVt4g" },
+    .{ .name = "sceAgcDcbWaitUntilSafeForRendering", .function = trace.wrap("sceAgcDcbWaitUntilSafeForRendering", &agcWaitUntilSafeForRendering), .expect_id = "MWiElSNE8j8" },
     .{ .name = "sceAgcDcbSetIndexBuffer", .function = trace.wrap("sceAgcDcbSetIndexBuffer", &agcSetIndexBuffer), .expect_id = "l4fM9K-Lyks" },
     .{ .name = "sceAgcDcbSetIndexCount", .function = trace.wrap("sceAgcDcbSetIndexCount", &agcSetIndexCount), .expect_id = "8N2tmT3jmC8" },
     .{ .name = "sceAgcDcbSetIndexSize", .function = trace.wrap("sceAgcDcbSetIndexSize", &agcSetIndexSize), .expect_id = "GIIW2J37e70" },
     .{ .name = "sceAgcDcbDrawIndex", .function = trace.wrap("sceAgcDcbDrawIndex", &agcDrawIndex), .expect_id = "q88lQ+GP5Yk" },
     .{ .name = "sceAgcDcbDrawIndexAuto", .function = trace.wrap("sceAgcDcbDrawIndexAuto", &agcDrawIndexAuto), .expect_id = "Yw0jKSqop+E" },
     .{ .name = "sceAgcDcbDrawIndexAutoGetSize", .function = trace.wrap("sceAgcDcbDrawIndexAutoGetSize", &agcDrawIndexAutoGetSize), .expect_id = "WrdP9Zxx3lQ" },
+    .{ .name = "sceAgcCbNopGetSize", .function = trace.wrap("sceAgcCbNopGetSize", &agcCbNopGetSize), .expect_id = "t7PlZ9nt5Lc" },
+    .{ .name = "sceAgcCbDispatchGetSize", .function = trace.wrap("sceAgcCbDispatchGetSize", &agcDispatchGetSize), .expect_id = "Abendgtz+3o" },
+    .{ .name = "sceAgcDcbDrawIndexGetSize", .function = trace.wrap("sceAgcDcbDrawIndexGetSize", &agcDrawIndexGetSize), .expect_id = "6ee9Hd3EWXQ" },
+    .{ .name = "sceAgcDcbEventWriteGetSize", .function = trace.wrap("sceAgcDcbEventWriteGetSize", &agcEventWriteGetSize), .expect_id = "C4l9fB17t8w" },
+    .{ .name = "sceAgcAcbEventWriteGetSize", .function = trace.wrap("sceAgcAcbEventWriteGetSize", &agcEventWriteGetSize), .expect_id = "Y-5vneiBtzk" },
+    .{ .name = "sceAgcDcbSetIndexBufferGetSize", .function = trace.wrap("sceAgcDcbSetIndexBufferGetSize", &agcSetIndexBufferGetSize), .expect_id = "j4emHHndCPY" },
+    .{ .name = "sceAgcDcbSetIndexCountGetSize", .function = trace.wrap("sceAgcDcbSetIndexCountGetSize", &agcSetIndexCountGetSize), .expect_id = "mljzuGDZRQ4" },
+    .{ .name = "sceAgcDcbSetIndexSizeGetSize", .function = trace.wrap("sceAgcDcbSetIndexSizeGetSize", &agcSetIndexSizeGetSize), .expect_id = "ca4KPvp0qLQ" },
+    .{ .name = "sceAgcDcbSetNumInstancesGetSize", .function = trace.wrap("sceAgcDcbSetNumInstancesGetSize", &agcSetNumInstancesGetSize), .expect_id = "6DFuRKT4C9w" },
+    .{ .name = "sceAgcDcbSetCxRegistersIndirectGetSize", .function = trace.wrap("sceAgcDcbSetCxRegistersIndirectGetSize", &agcSetRegistersIndirectGetSize), .expect_id = "GBCh3zCihoU" },
+    .{ .name = "sceAgcDcbSetShRegistersIndirectGetSize", .function = trace.wrap("sceAgcDcbSetShRegistersIndirectGetSize", &agcSetRegistersIndirectGetSize), .expect_id = "nNlUtdDDvZ0" },
+    .{ .name = "sceAgcDcbSetUcRegistersIndirectGetSize", .function = trace.wrap("sceAgcDcbSetUcRegistersIndirectGetSize", &agcSetRegistersIndirectGetSize), .expect_id = "UQGTw4xRlcM" },
+    .{ .name = "sceAgcDcbJumpGetSize", .function = trace.wrap("sceAgcDcbJumpGetSize", &agcJumpGetSize), .expect_id = "VEGu4dixjUg" },
+    .{ .name = "sceAgcAcbJumpGetSize", .function = trace.wrap("sceAgcAcbJumpGetSize", &agcJumpGetSize), .expect_id = "b-oySn+G2tE" },
+    .{ .name = "sceAgcDcbStallCommandBufferParserGetSize", .function = trace.wrap("sceAgcDcbStallCommandBufferParserGetSize", &agcStallCommandBufferParserGetSize), .expect_id = "+u6dKSLWM2o" },
+    .{ .name = "sceAgcCbSetShRegistersDirectGetSize", .function = trace.wrap("sceAgcCbSetShRegistersDirectGetSize", &agcSetRegistersDirectGetSize), .expect_id = "yUBESvCCJ4I" },
+    .{ .name = "sceAgcCbSetUcRegistersDirectGetSize", .function = trace.wrap("sceAgcCbSetUcRegistersDirectGetSize", &agcSetRegistersDirectGetSize), .expect_id = "TGEZzUWLbrc" },
     .{ .name = "sceAgcDcbDrawIndexOffset", .function = trace.wrap("sceAgcDcbDrawIndexOffset", &agcDrawIndexOffset), .expect_id = "B+aG9DUnTKA" },
     .{ .name = "sceAgcDcbDrawIndexOffsetGetSize", .function = trace.wrap("sceAgcDcbDrawIndexOffsetGetSize", &agcDrawIndexOffsetGetSize), .expect_id = "qMlfB1ZhMDc" },
     .{ .name = "sceAgcDcbDrawIndexIndirect", .function = trace.wrap("sceAgcDcbDrawIndexIndirect", &agcDrawIndexIndirect), .expect_id = "t1vNu082-jM" },
     .{ .name = "sceAgcDcbDrawIndirect", .function = trace.wrap("sceAgcDcbDrawIndirect", &agcDrawIndirect), .expect_id = "1q1titRBL6o" },
     .{ .name = "sceAgcDcbDispatchIndirect", .function = trace.wrap("sceAgcDcbDispatchIndirect", &agc.dispatchIndirect), .expect_id = "CtB+A9-VxO0" },
     .{ .name = "sceAgcDcbSetNumInstances", .function = trace.wrap("sceAgcDcbSetNumInstances", &agcSetNumInstances), .expect_id = "tSBxhAPyytQ" },
-    .{ .name = "sceAgcDcbStallCommandBufferParser", .function = trace.wrap("sceAgcDcbStallCommandBufferParser", &agcCommand), .expect_id = "u2T2DiA5hRI" },
+    .{ .name = "sceAgcDcbStallCommandBufferParser", .function = trace.wrap("sceAgcDcbStallCommandBufferParser", &agcStallCommandBufferParser), .expect_id = "u2T2DiA5hRI" },
     .{ .name = "sceAgcDcbSetBaseIndirectArgs", .function = trace.wrap("sceAgcDcbSetBaseIndirectArgs", &agcSetBaseIndirectArgs), .expect_id = "RmaJwLtc8rY" },
     .{ .name = "sceAgcDcbSetShRegistersIndirect", .function = trace.wrap("sceAgcDcbSetShRegistersIndirect", &agcSetShRegistersIndirect), .expect_id = "-HOOCn0JY48" },
     .{ .name = "sceAgcDcbSetUcRegistersIndirect", .function = trace.wrap("sceAgcDcbSetUcRegistersIndirect", &agcSetUcRegistersIndirect), .expect_id = "hvUfkUIQcOE" },
@@ -3559,12 +3804,12 @@ const agc_exports = [_]symbols.Export{
     .{ .name = "sceAgcDcbWaitRegMem", .function = trace.wrap("sceAgcDcbWaitRegMem", &agcWaitRegMem), .expect_id = "VmW0Tdpy420" },
     .{ .name = "sceAgcDcbAcquireMem", .function = trace.wrap("sceAgcDcbAcquireMem", &agcAcquireMem), .expect_id = "57labkp+rSQ" },
     .{ .name = "sceAgcDcbDmaData", .function = trace.wrap("sceAgcDcbDmaData", &agcDmaData), .expect_id = "WmAc2MEj6Io" },
-    .{ .name = "sceAgcDcbCopyData", .function = trace.wrap("sceAgcDcbCopyData", &agcCommand), .expect_id = "1rZSWUv1IRc" },
+    .{ .name = "sceAgcDcbCopyData", .function = trace.wrap("sceAgcDcbCopyData", &agc.writeCommand), .expect_id = "1rZSWUv1IRc" },
     .{ .name = "sceAgcDcbWriteData", .function = trace.wrap("sceAgcDcbWriteData", &agc.writeData), .expect_id = "i1jyy49AjXU" },
     .{ .name = "sceAgcDcbEventWrite", .function = trace.wrap("sceAgcDcbEventWrite", &agcEventWrite), .expect_id = "aJf+j5yntiU" },
     .{ .name = "sceAgcDcbJump", .function = trace.wrap("sceAgcDcbJump", &agcJump), .expect_id = "xSAR0LTcRKM" },
-    .{ .name = "sceAgcDcbPushMarker", .function = trace.wrap("sceAgcDcbPushMarker", &agcCommand), .expect_id = "+kSrjIVxKFE" },
-    .{ .name = "sceAgcDcbPopMarker", .function = trace.wrap("sceAgcDcbPopMarker", &agcCommand), .expect_id = "H7uZqCoNuWk" },
+    .{ .name = "sceAgcDcbPushMarker", .function = trace.wrap("sceAgcDcbPushMarker", &agcPushMarker), .expect_id = "+kSrjIVxKFE" },
+    .{ .name = "sceAgcDcbPopMarker", .function = trace.wrap("sceAgcDcbPopMarker", &agcPopMarker), .expect_id = "H7uZqCoNuWk" },
     .{ .name = "sceAgcDcbSetFlip", .function = trace.wrap("sceAgcDcbSetFlip", &agcSetFlip), .expect_id = "YUeqkyT7mEQ" },
 };
 
@@ -3688,25 +3933,32 @@ pub fn register(db: *symbols.Database, gpa: std.mem.Allocator) symbols.Error!voi
     try db.addLibrary(gpa, .{ .name = "libSceAmpr" }, .{ .name = "libSceAmpr" }, &ampr_exports);
 }
 
-test "bootstrap AGC commands are one walkable PM4 NOP" {
-    var words: [32]u32 = @splat(0xdead_beef);
-    var command_buffer = AgcCommandBuffer{
-        .bottom = words[0..].ptr,
-        .top = words[0..].ptr + words.len,
-        .cursor_up = words[0..].ptr,
-        .cursor_down = null,
-        .callback = null,
-        .user_data = null,
-        .reserved_dwords = 0,
-    };
-    try std.testing.expect(agcCommand(&command_buffer, 0, 0, 0, 0, 0) != null);
-    try std.testing.expectEqual(words[0..].ptr + 16, command_buffer.cursor_up.?);
+test "bootstrap AGC nop occupies exactly the width it was asked for" {
+    for ([_]u32{ 2, 3, 16, 31 }) |requested| {
+        var words: [32]u32 = @splat(0xdead_beef);
+        var command_buffer = AgcCommandBuffer{
+            .bottom = words[0..].ptr,
+            .top = words[0..].ptr + words.len,
+            .cursor_up = words[0..].ptr,
+            .cursor_down = null,
+            .callback = null,
+            .user_data = null,
+            .reserved_dwords = 0,
+        };
+        try std.testing.expectEqual(requested * @sizeOf(u32), agcCbNopGetSize(requested));
+        try std.testing.expect(agcCbNop(&command_buffer, requested, 0, 0, 0, 0) != null);
+        try std.testing.expectEqual(words[0..].ptr + requested, command_buffer.cursor_up.?);
 
-    var walker = gpu.pm4.Walker.init(words[0..16]);
-    const packet = (try walker.next()).?;
-    try std.testing.expectEqual(gpu.pm4.nop, packet.opcode);
-    try std.testing.expectEqual(@as(usize, 16), packet.wordCount());
-    try std.testing.expect((try walker.next()) == null);
+        var walker = gpu.pm4.Walker.init(words[0..requested]);
+        const packet = (try walker.next()).?;
+        try std.testing.expectEqual(gpu.pm4.nop, packet.opcode);
+        try std.testing.expectEqual(@as(usize, requested), packet.wordCount());
+        try std.testing.expect((try walker.next()) == null);
+    }
+
+    // A width the writer refuses must be sized at zero, not at some default.
+    try std.testing.expectEqual(@as(u32, 0), agcCbNopGetSize(1));
+    try std.testing.expectEqual(@as(u32, 0), agcCbNopGetSize(0x4001));
 }
 
 test "bootstrap AGC jump emits the four-dword indirect-buffer packet" {
