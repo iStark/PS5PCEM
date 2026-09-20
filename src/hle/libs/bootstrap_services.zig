@@ -2413,9 +2413,8 @@ fn agcSetPredicationGetSize() callconv(abi.guest) u32 {
 /// Marks one already-written packet as guarded by the predicate, or clears
 /// the mark.
 ///
-/// The flag is bit zero of the packet header. Only that bit is touched: the
-/// rest of the word is the packet type, its length and its opcode, and a
-/// caller reaches this with a packet it has already filled in.
+/// Only type-3 commands carry this flag. Register writes and alignment words
+/// are left unchanged; a reserved packet type is refused.
 fn agcSetPacketPredication(packet: ?[*]u32, predication: u64) callconv(abi.guest) i32 {
     const words = packet orelse return errno.KernelError.einval.raw();
     const address = @intFromPtr(words);
@@ -2423,7 +2422,7 @@ fn agcSetPacketPredication(packet: ?[*]u32, predication: u64) callconv(abi.guest
         return errno.KernelError.efault.raw();
     }
     const marked: u32 = if (@as(u8, @truncate(predication)) == 1) 1 else 0;
-    words[0] = (words[0] & ~@as(u32, 1)) | marked;
+    words[0] = agcPredicatedHeader(words[0], marked) orelse return errno.KernelError.einval.raw();
     return errno.ok;
 }
 
@@ -2451,26 +2450,28 @@ fn agcSetRangePredication(
 
     // Walk once to check the span is whole, then again to mark it.
     const words = first[0..span];
-    var offset: usize = 0;
-    while (offset < span) {
-        const width = agcPacketWords(words[offset]);
-        if (width == 0 or width > span - offset) return errno.KernelError.einval.raw();
-        offset += width;
-    }
+    var walker = gpu.pm4.Walker.init(words);
+    while ((walker.next() catch return errno.KernelError.einval.raw()) != null) {}
 
     const marked: u32 = if (@as(u8, @truncate(predication)) == 1) 1 else 0;
-    offset = 0;
-    while (offset < span) {
-        words[offset] = (words[offset] & ~@as(u32, 1)) | marked;
-        offset += agcPacketWords(words[offset]);
+    walker = gpu.pm4.Walker.init(words);
+    while (walker.index < span) {
+        const offset = walker.index;
+        const packet = (walker.next() catch unreachable).?;
+        words[offset] = agcPredicatedHeader(packet.header, marked).?;
     }
     return errno.ok;
 }
 
-/// Dwords one packet occupies, by the same rule the command walker uses.
-fn agcPacketWords(header: u32) usize {
-    if (header >> 30 == 2 or header == 0xffff_1000) return 1;
-    return ((header >> 16) & 0x3fff) + 2;
+/// The special one-word NOP has type-3 bits, but changing its low bit destroys
+/// its encoding. Type-0 bit zero belongs to the register address instead.
+fn agcPredicatedHeader(header: u32, marked: u32) ?u32 {
+    const kind: gpu.pm4.Kind = @enumFromInt(@as(u2, @truncate(header >> 30)));
+    return switch (kind) {
+        .reserved => null,
+        .register_write, .filler => header,
+        .command => if (header == 0xffff_1000) header else (header & ~@as(u32, 1)) | marked,
+    };
 }
 /// SET_*_REG_INDIRECT: header, list low, list high, control, count.
 fn agcSetRegistersIndirectGetSize() callconv(abi.guest) u32 {
@@ -2506,7 +2507,6 @@ fn agcEventWriteGetSize(event_type_raw: u64) callconv(abi.guest) u32 {
     const dwords: u32 = if ((event_type & 0x3e) == 0x38) 4 else 2;
     return dwords * @sizeOf(u32);
 }
-
 
 fn agcJump(
     buffer: ?*AgcCommandBuffer,

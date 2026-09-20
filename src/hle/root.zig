@@ -1359,6 +1359,95 @@ test "marking one packet leaves the rest of its header alone" {
     try testing.expectEqual(errno.KernelError.einval.raw(), mark(null, 1, 0, 0, 0, 0));
 }
 
+test "packet predication preserves register addresses and alignment words" {
+    const std = @import("std");
+    const testing = std.testing;
+    var db = Database{};
+    defer db.deinit(testing.allocator);
+    try registerAll(&db, testing.allocator);
+    const mark = try agcEntryPoint(&db, "w6Dj1VJt5qY", AgcPatch2);
+
+    for ([_]u32{ 0x0000_2000, 0x0000_2001, 0x8000_0000, 0x8000_0001, 0xffff_1000 }) |header| {
+        var words = [_]u32{ header, 0xdead_beef };
+        const before = words;
+        for ([_]u64{ 1, 0, 1 }) |flag| {
+            try testing.expectEqual(errno.ok, mark(&words, flag, 0, 0, 0, 0));
+            try testing.expectEqualSlices(u32, &before, &words);
+        }
+    }
+
+    var reserved = [_]u32{ 0x4000_0000, 0xdead_beef };
+    const before = reserved;
+    try testing.expectEqual(errno.KernelError.einval.raw(), mark(&reserved, 1, 0, 0, 0, 0));
+    try testing.expectEqualSlices(u32, &before, &reserved);
+}
+
+test "range predication keeps mixed streams walkable and marks commands after padding" {
+    const std = @import("std");
+    const gpu = @import("gpu");
+    const testing = std.testing;
+    var db = Database{};
+    defer db.deinit(testing.allocator);
+    try registerAll(&db, testing.allocator);
+    const range = try agcEntryPoint(&db, "n8vgpaQg6dA", AgcRangePatch);
+
+    // Special padding at the beginning, middle and end; ordinary type-2
+    // padding; and an odd type-0 register address that clearing bit zero
+    // would change. A payload word also looks like the special filler.
+    var words = [_]u32{
+        0xffff_1000,
+        pm4Command(gpu.pm4.draw_index_auto, 2),
+        3,
+        0,
+        0x8000_0000,
+        0x0000_2001,
+        0xffff_1000,
+        0xffff_1000,
+        pm4Command(gpu.pm4.num_instances, 1) | 1,
+        2,
+        0xffff_1000,
+    };
+    const before = words;
+    for ([_]u64{ 1, 0, 1, 1 }) |flag| {
+        try testing.expectEqual(errno.ok, range(&words, words[words.len..].ptr, flag, 0, 0, 0));
+        for (words, 0..) |word, index| {
+            const expected = if (index == 1 or index == 8)
+                (before[index] & ~@as(u32, 1)) | @as(u32, @intCast(flag))
+            else
+                before[index];
+            try testing.expectEqual(expected, word);
+        }
+        var walker = gpu.pm4.Walker.init(&words);
+        var packet_count: usize = 0;
+        while (try walker.next()) |_| packet_count += 1;
+        try testing.expectEqual(@as(usize, 7), packet_count);
+        try testing.expectEqual(words.len, walker.index);
+    }
+}
+
+test "range predication refuses malformed tails before changing earlier headers" {
+    const std = @import("std");
+    const gpu = @import("gpu");
+    const testing = std.testing;
+    var db = Database{};
+    defer db.deinit(testing.allocator);
+    try registerAll(&db, testing.allocator);
+    const range = try agcEntryPoint(&db, "n8vgpaQg6dA", AgcRangePatch);
+
+    // The tail is either reserved type-1 or a draw missing its final word.
+    for ([_]u32{ 0x4000_0000, pm4Command(gpu.pm4.draw_index_auto, 2) }) |tail| {
+        for ([_]u32{ 0, 1 }) |flag| {
+            var words = [_]u32{ pm4Command(gpu.pm4.num_instances, 1) | (flag ^ 1), 2, tail, 3 };
+            const before = words;
+            try testing.expectEqual(
+                errno.KernelError.einval.raw(),
+                range(&words, words[words.len..].ptr, flag, 0, 0, 0),
+            );
+            try testing.expectEqualSlices(u32, &before, &words);
+        }
+    }
+}
+
 test "an unsupported predication mode is reported and issues its packets" {
     const std = @import("std");
     const gpu = @import("gpu");
