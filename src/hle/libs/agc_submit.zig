@@ -3526,6 +3526,88 @@ fn submitCommandBuffer(_: u32, address: ?[*]const u32, word_count: u32) callconv
     return errno.ok;
 }
 
+/// Where the AGC driver keeps the queue identifier inside its queue context.
+///
+/// The context itself is opaque to the title: it receives one from the driver
+/// and hands the same pointer back. This offset rests on Kyty alone, which
+/// reads a u32 here; nothing in this tree describes the context layout, and no
+/// title has been observed reaching this entry point. What the offset yields is
+/// corroborated separately -- see the queue block below -- but where it is read
+/// from is a single-source assumption.
+const driver_queue_context_offset: u64 = 4;
+
+/// The identifier block the compute queues occupy.
+///
+/// The base and stride are corroborated: `sdk11AcbQueueAt` validates a guest
+/// queue object by re-encoding its owner as `(queue_number * 8 + 0x20) | lane`,
+/// derived here from real queue objects, so compute identifiers start at 0x20
+/// and advance eight per pipe with three bits of lane below. Kyty's constant
+/// agrees. The upper bound does not follow from that encoding -- it implies
+/// seven pipes, which ends at 0x57 -- and 0x58 is Kyty's number alone.
+/// Anything outside the block is graphics work on the single DCB queue.
+const compute_queue_first: u32 = 0x20;
+const compute_queue_limit: u32 = 0x58;
+
+fn isComputeDriverQueue(queue: u32) bool {
+    return queue >= compute_queue_first and queue < compute_queue_limit;
+}
+
+/// Reads the queue identifier out of a driver queue context.
+///
+/// Returns null for a context this process cannot read. The identifier selects
+/// which queue every buffer in the batch runs on, so guessing one would send a
+/// whole submission to the wrong queue; refusing the call is the honest answer.
+fn driverQueueOf(queue_context: ?*const anyopaque) ?u32 {
+    const context = queue_context orelse return null;
+    const address = @intFromPtr(context) + driver_queue_context_offset;
+    if (!memory.isGuestRangeAccessible(address, @sizeOf(u32))) return null;
+    const field: *align(1) const u32 = @ptrFromInt(address);
+    return field.*;
+}
+
+/// Several command buffers on the queue the driver context names.
+///
+/// Unlike SubmitMultiDcbs the queue is not implied by the entry point. The
+/// driver passes its queue context and the identifier inside it decides between
+/// the graphics queue and one of the compute queues, so the same array of
+/// buffers means different work depending on that word. Routing everything to
+/// the DCB queue would order compute work against graphics and publish its
+/// completion without the queue owner the guest registered its event under.
+///
+/// A null entry is skipped rather than ending the batch, matching
+/// SubmitMultiDcbs: the arrays are indexed in parallel, so stopping early would
+/// drop every buffer after a hole the title deliberately left.
+fn submitMultiCommandBuffers(
+    queue_context: ?*const anyopaque,
+    addresses: ?[*]const ?[*]const u32,
+    word_counts: ?[*]const u32,
+    count: u32,
+) callconv(abi.guest) i32 {
+    drainCompletionNotifications();
+    if (count == 0) return errno.ok;
+    const submit_started = gpu.frame_timing.timestampNs();
+    defer gpu.frame_timing.noteSubmit(gpu.frame_timing.elapsedNs(submit_started));
+    const buffers = addresses orelse return errno.KernelError.einval.raw();
+    const sizes = word_counts orelse return errno.KernelError.einval.raw();
+    const queue = driverQueueOf(queue_context) orelse return errno.KernelError.einval.raw();
+
+    for (0..count) |index| {
+        const stream = streamOf(buffers[index], sizes[index]) orelse continue;
+        if (isComputeDriverQueue(queue)) {
+            // Same order of operations as SubmitMultiAcbs: the graphics
+            // segment is closed first so a compute buffer cannot be folded
+            // into the pending graphics arena.
+            flushPendingGraphicsSegment();
+            const outcome = acceptSubmitted("acb", stream, null, queue);
+            if (outcome.last_release) |release| publishSdk11AcbRetirement(release);
+            publishAcbCompletion(queue, outcome);
+        } else {
+            publishDcbCompletion(acceptSubmitted("dcb", stream, null, 0));
+        }
+    }
+    return errno.ok;
+}
+
 pub const exports = [_]symbols.Export{
     .{ .name = "sceAgcDriverSubmitDcb", .function = trace.wrap("sceAgcDriverSubmitDcb", &submitDcb), .expect_id = "UglJIZjGssM" },
     .{ .name = "sceAgcDriverAgrSubmitDcb", .function = trace.wrap("sceAgcDriverAgrSubmitDcb", &submitDcb), .expect_id = "AhGvpITrf4M" },
@@ -3533,6 +3615,7 @@ pub const exports = [_]symbols.Export{
     .{ .name = "sceAgcDriverSubmitMultiDcbs", .function = trace.wrap("sceAgcDriverSubmitMultiDcbs", &submitMultiDcbs), .expect_id = "6UzEidRZwkg" },
     .{ .name = "sceAgcDriverAgrSubmitMultiDcbs", .function = trace.wrap("sceAgcDriverAgrSubmitMultiDcbs", &submitMultiDcbs), .expect_id = "+T8Xo6LtFJI" },
     .{ .name = "sceAgcDriverSubmitCommandBuffer", .function = trace.wrap("sceAgcDriverSubmitCommandBuffer", &submitCommandBuffer), .expect_id = "b4fpgH5ZXxQ" },
+    .{ .name = "sceAgcDriverSubmitMultiCommandBuffers", .function = trace.wrap("sceAgcDriverSubmitMultiCommandBuffers", &submitMultiCommandBuffers), .expect_id = "Fj7r9EHzF38" },
 };
 
 // ---------------------------------------------------------------------------

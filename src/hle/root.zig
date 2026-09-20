@@ -149,20 +149,37 @@ test {
 // what the registry actually hands the dynamic linker, which is the only place
 // a shadowed binding shows up.
 
-/// Resolves one libSceAgc identifier exactly as `resolveHleExact` does.
-fn agcEntryPoint(
+/// Resolves one firmware identifier exactly as `resolveHleExact` does.
+fn firmwareEntryPoint(
     db: *const Database,
+    comptime library_name: []const u8,
     comptime id: *const [nid.encoded_len:0]u8,
     comptime Signature: type,
 ) !*const Signature {
     const key = symbols.Key{
         .id = id[0..nid.encoded_len].*,
-        .library = .{ .name = "libSceAgc", .version = 1 },
-        .module = .{ .name = "libSceAgc" },
+        .library = .{ .name = library_name, .version = 1 },
+        .module = .{ .name = library_name },
         .type = .function,
     };
     const symbol = db.find(key) orelse return error.IdentifierNotRegistered;
     return @ptrFromInt(symbol.address);
+}
+
+fn agcEntryPoint(
+    db: *const Database,
+    comptime id: *const [nid.encoded_len:0]u8,
+    comptime Signature: type,
+) !*const Signature {
+    return firmwareEntryPoint(db, "libSceAgc", id, Signature);
+}
+
+fn agcDriverEntryPoint(
+    db: *const Database,
+    comptime id: *const [nid.encoded_len:0]u8,
+    comptime Signature: type,
+) !*const Signature {
+    return firmwareEntryPoint(db, "libSceAgcDriver", id, Signature);
 }
 
 test "register-indirect count patches reach the handler that edits the packet" {
@@ -291,4 +308,251 @@ test "draw index auto reports the size it writes" {
     const written = @intFromPtr(buffer.cursor_up.?) - @intFromPtr(words[0..].ptr);
     try testing.expectEqual(@as(usize, get_size()), written);
     try testing.expectEqual(gpu.pm4.draw_index_auto, @as(u8, @truncate(words[0] >> 8)));
+}
+
+// ---------------------------------------------------------------------------
+// sceAgcDriverSubmitMultiCommandBuffers
+
+/// The signature the driver calls this entry point with: its queue context,
+/// the buffer and size arrays, and how many of each.
+const SubmitMultiCommandBuffers = fn (
+    ?*const anyopaque,
+    ?[*]const ?[*]const u32,
+    ?[*]const u32,
+    u32,
+) callconv(abi.guest) i32;
+
+/// Records what reached the renderer and in which order.
+///
+/// Each queue keeps its own register state, so the draw counter the callback
+/// observes says which queue ran the buffer: a second graphics buffer sees two,
+/// while the first compute buffer sees one.
+const SubmitProbe = struct {
+    const gpu_module = @import("gpu");
+
+    marks: [16]u32 = @splat(0),
+    counters: [16]u64 = @splat(0),
+    mark_count: usize = 0,
+
+    fn from(context: ?*anyopaque) *SubmitProbe {
+        return @ptrCast(@alignCast(context.?));
+    }
+
+    fn read(_: ?*anyopaque, address: u64, bytes: []u8) bool {
+        if (address == 0) return false;
+        const source: [*]const u8 = @ptrFromInt(address);
+        @memcpy(bytes, source[0..bytes.len]);
+        return true;
+    }
+
+    fn write(_: ?*anyopaque, address: u64, bytes: []const u8) bool {
+        if (address == 0) return false;
+        const target: [*]u8 = @ptrFromInt(address);
+        @memcpy(target[0..bytes.len], bytes);
+        return true;
+    }
+
+    fn draw(
+        context: ?*anyopaque,
+        state: *const gpu_module.State,
+        packet: gpu_module.pm4.Packet,
+    ) bool {
+        const self = from(context);
+        if (self.mark_count < self.marks.len) {
+            self.marks[self.mark_count] = packet.body[0];
+            self.counters[self.mark_count] = state.draw_count;
+            self.mark_count += 1;
+        }
+        return true;
+    }
+
+    const vtable = gpu_module.DcbBackend.VTable{
+        .read = read,
+        .write = write,
+        .draw = draw,
+    };
+
+    fn attach(self: *SubmitProbe) void {
+        libs.agc_submit.attachBackend(.{ .context = self, .vtable = &vtable });
+    }
+};
+
+fn pm4Command(opcode: u8, body_words: u14) u32 {
+    return (@as(u32, 3) << 30) | (@as(u32, body_words - 1) << 16) | (@as(u32, opcode) << 8);
+}
+
+/// One DRAW_INDEX_AUTO whose index count identifies the buffer it came from.
+fn markedDraw(mark: u32) [3]u32 {
+    const gpu_module = @import("gpu");
+    return .{ pm4Command(gpu_module.pm4.draw_index_auto, 2), mark, 0 };
+}
+
+test "SubmitMultiCommandBuffers accepts an empty batch" {
+    const std = @import("std");
+    const testing = std.testing;
+
+    var db = Database{};
+    defer db.deinit(testing.allocator);
+    try registerAll(&db, testing.allocator);
+    const submit = try agcDriverEntryPoint(&db, "Fj7r9EHzF38", SubmitMultiCommandBuffers);
+
+    libs.agc_submit.reset();
+    defer libs.agc_submit.reset();
+
+    // A count of zero is answered before the arrays are looked at, so a driver
+    // that passes nothing at all is not an error.
+    try testing.expectEqual(errno.ok, submit(null, null, null, 0));
+}
+
+test "SubmitMultiCommandBuffers refuses a batch missing a required array" {
+    const std = @import("std");
+    const testing = std.testing;
+
+    var db = Database{};
+    defer db.deinit(testing.allocator);
+    try registerAll(&db, testing.allocator);
+    const submit = try agcDriverEntryPoint(&db, "Fj7r9EHzF38", SubmitMultiCommandBuffers);
+
+    libs.agc_submit.reset();
+    defer libs.agc_submit.reset();
+
+    var context = [_]u32{ 0, 0 };
+    var only = markedDraw(1);
+    const buffers = [_]?[*]const u32{&only};
+    const sizes = [_]u32{only.len};
+
+    const einval = errno.KernelError.einval.raw();
+    try testing.expectEqual(einval, submit(&context, null, &sizes, 1));
+    try testing.expectEqual(einval, submit(&context, &buffers, null, 1));
+    // The queue identifier lives inside the context, so without one there is no
+    // queue to run the batch on.
+    try testing.expectEqual(einval, submit(null, &buffers, &sizes, 1));
+}
+
+test "SubmitMultiCommandBuffers runs its buffers in the order given" {
+    const std = @import("std");
+    const testing = std.testing;
+
+    var db = Database{};
+    defer db.deinit(testing.allocator);
+    try registerAll(&db, testing.allocator);
+    const submit = try agcDriverEntryPoint(&db, "Fj7r9EHzF38", SubmitMultiCommandBuffers);
+
+    libs.agc_submit.reset();
+    defer libs.agc_submit.reset();
+    var probe = SubmitProbe{};
+    probe.attach();
+
+    var context = [_]u32{ 0, 0 };
+    var first = markedDraw(11);
+    var second = markedDraw(22);
+    var third = markedDraw(33);
+    // A hole between buffers must not end the batch.
+    const buffers = [_]?[*]const u32{ &first, null, &second, &third };
+    const sizes = [_]u32{ first.len, 0, second.len, third.len };
+
+    try testing.expectEqual(errno.ok, submit(&context, &buffers, &sizes, buffers.len));
+    try testing.expectEqual(@as(usize, 3), probe.mark_count);
+    try testing.expectEqualSlices(u32, &.{ 11, 22, 33 }, probe.marks[0..3]);
+}
+
+test "SubmitMultiCommandBuffers routes by the queue its context names" {
+    const std = @import("std");
+    const testing = std.testing;
+
+    var db = Database{};
+    defer db.deinit(testing.allocator);
+    try registerAll(&db, testing.allocator);
+    const submit = try agcDriverEntryPoint(&db, "Fj7r9EHzF38", SubmitMultiCommandBuffers);
+
+    libs.agc_submit.reset();
+    defer libs.agc_submit.reset();
+    var probe = SubmitProbe{};
+    probe.attach();
+
+    // 0x20 is the first compute identifier; 0x10 and 0x58 fall outside the
+    // compute block and are graphics work.
+    var graphics_context = [_]u32{ 0, 0x10 };
+    var compute_context = [_]u32{ 0, 0x20 };
+    var past_compute_context = [_]u32{ 0, 0x58 };
+
+    var one = markedDraw(1);
+    var two = markedDraw(2);
+    var three = markedDraw(3);
+    const first = [_]?[*]const u32{&one};
+    const second = [_]?[*]const u32{&two};
+    const third = [_]?[*]const u32{&three};
+    const sizes = [_]u32{one.len};
+
+    try testing.expectEqual(errno.ok, submit(&graphics_context, &first, &sizes, 1));
+    try testing.expectEqual(errno.ok, submit(&compute_context, &second, &sizes, 1));
+    try testing.expectEqual(errno.ok, submit(&past_compute_context, &third, &sizes, 1));
+
+    try testing.expectEqual(@as(usize, 3), probe.mark_count);
+    try testing.expectEqualSlices(u32, &.{ 1, 2, 3 }, probe.marks[0..3]);
+    // Each queue counts its own work. The compute buffer starts a fresh count,
+    // and the second graphics buffer continues the first one, which it could
+    // not do if every submission were funnelled onto the DCB queue.
+    try testing.expectEqual(@as(u64, 1), probe.counters[0]);
+    try testing.expectEqual(@as(u64, 1), probe.counters[1]);
+    try testing.expectEqual(@as(u64, 2), probe.counters[2]);
+}
+
+test "SubmitMultiCommandBuffers resumes past a wait without replaying it" {
+    const std = @import("std");
+    const gpu_module = @import("gpu");
+    const testing = std.testing;
+
+    var db = Database{};
+    defer db.deinit(testing.allocator);
+    try registerAll(&db, testing.allocator);
+    const submit = try agcDriverEntryPoint(&db, "Fj7r9EHzF38", SubmitMultiCommandBuffers);
+
+    libs.agc_submit.reset();
+    defer libs.agc_submit.reset();
+    var probe = SubmitProbe{};
+    probe.attach();
+
+    // The label the queue parks on. It does not hold the awaited value, so the
+    // stream blocks midway and only continues once that value arrives.
+    //
+    // It lives on the heap rather than beside the buffers: the submit path
+    // protects the sixteen bytes ahead of every submitted arena as its
+    // allocation header, and a label the stack happened to place there would be
+    // recovered by the scheduler instead of through guest memory.
+    const label = try testing.allocator.create(u32);
+    defer testing.allocator.destroy(label);
+    label.* = 0;
+    const label_address = @intFromPtr(label);
+
+    var waiting = [_]u32{
+        pm4Command(gpu_module.pm4.draw_index_auto, 2),
+        44,
+        0,
+        pm4Command(gpu_module.pm4.wait_reg_mem, 6),
+        // Memory space (bit 4), compare "equal" (3).
+        0x13,
+        @truncate(label_address),
+        @truncate(label_address >> 32),
+        1,
+        0xffff_ffff,
+        0x10,
+        pm4Command(gpu_module.pm4.draw_index_auto, 2),
+        55,
+        0,
+    };
+    var after = markedDraw(66);
+    const buffers = [_]?[*]const u32{ &waiting, &after };
+    const sizes = [_]u32{ waiting.len, after.len };
+
+    var context = [_]u32{ 0, 0 };
+    try testing.expectEqual(errno.ok, submit(&context, &buffers, &sizes, buffers.len));
+
+    // The wait really parked the queue: the value it waited for was not there
+    // before the call and is there afterwards.
+    try testing.expectEqual(@as(u32, 1), label.*);
+    // The draw ahead of the wait ran once, not once per resume attempt, and the
+    // rest of the batch followed it in order.
+    try testing.expectEqual(@as(usize, 3), probe.mark_count);
+    try testing.expectEqualSlices(u32, &.{ 44, 55, 66 }, probe.marks[0..3]);
 }
