@@ -27,7 +27,8 @@ Selector definitions were checked against AMD PAL's public packet headers:
 [ME](https://github.com/GPUOpen-Drivers/pal/blob/dev/src/core/hw/gfxip/gfx9/chip/gfx9_plus_merged_f32_me_pm4_packets.h),
 [PFP](https://github.com/GPUOpen-Drivers/pal/blob/dev/src/core/hw/gfxip/gfx9/chip/gfx9_plus_merged_f32_pfp_pm4_packets.h), and
 [MEC](https://github.com/GPUOpen-Drivers/pal/blob/dev/src/core/hw/gfxip/gfx9/chip/gfx9_plus_merged_f32_mec_pm4_packets.h).
-Kyty's reconstructed compound selector mapping is not used as the hardware enum.
+The decoder keeps the hardware source and destination selectors separate from
+engine selection.
 
 ## Verification
 

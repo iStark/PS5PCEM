@@ -3529,11 +3529,10 @@ fn submitCommandBuffer(_: u32, address: ?[*]const u32, word_count: u32) callconv
 /// Where the AGC driver keeps the queue identifier inside its queue context.
 ///
 /// The context itself is opaque to the title: it receives one from the driver
-/// and hands the same pointer back. This offset rests on Kyty alone, which
-/// reads a u32 here; nothing in this tree describes the context layout, and no
-/// title has been observed reaching this entry point. What the offset yields is
-/// corroborated separately -- see the queue block below -- but where it is read
-/// from is a single-source assumption.
+/// and hands the same pointer back. The u32 field at offset 4 is inferred;
+/// nothing in this tree describes the context layout, and no title has been
+/// observed reaching this entry point. The identifier encoding is corroborated
+/// separately below, but this field's position still needs runtime validation.
 const driver_queue_context_offset: u64 = 4;
 
 /// The identifier block the compute queues occupy.
@@ -3541,9 +3540,9 @@ const driver_queue_context_offset: u64 = 4;
 /// The base and stride are corroborated: `sdk11AcbQueueAt` validates a guest
 /// queue object by re-encoding its owner as `(queue_number * 8 + 0x20) | lane`,
 /// derived here from real queue objects, so compute identifiers start at 0x20
-/// and advance eight per pipe with three bits of lane below. Kyty's constant
-/// agrees. The upper bound does not follow from that encoding -- it implies
-/// seven pipes, which ends at 0x57 -- and 0x58 is Kyty's number alone.
+/// and advance eight per pipe with three bits of lane below. The exclusive
+/// upper bound 0x58 remains provisional: it implies seven pipes, ending at
+/// 0x57, but the encoding alone does not establish the number of pipes.
 /// Anything outside the block is graphics work on the single DCB queue.
 const compute_queue_first: u32 = 0x20;
 const compute_queue_limit: u32 = 0x58;

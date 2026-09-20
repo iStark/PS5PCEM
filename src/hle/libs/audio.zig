@@ -2916,8 +2916,8 @@ fn findAjmInstanceLocked(instance: u32) ?*AjmInstance {
 
 fn ajmInitialize(reserved: i64, context: ?*u32) callconv(abi.guest) i32 {
     // Newer Prospero middleware passes generation/feature bits here even
-    // though older SDK headers called the field reserved. Real firmware (and
-    // Kyty's compatible implementation) accepts those bits.
+    // though older SDK headers called the field reserved. Accept these flags
+    // without rejecting initialization merely because the value is nonzero.
     _ = reserved;
     const output = context orelse return ajm_error_invalid_parameter;
     ajm_mutex.lock();
