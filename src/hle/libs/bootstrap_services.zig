@@ -2473,6 +2473,107 @@ fn agcPredicatedHeader(header: u32, marked: u32) ?u32 {
         .command => if (header == 0xffff_1000) header else (header & ~@as(u32, 1)) | marked,
     };
 }
+/// Moves four or eight bytes, from memory or from an immediate the packet
+/// carries, into memory.
+///
+/// Six dwords: header, control, source low, source high, destination low,
+/// destination high. The two forms differ only in how the control word spells
+/// its selectors, which is why they share everything below it.
+fn agcCopyData(
+    buffer: ?*AgcCommandBuffer,
+    destination: u64,
+    destination_cache_policy: u64,
+    destination_address: u64,
+    source: u64,
+    source_cache_policy: u64,
+    source_address_or_immediate: u64,
+    item_size: u64,
+    write_confirm: u64,
+    selectors: u32,
+) ?[*]u32 {
+    const body = [_]u32{
+        selectors |
+            ((@as(u32, @truncate(source_cache_policy)) & 0x3) << 13) |
+            ((@as(u32, @truncate(item_size)) & 0x1) << 16) |
+            ((@as(u32, @truncate(write_confirm)) & 0x1) << 20) |
+            ((@as(u32, @truncate(destination_cache_policy)) & 0x3) << 25),
+        @truncate(source_address_or_immediate),
+        @truncate(source_address_or_immediate >> 32),
+        @truncate(destination_address),
+        @truncate(destination_address >> 32),
+    };
+    _ = destination;
+    _ = source;
+    return writeExactAgcPacket(buffer, gpu.pm4.copy_data, &body);
+}
+
+/// The graphics form. Its selectors are written shifted right by one, and the
+/// bit that falls out of the source selector is parked at bit 30 -- the same
+/// split SetUcRegisterDirect and WriteData use to name the parser as well as
+/// the hardware destination.
+fn agcDcbCopyData(
+    buffer: ?*AgcCommandBuffer,
+    destination: u64,
+    destination_cache_policy: u64,
+    destination_address: u64,
+    source: u64,
+    source_cache_policy: u64,
+    source_address_or_immediate: u64,
+    item_size: u64,
+    write_confirm: u64,
+) callconv(abi.guest) ?[*]u32 {
+    const source_byte: u32 = @truncate(source);
+    const destination_byte: u32 = @truncate(destination);
+    const selectors = ((source_byte >> 1) & 0xf) |
+        (((destination_byte >> 1) & 0xf) << 8) |
+        ((source_byte & 0x1) << 30);
+    return agcCopyData(
+        buffer,
+        destination,
+        destination_cache_policy,
+        destination_address,
+        source,
+        source_cache_policy,
+        source_address_or_immediate,
+        item_size,
+        write_confirm,
+        selectors,
+    );
+}
+
+/// The compute form. It has no parser to choose between, so the selectors go
+/// in unshifted and bit 30 is unused.
+fn agcAcbCopyData(
+    buffer: ?*AgcCommandBuffer,
+    destination: u64,
+    destination_cache_policy: u64,
+    destination_address: u64,
+    source: u64,
+    source_cache_policy: u64,
+    source_address_or_immediate: u64,
+    item_size: u64,
+    write_confirm: u64,
+) callconv(abi.guest) ?[*]u32 {
+    const selectors = (@as(u32, @truncate(source)) & 0xf) |
+        ((@as(u32, @truncate(destination)) & 0xf) << 8);
+    return agcCopyData(
+        buffer,
+        destination,
+        destination_cache_policy,
+        destination_address,
+        source,
+        source_cache_policy,
+        source_address_or_immediate,
+        item_size,
+        write_confirm,
+        selectors,
+    );
+}
+
+/// COPY_DATA: header, control, source pair, destination pair.
+fn agcCopyDataGetSize() callconv(abi.guest) u32 {
+    return 6 * @sizeOf(u32);
+}
 /// SET_*_REG_INDIRECT: header, list low, list high, control, count.
 fn agcSetRegistersIndirectGetSize() callconv(abi.guest) u32 {
     return 5 * @sizeOf(u32);
@@ -3855,7 +3956,7 @@ const agc_exports = [_]symbols.Export{
     .{ .name = "sceAgcAcbWaitRegMem", .function = trace.wrap("sceAgcAcbWaitRegMem", &agcAcbWaitRegMem), .expect_id = "htn36gPnBk4" },
     .{ .name = "sceAgcAcbAcquireMem", .function = trace.wrap("sceAgcAcbAcquireMem", &agcAcbAcquireMem), .expect_id = "KT-hTp-Ch14" },
     .{ .name = "sceAgcAcbDmaData", .function = trace.wrap("sceAgcAcbDmaData", &agcAcbDmaData), .expect_id = "-RnpfpxIhec" },
-    .{ .name = "sceAgcAcbCopyData", .function = trace.wrap("sceAgcAcbCopyData", &agc.writeCommand), .expect_id = "qzMN2XKGA4k" },
+    .{ .name = "sceAgcAcbCopyData", .function = trace.wrap("sceAgcAcbCopyData", &agcAcbCopyData), .expect_id = "qzMN2XKGA4k" },
     .{ .name = "sceAgcAcbWriteData", .function = trace.wrap("sceAgcAcbWriteData", &agc.writeDataAcb), .expect_id = "eZ4+17OQz4Q" },
     .{ .name = "sceAgcAcbEventWrite", .function = trace.wrap("sceAgcAcbEventWrite", &agcEventWrite), .expect_id = "cFazmnXpJOE" },
     .{ .name = "sceAgcAcbJump", .function = trace.wrap("sceAgcAcbJump", &agcAcbJump), .expect_id = "e1DFTg+Sd8U" },
@@ -3888,6 +3989,8 @@ const agc_exports = [_]symbols.Export{
     .{ .name = "sceAgcSetPacketPredication", .function = trace.wrap("sceAgcSetPacketPredication", &agcSetPacketPredication), .expect_id = "w6Dj1VJt5qY" },
     .{ .name = "sceAgcSetRangePredication", .function = trace.wrap("sceAgcSetRangePredication", &agcSetRangePredication), .expect_id = "n8vgpaQg6dA" },
     .{ .name = "sceAgcDcbSetPredication", .function = trace.wrap("sceAgcDcbSetPredication", &agcDcbSetPredication), .expect_id = "bbFueFP+J4k" },
+    .{ .name = "sceAgcDcbCopyDataGetSize", .function = trace.wrap("sceAgcDcbCopyDataGetSize", &agcCopyDataGetSize), .expect_id = "b5u0Jzm8TF8" },
+    .{ .name = "sceAgcAcbCopyDataGetSize", .function = trace.wrap("sceAgcAcbCopyDataGetSize", &agcCopyDataGetSize), .expect_id = "CbQh3DKMSno" },
     .{ .name = "sceAgcCbSetShRegistersDirectGetSize", .function = trace.wrap("sceAgcCbSetShRegistersDirectGetSize", &agcSetRegistersDirectGetSize), .expect_id = "yUBESvCCJ4I" },
     .{ .name = "sceAgcCbSetUcRegistersDirectGetSize", .function = trace.wrap("sceAgcCbSetUcRegistersDirectGetSize", &agcSetRegistersDirectGetSize), .expect_id = "TGEZzUWLbrc" },
     .{ .name = "sceAgcDcbDrawIndexOffset", .function = trace.wrap("sceAgcDcbDrawIndexOffset", &agcDrawIndexOffset), .expect_id = "B+aG9DUnTKA" },
@@ -3904,7 +4007,7 @@ const agc_exports = [_]symbols.Export{
     .{ .name = "sceAgcDcbWaitRegMem", .function = trace.wrap("sceAgcDcbWaitRegMem", &agcWaitRegMem), .expect_id = "VmW0Tdpy420" },
     .{ .name = "sceAgcDcbAcquireMem", .function = trace.wrap("sceAgcDcbAcquireMem", &agcAcquireMem), .expect_id = "57labkp+rSQ" },
     .{ .name = "sceAgcDcbDmaData", .function = trace.wrap("sceAgcDcbDmaData", &agcDmaData), .expect_id = "WmAc2MEj6Io" },
-    .{ .name = "sceAgcDcbCopyData", .function = trace.wrap("sceAgcDcbCopyData", &agc.writeCommand), .expect_id = "1rZSWUv1IRc" },
+    .{ .name = "sceAgcDcbCopyData", .function = trace.wrap("sceAgcDcbCopyData", &agcDcbCopyData), .expect_id = "1rZSWUv1IRc" },
     .{ .name = "sceAgcDcbWriteData", .function = trace.wrap("sceAgcDcbWriteData", &agc.writeData), .expect_id = "i1jyy49AjXU" },
     .{ .name = "sceAgcDcbEventWrite", .function = trace.wrap("sceAgcDcbEventWrite", &agcEventWrite), .expect_id = "aJf+j5yntiU" },
     .{ .name = "sceAgcDcbJump", .function = trace.wrap("sceAgcDcbJump", &agcJump), .expect_id = "xSAR0LTcRKM" },

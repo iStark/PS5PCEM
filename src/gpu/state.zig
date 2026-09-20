@@ -134,6 +134,51 @@ pub const SetPredication = struct {
     wait: u1,
     address: u64,
 };
+/// What one `COPY_DATA` packet moves.
+///
+/// The selectors are stored as the command processor recovers them, which is
+/// deliberately not how either constructor spells them. The graphics form
+/// writes the selector shifted right by one and puts the bit it shifted out
+/// at bit 30; the compute form writes the selector unshifted and has no bit
+/// 30 at all. Recovering `(field << 1) | bit30` undoes the first exactly and
+/// doubles the second, and the two land in one space that can be read without
+/// knowing which queue wrote the packet: a compute selector of 1, 2 or 3
+/// arrives as 2, 4 or 6, and a graphics selector of 2, 4 or 5 arrives
+/// unchanged -- all of them memory. The same holds for the immediate
+/// selector, which is 5 from compute and 10 from graphics and arrives as 10
+/// either way.
+pub const CopyData = struct {
+    /// Recovered selector values, not the arguments a title passed.
+    pub const Selector = enum {
+        memory,
+        gds,
+        immediate,
+        other,
+
+        pub fn from(recovered: u32) Selector {
+            return switch (recovered) {
+                2, 4, 5 => .memory,
+                3, 6, 7 => .gds,
+                10, 11 => .immediate,
+                else => .other,
+            };
+        }
+    };
+
+    source: Selector,
+    destination: Selector,
+    source_raw: u32,
+    destination_raw: u32,
+    source_cache_policy: u2,
+    destination_cache_policy: u2,
+    write_confirm: bool,
+    /// Four or eight. The packet carries one bit; everything else about the
+    /// transfer is the same either way.
+    byte_count: u4,
+    /// A memory address, or the immediate itself when the source says so.
+    source_address_or_immediate: u64,
+    destination_address: u64,
+};
 pub const State = struct {
     config: RegisterFile(config_register_count) = .{},
     context: RegisterFile(context_register_count) = .{},
@@ -149,6 +194,7 @@ pub const State = struct {
     last_event: ?EventWrite = null,
     last_flip: ?Flip = null,
     last_predication: ?SetPredication = null,
+    last_copy: ?CopyData = null,
 
     /// Whether packets carrying the predicate bit are currently dropped.
     ///
@@ -190,6 +236,10 @@ pub const State = struct {
     predicated_executed: u64 = 0,
     predicated_skipped: u64 = 0,
     predicated_opcode_counts: [256]u32 = @splat(0),
+
+    copy_data_count: u64 = 0,
+    /// Transfers whose selectors name something this does not move yet.
+    copy_data_unsupported_count: u64 = 0,
 
     pub fn writeRegister(self: *State, space: pm4.RegisterSpace, offset: u32, value: u32) Error!void {
         switch (space) {

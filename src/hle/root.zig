@@ -1593,3 +1593,365 @@ test "predication counters can be switched off" {
     try testing.expectEqual(@as(u64, 0), state.predication_enable_count);
     try testing.expectEqual(@as(u64, 0), state.predicated_skipped);
 }
+
+// ---------------------------------------------------------------------------
+// COPY_DATA
+//
+// The graphics and compute constructors describe the same transfer with
+// different numbers, because the graphics control word carries a parser
+// selector the compute one has no room for. These check that the two spellings
+// meet in the packet, and that what the packet says is what gets moved.
+
+const AgcCopyData = fn (
+    ?*libs.agc.CommandBuffer,
+    u64,
+    u64,
+    u64,
+    u64,
+    u64,
+    u64,
+    u64,
+    u64,
+) callconv(abi.guest) ?[*]u32;
+
+/// Selector spellings that mean the same thing to each queue.
+const memory_selector_dcb: u64 = 4;
+const memory_selector_acb: u64 = 2;
+const immediate_selector_dcb: u64 = 10;
+const immediate_selector_acb: u64 = 5;
+
+test "both COPY_DATA constructors reach the registry and agree on the packet" {
+    const std = @import("std");
+    const gpu = @import("gpu");
+    const testing = std.testing;
+
+    var db = Database{};
+    defer db.deinit(testing.allocator);
+    try registerAll(&db, testing.allocator);
+
+    const dcb = try agcEntryPoint(&db, "1rZSWUv1IRc", AgcCopyData);
+    const acb = try agcEntryPoint(&db, "qzMN2XKGA4k", AgcCopyData);
+    const dcb_size = try agcEntryPoint(&db, "b5u0Jzm8TF8", AgcGetSize);
+    const acb_size = try agcEntryPoint(&db, "CbQh3DKMSno", AgcGetSize);
+
+    try testing.expectEqual(@as(u32, 24), dcb_size(0, 0, 0, 0, 0, 0));
+    try testing.expectEqual(@as(u32, 24), acb_size(0, 0, 0, 0, 0, 0));
+
+    var graphics: [8]u32 = @splat(0);
+    var compute: [8]u32 = @splat(0);
+    var graphics_buffer = sizedBuffer(&graphics);
+    var compute_buffer = sizedBuffer(&compute);
+
+    const source_address: u64 = 0x1_0000_2000;
+    const destination_address: u64 = 0x2_0000_4000;
+
+    try testing.expect(dcb(
+        &graphics_buffer,
+        memory_selector_dcb,
+        1,
+        destination_address,
+        memory_selector_dcb,
+        2,
+        source_address,
+        1,
+        1,
+    ) != null);
+    try testing.expect(acb(
+        &compute_buffer,
+        memory_selector_acb,
+        1,
+        destination_address,
+        memory_selector_acb,
+        2,
+        source_address,
+        1,
+        1,
+    ) != null);
+
+    // The spellings differ; the packet does not.
+    try testing.expectEqualSlices(u32, graphics[0..6], compute[0..6]);
+    try testing.expectEqual(@as(usize, 6 * @sizeOf(u32)), @intFromPtr(graphics_buffer.cursor_up.?) - @intFromPtr(graphics[0..].ptr));
+
+    var walker = gpu.pm4.Walker.init(graphics[0..6]);
+    const packet = (try walker.next()).?;
+    try testing.expectEqual(gpu.pm4.copy_data, packet.opcode);
+    try testing.expectEqual(@as(usize, 6), packet.wordCount());
+
+    // Source and destination pairs, in that order.
+    try testing.expectEqual(@as(u32, @truncate(source_address)), graphics[2]);
+    try testing.expectEqual(@as(u32, @truncate(source_address >> 32)), graphics[3]);
+    try testing.expectEqual(@as(u32, @truncate(destination_address)), graphics[4]);
+    try testing.expectEqual(@as(u32, @truncate(destination_address >> 32)), graphics[5]);
+
+    // Cache policies, item size and write-confirm sit where the packet says.
+    const control = graphics[1];
+    try testing.expectEqual(@as(u32, 2), (control >> 13) & 0x3);
+    try testing.expectEqual(@as(u32, 1), (control >> 16) & 0x1);
+    try testing.expectEqual(@as(u32, 1), (control >> 20) & 0x1);
+    try testing.expectEqual(@as(u32, 1), (control >> 25) & 0x3);
+}
+
+test "COPY_DATA moves four and eight bytes of memory" {
+    const std = @import("std");
+    const gpu = @import("gpu");
+    const testing = std.testing;
+
+    var db = Database{};
+    defer db.deinit(testing.allocator);
+    try registerAll(&db, testing.allocator);
+
+    const dcb = try agcEntryPoint(&db, "1rZSWUv1IRc", AgcCopyData);
+    const acb = try agcEntryPoint(&db, "qzMN2XKGA4k", AgcCopyData);
+
+    for ([_]u64{ 0, 1 }) |item_size| {
+        const width: usize = if (item_size == 0) 4 else 8;
+        // Both queues, to prove the decode reads either spelling.
+        for ([_]struct { write: *const AgcCopyData, selector: u64 }{
+            .{ .write = dcb, .selector = memory_selector_dcb },
+            .{ .write = acb, .selector = memory_selector_acb },
+        }) |form| {
+            var source: [2]u32 = .{ 0x1122_3344, 0x5566_7788 };
+            var destination: [4]u32 = @splat(0xdead_beef);
+
+            var words: [16]u32 = @splat(0);
+            var buffer = sizedBuffer(&words);
+            try testing.expect(form.write(
+                &buffer,
+                form.selector,
+                0,
+                @intFromPtr(&destination),
+                form.selector,
+                0,
+                @intFromPtr(&source),
+                item_size,
+                0,
+            ) != null);
+            const used = (@intFromPtr(buffer.cursor_up.?) - @intFromPtr(words[0..].ptr)) / @sizeOf(u32);
+
+            var probe = PredicationProbe{};
+            var state = gpu.State{};
+            _ = try runPredicated(&probe, &state, words[0..used]);
+
+            try testing.expectEqualSlices(
+                u8,
+                std.mem.sliceAsBytes(source[0..])[0..width],
+                std.mem.sliceAsBytes(destination[0..])[0..width],
+            );
+            // Nothing beyond the transfer width is touched.
+            try testing.expectEqual(@as(u32, 0xdead_beef), destination[2]);
+            try testing.expectEqual(@as(u32, 0xdead_beef), destination[3]);
+            if (width == 4) try testing.expectEqual(@as(u32, 0xdead_beef), destination[1]);
+            try testing.expectEqual(@as(u64, 1), state.copy_data_count);
+            try testing.expectEqual(@as(u64, 0), state.copy_data_unsupported_count);
+        }
+    }
+}
+
+test "a COPY_DATA immediate carries its whole value" {
+    const std = @import("std");
+    const gpu = @import("gpu");
+    const testing = std.testing;
+
+    var db = Database{};
+    defer db.deinit(testing.allocator);
+    try registerAll(&db, testing.allocator);
+
+    const dcb = try agcEntryPoint(&db, "1rZSWUv1IRc", AgcCopyData);
+    const acb = try agcEntryPoint(&db, "qzMN2XKGA4k", AgcCopyData);
+
+    const immediate: u64 = 0x0123_4567_89ab_cdef;
+
+    // Each queue names its memory destination its own way too, so the pair
+    // travels together.
+    for ([_]struct { write: *const AgcCopyData, selector: u64, memory: u64 }{
+        .{ .write = dcb, .selector = immediate_selector_dcb, .memory = memory_selector_dcb },
+        .{ .write = acb, .selector = immediate_selector_acb, .memory = memory_selector_acb },
+    }) |form| {
+        // Thirty-two bits: the low half only, written once.
+        var narrow: [2]u32 = @splat(0xdead_beef);
+        var words: [16]u32 = @splat(0);
+        var buffer = sizedBuffer(&words);
+        try testing.expect(form.write(
+            &buffer,
+            form.memory,
+            0,
+            @intFromPtr(&narrow),
+            form.selector,
+            0,
+            immediate,
+            0,
+            0,
+        ) != null);
+        var used = (@intFromPtr(buffer.cursor_up.?) - @intFromPtr(words[0..].ptr)) / @sizeOf(u32);
+        var probe = PredicationProbe{};
+        var state = gpu.State{};
+        _ = try runPredicated(&probe, &state, words[0..used]);
+        try testing.expectEqual(@as(u32, @truncate(immediate)), narrow[0]);
+        try testing.expectEqual(@as(u32, 0xdead_beef), narrow[1]);
+
+        // Sixty-four bits: the value itself, not the low half twice. That
+        // repetition is DMA_DATA's behaviour for a 32-bit pattern, and it is
+        // the difference between the two packets.
+        var wide: [4]u32 = @splat(0xdead_beef);
+        words = @splat(0);
+        buffer = sizedBuffer(&words);
+        try testing.expect(form.write(
+            &buffer,
+            form.memory,
+            0,
+            @intFromPtr(&wide),
+            form.selector,
+            0,
+            immediate,
+            1,
+            0,
+        ) != null);
+        used = (@intFromPtr(buffer.cursor_up.?) - @intFromPtr(words[0..].ptr)) / @sizeOf(u32);
+        probe = PredicationProbe{};
+        state = gpu.State{};
+        _ = try runPredicated(&probe, &state, words[0..used]);
+        try testing.expectEqual(
+            immediate,
+            std.mem.readInt(u64, std.mem.sliceAsBytes(wide[0..])[0..8], .little),
+        );
+        try testing.expect(wide[0] != wide[1]);
+        try testing.expectEqual(@as(u32, 0xdead_beef), wide[2]);
+    }
+}
+
+test "COPY_DATA fits the size it reports" {
+    const std = @import("std");
+    const testing = std.testing;
+
+    var db = Database{};
+    defer db.deinit(testing.allocator);
+    try registerAll(&db, testing.allocator);
+
+    const dcb = try agcEntryPoint(&db, "1rZSWUv1IRc", AgcCopyData);
+    const get_size = try agcEntryPoint(&db, "b5u0Jzm8TF8", AgcGetSize);
+
+    const announced = get_size(0, 0, 0, 0, 0, 0);
+    const announced_words = announced / @sizeOf(u32);
+
+    var source: [2]u32 = @splat(1);
+    var destination: [2]u32 = @splat(0);
+
+    var storage: [32]u32 = @splat(guard_word);
+    var buffer = sizedBuffer(storage[0..announced_words]);
+    try testing.expect(dcb(
+        &buffer,
+        memory_selector_dcb,
+        0,
+        @intFromPtr(&destination),
+        memory_selector_dcb,
+        0,
+        @intFromPtr(&source),
+        0,
+        0,
+    ) != null);
+    try testing.expectEqual(
+        @as(usize, announced),
+        @intFromPtr(buffer.cursor_up.?) - @intFromPtr(storage[0..].ptr),
+    );
+    for (storage[announced_words..]) |word| try testing.expectEqual(guard_word, word);
+
+    // One word short is refused, and refusing writes nothing.
+    var tight: [32]u32 = @splat(guard_word);
+    var short = sizedBuffer(tight[0 .. announced_words - 1]);
+    try testing.expect(dcb(
+        &short,
+        memory_selector_dcb,
+        0,
+        @intFromPtr(&destination),
+        memory_selector_dcb,
+        0,
+        @intFromPtr(&source),
+        0,
+        0,
+    ) == null);
+    for (tight) |word| try testing.expectEqual(guard_word, word);
+}
+
+test "a guarded COPY_DATA does not copy" {
+    const std = @import("std");
+    const gpu = @import("gpu");
+    const testing = std.testing;
+
+    var db = Database{};
+    defer db.deinit(testing.allocator);
+    try registerAll(&db, testing.allocator);
+
+    const dcb = try agcEntryPoint(&db, "1rZSWUv1IRc", AgcCopyData);
+    const mark = try agcEntryPoint(&db, "w6Dj1VJt5qY", AgcPatch2);
+
+    var predicate: [4]u64 align(16) = @splat(1);
+    var source: [2]u32 = .{ 0xcafe_f00d, 0 };
+    var destination: [2]u32 = @splat(0xdead_beef);
+
+    var words: [32]u32 = @splat(0);
+    var buffer = sizedBuffer(&words);
+    try buildPredication(&db, &buffer, 0, 3, 0, @intFromPtr(&predicate));
+    const packet = dcb(
+        &buffer,
+        memory_selector_dcb,
+        0,
+        @intFromPtr(&destination),
+        memory_selector_dcb,
+        0,
+        @intFromPtr(&source),
+        0,
+        0,
+    ).?;
+    try testing.expectEqual(errno.ok, mark(packet, 1, 0, 0, 0, 0));
+    const used = (@intFromPtr(buffer.cursor_up.?) - @intFromPtr(words[0..].ptr)) / @sizeOf(u32);
+
+    var probe = PredicationProbe{};
+    var state = gpu.State{};
+    _ = try runPredicated(&probe, &state, words[0..used]);
+
+    // The guard dropped the packet before it was decoded, so nothing moved and
+    // nothing was counted as a transfer.
+    try testing.expectEqual(@as(u32, 0xdead_beef), destination[0]);
+    try testing.expectEqual(@as(u64, 0), state.copy_data_count);
+    try testing.expectEqual(@as(u64, 1), state.predicated_skipped);
+}
+
+test "a COPY_DATA this does not move yet copies nothing and says so" {
+    const std = @import("std");
+    const gpu = @import("gpu");
+    const testing = std.testing;
+
+    var db = Database{};
+    defer db.deinit(testing.allocator);
+    try registerAll(&db, testing.allocator);
+
+    const dcb = try agcEntryPoint(&db, "1rZSWUv1IRc", AgcCopyData);
+
+    var source: [2]u32 = .{ 0xcafe_f00d, 0 };
+    var destination: [2]u32 = @splat(0xdead_beef);
+
+    // Selector 6 recovers to the GDS group, which nothing here reads.
+    var words: [16]u32 = @splat(0);
+    var buffer = sizedBuffer(&words);
+    try testing.expect(dcb(
+        &buffer,
+        memory_selector_dcb,
+        0,
+        @intFromPtr(&destination),
+        6,
+        0,
+        @intFromPtr(&source),
+        0,
+        0,
+    ) != null);
+    const used = (@intFromPtr(buffer.cursor_up.?) - @intFromPtr(words[0..].ptr)) / @sizeOf(u32);
+
+    var probe = PredicationProbe{};
+    var state = gpu.State{};
+    _ = try runPredicated(&probe, &state, words[0..used]);
+
+    try testing.expectEqual(@as(u32, 0xdead_beef), destination[0]);
+    try testing.expectEqual(@as(u64, 1), state.copy_data_count);
+    try testing.expectEqual(@as(u64, 1), state.copy_data_unsupported_count);
+    try testing.expectEqual(gpu.state.CopyData.Selector.gds, state.last_copy.?.source);
+}

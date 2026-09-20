@@ -50,6 +50,74 @@ fn SizedGuestMemory(comptime size: usize) type {
     };
 }
 
+/// Runs COPY_DATA against the real renderer backend.
+///
+/// The unit tests drive the packet through a probe that reads and writes host
+/// memory directly. This one goes through `Renderer.dcbBackend`, which is the
+/// path a title actually takes: the read finishes the pending draw batch and
+/// waits on submitted work before it looks at guest memory, and the write
+/// invalidates whatever cached the destination. A copy that only worked
+/// against a bare probe would not prove either of those still happens.
+fn runCopyDataProbe(allocator: std.mem.Allocator) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{});
+    defer renderer.deinit();
+    var guest = GuestMemory{};
+    const backend = renderer.dcbBackend(guest.interface());
+
+    const source: usize = 0x2000;
+    const destination: usize = 0x3000;
+    const immediate_destination: usize = 0x4000;
+
+    guest.word(source, 0x1122_3344);
+    guest.word(source + 4, 0x5566_7788);
+    for ([_]usize{ destination, immediate_destination }) |slot| {
+        guest.word(slot, 0xdead_beef);
+        guest.word(slot + 4, 0xdead_beef);
+    }
+
+    // Eight bytes of memory, then a 64-bit immediate: the two shapes the
+    // packet can take that move a full quadword.
+    const immediate: u64 = 0x0123_4567_89ab_cdef;
+    const memory_selectors: u32 = 2 | (2 << 8); // both recover to "memory"
+    const immediate_selectors: u32 = 5 | (2 << 8); // source recovers to "immediate"
+    const item_size_64: u32 = 1 << 16;
+
+    const stream = [_]u32{
+        command(gpu.pm4.copy_data, 5),
+        memory_selectors | item_size_64,
+        source,
+        0,
+        destination,
+        0,
+        command(gpu.pm4.copy_data, 5),
+        immediate_selectors | item_size_64,
+        @truncate(immediate),
+        @truncate(immediate >> 32),
+        immediate_destination,
+        0,
+    };
+
+    var state = gpu.State{};
+    var executor = gpu.DcbExecutor{ .state = &state, .backend = backend, .allocator = allocator };
+    _ = try executor.execute(&stream);
+    try renderer.flushPendingGuestWrites();
+
+    try std.testing.expectEqualSlices(
+        u8,
+        guest.bytes[source..][0..8],
+        guest.bytes[destination..][0..8],
+    );
+    try std.testing.expectEqual(
+        immediate,
+        std.mem.readInt(u64, guest.bytes[immediate_destination..][0..8], .little),
+    );
+    try std.testing.expectEqual(@as(u64, 2), state.copy_data_count);
+    try std.testing.expectEqual(@as(u64, 0), state.copy_data_unsupported_count);
+    std.debug.print(
+        "COPY_DATA passed: 8-byte memory copy and 64-bit immediate through the renderer backend\n",
+        .{},
+    );
+}
 fn command(opcode: u8, body_words: u14) u32 {
     return (@as(u32, 3) << 30) |
         (@as(u32, body_words - 1) << 16) |
@@ -10146,6 +10214,10 @@ pub fn main(init: std.process.Init) !void {
         try renderer.probeTessellationInputs();
         return;
     }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--copy-data")) {
+        try runCopyDataProbe(allocator);
+        return;
+    }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--high-half-stores")) {
         try runHighHalfStoreProbe(allocator);
         return;
@@ -10717,6 +10789,7 @@ pub fn main(init: std.process.Init) !void {
         try runNormalizedColorProbe(allocator);
         try runPackedFloatProbe(allocator);
         try runSdwaProbe(allocator);
+        try runCopyDataProbe(allocator);
     }
     var renderer = try vulkan.Renderer.init(allocator, .{ .enable_graphics_probe = true });
     defer renderer.deinit();

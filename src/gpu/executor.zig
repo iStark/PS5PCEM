@@ -78,6 +78,8 @@ pub fn predicationStatsEnabled() bool {
 
 var predication_reports = std.atomic.Value(u32).init(0);
 var unsupported_predication_reports = std.atomic.Value(u32).init(0);
+var unsupported_copy_reports = std.atomic.Value(u32).init(0);
+var performed_copy_reports = std.atomic.Value(u32).init(0);
 
 /// Reports what a stream did with predication, a bounded number of times.
 pub fn reportPredication(state: *const gpu_state.State) void {
@@ -684,6 +686,10 @@ pub const DcbExecutor = struct {
             try self.writeData(packet, true);
             return .complete;
         }
+        if (packet.opcode == pm4.copy_data) {
+            try self.copyData(packet);
+            return .complete;
+        }
         if (packet.opcode == pm4.dma_data) {
             try self.dmaData(packet);
             return .complete;
@@ -1088,6 +1094,89 @@ pub const DcbExecutor = struct {
         self.state.write_data_count += 1;
     }
 
+    /// Moves four or eight bytes between memory, a register-like source and
+    /// an immediate carried in the packet.
+    ///
+    /// Both halves go through the backend rather than straight at guest
+    /// memory. The read is the synchronising one, so a value an earlier draw
+    /// produced is finished before it is copied; the write is the one that
+    /// invalidates whatever cached the destination. Routing this through the
+    /// DMA hook instead would add that path's metadata handling, which is for
+    /// tiled depth and colour surfaces -- this packet moves fences and
+    /// counters, four or eight bytes at a time, and never those.
+    fn copyData(self: *DcbExecutor, packet: pm4.Packet) Error!void {
+        if (packet.body.len != 5) return Error.InvalidPacket;
+        const body = packet.body;
+        const control = body[0];
+
+        // Undo the graphics form's shift and pick up the bit it parked at 30.
+        // The compute form has neither, and doubles instead; see CopyData.
+        const source_raw = ((control & 0xf) << 1) | ((control >> 30) & 0x1);
+        const destination_raw = ((control >> 8) & 0xf) << 1;
+        const value = gpu_state.CopyData{
+            .source = gpu_state.CopyData.Selector.from(source_raw),
+            .destination = gpu_state.CopyData.Selector.from(destination_raw),
+            .source_raw = source_raw,
+            .destination_raw = destination_raw,
+            .source_cache_policy = @truncate((control >> 13) & 0x3),
+            .destination_cache_policy = @truncate((control >> 25) & 0x3),
+            .write_confirm = control & (1 << 20) != 0,
+            .byte_count = if (control & (1 << 16) != 0) 8 else 4,
+            .source_address_or_immediate = (@as(u64, body[2]) << 32) | body[1],
+            .destination_address = (@as(u64, body[4]) << 32) | body[3],
+        };
+        self.state.last_copy = value;
+        self.state.copy_data_count += 1;
+
+        if (value.destination != .memory or
+            (value.source != .memory and value.source != .immediate))
+        {
+            // GDS and the reference-clock selectors name things this does not
+            // move yet. Copying nothing is the honest answer -- inventing
+            // bytes for a fence would release work that is not finished.
+            self.state.copy_data_unsupported_count += 1;
+            if (unsupported_copy_reports.fetchAdd(1, .monotonic) < 16) {
+                std.debug.print(
+                    "[gpu copy] unsupported COPY_DATA src={d} dst={d} bytes={d}; nothing copied\n",
+                    .{ value.source_raw, value.destination_raw, value.byte_count },
+                );
+            }
+            return;
+        }
+
+        var bytes: [8]u8 = undefined;
+        const span = bytes[0..value.byte_count];
+        switch (value.source) {
+            // The immediate is the whole of the two source words, so an
+            // eight-byte copy moves the value itself rather than the low
+            // half twice. DMA_DATA replicates a 32-bit pattern; this does
+            // not, and that is the difference between the two packets.
+            .immediate => std.mem.writeInt(
+                u64,
+                &bytes,
+                value.source_address_or_immediate,
+                .little,
+            ),
+            .memory => {
+                if (value.source_address_or_immediate == 0) return Error.InvalidPacket;
+                try self.backend.read(value.source_address_or_immediate, span);
+            },
+            else => unreachable,
+        }
+        if (value.destination_address == 0) return Error.InvalidPacket;
+        try self.backend.write(value.destination_address, span);
+        if (performed_copy_reports.fetchAdd(1, .monotonic) < 16) {
+            std.debug.print(
+                "[gpu copy] {d} bytes {s} 0x{x} -> 0x{x}\n",
+                .{
+                    value.byte_count,
+                    if (value.source == .immediate) "immediate" else "from",
+                    value.source_address_or_immediate,
+                    value.destination_address,
+                },
+            );
+        }
+    }
     fn dmaData(self: *DcbExecutor, packet: pm4.Packet) Error!void {
         if (packet.body.len != 6) return Error.InvalidPacket;
         const body = packet.body;
