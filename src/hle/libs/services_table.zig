@@ -23,7 +23,6 @@ pub const agc_exports = [_]symbols.Export{
     .{ .name = "libSceAgc:rP5xLdOf26k", .function = trace.wrap("libSceAgc:rP5xLdOf26k", &services.accept), .id_override = "rP5xLdOf26k" },
     .{ .name = "libSceAgc:k0E7vkgqAuE", .function = trace.wrap("libSceAgc:k0E7vkgqAuE", &services.accept), .id_override = "k0E7vkgqAuE" },
     .{ .name = "libSceAgc:gQkqkLttcpw", .function = trace.wrap("libSceAgc:gQkqkLttcpw", &services.accept), .id_override = "gQkqkLttcpw" },
-    .{ .name = "libSceAgc:qj7QZpgr9Uw", .function = trace.wrap("libSceAgc:qj7QZpgr9Uw", &services.accept), .id_override = "qj7QZpgr9Uw" },
     .{ .name = "libSceAgc:zARR5aCmkoY", .function = trace.wrap("libSceAgc:zARR5aCmkoY", &services.accept), .id_override = "zARR5aCmkoY" },
 };
 

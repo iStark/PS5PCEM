@@ -179,9 +179,42 @@ pub const CopyData = struct {
     source_address_or_immediate: u64,
     destination_address: u64,
 };
+/// What one context-state packet asks the command processor to do with the
+/// context register file.
+///
+/// Only the context registers take part. The shader and uconfig files, the
+/// index state, the predicate and everything about synchronisation are queue
+/// state that a save and restore must not touch: a title pushes context
+/// around a pass it wants to draw differently, not around the fence it is
+/// waiting on.
+pub const ContextStateOperation = enum(u32) {
+    clear = 0,
+    push = 1,
+    pop = 2,
+    push_clear = 3,
+
+    pub fn from(value: u32) ?ContextStateOperation {
+        return switch (value) {
+            0 => .clear,
+            1 => .push,
+            2 => .pop,
+            3 => .push_clear,
+            else => null,
+        };
+    }
+};
+
+/// How deep the saved context registers stack.
+///
+/// The command processor keeps a small fixed stack, not an arena, so a title
+/// that pushes without popping runs out rather than growing without bound.
+pub const context_state_depth: usize = 4;
 pub const State = struct {
     config: RegisterFile(config_register_count) = .{},
     context: RegisterFile(context_register_count) = .{},
+    /// Saved copies of `context`, innermost last.
+    context_stack: [context_state_depth]RegisterFile(context_register_count) = @splat(.{}),
+    context_depth: u8 = 0,
     shader: RegisterFile(shader_register_count) = .{},
     uconfig: RegisterFile(uconfig_register_count) = .{},
 
@@ -241,6 +274,12 @@ pub const State = struct {
     /// Transfers whose selectors name something this does not move yet.
     copy_data_unsupported_count: u64 = 0,
 
+    context_state_clear_count: u64 = 0,
+    context_state_push_count: u64 = 0,
+    context_state_pop_count: u64 = 0,
+    /// A push with nowhere left to save, or a pop with nothing saved.
+    context_state_refused_count: u64 = 0,
+
     pub fn writeRegister(self: *State, space: pm4.RegisterSpace, offset: u32, value: u32) Error!void {
         switch (space) {
             .config => try self.config.write(offset, value),
@@ -262,6 +301,46 @@ pub const State = struct {
         };
     }
 
+    /// Applies one context-state operation, and says whether it could be.
+    ///
+    /// A push onto a full stack and a pop from an empty one are refused
+    /// rather than silently dropping or inventing a context: either would
+    /// leave later draws reading registers that belong to a different pass,
+    /// which is far harder to see than a counter going up.
+    pub fn applyContextStateOperation(self: *State, operation: ContextStateOperation) bool {
+        switch (operation) {
+            .clear => {
+                self.context.clear();
+                self.context_state_clear_count += 1;
+                return true;
+            },
+            .push, .push_clear => {
+                if (self.context_depth >= context_state_depth) {
+                    self.context_state_refused_count += 1;
+                    return false;
+                }
+                self.context_stack[self.context_depth] = self.context;
+                self.context_depth += 1;
+                self.context_state_push_count += 1;
+                if (operation == .push_clear) {
+                    self.context.clear();
+                    self.context_state_clear_count += 1;
+                }
+                return true;
+            },
+            .pop => {
+                if (self.context_depth == 0) {
+                    self.context_state_refused_count += 1;
+                    return false;
+                }
+                self.context_depth -= 1;
+                self.context = self.context_stack[self.context_depth];
+                self.context_stack[self.context_depth] = .{};
+                self.context_state_pop_count += 1;
+                return true;
+            },
+        }
+    }
     pub fn clearRegisters(self: *State) void {
         self.config.clear();
         self.context.clear();
@@ -273,7 +352,8 @@ pub const State = struct {
         self.draw_indirect_args_base_address = 0;
         self.dispatch_indirect_args_base_address = 0;
         self.index_type = 0;
-        // `predicate_skip` is deliberately left alone. CLEAR_STATE drops the
+        // `predicate_skip` and the saved context stack are deliberately left
+        // alone. CLEAR_STATE drops the
         // register files; the predicate is not one of them, and a title that
         // clears state between passes does not expect its guarded draws to
         // start issuing again.

@@ -107,7 +107,6 @@ pub const exports = [_]symbols.Export{
     .{ .name = "sceAgcDcbAtomicGdsGetSize", .function = trace.wrap("sceAgcDcbAtomicGdsGetSize", &agc.commandSize), .expect_id = "1tB0xkLNjcw" },
     .{ .name = "sceAgcDcbAtomicMemGetSize", .function = trace.wrap("sceAgcDcbAtomicMemGetSize", &agc.commandSize), .expect_id = "oz6zQq1JwCE" },
     .{ .name = "sceAgcDcbCondExecGetSize", .function = trace.wrap("sceAgcDcbCondExecGetSize", &agc.condExecGetSize), .expect_id = "ou16V5hh5sg" },
-    .{ .name = "sceAgcDcbContextStateOpGetSize", .function = trace.wrap("sceAgcDcbContextStateOpGetSize", &agc.commandSize), .expect_id = "H6vHS5cidSA" },
     .{ .name = "sceAgcDcbDmaDataGetSize", .function = trace.wrap("sceAgcDcbDmaDataGetSize", &agc.dmaDataGetSize), .expect_id = "2ccJz9LQI+w" },
     .{ .name = "sceAgcDcbWriteDataGetSize", .function = trace.wrap("sceAgcDcbWriteDataGetSize", &agc.writeDataGetSize), .expect_id = "p9tI+yTvx68" },
     .{ .name = "sceAgcDcbQueueEndOfShaderActionGetSize", .function = trace.wrap("sceAgcDcbQueueEndOfShaderActionGetSize", &agc.commandSize), .expect_id = "zg6u-N6Otxs" },

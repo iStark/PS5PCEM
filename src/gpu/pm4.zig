@@ -235,6 +235,7 @@ pub const custom = struct {
     pub const flip: u6 = 0x17;
     pub const release_mem: u6 = 0x18;
     pub const dma_data: u6 = 0x19;
+    pub const context_state: u6 = 0x1a;
 };
 
 /// Returns the Gen5 extension selector of a custom NOP packet.
@@ -246,6 +247,7 @@ pub fn customCode(packet: Packet) ?u6 {
 pub fn customName(code: u6) ?[]const u8 {
     return switch (code) {
         custom.zero => null,
+        custom.context_state => "R_CONTEXT_STATE",
         custom.draw_reset => "R_DRAW_RESET",
         custom.wait_flip_done => "R_WAIT_FLIP_DONE",
         custom.dispatch_reset => "R_DISPATCH_RESET",

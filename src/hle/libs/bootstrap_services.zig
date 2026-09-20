@@ -2574,6 +2574,69 @@ fn agcAcbCopyData(
 fn agcCopyDataGetSize() callconv(abi.guest) u32 {
     return 6 * @sizeOf(u32);
 }
+/// Saves, restores or drops the context register file.
+///
+/// The operation is one packet followed by padding, and the padding is not
+/// decoration: the library this replaces reserves a fixed span per operation
+/// and a title sizes its buffer from GetSize, so the span has to match even
+/// though only the first packet carries anything. The segment boundaries are
+/// the ones the native helper uses -- five, eight and nine dwords for the
+/// save-and-restore block, three and two around it -- because a title that
+/// walks its own buffer afterwards sees those boundaries.
+///
+/// Pop puts its three-dword segment first, which is why the command processor
+/// accepts a leading packet of either three or five dwords.
+fn agcDcbContextStateOp(
+    buffer: ?*AgcCommandBuffer,
+    operation: u32,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+) callconv(abi.guest) ?[*]u32 {
+    // Segment widths, in order. Pop puts its three-dword segment first, which
+    // is why the command processor accepts a leading packet of three or five.
+    const segments: []const u32 = switch (operation) {
+        0 => &[_]u32{5},
+        1 => &[_]u32{ 5, 8, 9, 3, 2 },
+        2 => &[_]u32{ 3, 5, 8, 9, 2 },
+        3 => &[_]u32{ 5, 8, 9, 3, 2, 5 },
+        else => return null,
+    };
+
+    // The whole span is taken at once, so an arena that runs out cannot leave
+    // half an operation behind for the command processor to walk into.
+    const total = contextStateOpDwords(operation);
+    const cursor = reserveAgcDwords(buffer, total) orelse return null;
+    @memset(cursor[0..total], 0);
+
+    var offset: usize = 0;
+    for (segments, 0..) |words, index| {
+        cursor[offset] = pm4Header(gpu.pm4.nop, words - 1);
+        if (index == 0) {
+            cursor[offset] |= @as(u32, gpu.pm4.custom.context_state) << 2;
+            cursor[offset + 1] = operation;
+        }
+        offset += words;
+    }
+    return cursor;
+}
+
+/// Dwords one context-state operation occupies, including its padding.
+fn contextStateOpDwords(operation: u32) u32 {
+    return switch (operation) {
+        0 => 5, // clear
+        1, 2 => 27, // push, pop
+        3 => 32, // push and clear
+        else => 0,
+    };
+}
+
+/// Zero for an operation the constructor refuses, so a caller that sizes
+/// first never reserves room for a command that will not appear.
+fn agcDcbContextStateOpGetSize(operation: u32) callconv(abi.guest) u32 {
+    return contextStateOpDwords(operation) * @sizeOf(u32);
+}
 /// SET_*_REG_INDIRECT: header, list low, list high, control, count.
 fn agcSetRegistersIndirectGetSize() callconv(abi.guest) u32 {
     return 5 * @sizeOf(u32);
@@ -4114,6 +4177,11 @@ const agc_exports = [_]symbols.Export{
     .{ .name = "sceAgcSetPacketPredication", .function = trace.wrap("sceAgcSetPacketPredication", &agcSetPacketPredication), .expect_id = "w6Dj1VJt5qY" },
     .{ .name = "sceAgcSetRangePredication", .function = trace.wrap("sceAgcSetRangePredication", &agcSetRangePredication), .expect_id = "n8vgpaQg6dA" },
     .{ .name = "sceAgcDcbSetPredication", .function = trace.wrap("sceAgcDcbSetPredication", &agcDcbSetPredication), .expect_id = "bbFueFP+J4k" },
+    // The size query hashes to its published name; the constructor does not,
+    // so its public spelling is still unknown and the identifier is stated
+    // outright rather than derived from a guess at the name.
+    .{ .name = "sceAgcDcbContextStateOp", .function = trace.wrap("sceAgcDcbContextStateOp", &agcDcbContextStateOp), .id_override = "qj7QZpgr9Uw" },
+    .{ .name = "sceAgcDcbContextStateOpGetSize", .function = trace.wrap("sceAgcDcbContextStateOpGetSize", &agcDcbContextStateOpGetSize), .expect_id = "H6vHS5cidSA" },
     .{ .name = "sceAgcDcbCopyDataGetSize", .function = trace.wrap("sceAgcDcbCopyDataGetSize", &agcCopyDataGetSize), .expect_id = "b5u0Jzm8TF8" },
     .{ .name = "sceAgcAcbCopyDataGetSize", .function = trace.wrap("sceAgcAcbCopyDataGetSize", &agcCopyDataGetSize), .expect_id = "CbQh3DKMSno" },
     .{ .name = "sceAgcCbSetShRegistersDirectGetSize", .function = trace.wrap("sceAgcCbSetShRegistersDirectGetSize", &agcSetRegistersDirectGetSize), .expect_id = "yUBESvCCJ4I" },

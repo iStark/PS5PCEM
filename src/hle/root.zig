@@ -2318,3 +2318,343 @@ test "halves that do not belong together are refused by both exports" {
         try testing.expectEqual(errno.KernelError.einval.raw(), fuse(&fused.bytes, &front.bytes, null, null));
     }
 }
+
+// ---------------------------------------------------------------------------
+// Context state
+//
+// A title brackets a pass with save and restore so the registers it sets do
+// not leak into what follows. The constructor writes a packet the command
+// processor understands, so these build with the registered constructor and
+// run the result -- a writer on its own would prove nothing.
+
+const AgcContextStateOp = fn (
+    ?*libs.agc.CommandBuffer,
+    u32,
+    u64,
+    u64,
+    u64,
+    u64,
+) callconv(abi.guest) ?[*]u32;
+
+const context_clear: u32 = 0;
+const context_push: u32 = 1;
+const context_pop: u32 = 2;
+const context_push_clear: u32 = 3;
+
+/// A context register a draw would read, chosen away from the ones the other
+/// constructors in these tests write.
+const probe_register: u32 = 0x318;
+
+fn setContextRegister(buffer: *libs.agc.CommandBuffer, value: u32) void {
+    const gpu_module = @import("gpu");
+    const words = agc_reserve(buffer, 3);
+    words[0] = pm4Command(gpu_module.pm4.set_context_reg, 2);
+    words[1] = probe_register;
+    words[2] = value;
+}
+
+fn agc_reserve(buffer: *libs.agc.CommandBuffer, count: u32) [*]u32 {
+    return libs.agc.reserveDwords(buffer, count).?;
+}
+
+test "context state saves, survives changes, and restores" {
+    const std = @import("std");
+    const gpu = @import("gpu");
+    const testing = std.testing;
+
+    var db = Database{};
+    defer db.deinit(testing.allocator);
+    try registerAll(&db, testing.allocator);
+
+    const context_op = try agcEntryPoint(&db, "qj7QZpgr9Uw", AgcContextStateOp);
+    const get_size = try agcEntryPoint(&db, "H6vHS5cidSA", AgcGetSize);
+
+    var words: [128]u32 = @splat(0);
+    var buffer = sizedBuffer(&words);
+
+    // Set a register, save it, change it, restore it, then draw so the state
+    // the draw sees is the one that was restored.
+    setContextRegister(&buffer, 0x1111_1111);
+    try testing.expect(context_op(&buffer, context_push, 0, 0, 0, 0) != null);
+    setContextRegister(&buffer, 0x2222_2222);
+    try testing.expect(context_op(&buffer, context_pop, 0, 0, 0, 0) != null);
+    const draw = try agcEntryPoint(&db, "Yw0jKSqop+E", AgcWrite);
+    _ = draw(&buffer, 3, 0, 0, 0, 0).?;
+
+    const used = (@intFromPtr(buffer.cursor_up.?) - @intFromPtr(words[0..].ptr)) / @sizeOf(u32);
+    var probe = PredicationProbe{};
+    var state = gpu.State{};
+    _ = try runPredicated(&probe, &state, words[0..used]);
+
+    try testing.expectEqual(@as(u32, 1), probe.draws);
+    try testing.expectEqual(@as(?u32, 0x1111_1111), state.readRegister(.context, probe_register));
+    try testing.expectEqual(@as(u8, 0), state.context_depth);
+    try testing.expectEqual(@as(u64, 1), state.context_state_push_count);
+    try testing.expectEqual(@as(u64, 1), state.context_state_pop_count);
+
+    // Each operation occupies the span its size query promised.
+    try testing.expectEqual(@as(u32, 5 * @sizeOf(u32)), get_size(context_clear, 0, 0, 0, 0, 0));
+    try testing.expectEqual(@as(u32, 27 * @sizeOf(u32)), get_size(context_push, 0, 0, 0, 0, 0));
+    try testing.expectEqual(@as(u32, 27 * @sizeOf(u32)), get_size(context_pop, 0, 0, 0, 0, 0));
+    try testing.expectEqual(@as(u32, 32 * @sizeOf(u32)), get_size(context_push_clear, 0, 0, 0, 0, 0));
+    try testing.expectEqual(@as(u32, 0), get_size(4, 0, 0, 0, 0, 0));
+}
+
+test "each context operation writes exactly the span it reports" {
+    const std = @import("std");
+    const gpu = @import("gpu");
+    const testing = std.testing;
+
+    var db = Database{};
+    defer db.deinit(testing.allocator);
+    try registerAll(&db, testing.allocator);
+
+    const context_op = try agcEntryPoint(&db, "qj7QZpgr9Uw", AgcContextStateOp);
+    const get_size = try agcEntryPoint(&db, "H6vHS5cidSA", AgcGetSize);
+
+    for ([_]u32{ context_clear, context_push, context_pop, context_push_clear }) |operation| {
+        const announced = get_size(operation, 0, 0, 0, 0, 0);
+        const announced_words = announced / @sizeOf(u32);
+
+        var storage: [64]u32 = @splat(guard_word);
+        var buffer = sizedBuffer(storage[0..announced_words]);
+        try testing.expect(context_op(&buffer, operation, 0, 0, 0, 0) != null);
+        try testing.expectEqual(
+            @as(usize, announced),
+            @intFromPtr(buffer.cursor_up.?) - @intFromPtr(storage[0..].ptr),
+        );
+        for (storage[announced_words..]) |word| try testing.expectEqual(guard_word, word);
+
+        // The span is a walkable run of packets, and the first one carries the
+        // operation where the command processor looks for it.
+        var walker = gpu.pm4.Walker.init(storage[0..announced_words]);
+        const first = (try walker.next()).?;
+        try testing.expectEqual(gpu.pm4.nop, first.opcode);
+        try testing.expectEqual(@as(?u6, gpu.pm4.custom.context_state), gpu.pm4.customCode(first));
+        try testing.expectEqual(operation, first.body[0]);
+        var seen: usize = first.wordCount();
+        while (try walker.next()) |packet| seen += packet.wordCount();
+        try testing.expectEqual(@as(usize, announced_words), seen);
+
+        // One word short is refused, and refusing writes nothing at all --
+        // half an operation would leave a packet the processor walks into.
+        var tight: [64]u32 = @splat(guard_word);
+        var short = sizedBuffer(tight[0 .. announced_words - 1]);
+        try testing.expect(context_op(&short, operation, 0, 0, 0, 0) == null);
+        for (tight) |word| try testing.expectEqual(guard_word, word);
+    }
+}
+
+test "context saves nest, and the stack has a bottom and a top" {
+    const std = @import("std");
+    const gpu = @import("gpu");
+    const testing = std.testing;
+
+    var db = Database{};
+    defer db.deinit(testing.allocator);
+    try registerAll(&db, testing.allocator);
+
+    const context_op = try agcEntryPoint(&db, "qj7QZpgr9Uw", AgcContextStateOp);
+
+    var words: [512]u32 = @splat(0);
+    var buffer = sizedBuffer(&words);
+
+    // Four nested saves, each around a different value, then four restores.
+    const depth = gpu.state.context_state_depth;
+    for (0..depth) |level| {
+        setContextRegister(&buffer, @intCast(0x100 + level));
+        try testing.expect(context_op(&buffer, context_push, 0, 0, 0, 0) != null);
+    }
+    setContextRegister(&buffer, 0x999);
+
+    const used_push = (@intFromPtr(buffer.cursor_up.?) - @intFromPtr(words[0..].ptr)) / @sizeOf(u32);
+    var probe = PredicationProbe{};
+    var state = gpu.State{};
+    _ = try runPredicated(&probe, &state, words[0..used_push]);
+    try testing.expectEqual(@as(u8, depth), state.context_depth);
+    try testing.expectEqual(@as(?u32, 0x999), state.readRegister(.context, probe_register));
+
+    // Restoring unwinds innermost first.
+    var level = depth;
+    while (level > 0) {
+        level -= 1;
+        var pop_words: [64]u32 = @splat(0);
+        var pop_buffer = sizedBuffer(&pop_words);
+        try testing.expect(context_op(&pop_buffer, context_pop, 0, 0, 0, 0) != null);
+        const used = (@intFromPtr(pop_buffer.cursor_up.?) - @intFromPtr(pop_words[0..].ptr)) / @sizeOf(u32);
+        _ = try runPredicated(&probe, &state, pop_words[0..used]);
+        try testing.expectEqual(@as(u8, @intCast(level)), state.context_depth);
+        try testing.expectEqual(@as(?u32, @intCast(0x100 + level)), state.readRegister(.context, probe_register));
+    }
+
+    // A pop with nothing saved is refused rather than restoring a register
+    // file that belongs to no pass.
+    const before = state.readRegister(.context, probe_register);
+    var empty_words: [64]u32 = @splat(0);
+    var empty_buffer = sizedBuffer(&empty_words);
+    try testing.expect(context_op(&empty_buffer, context_pop, 0, 0, 0, 0) != null);
+    const empty_used = (@intFromPtr(empty_buffer.cursor_up.?) - @intFromPtr(empty_words[0..].ptr)) / @sizeOf(u32);
+    _ = try runPredicated(&probe, &state, empty_words[0..empty_used]);
+    try testing.expectEqual(@as(u8, 0), state.context_depth);
+    try testing.expectEqual(before, state.readRegister(.context, probe_register));
+    try testing.expectEqual(@as(u64, 1), state.context_state_refused_count);
+
+    // And one push past the top is refused the same way.
+    for (0..depth + 1) |_| {
+        var push_words: [64]u32 = @splat(0);
+        var push_buffer = sizedBuffer(&push_words);
+        try testing.expect(context_op(&push_buffer, context_push, 0, 0, 0, 0) != null);
+        const used = (@intFromPtr(push_buffer.cursor_up.?) - @intFromPtr(push_words[0..].ptr)) / @sizeOf(u32);
+        _ = try runPredicated(&probe, &state, push_words[0..used]);
+    }
+    try testing.expectEqual(@as(u8, depth), state.context_depth);
+    try testing.expectEqual(@as(u64, 2), state.context_state_refused_count);
+}
+
+test "clearing context leaves the predicate and the pending wait alone" {
+    const std = @import("std");
+    const gpu = @import("gpu");
+    const testing = std.testing;
+
+    var db = Database{};
+    defer db.deinit(testing.allocator);
+    try registerAll(&db, testing.allocator);
+
+    const context_op = try agcEntryPoint(&db, "qj7QZpgr9Uw", AgcContextStateOp);
+
+    var predicate: [4]u64 align(16) = @splat(1);
+
+    var words: [256]u32 = @splat(0);
+    var buffer = sizedBuffer(&words);
+    setContextRegister(&buffer, 0x5555_5555);
+    // Establish a predicate, then push-and-clear: the context goes, the
+    // predicate stays, because a title clears context between passes and does
+    // not expect the guard it just set up to be forgotten.
+    try buildPredication(&db, &buffer, 0, 3, 0, @intFromPtr(&predicate));
+    try testing.expect(context_op(&buffer, context_push_clear, 0, 0, 0, 0) != null);
+
+    const used = (@intFromPtr(buffer.cursor_up.?) - @intFromPtr(words[0..].ptr)) / @sizeOf(u32);
+    var probe = PredicationProbe{};
+    var state = gpu.State{};
+    _ = try runPredicated(&probe, &state, words[0..used]);
+
+    // Context was saved and then dropped.
+    try testing.expectEqual(@as(u8, 1), state.context_depth);
+    try testing.expectEqual(@as(?u32, null), state.readRegister(.context, probe_register));
+    try testing.expectEqual(@as(u64, 1), state.context_state_clear_count);
+
+    // The predicate and what it was read from are untouched.
+    try testing.expect(state.predicate_skip);
+    try testing.expectEqual(@as(u64, 1), state.predication_enable_count);
+    try testing.expect(state.last_predication != null);
+
+    // And restoring brings the register back without disturbing the predicate.
+    var pop_words: [64]u32 = @splat(0);
+    var pop_buffer = sizedBuffer(&pop_words);
+    try testing.expect(context_op(&pop_buffer, context_pop, 0, 0, 0, 0) != null);
+    const pop_used = (@intFromPtr(pop_buffer.cursor_up.?) - @intFromPtr(pop_words[0..].ptr)) / @sizeOf(u32);
+    _ = try runPredicated(&probe, &state, pop_words[0..pop_used]);
+    try testing.expectEqual(@as(?u32, 0x5555_5555), state.readRegister(.context, probe_register));
+    try testing.expect(state.predicate_skip);
+}
+
+test "a saved context belongs to its own queue" {
+    const std = @import("std");
+    const gpu = @import("gpu");
+    const testing = std.testing;
+
+    var db = Database{};
+    defer db.deinit(testing.allocator);
+    try registerAll(&db, testing.allocator);
+
+    const context_op = try agcEntryPoint(&db, "qj7QZpgr9Uw", AgcContextStateOp);
+
+    // Two queues, each with its own register file and its own saved copies.
+    var graphics = gpu.State{};
+    var compute = gpu.State{};
+    var probe = PredicationProbe{};
+
+    var words: [256]u32 = @splat(0);
+    var buffer = sizedBuffer(&words);
+    setContextRegister(&buffer, 0xaaaa_aaaa);
+    try testing.expect(context_op(&buffer, context_push, 0, 0, 0, 0) != null);
+    setContextRegister(&buffer, 0xbbbb_bbbb);
+    const used = (@intFromPtr(buffer.cursor_up.?) - @intFromPtr(words[0..].ptr)) / @sizeOf(u32);
+
+    _ = try runPredicated(&probe, &graphics, words[0..used]);
+    try testing.expectEqual(@as(u8, 1), graphics.context_depth);
+    try testing.expectEqual(@as(u8, 0), compute.context_depth);
+    try testing.expectEqual(@as(?u32, null), compute.readRegister(.context, probe_register));
+
+    // A pop on the other queue finds nothing saved: the stacks do not meet.
+    var pop_words: [64]u32 = @splat(0);
+    var pop_buffer = sizedBuffer(&pop_words);
+    try testing.expect(context_op(&pop_buffer, context_pop, 0, 0, 0, 0) != null);
+    const pop_used = (@intFromPtr(pop_buffer.cursor_up.?) - @intFromPtr(pop_words[0..].ptr)) / @sizeOf(u32);
+    _ = try runPredicated(&probe, &compute, pop_words[0..pop_used]);
+    try testing.expectEqual(@as(u64, 1), compute.context_state_refused_count);
+    try testing.expectEqual(@as(u64, 0), graphics.context_state_refused_count);
+    try testing.expectEqual(@as(u8, 1), graphics.context_depth);
+}
+
+test "a save survives the wait that splits its command buffer" {
+    const std = @import("std");
+    const gpu = @import("gpu");
+    const testing = std.testing;
+
+    var db = Database{};
+    defer db.deinit(testing.allocator);
+    try registerAll(&db, testing.allocator);
+
+    const context_op = try agcEntryPoint(&db, "qj7QZpgr9Uw", AgcContextStateOp);
+
+    // Driven through the queue scheduler rather than a bare executor, because
+    // parking on a wait and continuing afterwards is the scheduler's job: a
+    // bare executor stops at the wait and never comes back.
+    var label: [1]u32 = @splat(0);
+    const label_address = @intFromPtr(&label);
+
+    var words: [256]u32 = @splat(0);
+    var buffer = sizedBuffer(&words);
+    setContextRegister(&buffer, 0x7777_7777);
+    try testing.expect(context_op(&buffer, context_push, 0, 0, 0, 0) != null);
+    setContextRegister(&buffer, 0x8888_8888);
+
+    const wait = agc_reserve(&buffer, 7);
+    wait[0] = pm4Command(gpu.pm4.wait_reg_mem, 6);
+    wait[1] = 0x13; // memory space, compare equal
+    wait[2] = @truncate(label_address);
+    wait[3] = @truncate(label_address >> 32);
+    wait[4] = 1;
+    wait[5] = 0xffff_ffff;
+    wait[6] = 0x10;
+
+    try testing.expect(context_op(&buffer, context_pop, 0, 0, 0, 0) != null);
+    const used = (@intFromPtr(buffer.cursor_up.?) - @intFromPtr(words[0..].ptr)) / @sizeOf(u32);
+
+    var probe = PredicationProbe{};
+    var scheduler = gpu.QueueScheduler.init(testing.allocator, probe.backend());
+    defer scheduler.deinit();
+
+    // The stream parks on the wait, with the save already made.
+    _ = try scheduler.submit(.graphics, words[0..used]);
+    try testing.expect(scheduler.isBlocked(.graphics));
+    try testing.expectEqual(@as(u8, 1), scheduler.state(.graphics).context_depth);
+    try testing.expectEqual(
+        @as(?u32, 0x8888_8888),
+        scheduler.state(.graphics).readRegister(.context, probe_register),
+    );
+
+    // The label arrives and the rest of the buffer runs. The restore on the
+    // far side of the wait finds the copy saved before it.
+    label[0] = 1;
+    _ = try scheduler.pump();
+    try testing.expect(!scheduler.isBlocked(.graphics));
+    try testing.expectEqual(@as(u8, 0), scheduler.state(.graphics).context_depth);
+    try testing.expectEqual(
+        @as(?u32, 0x7777_7777),
+        scheduler.state(.graphics).readRegister(.context, probe_register),
+    );
+    try testing.expectEqual(@as(u64, 1), scheduler.state(.graphics).context_state_push_count);
+    try testing.expectEqual(@as(u64, 1), scheduler.state(.graphics).context_state_pop_count);
+}

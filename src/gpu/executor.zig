@@ -82,6 +82,7 @@ pub fn predicationStatsEnabled() bool {
 var predication_reports = std.atomic.Value(u32).init(0);
 var unsupported_predication_reports = std.atomic.Value(u32).init(0);
 var unsupported_copy_reports = std.atomic.Value(u32).init(0);
+var context_state_reports = std.atomic.Value(u32).init(0);
 var performed_copy_reports = std.atomic.Value(u32).init(0);
 
 /// Reports what a stream did with predication, a bounded number of times.
@@ -718,6 +719,24 @@ pub const DcbExecutor = struct {
                 // of a different buffer. Bring-up treats the wait as already
                 // satisfied so a second frame can be built without parking the CP.
                 pm4.custom.wait_flip_done => {},
+                // Saving and restoring the context register file. The rest of
+                // the queue -- shader and uconfig registers, the predicate,
+                // the pending wait -- is not part of it and is left exactly
+                // as it was, so a pass that pushes context around itself does
+                // not disturb the fence the queue is sitting on.
+                pm4.custom.context_state => {
+                    if (packet.body.len < 1) return Error.InvalidPacket;
+                    const operation = gpu_state.ContextStateOperation.from(packet.body[0]) orelse
+                        return Error.InvalidPacket;
+                    if (!self.state.applyContextStateOperation(operation) and
+                        context_state_reports.fetchAdd(1, .monotonic) < 16)
+                    {
+                        std.debug.print(
+                            "[gpu context] {s} refused at depth {d}\n",
+                            .{ @tagName(operation), self.state.context_depth },
+                        );
+                    }
+                },
                 else => {
                     result.ignored_commands += 1;
                     result.ignored_custom_counts[code] +|= 1;
