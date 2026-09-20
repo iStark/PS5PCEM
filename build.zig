@@ -635,10 +635,12 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    b.installArtifact(vulkan_smoke);
+    const install_vulkan_smoke = b.addInstallArtifact(vulkan_smoke, .{});
+    b.getInstallStep().dependOn(&install_vulkan_smoke.step);
 
     const vulkan_smoke_cmd = b.addRunArtifact(vulkan_smoke);
-    vulkan_smoke_cmd.step.dependOn(b.getInstallStep());
+    vulkan_smoke_cmd.step.dependOn(&install_vulkan_smoke.step);
+    if (b.args) |args| vulkan_smoke_cmd.addArgs(args);
     const vulkan_smoke_step = b.step("vulkan-smoke", "Run the headless Vulkan compute/staging probe");
     vulkan_smoke_step.dependOn(&vulkan_smoke_cmd.step);
 

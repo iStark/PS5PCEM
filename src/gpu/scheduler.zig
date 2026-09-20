@@ -549,6 +549,7 @@ const SnapshotBackend = struct {
         return .{
             .read = read,
             .write = write,
+            .read_live = readLive,
             .read_wait = readWait,
             .acquire = if (self.original.vtable.acquire != null) acquire else null,
             .release = if (self.original.vtable.release != null) release else null,
@@ -589,6 +590,12 @@ const SnapshotBackend = struct {
             return true;
         }
         return self.original.vtable.read(self.original.context, address, bytes);
+    }
+
+    fn readLive(context: ?*anyopaque, address: u64, bytes: []u8) bool {
+        const self = from(context);
+        const callback = self.original.vtable.read_live orelse self.original.vtable.read;
+        return callback(self.original.context, address, bytes);
     }
 
     fn readWait(context: ?*anyopaque, address: u64, bytes: []u8) bool {
@@ -740,6 +747,98 @@ fn customCommand(code: u6, body_words: u14) u32 {
     return command(pm4.nop, body_words) | (@as(u32, code) << 2);
 }
 
+test "COPY_DATA reads current data inside a retained command allocation" {
+    var host = FakeBackend{};
+    const child = [_]u32{
+        command(pm4.nop, 3),       0xcafe,                   0,                         0,
+        command(pm4.copy_data, 5), 2 | (2 << 8) | (1 << 16), 0x1108,                    0,
+        0x1200,                    0,                        command(pm4.copy_data, 5), 2 | (2 << 8) | (1 << 16),
+        0x1200,                    0,                        0x1210,                    0,
+    };
+    host.putWords(0x1100, &child);
+    const root = [_]u32{
+        customCommand(pm4.custom.wait_mem_32, 6), 0x1080, 0, 0xffff_ffff,             1, 0x13, 1,
+        command(pm4.indirect_buffer, 3),          0x1100, 0, 0x0f20_0000 | child.len,
+    };
+    var scheduler = Scheduler.init(testing.allocator, host.interface());
+    defer scheduler.deinit();
+    _ = try scheduler.submit(.graphics, &root);
+    try testing.expect(scheduler.isBlocked(.graphics));
+    // The retained child has zeroes here. Only data reads should see this
+    // later write; its PM4 instructions must still come from the snapshot.
+    host.putWords(0x1108, &.{ 0x1122_3344, 0x5566_7788 });
+    host.putWords(0x1080, &.{1});
+    const resumed = try scheduler.pump();
+    try testing.expectEqual(@as(usize, 1), resumed.completed_submissions);
+    for ([_]usize{ 0x200, 0x210 }) |offset| {
+        try testing.expectEqual(@as(u64, 0x5566_7788_1122_3344), std.mem.readInt(u64, host.memory[offset..][0..8], .little));
+    }
+}
+
+test "COPY_DATA cannot copy a synthetic wait recovery value" {
+    var host = FakeBackend{};
+    host.putWords(0x1200, &.{0xdead_beef});
+    const root = [_]u32{
+        customCommand(pm4.custom.wait_mem_32, 6), 0x1080,       0,      0xffff_ffff, 1,      0x13, 1,
+        command(pm4.copy_data, 5),                2 | (2 << 8), 0x1080, 0,           0x1200, 0,
+    };
+    var scheduler = Scheduler.init(testing.allocator, host.interface());
+    defer scheduler.deinit();
+    _ = try scheduler.submit(.graphics, &root);
+    try testing.expect(scheduler.isBlocked(.graphics));
+    try testing.expect(scheduler.softSatisfyActiveWait(.graphics, scheduler.state(.graphics).blocked_wait.?, 1));
+    const resumed = try scheduler.pump();
+    try testing.expectEqual(@as(usize, 1), resumed.completed_submissions);
+    // Recovery satisfies the wait without modifying guest data at 0x1080.
+    try testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, host.memory[0x200..][0..4], .little));
+}
+
+test "COPY_DATA memory selectors do not change meaning with engine selection" {
+    var host = FakeBackend{};
+    host.putWords(0x1100, &.{ 0x1122_3344, 0x5566_7788 });
+    // PM4 selectors are independent of engine bits 30..31. Destination 5
+    // is the legacy memory selector, not the source's immediate selector.
+    for ([_]u32{ 1, 2 }) |source| {
+        for ([_]u32{ 1, 2, 5 }) |destination| {
+            for ([_]u32{ 0, 1 }) |engine| {
+                host.putWords(0x1200, &.{ 0, 0 });
+                const stream = [_]u32{
+                    command(pm4.copy_data, 5), source | (destination << 8) | (1 << 16) | (engine << 30),
+                    0x1100,                    0,
+                    0x1200,                    0,
+                };
+                var state = gpu_state.State{};
+                var runner = executor.DcbExecutor{ .state = &state, .backend = host.interface(), .allocator = testing.allocator };
+                _ = try runner.execute(&stream);
+                try testing.expectEqual(@as(u64, 0x5566_7788_1122_3344), std.mem.readInt(u64, host.memory[0x200..][0..8], .little));
+            }
+        }
+    }
+}
+
+test "COPY_DATA rejects malformed packets and propagates memory failures" {
+    var host = FakeBackend{};
+    host.putWords(0x1100, &.{ 0x1122_3344, 0x5566_7788 });
+    host.putWords(0x1200, &.{ 0xdead_beef, 0xdead_beef });
+    const before = host.memory;
+    var state = gpu_state.State{};
+    var runner = executor.DcbExecutor{ .state = &state, .backend = host.interface(), .allocator = testing.allocator };
+    const valid = [_]u32{ command(pm4.copy_data, 5), 2 | (2 << 8) | (1 << 16), 0x1100, 0, 0x1200, 0 };
+    try testing.expectError(error.Truncated, runner.execute(valid[0..5]));
+    var malformed = valid;
+    malformed[0] = command(pm4.copy_data, 4);
+    try testing.expectError(error.InvalidPacket, runner.execute(malformed[0..5]));
+    for ([_]usize{ 2, 4 }) |address_word| {
+        malformed = valid;
+        malformed[address_word] = 0;
+        try testing.expectError(error.InvalidPacket, runner.execute(&malformed));
+        malformed[address_word] = 0x2000; // Just outside the backend's memory.
+        const expected: anyerror = if (address_word == 2) error.MemoryReadFailed else error.MemoryWriteFailed;
+        try testing.expectError(expected, runner.execute(&malformed));
+    }
+    try testing.expectEqualSlices(u8, &before, &host.memory);
+}
+
 test "long tail chains retain their submitted contents while the root waits" {
     var host = FakeBackend{};
     const link_count = executor.maximum_stream_depth + 22;
@@ -778,19 +877,23 @@ test "synchronization labels inside retained command buffers stay live" {
     inline for (.{ false, true }) |wide| {
         var host = FakeBackend{};
         const child: []const u32 = if (wide) &.{
-            command(pm4.nop, 3), 0xcafe, 0, 0,
-            customCommand(pm4.custom.wait_mem_64, 8), 0x1108, 0, 0xffff_ffff, 0xffff_ffff, 1, 1, 0x13, 1,
-            command(pm4.event_write, 1), 0x21,
+            command(pm4.nop, 3),                      0xcafe,                      0,    0,
+            customCommand(pm4.custom.wait_mem_64, 8), 0x1108,                      0,    0xffff_ffff,
+            0xffff_ffff,                              1,                           1,    0x13,
+            1,                                        command(pm4.event_write, 1), 0x21,
         } else &.{
-            command(pm4.nop, 3), 0xcafe, 0, 0,
-            customCommand(pm4.custom.wait_mem_32, 6), 0x1108, 0, 0xffff_ffff, 1, 0x13, 1,
-            command(pm4.event_write, 1), 0x21,
+            command(pm4.nop, 3),                      0xcafe, 0, 0,
+            customCommand(pm4.custom.wait_mem_32, 6), 0x1108, 0, 0xffff_ffff,
+            1,                                        0x13,   1, command(pm4.event_write, 1),
+            0x21,
         };
         host.putWords(0x1100, child);
         const graphics = [_]u32{ command(pm4.indirect_buffer, 3), 0x1100, 0, 0x0f20_0000 | @as(u32, @intCast(child.len)) };
         const compute = [_]u32{
             customCommand(pm4.custom.release_mem, 7), 0x28 | (5 << 8),
-            @as(u32, if (wide) 2 else 1) << 29, 0x1108, 0, 1, if (wide) 1 else 0, 0,
+            @as(u32, if (wide) 2 else 1) << 29,       0x1108,
+            0,                                        1,
+            if (wide) 1 else 0,                       0,
         };
         var scheduler = Scheduler.init(testing.allocator, host.interface());
         defer scheduler.deinit();

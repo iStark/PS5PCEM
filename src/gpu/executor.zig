@@ -37,6 +37,9 @@ pub const Backend = struct {
     pub const VTable = struct {
         read: *const fn (?*anyopaque, u64, []u8) bool,
         write: *const fn (?*anyopaque, u64, []const u8) bool,
+        /// Actual data at the execution point, bypassing retained command
+        /// snapshots and synthetic values used to recover blocked waits.
+        read_live: ?*const fn (?*anyopaque, u64, []u8) bool = null,
         /// Synchronization values are live even when command and register
         /// reads are served from immutable submission snapshots.
         read_wait: ?*const fn (?*anyopaque, u64, []u8) bool = null,
@@ -1094,30 +1097,24 @@ pub const DcbExecutor = struct {
         self.state.write_data_count += 1;
     }
 
-    /// Moves four or eight bytes between memory, a register-like source and
-    /// an immediate carried in the packet.
-    ///
-    /// Both halves go through the backend rather than straight at guest
-    /// memory. The read is the synchronising one, so a value an earlier draw
-    /// produced is finished before it is copied; the write is the one that
-    /// invalidates whatever cached the destination. Routing this through the
-    /// DMA hook instead would add that path's metadata handling, which is for
-    /// tiled depth and colour surfaces -- this packet moves fences and
-    /// counters, four or eight bytes at a time, and never those.
+    /// Copies one word or quadword through the backend's ordered memory path.
+    /// Data reads bypass command snapshots and synthetic wait recovery; writes
+    /// retain the backend's cache invalidation and metadata handling.
     fn copyData(self: *DcbExecutor, packet: pm4.Packet) Error!void {
         if (packet.body.len != 5) return Error.InvalidPacket;
         const body = packet.body;
         const control = body[0];
 
-        // Undo the graphics form's shift and pick up the bit it parked at 30.
-        // The compute form has neither, and doubles instead; see CopyData.
-        const source_raw = ((control & 0xf) << 1) | ((control >> 30) & 0x1);
-        const destination_raw = ((control >> 8) & 0xf) << 1;
+        // The writers have already converted guest selectors to PM4 fields.
+        // Engine selection must not change the meaning of a memory source.
+        const source_raw = control & 0xf;
+        const destination_raw = (control >> 8) & 0xf;
         const value = gpu_state.CopyData{
-            .source = gpu_state.CopyData.Selector.from(source_raw),
-            .destination = gpu_state.CopyData.Selector.from(destination_raw),
+            .source = gpu_state.CopyData.Selector.fromSource(source_raw),
+            .destination = gpu_state.CopyData.Selector.fromDestination(destination_raw),
             .source_raw = source_raw,
             .destination_raw = destination_raw,
+            .engine = @truncate(control >> 30),
             .source_cache_policy = @truncate((control >> 13) & 0x3),
             .destination_cache_policy = @truncate((control >> 25) & 0x3),
             .write_confirm = control & (1 << 20) != 0,
@@ -1144,6 +1141,7 @@ pub const DcbExecutor = struct {
             return;
         }
 
+        if (value.destination_address == 0) return Error.InvalidPacket;
         var bytes: [8]u8 = undefined;
         const span = bytes[0..value.byte_count];
         switch (value.source) {
@@ -1159,11 +1157,11 @@ pub const DcbExecutor = struct {
             ),
             .memory => {
                 if (value.source_address_or_immediate == 0) return Error.InvalidPacket;
-                try self.backend.read(value.source_address_or_immediate, span);
+                const read_live = self.backend.vtable.read_live orelse self.backend.vtable.read;
+                if (!read_live(self.backend.context, value.source_address_or_immediate, span)) return Error.MemoryReadFailed;
             },
             else => unreachable,
         }
-        if (value.destination_address == 0) return Error.InvalidPacket;
         try self.backend.write(value.destination_address, span);
         if (performed_copy_reports.fetchAdd(1, .monotonic) < 16) {
             std.debug.print(

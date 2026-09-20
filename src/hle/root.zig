@@ -1670,6 +1670,9 @@ test "both COPY_DATA constructors reach the registry and agree on the packet" {
 
     // The spellings differ; the packet does not.
     try testing.expectEqualSlices(u32, graphics[0..6], compute[0..6]);
+    // Independent PM4 expectation: TC/TC, read policy 2, write policy 1,
+    // 64-bit width, write confirmation, and ME selection.
+    try testing.expectEqualSlices(u32, &.{ 0xc004_4000, 0x0211_4202, 0x2000, 1, 0x4000, 2 }, graphics[0..6]);
     try testing.expectEqual(@as(usize, 6 * @sizeOf(u32)), @intFromPtr(graphics_buffer.cursor_up.?) - @intFromPtr(graphics[0..].ptr));
 
     var walker = gpu.pm4.Walker.init(graphics[0..6]);
@@ -1706,9 +1709,13 @@ test "COPY_DATA moves four and eight bytes of memory" {
     for ([_]u64{ 0, 1 }) |item_size| {
         const width: usize = if (item_size == 0) 4 else 8;
         // Both queues, to prove the decode reads either spelling.
-        for ([_]struct { write: *const AgcCopyData, selector: u64 }{
-            .{ .write = dcb, .selector = memory_selector_dcb },
-            .{ .write = acb, .selector = memory_selector_acb },
+        for ([_]struct { write: *const AgcCopyData, source: u64, destination: u64 }{
+            .{ .write = dcb, .source = memory_selector_dcb, .destination = memory_selector_dcb },
+            .{ .write = acb, .source = memory_selector_acb, .destination = memory_selector_acb },
+            // DCB bit zero selects PFP independently of the source selector.
+            .{ .write = dcb, .source = 3, .destination = 10 },
+            .{ .write = dcb, .source = 5, .destination = 4 },
+            .{ .write = acb, .source = 1, .destination = 5 },
         }) |form| {
             var source: [2]u32 = .{ 0x1122_3344, 0x5566_7788 };
             var destination: [4]u32 = @splat(0xdead_beef);
@@ -1717,10 +1724,10 @@ test "COPY_DATA moves four and eight bytes of memory" {
             var buffer = sizedBuffer(&words);
             try testing.expect(form.write(
                 &buffer,
-                form.selector,
+                form.destination,
                 0,
                 @intFromPtr(&destination),
-                form.selector,
+                form.source,
                 0,
                 @intFromPtr(&source),
                 item_size,
@@ -1930,7 +1937,7 @@ test "a COPY_DATA this does not move yet copies nothing and says so" {
     var source: [2]u32 = .{ 0xcafe_f00d, 0 };
     var destination: [2]u32 = @splat(0xdead_beef);
 
-    // Selector 6 recovers to the GDS group, which nothing here reads.
+    // DCB selector 6 encodes PM4 source 3 (GDS), which is unsupported.
     var words: [16]u32 = @splat(0);
     var buffer = sizedBuffer(&words);
     try testing.expect(dcb(

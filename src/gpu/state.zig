@@ -136,30 +136,29 @@ pub const SetPredication = struct {
 };
 /// What one `COPY_DATA` packet moves.
 ///
-/// The selectors are stored as the command processor recovers them, which is
-/// deliberately not how either constructor spells them. The graphics form
-/// writes the selector shifted right by one and puts the bit it shifted out
-/// at bit 30; the compute form writes the selector unshifted and has no bit
-/// 30 at all. Recovering `(field << 1) | bit30` undoes the first exactly and
-/// doubles the second, and the two land in one space that can be read without
-/// knowing which queue wrote the packet: a compute selector of 1, 2 or 3
-/// arrives as 2, 4 or 6, and a graphics selector of 2, 4 or 5 arrives
-/// unchanged -- all of them memory. The same holds for the immediate
-/// selector, which is 5 from compute and 10 from graphics and arrives as 10
-/// either way.
+/// Selectors below are PM4 fields, after the writer converts the guest ABI.
+/// Source and destination enumerations differ; engine selection is separate.
+/// See AMD PAL gfx9_plus_merged_f32_{me,pfp,mec}_pm4_packets.h, COPY_DATA.
 pub const CopyData = struct {
-    /// Recovered selector values, not the arguments a title passed.
     pub const Selector = enum {
         memory,
         gds,
         immediate,
         other,
 
-        pub fn from(recovered: u32) Selector {
-            return switch (recovered) {
-                2, 4, 5 => .memory,
-                3, 6, 7 => .gds,
-                10, 11 => .immediate,
+        pub fn fromSource(raw: u32) Selector {
+            return switch (raw) {
+                1, 2 => .memory,
+                3 => .gds,
+                5 => .immediate,
+                else => .other,
+            };
+        }
+
+        pub fn fromDestination(raw: u32) Selector {
+            return switch (raw) {
+                1, 2, 5 => .memory,
+                3 => .gds,
                 else => .other,
             };
         }
@@ -169,6 +168,7 @@ pub const CopyData = struct {
     destination: Selector,
     source_raw: u32,
     destination_raw: u32,
+    engine: u2,
     source_cache_policy: u2,
     destination_cache_policy: u2,
     write_confirm: bool,

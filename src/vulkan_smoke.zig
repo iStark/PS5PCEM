@@ -50,16 +50,15 @@ fn SizedGuestMemory(comptime size: usize) type {
     };
 }
 
-/// Runs COPY_DATA against the real renderer backend.
-///
-/// The unit tests drive the packet through a probe that reads and writes host
-/// memory directly. This one goes through `Renderer.dcbBackend`, which is the
-/// path a title actually takes: the read finishes the pending draw batch and
-/// waits on submitted work before it looks at guest memory, and the write
-/// invalidates whatever cached the destination. A copy that only worked
-/// against a bare probe would not prove either of those still happens.
+/// Produces COPY_DATA sources on the GPU and consumes the copies on the GPU.
+/// Deferred readback and an already cached destination exercise both sides of
+/// the renderer's memory visibility boundary.
 fn runCopyDataProbe(allocator: std.mem.Allocator) !void {
-    var renderer = try vulkan.Renderer.init(allocator, .{});
+    var renderer = try vulkan.Renderer.init(allocator, .{
+        .enable_timeline_scheduler = true,
+        .defer_small_storage_writes = true,
+        .retain_clean_storage_buffers = true,
+    });
     defer renderer.deinit();
     var guest = GuestMemory{};
     const backend = renderer.dcbBackend(guest.interface());
@@ -67,6 +66,52 @@ fn runCopyDataProbe(allocator: std.mem.Allocator) !void {
     const source: usize = 0x2000;
     const destination: usize = 0x3000;
     const immediate_destination: usize = 0x4000;
+    const consumed: usize = 0x5000;
+
+    // Write two different scalar values through a translated compute shader.
+    const producer = [_]u32{ vop1(1, 0, 4), vop1(1, 1, 5), 0xe0740000, 0x80000000, 0xbf810000 };
+    const consumer = [_]u32{ 0xe0340000, 0x80000000, 0xe0740000, 0x80010000, 0xbf810000 };
+    for (producer, 0..) |word, i| guest.word(0x100 + i * 4, word);
+    for (consumer, 0..) |word, i| guest.word(0x200 + i * 4, word);
+
+    var state = gpu.State{};
+    const compute = gpu.resources.ShaderStage.compute;
+    var executor = gpu.DcbExecutor{ .state = &state, .backend = backend, .allocator = allocator };
+    for ([_]u32{ 0, 1 }) |wide| {
+        const width: usize = if (wide == 0) 4 else 8;
+        const expected: [2]u32 = .{ 0x1122_3344 + wide, 0x5566_7788 + wide };
+        for ([_]usize{ source, destination, consumed }) |slot| {
+            guest.word(slot, 0xdead_beef);
+            guest.word(slot + 4, 0xdead_beef);
+            guest.word(slot + 8, 0xdead_beef);
+        }
+        // A dependent shader must not reuse these old destination bytes.
+        _ = try renderer.stageGuestStorageBufferAt(1, destination, 8);
+        try state.writeRegister(.shader, compute.programRegisterBase(), 1);
+        try state.writeRegister(.shader, compute.programRegisterBase() + 1, 0);
+        try state.writeRegister(.shader, 0x213, 6 << 1);
+        for ([_]u32{ source, 0, 8, 0, expected[0], expected[1] }, 0..) |word, i|
+            try state.writeRegister(.shader, compute.userDataBase() + @as(u32, @intCast(i)), word);
+        const produced = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
+        try std.testing.expect(produced.spirv_words > 0);
+        try std.testing.expectEqual(@as(u32, 0xdead_beef), std.mem.readInt(u32, guest.bytes[source..][0..4], .little));
+
+        // TC source via PFP, with the alternate TC destination selector.
+        _ = try executor.execute(&.{ command(gpu.pm4.copy_data, 5), 1 | (5 << 8) | (wide << 16) | (1 << 30), source, 0, destination, 0 });
+        try std.testing.expectEqualSlices(u8, std.mem.asBytes(&expected)[0..width], guest.bytes[destination..][0..width]);
+        try std.testing.expectEqual(@as(u32, 0xdead_beef), std.mem.readInt(u32, guest.bytes[destination + width ..][0..4], .little));
+
+        try state.writeRegister(.shader, compute.programRegisterBase(), 2);
+        try state.writeRegister(.shader, 0x213, 8 << 1);
+        for ([_]u32{ destination, 0, 8, 0, consumed, 0, 8, 0 }, 0..) |word, i|
+            try state.writeRegister(.shader, compute.userDataBase() + @as(u32, @intCast(i)), word);
+        const consumed_report = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
+        try std.testing.expect(consumed_report.spirv_words > 0);
+        var output: [8]u8 = undefined;
+        try renderer.readbackGuestStorageBuffer(consumed, &output);
+        try std.testing.expectEqualSlices(u8, guest.bytes[destination..][0..8], &output);
+        try std.testing.expectEqual(@as(u32, 0xdead_beef), std.mem.readInt(u32, guest.bytes[consumed + 8 ..][0..4], .little));
+    }
 
     guest.word(source, 0x1122_3344);
     guest.word(source + 4, 0x5566_7788);
@@ -78,8 +123,8 @@ fn runCopyDataProbe(allocator: std.mem.Allocator) !void {
     // Eight bytes of memory, then a 64-bit immediate: the two shapes the
     // packet can take that move a full quadword.
     const immediate: u64 = 0x0123_4567_89ab_cdef;
-    const memory_selectors: u32 = 2 | (2 << 8); // both recover to "memory"
-    const immediate_selectors: u32 = 5 | (2 << 8); // source recovers to "immediate"
+    const memory_selectors: u32 = 2 | (2 << 8);
+    const immediate_selectors: u32 = 5 | (2 << 8);
     const item_size_64: u32 = 1 << 16;
 
     const stream = [_]u32{
@@ -97,8 +142,6 @@ fn runCopyDataProbe(allocator: std.mem.Allocator) !void {
         0,
     };
 
-    var state = gpu.State{};
-    var executor = gpu.DcbExecutor{ .state = &state, .backend = backend, .allocator = allocator };
     _ = try executor.execute(&stream);
     try renderer.flushPendingGuestWrites();
 
@@ -111,10 +154,10 @@ fn runCopyDataProbe(allocator: std.mem.Allocator) !void {
         immediate,
         std.mem.readInt(u64, guest.bytes[immediate_destination..][0..8], .little),
     );
-    try std.testing.expectEqual(@as(u64, 2), state.copy_data_count);
+    try std.testing.expectEqual(@as(u64, 4), state.copy_data_count);
     try std.testing.expectEqual(@as(u64, 0), state.copy_data_unsupported_count);
     std.debug.print(
-        "COPY_DATA passed: 8-byte memory copy and 64-bit immediate through the renderer backend\n",
+        "COPY_DATA passed: deferred GPU sources, cached GPU consumers, 4/8-byte copies and 64-bit immediate\n",
         .{},
     );
 }

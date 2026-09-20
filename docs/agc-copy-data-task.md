@@ -1,5 +1,9 @@
 # AGC task: COPY_DATA from exports to execution
 
+Implemented in `c72fd4a` and corrected during [Codex review](agc-copy-data-review.md).
+The scope below records the original task; the review contains current results
+and remaining limitations.
+
 ## Objective
 
 Replace the NOP implementations of `sceAgcDcbCopyData` and `sceAgcAcbCopyData` with actual data copies. Implement the complete path: NID registration, guest ABI, matching writers and size queries, PM4 decoding, and execution that respects GPU write ordering.
