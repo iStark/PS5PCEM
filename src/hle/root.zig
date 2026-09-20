@@ -996,3 +996,511 @@ test "a direct register list never writes past the size it was given" {
     try testing.expectEqual(@as(u32, 0), get_size(0, 0, 0, 0, 0, 0));
     try testing.expectEqual(@as(u32, 0), get_size(0x1001, 0, 0, 0, 0, 0));
 }
+
+// ---------------------------------------------------------------------------
+// Predication
+//
+// A title sets a predicate, marks the packets it guards, and expects the ones
+// it guarded to disappear when the predicate says so. These go through the
+// registry for the constructor half and drive the executor directly for the
+// execution half, because the two are only useful together.
+
+const AgcPatch2 = fn (?[*]u32, u64, u64, u64, u64, u64) callconv(abi.guest) i32;
+const AgcRangePatch = fn (?[*]u32, ?[*]const u32, u64, u64, u64, u64) callconv(abi.guest) i32;
+
+/// Serves reads straight out of host memory, which is where a test's predicate
+/// lives, and records what reached the renderer.
+const PredicationProbe = struct {
+    const gpu_module = @import("gpu");
+
+    draws: u32 = 0,
+    dispatches: u32 = 0,
+    events: [16]u8 = @splat(0),
+    event_count: usize = 0,
+
+    fn from(context: ?*anyopaque) *PredicationProbe {
+        return @ptrCast(@alignCast(context.?));
+    }
+
+    fn read(_: ?*anyopaque, address: u64, bytes: []u8) bool {
+        if (address == 0) return false;
+        const source: [*]const u8 = @ptrFromInt(address);
+        @memcpy(bytes, source[0..bytes.len]);
+        return true;
+    }
+
+    fn write(_: ?*anyopaque, address: u64, bytes: []const u8) bool {
+        if (address == 0) return false;
+        const target: [*]u8 = @ptrFromInt(address);
+        @memcpy(target[0..bytes.len], bytes);
+        return true;
+    }
+
+    fn draw(context: ?*anyopaque, _: *const gpu_module.State, _: gpu_module.pm4.Packet) bool {
+        from(context).draws += 1;
+        return true;
+    }
+
+    fn dispatch(context: ?*anyopaque, _: *const gpu_module.State, _: gpu_module.pm4.Packet) bool {
+        from(context).dispatches += 1;
+        return true;
+    }
+
+    fn event(context: ?*anyopaque, value: gpu_module.state.EventWrite) bool {
+        const self = from(context);
+        if (self.event_count < self.events.len) {
+            self.events[self.event_count] = value.event_type;
+            self.event_count += 1;
+        }
+        return true;
+    }
+
+    const vtable = gpu_module.DcbBackend.VTable{
+        .read = read,
+        .write = write,
+        .event = event,
+        .draw = draw,
+        .dispatch = dispatch,
+    };
+
+    fn backend(self: *PredicationProbe) gpu_module.DcbBackend {
+        return .{ .context = self, .vtable = &vtable };
+    }
+};
+
+/// Builds one SET_PREDICATION packet through the registered constructor, so the
+/// bits the executor decodes are the bits the library actually writes.
+fn buildPredication(
+    db: *const Database,
+    buffer: *libs.agc.CommandBuffer,
+    condition: u64,
+    op: u64,
+    wait_op: u64,
+    address: u64,
+) !void {
+    const write = try agcEntryPoint(db, "bbFueFP+J4k", AgcWrite);
+    const std = @import("std");
+    if (write(buffer, condition, op, wait_op, address, 0) == null) return error.PredicationRefused;
+    _ = std;
+}
+
+/// Runs one stream on a fresh executor and reports what the backend saw.
+fn runPredicated(
+    probe: *PredicationProbe,
+    state: *@import("gpu").State,
+    stream: []const u32,
+) !@import("gpu").executor.Result {
+    const gpu_module = @import("gpu");
+    const std = @import("std");
+    var runner = gpu_module.DcbExecutor{
+        .state = state,
+        .backend = probe.backend(),
+        .allocator = std.testing.allocator,
+    };
+    return runner.execute(stream);
+}
+
+test "a boolean predicate drops the packets it guards and keeps the rest" {
+    const std = @import("std");
+    const gpu = @import("gpu");
+    const testing = std.testing;
+
+    var db = Database{};
+    defer db.deinit(testing.allocator);
+    try registerAll(&db, testing.allocator);
+
+    const mark = try agcEntryPoint(&db, "w6Dj1VJt5qY", AgcPatch2);
+
+    // Sixteen-byte aligned, as the packet format requires.
+    var predicate: [4]u64 align(16) = @splat(0);
+    const predicate_address = @intFromPtr(&predicate);
+
+    // condition 0 means: skip the guarded packets when the value is non-zero.
+    for ([_]struct { value: u64, guarded_runs: bool }{
+        .{ .value = 0, .guarded_runs = true },
+        .{ .value = 1, .guarded_runs = false },
+        .{ .value = 0xffff_ffff_ffff_ffff, .guarded_runs = false },
+    }) |trial| {
+        predicate[0] = trial.value;
+
+        var words: [32]u32 = @splat(0);
+        var buffer = sizedBuffer(&words);
+        try buildPredication(&db, &buffer, 0, 3, 0, predicate_address);
+
+        const guarded = try agcEntryPoint(&db, "Yw0jKSqop+E", AgcWrite);
+        const guarded_packet = guarded(&buffer, 3, 0, 0, 0, 0).?;
+        try testing.expectEqual(errno.ok, mark(guarded_packet, 1, 0, 0, 0, 0));
+
+        // An unguarded draw after it, which must run whatever the predicate says.
+        _ = guarded(&buffer, 4, 0, 0, 0, 0).?;
+
+        const used = (@intFromPtr(buffer.cursor_up.?) - @intFromPtr(words[0..].ptr)) / @sizeOf(u32);
+        var probe = PredicationProbe{};
+        var state = gpu.State{};
+        _ = try runPredicated(&probe, &state, words[0..used]);
+
+        try testing.expectEqual(@as(u32, if (trial.guarded_runs) 2 else 1), probe.draws);
+        try testing.expectEqual(trial.value != 0, state.predicate_skip);
+        try testing.expectEqual(@as(u64, 1), state.predication_enable_count);
+    }
+}
+
+test "the predicate condition inverts which way the guard runs" {
+    const std = @import("std");
+    const gpu = @import("gpu");
+    const testing = std.testing;
+
+    var db = Database{};
+    defer db.deinit(testing.allocator);
+    try registerAll(&db, testing.allocator);
+
+    const mark = try agcEntryPoint(&db, "w6Dj1VJt5qY", AgcPatch2);
+    const draw = try agcEntryPoint(&db, "Yw0jKSqop+E", AgcWrite);
+
+    var predicate: [4]u64 align(16) = @splat(0);
+    const predicate_address = @intFromPtr(&predicate);
+
+    // condition 1 skips when the value is zero, which is the opposite of
+    // condition 0 for the same value.
+    for ([_]u64{ 0, 1 }) |value| {
+        for ([_]u64{ 0, 1 }) |condition| {
+            predicate[0] = value;
+
+            var words: [32]u32 = @splat(0);
+            var buffer = sizedBuffer(&words);
+            try buildPredication(&db, &buffer, condition, 3, 0, predicate_address);
+            const guarded_packet = draw(&buffer, 3, 0, 0, 0, 0).?;
+            try testing.expectEqual(errno.ok, mark(guarded_packet, 1, 0, 0, 0, 0));
+
+            const used = (@intFromPtr(buffer.cursor_up.?) - @intFromPtr(words[0..].ptr)) / @sizeOf(u32);
+            var probe = PredicationProbe{};
+            var state = gpu.State{};
+            _ = try runPredicated(&probe, &state, words[0..used]);
+
+            const skipped = if (condition == 0) value != 0 else value == 0;
+            try testing.expectEqual(skipped, state.predicate_skip);
+            try testing.expectEqual(@as(u32, if (skipped) 0 else 1), probe.draws);
+        }
+    }
+}
+
+test "disabling predication lets the guarded packets through again" {
+    const std = @import("std");
+    const gpu = @import("gpu");
+    const testing = std.testing;
+
+    var db = Database{};
+    defer db.deinit(testing.allocator);
+    try registerAll(&db, testing.allocator);
+
+    const mark = try agcEntryPoint(&db, "w6Dj1VJt5qY", AgcPatch2);
+    const draw = try agcEntryPoint(&db, "Yw0jKSqop+E", AgcWrite);
+
+    var predicate: [4]u64 align(16) = @splat(1);
+    const predicate_address = @intFromPtr(&predicate);
+
+    var words: [64]u32 = @splat(0);
+    var buffer = sizedBuffer(&words);
+
+    // Guarded while the predicate says skip ...
+    try buildPredication(&db, &buffer, 0, 3, 0, predicate_address);
+    try testing.expectEqual(errno.ok, mark(draw(&buffer, 3, 0, 0, 0, 0).?, 1, 0, 0, 0, 0));
+    // ... then predication is turned off, and the same guarded packet runs.
+    try buildPredication(&db, &buffer, 0, 0, 0, 0);
+    try testing.expectEqual(errno.ok, mark(draw(&buffer, 4, 0, 0, 0, 0).?, 1, 0, 0, 0, 0));
+
+    const used = (@intFromPtr(buffer.cursor_up.?) - @intFromPtr(words[0..].ptr)) / @sizeOf(u32);
+    var probe = PredicationProbe{};
+    var state = gpu.State{};
+    _ = try runPredicated(&probe, &state, words[0..used]);
+
+    try testing.expectEqual(@as(u32, 1), probe.draws);
+    try testing.expect(!state.predicate_skip);
+    try testing.expectEqual(@as(u64, 1), state.predication_enable_count);
+    try testing.expectEqual(@as(u64, 1), state.predication_disable_count);
+    try testing.expectEqual(@as(u64, 1), state.predicated_skipped);
+    try testing.expectEqual(@as(u64, 1), state.predicated_executed);
+}
+
+test "the predicate is read after the command that writes it, not before" {
+    const std = @import("std");
+    const gpu = @import("gpu");
+    const testing = std.testing;
+
+    var db = Database{};
+    defer db.deinit(testing.allocator);
+    try registerAll(&db, testing.allocator);
+
+    const mark = try agcEntryPoint(&db, "w6Dj1VJt5qY", AgcPatch2);
+    const draw = try agcEntryPoint(&db, "Yw0jKSqop+E", AgcWrite);
+    // WRITE_DATA takes eight arguments, and the last two decide whether the
+    // words land at one address or at consecutive ones -- it cannot be called
+    // through the six-argument shape the other constructors share.
+    const WriteData = fn (
+        ?*libs.agc.CommandBuffer,
+        u32,
+        u32,
+        u64,
+        ?[*]align(1) const u32,
+        u32,
+        u32,
+        u32,
+    ) callconv(abi.guest) ?[*]u32;
+    const write_data = try agcEntryPoint(&db, "i1jyy49AjXU", WriteData);
+
+    // Starts at zero, so a predicate read before the stream ran would let the
+    // guarded draw through. The WRITE_DATA ahead of SET_PREDICATION sets it.
+    var predicate: [4]u64 align(16) = @splat(0);
+    const predicate_address = @intFromPtr(&predicate);
+
+    var words: [64]u32 = @splat(0);
+    var buffer = sizedBuffer(&words);
+
+    const payload = [_]u32{1};
+    // Destination five is memory; five ones say "write one dword, at this
+    // address, and do not wait for confirmation".
+    _ = write_data(&buffer, 5, 0, predicate_address, &payload, 1, 0, 0).?;
+    try buildPredication(&db, &buffer, 0, 3, 0, predicate_address);
+    try testing.expectEqual(errno.ok, mark(draw(&buffer, 3, 0, 0, 0, 0).?, 1, 0, 0, 0, 0));
+
+    const used = (@intFromPtr(buffer.cursor_up.?) - @intFromPtr(words[0..].ptr)) / @sizeOf(u32);
+    var probe = PredicationProbe{};
+    var state = gpu.State{};
+    _ = try runPredicated(&probe, &state, words[0..used]);
+
+    try testing.expectEqual(@as(u64, 1), predicate[0]);
+    try testing.expect(state.predicate_skip);
+    try testing.expectEqual(@as(u32, 0), probe.draws);
+}
+
+test "range predication marks whole packets and only the flag bit" {
+    const std = @import("std");
+    const testing = std.testing;
+
+    var db = Database{};
+    defer db.deinit(testing.allocator);
+    try registerAll(&db, testing.allocator);
+
+    const range = try agcEntryPoint(&db, "n8vgpaQg6dA", AgcRangePatch);
+    const draw = try agcEntryPoint(&db, "Yw0jKSqop+E", AgcWrite);
+    const set_count = try agcEntryPoint(&db, "8N2tmT3jmC8", AgcWrite);
+    const nop = try agcEntryPoint(&db, "LtTouSCZjHM", AgcWrite);
+
+    var words: [64]u32 = @splat(0);
+    var buffer = sizedBuffer(&words);
+
+    // Three packets of different widths, so a word-by-word walk would set the
+    // flag inside a payload rather than on a header.
+    _ = set_count(&buffer, 7, 0, 0, 0, 0).?;
+    _ = draw(&buffer, 3, 0, 0, 0, 0).?;
+    _ = nop(&buffer, 5, 0, 0, 0, 0).?;
+    const used = (@intFromPtr(buffer.cursor_up.?) - @intFromPtr(words[0..].ptr)) / @sizeOf(u32);
+    try testing.expectEqual(@as(usize, 10), used);
+
+    const before = words;
+    const headers = [_]usize{ 0, 2, 5 };
+
+    try testing.expectEqual(errno.ok, range(words[0..].ptr, words[used..].ptr, 1, 0, 0, 0));
+    for (words[0..used], 0..) |word, index| {
+        const is_header = std.mem.indexOfScalar(usize, &headers, index) != null;
+        if (is_header) {
+            try testing.expectEqual(before[index] | 1, word);
+        } else {
+            try testing.expectEqual(before[index], word);
+        }
+    }
+
+    // Clearing the range restores every header exactly.
+    try testing.expectEqual(errno.ok, range(words[0..].ptr, words[used..].ptr, 0, 0, 0, 0));
+    for (words[0..used], 0..) |word, index| try testing.expectEqual(before[index], word);
+
+    // A span that does not divide into whole packets is refused before it
+    // writes anything.
+    try testing.expectEqual(
+        errno.KernelError.einval.raw(),
+        range(words[0..].ptr, words[used - 1 ..].ptr, 1, 0, 0, 0),
+    );
+    for (words[0..used], 0..) |word, index| try testing.expectEqual(before[index], word);
+
+    // An empty span is not an error, and a reversed one is.
+    try testing.expectEqual(errno.ok, range(words[0..].ptr, words[0..].ptr, 1, 0, 0, 0));
+    try testing.expectEqual(
+        errno.KernelError.einval.raw(),
+        range(words[2..].ptr, words[0..].ptr, 1, 0, 0, 0),
+    );
+}
+
+test "marking one packet leaves the rest of its header alone" {
+    const std = @import("std");
+    const testing = std.testing;
+
+    var db = Database{};
+    defer db.deinit(testing.allocator);
+    try registerAll(&db, testing.allocator);
+
+    const mark = try agcEntryPoint(&db, "w6Dj1VJt5qY", AgcPatch2);
+    const draw = try agcEntryPoint(&db, "Yw0jKSqop+E", AgcWrite);
+
+    var words: [16]u32 = @splat(0);
+    var buffer = sizedBuffer(&words);
+    const packet = draw(&buffer, 3, 0, 0, 0, 0).?;
+    const original = words[0];
+
+    try testing.expectEqual(errno.ok, mark(packet, 1, 0, 0, 0, 0));
+    try testing.expectEqual(original | 1, words[0]);
+    try testing.expectEqual(errno.ok, mark(packet, 0, 0, 0, 0, 0));
+    try testing.expectEqual(original & ~@as(u32, 1), words[0]);
+    // Setting it twice is not cumulative, and the body is never touched.
+    try testing.expectEqual(errno.ok, mark(packet, 1, 0, 0, 0, 0));
+    try testing.expectEqual(errno.ok, mark(packet, 1, 0, 0, 0, 0));
+    try testing.expectEqual(original | 1, words[0]);
+    try testing.expectEqual(@as(u32, 3), words[1]);
+
+    try testing.expectEqual(errno.KernelError.einval.raw(), mark(null, 1, 0, 0, 0, 0));
+}
+
+test "an unsupported predication mode is reported and issues its packets" {
+    const std = @import("std");
+    const gpu = @import("gpu");
+    const testing = std.testing;
+
+    var db = Database{};
+    defer db.deinit(testing.allocator);
+    try registerAll(&db, testing.allocator);
+
+    const mark = try agcEntryPoint(&db, "w6Dj1VJt5qY", AgcPatch2);
+    const draw = try agcEntryPoint(&db, "Yw0jKSqop+E", AgcWrite);
+
+    var results: [32]u64 align(16) = @splat(0);
+
+    var words: [32]u32 = @splat(0);
+    var buffer = sizedBuffer(&words);
+    // Occlusion-query predication, which nothing here produces results for.
+    try buildPredication(&db, &buffer, 0, 1, 0, @intFromPtr(&results));
+    try testing.expectEqual(errno.ok, mark(draw(&buffer, 3, 0, 0, 0, 0).?, 1, 0, 0, 0, 0));
+
+    const used = (@intFromPtr(buffer.cursor_up.?) - @intFromPtr(words[0..].ptr)) / @sizeOf(u32);
+    var probe = PredicationProbe{};
+    var state = gpu.State{};
+    _ = try runPredicated(&probe, &state, words[0..used]);
+
+    // Counted as unsupported, and the guarded draw issues rather than
+    // disappearing with nothing to explain it.
+    try testing.expectEqual(@as(u64, 1), state.predication_unsupported_count);
+    try testing.expectEqual(@as(u64, 0), state.predication_enable_count);
+    try testing.expect(!state.predicate_skip);
+    try testing.expectEqual(@as(u32, 1), probe.draws);
+}
+
+test "predication carries into a nested indirect buffer and survives CLEAR_STATE" {
+    const std = @import("std");
+    const gpu = @import("gpu");
+    const testing = std.testing;
+
+    var db = Database{};
+    defer db.deinit(testing.allocator);
+    try registerAll(&db, testing.allocator);
+
+    const mark = try agcEntryPoint(&db, "w6Dj1VJt5qY", AgcPatch2);
+    const draw = try agcEntryPoint(&db, "Yw0jKSqop+E", AgcWrite);
+    const jump = try agcEntryPoint(&db, "xSAR0LTcRKM", AgcWrite);
+    const reset = try agcEntryPoint(&db, "TRO721eVt4g", AgcWrite);
+
+    var predicate: [4]u64 align(16) = @splat(1);
+    const predicate_address = @intFromPtr(&predicate);
+
+    // The child buffer: one guarded draw and one unguarded one.
+    var child: [16]u32 = @splat(0);
+    var child_buffer = sizedBuffer(&child);
+    try testing.expectEqual(errno.ok, mark(draw(&child_buffer, 3, 0, 0, 0, 0).?, 1, 0, 0, 0, 0));
+    _ = draw(&child_buffer, 4, 0, 0, 0, 0).?;
+    const child_words = (@intFromPtr(child_buffer.cursor_up.?) - @intFromPtr(child[0..].ptr)) / @sizeOf(u32);
+
+    var words: [64]u32 = @splat(0);
+    var buffer = sizedBuffer(&words);
+    try buildPredication(&db, &buffer, 0, 3, 0, predicate_address);
+    // CLEAR_STATE drops the register files; it must not drop the predicate.
+    _ = reset(&buffer, 0, 1, 0, 0, 0).?;
+    _ = jump(&buffer, 0, 0, @intFromPtr(&child), child_words, 0).?;
+    const used = (@intFromPtr(buffer.cursor_up.?) - @intFromPtr(words[0..].ptr)) / @sizeOf(u32);
+
+    var probe = PredicationProbe{};
+    var state = gpu.State{};
+    _ = try runPredicated(&probe, &state, words[0..used]);
+
+    // Only the unguarded child draw ran.
+    try testing.expectEqual(@as(u32, 1), probe.draws);
+    try testing.expect(state.predicate_skip);
+    try testing.expectEqual(@as(u64, 1), state.predicated_skipped);
+}
+
+test "a guarded indirect buffer is not descended into" {
+    const std = @import("std");
+    const gpu = @import("gpu");
+    const testing = std.testing;
+
+    var db = Database{};
+    defer db.deinit(testing.allocator);
+    try registerAll(&db, testing.allocator);
+
+    const mark = try agcEntryPoint(&db, "w6Dj1VJt5qY", AgcPatch2);
+    const draw = try agcEntryPoint(&db, "Yw0jKSqop+E", AgcWrite);
+    const jump = try agcEntryPoint(&db, "xSAR0LTcRKM", AgcWrite);
+
+    var predicate: [4]u64 align(16) = @splat(1);
+
+    var child: [16]u32 = @splat(0);
+    var child_buffer = sizedBuffer(&child);
+    _ = draw(&child_buffer, 3, 0, 0, 0, 0).?;
+    _ = draw(&child_buffer, 4, 0, 0, 0, 0).?;
+    const child_words = (@intFromPtr(child_buffer.cursor_up.?) - @intFromPtr(child[0..].ptr)) / @sizeOf(u32);
+
+    var words: [64]u32 = @splat(0);
+    var buffer = sizedBuffer(&words);
+    try buildPredication(&db, &buffer, 0, 3, 0, @intFromPtr(&predicate));
+    const jump_packet = jump(&buffer, 0, 0, @intFromPtr(&child), child_words, 0).?;
+    try testing.expectEqual(errno.ok, mark(jump_packet, 1, 0, 0, 0, 0));
+    const used = (@intFromPtr(buffer.cursor_up.?) - @intFromPtr(words[0..].ptr)) / @sizeOf(u32);
+
+    var probe = PredicationProbe{};
+    var state = gpu.State{};
+    _ = try runPredicated(&probe, &state, words[0..used]);
+
+    // Neither child draw ran: the jump itself was guarded.
+    try testing.expectEqual(@as(u32, 0), probe.draws);
+    try testing.expectEqual(@as(u64, 0), state.indirect_buffer_count);
+}
+
+test "predication counters can be switched off" {
+    const std = @import("std");
+    const gpu = @import("gpu");
+    const testing = std.testing;
+
+    var db = Database{};
+    defer db.deinit(testing.allocator);
+    try registerAll(&db, testing.allocator);
+
+    const mark = try agcEntryPoint(&db, "w6Dj1VJt5qY", AgcPatch2);
+    const draw = try agcEntryPoint(&db, "Yw0jKSqop+E", AgcWrite);
+
+    var predicate: [4]u64 align(16) = @splat(1);
+
+    var words: [32]u32 = @splat(0);
+    var buffer = sizedBuffer(&words);
+    try buildPredication(&db, &buffer, 0, 3, 0, @intFromPtr(&predicate));
+    try testing.expectEqual(errno.ok, mark(draw(&buffer, 3, 0, 0, 0, 0).?, 1, 0, 0, 0, 0));
+    const used = (@intFromPtr(buffer.cursor_up.?) - @intFromPtr(words[0..].ptr)) / @sizeOf(u32);
+
+    gpu.executor.setPredicationStatsEnabled(false);
+    defer gpu.executor.setPredicationStatsEnabled(true);
+
+    var probe = PredicationProbe{};
+    var state = gpu.State{};
+    _ = try runPredicated(&probe, &state, words[0..used]);
+
+    // The guard still works; only the bookkeeping is gone.
+    try testing.expectEqual(@as(u32, 0), probe.draws);
+    try testing.expect(state.predicate_skip);
+    try testing.expectEqual(@as(u64, 0), state.predication_enable_count);
+    try testing.expectEqual(@as(u64, 0), state.predicated_skipped);
+}

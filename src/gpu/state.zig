@@ -116,6 +116,24 @@ pub const Flip = struct {
     argument: i64,
 };
 
+/// What `SET_PREDICATION` asked for.
+///
+/// The packet does not carry the predicate, only where to find it and how to
+/// read it. `op` selects that: zero turns predication off outright, three
+/// names a 64-bit value in memory, and one names a block of occlusion-query
+/// results. `condition` then says which way round the answer runs.
+pub const SetPredication = struct {
+    pub const disable: u3 = 0;
+    pub const zpass: u3 = 1;
+    pub const boolean: u3 = 3;
+
+    op: u3,
+    /// 0 skips predicated packets when the value is non-zero, 1 when it is zero.
+    condition: u1,
+    /// The title asks the parser to wait for the value rather than read it now.
+    wait: u1,
+    address: u64,
+};
 pub const State = struct {
     config: RegisterFile(config_register_count) = .{},
     context: RegisterFile(context_register_count) = .{},
@@ -130,6 +148,17 @@ pub const State = struct {
     last_dma: ?DmaData = null,
     last_event: ?EventWrite = null,
     last_flip: ?Flip = null,
+    last_predication: ?SetPredication = null,
+
+    /// Whether packets carrying the predicate bit are currently dropped.
+    ///
+    /// This is queue state, not a context register: it survives CLEAR_STATE,
+    /// it is inherited by nested indirect buffers, and it is still in force
+    /// when a submission that blocked on a wait is resumed. All three follow
+    /// from the command processor holding one predicate per queue, and all
+    /// three matter -- a title sets the predicate once and then submits the
+    /// draws it guards from a different buffer.
+    predicate_skip: bool = false,
 
     packets_executed: u64 = 0,
     register_writes: u64 = 0,
@@ -150,6 +179,17 @@ pub const State = struct {
     dispatch_indirect_args_base_address: u64 = 0,
     /// 0 = u16, 1 = u32, 2 = u8 (VGT_INDEX_TYPE).
     index_type: u2 = 0,
+
+    // Predication counters. `predicated_opcode_counts` is indexed by opcode
+    // so a capture can say which commands a title actually guards, including
+    // the ones it built into its buffer itself rather than through an AGC
+    // constructor -- the packet bit is the same either way.
+    predication_enable_count: u64 = 0,
+    predication_disable_count: u64 = 0,
+    predication_unsupported_count: u64 = 0,
+    predicated_executed: u64 = 0,
+    predicated_skipped: u64 = 0,
+    predicated_opcode_counts: [256]u32 = @splat(0),
 
     pub fn writeRegister(self: *State, space: pm4.RegisterSpace, offset: u32, value: u32) Error!void {
         switch (space) {
@@ -183,6 +223,10 @@ pub const State = struct {
         self.draw_indirect_args_base_address = 0;
         self.dispatch_indirect_args_base_address = 0;
         self.index_type = 0;
+        // `predicate_skip` is deliberately left alone. CLEAR_STATE drops the
+        // register files; the predicate is not one of them, and a title that
+        // clears state between passes does not expect its guarded draws to
+        // start issuing again.
     }
 };
 

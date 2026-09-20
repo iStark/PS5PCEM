@@ -60,6 +60,50 @@ pub const Backend = struct {
     }
 };
 
+/// Whether predication is counted.
+///
+/// The counting is a handful of increments, but the per-opcode histogram is
+/// 256 slots per queue and the census prints; a capture that only wants frame
+/// timings can turn the whole thing off. Execution does not depend on it --
+/// only the numbers a capture reports do.
+var predication_stats_enabled = std.atomic.Value(bool).init(true);
+
+pub fn setPredicationStatsEnabled(value: bool) void {
+    predication_stats_enabled.store(value, .release);
+}
+
+pub fn predicationStatsEnabled() bool {
+    return predication_stats_enabled.load(.acquire);
+}
+
+var predication_reports = std.atomic.Value(u32).init(0);
+var unsupported_predication_reports = std.atomic.Value(u32).init(0);
+
+/// Reports what a stream did with predication, a bounded number of times.
+pub fn reportPredication(state: *const gpu_state.State) void {
+    if (!predicationStatsEnabled()) return;
+    if (state.predication_enable_count == 0 and
+        state.predication_disable_count == 0 and
+        state.predicated_executed == 0 and
+        state.predicated_skipped == 0 and
+        state.predication_unsupported_count == 0) return;
+    if (predication_reports.fetchAdd(1, .monotonic) >= 16) return;
+    std.debug.print(
+        "[gpu predication] set={d} disabled={d} unsupported={d} predicated: run={d} skipped={d}:",
+        .{
+            state.predication_enable_count,
+            state.predication_disable_count,
+            state.predication_unsupported_count,
+            state.predicated_executed,
+            state.predicated_skipped,
+        },
+    );
+    for (state.predicated_opcode_counts, 0..) |count, opcode| {
+        if (count == 0) continue;
+        std.debug.print(" 0x{x:0>2}={d}", .{ opcode, count });
+    }
+    std.debug.print("\n", .{});
+}
 pub const Status = enum { complete, blocked };
 
 /// Root DCB plus nested indirect calls. CHAIN replaces the current indirect
@@ -207,6 +251,7 @@ pub const DcbExecutor = struct {
             result.resume_word = stream.len;
         }
         reportIgnoredCommandCensus(&result);
+        reportPredication(self.state);
         return result;
     }
 
@@ -244,6 +289,7 @@ pub const DcbExecutor = struct {
             result.resume_word = stream.len;
         }
         reportIgnoredCommandCensus(&result);
+        reportPredication(self.state);
         return result;
     }
 
@@ -281,6 +327,21 @@ pub const DcbExecutor = struct {
                 depth + 1 < continuation.frame_count and packet_word == continuation.frames[depth].resume_word
             else
                 false;
+
+            // Predication is applied before the packet is looked at, because
+            // what it guards includes the indirect buffers and conditional
+            // jumps handled below: a skipped INDIRECT_BUFFER must not be
+            // descended into. A packet that the continuation is re-entering
+            // is never skipped -- that work is already part-done, and the
+            // predicate may have moved on since it began.
+            if (packet.kind == .command and packet.predicated and !resumes_child) {
+                if (self.predicationSkips(packet.opcode)) {
+                    self.notePredicated(packet.opcode, true);
+                    self.state.packets_executed += 1;
+                    continue;
+                }
+                self.notePredicated(packet.opcode, false);
+            }
 
             if (packet.kind == .command and packet.opcode == pm4.indirect_buffer) {
                 if (depth != 0 and packet.body.len == 3 and packet.body[2] & (1 << 20) != 0) {
@@ -612,6 +673,10 @@ pub const DcbExecutor = struct {
             try self.releaseMem(packet, true);
             return .complete;
         }
+        if (packet.opcode == pm4.set_predication) {
+            try self.setPredication(packet);
+            return .complete;
+        }
         if (packet.opcode == pm4.wait_reg_mem) {
             return self.waitRegMem(packet, true, false);
         }
@@ -812,6 +877,100 @@ pub const DcbExecutor = struct {
         }
     }
 
+    /// Whether a packet carrying the predicate bit is dropped right now.
+    ///
+    /// SET_PREDICATION is never dropped, whatever its own predicate bit says.
+    /// `sceAgcSetRangePredication` marks every packet in a span, so the
+    /// command that turns predication back off can carry the bit too; hardware
+    /// ignores it there, and honouring it would leave a queue with no way out
+    /// of the state it just entered.
+    fn predicationSkips(self: *const DcbExecutor, opcode: u8) bool {
+        return self.state.predicate_skip and opcode != pm4.set_predication;
+    }
+
+    fn notePredicated(self: *DcbExecutor, opcode: u8, skipped: bool) void {
+        if (!predicationStatsEnabled()) return;
+        self.state.predicated_opcode_counts[opcode] +|= 1;
+        if (skipped) {
+            self.state.predicated_skipped += 1;
+        } else {
+            self.state.predicated_executed += 1;
+        }
+    }
+
+    /// Decodes SET_PREDICATION, which has two payload layouts in the wild.
+    ///
+    /// The one AGC writes puts the flags first and the address after it. An
+    /// older arrangement puts the low half of the address first and packs the
+    /// flags and the high half into the second word. They are told apart the
+    /// way the flags themselves allow: in the first layout word zero holds
+    /// nothing outside the three flag fields, and word two is a plausible
+    /// address high half.
+    fn decodeSetPredication(body: []const u32) ?gpu_state.SetPredication {
+        if (body.len < 2) return null;
+        const flag_bits: u32 = 0x0007_1100;
+        var flags: u32 = undefined;
+        var address: u64 = undefined;
+        if (body.len >= 3 and body[0] & ~flag_bits == 0 and body[2] <= 0xffff) {
+            flags = body[0];
+            address = (@as(u64, body[2]) << 32) | (body[1] & 0xffff_fff0);
+        } else {
+            flags = body[1];
+            address = (body[0] & 0xffff_fff0) | (@as(u64, body[1] & 0xff) << 32);
+        }
+        return .{
+            .op = @truncate((flags >> 16) & 0x7),
+            .condition = @truncate((flags >> 8) & 0x1),
+            .wait = @truncate((flags >> 12) & 0x1),
+            .address = address,
+        };
+    }
+
+    /// Establishes, or drops, the predicate that guards later packets.
+    ///
+    /// The value is read through the synchronising read, never through the
+    /// submission snapshot. A snapshot is a copy of the command arena taken
+    /// when the submission was accepted; a predicate is written by the GPU
+    /// after that point, so reading it from the copy would answer with what
+    /// was true before the work that decides it ran. This is the same path
+    /// WAIT_REG_MEM uses, and for the same reason.
+    fn setPredication(self: *DcbExecutor, packet: pm4.Packet) Error!void {
+        const request = decodeSetPredication(packet.body) orelse return Error.InvalidPacket;
+        self.state.last_predication = request;
+
+        if (request.op == gpu_state.SetPredication.disable) {
+            self.state.predicate_skip = false;
+            if (predicationStatsEnabled()) self.state.predication_disable_count += 1;
+            return;
+        }
+
+        if (request.op != gpu_state.SetPredication.boolean) {
+            // Occlusion-query predication needs the query results the depth
+            // block writes, and nothing here produces them yet. Leaving the
+            // predicate off issues the guarded draws, which shows too much
+            // rather than too little; silently skipping them would lose work
+            // with nothing to say why.
+            self.state.predicate_skip = false;
+            if (predicationStatsEnabled()) self.state.predication_unsupported_count += 1;
+            if (unsupported_predication_reports.fetchAdd(1, .monotonic) < 16) {
+                std.debug.print(
+                    "[gpu predication] unsupported op=0x{x} condition={d} wait={d} address=0x{x}; predicated packets will run\n",
+                    .{ request.op, request.condition, request.wait, request.address },
+                );
+            }
+            return;
+        }
+
+        if (request.address == 0) return Error.InvalidPacket;
+        var bytes: [8]u8 = undefined;
+        const read_live = self.backend.vtable.read_wait orelse self.backend.vtable.read;
+        if (!read_live(self.backend.context, request.address, &bytes)) {
+            return Error.MemoryReadFailed;
+        }
+        const value = std.mem.readInt(u64, &bytes, .little);
+        self.state.predicate_skip = if (request.condition == 0) value != 0 else value == 0;
+        if (predicationStatsEnabled()) self.state.predication_enable_count += 1;
+    }
     fn waitRegMem(
         self: *DcbExecutor,
         packet: pm4.Packet,

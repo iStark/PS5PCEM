@@ -2375,6 +2375,103 @@ fn agcSetNumInstancesGetSize() callconv(abi.guest) u32 {
     return 2 * @sizeOf(u32);
 }
 
+/// Establishes, or drops, the predicate that guards later packets.
+///
+/// Four dwords: header, flags, address low, address high. The address is
+/// sixteen-byte aligned by the packet format, so its low bits are not stored
+/// and a caller that passes an unaligned one is refused rather than quietly
+/// pointed somewhere else.
+///
+/// `op` zero turns predication off and needs no address. `op` three reads a
+/// 64-bit value from memory. `condition` zero skips guarded packets when that
+/// value is non-zero, one when it is zero.
+fn agcDcbSetPredication(
+    buffer: ?*AgcCommandBuffer,
+    condition: u64,
+    op: u64,
+    wait_op: u64,
+    address: u64,
+    _: u64,
+) callconv(abi.guest) ?[*]u32 {
+    const operation: u32 = @as(u32, @truncate(op)) & 0x7;
+    if (operation != 0 and (address == 0 or address & 0xf != 0)) return null;
+    const body = [_]u32{
+        ((@as(u32, @truncate(condition)) & 0x1) << 8) |
+            ((@as(u32, @truncate(wait_op)) & 0x1) << 12) |
+            (operation << 16),
+        @as(u32, @truncate(address)) & 0xffff_fff0,
+        @truncate(address >> 32),
+    };
+    return writeExactAgcPacket(buffer, gpu.pm4.set_predication, &body);
+}
+
+/// SET_PREDICATION: header, flags, address low, address high.
+fn agcSetPredicationGetSize() callconv(abi.guest) u32 {
+    return 4 * @sizeOf(u32);
+}
+
+/// Marks one already-written packet as guarded by the predicate, or clears
+/// the mark.
+///
+/// The flag is bit zero of the packet header. Only that bit is touched: the
+/// rest of the word is the packet type, its length and its opcode, and a
+/// caller reaches this with a packet it has already filled in.
+fn agcSetPacketPredication(packet: ?[*]u32, predication: u64) callconv(abi.guest) i32 {
+    const words = packet orelse return errno.KernelError.einval.raw();
+    const address = @intFromPtr(words);
+    if (!kernel_memory.isGuestRangeAccessible(address, @sizeOf(u32))) {
+        return errno.KernelError.efault.raw();
+    }
+    const marked: u32 = if (@as(u8, @truncate(predication)) == 1) 1 else 0;
+    words[0] = (words[0] & ~@as(u32, 1)) | marked;
+    return errno.ok;
+}
+
+/// Marks every packet between two cursors.
+///
+/// The span is walked packet by packet rather than word by word, so the flag
+/// lands on headers and never on payload that happens to look like one. A
+/// span that does not divide into whole packets is refused before anything is
+/// written, so a caller cannot be left with half a range marked.
+fn agcSetRangePredication(
+    start: ?[*]u32,
+    end: ?[*]const u32,
+    predication: u64,
+) callconv(abi.guest) i32 {
+    const first = start orelse return errno.KernelError.einval.raw();
+    const last = end orelse return errno.KernelError.einval.raw();
+    const from = @intFromPtr(first);
+    const to = @intFromPtr(last);
+    if (to < from or (to - from) % @sizeOf(u32) != 0) return errno.KernelError.einval.raw();
+    const span = (to - from) / @sizeOf(u32);
+    if (span == 0) return errno.ok;
+    if (!kernel_memory.isGuestRangeAccessible(from, to - from)) {
+        return errno.KernelError.efault.raw();
+    }
+
+    // Walk once to check the span is whole, then again to mark it.
+    const words = first[0..span];
+    var offset: usize = 0;
+    while (offset < span) {
+        const width = agcPacketWords(words[offset]);
+        if (width == 0 or width > span - offset) return errno.KernelError.einval.raw();
+        offset += width;
+    }
+
+    const marked: u32 = if (@as(u8, @truncate(predication)) == 1) 1 else 0;
+    offset = 0;
+    while (offset < span) {
+        words[offset] = (words[offset] & ~@as(u32, 1)) | marked;
+        offset += agcPacketWords(words[offset]);
+    }
+    return errno.ok;
+}
+
+/// Dwords one packet occupies, by the same rule the command walker uses.
+fn agcPacketWords(header: u32) usize {
+    if (header >> 30 == 2 or header == 0xffff_1000) return 1;
+    return ((header >> 16) & 0x3fff) + 2;
+}
 /// SET_*_REG_INDIRECT: header, list low, list high, control, count.
 fn agcSetRegistersIndirectGetSize() callconv(abi.guest) u32 {
     return 5 * @sizeOf(u32);
@@ -3788,6 +3885,9 @@ const agc_exports = [_]symbols.Export{
     .{ .name = "sceAgcDcbJumpGetSize", .function = trace.wrap("sceAgcDcbJumpGetSize", &agcJumpGetSize), .expect_id = "VEGu4dixjUg" },
     .{ .name = "sceAgcAcbJumpGetSize", .function = trace.wrap("sceAgcAcbJumpGetSize", &agcJumpGetSize), .expect_id = "b-oySn+G2tE" },
     .{ .name = "sceAgcDcbStallCommandBufferParserGetSize", .function = trace.wrap("sceAgcDcbStallCommandBufferParserGetSize", &agcStallCommandBufferParserGetSize), .expect_id = "+u6dKSLWM2o" },
+    .{ .name = "sceAgcSetPacketPredication", .function = trace.wrap("sceAgcSetPacketPredication", &agcSetPacketPredication), .expect_id = "w6Dj1VJt5qY" },
+    .{ .name = "sceAgcSetRangePredication", .function = trace.wrap("sceAgcSetRangePredication", &agcSetRangePredication), .expect_id = "n8vgpaQg6dA" },
+    .{ .name = "sceAgcDcbSetPredication", .function = trace.wrap("sceAgcDcbSetPredication", &agcDcbSetPredication), .expect_id = "bbFueFP+J4k" },
     .{ .name = "sceAgcCbSetShRegistersDirectGetSize", .function = trace.wrap("sceAgcCbSetShRegistersDirectGetSize", &agcSetRegistersDirectGetSize), .expect_id = "yUBESvCCJ4I" },
     .{ .name = "sceAgcCbSetUcRegistersDirectGetSize", .function = trace.wrap("sceAgcCbSetUcRegistersDirectGetSize", &agcSetRegistersDirectGetSize), .expect_id = "TGEZzUWLbrc" },
     .{ .name = "sceAgcDcbDrawIndexOffset", .function = trace.wrap("sceAgcDcbDrawIndexOffset", &agcDrawIndexOffset), .expect_id = "B+aG9DUnTKA" },

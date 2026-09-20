@@ -33,8 +33,6 @@ pub const exports = [_]symbols.Export{
     .{ .name = "sceAgcAsyncCondExecPatchSetCommandAddress", .function = trace.wrap("sceAgcAsyncCondExecPatchSetCommandAddress", &agc.patchCondExecCommandAddress), .expect_id = "3ZWa3AoyWZQ" },
     .{ .name = "sceAgcRewindPatchSetRewindState", .function = trace.wrap("sceAgcRewindPatchSetRewindState", &agc.patchCommand), .expect_id = "ziVA3whp3p4" },
     .{ .name = "sceAgcAsyncRewindPatchSetRewindState", .function = trace.wrap("sceAgcAsyncRewindPatchSetRewindState", &agc.patchCommand), .expect_id = "eWaWyFegzgQ" },
-    .{ .name = "sceAgcSetPacketPredication", .function = trace.wrap("sceAgcSetPacketPredication", &agc.accept), .expect_id = "w6Dj1VJt5qY" },
-    .{ .name = "sceAgcSetRangePredication", .function = trace.wrap("sceAgcSetRangePredication", &agc.accept), .expect_id = "n8vgpaQg6dA" },
     .{ .name = "sceAgcGetPacketSize", .function = trace.wrap("sceAgcGetPacketSize", &agc.packetSize), .expect_id = "Lkf86B98qPc" },
     .{ .name = "sceAgcGetDataPacketPayloadRange", .function = trace.wrap("sceAgcGetDataPacketPayloadRange", &agc.zeroQuery), .expect_id = "s+VGAMDQ0AQ" },
     // The two DMA_DATA address patches (IxYiarKlXxM, cdDRpqcFGbU) likewise
@@ -96,7 +94,6 @@ pub const exports = [_]symbols.Export{
     .{ .name = "sceAgcDcbRewind", .function = trace.wrap("sceAgcDcbRewind", &agc.writeCommand), .expect_id = "zfcxg-ewMK8" },
     .{ .name = "sceAgcDcbPrimeUtcl2", .function = trace.wrap("sceAgcDcbPrimeUtcl2", &agc.writeCommand), .expect_id = "jt3pl7EN17o" },
     .{ .name = "sceAgcDcbSetIndexIndirectArgs", .function = trace.wrap("sceAgcDcbSetIndexIndirectArgs", &agc.writeCommand), .expect_id = "0o3VDdtA6nM" },
-    .{ .name = "sceAgcDcbSetPredication", .function = trace.wrap("sceAgcDcbSetPredication", &agc.writeCommand), .expect_id = "bbFueFP+J4k" },
     .{ .name = "sceAgcDcbSetMarker", .function = trace.wrap("sceAgcDcbSetMarker", &agc.writeCommand), .expect_id = "QhCbS4X9Rl8" },
     .{ .name = "sceAgcDcbSetMarkerSpan", .function = trace.wrap("sceAgcDcbSetMarkerSpan", &agc.writeCommand), .expect_id = "BYcSvEsINWU" },
     .{ .name = "sceAgcDcbPushMarkerSpan", .function = trace.wrap("sceAgcDcbPushMarkerSpan", &agc.writeCommand), .expect_id = "N7M3+N-sBCw" },
