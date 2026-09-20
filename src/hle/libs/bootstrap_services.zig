@@ -3872,10 +3872,16 @@ fn fuseShaderHalves(
                     const front_total = front_vgprs + (f2.value >> 28) * 8;
                     const back_total = back_vgprs + (d2.value >> 28) * 8;
                     const largest_total = @max(front_total, back_total);
-                    const shared: u32 = if (@max(front_vgprs, back_vgprs) >= largest_total)
-                        0
-                    else
-                        (largest_total - @min(front_total, back_total) + 7) / 64;
+                    // RSRC1 below keeps the larger private allocation. Cover
+                    // the remaining registers in eight-register shared blocks.
+                    // Subtracting the smaller *total* loses equal nonzero
+                    // shared allocations; dividing by 64 mixes wave width
+                    // with the register allocation unit.
+                    // Shared VGPRs apply to wave64. Valid wave32 halves have
+                    // zero shared counts, so their encoded private maximum
+                    // is sufficient without converting its granularity here.
+                    const private_vgprs = @max(front_vgprs, back_vgprs);
+                    const shared = (largest_total - private_vgprs + 7) / 8;
                     d2.value = (d2.value & 0x0fff_ffff) | ((shared & 0xf) << 28);
                 } else {
                     mergeMaxShaderField(d2, f2, 28, 0xf);

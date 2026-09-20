@@ -206,8 +206,8 @@ pub const ContextStateOperation = enum(u32) {
 
 /// How deep the saved context registers stack.
 ///
-/// The command processor keeps a small fixed stack, not an arena, so a title
-/// that pushes without popping runs out rather than growing without bound.
+/// Emulator limit for saved context frames, not a verified hardware depth.
+/// Exhaustion must stop the submission; ignoring a push unbalances its pops.
 pub const context_state_depth: usize = 4;
 pub const State = struct {
     config: RegisterFile(config_register_count) = .{},

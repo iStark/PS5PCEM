@@ -20,6 +20,7 @@ pub const Error = pm4.Error || gpu_state.Error || std.mem.Allocator.Error || err
     MemoryReadFailed,
     MemoryWriteFailed,
     BackendRejected,
+    ContextStateStackFault,
 };
 
 /// Host services visible to the command processor.
@@ -728,13 +729,17 @@ pub const DcbExecutor = struct {
                     if (packet.body.len < 1) return Error.InvalidPacket;
                     const operation = gpu_state.ContextStateOperation.from(packet.body[0]) orelse
                         return Error.InvalidPacket;
-                    if (!self.state.applyContextStateOperation(operation) and
-                        context_state_reports.fetchAdd(1, .monotonic) < 16)
-                    {
-                        std.debug.print(
-                            "[gpu context] {s} refused at depth {d}\n",
-                            .{ @tagName(operation), self.state.context_depth },
-                        );
+                    if (!self.state.applyContextStateOperation(operation)) {
+                        if (context_state_reports.fetchAdd(1, .monotonic) < 16) {
+                            std.debug.print(
+                                "[gpu context] {s} refused at depth {d}\n",
+                                .{ @tagName(operation), self.state.context_depth },
+                            );
+                        }
+                        // After a refused push, a subsequent pop would consume
+                        // the outer frame. Stop this submission before it can
+                        // restore or draw with another pass's context.
+                        return Error.ContextStateStackFault;
                     }
                 },
                 else => {

@@ -1014,6 +1014,7 @@ const PredicationProbe = struct {
     const gpu_module = @import("gpu");
 
     draws: u32 = 0,
+    context_at_draw: ?u32 = null,
     dispatches: u32 = 0,
     events: [16]u8 = @splat(0),
     event_count: usize = 0,
@@ -1036,8 +1037,9 @@ const PredicationProbe = struct {
         return true;
     }
 
-    fn draw(context: ?*anyopaque, _: *const gpu_module.State, _: gpu_module.pm4.Packet) bool {
+    fn draw(context: ?*anyopaque, state: *const gpu_module.State, _: gpu_module.pm4.Packet) bool {
         from(context).draws += 1;
+        from(context).context_at_draw = state.readRegister(.context, probe_register);
         return true;
     }
 
@@ -2077,18 +2079,18 @@ test "both fuse exports join a geometry pair and differ only where they should" 
         var code: [16]u8 align(256) = @splat(0);
         var user_data: [8]u64 = @splat(0);
 
-        // The front half wants more vector registers and more shared ones; the
-        // back half wants more of the export component count. A fused object
-        // has to satisfy both.
+        // The front half wants more private registers; the back half wants
+        // more shared registers and export components. The fused allocation
+        // must cover both, even when their private/shared split differs.
         var front_registers = [_]FuseRegister{
             .{ .offset = chksum_gs, .value = 0x1111_1111 },
             .{ .offset = chksum_gs, .value = 0x2222_2222 },
             // VGPRS = 7, GS_VGPR_COMP_CNT = 2, plus float-mode bits that must
             // survive untouched.
             .{ .offset = rsrc1_gs, .value = 0x4000_5007 | (@as(u32, 2) << 29) },
-            // USER_SGPR = 9, OC_LDS_EN set, ES comp = 1, and a large shared
-            // block so the two exports visibly disagree about it.
-            .{ .offset = rsrc2_gs, .value = (9 << 1) | (1 << 18) | (15 << 28) | (1 << 16) },
+            // USER_SGPR = 9 with its high bit, OC_LDS_EN, ES comp = 1,
+            // and one shared block.
+            .{ .offset = rsrc2_gs, .value = (9 << 1) | (1 << 27) | (1 << 18) | (1 << 28) | (1 << 16) },
         };
         var back_registers = [_]FuseRegister{
             .{ .offset = lo_es, .value = 0 },
@@ -2097,12 +2099,12 @@ test "both fuse exports join a geometry pair and differ only where they should" 
             .{ .offset = chksum_gs, .value = 0 },
             // VGPRS = 3, comp count 0, different float mode bits.
             .{ .offset = rsrc1_gs, .value = 0x0080_9003 },
-            // USER_SGPR = 2, no OC_LDS, SHARED_VGPR_CNT = 1, ES comp = 3,
+            // USER_SGPR = 2, no OC_LDS, SHARED_VGPR_CNT = 4, ES comp = 3,
             // LDS_SIZE and SCRATCH_EN set so they can be shown to survive.
-            .{ .offset = rsrc2_gs, .value = 1 | (2 << 1) | (3 << 16) | (0x5a << 19) | (1 << 28) },
+            .{ .offset = rsrc2_gs, .value = 1 | (2 << 1) | (3 << 16) | (0x5a << 19) | (4 << 28) },
         };
 
-        const stages = Specials.withStages(1 << 22);
+        const stages = Specials{}; // Shared VGPR allocation is a wave64 feature.
         var front = ShaderHeader{};
         var back = ShaderHeader{};
         var fused = ShaderHeader{};
@@ -2136,6 +2138,7 @@ test "both fuse exports join a geometry pair and differ only where they should" 
         try testing.expectEqual(@as(u32, 0x0080_9000), rsrc1.value & 0x1fff_ffc0);
         // User SGPR count comes from the front half; OC_LDS_EN with it.
         try testing.expectEqual(@as(u32, 9), (rsrc2.value >> 1) & 0x1f);
+        try testing.expectEqual(@as(u32, 1), (rsrc2.value >> 27) & 0x1);
         try testing.expectEqual(@as(u32, 1), (rsrc2.value >> 18) & 0x1);
         // Scratch enable and LDS size belong to the back half and stay.
         try testing.expectEqual(@as(u32, 1), rsrc2.value & 0x1);
@@ -2146,15 +2149,13 @@ test "both fuse exports join a geometry pair and differ only where they should" 
         // And here the two exports part company.
         const shared = (rsrc2.value >> 28) & 0xf;
         if (form.recomputes) {
-            // The front half needs 32 vector registers plus a 15-unit shared
-            // block, so 152 in total; the back half needs 16 plus one unit, so
-            // 24. Neither half's plain count covers 152 on its own, and the
-            // shortfall rounds up to two units of the shared block.
+            // Front needs 32 + 8 = 40 registers; back needs 16 + 32 = 48.
+            // Merging to 32 private registers leaves 16 shared (two blocks).
             try testing.expectEqual(@as(u32, 2), shared);
             try testing.expectEqual(@as(u64, 0), fused.get(user_data_at));
         } else {
             // No recomputation: whichever half already asked for more.
-            try testing.expectEqual(@as(u32, 15), shared);
+            try testing.expectEqual(@as(u32, 4), shared);
             try testing.expectEqual(@as(u64, @intFromPtr(&user_data)), fused.get(user_data_at));
         }
     }
@@ -2224,11 +2225,15 @@ test "the fused object reports the scratch it needs and works without it" {
     const size_of = try agcEntryPoint(&db, "dolOmWH+huQ", AgcFusedSize);
     const fuse = try agcEntryPoint(&db, "nApJjpKNBl4", AgcFuse);
 
-    var front_registers = [_]FuseRegister{.{ .offset = rsrc1_gs, .value = 1 }};
+    var front_registers = [_]FuseRegister{
+        .{ .offset = rsrc1_gs, .value = 9 },
+        .{ .offset = rsrc2_gs, .value = 0 },
+    };
     var back_registers = [_]FuseRegister{
         .{ .offset = lo_es, .value = 0 },
         .{ .offset = lo_es + 1, .value = 0 },
         .{ .offset = rsrc1_gs, .value = 7 },
+        .{ .offset = rsrc2_gs, .value = 0 },
     };
 
     var front = ShaderHeader{};
@@ -2249,14 +2254,17 @@ test "the fused object reports the scratch it needs and works without it" {
     // caller then owns the consequences of.
     try testing.expectEqual(errno.ok, fuse(&fused.bytes, &front.bytes, &back.bytes, null));
     try testing.expectEqual(@as(u64, @intFromPtr(&back_registers)), fused.get(sh_registers_at));
-    try testing.expectEqual(@as(u32, 7), back_registers[2].value & 0x3f);
+    try testing.expectEqual(@as(u32, 9), back_registers[2].value & 0x3f);
 
     // Given scratch of the reported size, the back half is left alone.
     back_registers[2].value = 7;
+    const before = back_registers;
     var scratch: [back_registers.len]FuseRegister = undefined;
     try testing.expectEqual(errno.ok, fuse(&fused.bytes, &front.bytes, &back.bytes, &scratch));
     try testing.expectEqual(@as(u64, @intFromPtr(&scratch)), fused.get(sh_registers_at));
     try testing.expectEqual(@as(u32, 7), back_registers[2].value);
+    try testing.expectEqual(@as(u32, 9), scratch[2].value & 0x3f);
+    try testing.expectEqualSlices(u8, std.mem.asBytes(&before), std.mem.asBytes(&back_registers));
 }
 
 test "halves that do not belong together are refused by both exports" {
@@ -2316,6 +2324,60 @@ test "halves that do not belong together are refused by both exports" {
         try testing.expectEqual(errno.KernelError.einval.raw(), fuse(null, &front.bytes, &back.bytes, null));
         try testing.expectEqual(errno.KernelError.einval.raw(), fuse(&fused.bytes, null, &back.bytes, null));
         try testing.expectEqual(errno.KernelError.einval.raw(), fuse(&fused.bytes, &front.bytes, null, null));
+    }
+}
+
+test "fused shared VGPR allocation covers each half after private registers merge" {
+    const std = @import("std");
+    const testing = std.testing;
+    var db = Database{};
+    defer db.deinit(testing.allocator);
+    try registerAll(&db, testing.allocator);
+    const fuse = try agcEntryPoint(&db, "fd5Bp5tGTgo", AgcFuse);
+
+    const Case = struct { front_private: u32, front_shared: u32, back_private: u32, back_shared: u32, expected_shared: u32 };
+    // Private counts are decoded register counts, not the encoded RSRC1 field.
+    // Include equal totals, private coverage, an eight-register rounding edge,
+    // and a near-limit allocation. Expectations follow allocation sizes rather
+    // than the implementation's arithmetic.
+    const cases = [_]Case{
+        .{ .front_private = 32, .front_shared = 8, .back_private = 32, .back_shared = 8, .expected_shared = 8 },
+        .{ .front_private = 32, .front_shared = 8, .back_private = 16, .back_shared = 32, .expected_shared = 16 },
+        .{ .front_private = 4, .front_shared = 8, .back_private = 8, .back_shared = 0, .expected_shared = 8 },
+        .{ .front_private = 16, .front_shared = 8, .back_private = 24, .back_shared = 0, .expected_shared = 0 },
+        .{ .front_private = 128, .front_shared = 120, .back_private = 136, .back_shared = 0, .expected_shared = 112 },
+    };
+    for ([_]bool{ false, true }) |hull| {
+        for (cases) |item| {
+            // Swapping the two resource demands must not change the allocation.
+            for ([_]bool{ false, true }) |swap| {
+                const r1: u32 = if (hull) rsrc1_hs else rsrc1_gs;
+                const r2: u32 = if (hull) rsrc2_hs else rsrc2_gs;
+                var front_regs = [_]FuseRegister{
+                    .{ .offset = r1, .value = (if (swap) item.back_private else item.front_private) / 4 - 1 },
+                    .{ .offset = r2, .value = ((if (swap) item.back_shared else item.front_shared) / 8) << 28 },
+                };
+                var back_regs = [_]FuseRegister{
+                    .{ .offset = r1, .value = (if (swap) item.front_private else item.back_private) / 4 - 1 },
+                    .{ .offset = r2, .value = ((if (swap) item.front_shared else item.back_shared) / 8) << 28 },
+                };
+                const stages = Specials{}; // Wave64, where shared VGPRs are available.
+                var front = ShaderHeader{};
+                var back = ShaderHeader{};
+                var fused = ShaderHeader{};
+                front.describe(if (hull) hs_front else gs_front, &front_regs, &stages, null);
+                back.describe(if (hull) hs_back else gs_back, &back_regs, &stages, null);
+                var scratch: [2]FuseRegister = undefined;
+                try testing.expectEqual(errno.ok, fuse(&fused.bytes, &front.bytes, &back.bytes, &scratch));
+                const private = ((scratch[0].value & 0x3f) + 1) * 4;
+                const shared = (scratch[1].value >> 28) * 8;
+                try testing.expectEqual(item.expected_shared, shared);
+                try testing.expectEqual(@max(item.front_private, item.back_private), private);
+                try testing.expect(private + shared >= item.front_private + item.front_shared);
+                try testing.expect(private + shared >= item.back_private + item.back_shared);
+                try testing.expect(private + shared <= 256);
+            }
+        }
     }
 }
 
@@ -2388,6 +2450,7 @@ test "context state saves, survives changes, and restores" {
 
     try testing.expectEqual(@as(u32, 1), probe.draws);
     try testing.expectEqual(@as(?u32, 0x1111_1111), state.readRegister(.context, probe_register));
+    try testing.expectEqual(@as(?u32, 0x1111_1111), probe.context_at_draw);
     try testing.expectEqual(@as(u8, 0), state.context_depth);
     try testing.expectEqual(@as(u64, 1), state.context_state_push_count);
     try testing.expectEqual(@as(u64, 1), state.context_state_pop_count);
@@ -2494,18 +2557,22 @@ test "context saves nest, and the stack has a bottom and a top" {
     var empty_buffer = sizedBuffer(&empty_words);
     try testing.expect(context_op(&empty_buffer, context_pop, 0, 0, 0, 0) != null);
     const empty_used = (@intFromPtr(empty_buffer.cursor_up.?) - @intFromPtr(empty_words[0..].ptr)) / @sizeOf(u32);
-    _ = try runPredicated(&probe, &state, empty_words[0..empty_used]);
+    try testing.expectError(error.ContextStateStackFault, runPredicated(&probe, &state, empty_words[0..empty_used]));
     try testing.expectEqual(@as(u8, 0), state.context_depth);
     try testing.expectEqual(before, state.readRegister(.context, probe_register));
     try testing.expectEqual(@as(u64, 1), state.context_state_refused_count);
 
     // And one push past the top is refused the same way.
-    for (0..depth + 1) |_| {
+    for (0..depth + 1) |index| {
         var push_words: [64]u32 = @splat(0);
         var push_buffer = sizedBuffer(&push_words);
         try testing.expect(context_op(&push_buffer, context_push, 0, 0, 0, 0) != null);
         const used = (@intFromPtr(push_buffer.cursor_up.?) - @intFromPtr(push_words[0..].ptr)) / @sizeOf(u32);
-        _ = try runPredicated(&probe, &state, push_words[0..used]);
+        if (index == depth) {
+            try testing.expectError(error.ContextStateStackFault, runPredicated(&probe, &state, push_words[0..used]));
+        } else {
+            _ = try runPredicated(&probe, &state, push_words[0..used]);
+        }
     }
     try testing.expectEqual(@as(u8, depth), state.context_depth);
     try testing.expectEqual(@as(u64, 2), state.context_state_refused_count);
@@ -2591,7 +2658,7 @@ test "a saved context belongs to its own queue" {
     var pop_buffer = sizedBuffer(&pop_words);
     try testing.expect(context_op(&pop_buffer, context_pop, 0, 0, 0, 0) != null);
     const pop_used = (@intFromPtr(pop_buffer.cursor_up.?) - @intFromPtr(pop_words[0..].ptr)) / @sizeOf(u32);
-    _ = try runPredicated(&probe, &compute, pop_words[0..pop_used]);
+    try testing.expectError(error.ContextStateStackFault, runPredicated(&probe, &compute, pop_words[0..pop_used]));
     try testing.expectEqual(@as(u64, 1), compute.context_state_refused_count);
     try testing.expectEqual(@as(u64, 0), graphics.context_state_refused_count);
     try testing.expectEqual(@as(u8, 1), graphics.context_depth);
@@ -2657,4 +2724,43 @@ test "a save survives the wait that splits its command buffer" {
     );
     try testing.expectEqual(@as(u64, 1), scheduler.state(.graphics).context_state_push_count);
     try testing.expectEqual(@as(u64, 1), scheduler.state(.graphics).context_state_pop_count);
+}
+
+test "context stack faults stop the submission before an outer pop or draw" {
+    const std = @import("std");
+    const gpu = @import("gpu");
+    const testing = std.testing;
+    var db = Database{};
+    defer db.deinit(testing.allocator);
+    try registerAll(&db, testing.allocator);
+    const context_op = try agcEntryPoint(&db, "qj7QZpgr9Uw", AgcContextStateOp);
+    const draw = try agcEntryPoint(&db, "Yw0jKSqop+E", AgcWrite);
+
+    for ([_]u32{ context_push, context_push_clear, context_pop }) |operation| {
+        var probe = PredicationProbe{};
+        var scheduler = gpu.QueueScheduler.init(testing.allocator, probe.backend());
+        defer scheduler.deinit();
+        const state = scheduler.state(.graphics);
+        if (operation != context_pop) {
+            for (0..gpu.state.context_state_depth) |level| {
+                try state.writeRegister(.context, probe_register, @intCast(level));
+                try testing.expect(state.applyContextStateOperation(.push));
+            }
+        }
+        try state.writeRegister(.context, probe_register, 0xbeef);
+        const depth_before = state.context_depth;
+        var words: [80]u32 = @splat(0);
+        var buffer = sizedBuffer(&words);
+        _ = context_op(&buffer, operation, 0, 0, 0, 0).?;
+        // Continuing after a refused push would pop the outer frame here.
+        _ = context_op(&buffer, context_pop, 0, 0, 0, 0).?;
+        _ = draw(&buffer, 3, 0, 0, 0, 0).?;
+        const used = (@intFromPtr(buffer.cursor_up.?) - @intFromPtr(&words)) / @sizeOf(u32);
+        try testing.expectError(error.ContextStateStackFault, scheduler.submit(.graphics, words[0..used]));
+        try testing.expectEqual(depth_before, state.context_depth);
+        try testing.expectEqual(@as(?u32, 0xbeef), state.readRegister(.context, probe_register));
+        try testing.expectEqual(@as(u32, 0), probe.draws);
+        try testing.expectEqual(@as(u64, 1), state.context_state_refused_count);
+        try testing.expectEqual(@as(usize, 0), scheduler.pendingCount(.graphics));
+    }
 }
