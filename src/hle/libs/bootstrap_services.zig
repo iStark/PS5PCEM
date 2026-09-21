@@ -2588,6 +2588,151 @@ fn agcDcbRewind(
     return writeExactAgcPacket(buffer, gpu.pm4.rewind, &body);
 }
 
+// --- Workload streams ------------------------------------------------------
+//
+// A title groups its submissions into named streams and, within a stream,
+// into numbered workloads. It registers the stream with the driver once, then
+// brackets work with packets naming which workloads are running and which have
+// finished. The packets are markers -- a no-operation carrying the ids -- so
+// what this has to get right is the bookkeeping that decides whether a packet
+// may be written at all, and the width of the one that is.
+
+const workload_stream_record_bytes: usize = 32;
+const workload_stream_min_id: u32 = 1;
+const workload_stream_max_id: u32 = 31;
+const workload_id_max: u32 = 63;
+const workload_active_count_max: u32 = 63;
+const workload_active_packet_dwords: u32 = 18;
+const workload_complete_packet_dwords: u32 = 12;
+
+const graphics_driver_error_invalid_value: i32 = @bitCast(@as(u32, 0x8a6c_0033));
+const graphics_driver_error_invalid_argument: i32 = @bitCast(@as(u32, 0x8a6c_0035));
+
+var workload_stream_lock = guest_memory.HostMutex{};
+/// One bit per registered stream, and the record each one was registered with.
+var workload_stream_mask: u32 = 0;
+var workload_stream_records: [workload_stream_max_id + 1][workload_stream_record_bytes]u8 =
+    @splat(@splat(0));
+
+fn workloadStreamIdValid(stream_id: u32) bool {
+    return stream_id >= workload_stream_min_id and stream_id <= workload_stream_max_id;
+}
+
+/// Whether a stream has been registered, taken under the lock.
+fn workloadStreamRegistered(stream_id: u32) bool {
+    workload_stream_lock.lock();
+    defer workload_stream_lock.unlock();
+    return workload_stream_mask & (@as(u32, 1) << @intCast(stream_id)) != 0;
+}
+
+/// Takes a copy of the stream record the title supplies.
+///
+/// The copy is what makes registering mean anything: the title's own record may
+/// be reused the moment this returns, and the id has to stay claimed until it
+/// is given back. Registering a stream that is already registered is refused
+/// rather than replacing it, because the work already bracketed under that id
+/// belongs to the first registration.
+fn agcDriverRegisterWorkloadStream(stream_id: u32, stream: ?*const anyopaque) callconv(abi.guest) i32 {
+    if (!workloadStreamIdValid(stream_id)) return graphics_driver_error_invalid_value;
+    const record = stream orelse return graphics_driver_error_invalid_argument;
+    const address = @intFromPtr(record);
+    if (!accessible(address, workload_stream_record_bytes)) {
+        return errno.KernelError.efault.raw();
+    }
+
+    workload_stream_lock.lock();
+    defer workload_stream_lock.unlock();
+    const bit = @as(u32, 1) << @intCast(stream_id);
+    if (workload_stream_mask & bit != 0) return graphics_driver_error_invalid_value;
+
+    const source: [*]const u8 = @ptrFromInt(address);
+    @memcpy(&workload_stream_records[stream_id], source[0..workload_stream_record_bytes]);
+    workload_stream_mask |= bit;
+    return errno.ok;
+}
+
+/// Gives a stream id back.
+///
+/// The inverse of registering, so that an id can be reused. Nothing outside
+/// this file describes it, but leaving it accepting would make the registry
+/// one-way: every id a title released would stay claimed and the next
+/// registration of it would be refused.
+fn agcDriverUnregisterWorkloadStream(stream_id: u32) callconv(abi.guest) i32 {
+    if (!workloadStreamIdValid(stream_id)) return graphics_driver_error_invalid_value;
+
+    workload_stream_lock.lock();
+    defer workload_stream_lock.unlock();
+    const bit = @as(u32, 1) << @intCast(stream_id);
+    if (workload_stream_mask & bit == 0) return graphics_driver_error_invalid_value;
+    workload_stream_mask &= ~bit;
+    @memset(&workload_stream_records[stream_id], 0);
+    return errno.ok;
+}
+
+/// Writes the marker naming the workloads now running in a stream.
+///
+/// The ids arrive as a list and leave as a mask, so a repeated id is refused:
+/// it would fold into the same bit and the packet would claim fewer workloads
+/// than the caller asked for, silently. An unregistered stream is refused too,
+/// which is the whole reason registering is more than a formality.
+fn agcDcbSetWorkloadsActive(
+    buffer: ?*AgcCommandBuffer,
+    stream_id: u32,
+    workload_ids: ?[*]const u32,
+    workload_count: u32,
+    _: u64,
+    _: u64,
+) callconv(abi.guest) ?[*]u32 {
+    if (!workloadStreamIdValid(stream_id)) return null;
+    if (workload_count == 0 or workload_count > workload_active_count_max) return null;
+    const ids = workload_ids orelse return null;
+    if (!accessible(@intFromPtr(ids), @as(usize, workload_count) * @sizeOf(u32))) return null;
+
+    var mask: u64 = 0;
+    for (ids[0..workload_count]) |id| {
+        if (id > workload_id_max) return null;
+        const bit = @as(u64, 1) << @intCast(id);
+        if (mask & bit != 0) return null;
+        mask |= bit;
+    }
+    if (!workloadStreamRegistered(stream_id)) return null;
+
+    const cursor = reserveAgcDwords(buffer, workload_active_packet_dwords) orelse return null;
+    @memset(cursor[0..workload_active_packet_dwords], 0);
+    cursor[0] = pm4Header(gpu.pm4.nop, workload_active_packet_dwords - 1);
+    cursor[1] = stream_id;
+    cursor[2] = @truncate(mask);
+    cursor[3] = @truncate(mask >> 32);
+    return cursor;
+}
+
+/// Writes the marker retiring one workload from a stream.
+///
+/// The packet carries the id and the mask with that one bit cleared, which is
+/// what a reader of the buffer needs to know which workloads remain.
+fn agcDcbSetWorkloadComplete(
+    buffer: ?*AgcCommandBuffer,
+    stream_id: u32,
+    workload_id: u32,
+    _: u64,
+    _: u64,
+    _: u64,
+) callconv(abi.guest) ?[*]u32 {
+    if (!workloadStreamIdValid(stream_id)) return null;
+    if (workload_id > workload_id_max) return null;
+    if (!workloadStreamRegistered(stream_id)) return null;
+
+    const cursor = reserveAgcDwords(buffer, workload_complete_packet_dwords) orelse return null;
+    @memset(cursor[0..workload_complete_packet_dwords], 0);
+    const remaining = ~(@as(u64, 1) << @intCast(workload_id));
+    cursor[0] = pm4Header(gpu.pm4.nop, workload_complete_packet_dwords - 1);
+    cursor[1] = stream_id;
+    cursor[2] = workload_id;
+    cursor[3] = @truncate(remaining);
+    cursor[4] = @truncate(remaining >> 32);
+    return cursor;
+}
+
 /// Bytes one wait on a memory address occupies.
 ///
 /// The width follows the argument, because the packet does: a 32-bit wait
@@ -4558,6 +4703,8 @@ const agc_exports = [_]symbols.Export{
     .{ .name = "sceAgcUpdatePrimState", .function = trace.wrap("sceAgcUpdatePrimState", &agcUpdatePrimState), .expect_id = "Y3ymLfZ1384" },
     .{ .name = "sceAgcGetGsOversubscription", .function = trace.wrap("sceAgcGetGsOversubscription", &agcGetGsOversubscription), .expect_id = "NKIzURsgV7I" },
     .{ .name = "sceAgcDcbRewind", .function = trace.wrap("sceAgcDcbRewind", &agcDcbRewind), .expect_id = "zfcxg-ewMK8" },
+    .{ .name = "sceAgcDcbSetWorkloadsActive", .function = trace.wrap("sceAgcDcbSetWorkloadsActive", &agcDcbSetWorkloadsActive), .expect_id = "LFSPFmGc9Hg" },
+    .{ .name = "sceAgcDcbSetWorkloadComplete", .function = trace.wrap("sceAgcDcbSetWorkloadComplete", &agcDcbSetWorkloadComplete), .expect_id = "hEK26Wdny6s" },
     .{ .name = "sceAgcDcbRewindGetSize", .function = trace.wrap("sceAgcDcbRewindGetSize", &agcDcbRewindGetSize), .expect_id = "QIXCsbipds0" },
     .{ .name = "sceAgcDcbWaitOnAddressGetSize", .function = trace.wrap("sceAgcDcbWaitOnAddressGetSize", &agcWaitOnAddressGetSize), .expect_id = "43WJ08sSugE" },
     .{ .name = "sceAgcAcbWaitOnAddressGetSize", .function = trace.wrap("sceAgcAcbWaitOnAddressGetSize", &agcWaitOnAddressGetSize), .expect_id = "idlaArvdXEs" },
@@ -4589,6 +4736,8 @@ const agc_exports = [_]symbols.Export{
 };
 
 const agc_driver_exports = [_]symbols.Export{
+    .{ .name = "sceAgcDriverRegisterWorkloadStream", .function = trace.wrap("sceAgcDriverRegisterWorkloadStream", &agcDriverRegisterWorkloadStream), .expect_id = "3AyTaWcF-H8" },
+    .{ .name = "sceAgcDriverUnregisterWorkloadStream", .function = trace.wrap("sceAgcDriverUnregisterWorkloadStream", &agcDriverUnregisterWorkloadStream), .expect_id = "n5ElQVYsU1A" },
     .{ .name = "sceAgcDriverRegisterOwner", .function = trace.wrap("sceAgcDriverRegisterOwner", &success), .expect_id = "X-Nm5KLREeg" },
     .{ .name = "sceAgcDriverSetHsOffchipParam", .function = trace.wrap("sceAgcDriverSetHsOffchipParam", &success), .expect_id = "MM4IZSEYytQ" },
     .{ .name = "sceAgcDriverRegisterResource", .function = trace.wrap("sceAgcDriverRegisterResource", &success), .expect_id = "W5z4eZrjEas" },

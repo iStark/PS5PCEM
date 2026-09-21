@@ -4004,3 +4004,225 @@ test "a wait on an address fits the size it reports" {
         for (storage) |word| try testing.expectEqual(guard_word, word);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Workload streams
+//
+// Registering a stream is what makes the two marker packets writable, so these
+// drive the three together. Each test claims its own stream ids and gives them
+// back, because the registry outlives a single test.
+
+const AgcRegisterStream = fn (u32, ?*const anyopaque) callconv(abi.guest) i32;
+const AgcUnregisterStream = fn (u32) callconv(abi.guest) i32;
+const AgcSetWorkloadsActive = fn (
+    ?*libs.agc.CommandBuffer,
+    u32,
+    ?[*]const u32,
+    u32,
+    u64,
+    u64,
+) callconv(abi.guest) ?[*]u32;
+const AgcSetWorkloadComplete = fn (
+    ?*libs.agc.CommandBuffer,
+    u32,
+    u32,
+    u64,
+    u64,
+    u64,
+) callconv(abi.guest) ?[*]u32;
+
+const driver_invalid_value: i32 = @bitCast(@as(u32, 0x8a6c_0033));
+const driver_invalid_argument: i32 = @bitCast(@as(u32, 0x8a6c_0035));
+const workload_active_dwords: usize = 18;
+const workload_complete_dwords: usize = 12;
+
+test "a stream must be registered before its markers can be written" {
+    const std = @import("std");
+    const gpu = @import("gpu");
+    const testing = std.testing;
+
+    var db = Database{};
+    defer db.deinit(testing.allocator);
+    try registerAll(&db, testing.allocator);
+
+    const register = try agcDriverEntryPoint(&db, "3AyTaWcF-H8", AgcRegisterStream);
+    const unregister = try agcDriverEntryPoint(&db, "n5ElQVYsU1A", AgcUnregisterStream);
+    const active = try agcEntryPoint(&db, "LFSPFmGc9Hg", AgcSetWorkloadsActive);
+    const complete = try agcEntryPoint(&db, "hEK26Wdny6s", AgcSetWorkloadComplete);
+
+    const stream: u32 = 3;
+    var record: [32]u8 = @splat(0xa5);
+    var ids = [_]u32{ 0, 5, 63 };
+
+    // Unregistered: both markers are refused and write nothing.
+    var words: [64]u32 = @splat(guard_word);
+    var buffer = sizedBuffer(&words);
+    try testing.expect(active(&buffer, stream, &ids, ids.len, 0, 0) == null);
+    try testing.expect(complete(&buffer, stream, 5, 0, 0, 0) == null);
+    for (words) |word| try testing.expectEqual(guard_word, word);
+
+    try testing.expectEqual(errno.ok, register(stream, &record));
+    defer _ = unregister(stream);
+
+    // Registered: the active marker is eighteen dwords and carries the stream
+    // and the ids folded into a mask.
+    try testing.expect(active(&buffer, stream, &ids, ids.len, 0, 0) != null);
+    const used = (@intFromPtr(buffer.cursor_up.?) - @intFromPtr(words[0..].ptr)) / @sizeOf(u32);
+    try testing.expectEqual(workload_active_dwords, used);
+    try testing.expectEqual(stream, words[1]);
+    const expected_mask: u64 = (1 << 0) | (1 << 5) | (@as(u64, 1) << 63);
+    try testing.expectEqual(@as(u32, @truncate(expected_mask)), words[2]);
+    try testing.expectEqual(@as(u32, @truncate(expected_mask >> 32)), words[3]);
+    // The rest of the marker is zero, and nothing past it was touched.
+    for (words[4..workload_active_dwords]) |word| try testing.expectEqual(@as(u32, 0), word);
+    for (words[workload_active_dwords..]) |word| try testing.expectEqual(guard_word, word);
+
+    // One walkable packet of exactly that width.
+    var walker = gpu.pm4.Walker.init(words[0..workload_active_dwords]);
+    const packet = (try walker.next()).?;
+    try testing.expectEqual(gpu.pm4.nop, packet.opcode);
+    try testing.expectEqual(workload_active_dwords, packet.wordCount());
+    try testing.expect((try walker.next()) == null);
+
+    // The completion marker is twelve dwords and carries the id and the mask
+    // with that one bit cleared.
+    var done: [64]u32 = @splat(guard_word);
+    var done_buffer = sizedBuffer(&done);
+    try testing.expect(complete(&done_buffer, stream, 5, 0, 0, 0) != null);
+    const done_used = (@intFromPtr(done_buffer.cursor_up.?) - @intFromPtr(done[0..].ptr)) / @sizeOf(u32);
+    try testing.expectEqual(workload_complete_dwords, done_used);
+    try testing.expectEqual(stream, done[1]);
+    try testing.expectEqual(@as(u32, 5), done[2]);
+    const remaining = ~(@as(u64, 1) << 5);
+    try testing.expectEqual(@as(u32, @truncate(remaining)), done[3]);
+    try testing.expectEqual(@as(u32, @truncate(remaining >> 32)), done[4]);
+    for (done[workload_complete_dwords..]) |word| try testing.expectEqual(guard_word, word);
+}
+
+test "registering a stream claims it until it is given back" {
+    const std = @import("std");
+    const testing = std.testing;
+
+    var db = Database{};
+    defer db.deinit(testing.allocator);
+    try registerAll(&db, testing.allocator);
+
+    const register = try agcDriverEntryPoint(&db, "3AyTaWcF-H8", AgcRegisterStream);
+    const unregister = try agcDriverEntryPoint(&db, "n5ElQVYsU1A", AgcUnregisterStream);
+
+    const stream: u32 = 7;
+    var record: [32]u8 = @splat(0x11);
+
+    try testing.expectEqual(errno.ok, register(stream, &record));
+    // A second registration of the same id is refused rather than replacing
+    // the first: work already bracketed under it belongs to that one.
+    try testing.expectEqual(driver_invalid_value, register(stream, &record));
+
+    try testing.expectEqual(errno.ok, unregister(stream));
+    // Given back, it can be claimed again -- and cannot be given back twice.
+    try testing.expectEqual(driver_invalid_value, unregister(stream));
+    try testing.expectEqual(errno.ok, register(stream, &record));
+    try testing.expectEqual(errno.ok, unregister(stream));
+
+    // Ids outside the range are refused on both halves.
+    for ([_]u32{ 0, 32, 64, 0xffff_ffff }) |bad| {
+        try testing.expectEqual(driver_invalid_value, register(bad, &record));
+        try testing.expectEqual(driver_invalid_value, unregister(bad));
+    }
+
+    // A record that is not there is a different complaint from an id that is
+    // not allowed.
+    try testing.expectEqual(driver_invalid_argument, register(9, null));
+}
+
+test "the workload markers refuse what they cannot express" {
+    const std = @import("std");
+    const testing = std.testing;
+
+    var db = Database{};
+    defer db.deinit(testing.allocator);
+    try registerAll(&db, testing.allocator);
+
+    const register = try agcDriverEntryPoint(&db, "3AyTaWcF-H8", AgcRegisterStream);
+    const unregister = try agcDriverEntryPoint(&db, "n5ElQVYsU1A", AgcUnregisterStream);
+    const active = try agcEntryPoint(&db, "LFSPFmGc9Hg", AgcSetWorkloadsActive);
+    const complete = try agcEntryPoint(&db, "hEK26Wdny6s", AgcSetWorkloadComplete);
+
+    const stream: u32 = 11;
+    var record: [32]u8 = @splat(0);
+    try testing.expectEqual(errno.ok, register(stream, &record));
+    defer _ = unregister(stream);
+
+    var words: [64]u32 = @splat(guard_word);
+    var buffer = sizedBuffer(&words);
+    var ids = [_]u32{ 1, 2, 3 };
+
+    // A repeated id would fold into one bit and claim fewer workloads than
+    // asked for, so the list is refused instead.
+    var repeated = [_]u32{ 4, 9, 4 };
+    try testing.expect(active(&buffer, stream, &repeated, repeated.len, 0, 0) == null);
+    // An id past the mask, an empty list, too many, and no list at all.
+    var too_large = [_]u32{64};
+    try testing.expect(active(&buffer, stream, &too_large, 1, 0, 0) == null);
+    try testing.expect(active(&buffer, stream, &ids, 0, 0, 0) == null);
+    try testing.expect(active(&buffer, stream, &ids, 64, 0, 0) == null);
+    try testing.expect(active(&buffer, stream, null, 3, 0, 0) == null);
+    // Stream ids outside the range, on both markers.
+    for ([_]u32{ 0, 32 }) |bad| {
+        try testing.expect(active(&buffer, bad, &ids, ids.len, 0, 0) == null);
+        try testing.expect(complete(&buffer, bad, 1, 0, 0, 0) == null);
+    }
+    // A workload id past the mask.
+    try testing.expect(complete(&buffer, stream, 64, 0, 0, 0) == null);
+    // None of that wrote anything.
+    for (words) |word| try testing.expectEqual(guard_word, word);
+
+    // A buffer one word short of the marker is refused whole.
+    var tight: [64]u32 = @splat(guard_word);
+    var short = sizedBuffer(tight[0 .. workload_active_dwords - 1]);
+    try testing.expect(active(&short, stream, &ids, ids.len, 0, 0) == null);
+    var short_done = sizedBuffer(tight[0 .. workload_complete_dwords - 1]);
+    try testing.expect(complete(&short_done, stream, 1, 0, 0, 0) == null);
+    for (tight) |word| try testing.expectEqual(guard_word, word);
+}
+
+test "streams are claimed one at a time and independently" {
+    const std = @import("std");
+    const testing = std.testing;
+
+    var db = Database{};
+    defer db.deinit(testing.allocator);
+    try registerAll(&db, testing.allocator);
+
+    const register = try agcDriverEntryPoint(&db, "3AyTaWcF-H8", AgcRegisterStream);
+    const unregister = try agcDriverEntryPoint(&db, "n5ElQVYsU1A", AgcUnregisterStream);
+    const complete = try agcEntryPoint(&db, "hEK26Wdny6s", AgcSetWorkloadComplete);
+
+    var record: [32]u8 = @splat(0);
+    const first: u32 = 17;
+    const second: u32 = 18;
+
+    try testing.expectEqual(errno.ok, register(first, &record));
+    defer _ = unregister(first);
+
+    // Registering one does not register its neighbours.
+    var words: [64]u32 = @splat(guard_word);
+    var buffer = sizedBuffer(&words);
+    try testing.expect(complete(&buffer, second, 0, 0, 0, 0) == null);
+    try testing.expect(complete(&buffer, first, 0, 0, 0, 0) != null);
+
+    try testing.expectEqual(errno.ok, register(second, &record));
+    defer _ = unregister(second);
+    var more: [64]u32 = @splat(guard_word);
+    var more_buffer = sizedBuffer(&more);
+    try testing.expect(complete(&more_buffer, second, 0, 0, 0, 0) != null);
+    try testing.expectEqual(second, more[1]);
+
+    // Giving one back does not give the other back.
+    try testing.expectEqual(errno.ok, unregister(first));
+    var after: [64]u32 = @splat(guard_word);
+    var after_buffer = sizedBuffer(&after);
+    try testing.expect(complete(&after_buffer, first, 0, 0, 0, 0) == null);
+    try testing.expect(complete(&after_buffer, second, 0, 0, 0, 0) != null);
+    try testing.expectEqual(errno.ok, register(first, &record));
+}
