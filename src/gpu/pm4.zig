@@ -213,6 +213,7 @@ pub const dump_const_ram: u8 = 0x83;
 pub const increment_ce_counter: u8 = 0x84;
 pub const increment_de_counter: u8 = 0x85;
 pub const wait_on_ce_counter: u8 = 0x86;
+pub const get_lod_stats: u8 = 0x8e;
 pub const set_sh_reg_index: u8 = 0x9b;
 pub const set_context_reg_indirect: u8 = 0x9f;
 
@@ -336,6 +337,7 @@ pub fn opcodeName(opcode: u8) ?[]const u8 {
         increment_ce_counter => "INCREMENT_CE_COUNTER",
         increment_de_counter => "INCREMENT_DE_COUNTER",
         wait_on_ce_counter => "WAIT_ON_CE_COUNTER",
+        get_lod_stats => "GET_LOD_STATS",
         set_sh_reg_index => "SET_SH_REG_INDEX",
         set_context_reg_indirect => "SET_CONTEXT_REG_INDIRECT",
         else => null,

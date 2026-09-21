@@ -2733,6 +2733,67 @@ fn agcDcbSetWorkloadComplete(
     return cursor;
 }
 
+/// The width of the level-of-detail statistics request: header and four words.
+const lod_stats_packet_dwords: u32 = 5;
+/// The address field keeps no bits under a sixty-four byte boundary.
+const lod_stats_buffer_alignment: u64 = 64;
+
+/// Asks the command processor to report texture residency statistics.
+///
+/// A title hands over a buffer and an interval and gets back, from time to
+/// time, how the mip levels its shaders sampled compare with the ones it has
+/// resident -- the feedback a streaming system decides what to load from.
+///
+/// Every argument here is narrower in the packet than in the call, and this
+/// refuses rather than truncates. The address keeps no bits under a sixty-four
+/// byte boundary, so an unaligned buffer would be reported into a different
+/// address than the caller named -- and, being lower, into memory belonging to
+/// something else. The counts and the interval have eight bits each, so a
+/// larger value would silently become a smaller one and the title would
+/// believe it asked for a reporting rate it did not get.
+fn agcDcbGetLodStats(
+    buffer: ?*AgcCommandBuffer,
+    cache_policy: u8,
+    stats_buffer: ?*anyopaque,
+    buffer_size_in_bytes: u32,
+    reset_count: u32,
+    force_reset: u8,
+    report_and_reset: u8,
+    reporting_interval_in_100k_clocks: u32,
+) callconv(abi.guest) ?[*]u32 {
+    if (cache_policy > 3) return null;
+    if (force_reset > 1 or report_and_reset > 1) return null;
+    if (reset_count > 0xff or reporting_interval_in_100k_clocks > 0xff) return null;
+
+    // No buffer and no size is how a title stops the reporting it started.
+    // Either one without the other names a request that cannot be carried out:
+    // a size with nowhere to put it, or somewhere to put nothing.
+    const address = @intFromPtr(stats_buffer);
+    if ((address == 0) != (buffer_size_in_bytes == 0)) return null;
+    if (address % lod_stats_buffer_alignment != 0) return null;
+
+    const cursor = reserveAgcDwords(buffer, lod_stats_packet_dwords) orelse return null;
+    cursor[0] = pm4Header(gpu.pm4.get_lod_stats, lod_stats_packet_dwords - 1);
+    cursor[1] = buffer_size_in_bytes;
+    cursor[2] = @as(u32, @truncate(address)) & 0xffff_ffc0;
+    cursor[3] = @truncate(address >> 32);
+    cursor[4] = (@as(u32, cache_policy & 0x3) << 28) |
+        (@as(u32, report_and_reset & 0x1) << 19) |
+        (@as(u32, force_reset & 0x1) << 18) |
+        ((reset_count & 0xff) << 10) |
+        ((reporting_interval_in_100k_clocks & 0xff) << 2);
+    return cursor;
+}
+
+/// GET_LOD_STATS: header, size, address pair, control.
+///
+/// One width for every request -- the buffer and the interval are named in the
+/// packet, not encoded into its length -- so unlike the widths that follow an
+/// argument there is nothing here to refuse.
+fn agcDcbGetLodStatsGetSize() callconv(abi.guest) u32 {
+    return lod_stats_packet_dwords * @sizeOf(u32);
+}
+
 /// Bytes one wait on a memory address occupies.
 ///
 /// The width follows the argument, because the packet does: a 32-bit wait
@@ -4705,6 +4766,8 @@ const agc_exports = [_]symbols.Export{
     .{ .name = "sceAgcDcbRewind", .function = trace.wrap("sceAgcDcbRewind", &agcDcbRewind), .expect_id = "zfcxg-ewMK8" },
     .{ .name = "sceAgcDcbSetWorkloadsActive", .function = trace.wrap("sceAgcDcbSetWorkloadsActive", &agcDcbSetWorkloadsActive), .expect_id = "LFSPFmGc9Hg" },
     .{ .name = "sceAgcDcbSetWorkloadComplete", .function = trace.wrap("sceAgcDcbSetWorkloadComplete", &agcDcbSetWorkloadComplete), .expect_id = "hEK26Wdny6s" },
+    .{ .name = "sceAgcDcbGetLodStats", .function = trace.wrap("sceAgcDcbGetLodStats", &agcDcbGetLodStats), .expect_id = "vuSXe69VILM" },
+    .{ .name = "sceAgcDcbGetLodStatsGetSize", .function = trace.wrap("sceAgcDcbGetLodStatsGetSize", &agcDcbGetLodStatsGetSize), .expect_id = "rUuVjyR+Rd4" },
     .{ .name = "sceAgcDcbRewindGetSize", .function = trace.wrap("sceAgcDcbRewindGetSize", &agcDcbRewindGetSize), .expect_id = "QIXCsbipds0" },
     .{ .name = "sceAgcDcbWaitOnAddressGetSize", .function = trace.wrap("sceAgcDcbWaitOnAddressGetSize", &agcWaitOnAddressGetSize), .expect_id = "43WJ08sSugE" },
     .{ .name = "sceAgcAcbWaitOnAddressGetSize", .function = trace.wrap("sceAgcAcbWaitOnAddressGetSize", &agcWaitOnAddressGetSize), .expect_id = "idlaArvdXEs" },

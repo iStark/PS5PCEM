@@ -4226,3 +4226,182 @@ test "streams are claimed one at a time and independently" {
     try testing.expect(complete(&after_buffer, second, 0, 0, 0, 0) != null);
     try testing.expectEqual(errno.ok, register(first, &record));
 }
+
+// ---------------------------------------------------------------------------
+// Level-of-detail statistics
+//
+// The packet names a buffer for the command processor to report texture
+// residency into. These check the writer against the size query, the refusals
+// against the fields the packet actually has, and what execution leaves in the
+// buffer.
+
+const AgcGetLodStats = fn (
+    ?*libs.agc.CommandBuffer,
+    u8,
+    ?*anyopaque,
+    u32,
+    u32,
+    u8,
+    u8,
+    u32,
+) callconv(abi.guest) ?[*]u32;
+const AgcLodStatsGetSize = fn () callconv(abi.guest) u32;
+
+test "a statistics request fits the size it reports and carries its fields" {
+    const std = @import("std");
+    const gpu = @import("gpu");
+    const testing = std.testing;
+
+    var db = Database{};
+    defer db.deinit(testing.allocator);
+    try registerAll(&db, testing.allocator);
+
+    const stats = try agcEntryPoint(&db, "vuSXe69VILM", AgcGetLodStats);
+    const get_size = try agcEntryPoint(&db, "rUuVjyR+Rd4", AgcLodStatsGetSize);
+
+    const announced = get_size();
+    try testing.expectEqual(@as(u32, 5 * @sizeOf(u32)), announced);
+    const announced_words = announced / @sizeOf(u32);
+
+    var target: [128]u8 align(64) = @splat(0);
+    const address = @intFromPtr(&target);
+
+    var words: [16]u32 = @splat(guard_word);
+    var buffer = sizedBuffer(words[0..announced_words]);
+    try testing.expect(stats(&buffer, 2, &target, 128, 0x5a, 1, 1, 0x27) != null);
+    try testing.expectEqual(
+        @as(usize, announced),
+        @intFromPtr(buffer.cursor_up.?) - @intFromPtr(words[0..].ptr),
+    );
+    for (words[announced_words..]) |word| try testing.expectEqual(guard_word, word);
+
+    // One walkable packet of exactly that width.
+    var walker = gpu.pm4.Walker.init(words[0..announced_words]);
+    const packet = (try walker.next()).?;
+    try testing.expectEqual(gpu.pm4.get_lod_stats, packet.opcode);
+    try testing.expectEqual(@as(usize, announced_words), packet.wordCount());
+    try testing.expect((try walker.next()) == null);
+
+    // Size, address split across two words, and every field of the control
+    // word in its own place.
+    try testing.expectEqual(@as(u32, 128), words[1]);
+    try testing.expectEqual(@as(u32, @truncate(address)), words[2]);
+    try testing.expectEqual(@as(u32, @truncate(address >> 32)), words[3]);
+    const control = words[4];
+    try testing.expectEqual(@as(u32, 2), (control >> 28) & 0x3);
+    try testing.expectEqual(@as(u32, 1), (control >> 19) & 0x1);
+    try testing.expectEqual(@as(u32, 1), (control >> 18) & 0x1);
+    try testing.expectEqual(@as(u32, 0x5a), (control >> 10) & 0xff);
+    try testing.expectEqual(@as(u32, 0x27), (control >> 2) & 0xff);
+    // Nothing outside those fields.
+    try testing.expectEqual(@as(u32, 0), control & ~@as(u32, 0x300f_fffc));
+
+    // One word short of the announced size is refused, and refusing writes
+    // nothing.
+    var tight: [16]u32 = @splat(guard_word);
+    var short = sizedBuffer(tight[0 .. announced_words - 1]);
+    try testing.expect(stats(&short, 0, &target, 128, 0, 0, 0, 0) == null);
+    for (tight) |word| try testing.expectEqual(guard_word, word);
+}
+
+test "a statistics request refuses what the packet cannot carry" {
+    const std = @import("std");
+    const testing = std.testing;
+
+    var db = Database{};
+    defer db.deinit(testing.allocator);
+    try registerAll(&db, testing.allocator);
+
+    const stats = try agcEntryPoint(&db, "vuSXe69VILM", AgcGetLodStats);
+
+    var target: [192]u8 align(64) = @splat(0);
+    var words: [16]u32 = @splat(guard_word);
+    var buffer = sizedBuffer(&words);
+
+    // An address the field cannot hold would be reported sixty-four bytes
+    // lower, into memory belonging to something else.
+    for ([_]usize{ 1, 4, 32, 63 }) |offset| {
+        const unaligned: *anyopaque = @ptrCast(&target[offset]);
+        try testing.expect(stats(&buffer, 0, unaligned, 64, 0, 0, 0, 0) == null);
+    }
+    // Counts and an interval past the eight bits each field has.
+    try testing.expect(stats(&buffer, 0, &target, 64, 0x100, 0, 0, 0) == null);
+    try testing.expect(stats(&buffer, 0, &target, 64, 0, 0, 0, 0x100) == null);
+    // A cache policy past its two bits, and flags that are not flags.
+    try testing.expect(stats(&buffer, 4, &target, 64, 0, 0, 0, 0) == null);
+    try testing.expect(stats(&buffer, 0, &target, 64, 0, 2, 0, 0) == null);
+    try testing.expect(stats(&buffer, 0, &target, 64, 0, 0, 2, 0) == null);
+    // A size with nowhere to put it, and somewhere to put nothing.
+    try testing.expect(stats(&buffer, 0, null, 64, 0, 0, 0, 0) == null);
+    try testing.expect(stats(&buffer, 0, &target, 0, 0, 0, 0, 0) == null);
+    // None of that wrote anything.
+    for (words) |word| try testing.expectEqual(guard_word, word);
+
+    // Neither a buffer nor a size is how a title stops the reporting it
+    // started, and that is accepted.
+    try testing.expect(stats(&buffer, 0, null, 0, 0, 0, 0, 0) != null);
+}
+
+test "executing a statistics request clears the buffer it names" {
+    const std = @import("std");
+    const gpu = @import("gpu");
+    const testing = std.testing;
+
+    var db = Database{};
+    defer db.deinit(testing.allocator);
+    try registerAll(&db, testing.allocator);
+
+    const stats = try agcEntryPoint(&db, "vuSXe69VILM", AgcGetLodStats);
+
+    // The numbers a previous frame left behind, and a witness on each side of
+    // the buffer that clearing must not reach. The size is deliberately not a
+    // multiple of the chunk the executor clears in.
+    var arena: [512]u8 align(64) = @splat(0xcd);
+    const reported = arena[64 .. 64 + 300];
+
+    var words: [16]u32 = @splat(0);
+    var buffer = sizedBuffer(&words);
+    try testing.expect(stats(
+        &buffer,
+        1,
+        @ptrCast(reported.ptr),
+        @intCast(reported.len),
+        7,
+        0,
+        1,
+        9,
+    ) != null);
+    const used = (@intFromPtr(buffer.cursor_up.?) - @intFromPtr(words[0..].ptr)) / @sizeOf(u32);
+
+    var probe = PredicationProbe{};
+    var state = gpu.State{};
+    _ = try runPredicated(&probe, &state, words[0..used]);
+
+    // No part of this emulator samples residency, so the honest report is that
+    // nothing was sampled -- neither the previous numbers left in place, nor a
+    // count the hardware never produced.
+    for (reported) |byte| try testing.expectEqual(@as(u8, 0), byte);
+    for (arena[0..64]) |byte| try testing.expectEqual(@as(u8, 0xcd), byte);
+    for (arena[64 + 300 ..]) |byte| try testing.expectEqual(@as(u8, 0xcd), byte);
+
+    // The request itself is decoded back out of the packet.
+    const seen = state.last_lod_stats.?;
+    try testing.expectEqual(@as(u64, @intFromPtr(reported.ptr)), seen.address);
+    try testing.expectEqual(@as(u32, 300), seen.size_in_bytes);
+    try testing.expectEqual(@as(u2, 1), seen.cache_policy);
+    try testing.expect(seen.report_and_reset);
+    try testing.expect(!seen.force_reset);
+    try testing.expectEqual(@as(u8, 7), seen.reset_count);
+    try testing.expectEqual(@as(u8, 9), seen.reporting_interval);
+    try testing.expectEqual(@as(u64, 1), state.lod_stats_count);
+
+    // The form that names no buffer is counted and touches nothing.
+    var stop: [16]u32 = @splat(0);
+    var stop_buffer = sizedBuffer(&stop);
+    try testing.expect(stats(&stop_buffer, 0, null, 0, 0, 1, 0, 0) != null);
+    const stop_used = (@intFromPtr(stop_buffer.cursor_up.?) - @intFromPtr(stop[0..].ptr)) / @sizeOf(u32);
+    _ = try runPredicated(&probe, &state, stop[0..stop_used]);
+    try testing.expectEqual(@as(u64, 2), state.lod_stats_count);
+    try testing.expectEqual(@as(u64, 0), state.last_lod_stats.?.address);
+    for (arena[0..64]) |byte| try testing.expectEqual(@as(u8, 0xcd), byte);
+}

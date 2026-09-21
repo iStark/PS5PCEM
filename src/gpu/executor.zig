@@ -703,6 +703,10 @@ pub const DcbExecutor = struct {
             try self.dmaData(packet);
             return .complete;
         }
+        if (packet.opcode == pm4.get_lod_stats) {
+            try self.getLodStats(packet);
+            return .complete;
+        }
         if (packet.opcode == pm4.event_write) {
             try self.eventWrite(packet);
             return .complete;
@@ -1172,6 +1176,52 @@ pub const DcbExecutor = struct {
         }
         self.state.last_write = info;
         self.state.write_data_count += 1;
+    }
+
+    /// Answers a request for level-of-detail statistics with no samples.
+    ///
+    /// The packet names a buffer the command processor is to fill with texture
+    /// residency feedback: which mip levels the shaders asked for against
+    /// which were resident, so a streaming system can decide what to load. No
+    /// part of this emulator collects that, so there is nothing to report and
+    /// the buffer is cleared.
+    ///
+    /// Clearing it is the honest answer and not merely the convenient one. It
+    /// says no sampling events were recorded over the interval. Leaving the
+    /// buffer untouched would be worse: a title that reuses it reads last
+    /// frame's numbers back as though they were this frame's, and one asking
+    /// for the first time reads whatever was in the memory. Filling in counts
+    /// the hardware never produced would be worse still -- a streaming system
+    /// acts on them.
+    fn getLodStats(self: *DcbExecutor, packet: pm4.Packet) Error!void {
+        if (packet.body.len != 4) return Error.InvalidPacket;
+        const body = packet.body;
+        const control = body[3];
+        const value = gpu_state.LodStats{
+            // The low six bits of the address word are not part of the
+            // address; the writer refuses anything that would need them.
+            .address = (@as(u64, body[2]) << 32) | (body[1] & 0xffff_ffc0),
+            .size_in_bytes = body[0],
+            .cache_policy = @truncate((control >> 28) & 0x3),
+            .report_and_reset = control & (1 << 19) != 0,
+            .force_reset = control & (1 << 18) != 0,
+            .reset_count = @truncate((control >> 10) & 0xff),
+            .reporting_interval = @truncate((control >> 2) & 0xff),
+        };
+        self.state.last_lod_stats = value;
+        self.state.lod_stats_count += 1;
+
+        // A packet naming no buffer is how a title stops the reporting it
+        // started; there is nothing to clear.
+        if (value.address == 0 or value.size_in_bytes == 0) return;
+
+        const zeros: [256]u8 = @splat(0);
+        var written: u32 = 0;
+        while (written < value.size_in_bytes) {
+            const chunk = @min(@as(u32, zeros.len), value.size_in_bytes - written);
+            try self.backend.write(value.address + written, zeros[0..chunk]);
+            written += chunk;
+        }
     }
 
     /// Copies one word or quadword through the backend's ordered memory path.

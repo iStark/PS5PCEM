@@ -179,6 +179,26 @@ pub const CopyData = struct {
     source_address_or_immediate: u64,
     destination_address: u64,
 };
+/// What one request for level-of-detail statistics asks for.
+///
+/// A title hands the command processor a buffer and asks it to report, at an
+/// interval, how the texture levels it sampled compare with the ones it has
+/// resident -- the feedback a streaming system uses to decide what to load
+/// next. The address is held to a sixty-four byte boundary by the field that
+/// carries it.
+pub const LodStats = struct {
+    address: u64,
+    size_in_bytes: u32,
+    cache_policy: u2,
+    /// Report what has accumulated and start again from nothing.
+    report_and_reset: bool,
+    /// Start again from nothing without reporting.
+    force_reset: bool,
+    reset_count: u8,
+    /// How long between reports, in hundreds of thousands of clocks.
+    reporting_interval: u8,
+};
+
 /// What one context-state packet asks the command processor to do with the
 /// context register file.
 ///
@@ -228,6 +248,7 @@ pub const State = struct {
     last_flip: ?Flip = null,
     last_predication: ?SetPredication = null,
     last_copy: ?CopyData = null,
+    last_lod_stats: ?LodStats = null,
 
     /// Whether packets carrying the predicate bit are currently dropped.
     ///
@@ -273,6 +294,8 @@ pub const State = struct {
     copy_data_count: u64 = 0,
     /// Transfers whose selectors name something this does not move yet.
     copy_data_unsupported_count: u64 = 0,
+
+    lod_stats_count: u64 = 0,
 
     context_state_clear_count: u64 = 0,
     context_state_push_count: u64 = 0,

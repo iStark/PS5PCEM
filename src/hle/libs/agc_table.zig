@@ -86,7 +86,6 @@ pub const exports = [_]symbols.Export{
     .{ .name = "sceAgcDcbDrawIndirectMulti", .function = trace.wrap("sceAgcDcbDrawIndirectMulti", &agc.drawIndirectMulti), .expect_id = "kUlvghKs-mA" },
     .{ .name = "sceAgcDcbDrawIndexIndirectMulti", .function = trace.wrap("sceAgcDcbDrawIndexIndirectMulti", &agc.drawIndexIndirectMulti), .expect_id = "ypVBz4uPKcQ" },
     .{ .name = "sceAgcDcbDrawIndexMultiInstanced", .function = trace.wrap("sceAgcDcbDrawIndexMultiInstanced", &agc.drawIndexMultiInstanced), .expect_id = "Rlx+bykm0r0" },
-    .{ .name = "sceAgcDcbGetLodStats", .function = trace.wrap("sceAgcDcbGetLodStats", &agc.writeCommand), .expect_id = "vuSXe69VILM" },
     .{ .name = "sceAgcDcbPrimeUtcl2", .function = trace.wrap("sceAgcDcbPrimeUtcl2", &agc.writeCommand), .expect_id = "jt3pl7EN17o" },
     .{ .name = "sceAgcDcbSetIndexIndirectArgs", .function = trace.wrap("sceAgcDcbSetIndexIndirectArgs", &agc.writeCommand), .expect_id = "0o3VDdtA6nM" },
     .{ .name = "sceAgcDcbSetMarker", .function = trace.wrap("sceAgcDcbSetMarker", &agc.writeCommand), .expect_id = "QhCbS4X9Rl8" },
@@ -118,7 +117,6 @@ pub const exports = [_]symbols.Export{
     // takes the first match.
     .{ .name = "sceAgcDcbDrawIndexIndirectGetSize", .function = trace.wrap("sceAgcDcbDrawIndexIndirectGetSize", &agc.drawIndexIndirectGetSize), .expect_id = "mStuvI0zOtc" },
     .{ .name = "sceAgcDcbDrawIndexMultiInstancedGetSize", .function = trace.wrap("sceAgcDcbDrawIndexMultiInstancedGetSize", &agc.drawIndexMultiInstancedGetSize), .expect_id = "mR9j7+SfM34" },
-    .{ .name = "sceAgcDcbGetLodStatsGetSize", .function = trace.wrap("sceAgcDcbGetLodStatsGetSize", &agc.commandSize), .expect_id = "rUuVjyR+Rd4" },
     .{ .name = "sceAgcDcbSetBaseDispatchIndirectArgsGetSize", .function = trace.wrap("sceAgcDcbSetBaseDispatchIndirectArgsGetSize", &agc.setBaseDrawIndirectArgsGetSize), .expect_id = "9S4noWrUI0s" },
     .{ .name = "sceAgcDcbSetBaseDrawIndirectArgsGetSize", .function = trace.wrap("sceAgcDcbSetBaseDrawIndirectArgsGetSize", &agc.setBaseDrawIndirectArgsGetSize), .expect_id = "MMlmJAL7N5w" },
     .{ .name = "sceAgcDcbBeginOcclusionQueryGetSize", .function = trace.wrap("sceAgcDcbBeginOcclusionQueryGetSize", &agc.commandSize), .expect_id = "ms1xVoZ-Vwc" },
