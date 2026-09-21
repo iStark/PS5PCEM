@@ -2588,6 +2588,22 @@ fn agcDcbRewind(
     return writeExactAgcPacket(buffer, gpu.pm4.rewind, &body);
 }
 
+/// Bytes one wait on a memory address occupies.
+///
+/// The width follows the argument, because the packet does: a 32-bit wait
+/// carries one word of mask and one of reference and comes to seven dwords, a
+/// 64-bit wait carries two of each and comes to nine. Both forms, graphics and
+/// compute, go through the same writer and so have the same widths. Zero for a
+/// width the writer refuses, so a caller that sizes first never reserves room
+/// for a command that will not appear.
+fn agcWaitOnAddressGetSize(size: u64) callconv(abi.guest) u32 {
+    return switch (size) {
+        0 => 7 * @sizeOf(u32),
+        1 => 9 * @sizeOf(u32),
+        else => 0,
+    };
+}
+
 /// REWIND: header and control word.
 fn agcDcbRewindGetSize() callconv(abi.guest) u32 {
     return 2 * @sizeOf(u32);
@@ -4543,6 +4559,8 @@ const agc_exports = [_]symbols.Export{
     .{ .name = "sceAgcGetGsOversubscription", .function = trace.wrap("sceAgcGetGsOversubscription", &agcGetGsOversubscription), .expect_id = "NKIzURsgV7I" },
     .{ .name = "sceAgcDcbRewind", .function = trace.wrap("sceAgcDcbRewind", &agcDcbRewind), .expect_id = "zfcxg-ewMK8" },
     .{ .name = "sceAgcDcbRewindGetSize", .function = trace.wrap("sceAgcDcbRewindGetSize", &agcDcbRewindGetSize), .expect_id = "QIXCsbipds0" },
+    .{ .name = "sceAgcDcbWaitOnAddressGetSize", .function = trace.wrap("sceAgcDcbWaitOnAddressGetSize", &agcWaitOnAddressGetSize), .expect_id = "43WJ08sSugE" },
+    .{ .name = "sceAgcAcbWaitOnAddressGetSize", .function = trace.wrap("sceAgcAcbWaitOnAddressGetSize", &agcWaitOnAddressGetSize), .expect_id = "idlaArvdXEs" },
     .{ .name = "sceAgcDcbCopyDataGetSize", .function = trace.wrap("sceAgcDcbCopyDataGetSize", &agcCopyDataGetSize), .expect_id = "b5u0Jzm8TF8" },
     .{ .name = "sceAgcAcbCopyDataGetSize", .function = trace.wrap("sceAgcAcbCopyDataGetSize", &agcCopyDataGetSize), .expect_id = "CbQh3DKMSno" },
     .{ .name = "sceAgcCbSetShRegistersDirectGetSize", .function = trace.wrap("sceAgcCbSetShRegistersDirectGetSize", &agcSetRegistersDirectGetSize), .expect_id = "yUBESvCCJ4I" },

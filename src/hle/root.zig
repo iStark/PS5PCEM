@@ -3900,3 +3900,107 @@ test "an indirect-buffer patch refuses what it cannot honour" {
     try testing.expectEqual(errno.ok, patch(mapped, 0, 0x1000, 1, 0, 0));
     try testing.expectEqual(@as(u32, 0x1000), mapped[1] & 0xffff_fffc);
 }
+
+// ---------------------------------------------------------------------------
+// Waiting on an address
+//
+// The constructor and the size query are named after different things -- one
+// is a wait on a register or memory, the other a wait on an address -- which
+// is how the pair came to disagree. These check them against each other.
+
+test "a wait on an address fits the size it reports" {
+    const std = @import("std");
+    const gpu = @import("gpu");
+    const testing = std.testing;
+
+    var db = Database{};
+    defer db.deinit(testing.allocator);
+    try registerAll(&db, testing.allocator);
+
+    const get_size = try agcEntryPoint(&db, "43WJ08sSugE", AgcGetSize);
+    const acb_get_size = try agcEntryPoint(&db, "idlaArvdXEs", AgcGetSize);
+
+    // Nine arguments, so the wait constructors cannot go through the shape the
+    // other commands share.
+    const Wait = fn (
+        ?*libs.agc.CommandBuffer,
+        u64,
+        u64,
+        u64,
+        u64,
+        u64,
+        u64,
+        u64,
+        u64,
+    ) callconv(abi.guest) ?[*]u32;
+    const AcbWait = fn (
+        ?*libs.agc.CommandBuffer,
+        u64,
+        u64,
+        u64,
+        u64,
+        u64,
+        u64,
+        u64,
+    ) callconv(abi.guest) ?[*]u32;
+    const wait = try agcEntryPoint(&db, "VmW0Tdpy420", Wait);
+    const acb_wait = try agcEntryPoint(&db, "htn36gPnBk4", AcbWait);
+
+    var label: [2]u32 align(8) = @splat(0);
+    const label_address = @intFromPtr(&label);
+
+    // A 32-bit wait is seven dwords and a 64-bit one is nine, and the graphics
+    // and compute forms agree because they share a writer.
+    for ([_]struct { size: u64, words: u32 }{
+        .{ .size = 0, .words = 7 },
+        .{ .size = 1, .words = 9 },
+    }) |case| {
+        const announced = get_size(case.size, 0, 0, 0, 0, 0);
+        try testing.expectEqual(case.words * @sizeOf(u32), announced);
+        try testing.expectEqual(announced, acb_get_size(case.size, 0, 0, 0, 0, 0));
+        const announced_words = announced / @sizeOf(u32);
+
+        // Exactly the announced span, with guard words past it.
+        var storage: [32]u32 = @splat(guard_word);
+        var buffer = sizedBuffer(storage[0..announced_words]);
+        try testing.expect(wait(&buffer, case.size, 3, 0, 0, label_address, 1, 0xffff_ffff, 0x10) != null);
+        try testing.expectEqual(
+            @as(usize, announced),
+            @intFromPtr(buffer.cursor_up.?) - @intFromPtr(storage[0..].ptr),
+        );
+        for (storage[announced_words..]) |word| try testing.expectEqual(guard_word, word);
+
+        // One walkable packet of exactly that width.
+        var walker = gpu.pm4.Walker.init(storage[0..announced_words]);
+        const packet = (try walker.next()).?;
+        try testing.expectEqual(@as(usize, announced_words), packet.wordCount());
+        try testing.expect((try walker.next()) == null);
+
+        // One word short is refused, and refusing writes nothing.
+        var tight: [32]u32 = @splat(guard_word);
+        var short = sizedBuffer(tight[0 .. announced_words - 1]);
+        try testing.expect(wait(&short, case.size, 3, 0, 0, label_address, 1, 0xffff_ffff, 0x10) == null);
+        for (tight) |word| try testing.expectEqual(guard_word, word);
+
+        // The compute form occupies the same span.
+        var compute: [32]u32 = @splat(guard_word);
+        var compute_buffer = sizedBuffer(compute[0..announced_words]);
+        try testing.expect(acb_wait(&compute_buffer, case.size, 3, 0, label_address, 1, 0xffff_ffff, 0x10) != null);
+        try testing.expectEqual(
+            @as(usize, announced),
+            @intFromPtr(compute_buffer.cursor_up.?) - @intFromPtr(compute[0..].ptr),
+        );
+        for (compute[announced_words..]) |word| try testing.expectEqual(guard_word, word);
+    }
+
+    // A width the constructor refuses is sized at zero rather than at a span
+    // nothing will occupy.
+    for ([_]u64{ 2, 3, 0xffff_ffff }) |unsupported| {
+        try testing.expectEqual(@as(u32, 0), get_size(unsupported, 0, 0, 0, 0, 0));
+        try testing.expectEqual(@as(u32, 0), acb_get_size(unsupported, 0, 0, 0, 0, 0));
+        var storage: [32]u32 = @splat(guard_word);
+        var buffer = sizedBuffer(&storage);
+        try testing.expect(wait(&buffer, unsupported, 3, 0, 0, label_address, 1, 0xffff_ffff, 0x10) == null);
+        for (storage) |word| try testing.expectEqual(guard_word, word);
+    }
+}
