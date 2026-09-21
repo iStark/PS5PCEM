@@ -842,6 +842,10 @@ const sampled_image_3d_descriptor_binding = dynamic_scalar_descriptor_binding + 
 const sampled_image_cube_descriptor_binding = dynamic_scalar_descriptor_binding + 2;
 const sampled_image_2d_array_descriptor_binding = dynamic_scalar_descriptor_binding + 3;
 const gds_descriptor_binding = sampled_image_2d_array_descriptor_binding + 1;
+const sampled_image_comparison_2d_descriptor_binding = gds_descriptor_binding + 1;
+comptime {
+    std.debug.assert(sampled_image_comparison_2d_descriptor_binding == rdna2.spirv.sampled_image_comparison_2d_descriptor_binding);
+}
 const dynamic_scalar_words_per_stage = gpu.scalar_provenance.maximum_scalar_specializations;
 const dynamic_scalar_buffer_words = dynamic_scalar_words_per_stage * 2;
 const dynamic_scalar_buffer_bytes = dynamic_scalar_buffer_words * @sizeOf(u32);
@@ -956,21 +960,23 @@ fn sampledImageDescriptorBindings(mappings: []const gpu.ShaderSpirvSampledImageB
             if (mapping.unbound or mapping.descriptor_index >= bindings.len) continue;
             const slot = &bindings[mapping.descriptor_index];
             if (slot.* != std.math.maxInt(u32)) continue;
-            slot.* = sampledImageDescriptorBinding(mapping.dimension);
+            slot.* = sampledImageDescriptorBinding(mapping);
         }
     } else {
         for (bindings, 0..) |*slot, index| {
             for (mappings) |mapping| {
                 if (mapping.unbound or mapping.descriptor_index != index) continue;
-                slot.* = sampledImageDescriptorBinding(mapping.dimension);
+                slot.* = sampledImageDescriptorBinding(mapping);
                 break;
             }
         }
     }
 }
 
-fn sampledImageDescriptorBinding(dimension: rdna2.spirv.SampledImageDimension) u32 {
-    return switch (dimension) {
+fn sampledImageDescriptorBinding(mapping: gpu.ShaderSpirvSampledImageBinding) u32 {
+    if (mapping.comparison and mapping.dimension == .two_d)
+        return sampled_image_comparison_2d_descriptor_binding;
+    return switch (mapping.dimension) {
         .two_d => rdna2.spirv.sampled_image_2d_descriptor_binding,
         .three_d => sampled_image_3d_descriptor_binding,
         .cube => sampled_image_cube_descriptor_binding,
@@ -4377,7 +4383,7 @@ pub const Renderer = struct {
             .descriptor_count = candidate.info.sampled_image_capacity,
             .stage_flags = vk.shader_stage_vertex_bit | vk.shader_stage_fragment_bit | vk.shader_stage_compute_bit,
         };
-        var descriptor_bindings: [7 + maximum_storage_images]vk.DescriptorSetLayoutBinding = undefined;
+        var descriptor_bindings: [8 + maximum_storage_images]vk.DescriptorSetLayoutBinding = undefined;
         descriptor_bindings[0] = storage_binding;
         descriptor_bindings[1] = sampled_image_binding;
         for (0..maximum_storage_images) |index| {
@@ -4420,6 +4426,12 @@ pub const Renderer = struct {
             .descriptor_count = 1,
             .stage_flags = vk.shader_stage_compute_bit,
         };
+        descriptor_bindings[7 + maximum_storage_images] = .{
+            .binding = sampled_image_comparison_2d_descriptor_binding,
+            .descriptor_type = vk.descriptor_type_combined_image_sampler,
+            .descriptor_count = candidate.info.sampled_image_capacity,
+            .stage_flags = vk.shader_stage_vertex_bit | vk.shader_stage_fragment_bit | vk.shader_stage_compute_bit,
+        };
         var descriptor_binding_flags: [descriptor_bindings.len]vk.Flags = @splat(0);
         if (descriptor_partially_bound) {
             @memset(&descriptor_binding_flags, vk.descriptor_binding_partially_bound_bit);
@@ -4452,7 +4464,7 @@ pub const Renderer = struct {
         };
         const image_pool_size = vk.DescriptorPoolSize{
             .descriptor_type = vk.descriptor_type_combined_image_sampler,
-            .descriptor_count = candidate.info.sampled_image_capacity * 4 * maximum_frame_descriptor_sets,
+            .descriptor_count = candidate.info.sampled_image_capacity * 5 * maximum_frame_descriptor_sets,
         };
         const storage_image_pool_size = vk.DescriptorPoolSize{
             .descriptor_type = vk.descriptor_type_storage_image,
@@ -10086,6 +10098,7 @@ pub const Renderer = struct {
                         return Error.UnsupportedSampledImage;
                     };
                 if (inst.opcode == .image_gather4) sampler_descriptor = pointGatherSampler(sampler_descriptor);
+                sampler_descriptor.compare_sample = comparesThroughSampler(inst);
                 const sampled_dimension = sampledImageDimensionForInstruction(
                     inst.image_dimension,
                     image_descriptor.image_type,
@@ -10156,6 +10169,7 @@ pub const Renderer = struct {
                     .instruction_pc = inst.pc,
                     .candidate_words = candidate_words,
                     .depth_compare = sampler_descriptor.depth_compare,
+                    .comparison = sampler_descriptor.compare_sample,
                     .minimum_lod = sampler_descriptor.minimum_lod,
                     .maximum_lod = sampler_descriptor.maximum_lod,
                 };
@@ -12545,7 +12559,7 @@ pub const Renderer = struct {
                 self.last_depth_reject = 6;
                 continue;
             }
-            if (self.resident_depth_sample_reports < 8 or self.traceCurrentGraphicsFrame()) {
+            if (self.resident_depth_sample_reports < 8) {
                 std.debug.print(
                     "[vulkan dcb] sampled resident depth @0x{x} {d}x{d} fmt={d}->{d}\n",
                     .{
@@ -18927,6 +18941,7 @@ pub const Renderer = struct {
                     return Error.UnsupportedSampledImage;
                 };
             if (inst.opcode == .image_gather4) sampler_descriptor = pointGatherSampler(sampler_descriptor);
+            sampler_descriptor.compare_sample = comparesThroughSampler(inst);
             const sampled_dimension = sampledImageDimensionForInstruction(
                 inst.image_dimension,
                 image_descriptor.image_type,
@@ -19000,6 +19015,7 @@ pub const Renderer = struct {
                 .dimension = sampled_dimension,
                 .instruction_pc = inst.pc,
                 .depth_compare = sampler_descriptor.depth_compare,
+                .comparison = sampler_descriptor.compare_sample,
                 .minimum_lod = sampler_descriptor.minimum_lod,
                 .maximum_lod = sampler_descriptor.maximum_lod,
             };
@@ -19038,6 +19054,7 @@ pub const Renderer = struct {
         }
         var sampler = candidates.sampler orelse (try resolveComputeSamplerDescriptor(bindings, reader, analysis, scalar, inst.src2.reg, inst.pc, sampler_slot)) orelse return false;
         if (inst.opcode == .image_gather4) sampler = pointGatherSampler(sampler);
+        sampler.compare_sample = comparesThroughSampler(inst);
         for (candidates.words[0..candidates.count]) |words| {
             const descriptor = try gpu.resources.decodeImageDescriptor(words[0..inst.imageResourceWords()]);
             const dimension = sampledImageDimensionForInstruction(inst.image_dimension, descriptor.image_type) orelse return false;
@@ -19069,6 +19086,7 @@ pub const Renderer = struct {
                 .instruction_pc = inst.pc,
                 .candidate_words = words,
                 .depth_compare = sampler.depth_compare,
+                .comparison = sampler.compare_sample,
                 .minimum_lod = sampler.minimum_lod,
                 .maximum_lod = sampler.maximum_lod,
             };
@@ -27511,6 +27529,16 @@ fn vulkanAddressMode(mode: u8) Error!u32 {
     };
 }
 
+/// Whether this instruction reads through its sampler with a depth reference.
+///
+/// Only a plain sample hands the reference to the sampler. `image_gather4`
+/// carries one too, but its comparison happens per texel before filtering,
+/// which the translator performs in the shader -- so its sampler has to stay
+/// an ordinary one, or the gather would compare twice.
+fn comparesThroughSampler(inst: rdna2.Instruction) bool {
+    return inst.image_sample_flags.compare and inst.opcode != .image_gather4;
+}
+
 fn pointGatherSampler(descriptor: gpu.resources.SamplerDescriptor) gpu.resources.SamplerDescriptor {
     var result = descriptor;
     // Gather returns individual texels even when the guest sampler requests
@@ -27545,6 +27573,13 @@ fn guestSamplerCreateInfo(descriptor: gpu.resources.SamplerDescriptor) Error!vk.
         .minimum_lod = if (unnormalized) 0 else descriptor.minimum_lod,
         .maximum_lod = if (unnormalized) 0 else descriptor.maximum_lod,
         .unnormalized_coordinates = @intFromBool(unnormalized),
+        // A depth reference is compared by the sampler in Vulkan, and only a
+        // sampler built for it may be read that way. The guest comparison
+        // function shares its encoding with Vulkan, value for value, so it
+        // carries over unchanged -- including NEVER, which a shader asking
+        // for it means.
+        .compare_enable = @intFromBool(descriptor.compare_sample),
+        .compare_operation = if (descriptor.compare_sample) descriptor.depth_compare else 0,
     };
 }
 
@@ -27593,7 +27628,9 @@ fn sampledImageStateHash(
             (@as(u32, descriptor.dst_select[1]) << 8) |
             (@as(u32, descriptor.dst_select[2]) << 16) |
             (@as(u32, descriptor.dst_select[3]) << 24),
-        @intFromBool(sampler.force_srgb),
+        @as(u32, @intFromBool(sampler.force_srgb)) |
+            (@as(u32, @intFromBool(sampler.compare_sample)) << 1) |
+            (@as(u32, sampler.depth_compare) << 2),
         @as(u32, sampler.clamp_x) |
             (@as(u32, sampler.clamp_y) << 8) |
             (@as(u32, sampler.clamp_z) << 16) |
@@ -30114,11 +30151,11 @@ fn choosePhysicalDevice(
         const other_descriptors = maximum_storage_descriptors + maximum_storage_images + 2;
         info.sampled_image_capacity = @min(
             maximum_sampled_images,
-            limits.max_per_stage_descriptor_samplers / 4,
-            limits.max_per_stage_descriptor_sampled_images / 4,
-            limits.max_descriptor_set_samplers / 4,
-            limits.max_descriptor_set_sampled_images / 4,
-            (limits.max_per_stage_resources -| other_descriptors) / 4,
+            limits.max_per_stage_descriptor_samplers / 5,
+            limits.max_per_stage_descriptor_sampled_images / 5,
+            limits.max_descriptor_set_samplers / 5,
+            limits.max_descriptor_set_sampled_images / 5,
+            (limits.max_per_stage_resources -| other_descriptors) / 5,
         );
         if (info.sampled_image_capacity == 0) continue;
         @memcpy(info.name_bytes[0..name_length], name_source[0..name_length]);
@@ -31886,6 +31923,13 @@ test "sampled image view identity excludes sampler filtering state" {
         sampledImageViewStateHash(descriptor, sampler_a.force_srgb),
         sampledImageViewStateHash(descriptor, sampler_b.force_srgb),
     );
+
+    // Reading one guest sampler with a depth reference and without needs two
+    // Vulkan samplers, so the two reads must not share a cached image either.
+    var sampler_compare = sampler_a;
+    sampler_compare.compare_sample = true;
+    try std.testing.expect(sampledImageStateHash(descriptor, sampler_a) !=
+        sampledImageStateHash(descriptor, sampler_compare));
 }
 
 test "RGB10A2 UNORM storage images preserve packed color semantics" {
@@ -32475,6 +32519,56 @@ test "unnormalized guest samplers satisfy Vulkan restrictions" {
     try std.testing.expectEqual(@as(f32, 0), info.mip_lod_bias);
     try std.testing.expectEqual(@as(f32, 0), info.minimum_lod);
     try std.testing.expectEqual(@as(f32, 0), info.maximum_lod);
+}
+
+test "a depth reference builds a comparison sampler and an ordinary read does not" {
+    // DEPTH_COMPARE_FUNC occupies bits 12..14 of the first sampler word. Three
+    // is LESS_OR_EQUAL, which is what a shadow lookup normally asks for.
+    const words = [_]u32{ 3 << 12, 0, 0, 0 };
+    const guest = try gpu.resources.decodeSamplerDescriptor(&words);
+    try std.testing.expectEqual(@as(u8, 3), guest.depth_compare);
+
+    // The same guest sampler read without a depth reference stays an ordinary
+    // sampler: hardware ignores the function there, and a comparison sampler
+    // may not be read that way in Vulkan at all.
+    try std.testing.expect(!guest.compare_sample);
+    const plain = try guestSamplerCreateInfo(guest);
+    try std.testing.expectEqual(@as(vk.Bool32, 0), plain.compare_enable);
+
+    // Read with one, it becomes a comparison sampler carrying that function.
+    var comparing = guest;
+    comparing.compare_sample = true;
+    const shadow = try guestSamplerCreateInfo(comparing);
+    try std.testing.expectEqual(@as(vk.Bool32, 1), shadow.compare_enable);
+    try std.testing.expectEqual(@as(u32, 3), shadow.compare_operation);
+
+    // NEVER is a function a shader can ask for, not an absent one, so it is
+    // carried over rather than treated as "no comparison".
+    var never = try gpu.resources.decodeSamplerDescriptor(&[_]u32{ 0, 0, 0, 0 });
+    try std.testing.expectEqual(@as(u8, 0), never.depth_compare);
+    never.compare_sample = true;
+    const refusing = try guestSamplerCreateInfo(never);
+    try std.testing.expectEqual(@as(vk.Bool32, 1), refusing.compare_enable);
+    try std.testing.expectEqual(@as(u32, 0), refusing.compare_operation);
+}
+
+test "only a plain sample hands its depth reference to the sampler" {
+    // A sample carrying a reference.
+    try std.testing.expect(comparesThroughSampler(.{
+        .opcode = .image_sample,
+        .image_sample_flags = .{ .compare = true },
+    }));
+    // The same flag on a gather, whose comparison the translator performs per
+    // texel in the shader. Its sampler has to stay ordinary.
+    try std.testing.expect(!comparesThroughSampler(.{
+        .opcode = .image_gather4,
+        .image_sample_flags = .{ .compare = true },
+    }));
+    // No reference at all.
+    try std.testing.expect(!comparesThroughSampler(.{
+        .opcode = .image_sample,
+        .image_sample_flags = .{},
+    }));
 }
 
 test "buffer table plans follow reaching loads and offsets across sibling branches" {

@@ -262,6 +262,16 @@ pub const SamplerDescriptor = struct {
     clamp_z: u8,
     maximum_anisotropy: u8,
     depth_compare: u8,
+    /// Whether the shader samples through this sampler with a depth reference.
+    ///
+    /// Hardware decides that per instruction -- the sampler only carries the
+    /// comparison function, and an ordinary sample through the same sampler
+    /// ignores it. Vulkan decides it per sampler instead, and a sampler must
+    /// be built for one use or the other. So this is not decoded from the
+    /// guest sampler: the caller sets it from the instruction that reads
+    /// through the sampler, and two uses of one guest sampler become two
+    /// Vulkan samplers.
+    compare_sample: bool = false,
     unnormalized_coordinates: bool,
     force_srgb: bool,
     trunc_coordinates: bool,

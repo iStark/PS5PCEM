@@ -111,6 +111,10 @@ pub const SampledImageBinding = struct {
     unbound_fault_descriptor: ?u32 = null,
     /// Gather comparisons operate on each texel before any filtering.
     depth_compare: u8 = 7,
+    /// The sampled image is read through a Vulkan comparison sampler.  This
+    /// selects an OpTypeImage with Depth=1; gather4 deliberately leaves this
+    /// false because its comparison is lowered per texel in the shader.
+    comparison: bool = false,
     minimum_lod: f32 = 0,
     maximum_lod: f32 = 16,
 };
@@ -128,6 +132,7 @@ pub const sampled_image_3d_descriptor_binding: u32 = 3 + maximum_storage_images;
 pub const sampled_image_cube_descriptor_binding: u32 = 4 + maximum_storage_images;
 pub const sampled_image_2d_array_descriptor_binding: u32 = 5 + maximum_storage_images;
 pub const gds_descriptor_binding: u32 = 6 + maximum_storage_images;
+pub const sampled_image_comparison_2d_descriptor_binding: u32 = gds_descriptor_binding + 1;
 
 fn sampledImageDimensionIndex(dimension: SampledImageDimension) usize {
     return switch (dimension) {
@@ -136,6 +141,26 @@ fn sampledImageDimensionIndex(dimension: SampledImageDimension) usize {
         .cube => 2,
         .two_d_array => 3,
     };
+}
+
+fn sampledImageArray(self: *const Builder, binding: SampledImageBinding) u32 {
+    if (binding.comparison and binding.dimension == .two_d) return self.sampled_image_comparison_array;
+    return self.sampled_image_arrays[sampledImageDimensionIndex(binding.dimension)];
+}
+
+fn sampledImageType(self: *const Builder, binding: SampledImageBinding) u32 {
+    if (binding.comparison and binding.dimension == .two_d) return self.sampled_image_comparison_type;
+    return self.sampled_image_types[sampledImageDimensionIndex(binding.dimension)];
+}
+
+fn sampledImageImageType(self: *const Builder, binding: SampledImageBinding) u32 {
+    if (binding.comparison and binding.dimension == .two_d) return self.sampled_image_comparison_image_type;
+    return self.sampled_image_image_types[sampledImageDimensionIndex(binding.dimension)];
+}
+
+fn sampledImagePointerType(self: *const Builder, binding: SampledImageBinding) u32 {
+    if (binding.comparison and binding.dimension == .two_d) return self.sampled_image_comparison_pointer_type;
+    return self.sampled_image_pointer_types[sampledImageDimensionIndex(binding.dimension)];
 }
 
 /// Static association between a GFX10 T# and an element in Vulkan's storage
@@ -950,6 +975,10 @@ const Builder = struct {
     sampled_image_types: [4]u32 = @splat(0),
     sampled_image_arrays: [4]u32 = @splat(0),
     sampled_image_pointer_types: [4]u32 = @splat(0),
+    sampled_image_comparison_image_type: u32 = 0,
+    sampled_image_comparison_type: u32 = 0,
+    sampled_image_comparison_array: u32 = 0,
+    sampled_image_comparison_pointer_type: u32 = 0,
     storage_image_types: [maximum_storage_images]u32 = @splat(0),
     storage_image_pointer_types: [maximum_storage_images]u32 = @splat(0),
     storage_image_vector_types: [maximum_storage_images]u32 = @splat(0),
@@ -1436,8 +1465,11 @@ const Builder = struct {
             }
             try validateSampledImageBindings(allocator, options.sampled_images, sampled_array_length);
             var sampled_dimensions: [4]bool = @splat(false);
+            var comparison_2d = false;
             for (options.sampled_images) |binding| {
-                if (!binding.unbound) sampled_dimensions[sampledImageDimensionIndex(binding.dimension)] = true;
+                if (binding.unbound) continue;
+                sampled_dimensions[sampledImageDimensionIndex(binding.dimension)] = true;
+                comparison_2d = comparison_2d or (binding.comparison and binding.dimension == .two_d);
             }
             if (self.vector4_type == 0) {
                 self.vector4_type = self.id();
@@ -1495,6 +1527,36 @@ const Builder = struct {
                 try self.emit(&self.declarations, 32, &.{ array_pointer, 0, descriptor_array }); // ptr UniformConstant
                 try self.emit(&self.declarations, 32, &.{ self.sampled_image_pointer_types[dimension_index], 0, self.sampled_image_types[dimension_index] });
                 try self.emit(&self.declarations, 59, &.{ array_pointer, self.sampled_image_arrays[dimension_index], 0 }); // OpVariable
+            }
+            if (comparison_2d) {
+                // A Dref sample must use an OpTypeImage whose Depth operand is
+                // one. Keep comparison images in their own descriptor bank:
+                // Vulkan requires the sampler and image type to agree, while
+                // ordinary colour samples must continue using Depth=0.
+                const image_type = self.id();
+                self.sampled_image_comparison_image_type = image_type;
+                self.sampled_image_comparison_type = self.id();
+                const descriptor_array = self.id();
+                const array_pointer = self.id();
+                self.sampled_image_comparison_pointer_type = self.id();
+                self.sampled_image_comparison_array = self.id();
+                try self.emit(&self.annotations, 71, &.{ self.sampled_image_comparison_array, 34, 0 }); // DescriptorSet 0
+                try self.emit(&self.annotations, 71, &.{ self.sampled_image_comparison_array, 33, sampled_image_comparison_2d_descriptor_binding });
+                try self.emit(&self.declarations, 25, &.{
+                    image_type,
+                    self.float_type,
+                    1, // 2D
+                    1, // Depth image
+                    0, // not arrayed
+                    0, // no multisampling
+                    1, // sampled image
+                    0, // unknown format
+                });
+                try self.emit(&self.declarations, 27, &.{ self.sampled_image_comparison_type, image_type });
+                try self.emit(&self.declarations, 28, &.{ descriptor_array, self.sampled_image_comparison_type, descriptor_count });
+                try self.emit(&self.declarations, 32, &.{ array_pointer, 0, descriptor_array }); // ptr UniformConstant
+                try self.emit(&self.declarations, 32, &.{ self.sampled_image_comparison_pointer_type, 0, self.sampled_image_comparison_type });
+                try self.emit(&self.declarations, 59, &.{ array_pointer, self.sampled_image_comparison_array, 0 }); // OpVariable
             }
         }
         if (options.storage_images.len != 0) {
@@ -4094,19 +4156,21 @@ const Builder = struct {
 
         if (inst.src2.kind == .sgpr) {
             if (self.sampledImageBinding(inst.src1.reg, inst.src2.reg, inst.pc)) |binding| {
-                const dim = sampledImageDimensionIndex(binding.dimension);
-                if (self.sampled_image_arrays[dim] != 0 and self.sampled_image_image_types[dim] != 0) {
+                const sampled_array = sampledImageArray(self, binding);
+                const sampled_type = sampledImageType(self, binding);
+                const image_type = sampledImageImageType(self, binding);
+                if (sampled_array != 0 and image_type != 0) {
                     const pointer = self.id();
                     try self.emit(&self.body, 65, &.{
-                        self.sampled_image_pointer_types[dim],
+                        sampledImagePointerType(self, binding),
                         pointer,
-                        self.sampled_image_arrays[dim],
+                        sampled_array,
                         try self.constant(.bits32, binding.descriptor_index),
                     });
                     const sampled = self.id();
-                    try self.emit(&self.body, 61, &.{ self.sampled_image_types[dim], sampled, pointer });
+                    try self.emit(&self.body, 61, &.{ sampled_type, sampled, pointer });
                     const image = self.id();
-                    try self.emit(&self.body, 100, &.{ self.sampled_image_image_types[dim], image, sampled });
+                    try self.emit(&self.body, 100, &.{ image_type, image, sampled });
                     const size_type: u32 = if (binding.dimension == .two_d)
                         try self.ensureBitsVec2()
                     else
@@ -4249,7 +4313,8 @@ const Builder = struct {
         const binding = self.sampledImageBinding(inst.src1.reg, inst.src2.reg, inst.pc) orelse {
             return Error.InvalidStorageBinding;
         };
-        const dim = sampledImageDimensionIndex(binding.dimension);
+        const sampled_array = sampledImageArray(self, binding);
+        const sampled_type = sampledImageType(self, binding);
         const x = try self.source(try imageAddressOperand(inst, 0), .float32);
         const y = try self.source(try imageAddressOperand(inst, 1), .float32);
         var coordinates = self.id();
@@ -4279,13 +4344,13 @@ const Builder = struct {
         }
         const pointer = self.id();
         try self.emit(&self.body, 65, &.{
-            self.sampled_image_pointer_types[dim],
+            sampledImagePointerType(self, binding),
             pointer,
-            self.sampled_image_arrays[dim],
+            sampled_array,
             try self.constant(.bits32, binding.descriptor_index),
         });
         const sampled = self.id();
-        try self.emit(&self.body, 61, &.{ self.sampled_image_types[dim], sampled, pointer });
+        try self.emit(&self.body, 61, &.{ sampled_type, sampled, pointer });
         const lod = self.id();
         try self.emit(&self.body, 105, &.{ try self.ensureFloatVec2(), lod, sampled, coordinates }); // OpImageQueryLod
         var destination_index: u32 = 0;
@@ -5780,7 +5845,6 @@ const Builder = struct {
     }
 
     fn loadSampledImage(self: *Builder, binding: SampledImageBinding, inst: instruction.Instruction) Error!u32 {
-        const dimension = sampledImageDimensionIndex(binding.dimension);
         var slot = try self.constant(.bits32, binding.descriptor_index);
         if (binding.candidate_words != null) {
             self.uses_nonuniform_sampled_images = true;
@@ -5838,9 +5902,9 @@ const Builder = struct {
             try self.emit(&self.annotations, 71, &.{ slot, 5300 }); // NonUniform
         }
         const pointer = self.id();
-        try self.emit(&self.body, 65, &.{ self.sampled_image_pointer_types[dimension], pointer, self.sampled_image_arrays[dimension], slot });
+        try self.emit(&self.body, 65, &.{ sampledImagePointerType(self, binding), pointer, sampledImageArray(self, binding), slot });
         const sampled = self.id();
-        try self.emit(&self.body, 61, &.{ self.sampled_image_types[dimension], sampled, pointer });
+        try self.emit(&self.body, 61, &.{ sampledImageType(self, binding), sampled, pointer });
         if (binding.candidate_words != null) {
             try self.emit(&self.annotations, 71, &.{ pointer, 5300 });
             try self.emit(&self.annotations, 71, &.{ sampled, 5300 });
@@ -5962,9 +6026,8 @@ const Builder = struct {
         }
         const binding = self.sampledImageBinding(inst.src1.reg, inst.src2.reg, inst.pc) orelse
             return Error.InvalidStorageBinding;
-        const dimension_index = sampledImageDimensionIndex(binding.dimension);
-        if (self.sampled_image_arrays[dimension_index] == 0 or
-            self.sampled_image_image_types[dimension_index] == 0)
+        if (sampledImageArray(self, binding) == 0 or
+            sampledImageImageType(self, binding) == 0)
         {
             return Error.InvalidStorageBinding;
         }
@@ -5981,7 +6044,7 @@ const Builder = struct {
         }
         const sampled_image = try self.loadSampledImage(binding, inst);
         const image = self.id();
-        try self.emit(&self.body, 100, &.{ self.sampled_image_image_types[dimension_index], image, sampled_image }); // OpImage
+        try self.emit(&self.body, 100, &.{ sampledImageImageType(self, binding), image, sampled_image }); // OpImage
         if (binding.candidate_words != null) try self.emit(&self.annotations, 71, &.{ image, 5300 }); // NonUniform
         const texel = self.id();
         const lod = if (explicit_mip)
@@ -6476,7 +6539,6 @@ const Builder = struct {
             return Error.InvalidStorageBinding;
         };
         const image_dimension = binding.dimension;
-        const dimension_index = sampledImageDimensionIndex(image_dimension);
         const instruction_coordinate_components: u8 = if (one_dimensional)
             1
         else if (requested_dimension == .two_d)
@@ -6493,7 +6555,7 @@ const Builder = struct {
             @intFromBool(explicit_lod or biased_lod) +
             gradient_components;
         if ((self.stage != .vertex and self.stage != .fragment and self.stage != .compute) or
-            self.sampled_image_arrays[dimension_index] == 0 or
+            sampledImageArray(self, binding) == 0 or
             (!implicit_lod and !level_zero and !explicit_lod and !biased_lod and !explicit_grad) or
             ((self.stage == .vertex or self.stage == .compute) and
                 !level_zero and !explicit_lod and !explicit_grad) or
@@ -6531,7 +6593,7 @@ const Builder = struct {
         }
         const sampled_image = try self.loadSampledImage(binding, inst);
         if (inst.image_sample_flags.offset) {
-            coordinates = try self.adjustSampleCoordinates(inst, sampled_image, coordinates, image_dimension);
+            coordinates = try self.adjustSampleCoordinates(inst, sampled_image, coordinates, binding);
         }
         const sampled = self.id();
         if (compare) {
@@ -6743,8 +6805,9 @@ const Builder = struct {
         inst: instruction.Instruction,
         sampled_image: u32,
         coordinates: u32,
-        dimension: SampledImageDimension,
+        binding: SampledImageBinding,
     ) Error!u32 {
+        const dimension = binding.dimension;
         if (dimension != .two_d) return coordinates;
 
         self.uses_image_query = true;
@@ -6755,7 +6818,7 @@ const Builder = struct {
         try self.emit(&self.body, 81, &.{ self.signed_type, offset_y, offset, 1 });
 
         const image = self.id();
-        try self.emit(&self.body, 100, &.{ self.sampled_image_image_types[0], image, sampled_image }); // OpImage
+        try self.emit(&self.body, 100, &.{ sampledImageImageType(self, binding), image, sampled_image }); // OpImage
         const size = self.id();
         try self.emit(&self.body, 103, &.{
             try self.ensureBitsVec2(),
@@ -6817,8 +6880,7 @@ const Builder = struct {
         const binding = self.sampledImageBinding(inst.src1.reg, inst.src2.reg, inst.pc) orelse
             return Error.InvalidStorageBinding;
         const dimension: SampledImageDimension = if (arrayed) .two_d_array else .two_d;
-        const dimension_index = sampledImageDimensionIndex(dimension);
-        if (binding.dimension != dimension or self.sampled_image_arrays[dimension_index] == 0) {
+        if (binding.dimension != dimension or sampledImageArray(self, binding) == 0) {
             return Error.InvalidStorageBinding;
         }
         self.uses_image_gather_extended = self.uses_image_gather_extended or inst.image_sample_flags.offset;
@@ -6844,7 +6906,7 @@ const Builder = struct {
             // the four texel centers at the selected mip and compare each
             // fetched depth separately. This also works when depth is exposed
             // through an ordinary R32/R16 sampled view.
-            if (self.sampled_image_image_types[dimension_index] == 0) return Error.InvalidStorageBinding;
+            if (sampledImageImageType(self, binding) == 0) return Error.InvalidStorageBinding;
             const dref = if (compare)
                 try self.source(try imageAddressOperand(inst, dref_index), .float32)
             else
@@ -6866,7 +6928,7 @@ const Builder = struct {
 
             self.uses_image_query = true;
             const image = self.id();
-            try self.emit(&self.body, 100, &.{ self.sampled_image_image_types[dimension_index], image, sampled_image }); // OpImage
+            try self.emit(&self.body, 100, &.{ sampledImageImageType(self, binding), image, sampled_image }); // OpImage
             var lod = try self.constant(.float32, 0);
             var mip = try self.constant(.bits32, 0);
             if (inst.image_sample_flags.lod) {
@@ -11643,6 +11705,8 @@ fn assemble(allocator: std.mem.Allocator, builder: *Builder, options: Options) E
     for (builder.sampled_image_arrays) |sampled_image_array| {
         if (sampled_image_array != 0) try entry_point.append(allocator, sampled_image_array);
     }
+    if (builder.sampled_image_comparison_array != 0)
+        try entry_point.append(allocator, builder.sampled_image_comparison_array);
     for (builder.storage_image_variables) |variable| {
         if (variable != 0) try entry_point.append(allocator, variable);
     }
