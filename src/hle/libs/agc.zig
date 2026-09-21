@@ -807,6 +807,69 @@ pub fn packetSize(
     return ((header >> 16) & 0x3fff) + 2;
 }
 
+/// Where a data packet keeps its payload, and how much of it there is.
+///
+/// A title writes a packet that carries bytes of its own -- a marker string,
+/// a block of user data -- and comes back later to read or rewrite them
+/// without rebuilding the packet. This is how it finds them: hand over the
+/// packet and the form it was written in, and get back the address the payload
+/// starts at and its length in bytes.
+///
+/// The two forms differ only in where the payload begins. One puts it directly
+/// after the header; the other reserves a word in between, and its payload
+/// starts a word later and is a word shorter. The length is taken from the
+/// header's own count field, so the range this reports and the span the
+/// command walker steps over are the same span.
+///
+/// A packet with no body is reported as an empty range rather than as a range
+/// that starts inside the packet after it. That covers the two headers which
+/// carry no length at all: type-2 padding, which has no count field, and the
+/// all-ones count that marks the single-dword filler a builder emits to
+/// realign. Neither encodes a length, so there is nothing to point at -- and
+/// handing back the maximum the field can express would be a range over
+/// whatever follows the packet in the buffer.
+pub const MemoryRange = extern struct {
+    base: ?[*]u32,
+    size: u64,
+};
+
+pub fn dataPacketPayloadRange(
+    range: ?*MemoryRange,
+    packet: ?[*]u32,
+    payload_form: u32,
+    _: u64,
+    _: u64,
+    _: u64,
+) callconv(abi.guest) i32 {
+    const out = range orelse return errno.KernelError.einval.raw();
+    const words = packet orelse return errno.KernelError.einval.raw();
+    if (!kernel_memory.isGuestRangeAccessible(@intFromPtr(out), @sizeOf(MemoryRange))) {
+        return errno.KernelError.efault.raw();
+    }
+    if (!kernel_memory.isGuestRangeAccessible(@intFromPtr(words), @sizeOf(u32))) {
+        return errno.KernelError.efault.raw();
+    }
+
+    const header = words[0];
+    const count = (header >> 16) & 0x3fff;
+    if (header >> 30 != 3 or count == 0x3fff) {
+        out.* = .{ .base = null, .size = 0 };
+        return errno.ok;
+    }
+
+    // `count` is one less than the body, so the body is `count + 1` words and
+    // the words after a reserved one are `count`.
+    const payload_words: u64 = if (payload_form == 0) @as(u64, count) + 1 else count;
+    // An empty range has no base, so a caller that tests the pointer reaches
+    // the same conclusion as one that tests the length. The reserved form of
+    // a one-word packet is the case: every word of it is the reserved one.
+    out.* = if (payload_words == 0)
+        .{ .base = null, .size = 0 }
+    else
+        .{ .base = words + (if (payload_form == 0) @as(usize, 1) else 2), .size = payload_words * @sizeOf(u32) };
+    return errno.ok;
+}
+
 /// Answers "how many" and "which" with nothing.
 pub fn zeroQuery(_: u64, _: u64, _: u64, _: u64, _: u64, _: u64) callconv(abi.guest) u64 {
     return 0;

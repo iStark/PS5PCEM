@@ -4405,3 +4405,168 @@ test "executing a statistics request clears the buffer it names" {
     try testing.expectEqual(@as(u64, 0), state.last_lod_stats.?.address);
     for (arena[0..64]) |byte| try testing.expectEqual(@as(u8, 0xcd), byte);
 }
+
+// ---------------------------------------------------------------------------
+// Finding the payload of a data packet
+//
+// A title writes a packet carrying bytes of its own and comes back later to
+// read or rewrite them. These build the packet with the registered constructor
+// and check the range against what the packet-size query says the packet
+// occupies, because the two have to describe the same span.
+
+const AgcPayloadRange = fn (
+    ?*libs.agc.MemoryRange,
+    ?[*]u32,
+    u32,
+    u64,
+    u64,
+    u64,
+) callconv(abi.guest) i32;
+test "a payload range and the packet size describe the same span" {
+    const std = @import("std");
+    const testing = std.testing;
+
+    var db = Database{};
+    defer db.deinit(testing.allocator);
+    try registerAll(&db, testing.allocator);
+
+    const payload_range = try agcEntryPoint(&db, "s+VGAMDQ0AQ", AgcPayloadRange);
+    const packet_size = try agcEntryPoint(&db, "Lkf86B98qPc", AgcPacketSize);
+    const nop = try agcEntryPoint(&db, "LtTouSCZjHM", AgcWrite);
+
+    // From three dwords up, because at two the reserved form has no payload
+    // left and is covered on its own below.
+    for ([_]u32{ 3, 4, 8, 64 }) |dwords| {
+        var words: [80]u32 = @splat(guard_word);
+        var buffer = sizedBuffer(words[0..dwords]);
+        try testing.expect(nop(&buffer, dwords, 0, 0, 0, 0) != null);
+        try testing.expectEqual(dwords, packet_size(&words, 0, 0, 0, 0, 0));
+
+        // The plain form: everything after the header.
+        var range: libs.agc.MemoryRange = undefined;
+        try testing.expectEqual(errno.ok, payload_range(&range, &words, 0, 0, 0, 0));
+        try testing.expectEqual(@intFromPtr(&words[1]), @intFromPtr(range.base.?));
+        try testing.expectEqual(@as(u64, dwords - 1) * @sizeOf(u32), range.size);
+        // Header plus payload is the whole packet.
+        try testing.expectEqual(
+            @as(u64, dwords) * @sizeOf(u32),
+            range.size + @sizeOf(u32),
+        );
+
+        // The reserved form: a word later and a word shorter.
+        var reserved: libs.agc.MemoryRange = undefined;
+        try testing.expectEqual(errno.ok, payload_range(&reserved, &words, 1, 0, 0, 0));
+        try testing.expectEqual(@intFromPtr(&words[2]), @intFromPtr(reserved.base.?));
+        try testing.expectEqual(range.size - @sizeOf(u32), reserved.size);
+
+        // Neither range reaches past the packet.
+        try testing.expectEqual(
+            @intFromPtr(&words[dwords]),
+            @intFromPtr(range.base.?) + range.size,
+        );
+        try testing.expectEqual(
+            @intFromPtr(&words[dwords]),
+            @intFromPtr(reserved.base.?) + reserved.size,
+        );
+        // And the packet itself was not touched by asking.
+        for (words[dwords..]) |word| try testing.expectEqual(guard_word, word);
+    }
+}
+
+test "a packet with no body has no payload to point at" {
+    const std = @import("std");
+    const gpu = @import("gpu");
+    const testing = std.testing;
+
+    var db = Database{};
+    defer db.deinit(testing.allocator);
+    try registerAll(&db, testing.allocator);
+
+    const payload_range = try agcEntryPoint(&db, "s+VGAMDQ0AQ", AgcPayloadRange);
+    const packet_size = try agcEntryPoint(&db, "Lkf86B98qPc", AgcPacketSize);
+
+    // The all-ones count marking the single-dword filler, and type-2 padding.
+    // Neither header encodes a length, so the maximum the count field can
+    // express would be a range over whatever follows the packet.
+    for ([_]u32{ 0xffff_1000, @as(u32, 2) << 30 }) |header| {
+        var words = [_]u32{ header, guard_word, guard_word, guard_word };
+        try testing.expectEqual(@as(u32, 1), packet_size(&words, 0, 0, 0, 0, 0));
+        for ([_]u32{ 0, 1 }) |form| {
+            var range = libs.agc.MemoryRange{ .base = &words, .size = 0xdead };
+            try testing.expectEqual(errno.ok, payload_range(&range, &words, form, 0, 0, 0));
+            try testing.expect(range.base == null);
+            try testing.expectEqual(@as(u64, 0), range.size);
+        }
+    }
+
+    // A one-word body is entirely the reserved word in that form, so the
+    // range is empty there and one word long in the plain form.
+    var single = [_]u32{ pm4Command(gpu.pm4.nop, 1), 0x1234_5678 };
+    var reserved = libs.agc.MemoryRange{ .base = null, .size = 0xdead };
+    try testing.expectEqual(errno.ok, payload_range(&reserved, &single, 1, 0, 0, 0));
+    try testing.expect(reserved.base == null);
+    try testing.expectEqual(@as(u64, 0), reserved.size);
+
+    var plain: libs.agc.MemoryRange = undefined;
+    try testing.expectEqual(errno.ok, payload_range(&plain, &single, 0, 0, 0, 0));
+    try testing.expectEqual(@intFromPtr(&single[1]), @intFromPtr(plain.base.?));
+    try testing.expectEqual(@as(u64, @sizeOf(u32)), plain.size);
+}
+
+test "a payload range refuses what it cannot read or answer into" {
+    const std = @import("std");
+    const gpu = @import("gpu");
+    const guest_memory = @import("memory");
+    const kernel_memory = libs.kernel_memory;
+    const testing = std.testing;
+
+    var db = Database{};
+    defer db.deinit(testing.allocator);
+    try registerAll(&db, testing.allocator);
+
+    const payload_range = try agcEntryPoint(&db, "s+VGAMDQ0AQ", AgcPayloadRange);
+    const einval = errno.KernelError.einval.raw();
+    const efault = errno.KernelError.efault.raw();
+
+    var words = [_]u32{ pm4Command(gpu.pm4.nop, 3), 1, 2, 3 };
+    var range: libs.agc.MemoryRange = undefined;
+    try testing.expectEqual(einval, payload_range(null, &words, 0, 0, 0, 0));
+    try testing.expectEqual(einval, payload_range(&range, null, 0, 0, 0, 0));
+
+    // Memory this process cannot read is refused, which needs a real address
+    // space: without one every pointer reads as valid and the check never
+    // fires.
+    var address_space = try guest_memory.AddressSpace.initWithDirectMemory(
+        testing.allocator,
+        16 * kernel_memory.page_size,
+    );
+    defer address_space.deinit();
+    kernel_memory.init(testing.allocator);
+    defer kernel_memory.deinit();
+    kernel_memory.attachAddressSpace(&address_space);
+    defer kernel_memory.attachAddressSpace(null);
+
+    const page = kernel_memory.page_size;
+    const base = guest_memory.user.start;
+    try address_space.mapFixed(base, page, .{ .read = true, .write = true }, .direct_memory, 0);
+
+    const mapped: [*]u32 = @ptrFromInt(base);
+    mapped[0] = pm4Command(gpu.pm4.nop, 3);
+    const unmapped: [*]u32 = @ptrFromInt(base + 8 * page);
+
+    // An unreadable packet, and an answer with nowhere to go.
+    const out: *libs.agc.MemoryRange = @ptrFromInt(base + 256);
+    out.* = .{ .base = null, .size = 0xdead };
+    try testing.expectEqual(efault, payload_range(out, unmapped, 0, 0, 0, 0));
+    // Refusing leaves the caller's range as it was.
+    try testing.expectEqual(@as(u64, 0xdead), out.size);
+    try testing.expectEqual(
+        efault,
+        payload_range(@ptrFromInt(base + 8 * page), mapped, 0, 0, 0, 0),
+    );
+
+    // Inside the mapping the same question is answered.
+    try testing.expectEqual(errno.ok, payload_range(out, mapped, 0, 0, 0, 0));
+    try testing.expectEqual(@intFromPtr(mapped + 1), @intFromPtr(out.base.?));
+    try testing.expectEqual(@as(u64, 3 * @sizeOf(u32)), out.size);
+}

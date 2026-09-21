@@ -34,7 +34,7 @@ pub const exports = [_]symbols.Export{
     .{ .name = "sceAgcRewindPatchSetRewindState", .function = trace.wrap("sceAgcRewindPatchSetRewindState", &agc.patchCommand), .expect_id = "ziVA3whp3p4" },
     .{ .name = "sceAgcAsyncRewindPatchSetRewindState", .function = trace.wrap("sceAgcAsyncRewindPatchSetRewindState", &agc.patchCommand), .expect_id = "eWaWyFegzgQ" },
     .{ .name = "sceAgcGetPacketSize", .function = trace.wrap("sceAgcGetPacketSize", &agc.packetSize), .expect_id = "Lkf86B98qPc" },
-    .{ .name = "sceAgcGetDataPacketPayloadRange", .function = trace.wrap("sceAgcGetDataPacketPayloadRange", &agc.zeroQuery), .expect_id = "s+VGAMDQ0AQ" },
+    .{ .name = "sceAgcGetDataPacketPayloadRange", .function = trace.wrap("sceAgcGetDataPacketPayloadRange", &agc.dataPacketPayloadRange), .expect_id = "s+VGAMDQ0AQ" },
     // The two DMA_DATA address patches (IxYiarKlXxM, cdDRpqcFGbU) likewise
     // belong with the DMA_DATA writer in bootstrap_services: the words they
     // overwrite are fixed by the layout that writer emits, so the patch and
