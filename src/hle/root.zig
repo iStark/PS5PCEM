@@ -3423,3 +3423,284 @@ test "asking twice gives the same answer" {
     try testing.expectEqual(@as(u32, 0), second[0].value);
     try testing.expectEqual(@as(u32, 0), second[1].value);
 }
+
+// ---------------------------------------------------------------------------
+// Rewind
+//
+// A rewind is a packet a title writes before the work behind it exists. The
+// queue sits on it until someone sets its valid bit. These build it with the
+// registered constructor and then run it, because a packet nothing parks on is
+// not a rewind.
+
+const AgcRewind = fn (
+    ?*libs.agc.CommandBuffer,
+    u64,
+    u64,
+    u64,
+    u64,
+    u64,
+) callconv(abi.guest) ?[*]u32;
+
+const rewind_valid_bit: u32 = 0x8000_0000;
+
+test "rewind occupies exactly the size it reports" {
+    const std = @import("std");
+    const gpu = @import("gpu");
+    const testing = std.testing;
+
+    var db = Database{};
+    defer db.deinit(testing.allocator);
+    try registerAll(&db, testing.allocator);
+
+    const rewind = try agcEntryPoint(&db, "zfcxg-ewMK8", AgcRewind);
+    const get_size = try agcEntryPoint(&db, "QIXCsbipds0", AgcGetSize);
+
+    const announced = get_size(0, 0, 0, 0, 0, 0);
+    try testing.expectEqual(@as(u32, 2 * @sizeOf(u32)), announced);
+    const announced_words = announced / @sizeOf(u32);
+
+    var storage: [16]u32 = @splat(guard_word);
+    var buffer = sizedBuffer(storage[0..announced_words]);
+    try testing.expect(rewind(&buffer, 1, 0, 0, 0, 0) != null);
+    try testing.expectEqual(
+        @as(usize, announced),
+        @intFromPtr(buffer.cursor_up.?) - @intFromPtr(storage[0..].ptr),
+    );
+    for (storage[announced_words..]) |word| try testing.expectEqual(guard_word, word);
+
+    // One walkable packet, carrying the valid flag where the processor reads it.
+    var walker = gpu.pm4.Walker.init(storage[0..announced_words]);
+    const packet = (try walker.next()).?;
+    try testing.expectEqual(gpu.pm4.rewind, packet.opcode);
+    try testing.expectEqual(@as(usize, 2), packet.wordCount());
+    try testing.expectEqual(rewind_valid_bit, packet.body[0]);
+    try testing.expect((try walker.next()) == null);
+
+    // Written invalid, the flag is clear and nothing else is set.
+    var clear: [16]u32 = @splat(guard_word);
+    var clear_buffer = sizedBuffer(clear[0..announced_words]);
+    try testing.expect(rewind(&clear_buffer, 0, 0, 0, 0, 0) != null);
+    try testing.expectEqual(@as(u32, 0), clear[1]);
+
+    // Only the low bit of the argument reaches the packet.
+    var odd: [16]u32 = @splat(guard_word);
+    var odd_buffer = sizedBuffer(odd[0..announced_words]);
+    try testing.expect(rewind(&odd_buffer, 0xffff_fffe, 0, 0, 0, 0) != null);
+    try testing.expectEqual(@as(u32, 0), odd[1]);
+}
+
+test "a buffer too small for a rewind is refused whole" {
+    const std = @import("std");
+    const testing = std.testing;
+
+    var db = Database{};
+    defer db.deinit(testing.allocator);
+    try registerAll(&db, testing.allocator);
+
+    const rewind = try agcEntryPoint(&db, "zfcxg-ewMK8", AgcRewind);
+
+    // One word short of the two the packet needs.
+    var storage: [16]u32 = @splat(guard_word);
+    var buffer = sizedBuffer(storage[0..1]);
+    try testing.expect(rewind(&buffer, 1, 0, 0, 0, 0) == null);
+    for (storage) |word| try testing.expectEqual(guard_word, word);
+
+    // And no buffer at all.
+    try testing.expect(rewind(null, 1, 0, 0, 0, 0) == null);
+}
+
+test "a valid rewind is stepped over" {
+    const std = @import("std");
+    const gpu = @import("gpu");
+    const testing = std.testing;
+
+    var db = Database{};
+    defer db.deinit(testing.allocator);
+    try registerAll(&db, testing.allocator);
+
+    const rewind = try agcEntryPoint(&db, "zfcxg-ewMK8", AgcRewind);
+    const draw = try agcEntryPoint(&db, "Yw0jKSqop+E", AgcWrite);
+
+    var words: [32]u32 = @splat(0);
+    var buffer = sizedBuffer(&words);
+    _ = draw(&buffer, 3, 0, 0, 0, 0).?;
+    try testing.expect(rewind(&buffer, 1, 0, 0, 0, 0) != null);
+    _ = draw(&buffer, 4, 0, 0, 0, 0).?;
+    const used = (@intFromPtr(buffer.cursor_up.?) - @intFromPtr(words[0..].ptr)) / @sizeOf(u32);
+
+    var probe = PredicationProbe{};
+    var state = gpu.State{};
+    const result = try runPredicated(&probe, &state, words[0..used]);
+
+    // Both draws ran and the queue never parked.
+    try testing.expectEqual(@as(u32, 2), probe.draws);
+    try testing.expectEqual(gpu.executor.Status.complete, result.status);
+    try testing.expectEqual(@as(u64, 0), state.rewind_wait_count);
+    try testing.expectEqual(@as(u32, 0), state.rewind_reentry_count);
+}
+
+test "an invalid rewind parks the queue, and a valid one does not" {
+    const std = @import("std");
+    const gpu = @import("gpu");
+    const testing = std.testing;
+
+    var db = Database{};
+    defer db.deinit(testing.allocator);
+    try registerAll(&db, testing.allocator);
+
+    const rewind = try agcEntryPoint(&db, "zfcxg-ewMK8", AgcRewind);
+    const draw = try agcEntryPoint(&db, "Yw0jKSqop+E", AgcWrite);
+
+    // The same stream twice, differing only in the valid flag the constructor
+    // writes: a draw, a rewind, and a draw behind it.
+    for ([_]u64{ 0, 1 }) |initial_state| {
+        var words: [32]u32 = @splat(0);
+        var buffer = sizedBuffer(&words);
+        _ = draw(&buffer, 3, 0, 0, 0, 0).?;
+        try testing.expect(rewind(&buffer, initial_state, 0, 0, 0, 0) != null);
+        _ = draw(&buffer, 4, 0, 0, 0, 0).?;
+        const used = (@intFromPtr(buffer.cursor_up.?) - @intFromPtr(words[0..].ptr)) / @sizeOf(u32);
+
+        var probe = PredicationProbe{};
+        var scheduler = gpu.QueueScheduler.init(testing.allocator, probe.backend());
+        defer scheduler.deinit();
+        _ = try scheduler.submit(.graphics, words[0..used]);
+
+        if (initial_state == 0) {
+            // Parked: the draw ahead of the rewind ran and the one behind it
+            // did not.
+            try testing.expect(scheduler.isBlocked(.graphics));
+            try testing.expectEqual(@as(u32, 1), probe.draws);
+            try testing.expect(scheduler.state(.graphics).rewind_wait_count > 0);
+            try testing.expect(scheduler.continuation(.graphics) != null);
+
+            // Pumping finds the same packet and parks again. That is re-entry,
+            // not progress, and it is what the guard counts.
+            const before = scheduler.state(.graphics).rewind_reentry_count;
+            _ = try scheduler.pump();
+            try testing.expect(scheduler.isBlocked(.graphics));
+            try testing.expectEqual(@as(u32, 1), probe.draws);
+            try testing.expect(scheduler.state(.graphics).rewind_reentry_count > before);
+        } else {
+            // Valid from the start: nothing parks and both draws run.
+            try testing.expect(!scheduler.isBlocked(.graphics));
+            try testing.expectEqual(@as(u32, 2), probe.draws);
+            try testing.expectEqual(@as(u64, 0), scheduler.state(.graphics).rewind_wait_count);
+        }
+    }
+}
+
+test "a rewind nobody validates does not hold the queue forever" {
+    const std = @import("std");
+    const gpu = @import("gpu");
+    const testing = std.testing;
+
+    var db = Database{};
+    defer db.deinit(testing.allocator);
+    try registerAll(&db, testing.allocator);
+
+    const rewind = try agcEntryPoint(&db, "zfcxg-ewMK8", AgcRewind);
+    const draw = try agcEntryPoint(&db, "Yw0jKSqop+E", AgcWrite);
+
+    var words: [32]u32 = @splat(0);
+    var buffer = sizedBuffer(&words);
+    try testing.expect(rewind(&buffer, 0, 0, 0, 0, 0) != null);
+    _ = draw(&buffer, 7, 0, 0, 0, 0).?;
+    const used = (@intFromPtr(buffer.cursor_up.?) - @intFromPtr(words[0..].ptr)) / @sizeOf(u32);
+
+    var probe = PredicationProbe{};
+    var scheduler = gpu.QueueScheduler.init(testing.allocator, probe.backend());
+    defer scheduler.deinit();
+
+    _ = try scheduler.submit(.graphics, words[0..used]);
+    try testing.expect(scheduler.isBlocked(.graphics));
+
+    // Pump until the guard gives up. It has to happen in a bounded number of
+    // rounds, which is the point of the guard.
+    var rounds: u32 = 0;
+    while (scheduler.isBlocked(.graphics) and rounds < 256) : (rounds += 1) {
+        _ = try scheduler.pump();
+    }
+    try testing.expect(!scheduler.isBlocked(.graphics));
+    try testing.expect(rounds < 256);
+    try testing.expectEqual(@as(u64, 1), scheduler.state(.graphics).rewind_abandoned_count);
+    // Having given up, the queue carried on rather than losing the draw.
+    try testing.expectEqual(@as(u32, 1), probe.draws);
+}
+
+test "a malformed rewind leaves the queue as it was" {
+    const std = @import("std");
+    const gpu = @import("gpu");
+    const testing = std.testing;
+
+    var probe = PredicationProbe{};
+    var state = gpu.State{};
+
+    // Bit 30 means nothing to a rewind, so the packet is refused rather than
+    // guessed at, and nothing about the queue moves.
+    const bad = [_]u32{ pm4Command(gpu.pm4.rewind, 1), 0x4000_0000 };
+    try testing.expectError(
+        gpu.executor.Error.InvalidPacket,
+        runPredicated(&probe, &state, &bad),
+    );
+    try testing.expectEqual(@as(u64, 0), state.rewind_wait_count);
+    try testing.expectEqual(@as(u32, 0), state.rewind_reentry_count);
+    try testing.expectEqual(@as(u64, 0), state.rewind_abandoned_count);
+
+    // A body of the wrong width is refused the same way.
+    const wide = [_]u32{ pm4Command(gpu.pm4.rewind, 2), 0, 0 };
+    try testing.expectError(
+        gpu.executor.Error.InvalidPacket,
+        runPredicated(&probe, &state, &wide),
+    );
+    try testing.expectEqual(@as(u64, 0), state.rewind_wait_count);
+
+    // Bit 24 is carried by real packets and is accepted.
+    const spare = [_]u32{ pm4Command(gpu.pm4.rewind, 1), 0x8100_0000 };
+    _ = try runPredicated(&probe, &state, &spare);
+    try testing.expectEqual(@as(u64, 0), state.rewind_wait_count);
+}
+
+test "one queue parked on a rewind does not park the other" {
+    const std = @import("std");
+    const gpu = @import("gpu");
+    const testing = std.testing;
+
+    var db = Database{};
+    defer db.deinit(testing.allocator);
+    try registerAll(&db, testing.allocator);
+
+    const rewind = try agcEntryPoint(&db, "zfcxg-ewMK8", AgcRewind);
+    const draw = try agcEntryPoint(&db, "Yw0jKSqop+E", AgcWrite);
+
+    var parked: [32]u32 = @splat(0);
+    var parked_buffer = sizedBuffer(&parked);
+    try testing.expect(rewind(&parked_buffer, 0, 0, 0, 0, 0) != null);
+    _ = draw(&parked_buffer, 3, 0, 0, 0, 0).?;
+    const parked_used = (@intFromPtr(parked_buffer.cursor_up.?) - @intFromPtr(parked[0..].ptr)) / @sizeOf(u32);
+
+    var free: [32]u32 = @splat(0);
+    var free_buffer = sizedBuffer(&free);
+    try testing.expect(rewind(&free_buffer, 1, 0, 0, 0, 0) != null);
+    _ = draw(&free_buffer, 4, 0, 0, 0, 0).?;
+    const free_used = (@intFromPtr(free_buffer.cursor_up.?) - @intFromPtr(free[0..].ptr)) / @sizeOf(u32);
+
+    var probe = PredicationProbe{};
+    var scheduler = gpu.QueueScheduler.init(testing.allocator, probe.backend());
+    defer scheduler.deinit();
+
+    _ = try scheduler.submit(.graphics, parked[0..parked_used]);
+    try testing.expect(scheduler.isBlocked(.graphics));
+    try testing.expectEqual(@as(u32, 0), probe.draws);
+
+    // The compute queue has its own rewind, already valid, and runs straight
+    // through while the graphics queue is still sitting on its own.
+    _ = try scheduler.submit(.compute, free[0..free_used]);
+    try testing.expect(!scheduler.isBlocked(.compute));
+    try testing.expectEqual(@as(u32, 1), probe.draws);
+    try testing.expect(scheduler.isBlocked(.graphics));
+
+    // The counters belong to their own queues.
+    try testing.expect(scheduler.state(.graphics).rewind_wait_count > 0);
+    try testing.expectEqual(@as(u64, 0), scheduler.state(.compute).rewind_wait_count);
+}

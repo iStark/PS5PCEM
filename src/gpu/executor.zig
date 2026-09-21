@@ -84,6 +84,7 @@ var predication_reports = std.atomic.Value(u32).init(0);
 var unsupported_predication_reports = std.atomic.Value(u32).init(0);
 var unsupported_copy_reports = std.atomic.Value(u32).init(0);
 var context_state_reports = std.atomic.Value(u32).init(0);
+var abandoned_rewind_reports = std.atomic.Value(u32).init(0);
 var performed_copy_reports = std.atomic.Value(u32).init(0);
 
 /// Reports what a stream did with predication, a bounded number of times.
@@ -684,6 +685,9 @@ pub const DcbExecutor = struct {
             try self.setPredication(packet);
             return .complete;
         }
+        if (packet.opcode == pm4.rewind) {
+            return self.rewind(packet);
+        }
         if (packet.opcode == pm4.wait_reg_mem) {
             return self.waitRegMem(packet, true, false);
         }
@@ -1003,6 +1007,55 @@ pub const DcbExecutor = struct {
         const value = std.mem.readInt(u64, &bytes, .little);
         self.state.predicate_skip = if (request.condition == 0) value != 0 else value == 0;
         if (predicationStatsEnabled()) self.state.predication_enable_count += 1;
+    }
+    /// How many times the same REWIND may be re-entered before the queue
+    /// stops waiting on it.
+    ///
+    /// A rewind becomes valid when someone else patches the packet in the
+    /// command buffer. Nothing here guarantees that happens, and a queue
+    /// that re-read it forever would take every later frame down with it.
+    const rewind_reentry_limit: u32 = 64;
+
+    /// Parks the queue on a rewind, or steps over one that is already valid.
+    ///
+    /// Bit 31 of the single body word says whether the packet has been made
+    /// valid. While it is clear the command processor is meant to sit on this
+    /// packet and read it again; the scheduler does that by re-entering the
+    /// same word on the next pump, so blocking here is the whole mechanism.
+    ///
+    /// Bit 24 is carried by real packets and means nothing to this; any other
+    /// bit does, so a packet setting one is refused rather than guessed at,
+    /// and refusing leaves the queue exactly as it was.
+    fn rewind(self: *DcbExecutor, packet: pm4.Packet) Error!PacketOutcome {
+        if (packet.body.len != 1) return Error.InvalidPacket;
+        const control = packet.body[0];
+        if (control & ~@as(u32, 0x8100_0000) != 0) return Error.InvalidPacket;
+
+        if (control & 0x8000_0000 != 0) {
+            // Valid: the stream carries on, and whatever the queue had
+            // accumulated waiting on a previous rewind is done with.
+            self.state.rewind_reentry_count = 0;
+            return .complete;
+        }
+
+        self.state.rewind_wait_count += 1;
+        if (self.state.rewind_reentry_count >= rewind_reentry_limit) {
+            // Nobody is going to make this one valid. Carrying on issues
+            // commands that were meant to wait, which shows too much; the
+            // alternative is a queue that never runs again, which shows
+            // nothing ever after.
+            self.state.rewind_reentry_count = 0;
+            self.state.rewind_abandoned_count += 1;
+            if (abandoned_rewind_reports.fetchAdd(1, .monotonic) < 16) {
+                std.debug.print(
+                    "[gpu rewind] never became valid after {d} reads; continuing\n",
+                    .{rewind_reentry_limit},
+                );
+            }
+            return .complete;
+        }
+        self.state.rewind_reentry_count += 1;
+        return .blocked;
     }
     fn waitRegMem(
         self: *DcbExecutor,

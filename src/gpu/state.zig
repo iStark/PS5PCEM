@@ -280,6 +280,15 @@ pub const State = struct {
     /// A push with nowhere left to save, or a pop with nothing saved.
     context_state_refused_count: u64 = 0,
 
+    /// How many times in a row the queue has re-entered the REWIND it is
+    /// parked on. A rewind is made valid by someone else patching the packet,
+    /// and nothing here guarantees that ever happens, so the count is what
+    /// stops the queue re-reading it forever.
+    rewind_reentry_count: u32 = 0,
+    rewind_wait_count: u64 = 0,
+    /// Times the guard gave up waiting and let the stream continue.
+    rewind_abandoned_count: u64 = 0,
+
     pub fn writeRegister(self: *State, space: pm4.RegisterSpace, offset: u32, value: u32) Error!void {
         switch (space) {
             .config => try self.config.write(offset, value),

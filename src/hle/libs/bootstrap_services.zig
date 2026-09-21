@@ -2570,6 +2570,29 @@ fn agcAcbCopyData(
     );
 }
 
+/// Parks the command processor until someone makes this packet valid.
+///
+/// Two dwords: the header and one control word whose bit 31 is the valid
+/// flag. A title writes the packet with the flag clear, hands the buffer to
+/// something that will fill in the work behind it, and that writer sets the
+/// bit when the work is there. Until then the queue re-reads this packet.
+fn agcDcbRewind(
+    buffer: ?*AgcCommandBuffer,
+    initial_state: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+) callconv(abi.guest) ?[*]u32 {
+    const body = [_]u32{(@as(u32, @truncate(initial_state)) & 0x1) << 31};
+    return writeExactAgcPacket(buffer, gpu.pm4.rewind, &body);
+}
+
+/// REWIND: header and control word.
+fn agcDcbRewindGetSize() callconv(abi.guest) u32 {
+    return 2 * @sizeOf(u32);
+}
+
 /// COPY_DATA: header, control, source pair, destination pair.
 fn agcCopyDataGetSize() callconv(abi.guest) u32 {
     return 6 * @sizeOf(u32);
@@ -4466,6 +4489,8 @@ const agc_exports = [_]symbols.Export{
     .{ .name = "sceAgcDcbContextStateOpGetSize", .function = trace.wrap("sceAgcDcbContextStateOpGetSize", &agcDcbContextStateOpGetSize), .expect_id = "H6vHS5cidSA" },
     .{ .name = "sceAgcUpdatePrimState", .function = trace.wrap("sceAgcUpdatePrimState", &agcUpdatePrimState), .expect_id = "Y3ymLfZ1384" },
     .{ .name = "sceAgcGetGsOversubscription", .function = trace.wrap("sceAgcGetGsOversubscription", &agcGetGsOversubscription), .expect_id = "NKIzURsgV7I" },
+    .{ .name = "sceAgcDcbRewind", .function = trace.wrap("sceAgcDcbRewind", &agcDcbRewind), .expect_id = "zfcxg-ewMK8" },
+    .{ .name = "sceAgcDcbRewindGetSize", .function = trace.wrap("sceAgcDcbRewindGetSize", &agcDcbRewindGetSize), .expect_id = "QIXCsbipds0" },
     .{ .name = "sceAgcDcbCopyDataGetSize", .function = trace.wrap("sceAgcDcbCopyDataGetSize", &agcCopyDataGetSize), .expect_id = "b5u0Jzm8TF8" },
     .{ .name = "sceAgcAcbCopyDataGetSize", .function = trace.wrap("sceAgcAcbCopyDataGetSize", &agcCopyDataGetSize), .expect_id = "CbQh3DKMSno" },
     .{ .name = "sceAgcCbSetShRegistersDirectGetSize", .function = trace.wrap("sceAgcCbSetShRegistersDirectGetSize", &agcSetRegistersDirectGetSize), .expect_id = "yUBESvCCJ4I" },
