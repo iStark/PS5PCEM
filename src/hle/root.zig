@@ -3704,3 +3704,199 @@ test "one queue parked on a rewind does not park the other" {
     try testing.expect(scheduler.state(.graphics).rewind_wait_count > 0);
     try testing.expectEqual(@as(u64, 0), scheduler.state(.compute).rewind_wait_count);
 }
+
+// ---------------------------------------------------------------------------
+// Patching an indirect buffer
+//
+// A title reserves the jump before the buffer it jumps to exists and fills it
+// in afterwards. These build a real jump with the registered constructor and
+// then patch it, because a patch checked against a hand-written packet would
+// not prove it matches what the library actually writes.
+
+const AgcPatchIndirect = fn (
+    ?[*]u32,
+    u64,
+    u64,
+    u64,
+    u64,
+    u64,
+) callconv(abi.guest) i32;
+
+/// The bits `sceAgcDcbJump` puts in the control word that are none of the
+/// patch's business: the fixed control bits and the jump mode.
+const jump_control_keep: u32 = 0xcff0_0000;
+
+test "patching an indirect buffer moves target, policy and length only" {
+    const std = @import("std");
+    const gpu = @import("gpu");
+    const testing = std.testing;
+
+    var db = Database{};
+    defer db.deinit(testing.allocator);
+    try registerAll(&db, testing.allocator);
+
+    const patch = try agcEntryPoint(&db, "Ikfdt-rIqCE", AgcPatchIndirect);
+    const jump = try agcEntryPoint(&db, "xSAR0LTcRKM", AgcWrite);
+
+    // Addresses on both sides of the thirty-two bit boundary, and every cache
+    // policy the field can hold.
+    const targets = [_]u64{ 0, 0x1000, 0xffff_fffc, 0x1_0000_0000, 0x7fff_ffff_fffc };
+    const sizes = [_]u64{ 0, 1, 0x1234, 0x000f_ffff };
+
+    for (targets) |target| {
+        for (sizes) |size| {
+            for ([_]u64{ 0, 1, 2, 3 }) |policy| {
+                var words: [8]u32 = @splat(guard_word);
+                var buffer = sizedBuffer(words[0..4]);
+                // Built with the other mode and policy, so the patch has to
+                // change them and keep what it must.
+                try testing.expect(jump(&buffer, 1, 3, 0x2000, 7, 0) != null);
+                const control_before = words[3];
+
+                try testing.expectEqual(errno.ok, patch(&words, policy, target, size, 0, 0));
+
+                // Target, split across the two address words.
+                try testing.expectEqual(@as(u32, @truncate(target)), words[1] & 0xffff_fffc);
+                try testing.expectEqual(@as(u32, @truncate(target >> 32)), words[2]);
+                // Policy and length in the control word.
+                try testing.expectEqual(@as(u32, @truncate(policy)), (words[3] >> 28) & 0x3);
+                try testing.expectEqual(@as(u32, @truncate(size)), words[3] & 0x000f_ffff);
+                // The jump mode and the fixed control bits are as the
+                // constructor left them.
+                try testing.expectEqual(control_before & jump_control_keep, words[3] & jump_control_keep);
+                // The packet is still one walkable INDIRECT_BUFFER.
+                var walker = gpu.pm4.Walker.init(words[0..4]);
+                const packet = (try walker.next()).?;
+                try testing.expectEqual(gpu.pm4.indirect_buffer, packet.opcode);
+                try testing.expectEqual(@as(usize, 4), packet.wordCount());
+                // Nothing past the packet.
+                for (words[4..]) |word| try testing.expectEqual(guard_word, word);
+            }
+        }
+    }
+}
+
+test "the low bits of the address word belong to the packet" {
+    const std = @import("std");
+    const testing = std.testing;
+
+    var db = Database{};
+    defer db.deinit(testing.allocator);
+    try registerAll(&db, testing.allocator);
+
+    const patch = try agcEntryPoint(&db, "Ikfdt-rIqCE", AgcPatchIndirect);
+
+    // Those two bits are not part of the address, so a patch must leave
+    // whatever the packet carries in them.
+    for ([_]u32{ 0, 1, 2, 3 }) |low| {
+        var words = [_]u32{ pm4Command(@import("gpu").pm4.indirect_buffer, 3), low, 0, 0 };
+        try testing.expectEqual(errno.ok, patch(&words, 0, 0x4000, 4, 0, 0));
+        try testing.expectEqual(low, words[1] & 0x3);
+        try testing.expectEqual(@as(u32, 0x4000), words[1] & 0xffff_fffc);
+    }
+}
+
+test "patching twice leaves the second answer" {
+    const std = @import("std");
+    const testing = std.testing;
+
+    var db = Database{};
+    defer db.deinit(testing.allocator);
+    try registerAll(&db, testing.allocator);
+
+    const patch = try agcEntryPoint(&db, "Ikfdt-rIqCE", AgcPatchIndirect);
+    const jump = try agcEntryPoint(&db, "xSAR0LTcRKM", AgcWrite);
+
+    var words: [8]u32 = @splat(guard_word);
+    var buffer = sizedBuffer(words[0..4]);
+    try testing.expect(jump(&buffer, 1, 0, 0x1000, 1, 0) != null);
+    const control_before = words[3];
+
+    try testing.expectEqual(errno.ok, patch(&words, 1, 0x2_0000_1000, 0x10, 0, 0));
+    try testing.expectEqual(errno.ok, patch(&words, 2, 0x3_0000_2000, 0x20, 0, 0));
+
+    // Nothing accumulates: the second patch is the whole answer.
+    try testing.expectEqual(@as(u32, 0x2000), words[1] & 0xffff_fffc);
+    try testing.expectEqual(@as(u32, 3), words[2]);
+    try testing.expectEqual(@as(u32, 2), (words[3] >> 28) & 0x3);
+    try testing.expectEqual(@as(u32, 0x20), words[3] & 0x000f_ffff);
+    try testing.expectEqual(control_before & jump_control_keep, words[3] & jump_control_keep);
+}
+
+test "an indirect-buffer patch refuses what it cannot honour" {
+    const std = @import("std");
+    const gpu = @import("gpu");
+    const guest_memory = @import("memory");
+    const kernel_memory = libs.kernel_memory;
+    const testing = std.testing;
+
+    var db = Database{};
+    defer db.deinit(testing.allocator);
+    try registerAll(&db, testing.allocator);
+
+    const patch = try agcEntryPoint(&db, "Ikfdt-rIqCE", AgcPatchIndirect);
+    const einval = errno.KernelError.einval.raw();
+    const efault = errno.KernelError.efault.raw();
+    const bad_packet: i32 = @bitCast(@as(u32, 0x8a6c_000c));
+
+    try testing.expectEqual(einval, patch(null, 0, 0x1000, 1, 0, 0));
+
+    // Each refusal has to leave the packet exactly as it was.
+    const Case = struct { what: []const u8, header: u32, target: u64, size: u64, expect: i32 };
+    const cases = [_]Case{
+        // A different opcode in an otherwise well-formed type-3 packet.
+        .{ .what = "opcode", .header = pm4Command(gpu.pm4.nop, 3), .target = 0x1000, .size = 1, .expect = bad_packet },
+        // Type-2 padding, which has no opcode at all.
+        .{ .what = "type", .header = @as(u32, 2) << 30, .target = 0x1000, .size = 1, .expect = bad_packet },
+        // The right opcode at the wrong length.
+        .{ .what = "length", .header = pm4Command(gpu.pm4.indirect_buffer, 4), .target = 0x1000, .size = 1, .expect = bad_packet },
+        // An address with bits under the alignment the field cannot hold.
+        .{ .what = "alignment", .header = pm4Command(gpu.pm4.indirect_buffer, 3), .target = 0x1002, .size = 1, .expect = einval },
+        // A length past the twenty bits the field has.
+        .{ .what = "size", .header = pm4Command(gpu.pm4.indirect_buffer, 3), .target = 0x1000, .size = 0x0010_0000, .expect = einval },
+    };
+
+    for (cases) |case| {
+        var words = [_]u32{ case.header, 0xaaaa_aaa1, 0xbbbb_bbbb, 0xcccc_cccc };
+        const before = words;
+        try testing.expectEqual(case.expect, patch(&words, 1, case.target, case.size, 0, 0));
+        try testing.expectEqualSlices(u32, &before, &words);
+    }
+
+    // Memory this process cannot read is refused before anything is written,
+    // which needs a real address space: without one every pointer reads as
+    // valid and the check never fires.
+    var address_space = try guest_memory.AddressSpace.initWithDirectMemory(
+        testing.allocator,
+        16 * kernel_memory.page_size,
+    );
+    defer address_space.deinit();
+    kernel_memory.init(testing.allocator);
+    defer kernel_memory.deinit();
+    kernel_memory.attachAddressSpace(&address_space);
+    defer kernel_memory.attachAddressSpace(null);
+
+    const page = kernel_memory.page_size;
+    const base = guest_memory.user.start;
+    try address_space.mapFixed(base, page, .{ .read = true, .write = true }, .direct_memory, 0);
+
+    const unmapped: [*]u32 = @ptrFromInt(base + 8 * page);
+    try testing.expectEqual(efault, patch(unmapped, 0, 0x1000, 1, 0, 0));
+
+    // A packet running off the end of the mapping is refused too, and the part
+    // of it that is mapped is left alone.
+    const truncated: [*]u32 = @ptrFromInt(base + page - 2 * @sizeOf(u32));
+    truncated[0] = pm4Command(gpu.pm4.indirect_buffer, 3);
+    truncated[1] = 0xdead_beef;
+    try testing.expectEqual(efault, patch(truncated, 0, 0x1000, 1, 0, 0));
+    try testing.expectEqual(@as(u32, 0xdead_beef), truncated[1]);
+
+    // Inside the mapping the same patch goes through.
+    const mapped: [*]u32 = @ptrFromInt(base);
+    mapped[0] = pm4Command(gpu.pm4.indirect_buffer, 3);
+    mapped[1] = 0;
+    mapped[2] = 0;
+    mapped[3] = 0;
+    try testing.expectEqual(errno.ok, patch(mapped, 0, 0x1000, 1, 0, 0));
+    try testing.expectEqual(@as(u32, 0x1000), mapped[1] & 0xffff_fffc);
+}

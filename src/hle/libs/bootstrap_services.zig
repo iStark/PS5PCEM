@@ -2957,6 +2957,58 @@ fn agcDmaData(
     return writeAgcPacket(buffer, gpu.pm4.dma_data, &body);
 }
 
+/// Fills in the target, cache policy and length of an INDIRECT_BUFFER.
+///
+/// A title reserves the jump before the buffer it jumps to exists, then comes
+/// back here once it does. That is why this touches three words of an existing
+/// packet rather than writing one: the packet is already in the stream, and
+/// everything in it that is not the target, the policy or the length was
+/// decided when it was written.
+///
+/// What survives is not incidental. The low two bits of the address word and
+/// bits 20 to 27 of the control word carry the jump mode and the fixed control
+/// bits `sceAgcDcbJump` put there, so the masks below keep them and write only
+/// around them.
+///
+/// The packet is checked whole before any of it is written -- readable, a
+/// type-3 header, the right opcode and the right length -- and so are the
+/// arguments, because an address with bits under the alignment or a length
+/// past the field would otherwise be silently truncated into a jump that runs
+/// somewhere else.
+fn agcPatchIndirectBufferTarget(
+    command: ?[*]u32,
+    cache_policy: u64,
+    target: u64,
+    size_in_dwords: u64,
+    _: u64,
+    _: u64,
+) callconv(abi.guest) i32 {
+    const words = command orelse return invalid_argument;
+    const address = @intFromPtr(words);
+    if (!accessible(address, 4 * @sizeOf(u32))) return errno.KernelError.efault.raw();
+
+    const header = words[0];
+    if ((header >> 30) & 3 != 3 or
+        @as(u8, @truncate(header >> 8)) != gpu.pm4.indirect_buffer or
+        (header >> 16) & 0x3fff != 2)
+    {
+        return graphics_error_invalid_packet;
+    }
+
+    // The address field has no room for the low two bits, and the length field
+    // is twenty bits wide. Truncating either would leave a jump that reads as
+    // valid and goes somewhere the caller never named.
+    if (target & 0x3 != 0) return invalid_argument;
+    if (size_in_dwords > 0x000f_ffff) return invalid_argument;
+
+    words[1] = (words[1] & 0x3) | (@as(u32, @truncate(target)) & 0xffff_fffc);
+    words[2] = @truncate(target >> 32);
+    words[3] = (words[3] & 0xcff0_0000) |
+        ((@as(u32, @truncate(cache_policy)) & 0x3) << 28) |
+        (@as(u32, @truncate(size_in_dwords)) & 0x000f_ffff);
+    return errno.ok;
+}
+
 fn agcDmaDataPatchDestination(command_address: u64, address: u64) callconv(abi.guest) i32 {
     if (!kernel_memory.isGuestRangeAccessible(command_address, 24)) {
         return errno.KernelError.efault.raw();
@@ -4433,7 +4485,7 @@ const agc_exports = [_]symbols.Export{
     .{ .name = "sceAgcCreateInterpolantMapping", .function = trace.wrap("sceAgcCreateInterpolantMapping", &agcCreateInterpolantMapping), .id_override = "HV4j+E0MBHE" },
     .{ .name = "sceAgcCreateInterpolantMapping2", .function = trace.wrap("sceAgcCreateInterpolantMapping2", &agcCreateInterpolantMapping2), .id_override = "dbOlWdppb4o" },
     .{ .name = "sceAgcUnknownKRzWekV120", .function = trace.wrap("sceAgcUnknownKRzWekV120", &agcSetIndexTypeIndexed), .id_override = "-KRzWekV120" },
-    .{ .name = "sceAgcUnknownIkfdtRIqCE", .function = trace.wrap("sceAgcUnknownIkfdtRIqCE", &agcPatch), .id_override = "Ikfdt-rIqCE" },
+    .{ .name = "sceAgcUnknownIkfdtRIqCE", .function = trace.wrap("sceAgcUnknownIkfdtRIqCE", &agcPatchIndirectBufferTarget), .id_override = "Ikfdt-rIqCE" },
     .{ .name = "sceAgcGetDataPacketPayloadAddress", .function = trace.wrap("sceAgcGetDataPacketPayloadAddress", &agcGetDataPacketPayloadAddress), .id_override = "V++UgBtQhn0" },
 
     .{ .name = "sceAgcCbNop", .function = trace.wrap("sceAgcCbNop", &agcCbNop), .expect_id = "LtTouSCZjHM" },
