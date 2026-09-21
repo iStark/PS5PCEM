@@ -3946,6 +3946,205 @@ fn agcFuseShaderHalvesKeepingUserData(
     return fuseShaderHalves(fused, front, back, scratch, false);
 }
 
+// --- GS oversubscription ---------------------------------------------------
+//
+// A geometry shader runs in subgroups, and how many of them the hardware may
+// keep in flight at once is bounded by two separate resources: parameter cache
+// space for the vertices they produce, and export space for the attributes.
+// This works out how far past the guaranteed occupancy a title may push, and
+// hands back the two registers that say so.
+
+const uc_parameter_oversubscription: u32 = 0x260;
+const spi_shader_pgm_rsrc4_gs: u32 = 0x81;
+const vgt_gs_onchip_cntl: u32 = 0x291;
+const ge_ngg_subgrp_cntl: u32 = 0x2d3;
+const spi_vs_out_config: u32 = 0x1b1;
+const pa_cl_vs_out_cntl: u32 = 0x207;
+const ge_max_output_per_subgroup: u32 = 0x1ff;
+
+/// Every bit of the parameter-cache field, and of the export field.
+const full_pc_oversubscription: u32 = 0x7ff;
+const full_sh_oversubscription: u32 = 0x007f_0000;
+
+/// Wave32 for the geometry pair, in VGT_SHADER_STAGES_EN.
+const gs_wave32_bit: u32 = 0x0040_0000;
+
+const shader_cx_register_count_offset: usize = 0x5b;
+
+const GsOccupancy = struct {
+    vertex: u32,
+    exports: u32,
+};
+
+/// How many subgroups fit, given a parameter-cache and an export budget.
+///
+/// Both answers are "waves in flight multiplied by how many subgroups of this
+/// shape fit in the budget". The wave count itself depends on the wave size:
+/// a wave64 covers twice the work of a wave32, so half as many are needed.
+fn gsOccupancyLimits(
+    cx: [*]align(1) const ShaderRegister,
+    count: u8,
+    stages: u32,
+    vertex_capacity: u32,
+    export_capacity: u32,
+) GsOccupancy {
+    const onchip = registerValue(cx, count, vgt_gs_onchip_cntl);
+    const subgroup = registerValue(cx, count, ge_ngg_subgrp_cntl);
+    const vs_out = registerValue(cx, count, spi_vs_out_config);
+    const cl_out = registerValue(cx, count, pa_cl_vs_out_cntl);
+    const max_output = registerValue(cx, count, ge_max_output_per_subgroup);
+
+    // Vertices per subgroup, rounded up to whole waves of 32.
+    var output_words = ((max_output & 0x3ff) + 31) >> 5;
+    const subgroup_work =
+        (((((onchip >> 11) & 0x7ff) * (subgroup & 0x1ff))) + 31) >> 5;
+    var waves = @max(subgroup_work, output_words);
+    if (stages & gs_wave32_bit == 0) waves >>= 1;
+    waves = @max(waves, 1);
+    // A shader declaring no output per subgroup would divide by zero below.
+    // One is the smallest granularity the field can mean, and it keeps the
+    // shape of the calculation rather than inventing a special case.
+    output_words = @max(output_words, 1);
+
+    const exports = 1 +
+        ((cl_out >> 21) & 1) + ((cl_out >> 22) & 1) + ((cl_out >> 23) & 1);
+    const export_limit = (export_capacity / exports) * 4;
+    const vertex_limit = if (vs_out & 0x80 != 0)
+        2048
+    else
+        vertex_capacity / (((vs_out >> 2) & 0xf) + 1);
+
+    return .{
+        .vertex = saturatingProduct(waves, vertex_limit / output_words),
+        .exports = saturatingProduct(waves, export_limit / output_words),
+    };
+}
+
+fn registerValue(cx: [*]align(1) const ShaderRegister, count: u8, offset: u32) u32 {
+    for (cx[0..count]) |entry| {
+        if (entry.offset == offset) return entry.value;
+    }
+    return 0;
+}
+
+fn saturatingProduct(a: u32, b: u32) u32 {
+    const wide = @as(u64, a) * @as(u64, b);
+    return @intCast(@min(wide, std.math.maxInt(u32)));
+}
+
+/// Turns the interpolated target back into a whole number of subgroups.
+///
+/// The factor is a caller-supplied float, so it can be negative, enormous or
+/// not a number at all. Anything outside the range clamps instead of trapping.
+fn interpolatedTarget(factor: f32, headroom: u32, base: u32) u32 {
+    if (std.math.isNan(factor)) return base;
+    const scaled = @as(f64, factor) * @as(f64, @floatFromInt(headroom)) +
+        @as(f64, @floatFromInt(base));
+    if (!(scaled > 0)) return 0;
+    if (scaled >= @as(f64, std.math.maxInt(u32))) return std.math.maxInt(u32);
+    return @intFromFloat(scaled);
+}
+
+const GsOversubscription = struct {
+    parameter_cache: u32 = 0,
+    exports: u32 = 0,
+};
+
+fn gsOversubscriptionValues(
+    shader_address: usize,
+    budget: u32,
+    factor: f32,
+) ?GsOversubscription {
+    if (!accessible(shader_address, shader_structure_size)) return null;
+    const cx_address = readGuestU64(shader_address + shader_cx_registers_offset);
+    const count = @as([*]const u8, @ptrFromInt(shader_address))[shader_cx_register_count_offset];
+    if (cx_address == 0 or count == 0) return null;
+    if (!accessible(cx_address, @as(usize, count) * @sizeOf(ShaderRegister))) return null;
+    const specials_address = readGuestU64(shader_address + shader_specials_offset);
+    if (specials_address == 0 or !accessible(specials_address, 0x30)) return null;
+
+    const cx: [*]align(1) const ShaderRegister = @ptrFromInt(cx_address);
+    const specials: [*]align(1) const ShaderRegister = @ptrFromInt(specials_address);
+    const stages = specials[1].value;
+
+    // The guaranteed occupancy, and what the same shader could reach with the
+    // larger parameter-cache and export budgets.
+    const base = gsOccupancyLimits(cx, count, stages, 1024, 128);
+    const expanded = gsOccupancyLimits(cx, count, stages, 2048, 382);
+    const base_min = @min(base.vertex, base.exports);
+
+    // A wave32 subgroup is half the work, so the budget buys twice as many.
+    const limit_shift: u5 = if (stages & gs_wave32_bit != 0) 5 else 6;
+    const expanded_limit = @min(
+        @min(expanded.vertex, expanded.exports),
+        @min(budget >> limit_shift, @as(u32, 1024)),
+    );
+    const headroom = if (expanded_limit > base_min) expanded_limit - base_min else 0;
+    const target = interpolatedTarget(factor, headroom, base_min);
+    if (target <= base_min) return .{};
+
+    var result = GsOversubscription{};
+    if (target < base.exports) {
+        // Parameter cache is the binding resource: ask for the fraction of the
+        // extra vertex space the target needs, and leave exports wide open.
+        const range = @max(expanded.vertex -| base.vertex, 1);
+        const raw = (@as(u64, target -| base.vertex) << 10) / range;
+        const value: u32 = @max(@as(u32, @intCast(@min(raw, 1024))), 1);
+        result.parameter_cache = ((value << 1) - 1) & full_pc_oversubscription;
+        result.exports = full_sh_oversubscription;
+    } else {
+        // Exports are the binding resource; the parameter cache is not.
+        const range = @max(expanded.exports -| base.exports, 1);
+        const raw = (@as(u64, target -| base.exports) * 127) / range;
+        const value: u32 = @intCast(@min(raw, 127));
+        result.parameter_cache = full_pc_oversubscription;
+        result.exports = (value << 16) & full_sh_oversubscription;
+    }
+    return result;
+}
+
+/// Reports how far a geometry shader may be oversubscribed, as two registers.
+///
+/// The output array is two entries and the call owns both of them outright:
+/// each gets its register offset and a value built from zero, because there is
+/// nothing of the caller's in an output. Within those values only the two
+/// oversubscription fields are ever set, through their masks, and nothing past
+/// the second entry is touched.
+///
+/// A budget of zero asks for no oversubscription and an all-ones budget asks
+/// for all of it; neither needs to look at the shader. Anything between is
+/// worked out from the shader's own occupancy, so the shader and its register
+/// arrays must be readable, and they are checked before either output entry is
+/// written -- a caller that passes a shader this process cannot read gets an
+/// error and an untouched array rather than one register of an answer.
+fn agcGetGsOversubscription(
+    registers: ?[*]ShaderRegister,
+    geometry_shader: ?*const anyopaque,
+    budget: u32,
+    factor: f32,
+) callconv(abi.guest) i32 {
+    const out = registers orelse return invalid_argument;
+    if (!accessible(@intFromPtr(out), 2 * @sizeOf(ShaderRegister))) {
+        return errno.KernelError.efault.raw();
+    }
+
+    var values = GsOversubscription{};
+    if (budget == std.math.maxInt(u32)) {
+        values = .{
+            .parameter_cache = full_pc_oversubscription,
+            .exports = full_sh_oversubscription,
+        };
+    } else if (budget != 0) {
+        const shader = geometry_shader orelse return invalid_argument;
+        values = gsOversubscriptionValues(@intFromPtr(shader), budget, factor) orelse
+            return errno.KernelError.efault.raw();
+    }
+
+    out[0] = .{ .offset = uc_parameter_oversubscription, .value = values.parameter_cache };
+    out[1] = .{ .offset = spi_shader_pgm_rsrc4_gs, .value = values.exports };
+    return errno.ok;
+}
+
 /// The topology a geometry stage emits for a given input topology.
 ///
 /// The two are different fields with different encodings, and treating them as
@@ -4266,6 +4465,7 @@ const agc_exports = [_]symbols.Export{
     .{ .name = "sceAgcDcbContextStateOp", .function = trace.wrap("sceAgcDcbContextStateOp", &agcDcbContextStateOp), .id_override = "qj7QZpgr9Uw" },
     .{ .name = "sceAgcDcbContextStateOpGetSize", .function = trace.wrap("sceAgcDcbContextStateOpGetSize", &agcDcbContextStateOpGetSize), .expect_id = "H6vHS5cidSA" },
     .{ .name = "sceAgcUpdatePrimState", .function = trace.wrap("sceAgcUpdatePrimState", &agcUpdatePrimState), .expect_id = "Y3ymLfZ1384" },
+    .{ .name = "sceAgcGetGsOversubscription", .function = trace.wrap("sceAgcGetGsOversubscription", &agcGetGsOversubscription), .expect_id = "NKIzURsgV7I" },
     .{ .name = "sceAgcDcbCopyDataGetSize", .function = trace.wrap("sceAgcDcbCopyDataGetSize", &agcCopyDataGetSize), .expect_id = "b5u0Jzm8TF8" },
     .{ .name = "sceAgcAcbCopyDataGetSize", .function = trace.wrap("sceAgcAcbCopyDataGetSize", &agcCopyDataGetSize), .expect_id = "CbQh3DKMSno" },
     .{ .name = "sceAgcCbSetShRegistersDirectGetSize", .function = trace.wrap("sceAgcCbSetShRegistersDirectGetSize", &agcSetRegistersDirectGetSize), .expect_id = "yUBESvCCJ4I" },

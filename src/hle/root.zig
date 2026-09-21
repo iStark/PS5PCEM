@@ -1990,6 +1990,9 @@ const sh_registers_at: usize = 0x20;
 const specials_at: usize = 0x28;
 const type_at: usize = 0x5a;
 const sh_register_count_at: usize = 0x5c;
+/// The context register array and its count, used by the occupancy query.
+const cx_registers_at: usize = 0x18;
+const cx_count_at: usize = 0x5b;
 
 /// Binary types: the two halves of each pair, and what they fuse into.
 const gs_front: u8 = 4;
@@ -3090,4 +3093,333 @@ test "each draw runs under the topology set before it" {
         @as(?u32, 0x7654_3200 | 7),
         state.readRegister(.uconfig, primitive_register),
     );
+}
+
+// ---------------------------------------------------------------------------
+// GS oversubscription
+//
+// The call reports how far a geometry shader may run past its guaranteed
+// occupancy, as two registers. These build a shader whose occupancy is known
+// by construction and check the answer, the bits around it, and what happens
+// when the arguments are not what the call can work with.
+
+const AgcGetGsOversubscription = fn (
+    ?[*]PrimRegister,
+    ?*const anyopaque,
+    u32,
+    f32,
+) callconv(abi.guest) i32;
+
+const uc_parameter_oversubscription: u32 = 0x260;
+const spi_shader_pgm_rsrc4_gs: u32 = 0x81;
+const full_pc_oversubscription: u32 = 0x7ff;
+const full_sh_oversubscription: u32 = 0x007f_0000;
+const gs_wave32_bit: u32 = 0x0040_0000;
+
+/// The context registers the occupancy is read from.
+const GsShader = struct {
+    header: [0x60]u8 align(8) = @splat(0),
+    cx: [5]PrimRegister = undefined,
+    specials: [8]PrimRegister = @splat(.{ .offset = 0, .value = 0 }),
+
+
+    /// A shader with one vertex-attribute slot, one export, and the given
+    /// per-subgroup output. Wave32 is selected through the stage bit, which is
+    /// the same bit the occupancy calculation halves the wave count on.
+    fn init(self: *GsShader, output_per_subgroup: u32, wave32: bool) void {
+        const std = @import("std");
+        self.cx = .{
+            .{ .offset = 0x291, .value = (4 << 11) }, // VGT_GS_ONCHIP_CNTL
+            .{ .offset = 0x2d3, .value = 8 }, // GE_NGG_SUBGRP_CNTL
+            .{ .offset = 0x1b1, .value = 0 }, // SPI_VS_OUT_CONFIG: one slot
+            .{ .offset = 0x207, .value = 0 }, // PA_CL_VS_OUT_CNTL: one export
+            .{ .offset = 0x1ff, .value = output_per_subgroup }, // GE_MAX_OUTPUT
+        };
+        self.specials[1] = .{
+            .offset = 0,
+            .value = if (wave32) gs_wave32_bit else 0,
+        };
+        self.header = @splat(0);
+        self.header[type_at] = 2; // geometry
+        self.header[cx_count_at] = self.cx.len;
+        std.mem.writeInt(u64, self.header[cx_registers_at..][0..8], @intFromPtr(&self.cx), .little);
+        std.mem.writeInt(u64, self.header[specials_at..][0..8], @intFromPtr(&self.specials), .little);
+    }
+
+    fn pointer(self: *GsShader) *const anyopaque {
+        return @ptrCast(&self.header);
+    }
+};
+
+/// Three entries, so the third can prove nothing past the pair is touched.
+fn oversubscriptionOut() [3]PrimRegister {
+    return @splat(.{ .offset = 0xdead, .value = 0xbeef_beef });
+}
+
+test "oversubscription answers the two registers and nothing beyond them" {
+    const std = @import("std");
+    const testing = std.testing;
+
+    var db = Database{};
+    defer db.deinit(testing.allocator);
+    try registerAll(&db, testing.allocator);
+
+    const get = try agcEntryPoint(&db, "NKIzURsgV7I", AgcGetGsOversubscription);
+
+    var shader = GsShader{};
+    shader.init(64, true);
+
+    var out = oversubscriptionOut();
+    try testing.expectEqual(errno.ok, get(&out, shader.pointer(), 0x4000, 0.5));
+
+    // Both entries name their register, and the guard entry past them is as it
+    // was left.
+    try testing.expectEqual(uc_parameter_oversubscription, out[0].offset);
+    try testing.expectEqual(spi_shader_pgm_rsrc4_gs, out[1].offset);
+    try testing.expectEqual(@as(u32, 0xdead), out[2].offset);
+    try testing.expectEqual(@as(u32, 0xbeef_beef), out[2].value);
+
+    // Only the two oversubscription fields carry anything.
+    try testing.expectEqual(@as(u32, 0), out[0].value & ~full_pc_oversubscription);
+    try testing.expectEqual(@as(u32, 0), out[1].value & ~full_sh_oversubscription);
+}
+
+test "a budget of none or all does not need the shader" {
+    const std = @import("std");
+    const testing = std.testing;
+
+    var db = Database{};
+    defer db.deinit(testing.allocator);
+    try registerAll(&db, testing.allocator);
+
+    const get = try agcEntryPoint(&db, "NKIzURsgV7I", AgcGetGsOversubscription);
+
+    // No budget: both fields clear, and the shader is never looked at, so a
+    // null one is not an error.
+    var none = oversubscriptionOut();
+    try testing.expectEqual(errno.ok, get(&none, null, 0, 1.0));
+    try testing.expectEqual(@as(u32, 0), none[0].value);
+    try testing.expectEqual(@as(u32, 0), none[1].value);
+    try testing.expectEqual(uc_parameter_oversubscription, none[0].offset);
+    try testing.expectEqual(spi_shader_pgm_rsrc4_gs, none[1].offset);
+
+    // Everything: both fields full, again without a shader.
+    var all = oversubscriptionOut();
+    try testing.expectEqual(errno.ok, get(&all, null, std.math.maxInt(u32), 0.0));
+    try testing.expectEqual(full_pc_oversubscription, all[0].value);
+    try testing.expectEqual(full_sh_oversubscription, all[1].value);
+
+    // The guard entry survives both.
+    try testing.expectEqual(@as(u32, 0xbeef_beef), none[2].value);
+    try testing.expectEqual(@as(u32, 0xbeef_beef), all[2].value);
+}
+
+test "the factor walks the answer from none to the whole headroom" {
+    const std = @import("std");
+    const testing = std.testing;
+
+    var db = Database{};
+    defer db.deinit(testing.allocator);
+    try registerAll(&db, testing.allocator);
+
+    const get = try agcEntryPoint(&db, "NKIzURsgV7I", AgcGetGsOversubscription);
+
+    var shader = GsShader{};
+    shader.init(64, true);
+
+    // A factor of zero asks for nothing past the guaranteed occupancy, so both
+    // fields stay clear however large the budget is.
+    var lowest = oversubscriptionOut();
+    try testing.expectEqual(errno.ok, get(&lowest, shader.pointer(), 0x8000, 0.0));
+    try testing.expectEqual(@as(u32, 0), lowest[0].value);
+    try testing.expectEqual(@as(u32, 0), lowest[1].value);
+
+    // A negative factor cannot ask for less than nothing.
+    var negative = oversubscriptionOut();
+    try testing.expectEqual(errno.ok, get(&negative, shader.pointer(), 0x8000, -4.0));
+    try testing.expectEqual(@as(u32, 0), negative[0].value);
+    try testing.expectEqual(@as(u32, 0), negative[1].value);
+
+    // A factor of one takes the whole headroom, and the answer grows with it.
+    var middle = oversubscriptionOut();
+    var highest = oversubscriptionOut();
+    try testing.expectEqual(errno.ok, get(&middle, shader.pointer(), 0x8000, 0.5));
+    try testing.expectEqual(errno.ok, get(&highest, shader.pointer(), 0x8000, 1.0));
+    const middle_total = middle[0].value + (middle[1].value >> 16);
+    const highest_total = highest[0].value + (highest[1].value >> 16);
+    try testing.expect(highest_total >= middle_total);
+
+    // Neither field can exceed its width, whatever the factor.
+    for ([_]f32{ 2.0, 1000.0, 1e30, std.math.inf(f32) }) |factor| {
+        var out = oversubscriptionOut();
+        try testing.expectEqual(errno.ok, get(&out, shader.pointer(), 0x8000, factor));
+        try testing.expectEqual(@as(u32, 0), out[0].value & ~full_pc_oversubscription);
+        try testing.expectEqual(@as(u32, 0), out[1].value & ~full_sh_oversubscription);
+    }
+
+    // A factor that is not a number leaves the target at the guaranteed
+    // occupancy rather than trapping on the conversion.
+    var nan_out = oversubscriptionOut();
+    try testing.expectEqual(errno.ok, get(&nan_out, shader.pointer(), 0x8000, std.math.nan(f32)));
+    try testing.expectEqual(@as(u32, 0), nan_out[0].value);
+    try testing.expectEqual(@as(u32, 0), nan_out[1].value);
+}
+
+test "wave size changes how much budget buys" {
+    const std = @import("std");
+    const testing = std.testing;
+
+    var db = Database{};
+    defer db.deinit(testing.allocator);
+    try registerAll(&db, testing.allocator);
+
+    const get = try agcEntryPoint(&db, "NKIzURsgV7I", AgcGetGsOversubscription);
+
+    // The same shader twice, differing only in the wave-size bit. A wave64
+    // covers twice the work of a wave32, so the same budget buys half as many
+    // subgroups -- and the guaranteed occupancy it has to beat is halved too.
+    var wave32 = GsShader{};
+    var wave64 = GsShader{};
+    wave32.init(64, true);
+    wave64.init(64, false);
+
+    // This budget is one subgroup past what the wave32 shader is guaranteed
+    // and exactly what the wave64 one is guaranteed, so it buys the first
+    // some oversubscription and the second none at all.
+    const budget: u32 = 0x4020;
+    var out32 = oversubscriptionOut();
+    var out64 = oversubscriptionOut();
+    try testing.expectEqual(errno.ok, get(&out32, wave32.pointer(), budget, 1.0));
+    try testing.expectEqual(errno.ok, get(&out64, wave64.pointer(), budget, 1.0));
+
+    try testing.expect(out32[0].value != out64[0].value);
+    try testing.expectEqual(full_pc_oversubscription, out32[0].value);
+    try testing.expectEqual(@as(u32, 0), out64[0].value);
+    try testing.expectEqual(@as(u32, 0), out64[1].value);
+
+    // Both answers are still well formed.
+    try testing.expectEqual(@as(u32, 0), out32[0].value & ~full_pc_oversubscription);
+    try testing.expectEqual(@as(u32, 0), out32[1].value & ~full_sh_oversubscription);
+
+    // Raising the budget far enough lifts the wave64 shader over its own
+    // threshold as well, which is the same mechanism one shift further along.
+    var lifted = oversubscriptionOut();
+    try testing.expectEqual(errno.ok, get(&lifted, wave64.pointer(), 0x8000, 1.0));
+    try testing.expect(lifted[0].value != 0 or lifted[1].value != 0);
+}
+
+test "a shader that declares no output is not a division" {
+    const std = @import("std");
+    const testing = std.testing;
+
+    var db = Database{};
+    defer db.deinit(testing.allocator);
+    try registerAll(&db, testing.allocator);
+
+    const get = try agcEntryPoint(&db, "NKIzURsgV7I", AgcGetGsOversubscription);
+
+    // Zero output per subgroup rounds to zero words, which is the divisor in
+    // the occupancy calculation. It must not divide by it.
+    var empty = GsShader{};
+    empty.init(0, true);
+    var out = oversubscriptionOut();
+    try testing.expectEqual(errno.ok, get(&out, empty.pointer(), 0x4000, 1.0));
+    try testing.expectEqual(@as(u32, 0), out[0].value & ~full_pc_oversubscription);
+    try testing.expectEqual(@as(u32, 0), out[1].value & ~full_sh_oversubscription);
+
+    // The largest values the fields can hold do not overflow either.
+    var huge = GsShader{};
+    huge.init(0x3ff, true);
+    huge.cx[0].value = 0x7ff << 11; // VGT_GS_ONCHIP_CNTL at its widest
+    huge.cx[1].value = 0x1ff; // GE_NGG_SUBGRP_CNTL at its widest
+    var huge_out = oversubscriptionOut();
+    try testing.expectEqual(errno.ok, get(&huge_out, huge.pointer(), std.math.maxInt(u32) - 1, 1.0));
+    try testing.expectEqual(@as(u32, 0), huge_out[0].value & ~full_pc_oversubscription);
+    try testing.expectEqual(@as(u32, 0), huge_out[1].value & ~full_sh_oversubscription);
+}
+
+test "oversubscription refuses what it cannot read and writes nothing" {
+    const std = @import("std");
+    const guest_memory = @import("memory");
+    const kernel_memory = libs.kernel_memory;
+    const testing = std.testing;
+
+    var db = Database{};
+    defer db.deinit(testing.allocator);
+    try registerAll(&db, testing.allocator);
+
+    const get = try agcEntryPoint(&db, "NKIzURsgV7I", AgcGetGsOversubscription);
+    const einval = errno.KernelError.einval.raw();
+    const efault = errno.KernelError.efault.raw();
+
+    var shader = GsShader{};
+    shader.init(64, true);
+
+    // No output array at all, and a budget that needs a shader but has none.
+    try testing.expectEqual(einval, get(null, shader.pointer(), 0x1000, 1.0));
+    var out = oversubscriptionOut();
+    try testing.expectEqual(einval, get(&out, null, 0x1000, 1.0));
+    try testing.expectEqual(@as(u32, 0xdead), out[0].offset);
+    try testing.expectEqual(@as(u32, 0xbeef_beef), out[0].value);
+
+    // With a real address space attached, a shader this process cannot read is
+    // refused, and the output array is left exactly as it was: the shader is
+    // proved readable before either entry is written.
+    var address_space = try guest_memory.AddressSpace.initWithDirectMemory(
+        testing.allocator,
+        16 * kernel_memory.page_size,
+    );
+    defer address_space.deinit();
+    kernel_memory.init(testing.allocator);
+    defer kernel_memory.deinit();
+    kernel_memory.attachAddressSpace(&address_space);
+    defer kernel_memory.attachAddressSpace(null);
+
+    const page = kernel_memory.page_size;
+    const base = guest_memory.user.start;
+    try address_space.mapFixed(base, page, .{ .read = true, .write = true }, .direct_memory, 0);
+
+    const mapped_out: [*]PrimRegister = @ptrFromInt(base);
+    mapped_out[0] = .{ .offset = 0xdead, .value = 0xbeef_beef };
+    mapped_out[1] = .{ .offset = 0xdead, .value = 0xbeef_beef };
+
+    const unmapped: *const anyopaque = @ptrFromInt(base + 8 * page);
+    try testing.expectEqual(efault, get(mapped_out, unmapped, 0x1000, 1.0));
+    try testing.expectEqual(@as(u32, 0xdead), mapped_out[0].offset);
+    try testing.expectEqual(@as(u32, 0xbeef_beef), mapped_out[0].value);
+    try testing.expectEqual(@as(u32, 0xdead), mapped_out[1].offset);
+
+    // An output array running off the end of the mapping is refused too.
+    const truncated: [*]PrimRegister = @ptrFromInt(base + page - @sizeOf(PrimRegister));
+    try testing.expectEqual(efault, get(truncated, unmapped, 0x1000, 1.0));
+}
+
+test "asking twice gives the same answer" {
+    const std = @import("std");
+    const testing = std.testing;
+
+    var db = Database{};
+    defer db.deinit(testing.allocator);
+    try registerAll(&db, testing.allocator);
+
+    const get = try agcEntryPoint(&db, "NKIzURsgV7I", AgcGetGsOversubscription);
+
+    var shader = GsShader{};
+    shader.init(96, true);
+
+    // Nothing is carried between calls, so the same question answers the same
+    // way even into an array the previous answer already filled.
+    var first = oversubscriptionOut();
+    try testing.expectEqual(errno.ok, get(&first, shader.pointer(), 0x3000, 0.75));
+    var second = first;
+    try testing.expectEqual(errno.ok, get(&second, shader.pointer(), 0x3000, 0.75));
+    try testing.expectEqual(first[0].value, second[0].value);
+    try testing.expectEqual(first[1].value, second[1].value);
+    try testing.expectEqual(first[0].offset, second[0].offset);
+    try testing.expectEqual(first[1].offset, second[1].offset);
+
+    // And a different question answers differently in the same array.
+    try testing.expectEqual(errno.ok, get(&second, shader.pointer(), 0, 0.75));
+    try testing.expectEqual(@as(u32, 0), second[0].value);
+    try testing.expectEqual(@as(u32, 0), second[1].value);
 }

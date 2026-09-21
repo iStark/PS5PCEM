@@ -49,7 +49,6 @@ pub const exports = [_]symbols.Export{
     .{ .name = "sceAgcQueueEndOfPipeActionPatchData", .function = trace.wrap("sceAgcQueueEndOfPipeActionPatchData", &agc.patchQueueEndOfPipeData), .expect_id = "MlEw1feXcjg" },
     .{ .name = "sceAgcQueueEndOfPipeActionPatchType", .function = trace.wrap("sceAgcQueueEndOfPipeActionPatchType", &agc.patchQueueEndOfPipeType), .expect_id = "T9fjQIINoeE" },
     .{ .name = "sceAgcAcquireMemSetEngine", .function = trace.wrap("sceAgcAcquireMemSetEngine", &agc.accept), .expect_id = "W0WEyog0f74" },
-    .{ .name = "sceAgcGetGsOversubscription", .function = trace.wrap("sceAgcGetGsOversubscription", &agc.zeroQuery), .expect_id = "NKIzURsgV7I" },
     .{ .name = "sceAgcCbBranch", .function = trace.wrap("sceAgcCbBranch", &agc.branch), .expect_id = "w1KFAHVqpaU" },
     .{ .name = "sceAgcCbCondWrite", .function = trace.wrap("sceAgcCbCondWrite", &agc.writeCommand), .expect_id = "7toV+elXqNM" },
     .{ .name = "sceAgcCbSetUcRegisterRangeDirect", .function = trace.wrap("sceAgcCbSetUcRegisterRangeDirect", &agc.writeCommand), .expect_id = "MDLD5Ly94Xk" },
