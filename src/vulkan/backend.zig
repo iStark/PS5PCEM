@@ -9509,6 +9509,16 @@ pub const Renderer = struct {
                 .buffer_load_format_d16_xy,
                 .buffer_load_format_d16_xyz,
                 .buffer_load_format_d16_xyzw,
+                // The typed forms name the same V# through MTBUF and differ
+                // only in carrying their format in the instruction rather than
+                // the descriptor. Leaving them out here left every read
+                // through them without a mapping, and the translator lowers a
+                // read it cannot bind as a null buffer -- so the shader got
+                // zeroes and no diagnostic.
+                .tbuffer_load_format_x,
+                .tbuffer_load_format_xy,
+                .tbuffer_load_format_xyz,
+                .tbuffer_load_format_xyzw,
                 .s_buffer_load_dword,
                 .s_buffer_load_dwordx2,
                 .s_buffer_load_dwordx4,
@@ -9532,6 +9542,10 @@ pub const Renderer = struct {
                 .buffer_store_format_d16_xy,
                 .buffer_store_format_d16_xyz,
                 .buffer_store_format_d16_xyzw,
+                .tbuffer_store_format_x,
+                .tbuffer_store_format_xy,
+                .tbuffer_store_format_xyz,
+                .tbuffer_store_format_xyzw,
                 .buffer_atomic_swap,
                 .buffer_atomic_add,
                 .buffer_atomic_sub,
