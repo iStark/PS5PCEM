@@ -244,6 +244,13 @@ fn needsResource(inst: rdna2.Instruction) bool {
         .buffer_load_format_d16_xy,
         .buffer_load_format_d16_xyz,
         .buffer_load_format_d16_xyzw,
+        // The typed MTBUF forms name their V# in the same operand as the
+        // untyped ones and only carry the format in the instruction. The
+        // buffer pass walks them, so a checkpoint has to exist at their PC.
+        .tbuffer_load_format_x,
+        .tbuffer_load_format_xy,
+        .tbuffer_load_format_xyz,
+        .tbuffer_load_format_xyzw,
         .s_buffer_load_dword,
         .s_buffer_load_dwordx2,
         .s_buffer_load_dwordx4,
@@ -266,6 +273,10 @@ fn needsResource(inst: rdna2.Instruction) bool {
         .buffer_store_format_d16_xy,
         .buffer_store_format_d16_xyz,
         .buffer_store_format_d16_xyzw,
+        .tbuffer_store_format_x,
+        .tbuffer_store_format_xy,
+        .tbuffer_store_format_xyz,
+        .tbuffer_store_format_xyzw,
         .buffer_atomic_swap,
         .buffer_atomic_add,
         .buffer_atomic_sub,
@@ -466,4 +477,19 @@ test "the storage-image list names exactly what a full walk would visit" {
     // program as far as the plan is concerned, so it refuses to answer.
     var copy = instructions;
     try std.testing.expectEqual(@as(?[]const u32, null), plan.storageImageIndices(&copy));
+}
+
+test "typed buffer accesses get a resource checkpoint like their untyped forms" {
+    // The buffer pass in the Vulkan backend walks MTBUF alongside MUBUF and
+    // then reads the scalar state recorded at the instruction's PC. A typed
+    // access missing from this list leaves that read without a checkpoint.
+    const typed = [_]rdna2.Opcode{
+        .tbuffer_load_format_x,  .tbuffer_load_format_xy,
+        .tbuffer_load_format_xyz, .tbuffer_load_format_xyzw,
+        .tbuffer_store_format_x, .tbuffer_store_format_xy,
+        .tbuffer_store_format_xyz, .tbuffer_store_format_xyzw,
+    };
+    for (typed) |opcode| {
+        try std.testing.expect(needsCheckpoint(.{ .opcode = opcode }, .resource));
+    }
 }
