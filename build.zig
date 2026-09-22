@@ -482,6 +482,27 @@ pub fn build(b: *std.Build) void {
     const pm4_dump_step = b.step("pm4-dump", "Decode a captured GPU command stream");
     pm4_dump_step.dependOn(&pm4_dump_cmd.step);
 
+    // The same frontend the translator uses, pointed at one shader. What a
+    // shader reads is written in its prolog, and a resource the decoder drops
+    // there is a resource the draw never binds.
+    const shader_dump = b.addExecutable(.{
+        .name = "shader-dump",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/shader_dump.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "rdna2", .module = mod }},
+        }),
+    });
+    b.installArtifact(shader_dump);
+
+    const shader_dump_cmd = b.addRunArtifact(shader_dump);
+    shader_dump_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| shader_dump_cmd.addArgs(args);
+
+    const shader_dump_step = b.step("shader-dump", "Decode a guest shader");
+    shader_dump_step.dependOn(&shader_dump_cmd.step);
+
     // Verifies that a real executable/PRX dependency graph can be mapped and
     // relocated without entering guest code.
     const graph_info = b.addExecutable(.{
