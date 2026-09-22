@@ -66,8 +66,8 @@ pub const Instruction = struct {
     /// Number and shape of dwords transferred by memory instructions.
     data_words: u8 = 0,
     data_bits: u8 = 32,
-    data_format: u4 = 0,
-    number_format: u3 = 0,
+    /// MTBUF FORMAT[25:19]: GFX10 uses a unified format, not GCN's DFMT/NFMT.
+    buffer_format: u7 = 0,
     data_mask: u4 = 0,
     image_address_components: u8 = 0,
     image_nsa_words: u2 = 0,

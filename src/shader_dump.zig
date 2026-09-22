@@ -196,6 +196,7 @@ fn printInstruction(out: *std.Io.Writer, inst: rdna2.Instruction) !void {
     }
     if (inst.memory_offset != 0) try out.print("  offset=0x{x}", .{inst.memory_offset});
     if (inst.data_words != 0) try out.print("  words={d}", .{inst.data_words});
+    if (inst.family == .mtbuf) try out.print("  format={d}", .{inst.buffer_format});
     try out.writeAll("\n");
 }
 

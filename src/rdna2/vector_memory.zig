@@ -137,8 +137,7 @@ pub fn decodeMtbuf(pc: u32, code: []const u32, word_index: u32) Error!Instructio
     inst.offset_enable = (word0 >> 12) & 1 != 0;
     inst.index_enable = (word0 >> 13) & 1 != 0;
     inst.globally_coherent = (word0 >> 14) & 1 != 0;
-    inst.data_format = @intCast((word0 >> 19) & 0xf);
-    inst.number_format = @intCast((word0 >> 23) & 7);
+    inst.buffer_format = @intCast((word0 >> 19) & 0x7f);
     inst.system_coherent = (word1 >> 22) & 1 != 0;
     applyInfo(&inst, mtbufInfo(id), "MTBUF opcode is not implemented");
     inst.dst = try operand.decodeVectorGpr((word1 >> 8) & 0xff);

@@ -631,6 +631,11 @@ fn bufferComponentLayout(data_format: u8, component: u8) ?BufferComponentLayout 
     };
 }
 
+fn bufferInstructionFormat(inst: instruction.Instruction, descriptor_format: u8) ?BufferFormat {
+    // RDNA2 ISA 8.1.4: MTBUF overrides the resource format per instruction.
+    return decodeBufferUnifiedFormat(if (inst.family == .mtbuf) inst.buffer_format else descriptor_format);
+}
+
 const WorkgroupAccess = struct {
     pointer: u32,
     in_range: u32,
@@ -1392,6 +1397,7 @@ const Builder = struct {
         var has_sampled_lookup = false;
         for (options.sampled_images) |binding| if (binding.lookup) |lookup| {
             if (lookup.descriptor_index >= options.descriptor_array_length or
+                lookup.mask == std.math.maxInt(u32) or
                 lookup.probes == 0 or lookup.probes > lookup.mask + 1 or
                 !std.math.isPowerOfTwo(lookup.mask + 1) or binding.candidate_words == null)
                 return Error.InvalidStorageBinding;
@@ -8601,7 +8607,7 @@ const Builder = struct {
     fn bufferStoreFormat(self: *Builder, inst: instruction.Instruction, count: u8) Error!void {
         if (!try self.hasBufferStorage(inst)) return;
         const binding = self.storageBinding(inst.src1.reg, inst.pc) orelse return Error.InvalidStorageBinding;
-        const format = decodeBufferUnifiedFormat(binding.unified_format) orelse return self.bufferStoreWords(inst, count);
+        const format = bufferInstructionFormat(inst, binding.unified_format) orelse return self.bufferStoreWords(inst, count);
         // Preserve the existing path for float/normalized formats. Integer
         // FORMAT stores use the descriptor's component widths, not one dword
         // per VGPR. In particular, four R8_UINT components occupy one word.
@@ -9553,7 +9559,7 @@ const Builder = struct {
             return;
         }
         const binding = self.storageBinding(inst.src1.reg, inst.pc) orelse return Error.InvalidStorageBinding;
-        const format = decodeBufferUnifiedFormat(binding.unified_format) orelse {
+        const format = bufferInstructionFormat(inst, binding.unified_format) orelse {
             if (pack_output) return Error.UnsupportedBufferAddressing;
             try self.bufferLoadWords(inst, count);
             return;
@@ -9581,7 +9587,9 @@ const Builder = struct {
 
         var selected: [4]u32 = undefined;
         for (0..count) |destination_index| {
-            const selector = binding.dst_select[destination_index];
+            // Typed loads use identity component selection (X000/XY00/XYZ0/
+            // XYZW), regardless of the resource's DST_SEL (ISA table 31).
+            const selector = if (inst.family == .mtbuf) destination_index + 4 else binding.dst_select[destination_index];
             const value = switch (selector) {
                 0 => try self.constant(.bits32, 0),
                 1 => try self.constant(.bits32, one_bits),
@@ -14526,6 +14534,17 @@ test "GFX10 unified buffer formats expose packed component layouts" {
     );
     try std.testing.expect(bufferComponentLayout(5, 2) == null);
     try std.testing.expect(decodeBufferUnifiedFormat(47) == null);
+}
+
+test "a typed access takes its format from the instruction, not the resource" {
+    // Quake II loads three floats through a V# whose own FORMAT says one
+    // 8-bit component. Reading the descriptor there returned X alone and
+    // zeroed Y and Z, which is what left its lit geometry unlit.
+    const typed = instruction.Instruction{ .family = .mtbuf, .buffer_format = 74 };
+    try std.testing.expectEqual(BufferFormat{ .data = 13, .number = 7 }, bufferInstructionFormat(typed, 5).?);
+    // An untyped access has no format of its own and keeps reading the V#.
+    const untyped = instruction.Instruction{ .family = .mubuf, .buffer_format = 74 };
+    try std.testing.expectEqual(BufferFormat{ .data = 1, .number = 4 }, bufferInstructionFormat(untyped, 5).?);
 }
 
 test "MUBUF format load converts packed descriptor components" {
