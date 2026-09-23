@@ -182,7 +182,6 @@ const CompletionKind = enum {
     driver_label,
     release,
     dcb,
-    acb,
 };
 
 const PendingCompletion = struct {
@@ -260,8 +259,8 @@ fn enqueueCompletion(completion: PendingCompletion) void {
     completion_lock.lock();
     const ready_after_ns = kernel_runtime.processTimeCounter() +|
         @as(u64, completion_latency_ns);
-    // Each public submit owns one retirement edge. Preserve FIFO order and do
-    // not merge equivalent queue identifiers across separate submissions.
+    // Preserve FIFO order without merging equivalent interrupt identifiers
+    // across separate submissions. Driver-label writes are not interrupts.
     if (pending_completion_count == pending_completions.len) {
         if (dropped_completion_reports < 8) {
             std.debug.print("[agc delivery] completion FIFO full; dropping {s}\n", .{@tagName(completion.kind)});
@@ -345,15 +344,6 @@ fn deliverCompletion(completion: PendingCompletion) usize {
             return triggered;
         },
         .dcb => event_queue.triggerGraphicsEvent(0, completion.context_id),
-        // SubmitAcb's first argument is the compute queue owner. The AGC
-        // runtime registers that owner as a graphics-filter event ident and
-        // advances the queue's CPU retirement label from its handler. A user
-        // event (or graphics ident zero) leaves the handler asleep even though
-        // the hardware RELEASE_MEM label has already reached its generation.
-        .acb => event_queue.triggerGraphicsEvent(
-            @bitCast(completion.context_id),
-            completion.context_id,
-        ),
     };
 }
 
@@ -3399,14 +3389,6 @@ fn publishSdk11AcbRetirement(release: gpu.state.ReleaseMem) void {
     }
 }
 
-/// Compute completion is delivered under the queue-owner ident passed to
-/// SubmitAcb. The guest registers that exact ident with the graphics filter;
-/// its event handler then advances the paired CPU retirement generation.
-fn publishAcbCompletion(owner: u32, outcome: SubmitOutcome) void {
-    if (!outcome.accepted or outcome.queued_interrupt) return;
-    enqueueCompletion(.{ .kind = .acb, .context_id = owner });
-}
-
 /// A public graphics submission without an explicit interrupt still needs the
 /// same AGC completion fanout that an interrupting RELEASE_MEM would publish.
 fn publishDcbCompletion(outcome: SubmitOutcome) void {
@@ -3451,6 +3433,9 @@ fn submitDcb(descriptor: ?*const Submission) callconv(abi.guest) i32 {
 }
 
 /// Compute work on a named queue.
+/// Only an executed interrupting packet may notify the queue's graphics event.
+/// Silent submissions still retire driver labels, but an extra event can
+/// underflow the guest's CPU dependency counter and strand its next job batch.
 fn submitAcb(owner: u32, descriptor: ?*const Submission) callconv(abi.guest) i32 {
     drainCompletionNotifications();
     const submit_started = gpu.frame_timing.timestampNs();
@@ -3466,7 +3451,6 @@ fn submitAcb(owner: u32, descriptor: ?*const Submission) callconv(abi.guest) i32
     } else if (outcome.completed) {
         publishSdk11AcbDriverGeneration(owner, submission.*, null);
     }
-    publishAcbCompletion(owner, outcome);
     return errno.ok;
 }
 
@@ -3511,7 +3495,6 @@ pub fn submitMultiAcbs(
         flushPendingGraphicsSegment();
         const outcome = acceptSubmitted("acb", stream, null, queue);
         if (outcome.last_release) |release| publishSdk11AcbRetirement(release);
-        publishAcbCompletion(queue, outcome);
     }
     return errno.ok;
 }
@@ -3599,7 +3582,6 @@ fn submitMultiCommandBuffers(
             flushPendingGraphicsSegment();
             const outcome = acceptSubmitted("acb", stream, null, queue);
             if (outcome.last_release) |release| publishSdk11AcbRetirement(release);
-            publishAcbCompletion(queue, outcome);
         } else {
             publishDcbCompletion(acceptSubmitted("dcb", stream, null, 0));
         }
@@ -4215,6 +4197,93 @@ test "release interrupts only notify their originating queue" {
     try testing.expectEqual(@as(u64, 0xcafe), events[0].user_data);
 }
 
+test "compute submissions notify only requested release interrupts" {
+    reset();
+    defer reset();
+    event_queue.reset();
+    defer event_queue.reset();
+    var address_space = try guest_address_space.AddressSpace.init(testing.allocator);
+    defer address_space.deinit();
+    memory.attachAddressSpace(&address_space);
+    defer memory.attachAddressSpace(null);
+
+    const api = struct {
+        fn get(comptime name: []const u8, comptime T: type) T {
+            inline for (event_queue.exports) |entry| {
+                if (comptime std.mem.eql(u8, entry.name, name)) return @ptrCast(entry.function);
+            }
+            @compileError("missing equeue export");
+        }
+    };
+    const create = api.get("sceKernelCreateEqueue", *const fn (?*i64, ?[*:0]const u8) callconv(abi.guest) i32);
+    const wait = api.get("sceKernelWaitEqueue", *const fn (i64, ?[*]event_queue.Event, i32, ?*i32, ?*const u32) callconv(abi.guest) i32);
+    var handle: i64 = 0;
+    try testing.expectEqual(errno.ok, create(&handle, "compute-interrupts"));
+    try testing.expectEqual(errno.ok, event_queue.addGraphicsEvent(handle, 0x52, 0xcafe));
+    var labels: [0x1000 / 8]u64 align(0x1000) = @splat(0);
+    const label_address = @intFromPtr(&labels[16]);
+    // Noninterrupting releases still write their labels, but must not consume
+    // CPU dependency counts for a later explicitly interrupting submission.
+    var release = [_]u32{
+        command(gpu.pm4.release_mem, 7),           0x28,
+        (@as(u32, 2) << 29) | (@as(u32, 1) << 16), @truncate(label_address),
+        @truncate(label_address >> 32),            37,
+        1,                                         0x1234,
+    };
+    var descriptor: [0x60]u8 align(8) = @splat(0);
+    const submission: *Submission = @ptrCast(&descriptor);
+    submission.* = .{ .address = &release, .word_count = release.len, .reserved = 0 };
+    // Driver-owned busy flags must retire even when no interrupt was requested.
+    labels[20] = 1;
+    var node: [0xc0]u8 align(8) = @splat(0);
+    std.mem.writeInt(u64, node[0x08..0x10], @intFromPtr(&release), .little);
+    std.mem.writeInt(u32, node[0x10..0x14], release.len, .little);
+    std.mem.writeInt(u64, node[0x20..0x28], @intFromPtr(&labels[20]), .little);
+    node[0xb8] = 2;
+    std.mem.writeInt(u64, descriptor[0x50..0x58], @intFromPtr(&node), .little);
+    try testing.expectEqual(errno.ok, submitAcb(0x52, submission));
+    try testing.expectEqual(@as(u64, 0x1_0000_0025), labels[16]);
+    std.mem.writeInt(u64, descriptor[0x50..0x58], 0, .little);
+
+    const addresses = [_]?[*]const u32{&release};
+    const sizes = [_]u32{release.len};
+    release[5] = 38;
+    try testing.expectEqual(errno.ok, submitMultiAcbs(0x52, &addresses, &sizes, 1));
+    try testing.expectEqual(@as(u64, 0x1_0000_0026), labels[16]);
+    const queue_context = [_]u32{ 0, 0x52 };
+    release[5] = 39;
+    try testing.expectEqual(errno.ok, submitMultiCommandBuffers(&queue_context, &addresses, &sizes, 1));
+    try testing.expectEqual(@as(u64, 0x1_0000_0027), labels[16]);
+
+    // The explicit interrupt is nested: scanning only root packets cannot
+    // determine whether executing the command stream will send an event.
+    release[2] |= @as(u32, 2) << 24;
+    release[5] = 40;
+    const child_address = @intFromPtr(&release);
+    const indirect = [_]u32{
+        command(gpu.pm4.indirect_buffer, 3), @truncate(child_address),
+        @truncate(child_address >> 32),      release.len,
+    };
+    submission.* = .{ .address = &indirect, .word_count = indirect.len, .reserved = 0 };
+    try testing.expectEqual(errno.ok, submitAcb(0x52, submission));
+    try testing.expectEqual(@as(u64, 0x1_0000_0028), labels[16]);
+
+    // Drain deterministically, including any incorrectly synthesized edges.
+    while (pending_completion_count != 0) {
+        pending_completions[pending_completion_head].ready_after_ns = 0;
+        drainCompletionNotifications();
+    }
+    try testing.expectEqual(@as(u64, 0), labels[20]);
+    var events: [8]event_queue.Event = @splat(.{});
+    var count: i32 = 0;
+    const timeout: u32 = 0;
+    try testing.expectEqual(errno.ok, wait(handle, &events, events.len, &count, &timeout));
+    try testing.expectEqual(@as(i32, 1), count);
+    try testing.expectEqual(@as(u64, 0x52), events[0].ident);
+    try testing.expectEqual(@as(i64, 0x1234), events[0].data);
+    try testing.expectEqual(@as(u64, 0xcafe), events[0].user_data);
+}
+
 test "pending completion FIFO preserves equivalent submit edges" {
     reset();
     defer reset();
@@ -4225,7 +4294,7 @@ test "pending completion FIFO preserves equivalent submit edges" {
     enqueueCompletion(.{ .kind = .release, .context_id = 3 });
     try testing.expectEqual(@as(usize, 2), pending_completion_count);
 
-    enqueueCompletion(.{ .kind = .acb, .context_id = 0 });
+    enqueueCompletion(.{ .kind = .dcb, .context_id = 0 });
     try testing.expectEqual(@as(usize, 3), pending_completion_count);
     try testing.expectEqual(CompletionKind.release, pending_completions[pending_completion_head].kind);
     const second = (pending_completion_head + 1) % pending_completions.len;
