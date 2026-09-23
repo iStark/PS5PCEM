@@ -58,6 +58,10 @@ the measured playback speed. Later development reached the bonus notices,
 brightness calibration and parts of the 3D scene/interface; full title-menu
 composition and gameplay remain unverified.*
 
+![Ghost of Yotei tree scene captured from PS5PCEM](images/yotei-tree-scene.png)
+
+*Captured directly from the emulator's live client area at 1624×941 on
+September 23, 2026, using a development build.*
 
 ![Terminator 2D gameplay rendered by PS5PCEM](images/live-gameplay.png)
 

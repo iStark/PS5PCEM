@@ -82,6 +82,12 @@ found, and can invoke the package extractor on a debug package directly.
       <sub>Dreaming Sarah &mdash; world scene with an NPC</sub>
     </td>
   </tr>
+  <tr>
+    <td colspan="2" align="center">
+      <img src="docs/images/yotei-tree-scene.png" alt="Ghost of Yotei tree scene captured from PS5PCEM"><br>
+      <sub>Ghost of Yotei &mdash; tree scene (development capture, September 23, 2026)</sub>
+    </td>
+  </tr>
 </table>
 
 See the
