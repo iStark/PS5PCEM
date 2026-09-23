@@ -186,22 +186,24 @@ and scheduler-watchdog reports used during CPU synchronization debugging. They
 are disabled during normal play because several parked engine workers printing
 to the same console can themselves introduce frame and audio stalls.
 
-New GPU architecture paths are independently gated for title A/B testing. They
-are disabled in ordinary `game-run` launches; the startup log prints every
-effective value so a captured report is self-describing:
+GPU architecture paths are independently gated for title A/B testing. The
+startup log prints effective values so a captured report is self-describing.
+Pipeline compilation uses two workers by default; set
+`PS5_GPU_COMPILER_WORKERS=1..4` to change the bound or
+`PS5_GPU_ASYNC_PIPELINES=0` for synchronous compilation without compute warmup.
 
 | Variable | Experimental path |
 |---|---|
 | `PS5_GPU_SHADER_IR=1` | typed RDNA2 IR as the executable SPIR-V input |
 | `PS5_GPU_SSA=1` | SSA construction, constant folding, and shader DCE |
-| `PS5_GPU_ASYNC_PIPELINES=1` | FIFO worker for first-use pipeline compilation |
+| `PS5_GPU_ASYNC_PIPELINES=1` | bounded compiler pool and per-title compute warmup (default) |
 | `PS5_GPU_CANONICAL_ALIASES=1` | shared generations and canonical writers for overlapping image caches |
 | `PS5_GPU_DEPTH_TRANSFER=1` | single-sample guest depth/stencil import and writeback |
 | `PS5_GPU_IMAGE_STATE_OPT=1` | read-only barrier elision and compatible aspect merging |
 | `PS5_GPU_TIMELINE_SCHEDULER=1` | multiple in-flight submissions retired by timeline tick |
 | `PS5_GPU_DEFER_STORAGE_WRITES=1` | GPU-authoritative small compute outputs until an exact CPU consumer |
 | `PS5_GPU_PAGE_TRACKER=1` | 16 KiB guest-page generations backed by CPU write faults |
-| `PS5_GPU_EXPERIMENTAL=1` | enables all nine paths together |
+| `PS5_GPU_EXPERIMENTAL=1` | enables the experimental paths together |
 
 `PPSA25872` automatically enables the timeline scheduler and deferred small
 storage writeback after measured title-specific A/B passes. Set

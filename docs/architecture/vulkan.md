@@ -28,11 +28,34 @@ This avoids repeating translation just to discover an existing Vulkan pipeline.
 Compute, fragment and unchanged vertex programs reuse the immutable analysis
 key prefix, avoiding repeated serialization of decoded instructions. Inlined
 vertex fetch programs and changed lowering options rebuild the complete key.
-When `PS5_GPU_ASYNC_PIPELINES=1`, first-use compute and graphics pipelines are created by
-[`vulkan.pipeline_compiler`](../../src/vulkan/pipeline_compiler.zig), an on-demand
-single-worker FIFO which serializes the shared driver cache and falls back to a
-correct inline drain if the host cannot create a thread. The Vulkan-driver
-cache is persisted as
+`game-run` enables [`vulkan.pipeline_compiler`](../../src/vulkan/pipeline_compiler.zig)
+by default with two workers. `PS5_GPU_COMPILER_WORKERS=1..4` sets the bound;
+`PS5_GPU_ASYNC_PIPELINES=0` restores synchronous compilation and disables warmup.
+Workers sleep when idle, prioritize current-frame jobs over queued background
+work, and are joined before device destruction. A failed worker start preserves
+the job using an existing worker or inline execution. Vulkan's ordinary driver
+cache provides internal synchronization for concurrent pipeline creation.
+
+[`pipeline_warmup`](../../src/vulkan/pipeline_warmup.zig) records successfully
+compiled compute SPIR-V under `out/shader-cache/<PPSA title>/compute-v1/`, with a
+subdirectory for the GPU vendor, device and driver pipeline-cache UUID. On the
+next launch, independent jobs load, validate and compile these modules into the
+driver cache. They never dispatch cached code and immediately destroy their
+temporary pipelines and shader modules. Queued warmups retain only metadata;
+each worker loads at most 16 MiB, pending catalog writes are capped at 32 MiB,
+and the catalog admits at most 512 MiB / 2048 jobs. Shutdown cancels warmups
+that have not started and drains accepted writes. Runtime compute shader modules
+are also destroyed after pipeline creation; executable pipelines remain in the
+ordinary LRU until eviction and GPU retirement.
+
+First-use pipelines absent from the catalog still block until available. The
+pool supplies actual parallel work through replay of known compute variants;
+it does not skip draws or speculate across guest resource dependencies.
+`vulkan-smoke --pipeline-warmup <catalog>` verifies concurrent driver calls and
+zero retained warmup pipelines; `--pipeline-warmup-serial` provides a one-worker
+comparison on the same catalog.
+
+The Vulkan-driver cache is persisted as
 `vulkan_pipeline_cache.bin` between runs, with a 4 GiB size limit. Invalid,
 unreadable, or oversized data falls back to an empty driver cache, so it can only affect
 startup compilation time, never correctness.

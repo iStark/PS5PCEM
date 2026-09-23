@@ -602,8 +602,24 @@ fn run(init: std.process.Init) !bool {
         (init.minimal.environ.containsUnempty(allocator, "PS5_GPU_SSA") catch false);
     const enable_shader_ir = enable_gpu_experimental or enable_shader_ssa or
         (init.minimal.environ.containsUnempty(allocator, "PS5_GPU_SHADER_IR") catch false);
-    const enable_async_pipelines = enable_gpu_experimental or
-        (init.minimal.environ.containsUnempty(allocator, "PS5_GPU_ASYNC_PIPELINES") catch false);
+    const enable_async_pipelines = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_ASYNC_PIPELINES")) |text| enabled: {
+        defer allocator.free(text);
+        break :enabled !std.mem.eql(u8, std.mem.trim(u8, text, " \t\r\n"), "0");
+    } else |_| true;
+    const pipeline_compiler_workers = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_COMPILER_WORKERS")) |text| workers: {
+        defer allocator.free(text);
+        break :workers std.math.clamp(std.fmt.parseInt(usize, std.mem.trim(u8, text, " \t\r\n"), 10) catch 2, 1, 4);
+    } else |_| 2;
+    // Use title-isolated catalogs and a versioned descriptor ABI directory.
+    // Unknown/nonstandard title identifiers simply run without disk warmup.
+    const safe_shader_title = title_identifier.len == 9 and std.mem.startsWith(u8, title_identifier, "PPSA") and
+        for (title_identifier[4..]) |character| {
+            if (!std.ascii.isDigit(character)) break false;
+        } else true;
+    const compute_warmup_directory = if (enable_async_pipelines and safe_shader_title)
+        try std.fmt.allocPrint(startup_arena, "out/shader-cache/{s}/compute-v1", .{title_identifier})
+    else
+        null;
     const enable_canonical_aliases = enable_gpu_experimental or
         (init.minimal.environ.containsUnempty(allocator, "PS5_GPU_CANONICAL_ALIASES") catch false);
     const enable_depth_transfer = enable_gpu_experimental or
@@ -743,6 +759,8 @@ fn run(init: std.process.Init) !bool {
             .enable_shader_ir = enable_shader_ir,
             .enable_shader_ssa_optimization = enable_shader_ssa,
             .enable_async_pipeline_compilation = enable_async_pipelines,
+            .pipeline_compiler_workers = pipeline_compiler_workers,
+            .compute_warmup_directory = compute_warmup_directory,
             .enable_canonical_image_aliases = enable_canonical_aliases,
             .enable_timeline_scheduler = enable_timeline_scheduler,
             .defer_small_storage_writes = defer_small_storage_writes,
@@ -819,6 +837,7 @@ fn run(init: std.process.Init) !bool {
             native.height,
         });
         try out.print("  scanout channel order uses the registered buffer set\n", .{});
+        try out.print("  pipeline compiler workers={d} warmup={s}\n", .{ pipeline_compiler_workers, compute_warmup_directory orelse "disabled" });
         try out.print(
             "  GPU flags ir={d} ssa={d} async_pso={d} aliases={d} depth_io={d} image_state_opt={d} timeline={d} timeline_auto={d} defer_storage={d} defer_storage_auto={d} page_tracker={d} buffer_content_cache={d} copy_workers={d} render_targets={d} storage_image_mib={d} compute_translation_mib={d}\n",
             .{

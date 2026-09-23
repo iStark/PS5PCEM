@@ -22,6 +22,7 @@ const image_alias = @import("image_alias.zig");
 const image_state = @import("image_state.zig");
 const pipeline_compiler = @import("pipeline_compiler.zig");
 const pipeline_cache_save = @import("pipeline_cache_save.zig");
+const pipeline_warmup = @import("pipeline_warmup.zig");
 const spirv_cache = @import("spirv_cache.zig");
 const tessellation_spirv = @import("tessellation_spirv.zig");
 // Kept opt-in while the live LS/HS resource path is being validated.
@@ -243,6 +244,10 @@ pub const Options = struct {
     enable_shader_ssa_optimization: bool = false,
     /// Runs first-use Vulkan pipeline creation on the compiler worker.
     enable_async_pipeline_compilation: bool = false,
+    pipeline_compiler_workers: usize = 2,
+    /// Optional per-title catalog. SPIR-V is warmed into the driver cache,
+    /// never dispatched; no device objects are retained by warmup jobs.
+    compute_warmup_directory: ?[]const u8 = null,
     /// Tracks overlapping image caches and selects one canonical writer.
     enable_canonical_image_aliases: bool = false,
     /// Allows multiple Vulkan submissions to remain in flight and retires
@@ -304,6 +309,7 @@ pub const DeviceInfo = struct {
     vendor_id: u32,
     device_id: u32,
     device_type: u32,
+    pipeline_cache_uuid: [16]u8 = @splat(0),
     sampled_image_capacity: u32 = 64,
     max_compute_shared_memory_size: u32 = 32768,
     max_compute_work_group_invocations: u32 = 128,
@@ -1148,7 +1154,6 @@ const ComputePipelineEntry = struct {
     hash: u64,
     words: []const u32,
     module: ?spirv_cache.Lease = null,
-    shader: vk.ShaderModule,
     pipeline: vk.Pipeline,
     last_used_sequence: u64,
 
@@ -1291,19 +1296,21 @@ const ComputePipelineCompileJob = struct {
     job: pipeline_compiler.Job = .{ .run = run },
     renderer: *Renderer,
     words: []const u32,
-    shader: vk.ShaderModule = 0,
     pipeline: vk.Pipeline = 0,
     failure: ?Error = null,
 
     fn run(base: *pipeline_compiler.Job) void {
         const work: *@This() = @fieldParentPtr("job", base);
-        work.shader = work.renderer.createShader(work.words) catch |err| {
+        const shader = work.renderer.createShader(work.words) catch |err| {
             work.failure = err;
             return;
         };
+        // VkShaderModule lifetime ends once pipeline creation returns. Keeping
+        // thousands of source modules alongside executable pipelines is waste.
+        defer work.renderer.device_functions.destroy_shader_module(work.renderer.device, shader, null);
         const stage = vk.PipelineShaderStageCreateInfo{
             .stage = vk.shader_stage_compute_bit,
-            .module = work.shader,
+            .module = shader,
             .name = "main",
         };
         const info = vk.ComputePipelineCreateInfo{
@@ -1321,8 +1328,8 @@ const ComputePipelineCompileJob = struct {
             null,
             @ptrCast(&work.pipeline),
         ) != vk.success) {
-            work.renderer.device_functions.destroy_shader_module(work.renderer.device, work.shader, null);
-            work.shader = 0;
+            if (work.pipeline != 0) work.renderer.device_functions.destroy_pipeline(work.renderer.device, work.pipeline, null);
+            work.pipeline = 0;
             work.failure = Error.ComputePipelineCreationFailed;
         } else {
             _ = work.renderer.pipeline_cache_generation.fetchAdd(1, .release);
@@ -3674,6 +3681,7 @@ pub const Renderer = struct {
     detile_shader: vk.ShaderModule = 0,
     driver_pipeline_cache: vk.PipelineCache,
     pipeline_compile_queue: pipeline_compiler.Queue = .{},
+    compute_warmup: ?*pipeline_warmup.Cache = null,
     memory_properties: vk.PhysicalDeviceMemoryProperties,
     host_import_properties: ?external_host.GetPointerProperties = null,
     host_import_alignment: u64 = 0,
@@ -3785,6 +3793,8 @@ pub const Renderer = struct {
     sampled_image_cache: std.ArrayList(CachedSampledImage) = .empty,
     sampled_image_cache_bytes: u64 = 0,
     sampled_image_cache_budget_bytes: u64 = 2 * 1024 * 1024 * 1024,
+    image_memory_reclaims: u64 = 0,
+    image_memory_reclaimed_bytes: u64 = 0,
     sampled_image_batch: u64 = 0,
     sampled_image_index: @import("sampled_image_index.zig").Index(maximum_cached_sampled_images) = .{},
     resident_image_views: std.ArrayList(CachedResidentImageView) = .empty,
@@ -4586,6 +4596,7 @@ pub const Renderer = struct {
             .descriptor_set = descriptor_set,
             .compute_pipeline_layout = compute_pipeline_layout,
             .driver_pipeline_cache = driver_pipeline_cache,
+            .pipeline_compile_queue = .{ .worker_limit = std.math.clamp(options.pipeline_compiler_workers, 1, pipeline_compiler.Queue.maximum_workers) },
             .memory_properties = memory_properties,
             .host_import_alignment = host_properties.alignment,
             .host_import_properties = if (host_import)
@@ -4704,11 +4715,23 @@ pub const Renderer = struct {
         renderer.createDetilePass() catch |err| {
             std.debug.print("[vulkan] compute detile unavailable: {s}\n", .{@errorName(err)});
         };
+        if (options.compute_warmup_directory) |directory| {
+            // Descriptor capacity and generated code can depend on the GPU's
+            // features. Never replay another device/driver's SPIR-V catalog.
+            var path_buffer: [1024]u8 = undefined;
+            const cache_path = std.fmt.bufPrint(&path_buffer, "{s}/{x:0>8}-{x:0>8}-{s}", .{
+                directory,                                                            renderer.device_info.vendor_id, renderer.device_info.device_id,
+                std.fmt.bytesToHex(renderer.device_info.pipeline_cache_uuid, .lower),
+            }) catch null;
+            if (cache_path) |path| renderer.compute_warmup = pipeline_warmup.Cache.open(path) catch null;
+        }
         return renderer;
     }
 
     pub fn deinit(self: *Renderer) void {
-        self.pipeline_compile_queue.waitIdle();
+        if (self.compute_warmup) |warmup| warmup.stop();
+        self.pipeline_compile_queue.deinit();
+        if (self.compute_warmup) |warmup| warmup.deinit();
         self.finishDrawBatch() catch {};
         _ = self.device_functions.device_wait_idle(self.device);
         self.completed_tick = self.submitted_tick;
@@ -4751,7 +4774,6 @@ pub const Renderer = struct {
         self.image_states.deinit(self.allocator);
         for (self.compute_pipelines.items) |entry| {
             self.device_functions.destroy_pipeline(self.device, entry.pipeline, null);
-            self.device_functions.destroy_shader_module(self.device, entry.shader, null);
             entry.releaseWords(self.allocator);
         }
         self.compute_pipelines.deinit(self.allocator);
@@ -4838,7 +4860,23 @@ pub const Renderer = struct {
     /// when a draw has no guest graphics programs.
     pub fn dcbBackend(self: *Renderer, memory: GuestMemory) gpu.DcbBackend {
         self.guest_memory = memory;
+        self.startComputeWarmup();
         return .{ .context = self, .vtable = &dcb_vtable };
+    }
+
+    fn startComputeWarmup(self: *Renderer) void {
+        if (self.compute_warmup) |warmup| warmup.start(&self.pipeline_compile_queue, .{
+            .context = self,
+            .compile = warmComputePipeline,
+        });
+    }
+
+    fn warmComputePipeline(context: ?*anyopaque, words: []const u32) bool {
+        const self: *Renderer = @ptrCast(@alignCast(context.?));
+        var work = ComputePipelineCompileJob{ .renderer = self, .words = words };
+        ComputePipelineCompileJob.run(&work.job);
+        if (work.pipeline != 0) self.device_functions.destroy_pipeline(self.device, work.pipeline, null);
+        return work.failure == null;
     }
 
     /// Installs the host consumer for completed `SetFlip` frames. The sink is
@@ -10388,6 +10426,7 @@ pub const Renderer = struct {
     }
 
     fn getComputePipeline(self: *Renderer, words: []const u32, module: ?spirv_cache.Lease) (Error || std.mem.Allocator.Error)!PipelineLookup {
+        self.startComputeWarmup();
         self.compute_pipeline_sequence +%= 1;
         // The pipeline holds a reference, so an immutable translation cannot
         // be freed and replaced at the same address while this entry exists.
@@ -10433,24 +10472,20 @@ pub const Renderer = struct {
         const owned_words: []const u32 = if (module != null) words else self.allocator.dupe(u32, words) catch |err| {
             if (asynchronous) work.job.wait();
             if (work.pipeline != 0) self.device_functions.destroy_pipeline(self.device, work.pipeline, null);
-            if (work.shader != 0) self.device_functions.destroy_shader_module(self.device, work.shader, null);
             return err;
         };
         errdefer if (module == null) self.allocator.free(owned_words);
         if (asynchronous) work.job.wait();
         if (work.failure) |failure| return failure;
         savePipelineCacheBytes(self);
-        const shader = work.shader;
         const pipeline = work.pipeline;
         errdefer self.destroyPipeline(pipeline);
-        errdefer self.destroyShaderModule(shader);
         const retained = if (module) |current| current.retain() else null;
         errdefer if (retained) |current| current.release();
         const replacement = ComputePipelineEntry{
             .hash = hash,
             .words = owned_words,
             .module = retained,
-            .shader = shader,
             .pipeline = pipeline,
             .last_used_sequence = self.compute_pipeline_sequence,
         };
@@ -10469,12 +10504,12 @@ pub const Renderer = struct {
             }
             const evicted = self.compute_pipelines.items[oldest_index];
             self.destroyPipeline(evicted.pipeline);
-            self.destroyShaderModule(evicted.shader);
             evicted.releaseWords(self.allocator);
             self.compute_pipelines.items[oldest_index] = replacement;
         }
         self.pipeline_cache_misses += 1;
         self.frame_profile.compute_pipeline_misses += 1;
+        if (self.compute_warmup) |warmup| warmup.record(&self.pipeline_compile_queue, words);
         return .{ .pipeline = pipeline, .cache_hit = false };
     }
 
@@ -11150,6 +11185,9 @@ pub const Renderer = struct {
         vertex_words: []const u32,
         fragment_words: []const u32,
     ) Error!vk.Pipeline {
+        // Pipeline workers may overlap the renderer. Temporary generated
+        // stages must not touch a caller-provided single-threaded allocator.
+        const shader_allocator = std.heap.page_allocator;
         const vertex = try self.createShader(vertex_words);
         defer self.device_functions.destroy_shader_module(self.device, vertex, null);
         const fragment = try self.createShader(fragment_words);
@@ -11164,21 +11202,21 @@ pub const Renderer = struct {
                 pipeline_state.tessellation_control_points > 32 or pipeline_state.tessellation_domain > 2)
                 return Error.UnsupportedGraphicsState;
             tess_vertex = try self.createShader(&tessellation_spirv.vertex);
-            const words = tessellation_spirv.control(self.allocator, pipeline_state.tessellation_factor_slot, @enumFromInt(pipeline_state.tessellation_domain)) catch
+            const words = tessellation_spirv.control(shader_allocator, pipeline_state.tessellation_factor_slot, @enumFromInt(pipeline_state.tessellation_domain)) catch
                 return Error.ShaderModuleCreationFailed;
-            defer self.allocator.free(words);
+            defer shader_allocator.free(words);
             tess_control = try self.createShader(words);
         }
         var geometry: vk.ShaderModule = 0;
         defer if (geometry != 0) self.device_functions.destroy_shader_module(self.device, geometry, null);
         if (pipeline_state.rectangle_completion != 0) {
             const geometry_words = buildRectangleListGeometrySpirv(
-                self.allocator,
+                shader_allocator,
                 pipeline_state.rectangle_parameter_mask,
                 pipeline_state.rectangle_completion,
             ) catch return Error.ShaderModuleCreationFailed;
-            defer self.allocator.free(geometry_words);
-            if (self.dump_graphics_spirv) dumpGraphicsSpirv(self.allocator, "gs", pipeline_state.rectangle_parameter_mask, geometry_words);
+            defer shader_allocator.free(geometry_words);
+            if (self.dump_graphics_spirv) dumpGraphicsSpirv(shader_allocator, "gs", pipeline_state.rectangle_parameter_mask, geometry_words);
             geometry = try self.createShader(geometry_words);
         }
         var stage_storage: [4]vk.PipelineShaderStageCreateInfo = undefined;
@@ -19311,6 +19349,15 @@ pub const Renderer = struct {
             if (sampled_cache) self.frame_profile.sampled_allocation_retries +|= 1;
             allocation_result = self.allocateImageMemory(&allocation_info, &memory, sampled_cache);
         }
+        while (allocation_result == vk.error_out_of_device_memory) {
+            // Independent cache budgets do not guarantee that their combined
+            // working set fits the device. Reclaim reconstructible textures
+            // even below their own budget, including for a new render target
+            // or storage image. Never discard images prepared for this batch.
+            if (!try self.reclaimSampledImageMemory(requirements.size)) break;
+            if (sampled_cache) self.frame_profile.sampled_allocation_retries +|= 1;
+            allocation_result = self.allocateImageMemory(&allocation_info, &memory, sampled_cache);
+        }
         if (allocation_result != vk.success) {
             std.debug.print("[vulkan memory] image allocation failed result={d} bytes={d} type={d} sampled_cache={d}MiB/{d}MiB images={d}\n", .{
                 allocation_result,                                     requirements.size,                  memory_type_index, self.sampled_image_cache_bytes / (1024 * 1024),
@@ -22252,19 +22299,7 @@ pub const Renderer = struct {
         while (self.sampled_image_cache_bytes +| incoming_bytes > self.sampled_image_cache_budget_bytes or
             self.sampled_image_cache.items.len >= maximum_cached_sampled_images)
         {
-            var victim: ?usize = null;
-            var oldest: u64 = std.math.maxInt(u64);
-            for (self.sampled_image_cache.items, 0..) |entry, index| {
-                // Resource preparation may publish a colour target and advance
-                // frame_sequence. A descriptor batch, unlike that counter,
-                // continues to protect every image selected for the next draw.
-                if (entry.last_used_batch == self.sampled_image_batch) continue;
-                if (victim == null or entry.last_used_batch < oldest) {
-                    victim = index;
-                    oldest = entry.last_used_batch;
-                }
-            }
-            const index = victim orelse {
+            const index = self.sampledImageEvictionCandidate() orelse {
                 if (self.sampled_image_cache.items.len >= maximum_cached_sampled_images)
                     return Error.UnsupportedSampledImage;
                 // A single prepared batch can exceed the soft byte budget.
@@ -22286,6 +22321,50 @@ pub const Renderer = struct {
         } else if (slack != 0 and self.pending_sampled_image_bytes != 0) {
             try self.waitForSampledImageRetirement(slack);
         }
+    }
+
+    fn sampledImageEvictionCandidate(self: *const Renderer) ?usize {
+        var victim: ?usize = null;
+        var oldest: u64 = std.math.maxInt(u64);
+        for (self.sampled_image_cache.items, 0..) |entry, index| {
+            // Publication can advance frame_sequence during preparation. The
+            // descriptor batch protects all prepared-but-unrecorded consumers.
+            if (entry.last_used_batch == self.sampled_image_batch) continue;
+            if (victim == null or entry.last_used_batch < oldest) {
+                victim = index;
+                oldest = entry.last_used_batch;
+            }
+        }
+        return victim;
+    }
+
+    fn reclaimSampledImageMemory(self: *Renderer, incoming_bytes: u64) Error!bool {
+        const reclaim_bytes = @max(incoming_bytes, 64 * 1024 * 1024);
+        var reclaimed: u64 = 0;
+        while (reclaimed < reclaim_bytes) {
+            const index = self.sampledImageEvictionCandidate() orelse break;
+            reclaimed +|= self.sampled_image_cache.items[index].image.allocation_bytes;
+            self.retireSampledImage(index);
+            self.frame_profile.texture_evictions +|= 1;
+        }
+        if (reclaimed == 0) return false;
+        // Retiring only removes cache ownership. Complete queued consumers and
+        // actually free their backing before retrying the failed allocation.
+        try self.waitForSampledImageRetirement(0);
+        self.image_memory_reclaims +|= 1;
+        self.image_memory_reclaimed_bytes +|= reclaimed;
+        // Do not immediately fill the cache back to a budget that just failed
+        // alongside the other resident resources. Keep a small working floor;
+        // a single protected batch may still exceed this soft limit.
+        self.sampled_image_cache_budget_bytes = @min(
+            self.sampled_image_cache_budget_bytes,
+            @max(self.sampled_image_cache_bytes, 64 * 1024 * 1024),
+        );
+        if (self.image_memory_reclaims <= 8) std.debug.print(
+            "[vulkan memory] reclaimed sampled images bytes={d} cache={d}MiB budget={d}MiB for allocation={d}\n",
+            .{ reclaimed, self.sampled_image_cache_bytes / (1024 * 1024), self.sampled_image_cache_budget_bytes / (1024 * 1024), incoming_bytes },
+        );
+        return true;
     }
 
     fn waitForSampledImageRetirement(self: *Renderer, allowed_bytes: u64) Error!void {
@@ -30354,6 +30433,7 @@ fn choosePhysicalDevice(
             .device_type = device_type,
         };
         const properties: *const vk.PhysicalDevicePropertiesPrefix = @ptrCast(@alignCast(&raw_properties));
+        info.pipeline_cache_uuid = properties.pipeline_cache_uuid;
         const limits = properties.limits;
         info.max_compute_shared_memory_size = limits.max_compute_shared_memory_size;
         info.max_compute_work_group_invocations = limits.max_compute_work_group_invocations;

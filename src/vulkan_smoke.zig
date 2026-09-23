@@ -3723,7 +3723,103 @@ fn runSampledCacheBudgetProbe(allocator: std.mem.Allocator) !void {
     }
 }
 
-fn runSampledCacheBudgetCase(allocator: std.mem.Allocator, mode: enum { one_byte, bounded_sync, bounded_async, replace_sync, bounded_reuse, bounded_reuse_revision, bounded_reuse_mismatch }, timeline: bool) !void {
+const SampledAllocationFailure = struct {
+    const vk = vulkan.api;
+    var allocate: vk.PfnAllocateMemory = undefined;
+    var free: vk.PfnFreeMemory = undefined;
+    var local_types: u32 = 0;
+    var armed: bool = false;
+    var successful_allocations: usize = 0;
+    var failures: usize = 0;
+    var release_memory: vk.DeviceMemory = 0;
+
+    fn allocateMemory(device: vk.Device, info: *const vk.MemoryAllocateInfo, callbacks: ?*const anyopaque, memory: *vk.DeviceMemory) callconv(vk.call) vk.Result {
+        if (armed and local_types & (@as(u32, 1) << @intCast(info.memory_type_index)) != 0) {
+            if (successful_allocations == 0) {
+                failures += 1;
+                return vk.error_out_of_device_memory;
+            }
+            successful_allocations -= 1;
+        }
+        return allocate(device, info, callbacks, memory);
+    }
+
+    fn freeMemory(device: vk.Device, memory: vk.DeviceMemory, callbacks: ?*const anyopaque) callconv(vk.call) void {
+        free(device, memory, callbacks);
+        if (memory == release_memory) armed = false;
+    }
+};
+
+fn runPipelineWarmupProbe(allocator: std.mem.Allocator, directory: []const u8, workers: usize) !void {
+    const Observer = struct {
+        const vk = vulkan.api;
+        var original: vk.PfnCreateComputePipelines = undefined;
+        var destroy: vk.PfnDestroyPipeline = undefined;
+        var active = std.atomic.Value(u32).init(0);
+        var peak = std.atomic.Value(u32).init(0);
+        var live_pipelines = std.atomic.Value(u32).init(0);
+        fn create(device: vk.Device, cache: vk.PipelineCache, count: u32, infos: [*]const vk.ComputePipelineCreateInfo, callbacks: ?*const anyopaque, pipelines: [*]vk.Pipeline) callconv(vk.call) vk.Result {
+            const current = active.fetchAdd(1, .acq_rel) + 1;
+            defer _ = active.fetchSub(1, .release);
+            _ = peak.fetchMax(current, .monotonic);
+            const result = original(device, cache, count, infos, callbacks, pipelines);
+            for (pipelines[0..count]) |pipeline| if (pipeline != 0) {
+                _ = live_pipelines.fetchAdd(1, .monotonic);
+            };
+            return result;
+        }
+        fn destroyPipeline(device: vk.Device, pipeline: vk.Pipeline, callbacks: ?*const anyopaque) callconv(vk.call) void {
+            destroy(device, pipeline, callbacks);
+            if (pipeline != 0) _ = live_pipelines.fetchSub(1, .monotonic);
+        }
+    };
+    var renderer = try vulkan.Renderer.init(allocator, .{
+        .enable_async_pipeline_compilation = true,
+        .pipeline_compiler_workers = workers,
+        .compute_warmup_directory = directory,
+    });
+    defer renderer.deinit();
+    Observer.original = renderer.device_functions.create_compute_pipelines;
+    Observer.destroy = renderer.device_functions.destroy_pipeline;
+    Observer.active.store(0, .release);
+    Observer.peak.store(0, .release);
+    Observer.live_pipelines.store(0, .release);
+    renderer.device_functions.create_compute_pipelines = Observer.create;
+    renderer.device_functions.destroy_pipeline = Observer.destroyPipeline;
+    // Keep the observer installed until every worker has left the driver call.
+    defer {
+        renderer.pipeline_compile_queue.waitIdle();
+        renderer.device_functions.create_compute_pipelines = Observer.original;
+        renderer.device_functions.destroy_pipeline = Observer.destroy;
+    }
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const start = std.Io.Clock.awake.now(io).nanoseconds;
+    var guest = GuestMemory{};
+    _ = renderer.dcbBackend(guest.interface());
+    renderer.pipeline_compile_queue.waitIdle();
+    const elapsed = std.Io.Clock.awake.now(io).nanoseconds - start;
+    const warmup = renderer.compute_warmup orelse return error.WarmupUnavailable;
+    try std.testing.expect(warmup.jobs.items.len >= 2);
+    try std.testing.expectEqual(@as(u32, @intCast(warmup.jobs.items.len)), warmup.warmed.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 0), warmup.failed.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), renderer.compute_pipelines.items.len);
+    try std.testing.expectEqual(@as(u32, 0), Observer.live_pipelines.load(.acquire));
+    try std.testing.expect(Observer.peak.load(.acquire) <= workers);
+    if (workers > 1) try std.testing.expect(Observer.peak.load(.acquire) > 1);
+    std.debug.print("pipeline warmup passed: jobs={d} workers={d} concurrent_driver_calls={d} elapsed_ms={d} retained_pipelines=0\n", .{
+        warmup.jobs.items.len, workers, Observer.peak.load(.acquire), @divTrunc(elapsed, std.time.ns_per_ms),
+    });
+}
+
+fn runSampledAllocationPressureProbe(allocator: std.mem.Allocator) !void {
+    for ([_]bool{ false, true }) |timeline| {
+        try runSampledCacheBudgetCase(allocator, .allocation_pressure, timeline);
+        try runSampledCacheBudgetCase(allocator, .allocation_pinned, timeline);
+    }
+}
+
+fn runSampledCacheBudgetCase(allocator: std.mem.Allocator, mode: enum { one_byte, bounded_sync, bounded_async, replace_sync, bounded_reuse, bounded_reuse_revision, bounded_reuse_mismatch, allocation_pressure, allocation_pinned }, timeline: bool) !void {
+    const pressure = mode == .allocation_pressure or mode == .allocation_pinned;
     const reuse = mode == .bounded_reuse or mode == .bounded_reuse_revision or mode == .bounded_reuse_mismatch;
     const bounded_case = mode == .bounded_sync or mode == .bounded_async or reuse;
     const previous_reuse = vulkan.backend.sampled_backing_reuse;
@@ -3738,8 +3834,26 @@ fn runSampledCacheBudgetCase(allocator: std.mem.Allocator, mode: enum { one_byte
     const guest = try allocator.create(Memory);
     defer allocator.destroy(guest);
     guest.* = .{};
-    var renderer = try vulkan.Renderer.init(allocator, .{ .defer_small_storage_writes = true, .enable_timeline_scheduler = timeline, .enable_canonical_image_aliases = mode == .bounded_reuse_revision });
+    var renderer = try vulkan.Renderer.init(allocator, .{ .defer_small_storage_writes = true, .enable_timeline_scheduler = timeline, .enable_async_pipeline_compilation = timeline, .enable_canonical_image_aliases = mode == .bounded_reuse_revision });
     defer renderer.deinit();
+    if (pressure) {
+        SampledAllocationFailure.allocate = renderer.device_functions.allocate_memory;
+        SampledAllocationFailure.free = renderer.device_functions.free_memory;
+        SampledAllocationFailure.local_types = 0;
+        SampledAllocationFailure.armed = false;
+        SampledAllocationFailure.failures = 0;
+        SampledAllocationFailure.release_memory = 0;
+        for (renderer.memory_properties.memory_types[0..renderer.memory_properties.memory_type_count], 0..) |memory_type, i| {
+            if (memory_type.property_flags & vulkan.api.memory_property_device_local_bit != 0)
+                SampledAllocationFailure.local_types |= @as(u32, 1) << @intCast(i);
+        }
+        renderer.device_functions.allocate_memory = SampledAllocationFailure.allocateMemory;
+        renderer.device_functions.free_memory = SampledAllocationFailure.freeMemory;
+    }
+    defer if (pressure) {
+        renderer.device_functions.allocate_memory = SampledAllocationFailure.allocate;
+        renderer.device_functions.free_memory = SampledAllocationFailure.free;
+    };
     const Context = struct {
         guest: *Memory,
         renderer: *vulkan.Renderer,
@@ -3763,7 +3877,7 @@ fn runSampledCacheBudgetCase(allocator: std.mem.Allocator, mode: enum { one_byte
     const backend = renderer.dcbBackend(.{ .context = &context, .read = Context.read, .write = Context.write });
     // Two images prepared by one dispatch must survive even a one-byte soft
     // budget. Advancing the publication counter between them is not a batch end.
-    renderer.sampled_image_cache_budget_bytes = if (replace_contents) 1024 * 1024 else 1;
+    renderer.sampled_image_cache_budget_bytes = if (replace_contents or pressure) 1024 * 1024 else 1;
     const store_a = mubuf(0x1e, 0, 2, 0, 20);
     const store_b = mubuf(0x1e, 16, 6, 0, 20);
     const code = [_]u32{
@@ -3802,12 +3916,33 @@ fn runSampledCacheBudgetCase(allocator: std.mem.Allocator, mode: enum { one_byte
         const userdata = sampledImageDescriptorWords(source, width, 1) ++
             sampledImageDescriptorWords(source + 0x100, width, 1) ++ [_]u32{ 0, 0, 0, 0, @intCast(0x10000 + round * 0x100), 0, 32, 0 };
         for (userdata, 0..) |word, i| try state.writeRegister(.shader, compute.userDataBase() + @as(u32, @intCast(i)), word);
+        if ((mode == .allocation_pressure and round == 1) or (mode == .allocation_pinned and round == 0)) {
+            // Fail the second image after the first has been selected for this
+            // dispatch. Only freeing an actual older backing ends pressure.
+            // With no older image, failure must preserve the prepared first one.
+            SampledAllocationFailure.release_memory = if (mode == .allocation_pressure) renderer.sampled_image_cache.items[0].image.memory else 0;
+            SampledAllocationFailure.successful_allocations = 1;
+            SampledAllocationFailure.armed = true;
+            if (mode == .allocation_pinned) {
+                try std.testing.expectError(error.MemoryAllocationFailed, renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 }));
+                try std.testing.expectEqual(@as(usize, 1), renderer.sampled_image_cache.items.len);
+                try std.testing.expectEqual(renderer.sampled_image_batch, renderer.sampled_image_cache.items[0].last_used_batch);
+                try std.testing.expectEqual(@as(u64, 0), renderer.frame_profile.texture_evictions);
+                SampledAllocationFailure.armed = false;
+            }
+        }
         _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
         if (mode == .bounded_reuse_revision and round >= 8) {
             try std.testing.expect(source_epoch != 0);
             try std.testing.expectEqual(source_epoch, renderer.image_aliases.generationForRange(.{ .address = source, .size = 4 }));
         }
-        try std.testing.expectEqual(if (bounded_case) @min((round + 1) * 2, 16) else @as(usize, 2), renderer.sampled_image_cache.items.len);
+        const expected_images: usize = if (pressure)
+            (round + 1) * 2 - (if (mode == .allocation_pressure and round >= 1) @as(usize, 2) else 0)
+        else if (bounded_case)
+            @min((round + 1) * 2, 16)
+        else
+            2;
+        try std.testing.expectEqual(expected_images, renderer.sampled_image_cache.items.len);
         var total: u64 = 0;
         for (renderer.sampled_image_cache.items) |entry| {
             try std.testing.expect(entry.image.allocation_bytes != 0);
@@ -3833,7 +3968,8 @@ fn runSampledCacheBudgetCase(allocator: std.mem.Allocator, mode: enum { one_byte
         }
     }
     try std.testing.expectEqual(rounds, context.advances);
-    try std.testing.expectEqual(@as(u64, if (replace_contents) 0 else if (bounded_case) 8 else 4), renderer.frame_profile.texture_evictions);
+    try std.testing.expectEqual(@as(u64, if (mode == .allocation_pressure) 2 else if (mode == .allocation_pinned or replace_contents) 0 else if (bounded_case) 8 else 4), renderer.frame_profile.texture_evictions);
+    if (pressure) try std.testing.expect(SampledAllocationFailure.failures != 0);
     // Updating texture contents below the budget never forced retirement waits
     // in the baseline, even when the old images still have queued consumers.
     if (replace_contents) try std.testing.expectEqual(@as(u64, 0), renderer.frame_profile.sampled_retire_wait_calls);
@@ -10707,6 +10843,14 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--sampled-cache-budget")) {
         try runSampledCacheBudgetProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--sampled-allocation-pressure")) {
+        try runSampledAllocationPressureProbe(allocator);
+        return;
+    }
+    if (args.len == 3 and (std.mem.eql(u8, args[1], "--pipeline-warmup") or std.mem.eql(u8, args[1], "--pipeline-warmup-serial"))) {
+        try runPipelineWarmupProbe(allocator, args[2], if (std.mem.eql(u8, args[1], "--pipeline-warmup-serial")) 1 else 2);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--sampled-scratch")) {
