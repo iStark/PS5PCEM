@@ -1113,7 +1113,11 @@ fn pipelineCacheSaveSource(self: *Renderer) pipeline_cache_save.Source {
 }
 
 fn savePipelineCacheBytes(self: *Renderer) void {
-    _ = self.pipeline_cache_saver.request(pipelineCacheSaveSource(self));
+    // Unlike the optional Windows frame profiler, cache persistence needs a
+    // working monotonic clock on every host platform.
+    const now = std.Io.Clock.awake.now(std.Io.Threaded.global_single_threaded.io());
+    const now_ns = std.math.cast(u64, now.nanoseconds) orelse return;
+    _ = self.pipeline_cache_saver.checkpoint(pipelineCacheSaveSource(self), now_ns);
 }
 
 const GuestBufferEntry = struct {
@@ -2357,6 +2361,7 @@ const WindowPresentation = struct {
     /// Reuse only after acquiring the same image, which proves that its last
     /// presentation consumed the binary semaphore signal.
     render_complete: []vk.Semaphore,
+    needs_recreate: bool = false,
 };
 
 const PackedClearStaging = struct {
@@ -2643,6 +2648,11 @@ const CachedStorageImage = struct {
     guest_content_hash_valid: bool = false,
     guest_page_generation: u64 = 0,
     depth_snapshot: ?struct { image: vk.Image, generation: u64 } = null,
+    // CPU texels observed at upload/publication, independent of GPU dirtiness.
+    // A deferred readback must not overwrite an allocation the CPU reused.
+    // Hash only this view's texels: padding and other mip levels may change.
+    guest_texel_hash: ?u64 = null,
+    guest_backing_hash: ?u64 = null,
     gpu_dirty: bool = false,
     // Every prepared binding owns one pin until its submission retires.
     pin_count: usize = 0,
@@ -3784,6 +3794,7 @@ pub const Renderer = struct {
     storage_image_cache_bytes: usize = 0,
     storage_image_cache_limit: usize = 1280 * 1024 * 1024,
     storage_image_sequence: u64 = 0,
+    storage_cpu_invalidations: u64 = 0,
     /// Decoded shader programs, held across draws. Its capacity is reserved
     /// once so entries never move: callers hold `*const Analysis` into it for
     /// the length of a draw.
@@ -4809,14 +4820,8 @@ pub const Renderer = struct {
         self.device_functions.destroy_descriptor_pool(self.device, self.descriptor_pool, null);
         self.device_functions.destroy_descriptor_set_layout(self.device, self.descriptor_set_layout, null);
         self.device_functions.destroy_command_pool(self.device, self.command_pool, null);
-        if (self.window_presentation) |presentation| {
-            presentation.swapchain_functions.destroy_swapchain(self.device, presentation.swapchain, null);
-            self.allocator.free(presentation.images);
-            self.device_functions.destroy_buffer(self.device, presentation.upload.handle, null);
-            self.device_functions.free_memory(self.device, presentation.upload.memory, null);
-            self.device_functions.destroy_fence(self.device, presentation.acquire_fence, null);
-            for (presentation.render_complete) |semaphore| self.device_functions.destroy_semaphore(self.device, semaphore, null);
-            self.allocator.free(presentation.render_complete);
+        if (self.window_presentation) |*presentation| {
+            destroyWindowSwapchain(self.allocator, self.device, &self.device_functions, presentation);
             presentation.surface_functions.destroy_surface(self.instance_handle, presentation.surface, null);
         }
         self.device_functions.destroy_semaphore(self.device, self.timeline_semaphore, null);
@@ -4949,7 +4954,41 @@ pub const Renderer = struct {
         return self.presentWindowFrame(frame);
     }
 
+    fn ensureWindowSwapchain(self: *Renderer) anyerror!bool {
+        const presentation = &(self.window_presentation orelse return Error.PresentationRejected);
+        if (!presentation.needs_recreate) return true;
+        var capabilities: vk.SurfaceCapabilitiesKHR = undefined;
+        if (presentation.surface_functions.get_surface_capabilities(self.physical_device, presentation.surface, &capabilities) != vk.success)
+            return Error.SurfaceQueryFailed;
+        // A minimized window cannot own a zero-sized swapchain. Keep retrying
+        // on later frames without blocking the guest until the window returns.
+        if (capabilities.current_extent.width == 0 or capabilities.current_extent.height == 0) return false;
+        try self.waitForSubmittedWork();
+        // Presentation can still own an image/semaphore after the rendering
+        // timeline completes. Drain it before destroying the old swapchain.
+        if (self.device_functions.device_wait_idle(self.device) != vk.success) return Error.DeviceWaitFailed;
+        destroyWindowSwapchain(self.allocator, self.device, &self.device_functions, presentation);
+        // Keep the surface and retry flag if creation fails (e.g. another resize
+        // raced the capabilities query). No retired handle is reused on retry.
+        presentation.* = try createWindowPresentation(
+            self.allocator,
+            self.physical_device,
+            self.device,
+            &self.device_functions,
+            self.memory_properties,
+            presentation.native_window,
+            presentation.surface,
+            presentation.surface_functions,
+            presentation.swapchain_functions,
+        );
+        return true;
+    }
+
     fn copyFrameToSwapchain(self: *Renderer, frame: PresentedFrame) anyerror!void {
+        if (!try self.ensureWindowSwapchain()) {
+            self.present_dropped += 1;
+            return;
+        }
         const presentation = &(self.window_presentation orelse return Error.PresentationRejected);
         if (frame.width == 0 or frame.height == 0 or frame.row_pitch_bytes < frame.width * 4) {
             return Error.PresentationRejected;
@@ -5003,10 +5042,12 @@ pub const Renderer = struct {
         if (acquired == vk.not_ready or acquired == vk.timeout or acquired == vk.error_out_of_date_khr) {
             // Frame dropped, not an error: the swapchain is still showing the
             // previous frame and a newer one will replace this one.
+            if (acquired == vk.error_out_of_date_khr) presentation.needs_recreate = true;
             self.present_dropped += 1;
             return;
         }
         if (acquired != vk.success and acquired != vk.suboptimal_khr) return Error.SwapchainAcquireFailed;
+        if (acquired == vk.suboptimal_khr) presentation.needs_recreate = true;
         if (image_index >= presentation.images.len or
             self.device_functions.wait_for_fences(self.device, 1, @ptrCast(&presentation.acquire_fence), vk.true_value, std.math.maxInt(u64)) != vk.success)
         {
@@ -5079,6 +5120,11 @@ pub const Renderer = struct {
             .image_indices = @ptrCast(&image_index),
         };
         const presented = presentation.swapchain_functions.queue_present(self.queue, &present_info);
+        if (presented == vk.error_out_of_date_khr or presented == vk.suboptimal_khr) {
+            presentation.needs_recreate = true;
+            if (presented == vk.error_out_of_date_khr) self.present_dropped += 1;
+            return;
+        }
         if (presented != vk.success and presented != vk.suboptimal_khr) return Error.SwapchainPresentFailed;
     }
 
@@ -5109,6 +5155,10 @@ pub const Renderer = struct {
         if (self.present_in_flight) return Error.PresentationRejected;
         self.present_in_flight = true;
         defer self.present_in_flight = false;
+        if (!try self.ensureWindowSwapchain()) {
+            self.present_dropped += 1;
+            return;
+        }
         if (target_index >= self.render_targets.items.len) return Error.MissingPresentedFrame;
         try self.transitionRenderTargetToColorAttachment(target_index);
         const target = self.render_targets.items[target_index];
@@ -5156,10 +5206,12 @@ pub const Renderer = struct {
             &image_index,
         );
         if (acquired == vk.not_ready or acquired == vk.timeout or acquired == vk.error_out_of_date_khr) {
+            if (acquired == vk.error_out_of_date_khr) presentation.needs_recreate = true;
             self.present_dropped += 1;
             return;
         }
         if (acquired != vk.success and acquired != vk.suboptimal_khr) return Error.SwapchainAcquireFailed;
+        if (acquired == vk.suboptimal_khr) presentation.needs_recreate = true;
         if (image_index >= presentation.images.len or
             self.device_functions.wait_for_fences(self.device, 1, @ptrCast(&presentation.acquire_fence), vk.true_value, std.math.maxInt(u64)) != vk.success)
         {
@@ -5273,6 +5325,11 @@ pub const Renderer = struct {
             .image_indices = @ptrCast(&image_index),
         };
         const presented = presentation.swapchain_functions.queue_present(self.queue, &present_info);
+        if (presented == vk.error_out_of_date_khr or presented == vk.suboptimal_khr) {
+            presentation.needs_recreate = true;
+            if (presented == vk.error_out_of_date_khr) self.present_dropped += 1;
+            return;
+        }
         if (presented != vk.success and presented != vk.suboptimal_khr) return Error.SwapchainPresentFailed;
     }
 
@@ -7023,6 +7080,12 @@ pub const Renderer = struct {
             programHasRawInstruction(analysis, 0x6e4, &.{ 0xe034_2000, 0x8005_181d }) and
             programHasRawInstruction(analysis, 0x764, &.{ 0xdc30_8000, 0x197d_0018 });
         const scene_collision_query = isSceneCollisionQuery(analysis) and resources.flat_memory_count != 0;
+        // Query inputs change which branch provenance visits first. The same
+        // producer/register set must still use the same dynamic uniform words,
+        // or its large SPIR-V module recompiles solely because discovery order
+        // changed. The later scalar upload consumes this same reordered list.
+        if (scene_collision_query)
+            spirv_cache.canonicalizeScalarRegisters(resources.scalar_registers[0..resources.scalar_count]);
         const lds_bytes = computeLdsSizeBytes(state);
         var spilled_lds: ?OwnedBuffer = null;
         defer if (spilled_lds) |buffer| self.destroyBuffer(buffer);
@@ -7045,11 +7108,15 @@ pub const Renderer = struct {
             // alternating exchanges when their scratch alone fits the device.
             wave_exchange_double_buffer = rdna2.spirv.wave64ScratchWords(invocations, true) *| 4 <= self.device_info.max_compute_shared_memory_size;
         }
+        // Scene collision queries traverse many control-flow blocks per ray.
+        // The setup-kernel budget of 256 truncated every lane in a captured
+        // 512-lane query before completion. Keep the guard, but allow the
+        // recognized query family its validated longer traversal budget.
         const module_lease = self.compute_translations.acquirePrepared(self.allocator, &analysis.program, .{
             .stage = .compute,
             .local_size = local_size,
             .physical_local_size = try @import("compute_shape.zig").fit(local_size, self.device_info.max_compute_work_group_size, self.device_info.max_compute_work_group_invocations),
-            .maximum_dispatcher_iterations = if (yotei_environment_lighting) 2048 else if (yotei_atmosphere_multiscatter) 1024 else if (yotei_atmosphere_precompute) 512 else 256,
+            .maximum_dispatcher_iterations = if (scene_collision_query) 4096 else if (yotei_environment_lighting) 2048 else if (yotei_atmosphere_multiscatter) 1024 else if (yotei_atmosphere_precompute) 512 else 256,
             .report_dispatcher_exhaustion = scene_collision_query,
             .wave32 = initiator & (1 << 15) != 0,
             .wave_exchange_double_buffer = wave_exchange_double_buffer,
@@ -7860,6 +7927,12 @@ pub const Renderer = struct {
         const allocation_bytes = std.math.cast(usize, texture.required_source_bytes) orelse
             return Error.UnsupportedStorageImage;
 
+        var backing_scratch = try self.image_scratch.acquire(self.allocator, allocation_bytes);
+        defer backing_scratch.release();
+        if (!memory.read(memory.context, descriptor.address, backing_scratch.bytes)) return Error.GuestMemoryReadFailed;
+        const guest_texel_hash = try self.storageGuestTexelHash(subresource, staging_bytes, backing_scratch.bytes);
+        const guest_backing_hash = gpu.parallel_copy.fingerprint(backing_scratch.bytes);
+
         self.storage_image_sequence +%= 1;
         var candidates = self.storage_image_address_index.candidatesBy(self.storage_image_cache.items, descriptor.address, CachedStorageImage.address);
         while (candidates.next()) |index| {
@@ -7872,6 +7945,8 @@ pub const Renderer = struct {
             try self.uploadCachedStorageImage(index, linear, false);
             resident.gpu_dirty = true;
             resident.guest_content_hash_valid = false;
+            resident.guest_texel_hash = guest_texel_hash;
+            resident.guest_backing_hash = guest_backing_hash;
             _ = self.image_aliases.markWrite(resident.alias_token);
             return;
         }
@@ -7943,6 +8018,8 @@ pub const Renderer = struct {
             .staging_bytes = staging_bytes,
             .last_used_sequence = self.storage_image_sequence,
             .gpu_dirty = true,
+            .guest_texel_hash = guest_texel_hash,
+            .guest_backing_hash = guest_backing_hash,
             .pin_count = 1,
         };
         self.storage_image_cache_bytes +|= staging_bytes;
@@ -8184,6 +8261,17 @@ pub const Renderer = struct {
 
         if (storage_image_index) |resolved_storage_index| {
             const snapshot = self.storage_image_cache.items[resolved_storage_index];
+            // This shortcut bypasses normal image staging and overwrites every
+            // texel. Observe a CPU update before the clear as its new backing
+            // baseline, so later publication does not discard the newer clear.
+            if (snapshot.guest_texel_hash == null or try self.storageGuestContentsChanged(memory, resolved_storage_index)) {
+                var scratch = try self.image_scratch.acquire(self.allocator, snapshot.allocation_bytes);
+                defer scratch.release();
+                if (!memory.read(memory.context, snapshot.descriptor.address, scratch.bytes)) return Error.GuestMemoryReadFailed;
+                const cached = &self.storage_image_cache.items[resolved_storage_index];
+                cached.guest_texel_hash = try self.storageGuestTexelHash(snapshot.subresource, snapshot.staging_bytes, scratch.bytes);
+                cached.guest_backing_hash = gpu.parallel_copy.fingerprint(scratch.bytes);
+            }
             const command_buffer = try self.beginOneShot();
             defer self.releaseOneShot(command_buffer);
             try self.transitionTrackedImage(
@@ -9053,6 +9141,7 @@ pub const Renderer = struct {
             .{ .extract_pc = 0x35f8, .extract = 0x9402ff04, .cube_pc = 0x37e8, .cube_sources = 0x040a0300, .multiply_pc = 0x37fc, .multiply_dst = 0xd569005c, .multiply_sources = 0x0002b0ff, .load_pc = 0x3808, .read_pc = 0x3820, .read_sources = 0x006a005c },
             .{ .extract_pc = 0x3c30, .extract = 0x9457ff51, .cube_pc = 0x3d38, .cube_sources = 0x040a0300, .multiply_pc = 0x3d4c, .multiply_dst = 0xd5690064, .multiply_sources = 0x0002c2ff, .load_pc = 0x3d58, .read_pc = 0x3d70, .read_sources = 0x006a0064 },
             .{ .extract_pc = 0x3334, .extract = 0x9457ff51, .cube_pc = 0x343c, .cube_sources = 0x040a0300, .multiply_pc = 0x3450, .multiply_dst = 0xd5690063, .multiply_sources = 0x0002c0ff, .load_pc = 0x345c, .read_pc = 0x3474, .read_sources = 0x006a0063 },
+            .{ .extract_pc = 0x33c0, .extract = 0x9457ff51, .cube_pc = 0x34c8, .cube_sources = 0x040a0300, .multiply_pc = 0x34dc, .multiply_dst = 0xd5690063, .multiply_sources = 0x0002c0ff, .load_pc = 0x34e8, .read_pc = 0x3500, .read_sources = 0x006a0063 },
             .{ .extract_pc = 0x3474, .extract = 0x9402ff0c, .cube_pc = 0x3664, .cube_sources = 0x040a0300, .multiply_pc = 0x3678, .multiply_dst = 0xd569005c, .multiply_sources = 0x0002b0ff, .load_pc = 0x3684, .read_pc = 0x369c, .read_sources = 0x006a005c },
         }) |shape| {
             if (programHasRawInstruction(analysis, shape.extract_pc, &.{ shape.extract, 0x00080010 }) and
@@ -10350,6 +10439,7 @@ pub const Renderer = struct {
         errdefer if (module == null) self.allocator.free(owned_words);
         if (asynchronous) work.job.wait();
         if (work.failure) |failure| return failure;
+        savePipelineCacheBytes(self);
         const shader = work.shader;
         const pipeline = work.pipeline;
         errdefer self.destroyPipeline(pipeline);
@@ -11480,6 +11570,7 @@ pub const Renderer = struct {
             break :blk work.pipeline;
         } else try self.createGraphicsPipeline(render_pass, pipeline_state, vertex_words, fragment_words);
         self.frame_profile.graphics_pipeline_build_ns +|= elapsedHostNanoseconds(build_started);
+        savePipelineCacheBytes(self);
         errdefer self.destroyPipeline(pipeline);
         const replacement = GraphicsPipelineEntry{
             .hash = hash,
@@ -15503,6 +15594,22 @@ pub const Renderer = struct {
         return self.readDepthProbeValues(index, false);
     }
 
+    /// Exercises resident-image presentation in the window smoke test, without
+    /// depending on a guest shader or the CPU-frame upload path.
+    pub fn probeWindowBlit(self: *Renderer, pixels: []const u8, width: u32, height: u32) anyerror!void {
+        var color = std.mem.zeroes(gpu.resources.ColorTarget);
+        color.address = 0x1000;
+        color.width = width;
+        color.height = height;
+        color.pitch = width;
+        color.depth = 1;
+        color.format = 10;
+        color.write_mask = 15;
+        color.tile_mode = .linear;
+        const index = try self.uploadLinearColorTarget(try guestColorTarget(color), pixels);
+        try self.blitRenderTargetToSwapchain(index, null);
+    }
+
     pub fn probePackedScanout(self: *Renderer) anyerror!void {
         const samples = [_][8]u32{
             .{ 0xc0000000, 0xc00003ff, 0xc00ffc00, 0xfff00000, 0xffffffff, 0x955aaa55, 0x40000000, 0 },
@@ -19416,6 +19523,59 @@ pub const Renderer = struct {
         cached.gpu_dirty = false;
     }
 
+    fn storageGuestTexelHash(
+        self: *Renderer,
+        subresource: gpu.TextureSubresourceLayout,
+        staging_bytes: usize,
+        allocation: []const u8,
+    ) (Error || std.mem.Allocator.Error)!u64 {
+        var scratch = try self.image_scratch.acquire(self.allocator, staging_bytes);
+        defer scratch.release();
+        subresource.detile(allocation, scratch.bytes) catch return Error.UnsupportedStorageImage;
+        return gpu.parallel_copy.fingerprint(scratch.bytes);
+    }
+
+    fn invalidateStorageGuestContents(self: *Renderer, cache_index: usize) void {
+        const cached = &self.storage_image_cache.items[cache_index];
+        cached.gpu_dirty = false;
+        cached.guest_content_hash_valid = false;
+        cached.guest_page_generation = 0;
+        cached.guest_texel_hash = null;
+        cached.guest_backing_hash = null;
+        cached.depth_snapshot = null;
+        _ = self.image_aliases.markGuestWrite(aliasRange(cached.descriptor.address, cached.allocation_bytes));
+        self.storage_cpu_invalidations +%= 1;
+        if (self.storage_cpu_invalidations <= 8) std.debug.print(
+            "[vulkan dcb] invalidated stale storage image after guest texel change: addr=0x{x} {d}x{d} fmt={d}\n",
+            .{ cached.descriptor.address, cached.subresource.width, cached.subresource.height, cached.descriptor.unified_format },
+        );
+    }
+
+    fn storageGuestContentsChanged(self: *Renderer, memory: GuestMemory, cache_index: usize) (Error || std.mem.Allocator.Error)!bool {
+        const cached = &self.storage_image_cache.items[cache_index];
+        const uploaded_hash = cached.guest_texel_hash orelse return false;
+        if (cached.guest_page_generation != 0) {
+            if (memory.gpu_generation) |generation| {
+                if (generation(memory.context, cached.descriptor.address, cached.allocation_bytes) == cached.guest_page_generation) return false;
+            }
+        }
+        // Native memory can fingerprint the backing without copying or detiling
+        // it. Only a changed allocation needs the more expensive texel check.
+        const current_hash = if (memory.fingerprint) |fingerprint|
+            fingerprint(memory.context, cached.descriptor.address, cached.allocation_bytes)
+        else
+            null;
+        if (current_hash != null and current_hash == cached.guest_backing_hash) return false;
+        var scratch = try self.image_scratch.acquire(self.allocator, cached.allocation_bytes);
+        defer scratch.release();
+        if (!memory.read(memory.context, cached.descriptor.address, scratch.bytes)) return Error.GuestMemoryReadFailed;
+        const backing_hash = gpu.parallel_copy.fingerprint(scratch.bytes);
+        if (backing_hash == cached.guest_backing_hash) return false;
+        if (try self.storageGuestTexelHash(cached.subresource, cached.staging_bytes, scratch.bytes) != uploaded_hash) return true;
+        cached.guest_backing_hash = backing_hash; // Only padding or another mip changed.
+        return false;
+    }
+
     fn flushCachedStorageImage(
         self: *Renderer,
         memory: GuestMemory,
@@ -19492,6 +19652,20 @@ pub const Renderer = struct {
         if (!memory.read(memory.context, snapshot.descriptor.address, allocation)) {
             return Error.GuestMemoryReadFailed;
         }
+        if (snapshot.guest_texel_hash) |uploaded_hash| {
+            if (gpu.parallel_copy.fingerprint(allocation) != snapshot.guest_backing_hash and
+                try self.storageGuestTexelHash(snapshot.subresource, snapshot.staging_bytes, allocation) != uploaded_hash)
+            {
+                // The guest has written new contents since this GPU image was
+                // staged. Publishing its old output now would corrupt those
+                // contents (which may already be descriptors for another use).
+                // Keep the Vulkan object alive, but require a fresh upload on
+                // its next binding. All earlier submissions have retired above.
+                self.invalidateStorageGuestContents(cache_index);
+                return;
+            }
+        }
+        var published_texel_hash: u64 = undefined;
         {
             const mapping = try self.mapBufferRange(snapshot.transfer, 0, snapshot.staging_bytes);
             defer mapping.release(self);
@@ -19505,6 +19679,7 @@ pub const Renderer = struct {
                 );
             }
             snapshot.subresource.tile(linear, allocation) catch return Error.UnsupportedStorageImage;
+            published_texel_hash = gpu.parallel_copy.fingerprint(linear);
         }
         if (!memory.write(memory.context, snapshot.descriptor.address, allocation)) {
             return Error.GuestMemoryWriteFailed;
@@ -19512,6 +19687,8 @@ pub const Renderer = struct {
         const cached = &self.storage_image_cache.items[cache_index];
         cached.guest_content_hash = gpu.parallel_copy.fingerprint(allocation);
         cached.guest_content_hash_valid = true;
+        cached.guest_texel_hash = published_texel_hash;
+        cached.guest_backing_hash = cached.guest_content_hash;
         cached.guest_page_generation = if (memory.gpu_generation) |generation|
             generation(memory.context, snapshot.descriptor.address, snapshot.allocation_bytes)
         else
@@ -19923,7 +20100,12 @@ pub const Renderer = struct {
             // hundreds of MiB of CPU work per frame. Each binding pins the
             // object independently, so retiring an older batch cannot make
             // a resource held by the current pass eligible for eviction.
-            if (cached.pin_count != 0 or cached.gpu_dirty or
+            if (cached.pin_count == 0 and cached.gpu_dirty and try self.storageGuestContentsChanged(memory, index)) {
+                // A completed image can be updated by the CPU and rebound
+                // before any host readback. Upload those new texels before the
+                // next dispatch so its output remains the newest writer.
+                self.invalidateStorageGuestContents(index);
+            } else if (cached.pin_count != 0 or cached.gpu_dirty or
                 (cached.depth_snapshot != null and self.storageDepthSource(descriptor) != null))
             {
                 const resident = &self.storage_image_cache.items[index];
@@ -20012,6 +20194,8 @@ pub const Renderer = struct {
         defer linear_scratch.release();
         const linear = linear_scratch.bytes;
         try subresource.detile(allocation, linear);
+        const guest_texel_hash = gpu.parallel_copy.fingerprint(linear);
+        const guest_backing_hash = if (guest_page_generation == 0) guest_content_hash else gpu.parallel_copy.fingerprint(allocation);
 
         if (matching_index) |index| {
             const cached = &self.storage_image_cache.items[index];
@@ -20021,6 +20205,8 @@ pub const Renderer = struct {
             cached.depth_snapshot = null;
             cached.guest_content_hash = guest_content_hash;
             cached.guest_content_hash_valid = true;
+            cached.guest_texel_hash = guest_texel_hash;
+            cached.guest_backing_hash = guest_backing_hash;
             cached.guest_page_generation = guest_page_generation;
             self.updateStorageImageDescriptor(descriptor_index, cached.view);
             return .{
@@ -20109,6 +20295,8 @@ pub const Renderer = struct {
             .last_used_sequence = self.storage_image_sequence,
             .guest_content_hash = guest_content_hash,
             .guest_content_hash_valid = true,
+            .guest_texel_hash = guest_texel_hash,
+            .guest_backing_hash = guest_backing_hash,
             .guest_page_generation = guest_page_generation,
             .pin_count = 1,
         };
@@ -20164,6 +20352,24 @@ pub const Renderer = struct {
         try self.submitOneShot(command_buffer);
     }
 
+    fn reportFlatMemoryFault(program_address: u64, faults: u32, record: *const [16]u8) void {
+        const pc = std.mem.readInt(u32, record[0..4], .little);
+        // The translator shares this record with its bounded dispatcher. Its
+        // sentinel describes unfinished control flow, not an unmapped address.
+        if (pc == 0xffff_ffff) {
+            std.debug.print("[vulkan dcb] shader dispatcher exhausted program=0x{x} unfinished_invocations={d} block={d} iterations={d} budget_per_wave={d}\n", .{
+                program_address,                               faults,
+                std.mem.readInt(u32, record[4..8], .little),   std.mem.readInt(u32, record[8..12], .little),
+                std.mem.readInt(u32, record[12..16], .little),
+            });
+        } else {
+            std.debug.print("[vulkan dcb] FLAT snapshot fault program=0x{x} unmapped_words={d} first_pc=0x{x} address=0x{x} component={d}\n", .{
+                program_address,                              faults,                                        pc,
+                std.mem.readInt(u64, record[4..12], .little), std.mem.readInt(u32, record[12..16], .little),
+            });
+        }
+    }
+
     fn checkFlatMemoryFault(self: *Renderer, resources: *const ComputeResources, program_address: u64, source_stage: vk.Flags) anyerror!void {
         if (resources.flat_memory_fault) |fault| {
             if (self.defer_flat_memory_fault_checks and self.draw_batch_active) {
@@ -20189,11 +20395,7 @@ pub const Renderer = struct {
             const faults = std.mem.readInt(u32, mapping.bytes[0..4], .little);
             if (faults != 0) {
                 const record = mapping.bytes[@intCast(fault.size - 16)..][0..16];
-                std.debug.print("[vulkan dcb] FLAT snapshot fault program=0x{x} unmapped_words={d} first_pc=0x{x} address=0x{x} component={d}\n", .{
-                    program_address,                               faults,
-                    std.mem.readInt(u32, record[0..4], .little),   std.mem.readInt(u64, record[4..12], .little),
-                    std.mem.readInt(u32, record[12..16], .little),
-                });
+                reportFlatMemoryFault(program_address, faults, record);
                 return Error.GuestMemoryReadFailed;
             }
         }
@@ -20255,11 +20457,7 @@ pub const Renderer = struct {
             self.flat_fault_checks_completed += 1;
             if (faults == 0) continue;
             const record = bytes[16..32];
-            std.debug.print("[vulkan dcb] FLAT snapshot fault program=0x{x} unmapped_words={d} first_pc=0x{x} address=0x{x} component={d}\n", .{
-                self.flat_fault_programs[slot],                faults,
-                std.mem.readInt(u32, record[0..4], .little),   std.mem.readInt(u64, record[4..12], .little),
-                std.mem.readInt(u32, record[12..16], .little),
-            });
+            reportFlatMemoryFault(self.flat_fault_programs[slot], faults, record);
             self.flat_memory_fault_failed = true;
             return Error.GuestMemoryReadFailed;
         }
@@ -24428,12 +24626,10 @@ pub const Renderer = struct {
         // Declared after the report so that it runs before it: the time this
         // flip spends belongs to the frame being reported, not the next one.
         defer self.frame_profile.flip_ns +|= elapsedHostNanoseconds(flip_started);
-        // Persist newly compiled driver pipelines at the first real frame.
-        // Guest shutdown is not guaranteed to unwind through Renderer.deinit,
-        // so saving only there made every diagnostic relaunch compile again.
-        defer if (self.flip_callbacks == 2 or
-            (self.flip_callbacks >= 64 and self.flip_callbacks % 128 == 0))
-            savePipelineCacheBytes(self);
+        // Also checkpoint frames that reuse pipelines: the last compilation
+        // in a burst may precede the periodic save deadline. Compilation sites
+        // handle long loading batches that do not reach a flip at all.
+        defer savePipelineCacheBytes(self);
         // Content probes only hold within the frame they were taken in.
         defer self.texture_probe_count = 0;
         // So do the colour targets this frame bound. Carrying them into the
@@ -30250,6 +30446,26 @@ fn findMemoryTypeIn(properties: vk.PhysicalDeviceMemoryProperties, supported_bit
     return null;
 }
 
+fn destroyWindowSwapchain(
+    allocator: std.mem.Allocator,
+    device: vk.Device,
+    functions: *const DeviceFunctions,
+    presentation: *WindowPresentation,
+) void {
+    if (presentation.swapchain != 0) presentation.swapchain_functions.destroy_swapchain(device, presentation.swapchain, null);
+    allocator.free(presentation.images);
+    if (presentation.upload.handle != 0) functions.destroy_buffer(device, presentation.upload.handle, null);
+    if (presentation.upload.memory != 0) functions.free_memory(device, presentation.upload.memory, null);
+    if (presentation.acquire_fence != 0) functions.destroy_fence(device, presentation.acquire_fence, null);
+    for (presentation.render_complete) |semaphore| functions.destroy_semaphore(device, semaphore, null);
+    allocator.free(presentation.render_complete);
+    presentation.swapchain = 0;
+    presentation.images = &.{};
+    presentation.upload = .{ .handle = 0, .memory = 0, .size = 0 };
+    presentation.acquire_fence = 0;
+    presentation.render_complete = &.{};
+}
+
 fn createWindowPresentation(
     allocator: std.mem.Allocator,
     physical_device: vk.PhysicalDevice,
@@ -30339,8 +30555,7 @@ fn createWindowPresentation(
     }
     // One persistent upload buffer and acquire fence serve every present, so
     // a flip no longer allocates Vulkan objects or blocks waiting for the
-    // swapchain. The extent is fixed at swapchain creation (FIFO mode), so the
-    // buffer never needs to grow.
+    // swapchain. Resizing recreates this buffer with the new swapchain extent.
     const output_bytes = @as(vk.DeviceSize, extent.width) * extent.height * 4;
     const upload_info = vk.BufferCreateInfo{
         .size = output_bytes,

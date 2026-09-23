@@ -19,6 +19,20 @@ pub const Source = struct {
 pub const Saver = struct {
     job: ?*Job = null,
     persisted_generation: u64 = 0,
+    last_checkpoint_ns: ?u64 = null,
+
+    /// Loading can spend minutes compiling pipelines without presenting a
+    /// frame. Check after each compilation as well as on flips, and bound
+    /// snapshot frequency independently of the game's frame rate.
+    pub fn checkpoint(self: *Saver, source: Source, now_ns: u64) bool {
+        const interval_ns = 30 * std.time.ns_per_s;
+        if (self.last_checkpoint_ns) |last| {
+            if (now_ns -| last < interval_ns) return false;
+        }
+        if (!self.request(source)) return false;
+        self.last_checkpoint_ns = now_ns;
+        return true;
+    }
 
     /// A busy writer coalesces requests. A newer generation is retried after
     /// this snapshot completes, without claiming it was included in the file.
@@ -168,4 +182,44 @@ test "failed and oversized pipeline snapshots preserve the previous file and ret
     const after = try temporary.dir.readFileAlloc(std.testing.io, "cache.bin", std.testing.allocator, .limited(128));
     defer std.testing.allocator.free(after);
     try std.testing.expectEqualSlices(u8, "complete snapshot", after);
+}
+
+test "pipeline cache checkpoints persist loading progress without flips and coalesce busy writes" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var driver = TestDriver{ .released = .init(true) };
+    var saver = Saver{};
+    defer {
+        driver.released.store(true, .release);
+        saver.join();
+    }
+    var source = Source{ .device = @ptrCast(&driver), .cache = 1, .get_data = TestDriver.get, .generation = 0, .maximum_bytes = 128, .directory = temporary.dir, .path = "cache.bin" };
+    const second = std.time.ns_per_s;
+    try std.testing.expect(!saver.checkpoint(source, 0));
+    source.generation = 1;
+    try std.testing.expect(saver.checkpoint(source, second));
+    saver.join();
+    source.generation = 2;
+    try std.testing.expect(!saver.checkpoint(source, 30 * second));
+    try std.testing.expectEqual(@as(u32, 1), driver.reads.load(.acquire));
+
+    driver.entered.store(false, .release);
+    driver.released.store(false, .release);
+    try std.testing.expect(saver.checkpoint(source, 31 * second));
+    while (!driver.entered.load(.acquire)) std.Thread.yield() catch {};
+    source.generation = 3;
+    try std.testing.expect(!saver.checkpoint(source, 90 * second));
+    driver.released.store(true, .release);
+    saver.join();
+    try std.testing.expectEqual(@as(u64, 2), saver.persisted_generation);
+    // A busy writer must not postpone the newer generation's deadline.
+    try std.testing.expect(saver.checkpoint(source, 90 * second));
+    saver.join();
+    try std.testing.expectEqual(@as(u64, 3), saver.persisted_generation);
+    try std.testing.expect(!saver.checkpoint(source, 120 * second));
+    try std.testing.expectEqual(@as(u32, 3), driver.reads.load(.acquire));
+    // Shutdown still saves the tail before the next periodic deadline.
+    source.generation = 4;
+    saver.finish(source);
+    try std.testing.expectEqual(@as(u64, 4), saver.persisted_generation);
 }

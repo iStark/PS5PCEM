@@ -7,6 +7,22 @@ const rdna2 = @import("rdna2");
 
 pub var reuse_program_hash_state = std.atomic.Value(bool).init(true);
 
+/// A dynamic scalar's array index is also its uniform-buffer word. Call this
+/// before both translation and upload, never only while constructing a key.
+/// Provenance can discover the same producer/register set in different orders
+/// as inputs change. Preserve duplicate-key order so override semantics remain
+/// unchanged even for a caller that supplies repeated specializations.
+pub fn canonicalizeScalarRegisters(scalars: []rdna2.spirv.ScalarRegister) void {
+    std.sort.block(rdna2.spirv.ScalarRegister, scalars, {}, struct {
+        fn lessThan(_: void, a: rdna2.spirv.ScalarRegister, b: rdna2.spirv.ScalarRegister) bool {
+            if (a.producer_pc == null and b.producer_pc != null) return true;
+            if (a.producer_pc != null and b.producer_pc == null) return false;
+            if (a.producer_pc != b.producer_pc) return a.producer_pc.? < b.producer_pc.?;
+            return a.register < b.register;
+        }
+    }.lessThan);
+}
+
 const SharedModule = struct {
     allocator: std.mem.Allocator,
     module: rdna2.spirv.Module,
@@ -503,6 +519,48 @@ test "prepared program keys match fresh translations across reconstructed instru
         try std.testing.expectEqual(@as(u64, @intCast(step + 1)), cache.misses);
         try std.testing.expectEqual(@as(u64, @intCast(step + 1)), cache.hits);
     }
+}
+
+test "canonical scalar order reuses dynamic translations and preserves duplicate overrides" {
+    const a = std.testing.allocator;
+    var cache = Cache{};
+    defer cache.deinit(a);
+    var program = try rdna2.decodeProgram(a, &.{0xbf810000});
+    defer program.deinit(a);
+    var first = [_]rdna2.spirv.ScalarRegister{
+        .{ .register = 4, .value = 11, .producer_pc = 12 },
+        .{ .register = 0, .value = 22 },
+        .{ .register = 4, .value = 33, .producer_pc = 4 },
+        .{ .register = 5, .value = 44, .producer_pc = 4 },
+    };
+    var second = [_]rdna2.spirv.ScalarRegister{ first[3], first[1], first[0], first[2] };
+    for (&second) |*scalar| scalar.value += 100;
+    canonicalizeScalarRegisters(&first);
+    canonicalizeScalarRegisters(&second);
+    for (first, second) |lhs, rhs| {
+        try std.testing.expectEqual(lhs.register, rhs.register);
+        try std.testing.expectEqual(lhs.producer_pc, rhs.producer_pc);
+        try std.testing.expectEqual(lhs.value + 100, rhs.value);
+    }
+    var options = rdna2.spirv.Options{ .stage = .compute, .scalar_registers = &first, .dynamic_scalar_binding = .{ .binding = 10 } };
+    const initial = try cache.acquire(a, &program, options, .{});
+    defer initial.release();
+    options.scalar_registers = &second;
+    const reordered = try cache.acquire(a, &program, options, .{});
+    defer reordered.release();
+    try std.testing.expect(initial.sameModule(reordered));
+    var fresh = try rdna2.translateProgramSpirvWithPipelineOptions(a, &program, options, .{});
+    defer fresh.deinit(a);
+    try std.testing.expectEqualSlices(u32, fresh.words, reordered.view().words);
+
+    var duplicates = [_]rdna2.spirv.ScalarRegister{
+        .{ .register = 4, .value = 1, .producer_pc = 4 },
+        .{ .register = 0, .value = 9 },
+        .{ .register = 4, .value = 2, .producer_pc = 4 },
+    };
+    canonicalizeScalarRegisters(&duplicates);
+    try std.testing.expectEqual(@as(u32, 1), duplicates[1].value);
+    try std.testing.expectEqual(@as(u32, 2), duplicates[2].value);
 }
 
 test "dynamic uniform values reuse translation while bindings and literals invalidate it" {

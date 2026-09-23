@@ -2559,7 +2559,7 @@ fn runDispatcherBudgetProbe(allocator: std.mem.Allocator) !void {
     for (code, 0..) |word, index| guest.word(0x100 + index * 4, word);
     var analysis = try gpu.shader_analysis.decode(allocator, .{ .context = &guest, .read_fn = GuestMemory.read }, 0x100, 64);
     defer analysis.deinit(allocator);
-    for ([_][2]u32{ .{ 8, 2 }, .{ 2048, 512 }, .{ 8, 2 } }) |test_case| {
+    for ([_][2]u32{ .{ 8, 2 }, .{ 2048, 512 }, .{ 4096, 512 }, .{ 8, 2 } }) |test_case| {
         var module = try analysis.translateSpirv(allocator, .{
             .stage = .compute,
             .maximum_dispatcher_iterations = test_case[0],
@@ -4310,6 +4310,97 @@ fn runResetDepthExtentCase(allocator: std.mem.Allocator, fragment_depth: bool, n
             }
         }
     }
+}
+
+fn runStorageImageCpuReuseProbe(allocator: std.mem.Allocator) !void {
+    for ([_]bool{ false, true }) |fingerprint| try runStorageImageCpuReuseCase(allocator, fingerprint);
+    try runStorageImageCpuClearCase(allocator);
+    std.debug.print("storage CPU reuse passed: deferred writes, CPU replacement, padding, and rebind\n", .{});
+}
+
+fn runStorageImageCpuReuseCase(allocator: std.mem.Allocator, fingerprint: bool) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true });
+    defer renderer.deinit();
+    var guest = GuestMemory{};
+    var memory = guest.interface();
+    if (fingerprint) memory.fingerprint = GuestMemory.fingerprint;
+    const backend = renderer.dcbBackend(memory);
+    const code = [_]u32{
+        vop1(1, 0, 128), vop1(1, 1, 128), vop1(1, 2, 8),
+        0xf020_0108, 0x0000_0200, // image_store red v2 at v0/v1, T#s0
+        0xbf81_0000,
+    };
+    for (code, 0..) |word, i| guest.word(0x100 + i * 4, word);
+    var state = gpu.State{};
+    const compute = gpu.resources.ShaderStage.compute;
+    try state.writeRegister(.shader, compute.programRegisterBase(), 1);
+    try state.writeRegister(.shader, compute.programRegisterBase() + 1, 0);
+    try state.writeRegister(.shader, 0x213, 9 << 1);
+    for (0..4) |case| {
+        const address = 0x4000 + case * 0x1000;
+        var descriptor = imageDescriptorWords(@intCast(address), 1, 2);
+        descriptor[4] = 63; // Row padding must not count as a texel change.
+        for (descriptor, 0..) |word, i|
+            try state.writeRegister(.shader, compute.userDataBase() + @as(u32, @intCast(i)), word);
+        try state.writeRegister(.shader, compute.userDataBase() + 8, 42);
+        _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
+        // Retire work without materializing images, just as a guest fence does.
+        try std.testing.expect(backend.vtable.release.?(backend.context, std.mem.zeroes(gpu.state.ReleaseMem)));
+        try std.testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, guest.bytes[address..][0..4], .little));
+        if (case == 1 or case == 3) {
+            guest.word(address, 0xdead_beef); // CPU repurposes the allocation.
+            guest.word(address + 256, 0x1234_abcd); // Second row, untouched by the shader.
+        }
+        if (case == 2) guest.word(address + 4, 0x1234_5678); // Only padding changes.
+        // Case 3 rebinds CPU-updated memory directly, without a host readback.
+        if (case != 3) try renderer.flushPendingGuestWrites();
+        try std.testing.expectEqual(@as(u32, if (case == 1 or case == 3) 0xdead_beef else 42), std.mem.readInt(u32, guest.bytes[address..][0..4], .little));
+        if (case == 2) try std.testing.expectEqual(@as(u32, 0x1234_5678), std.mem.readInt(u32, guest.bytes[address + 4 ..][0..4], .little));
+        // Reusing the image after either publication or invalidation must allow
+        // a new GPU write to become visible again.
+        try state.writeRegister(.shader, compute.userDataBase() + 8, 43);
+        _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
+        try renderer.flushPendingGuestWrites();
+        try std.testing.expectEqual(@as(u32, 43), std.mem.readInt(u32, guest.bytes[address..][0..4], .little));
+        if (case == 1 or case == 3) try std.testing.expectEqual(@as(u32, 0x1234_abcd), std.mem.readInt(u32, guest.bytes[address + 256 ..][0..4], .little));
+    }
+    try std.testing.expectEqual(@as(u64, 2), renderer.storage_cpu_invalidations);
+}
+
+fn runStorageImageCpuClearCase(allocator: std.mem.Allocator) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true });
+    defer renderer.deinit();
+    var guest = GuestMemory{};
+    const backend = renderer.dcbBackend(guest.interface());
+    const store = [_]u32{ vop1(1, 0, 128), vop1(1, 1, 128), vop1(1, 2, 242), 0xf020_0108, 0x0000_0200, 0xbf81_0000 };
+    const clear = [_]u32{ 0xd746_0004, 0x0401_0c08, vop1(1, 0, 4), vop1(1, 1, 5), vop1(1, 2, 6), vop1(1, 3, 7), 0xe01c_2000, 0x8000_0004, 0xbf81_0000 };
+    for (store, 0..) |word, i| guest.word(0x100 + i * 4, word);
+    for (clear, 0..) |word, i| guest.word(0x200 + i * 4, word);
+    var state = gpu.State{};
+    const compute = gpu.resources.ShaderStage.compute;
+    try state.writeRegister(.shader, compute.programRegisterBase(), 1);
+    try state.writeRegister(.shader, compute.programRegisterBase() + 1, 0);
+    try state.writeRegister(.shader, 0x213, 8 << 1);
+    const descriptor = sampledImageDescriptorWords(0x8000, 16, 16);
+    const texture = try gpu.TextureLayout.fromImage(try gpu.resources.decodeImageDescriptor(&descriptor));
+    const subresource = try texture.subresource(0, 0, 1);
+    const records: u32 = @intCast(texture.required_source_bytes / 16);
+    for (descriptor, 0..) |word, i| try state.writeRegister(.shader, compute.userDataBase() + @as(u32, @intCast(i)), word);
+    _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
+    try std.testing.expect(backend.vtable.release.?(backend.context, std.mem.zeroes(gpu.state.ReleaseMem)));
+    guest.word(0x8000, 0xdead_beef);
+    try state.writeRegister(.shader, compute.programRegisterBase(), 2);
+    try state.writeRegister(.shader, 0x213, (8 << 1) | (1 << 7));
+    for ([_]u32{ 0x8000, 16 << 16, records, (75 << 12) | 0xfac, 0x40302010, 0x40302010, 0x40302010, 0x40302010 }, 0..) |word, i|
+        try state.writeRegister(.shader, compute.userDataBase() + @as(u32, @intCast(i)), word);
+    const report = try renderer.dispatchRdna2State(&state, .{ 64, 1, 1 }, .{ records / 64, 1, 1 });
+    try std.testing.expectEqual(@as(usize, 0), report.spirv_words);
+    try std.testing.expect(renderer.storage_image_cache.items[0].gpu_dirty);
+    try renderer.flushPendingGuestWrites();
+    for (0..16) |y| for (0..16) |x| {
+        const offset: usize = @intCast(try subresource.sourceByteOffset(@intCast(x), @intCast(y), 0, 0));
+        try std.testing.expectEqual(@as(u32, 0x40302010), std.mem.readInt(u32, guest.bytes[0x8000 + offset ..][0..4], .little));
+    };
 }
 
 fn runStorageImageReuseProbe(allocator: std.mem.Allocator) !void {
@@ -8109,6 +8200,7 @@ fn runFragmentShadowPointerProbe(allocator: std.mem.Allocator) !void {
         // Captured material variants first used after the heroine lifts her
         // head. Their signed index moves through different SGPR/VGPR pairs.
         .{ .extract_pc = 0x3334, .extract = 0x9457ff51, .source_sgpr = 81, .index_sgpr = 87, .index_vgpr = 96, .cube_pc = 0x343c, .cube_sources = 0x040a0300, .multiply_pc = 0x3450, .multiply = .{ 0xd5690063, 0x0002c0ff, 116 }, .load_pc = 0x345c, .read_pc = 0x3474, .read_sources = 0x006a0063 },
+        .{ .extract_pc = 0x33c0, .extract = 0x9457ff51, .source_sgpr = 81, .index_sgpr = 87, .index_vgpr = 96, .cube_pc = 0x34c8, .cube_sources = 0x040a0300, .multiply_pc = 0x34dc, .multiply = .{ 0xd5690063, 0x0002c0ff, 116 }, .load_pc = 0x34e8, .read_pc = 0x3500, .read_sources = 0x006a0063 },
         .{ .extract_pc = 0x3474, .extract = 0x9402ff0c, .source_sgpr = 12, .index_sgpr = 2, .index_vgpr = 88, .cube_pc = 0x3664, .cube_sources = 0x040a0300, .multiply_pc = 0x3678, .multiply = .{ 0xd569005c, 0x0002b0ff, 116 }, .load_pc = 0x3684, .read_pc = 0x369c, .read_sources = 0x006a005c },
     }) |shape| try runFragmentShadowPointerCase(allocator, &renderer, shape);
 }
@@ -10587,6 +10679,10 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--sdwa")) {
         try runSdwaProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--storage-cpu-reuse")) {
+        try runStorageImageCpuReuseProbe(allocator);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--storage-reuse")) {
