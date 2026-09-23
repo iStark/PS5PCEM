@@ -27,7 +27,6 @@ const error_bad_locus: i32 = @bitCast(@as(u32, 0x80b2_0010));
 const error_bad_optional_type: i32 = @bitCast(@as(u32, 0x80b2_0024));
 
 const handle: u32 = 1;
-const base_chunk: u16 = 0;
 const locus_not_downloaded: u8 = 0;
 const locus_local_slow: u8 = 2;
 const locus_local_fast: u8 = 3;
@@ -38,6 +37,9 @@ const optional_scenario: i32 = 1;
 const all_languages: u64 = std.math.maxInt(u64);
 const all_scenarios: u64 = 0x1f;
 const maximum_manifest_bytes: usize = 4 * 1024 * 1024;
+/// Chunk ids a package can define. Ghost of Yotei sizes the list it hands to
+/// scePlayGoGetChunkId to exactly this many entries.
+const chunk_id_space: u32 = 1000;
 
 const InitParams = extern struct {
     buffer: u64,
@@ -50,13 +52,24 @@ var opened = std.atomic.Value(bool).init(false);
 var install_speed = std.atomic.Value(i32).init(2);
 var installed_chunks: [maximum_entries]u16 = undefined;
 var installed_chunk_count: u32 = 1;
+/// Whether the installed chunks are the package's own list, read from its
+/// manifest. Without one the dump is just as complete, but which ids the
+/// package defined is unknown, so every id it could have defined is local.
+var chunks_from_manifest = false;
 
+/// Advertises the whole chunk id space. A title that maps its content onto
+/// chunks treats an id missing from scePlayGoGetChunkId as not installed:
+/// Ghost of Yotei keeps its language audio out of chunk 0 and, told only of
+/// chunk 0, drops `lang_<language>_audio` and every movie and line of dialogue
+/// it indexes.
 fn resetInstalledChunks() void {
-    installed_chunks[0] = base_chunk;
-    installed_chunk_count = 1;
+    for (installed_chunks[0..chunk_id_space], 0..) |*id, index| id.* = @intCast(index);
+    installed_chunk_count = chunk_id_space;
+    chunks_from_manifest = false;
 }
 
 fn containsChunk(id: u16) bool {
+    if (!chunks_from_manifest) return id < chunk_id_space;
     for (installed_chunks[0..installed_chunk_count]) |installed| {
         if (installed == id) return true;
     }
@@ -121,9 +134,8 @@ fn parseManifestChunkIds(text: []const u8) u32 {
 }
 
 /// Directory dumps produced by the package extractor include the authoritative
-/// chunk list as JSON. Reading it makes every shipped chunk immediately local
-/// instead of advertising only chunk zero and leaving engines on an endless
-/// "installing content" screen.
+/// chunk list as JSON. Reading it narrows the advertised chunks to the ones the
+/// package shipped; other dumps keep the whole id space.
 fn loadInstalledChunks() void {
     resetInstalledChunks();
     var info: filesystem.Stat = .{};
@@ -142,7 +154,10 @@ fn loadInstalledChunks() void {
         filled += read;
     }
     const count = parseManifestChunkIds(bytes[0..filled]);
-    if (count != 0) installed_chunk_count = count;
+    if (count != 0) {
+        installed_chunk_count = count;
+        chunks_from_manifest = true;
+    }
 }
 
 fn readable(address: u64, size: u64) bool {
@@ -320,8 +335,9 @@ pub fn setToDoList(value: u32, list_address: u64, count: u32) callconv(abi.guest
     return errno.ok;
 }
 
-/// Enumerates the one locally installed base chunk exposed by a directory
-/// dump. A zero-capacity query is valid and reports no written entries.
+/// Enumerates the installed chunks: the manifest's list, or the whole id space
+/// for a dump without one. A zero-capacity query is valid and reports no
+/// written entries.
 pub fn getChunkId(
     value: u32,
     output_address: u64,
@@ -402,4 +418,14 @@ test "package manifest exposes every installed chunk" {
     resetInstalledChunks();
     try std.testing.expectEqual(@as(u32, 3), parseManifestChunkIds(manifest));
     try std.testing.expectEqualSlices(u16, &.{ 0, 2, 5 }, installed_chunks[0..3]);
+}
+
+test "a dump without a manifest has every chunk id installed" {
+    resetInstalledChunks();
+    try std.testing.expectEqual(chunk_id_space, installed_chunk_count);
+    try std.testing.expectEqual(@as(u16, 0), installed_chunks[0]);
+    try std.testing.expectEqual(@as(u16, chunk_id_space - 1), installed_chunks[chunk_id_space - 1]);
+    try std.testing.expect(containsChunk(0));
+    try std.testing.expect(containsChunk(@intCast(chunk_id_space - 1)));
+    try std.testing.expect(!containsChunk(@intCast(chunk_id_space)));
 }

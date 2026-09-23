@@ -1173,15 +1173,21 @@ const audio_out2_port_state_bytes: usize = 0x40;
 
 fn audioOut2PortGetState(port: u64, state: ?*[audio_out2_port_state_bytes]u8) callconv(abi.guest) i32 {
     const output = state orelse return audio_out2_error_invalid_parameter;
-    const object = audioObject(port, .port) orelse return audio_out2_error_invalid_parameter;
+    // A handle this layer never minted still names an output to the title.
+    // Yotei's mixer polls a port it keeps as -1 about a hundred times a
+    // second and reads a failure as "nothing is connected".
+    const data_format = if (audioObject(port, .port)) |object| object.data_format else 0;
     @memset(output, 0);
-    const channels = if (decodeAudioOut2Format(object.data_format)) |dec|
+    const channels = if (decodeAudioOut2Format(data_format)) |dec|
         dec.channels
     else
-        audioOut2PortChannels(object.data_format);
+        audioOut2PortChannels(data_format);
     std.mem.writeInt(u16, output[0x00..0x02], 1, .little);
     output[0x02] = channels;
-    std.mem.writeInt(i16, output[0x04..0x06], -1, .little);
+    // Kyty's SceAudioOut2PortState is the same 0x40 record: u16 output,
+    // u8 channels, u8 pad, i16 volume, u16 reroute, u32 flags. Full scale
+    // is 127 here; -1 is a muted port to a title that scales by it.
+    std.mem.writeInt(i16, output[0x04..0x06], 127, .little);
     return errno.ok;
 }
 
@@ -3638,11 +3644,14 @@ test "AudioOut2 context defaults and handles are deterministic" {
     try std.testing.expectEqual(errno.ok, audioOut2PortGetState(port, &state));
     try std.testing.expectEqual(@as(u16, 1), std.mem.readInt(u16, state[0x00..0x02], .little));
     try std.testing.expectEqual(@as(u8, 8), state[0x02]);
-    try std.testing.expectEqual(@as(i16, -1), std.mem.readInt(i16, state[0x04..0x06], .little));
+    try std.testing.expectEqual(@as(i16, 127), std.mem.readInt(i16, state[0x04..0x06], .little));
     try std.testing.expectEqual(@as(u8, 0), state[0x10]);
     try std.testing.expectEqualSlices(u8, &(@as([0x30]u8, @splat(0))), state[0x10..]);
     try std.testing.expectEqual(audio_out2_error_invalid_parameter, audioOut2PortGetState(port, null));
-    try std.testing.expectEqual(audio_out2_error_invalid_parameter, audioOut2PortGetState(std.math.maxInt(u64), &state));
+    try std.testing.expectEqual(errno.ok, audioOut2PortGetState(std.math.maxInt(u64), &state));
+    try std.testing.expectEqual(@as(u16, 1), std.mem.readInt(u16, state[0x00..0x02], .little));
+    try std.testing.expectEqual(@as(u8, 2), state[0x02]);
+    try std.testing.expectEqual(@as(i16, 127), std.mem.readInt(i16, state[0x04..0x06], .little));
 }
 
 test "NGS2 derives one bounded float32 render grain from all buses" {

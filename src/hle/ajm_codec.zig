@@ -44,6 +44,55 @@ pub const result_codec_fatal: i32 = @bitCast(@as(u32, 0xc000_0000));
 
 const maximum_input_bytes = 64 * 1024 * 1024;
 const maximum_frame_pcm_bytes = 64 * 1024;
+const maximum_atrac9_frame_samples = 2048;
+/// Channel layouts LibAtrac9 defines, mono through 7.1.
+const atrac9_channel_layouts = 6;
+const atrac9_dual_mono_layout: u8 = 1;
+const atrac9_haptics_layout: u8 = 7;
+
+/// Most channels a multichannel ATRAC9 stream carries: fifth-order ambisonics.
+const maximum_atrac9_substreams = 36;
+
+/// Multichannel ATRAC9 as PS5 titles store it.
+///
+/// LibAtrac9 stops at 7.1. Wider streams -- 7.1.4 movie beds, cube and
+/// ambisonic ambiences -- are one mono ATRAC9 substream per channel sharing a
+/// superframe: every channel's first frame, then every channel's second, and
+/// each channel's last frame padded out to its share of the superframe.
+///
+/// Their config runs the other way round to a standard one: it starts `0x30`,
+/// then the sample-rate index over the high bits of the channel-pair count,
+/// then that count's low bit over `0x40`, and ends in the substream frame size
+/// (less one) over the superframe index where a standard config starts with
+/// its sync byte. Ghost of Yotei ships this as stereo, 5.1, 7.1.4, cube and
+/// ambisonic streams of 2 to 36 channels; every one decodes this way without
+/// error.
+const Atrac9Multistream = struct {
+    channels: u32,
+    substream_config: [4]u8,
+    substream_superframe_bytes: u32,
+};
+
+fn parseAtrac9Multistream(config: [4]u8) ?Atrac9Multistream {
+    if (config[0] != 0x30 or config[2] & 0x7f != 0x40) return null;
+    const pairs: u32 = ((@as(u32, config[1] & 0x0f) << 1) | (config[2] >> 7)) + 1;
+    const channels = 2 * pairs;
+    if (channels > maximum_atrac9_substreams) return null;
+    const frame_bytes: u32 = (config[3] >> 2) + 1;
+    const superframe_index: u32 = config[3] & 0x3;
+    // A standard mono config for each substream.
+    const word: u32 = (@as(u32, 0xfe) << 24) |
+        (@as(u32, config[1] >> 4) << 20) |
+        ((frame_bytes - 1) << 5) |
+        (superframe_index << 3);
+    var substream_config: [4]u8 = undefined;
+    std.mem.writeInt(u32, &substream_config, word, .big);
+    return .{
+        .channels = channels,
+        .substream_config = substream_config,
+        .substream_superframe_bytes = frame_bytes << @intCast(superframe_index),
+    };
+}
 
 pub const Report = struct {
     result: i32 = 0,
@@ -106,6 +155,14 @@ pub const Decoder = struct {
     at9_info: c.Atrac9CodecInfo = undefined,
     at9_frame_in_superframe: u32 = 0,
     at9_superframe_remaining: u32 = 0,
+    /// Frames are accounted at their nominal size and render as silence.
+    at9_silent: bool = false,
+    /// Per-channel decoders of a multichannel stream; unused by a standard one.
+    at9_substreams: [maximum_atrac9_substreams]?*anyopaque = @splat(null),
+    at9_substream_count: u32 = 0,
+    at9_substream_superframe_bytes: u32 = 0,
+    /// Bytes each substream has used of its share of the current superframe.
+    at9_substream_used: [maximum_atrac9_substreams]u32 = @splat(0),
 
     mp3_state: c.mp3dec_t = undefined,
     mp3_channels: u32 = 0,
@@ -169,6 +226,11 @@ pub const Decoder = struct {
     pub fn deinit(self: *Decoder) void {
         if (self.at9_handle) |handle| c.Atrac9ReleaseHandle(handle);
         self.at9_handle = null;
+        for (&self.at9_substreams) |*substream| {
+            if (substream.*) |handle| c.Atrac9ReleaseHandle(handle);
+            substream.* = null;
+        }
+        self.at9_substream_count = 0;
         self.at9_initialized = false;
         self.closeAac();
         self.destroyOpus();
@@ -224,7 +286,28 @@ pub const Decoder = struct {
         if (parameters.len < self.at9_config.len) return .{ .result = result_invalid_parameter };
         const handle = self.at9_handle orelse return .{ .result = result_not_initialized };
         @memcpy(&self.at9_config, parameters[0..self.at9_config.len]);
-        const status = c.Atrac9InitDecoder(handle, @ptrCast(&self.at9_config));
+        self.at9_substream_count = 0;
+        self.at9_silent = false;
+        if (parseAtrac9Multistream(self.at9_config)) |layout| return self.initializeAtrac9Multistream(layout);
+
+        // LibAtrac9 indexes its six channel layouts with the config's three-bit
+        // field unchecked, so any other layout has to be settled here or it
+        // reads past the table and takes the whole process down.
+        var config = self.at9_config;
+        const layout = (config[1] >> 1) & 0x7;
+        if (layout == atrac9_haptics_layout) {
+            // DualSense haptics, as PS5 movies carry beside their sound: two
+            // channels in frames LibAtrac9 cannot decode. Their geometry is a
+            // two-channel stream's; with no actuator to drive, they play as
+            // silence. A title still sizes its buffers from the geometry, and
+            // Ghost of Yotei divides by it when told there is none.
+            config[1] = (config[1] & ~@as(u8, 0x0e)) | (atrac9_dual_mono_layout << 1);
+            self.at9_silent = true;
+        } else if (layout >= atrac9_channel_layouts) {
+            self.at9_initialized = false;
+            return .{ .result = result_codec_fatal };
+        }
+        const status = c.Atrac9InitDecoder(handle, @ptrCast(&config));
         if (status != 0) {
             self.at9_initialized = false;
             return .{ .result = result_codec_fatal, .internal_result = @intCast(status) };
@@ -241,6 +324,34 @@ pub const Decoder = struct {
         self.at9_initialized = true;
         self.at9_frame_in_superframe = 0;
         self.at9_superframe_remaining = @intCast(self.at9_info.superframeSize);
+        return .{};
+    }
+
+    fn initializeAtrac9Multistream(self: *Decoder, layout: Atrac9Multistream) Report {
+        self.at9_initialized = false;
+        var config = layout.substream_config;
+        for (self.at9_substreams[0..layout.channels]) |*substream| {
+            if (substream.* == null) substream.* = c.Atrac9GetHandle() orelse return .{ .result = result_codec_fatal };
+            const status = c.Atrac9InitDecoder(substream.*.?, @ptrCast(&config));
+            if (status != 0) return .{ .result = result_codec_fatal, .internal_result = @intCast(status) };
+        }
+        var info: c.Atrac9CodecInfo = undefined;
+        const info_status = c.Atrac9GetCodecInfo(self.at9_substreams[0].?, &info);
+        if (info_status != 0 or
+            info.frameSamples <= 0 or info.frameSamples > maximum_atrac9_frame_samples or
+            info.framesInSuperframe <= 0)
+        {
+            return .{ .result = result_codec_fatal, .internal_result = @intCast(info_status) };
+        }
+        info.channels = @intCast(layout.channels);
+        info.superframeSize = @intCast(layout.channels * layout.substream_superframe_bytes);
+        self.at9_info = info;
+        self.at9_substream_count = layout.channels;
+        self.at9_substream_superframe_bytes = layout.substream_superframe_bytes;
+        self.at9_substream_used = @splat(0);
+        self.at9_initialized = true;
+        self.at9_frame_in_superframe = 0;
+        self.at9_superframe_remaining = @intCast(info.superframeSize);
         return .{};
     }
 
@@ -333,6 +444,10 @@ pub const Decoder = struct {
             report.consumed = riff.data_offset;
         }
         if (!self.at9_initialized) return .{ .result = result_not_initialized };
+        if (self.at9_substream_count != 0) {
+            self.decodeAtrac9Multistream(input, output, &report);
+            return report;
+        }
         const handle = self.at9_handle orelse return .{ .result = result_not_initialized };
         const channels: usize = @intCast(self.at9_info.channels);
         const frame_samples: u32 = @intCast(self.at9_info.frameSamples);
@@ -358,7 +473,11 @@ pub const Decoder = struct {
             const encoded = input[report.consumed..];
             const encoded_len: c_int = @intCast(@min(encoded.len, @as(usize, std.math.maxInt(c_int))));
             const no_interleave: c_int = if (((self.flags >> 32) & (1 << 8)) != 0) 1 else 0;
-            const status = switch (self.encoding) {
+            const status = if (self.at9_silent) silent: {
+                @memset(pcm[0..full_pcm_bytes], 0);
+                used = @divExact(self.at9_info.superframeSize, self.at9_info.framesInSuperframe);
+                break :silent 0;
+            } else switch (self.encoding) {
                 .signed16 => c.Atrac9Decode(handle, encoded.ptr, encoded_len, @ptrCast(&pcm), &used, no_interleave),
                 .signed32 => c.Atrac9DecodeS32(handle, encoded.ptr, encoded_len, @ptrCast(&pcm), &used, no_interleave),
                 .float32 => c.Atrac9DecodeF32(handle, encoded.ptr, encoded_len, @ptrCast(&pcm), &used, no_interleave),
@@ -403,6 +522,94 @@ pub const Decoder = struct {
             }
         }
         return report;
+    }
+
+    /// Decodes a multichannel stream a frame at a time: that frame from every
+    /// substream in channel order, gathered into one multichannel PCM frame.
+    fn decodeAtrac9Multistream(self: *Decoder, input: []const u8, output: []u8, report: *Report) void {
+        const channels: usize = self.at9_substream_count;
+        const frame_samples: u32 = @intCast(self.at9_info.frameSamples);
+        const sample_bytes = self.sampleBytes();
+        if (@as(usize, frame_samples) * channels * sample_bytes > maximum_frame_pcm_bytes) {
+            report.result = result_codec_fatal;
+            return;
+        }
+        const planar = ((self.flags >> 32) & (1 << 8)) != 0;
+        const last_frame: u32 = @intCast(self.at9_info.framesInSuperframe - 1);
+
+        var channel_pcm: [maximum_atrac9_frame_samples * 4]u8 align(16) = undefined;
+        var pcm: [maximum_frame_pcm_bytes]u8 align(16) = undefined;
+        var frame_used: [maximum_atrac9_substreams]u32 = undefined;
+        while (report.consumed < input.len) {
+            if (input.len - report.consumed < self.at9_superframe_remaining) {
+                report.result |= result_partial_input;
+                break;
+            }
+            const selected = self.selectedFrames(frame_samples);
+            const selected_bytes = @as(usize, selected.count) * channels * sample_bytes;
+            if (selected_bytes > output.len - report.produced) {
+                report.result |= result_not_enough_room;
+                break;
+            }
+
+            // The channel frames sit back to back; the last frame of a
+            // superframe is followed by that channel's padding.
+            const closes_superframe = self.at9_frame_in_superframe == last_frame;
+            var offset: usize = 0;
+            for (0..channels) |channel| {
+                const share_left = self.at9_substream_superframe_bytes - self.at9_substream_used[channel];
+                const encoded = input[report.consumed + offset ..];
+                const encoded_len: c_int = @intCast(@min(encoded.len, share_left));
+                const handle = self.at9_substreams[channel].?;
+                var used: c_int = 0;
+                const status = switch (self.encoding) {
+                    .signed16 => c.Atrac9Decode(handle, encoded.ptr, encoded_len, @ptrCast(&channel_pcm), &used, 0),
+                    .signed32 => c.Atrac9DecodeS32(handle, encoded.ptr, encoded_len, @ptrCast(&channel_pcm), &used, 0),
+                    .float32 => c.Atrac9DecodeF32(handle, encoded.ptr, encoded_len, @ptrCast(&channel_pcm), &used, 0),
+                };
+                if (status != 0 or used <= 0 or used > share_left) {
+                    report.result |= result_codec_fatal;
+                    report.internal_result = @intCast(status);
+                    return;
+                }
+                frame_used[channel] = @intCast(used);
+                offset += if (closes_superframe) share_left else frame_used[channel];
+
+                for (0..frame_samples) |sample| {
+                    const slot = if (planar) channel * frame_samples + sample else sample * channels + channel;
+                    @memcpy(pcm[slot * sample_bytes ..][0..sample_bytes], channel_pcm[sample * sample_bytes ..][0..sample_bytes]);
+                }
+            }
+
+            report.consumed += offset;
+            self.at9_superframe_remaining -= @intCast(offset);
+            for (self.at9_substream_used[0..channels], frame_used[0..channels]) |*total, used| total.* += used;
+            self.at9_frame_in_superframe += 1;
+            report.frames += 1;
+
+            if (selected.count != 0) {
+                if (!planar) {
+                    const start = @as(usize, selected.skip) * channels * sample_bytes;
+                    @memcpy(output[report.produced..][0..selected_bytes], pcm[start..][0..selected_bytes]);
+                } else {
+                    const plane_bytes = @as(usize, frame_samples) * sample_bytes;
+                    const kept_plane_bytes = @as(usize, selected.count) * sample_bytes;
+                    for (0..channels) |channel| {
+                        const source = channel * plane_bytes + @as(usize, selected.skip) * sample_bytes;
+                        const destination = report.produced + channel * kept_plane_bytes;
+                        @memcpy(output[destination..][0..kept_plane_bytes], pcm[source..][0..kept_plane_bytes]);
+                    }
+                }
+                report.produced += selected_bytes;
+            }
+            self.commitFrames(selected);
+
+            if (closes_superframe) {
+                self.at9_superframe_remaining = @intCast(self.at9_info.superframeSize);
+                self.at9_substream_used = @splat(0);
+                self.at9_frame_in_superframe = 0;
+            }
+        }
     }
 
     fn decodeMp3(self: *Decoder, input: []const u8, output: []u8) Report {
@@ -798,6 +1005,108 @@ test "ATRAC9 RIFF stream initializes from its fmt chunk" {
     try std.testing.expectEqual(@as(i32, 0), report.result);
     try std.testing.expectEqual(@as(usize, riff.len), report.consumed);
     try std.testing.expectEqual(@as(u32, 48_000), decoder.codecInfo().sample_rate);
+}
+
+test "multichannel ATRAC9 configs name their layout and substream size" {
+    // Every multichannel layout Ghost of Yotei ships.
+    const cases = [_]struct { config: [4]u8, channels: u32, share: u32, substream: [4]u8 }{
+        .{ .config = .{ 0x30, 0x70, 0x40, 0xfe }, .channels = 2, .share = 256, .substream = .{ 0xfe, 0x70, 0x07, 0xf0 } },
+        .{ .config = .{ 0x30, 0x70, 0xc0, 0xbe }, .channels = 4, .share = 192, .substream = .{ 0xfe, 0x70, 0x05, 0xf0 } },
+        .{ .config = .{ 0x30, 0x71, 0x40, 0xfe }, .channels = 6, .share = 256, .substream = .{ 0xfe, 0x70, 0x07, 0xf0 } },
+        .{ .config = .{ 0x30, 0x71, 0xc0, 0xfe }, .channels = 8, .share = 256, .substream = .{ 0xfe, 0x70, 0x07, 0xf0 } },
+        .{ .config = .{ 0x30, 0x72, 0xc0, 0xfe }, .channels = 12, .share = 256, .substream = .{ 0xfe, 0x70, 0x07, 0xf0 } },
+        .{ .config = .{ 0x30, 0x78, 0xc0, 0xfe }, .channels = 36, .share = 256, .substream = .{ 0xfe, 0x70, 0x07, 0xf0 } },
+    };
+    for (cases) |case| {
+        const layout = parseAtrac9Multistream(case.config).?;
+        try std.testing.expectEqual(case.channels, layout.channels);
+        try std.testing.expectEqual(case.share, layout.substream_superframe_bytes);
+        try std.testing.expectEqualSlices(u8, &case.substream, &layout.substream_config);
+    }
+    try std.testing.expect(parseAtrac9Multistream(.{ 0xfe, 0x70, 0x07, 0xf0 }) == null);
+    try std.testing.expect(parseAtrac9Multistream(.{ 0x30, 0x79, 0xc0, 0xfe }) == null);
+}
+
+test "ATRAC9 haptics play as two channels of silence" {
+    // The opening superframe of the splash movie's haptics track: 48 kHz,
+    // layout 7, four 32-byte frames.
+    var superframe: [128]u8 = @splat(0x01);
+    const frames = [_][8]u8{
+        .{ 0x08, 0x00, 0x00, 0x00, 0x00, 0x01, 0x55, 0x00 },
+        .{ 0xc8, 0x00, 0x00, 0x00, 0x00, 0x01, 0x55, 0x00 },
+    };
+    for (0..8) |index| @memcpy(superframe[index * 8 ..][0..8], &frames[@min(index / 2, 1)]);
+
+    var decoder = try Decoder.create(codec_atrac9, 2);
+    defer decoder.deinit();
+    try std.testing.expectEqual(@as(i32, 0), decoder.initialize(&.{ 0xfe, 0x7e, 0x03, 0xf0 }).result);
+    const info = decoder.codecInfo();
+    try std.testing.expectEqual(@as(u32, 2), info.channels);
+    try std.testing.expectEqual(@as(u32, 48_000), info.sample_rate);
+    try std.testing.expectEqual(@as(u32, 256), info.frame_samples);
+    try std.testing.expectEqual(@as(u32, 128), info.superframe_size);
+
+    var output: [4 * 256 * 2 * 2]u8 = @splat(0xa5);
+    const report = decoder.decode(&superframe, &output);
+    try std.testing.expectEqual(@as(i32, 0), report.result);
+    try std.testing.expectEqual(superframe.len, report.consumed);
+    try std.testing.expectEqual(output.len, report.produced);
+    try std.testing.expect(std.mem.allEqual(u8, &output, 0));
+}
+
+test "ATRAC9 refuses a channel layout nothing defines" {
+    // Layout 6 would index past LibAtrac9's table.
+    var decoder = try Decoder.create(codec_atrac9, 2);
+    defer decoder.deinit();
+    try std.testing.expectEqual(result_codec_fatal, decoder.initialize(&.{ 0xfe, 0x7c, 0x03, 0xf0 }).result);
+    try std.testing.expectEqual(@as(u32, 0), decoder.codecInfo().channels);
+}
+
+test "multichannel ATRAC9 decodes each channel's substream from a shared superframe" {
+    // One channel's opening superframe from Ghost of Yotei's splash movie,
+    // encoded silence: four frames of 256 samples in a 256-byte share.
+    const frames = [_][]const u8{
+        &.{ 0x2c, 0xdc, 0x1e, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x67, 0x39, 0xce, 0x73, 0x9c, 0xf7, 0xbd, 0xef, 0x7b, 0xde, 0x93, 0x6d, 0x26, 0xda, 0x4d, 0xb4, 0xf1, 0xe3, 0xc7, 0x8f, 0x1d, 0x47, 0x51, 0xd4, 0x75, 0x00 },
+        &.{ 0xa8, 0xd8, 0x1e, 0x80, 0x00, 0x00, 0x19, 0xce, 0x73, 0x9c, 0xe7, 0x3d, 0xef, 0x7b, 0xde, 0xf7, 0xa4, 0xdb, 0x49, 0xb6, 0x93, 0x6d, 0x3c, 0x78, 0xf1, 0xe3, 0xc7, 0x51, 0xd4, 0x75, 0x00 },
+        &.{ 0xa4, 0xd4, 0x1e, 0x80, 0x00, 0x00, 0x33, 0x9c, 0xe7, 0x39, 0xce, 0x7b, 0xde, 0xf7, 0xbd, 0xef, 0x49, 0xb6, 0x93, 0x6d, 0x26, 0xda, 0x78, 0xf1, 0xe3, 0xc7, 0x8e, 0xa3, 0xa8 },
+        &.{ 0xa0, 0xd0, 0x1e, 0x80, 0x00, 0x00, 0x67, 0x39, 0xce, 0x73, 0x9c, 0xf7, 0xbd, 0xef, 0x7b, 0xde, 0x93, 0x6d, 0x26, 0xda, 0x4d, 0xb4, 0xf1, 0xe3, 0xc7, 0x8f, 0x1d, 0x40 },
+    };
+    const channels = 4;
+    const share = 256;
+    const leading_bytes = frames[0].len + frames[1].len + frames[2].len;
+    var superframe: [channels * share]u8 = @splat(0x01);
+    var cursor: usize = 0;
+    for (frames, 0..) |frame, index| {
+        for (0..channels) |_| {
+            @memcpy(superframe[cursor..][0..frame.len], frame);
+            cursor += if (index == frames.len - 1) share - leading_bytes else frame.len;
+        }
+    }
+    try std.testing.expectEqual(superframe.len, cursor);
+
+    var decoder = try Decoder.create(codec_atrac9, channels);
+    defer decoder.deinit();
+    try std.testing.expectEqual(@as(i32, 0), decoder.initialize(&.{ 0x30, 0x70, 0xc0, 0xfe }).result);
+    const info = decoder.codecInfo();
+    try std.testing.expectEqual(@as(u32, channels), info.channels);
+    try std.testing.expectEqual(@as(u32, 48_000), info.sample_rate);
+    try std.testing.expectEqual(@as(u32, 256), info.frame_samples);
+    try std.testing.expectEqual(@as(u32, channels * share), info.superframe_size);
+
+    // Room for one frame: the job stops after every channel's first frame.
+    const frame_pcm = 256 * channels * 2;
+    var output: [4 * frame_pcm]u8 = @splat(0xa5);
+    const first = decoder.decode(&superframe, output[0..frame_pcm]);
+    try std.testing.expectEqual(result_not_enough_room, first.result);
+    try std.testing.expectEqual(@as(usize, channels * frames[0].len), first.consumed);
+    try std.testing.expectEqual(@as(usize, frame_pcm), first.produced);
+
+    const rest = decoder.decode(superframe[first.consumed..], output[frame_pcm..]);
+    try std.testing.expectEqual(@as(i32, 0), rest.result);
+    try std.testing.expectEqual(superframe.len, first.consumed + rest.consumed);
+    try std.testing.expectEqual(@as(usize, 3 * frame_pcm), rest.produced);
+    try std.testing.expectEqual(@as(u32, 3), rest.frames);
+    try std.testing.expectEqual(@as(u32, channels * share), decoder.codecInfo().next_frame_size);
 }
 
 test "MP3 decoder produces PCM and reports actual byte counts" {
