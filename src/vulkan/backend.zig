@@ -1003,6 +1003,8 @@ const TextureContent = struct {
 
 const maximum_color_passes = 16;
 const maximum_depth_targets = 16;
+/// The largest GFX10 swizzle block.
+const zero_block_bytes = 65536;
 // A streamed material can combine a 3996-entry texture table with hundreds
 // of additional views. The device limits below still cap each bank.
 const maximum_sampled_images = 8192;
@@ -4255,6 +4257,9 @@ pub const Renderer = struct {
     reported_mip_surveys: u32 = 0,
     reported_materializations: u32 = 0,
     last_flush_caller: usize = 0,
+    /// One zeroed swizzle block, the source for in-place target fills.
+    zero_block_buffer: ?OwnedBuffer = null,
+    filled_target_regions: u64 = 0,
     release_drain_caller: usize = 0,
     depth_target_count: u32 = 0,
     reported_resident_rejects: u32 = 0,
@@ -5119,6 +5124,7 @@ pub const Renderer = struct {
         for (self.draw_upload_spills.items) |buffer| self.destroyBuffer(buffer);
         self.draw_upload_spills.deinit(self.allocator);
         if (self.flat_fault_buffer) |buffer| self.destroyBuffer(buffer);
+        if (self.zero_block_buffer) |buffer| self.destroyBuffer(buffer);
         if (self.sampled_fault_buffer) |buffer| self.destroyBuffer(buffer);
         if (self.linear_upload_buffer) |buffer| self.destroyBuffer(buffer);
         if (self.magnify_source_image) |image| self.destroyImage(image);
@@ -8450,7 +8456,7 @@ pub const Renderer = struct {
         }
         self.prepareHtileWrite(descriptor.address, byte_count);
         if (!memory.write(memory.context, descriptor.address, bytes)) return Error.GuestMemoryWriteFailed;
-        self.invalidateDmaDestination(descriptor.address, byte_count);
+        try self.invalidateFilledTargets(descriptor.address, byte_count, fill_value == 0);
         // This kernel also fills attachment metadata. Updating guest bytes
         // alone leaves resident colour/depth images with the previous frame,
         // unlike the translated and packed-fill paths.
@@ -25459,11 +25465,142 @@ pub const Renderer = struct {
         for (self.render_targets.items) |*cached| {
             const frame_bytes = colorTargetFrameBytes(cached.target) catch continue;
             if (!byteRangesOverlap(address, size, cached.target.descriptor.address, frame_bytes)) continue;
-            cached.initialized = false;
-            cached.gpu_generation = 0;
-            cached.host_generation = 0;
-            cached.scanout_flip_vertical = false;
+            invalidateResidentTarget(cached);
         }
+        self.invalidateCompletedFrames(address, size);
+    }
+
+    fn invalidateResidentTarget(cached: *CachedRenderTarget) void {
+        cached.initialized = false;
+        cached.gpu_generation = 0;
+        cached.host_generation = 0;
+        cached.scanout_flip_vertical = false;
+    }
+
+    /// Like `invalidateDmaDestination`, except that a fill landing on a
+    /// resident colour target is applied to its image in place. Engines alias
+    /// transient buffers inside render-target memory; clearing a few of those
+    /// pages must not cost a full re-upload of the target at its next draw.
+    fn invalidateFilledTargets(self: *Renderer, address: u64, size: usize, zero: bool) anyerror!void {
+        for (self.render_targets.items, 0..) |cached, index| {
+            const frame_bytes = colorTargetFrameBytes(cached.target) catch continue;
+            if (!byteRangesOverlap(address, size, cached.target.descriptor.address, frame_bytes)) continue;
+            if (try self.applyFillToResidentTarget(index, address, size, zero)) continue;
+            invalidateResidentTarget(&self.render_targets.items[index]);
+        }
+        self.invalidateCompletedFrames(address, size);
+    }
+
+    /// Reproduces on the device what invalidating the target and uploading
+    /// it again at its next draw would produce. That upload fills a DCC
+    /// surface whose metadata holds one clear value with that value, whatever
+    /// the fill wrote; otherwise it detiles the raw bytes, which for a zero
+    /// fill differ from the image only in the texels the fill covered.
+    /// Returns false when neither case applies exactly.
+    fn applyFillToResidentTarget(self: *Renderer, index: usize, address: u64, size: usize, zero: bool) anyerror!bool {
+        const cached = self.render_targets.items[index];
+        const descriptor = cached.target.descriptor;
+        const layout = cached.target.layout;
+        if (!cached.initialized or self.recording_command_buffer != null or
+            descriptor.fragments_log2 != 0 or descriptor.cmask_fast_clear or
+            layout.volume != null or layout.layers != 1 or layout.first_slice != 0 or
+            layout.source_base_offset != 0 or layout.block.tile_mode.isLinear() or
+            layout.block.bytes > zero_block_bytes or zero_block_bytes % @as(u32, layout.block.bytes_per_element) != 0)
+        {
+            return false;
+        }
+        var regions: std.ArrayList(vk.BufferImageCopy) = .empty;
+        defer regions.deinit(self.allocator);
+
+        if (descriptor.dcc_enabled) {
+            const texel = (try self.colorTargetFastClearTexel(cached.target)) orelse return false;
+            if (texel.length != layout.block.bytes_per_element) return false;
+            var block_y: u32 = 0;
+            while (block_y < layout.blocks_per_column) : (block_y += 1) {
+                var block_x: u32 = 0;
+                while (block_x < layout.blocks_per_row) : (block_x += 1) {
+                    try appendBlockRegion(self.allocator, &regions, layout, block_x, block_y);
+                }
+            }
+            var pattern: [zero_block_bytes]u8 = undefined;
+            fillTexels(&pattern, texel.bytes[0..texel.length]);
+            const source = try self.createBuffer(
+                zero_block_bytes,
+                vk.buffer_usage_transfer_src_bit,
+                vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit,
+            );
+            // Destruction waits for the copy that reads it.
+            defer self.destroyBuffer(source);
+            try self.writeMapped(source, &pattern);
+            try self.copyBlocksToTarget(index, source, regions.items);
+            // The state an upload leaves: synchronized with guest memory.
+            const updated = &self.render_targets.items[index];
+            updated.gpu_generation = 0;
+            updated.host_generation = 0;
+            updated.scanout_flip_vertical = false;
+            return true;
+        }
+
+        if (!zero) return false;
+        const block_bytes: u64 = layout.block.bytes;
+        const block_count = @as(u64, layout.blocks_per_row) * layout.blocks_per_column;
+        const surface_end = descriptor.address +| block_count * block_bytes;
+        const start = @max(address, descriptor.address);
+        const end = @min(address +| size, surface_end);
+        // Only padding past the last block was written.
+        if (start >= end) return true;
+        const first = start - descriptor.address;
+        const last = end - descriptor.address;
+        if (first % layout.block.bytes_per_element != 0 or last % layout.block.bytes_per_element != 0) return false;
+        var block = first / block_bytes;
+        while (block * block_bytes < last) : (block += 1) {
+            const block_x: u32 = @intCast(block % layout.blocks_per_row);
+            const block_y: u32 = @intCast(block / layout.blocks_per_row);
+            const block_start = block * block_bytes;
+            if (first <= block_start and block_start + block_bytes <= last) {
+                try appendBlockRegion(self.allocator, &regions, layout, block_x, block_y);
+            } else {
+                try appendPartialBlockRuns(self.allocator, &regions, layout, block_x, block_y, first, last);
+            }
+        }
+        if (regions.items.len == 0) return true;
+        const zeros = self.zero_block_buffer orelse created: {
+            const buffer = try self.createBuffer(
+                zero_block_bytes,
+                vk.buffer_usage_transfer_src_bit,
+                vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit,
+            );
+            errdefer self.destroyBuffer(buffer);
+            const empty: [zero_block_bytes]u8 = @splat(0);
+            try self.writeMapped(buffer, &empty);
+            self.zero_block_buffer = buffer;
+            break :created buffer;
+        };
+        try self.copyBlocksToTarget(index, zeros, regions.items);
+        return true;
+    }
+
+    fn copyBlocksToTarget(self: *Renderer, index: usize, source: OwnedBuffer, regions: []const vk.BufferImageCopy) anyerror!void {
+        const image = self.render_targets.items[index].image.handle;
+        const command_buffer = try self.beginOneShot();
+        defer self.releaseOneShot(command_buffer);
+        const range: vk.ImageSubresourceRange = .{ .aspect_mask = vk.image_aspect_color_bit };
+        try self.transitionTrackedImage(command_buffer, image, range, image_state.transfer_destination_usage);
+        self.device_functions.cmd_copy_buffer_to_image(
+            command_buffer,
+            source.handle,
+            image,
+            vk.image_layout_transfer_dst_optimal,
+            @intCast(regions.len),
+            regions.ptr,
+        );
+        try self.transitionTrackedImage(command_buffer, image, range, image_state.color_attachment_usage);
+        try self.submitOneShot(command_buffer);
+        self.render_targets.items[index].shader_read_layout = false;
+        self.filled_target_regions +|= regions.len;
+    }
+
+    fn invalidateCompletedFrames(self: *Renderer, address: u64, size: usize) void {
         for (self.completed_frames.items) |*cached| {
             const target = cached.target orelse continue;
             const frame_bytes = colorTargetFrameBytes(target) catch continue;
@@ -30007,6 +30144,68 @@ fn fillRgba8(linear: []u8, texel: [4]u8) void {
     var index: usize = 0;
     while (index + 3 < linear.len) : (index += 4) {
         linear[index..][0..4].* = texel;
+    }
+}
+
+/// The image rectangle one swizzle block covers, clipped to the surface.
+fn appendBlockRegion(
+    allocator: std.mem.Allocator,
+    regions: *std.ArrayList(vk.BufferImageCopy),
+    layout: gpu.SurfaceLayout,
+    block_x: u32,
+    block_y: u32,
+) !void {
+    const x = block_x * layout.block.width;
+    const y = block_y * layout.block.height;
+    if (x >= layout.width or y >= layout.height) return;
+    try regions.append(allocator, .{
+        .image_subresource = .{ .aspect_mask = vk.image_aspect_color_bit },
+        .image_offset = .{ .x = @intCast(x), .y = @intCast(y), .z = 0 },
+        .image_extent = .{
+            .width = @min(layout.block.width, layout.width - x),
+            .height = @min(layout.block.height, layout.height - y),
+            .depth = 1,
+        },
+    });
+}
+
+/// Rows of texels inside one swizzle block whose bytes lie in
+/// [first, last) of the surface, as one-row image regions.
+fn appendPartialBlockRuns(
+    allocator: std.mem.Allocator,
+    regions: *std.ArrayList(vk.BufferImageCopy),
+    layout: gpu.SurfaceLayout,
+    block_x: u32,
+    block_y: u32,
+    first: u64,
+    last: u64,
+) !void {
+    const x0 = block_x * layout.block.width;
+    const y0 = block_y * layout.block.height;
+    if (x0 >= layout.width or y0 >= layout.height) return;
+    const x_end = @min(x0 + layout.block.width, layout.width);
+    const y_end = @min(y0 + layout.block.height, layout.height);
+    var y = y0;
+    while (y < y_end) : (y += 1) {
+        var run_start: ?u32 = null;
+        var x = x0;
+        while (x <= x_end) : (x += 1) {
+            const covered = x < x_end and covered: {
+                const offset = try layout.sourceByteOffset(x, y, 0);
+                break :covered offset >= first and offset < last;
+            };
+            if (covered) {
+                if (run_start == null) run_start = x;
+                continue;
+            }
+            const run = run_start orelse continue;
+            run_start = null;
+            try regions.append(allocator, .{
+                .image_subresource = .{ .aspect_mask = vk.image_aspect_color_bit },
+                .image_offset = .{ .x = @intCast(run), .y = @intCast(y), .z = 0 },
+                .image_extent = .{ .width = x - run, .height = 1, .depth = 1 },
+            });
+        }
     }
 }
 
