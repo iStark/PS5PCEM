@@ -84,6 +84,12 @@ found, and can invoke the package extractor on a debug package directly.
   </tr>
   <tr>
     <td colspan="2" align="center">
+      <img src="docs/images/ritas-rewind-gameplay.png" alt="Mighty Morphin Power Rangers: Rita's Rewind gameplay with the Red Ranger in the Command Center rendered by PS5PCEM"><br>
+      <sub>Mighty Morphin Power Rangers: Rita's Rewind &mdash; gameplay in the Command Center</sub>
+    </td>
+  </tr>
+  <tr>
+    <td colspan="2" align="center">
       <img src="docs/images/yotei-tree-scene.png" alt="Ghost of Yotei tree scene captured from PS5PCEM"><br>
       <sub>Ghost of Yotei &mdash; tree scene (development capture, September 23, 2026)</sub>
     </td>
