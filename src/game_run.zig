@@ -679,7 +679,11 @@ fn run(init: std.process.Init) !bool {
         break :parse std.math.clamp(std.fmt.parseInt(u8, text, 10) catch default_copy_workers, 1, gpu.parallel_copy.Pool.maximum_participants);
     } else |_| default_copy_workers;
     gpu.parallel_copy.guest_copy_pool.participants.store(gpu_copy_workers, .release);
-    const default_render_targets: usize = if (std.ascii.eqlIgnoreCase(title_identifier, yotei_title_id)) 128 else 64;
+    // Tetris Journey Mode retains about 100 attachments. A 64-entry cache
+    // evicts/reimports roughly 60 of them per frame, causing hundreds of MiB
+    // of readbacks. Keep its working set resident, as for Yotei.
+    const default_render_targets: usize = if (std.ascii.eqlIgnoreCase(title_identifier, yotei_title_id) or
+        std.ascii.eqlIgnoreCase(title_identifier, tetris_effect_connected_title_id)) 128 else 64;
     const render_target_cache_limit = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_RENDER_TARGETS")) |text| parse: {
         defer allocator.free(text);
         break :parse std.math.clamp(std.fmt.parseInt(usize, text, 10) catch default_render_targets, 64, 256);

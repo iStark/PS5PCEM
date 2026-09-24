@@ -7305,6 +7305,24 @@ fn runDccMetadataClearProbe(allocator: std.mem.Allocator) !void {
             try std.testing.expectEqual(expected, std.mem.readInt(u16, guest.bytes[0x2000 + pixel * 8 + channel * 2 ..][0..2], .little));
         };
     }
+    // Tetris clears DCC through the four-instruction R32 fill as well as
+    // the packed RGBA fill above. Repaint between clears so an unchanged
+    // metadata value must still invalidate the previous resident colour.
+    const linear_clear = [_]u32{ 0xd746_0000, 0x0401_0c04, vop1(1, 1, 255), 0, 0xe010_2000, 0x8000_0100, 0xbf81_0000 };
+    for (linear_clear, 0..) |word, index| guest.word(0x100 + index * 4, word);
+    try state.writeRegister(.shader, 0x213, (4 << 1) | (1 << 7));
+    for ([_]u32{ 0x1c000, 4 << 16, 256, (20 << 12) | 0xfac }, 0..) |word, index| try state.writeRegister(.shader, 0x240 + @as(u32, @intCast(index)), word);
+    for ([_]u32{ 0, 0x4040_4040, 0x8080_8080, 0xc0c0_c0c0, 0 }) |value| {
+        _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 0 });
+        if (renderer.last_draw_error) |err| return err;
+        guest.word(0x10c, value);
+        _ = try renderer.dispatchRdna2State(&state, .{ 64, 1, 1 }, .{ 4, 1, 1 });
+        try renderer.flushPendingGuestWrites();
+        for (0..64 * 64) |pixel| for (0..4) |channel| {
+            const expected: u16 = if (value & (if (channel == 3) @as(u32, 0x40) else 0x80) != 0) 0x3c00 else 0;
+            try std.testing.expectEqual(expected, std.mem.readInt(u16, guest.bytes[0x2000 + pixel * 8 + channel * 2 ..][0..2], .little));
+        };
+    }
     @memset(guest.bytes[0x1c000..0x1c400], 0xff);
     _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 0 });
     try renderer.flushPendingGuestWrites();
@@ -7341,7 +7359,36 @@ fn runDccMetadataClearProbe(allocator: std.mem.Allocator) !void {
     }));
     try renderer.flushPendingGuestWrites();
     for (0..64 * 64) |pixel| try std.testing.expectEqual(@as(u64, 0x3c00_3c00_3c00_3c00), std.mem.readInt(u64, guest.bytes[0x2000 + pixel * 8 ..][0..8], .little));
-    std.debug.print("DCC metadata clears passed: repeated RGBA16F compute/PM4/DMA clears, partial and mixed metadata preservation\n", .{});
+    // Journey Mode clears its packed HDR scene and normal planes through
+    // the same metadata fill. Neither may retain earlier UI draws.
+    for ([_]u32{ 6, 9 }, 0..) |format, index| {
+        const address: u32 = 0x10000 + @as(u32, @intCast(index)) * 0x4000;
+        const metadata_address: u32 = 0x1c400 + @as(u32, @intCast(index)) * 0x400;
+        try state.writeRegister(.context, 0x318, address >> 8);
+        try state.writeRegister(.context, 0x31c, (format << 2) | (@as(u32, if (format == 6) 7 else 0) << 8) | (1 << 28));
+        try state.writeRegister(.context, 0x325, metadata_address >> 8);
+        try state.writeRegister(.shader, 0x240, metadata_address);
+        for ([_]u32{ 0, 0x4040_4040, 0x8080_8080, 0xc0c0_c0c0, 0 }) |value| {
+            @memset(guest.bytes[metadata_address..][0..1024], 0xff);
+            _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 0 });
+            if (renderer.last_draw_error) |err| return err;
+            try renderer.flushPendingGuestWrites();
+            const painted = std.mem.readInt(u32, guest.bytes[address + (32 * 64 + 32) * 4 ..][0..4], .little);
+            try std.testing.expect(painted != 0);
+            guest.word(0x10c, value);
+            _ = try renderer.dispatchRdna2State(&state, .{ 64, 1, 1 }, .{ 4, 1, 1 });
+            try renderer.flushPendingGuestWrites();
+            const expected: u32 = if (format == 6)
+                (if (value & 0x80 != 0) @as(u32, 0x781e_03c0) else 0)
+            else
+                (if (value & 0x80 != 0) @as(u32, 0x3fff_ffff) else 0) |
+                    (if (value & 0x40 != 0) @as(u32, 0xc000_0000) else 0);
+            for (0..64 * 64) |pixel| {
+                try std.testing.expectEqual(expected, std.mem.readInt(u32, guest.bytes[address + pixel * 4 ..][0..4], .little));
+            }
+        }
+    }
+    std.debug.print("DCC metadata clears passed: repeated RGBA16F/R11G11B10/RGB10A2 compute/PM4/DMA clears, partial and mixed metadata preservation\n", .{});
 }
 
 fn runNormalizedColorProbe(allocator: std.mem.Allocator) !void {

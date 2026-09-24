@@ -4114,7 +4114,6 @@ pub const Renderer = struct {
     resident_rt_storage_reports: u8 = 0,
     resident_rt_extent_alias_reports: u8 = 0,
     resident_storage_sample_reports: u8 = 0,
-    reported_tone_map_fallback: bool = false,
     reported_ui_composite: bool = false,
     reported_rgb10_menu_postprocess_fallback: bool = false,
     htile_targets: std.ArrayList(CachedHtileTarget) = .empty,
@@ -8433,8 +8432,14 @@ pub const Renderer = struct {
                 std.mem.writeInt(u32, bytes[offset..][0..4], fill_value, .little);
             }
         }
+        self.prepareHtileWrite(descriptor.address, byte_count);
         if (!memory.write(memory.context, descriptor.address, bytes)) return Error.GuestMemoryWriteFailed;
         self.invalidateDmaDestination(descriptor.address, byte_count);
+        // This kernel also fills attachment metadata. Updating guest bytes
+        // alone leaves resident colour/depth images with the previous frame,
+        // unlike the translated and packed-fill paths.
+        try self.applyUniformHtileWrite(descriptor.address, bytes);
+        try self.applyUniformDccWrite(descriptor.address, bytes);
         self.emulated_buffer_clear_dispatches += 1;
         self.noteComputeWrite("emulated-linear-fill", descriptor.address, 0, 0, 0);
         if (log_verbose_gpu or self.emulated_buffer_clear_dispatches <= 4) {
@@ -13744,6 +13749,21 @@ pub const Renderer = struct {
                 vk.format_r8g8b8a8_unorm, vk.format_b8g8r8a8_unorm => {
                     for (0..4) |channel| clear.float32[channel] = @as(f32, @floatFromInt(texel.bytes[channel])) / 255.0;
                 },
+                vk.format_b10g11r11_ufloat_pack32 => {
+                    const word = std.mem.readInt(u32, texel.bytes[0..4], .little);
+                    clear.float32 = .{
+                        decodeUnsignedMiniFloat(word & 0x7ff, 11),
+                        decodeUnsignedMiniFloat((word >> 11) & 0x7ff, 11),
+                        decodeUnsignedMiniFloat(word >> 22, 10),
+                        1,
+                    };
+                },
+                vk.format_a2b10g10r10_unorm_pack32 => {
+                    const word = std.mem.readInt(u32, texel.bytes[0..4], .little);
+                    for (0..3) |channel| clear.float32[channel] =
+                        @as(f32, @floatFromInt((word >> @intCast(channel * 10)) & 0x3ff)) / 1023.0;
+                    clear.float32[3] = @as(f32, @floatFromInt(word >> 30)) / 3.0;
+                },
                 else => continue,
             }
             const command_buffer = try self.beginOneShot();
@@ -18107,42 +18127,6 @@ pub const Renderer = struct {
             }
             return;
         }
-        // Tetris keeps the composited UI layer immediately below its packed
-        // HDR scene allocation.  Until the title's large deferred-composite
-        // pixel program is translated exactly, preserve the already rendered
-        // RGBA layer instead of feeding its malformed HDR result into the
-        // final tone mapper.
-        if (full_color_write and fragment_mapping_count == 4 and paired_parameter_mask == 0xf and
-            target.descriptor.width == 3840 and target.descriptor.height == 2160)
-        {
-            const scene = graphics_resources.descriptors[0];
-            if (scene.unified_format == 36 and scene.address >= 0x200_0000) {
-                var ui_layer = scene;
-                ui_layer.address -= 0x200_0000;
-                ui_layer.unified_format = 56;
-                if (!self.reported_ui_composite) {
-                    if (self.deferred_composite_ui_address != ui_layer.address) {
-                        std.debug.print(
-                            "[vulkan dcb] deferred-composite presentation anchor @0x{x}\n",
-                            .{ui_layer.address},
-                        );
-                    }
-                    self.deferred_composite_ui_address = ui_layer.address;
-                    self.deferred_composite_ui_last_flip = self.flip_callbacks;
-                }
-                if (self.findResidentRenderTargetIndex(ui_layer, vk.format_r8g8b8a8_unorm)) |source_index| {
-                    if (try self.blitResidentColorTarget(source_index, target, false) != null) {
-                        if (self.flip_callbacks < 24 or log_verbose_gpu) {
-                            std.debug.print(
-                                "[vulkan dcb] preserved Tetris UI layer: 0x{x} -> 0x{x}\n",
-                                .{ ui_layer.address, target.descriptor.address },
-                            );
-                        }
-                        return;
-                    }
-                }
-            }
-        }
         // A four-PARAM full-screen pass is not necessarily a copy. Tetris uses
         // this shape for its five-texture tone-map/composite shader. Bypassing
         // it with a copy of descriptor zero discards the UI and post-processing
@@ -18580,27 +18564,16 @@ pub const Renderer = struct {
         }
         var texture_probe_module: ?rdna2.spirv.Module = null;
         defer if (texture_probe_module) |*module| module.deinit(self.allocator);
-        const screen_space_tone_map = fragment_mapping_count == 4 and
-            paired_parameter_mask == 0xf and
-            target.descriptor.width == 3840 and target.descriptor.height == 2160;
-        if ((self.force_probe_fragment_texture or screen_space_tone_map) and
-            fragment_mapping_count != 0)
-        {
-            const tone_mapping_index: usize = 0;
-            const tone_mapping = graphics_resources.mappings[tone_mapping_index];
+        // A successfully translated post-process must keep all of its inputs.
+        // Four interpolants and a 4K target do not identify a copy: descriptor
+        // zero can be a 3D color-grading LUT rather than the scene image.
+        if (self.force_probe_fragment_texture and fragment_mapping_count != 0) {
             texture_probe_module = try buildTextureProbeFragmentSpirv(
                 self.allocator,
-                tone_mapping,
+                graphics_resources.mappings[0],
                 .{ target.descriptor.width, target.descriptor.height },
-                if (screen_space_tone_map) 0 else 2,
+                2,
             );
-            if (screen_space_tone_map and !self.reported_tone_map_fallback) {
-                self.reported_tone_map_fallback = true;
-                std.debug.print(
-                    "[vulkan dcb] using screen-space sampled fallback for unsupported 4K tone mapper program=0x{x}\n",
-                    .{fragment_address},
-                );
-            }
         }
         var parameter_probe_module: ?rdna2.spirv.Module = null;
         defer if (parameter_probe_module) |*module| module.deinit(self.allocator);
@@ -28073,7 +28046,9 @@ fn fillWholeImageBlocks(
         return true;
     }
 
-    if (subresource.in_tail or subresource.tail_x != 0 or subresource.tail_y != 0) {
+    if (subresource.in_tail or subresource.tail_x != 0 or subresource.tail_y != 0 or
+        subresource.block.depth != 1 or subresource.block.width > 256)
+    {
         return false;
     }
     const logical_blocks_wide = subresource.width / subresource.block.width;
@@ -28104,30 +28079,41 @@ fn fillWholeImageBlocks(
 
     const full_block_width = logical_blocks_wide * subresource.block.width;
     const full_block_height = logical_blocks_high * subresource.block.height;
-    for (0..subresource.height) |y_index| {
-        for (full_block_width..subresource.width) |x_index| {
-            const offset_u64 = try subresource.sourceByteOffset(
-                @intCast(x_index),
-                @intCast(y_index),
-                0,
-                0,
-            );
-            const offset = std.math.cast(usize, offset_u64) orelse return false;
-            if (offset > allocation.len or texel.len > allocation.len - offset) return false;
-            @memcpy(allocation[offset..][0..texel.len], texel);
-        }
+    if (full_block_width == subresource.width and full_block_height == subresource.height) return true;
+
+    // The swizzle is an XOR of independent coordinate contributions, just as
+    // in the thin-subresource copier. Cache X once, and evaluate Y
+    // and the RB+ block/slice contribution once per block row. A 4K clear can
+    // have hundreds of thousands of edge texels despite filling whole blocks
+    // above; rebuilding the general address for each one dominates CPU time.
+    var x_offsets: [256]u32 = undefined;
+    for (0..subresource.block.width) |x| {
+        x_offsets[x] = try subresource.block.byteOffset(@intCast(x), 0, 0, 0);
     }
-    for (full_block_height..subresource.height) |y_index| {
-        for (0..full_block_width) |x_index| {
-            const offset_u64 = try subresource.sourceByteOffset(
-                @intCast(x_index),
-                @intCast(y_index),
-                0,
+    const rb_plus = subresource.block.family == .depth_64kb or
+        subresource.block.family == .render_target_64kb;
+    const swizzle_z = if (rb_plus and subresource.kind == .array_2d) subresource.first_slice else 0;
+    for (0..subresource.height) |y_index| {
+        const y: u32 = @intCast(y_index);
+        var x: u32 = if (y < full_block_height) full_block_width else 0;
+        while (x < subresource.width) {
+            const block_x = x / subresource.block.width;
+            const local_x = x % subresource.block.width;
+            const count = @min(subresource.block.width - local_x, subresource.width - x);
+            const block_index = try std.math.add(usize, try std.math.mul(usize, y / subresource.block.height, physical_blocks_wide), block_x);
+            const block_base = try std.math.add(usize, allocation_base, try std.math.mul(usize, block_index, block_bytes));
+            const row_xor = try subresource.block.byteOffset(
+                if (rb_plus) x - local_x else 0,
+                if (rb_plus) y else y % subresource.block.height,
+                swizzle_z,
                 0,
             );
-            const offset = std.math.cast(usize, offset_u64) orelse return false;
-            if (offset > allocation.len or texel.len > allocation.len - offset) return false;
-            @memcpy(allocation[offset..][0..texel.len], texel);
+            for (0..count) |column| {
+                const offset = try std.math.add(usize, block_base, x_offsets[local_x + column] ^ row_xor);
+                if (offset > allocation.len or texel.len > allocation.len - offset) return false;
+                @memcpy(allocation[offset..][0..texel.len], texel);
+            }
+            x += count;
         }
     }
     return true;
@@ -29558,6 +29544,21 @@ fn dccClearTexel(code: u8, descriptor: gpu.resources.ColorTarget) ?[4]u8 {
 fn colorDccClearTexel(code: u8, descriptor: gpu.resources.ColorTarget) ?DccClearTexel {
     var result = DccClearTexel{ .bytes = @splat(0), .length = 0 };
     switch (descriptor.format) {
+        6, 9 => {
+            // Packed HDR and RGB10A2 attachments need the same metadata
+            // clears as RGBA targets. Keep unsupported numeric/swap layouts
+            // and payload-dependent keys on the existing raw path.
+            if (descriptor.component_swap != 0 or
+                descriptor.number_type != @as(u8, if (descriptor.format == 6) 7 else 0) or
+                (code != 0 and code != 0x40 and code != 0x80 and code != 0xc0)) return null;
+            const word: u32 = if (descriptor.format == 6)
+                (if (code & 0x80 != 0) @as(u32, 0x781e_03c0) else 0)
+            else
+                (if (code & 0x80 != 0) @as(u32, 0x3fff_ffff) else 0) |
+                    (if (code & 0x40 != 0) @as(u32, 0xc000_0000) else 0);
+            std.mem.writeInt(u32, result.bytes[0..4], word, .little);
+            result.length = 4;
+        },
         10 => {
             const rgba = dccClearTexel(code, descriptor) orelse return null;
             result.bytes[0..4].* = rgba;
@@ -35279,6 +35280,51 @@ test "whole image clear plans are bounded and reject partial dispatches" {
     const padding_block: usize = @intCast(tiled.subresource.level_offset + tiled.subresource.block.bytes * 2);
     try std.testing.expect(padding_block < allocation.len);
     try std.testing.expectEqual(@as(u8, 0xaa), allocation[padding_block]);
+}
+
+test "image clear edges match scalar addresses and preserve padding across tile modes" {
+    const modes = [_]gpu.resources.TileMode{
+        .standard_256b,      .standard_4kb,  .standard_64kb,
+        .partially_resident, .render_target, .depth,
+    };
+    const pattern = [_]u8{ 1, 7, 13, 19, 25, 31, 37, 43, 49, 55, 61, 67, 73, 79, 85, 91 };
+    for (modes) |mode| {
+        for ([_]u8{ 1, 2, 4, 8, 16 }) |element_bytes| {
+            if (mode == .depth and element_bytes == 16) continue;
+            const block = try gpu.tiling.SwizzleBlock.init(mode, element_bytes, false, 0);
+            for (0..3) |edge_shape| {
+                const width = block.width * 2 - (if (edge_shape == 0) @as(u32, 0) else 3);
+                const height = block.height + (if (edge_shape == 1) @as(u32, 0) else 3);
+                const layout = try gpu.TextureLayout.init(.{
+                    .tile_mode = mode,
+                    .width = width,
+                    .height = height,
+                    .first_slice = 3,
+                    .row_pitch_elements = block.width * 3,
+                }, element_bytes);
+                var view = try layout.subresource(0, 0, 1);
+                // Exercise a nonzero mip/allocation offset as well as the
+                // RB+ slice XOR and untouched preceding physical slices.
+                view.level_offset += block.bytes;
+                view.required_source_bytes += block.bytes;
+                const actual = try std.testing.allocator.alloc(u8, @intCast(view.required_source_bytes));
+                defer std.testing.allocator.free(actual);
+                const expected = try std.testing.allocator.alloc(u8, actual.len);
+                defer std.testing.allocator.free(expected);
+                @memset(actual, 0xa5);
+                @memset(expected, 0xa5);
+                const texel = pattern[0..element_bytes];
+                for (0..height) |y| {
+                    for (0..width) |x| {
+                        const offset: usize = @intCast(try view.sourceByteOffset(@intCast(x), @intCast(y), 0, 0));
+                        @memcpy(expected[offset..][0..texel.len], texel);
+                    }
+                }
+                try std.testing.expect(try fillWholeImageBlocks(actual, view, texel));
+                try std.testing.expectEqualSlices(u8, expected, actual);
+            }
+        }
+    }
 }
 
 test "repeated-pattern fill handles partial final patterns" {

@@ -86,15 +86,33 @@ var next_thread_ordinal = std.atomic.Value(u32).init(1);
 
 inline fn captureGuestCalleeSaved() void {
     if (comptime abi.can_run_guest_code) {
-        guest_rbx = asm volatile ("movq %%rbx, %%rax" : [value] "={rax}" (-> u64));
-        guest_rbp = asm volatile ("movq %%rbp, %%rax" : [value] "={rax}" (-> u64));
-        guest_r12 = asm volatile ("movq %%r12, %%rax" : [value] "={rax}" (-> u64));
-        guest_r13 = asm volatile ("movq %%r13, %%rax" : [value] "={rax}" (-> u64));
-        guest_r14 = asm volatile ("movq %%r14, %%rax" : [value] "={rax}" (-> u64));
-        guest_r15 = asm volatile ("movq %%r15, %%rax" : [value] "={rax}" (-> u64));
-        guest_rsp = asm volatile ("movq %%rsp, %%rax" : [value] "={rax}" (-> u64));
-        guest_rsi = asm volatile ("movq %%rsi, %%rax" : [value] "={rax}" (-> u64));
-        guest_rdi = asm volatile ("movq %%rdi, %%rax" : [value] "={rax}" (-> u64));
+        guest_rbx = asm volatile ("movq %%rbx, %%rax"
+            : [value] "={rax}" (-> u64),
+        );
+        guest_rbp = asm volatile ("movq %%rbp, %%rax"
+            : [value] "={rax}" (-> u64),
+        );
+        guest_r12 = asm volatile ("movq %%r12, %%rax"
+            : [value] "={rax}" (-> u64),
+        );
+        guest_r13 = asm volatile ("movq %%r13, %%rax"
+            : [value] "={rax}" (-> u64),
+        );
+        guest_r14 = asm volatile ("movq %%r14, %%rax"
+            : [value] "={rax}" (-> u64),
+        );
+        guest_r15 = asm volatile ("movq %%r15, %%rax"
+            : [value] "={rax}" (-> u64),
+        );
+        guest_rsp = asm volatile ("movq %%rsp, %%rax"
+            : [value] "={rax}" (-> u64),
+        );
+        guest_rsi = asm volatile ("movq %%rsi, %%rax"
+            : [value] "={rax}" (-> u64),
+        );
+        guest_rdi = asm volatile ("movq %%rdi, %%rax"
+            : [value] "={rax}" (-> u64),
+        );
     }
 }
 
@@ -321,12 +339,8 @@ pub fn reportGuestThreadContext(slot: usize) void {
         // +0xb4 of the object in R15: that is this SDK's completion table and
         // its queue's label index. Resolve both so the polled counter is named
         // rather than inferred.
-        var index: u32 = 0;
+        const index = sampledCompletionLabelIndex(again.R15);
         var polled: u64 = 0;
-        if (again.R15 != 0 and readableRange(again.R15 + 0xb4, @sizeOf(u32))) {
-            const field: *const u32 = @ptrFromInt(again.R15 + 0xb4);
-            index = field.*;
-        }
         if (index != 0 and index < 0x80) polled = @as(u64, index) * 0x20;
         std.debug.print(
             "  [thread {d}] sample rip=0x{x} rcx=0x{x} rdx=0x{x} r15=0x{x} label_index={d} slot_offset=0x{x}\n",
@@ -363,6 +377,25 @@ pub fn reportGuestThreadContext(slot: usize) void {
     std.debug.print("  [thread {d}] code@rip:", .{slot});
     for (code[0..window]) |byte| std.debug.print(" {x:0>2}", .{byte});
     std.debug.print("\n", .{});
+}
+
+fn sampledCompletionLabelIndex(object: u64) u32 {
+    if (object == 0) return 0;
+    const address = std.math.add(u64, object, 0xb4) catch return 0;
+    if (!readableRange(address, @sizeOf(u32))) return 0;
+    // R15 is only an AGC object while executing the known polling loop.
+    // A sample inside a host wait may hold an arbitrary, unaligned address.
+    const field: *align(1) const u32 = @ptrFromInt(address);
+    return field.*;
+}
+
+test "thread context label probing accepts unaligned registers and rejects overflow" {
+    if (comptime builtin.os.tag != .windows) return;
+    var bytes: [0xb9]u8 align(4) = @splat(0);
+    std.mem.writeInt(u32, bytes[0xb5..0xb9], 35, .little);
+    try std.testing.expectEqual(@as(u32, 35), sampledCompletionLabelIndex(@intFromPtr(&bytes) + 1));
+    try std.testing.expectEqual(@as(u32, 0), sampledCompletionLabelIndex(0));
+    try std.testing.expectEqual(@as(u32, 0), sampledCompletionLabelIndex(std.math.maxInt(u64)));
 }
 
 /// Prints the entry point each thread is still inside, if any.
