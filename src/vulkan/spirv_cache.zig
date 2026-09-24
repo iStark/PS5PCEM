@@ -98,6 +98,7 @@ pub const Cache = struct {
     hits: u64 = 0,
     misses: u64 = 0,
     maximum_bytes: usize = 64 * 1024 * 1024,
+    maximum_entries: usize = 4096,
 
     pub fn deinit(self: *Cache, allocator: std.mem.Allocator) void {
         for (self.entries.items) |*entry| {
@@ -220,9 +221,9 @@ pub const Cache = struct {
         };
         errdefer shared.module.deinit(allocator);
         const size = key_length + shared.module.words.len * @sizeOf(u32);
-        if (size > self.maximum_bytes) return .{ .shared = shared };
+        if (size > self.maximum_bytes or self.maximum_entries == 0) return .{ .shared = shared };
         while (self.entries.items.len != 0 and
-            (self.bytes + size > self.maximum_bytes or self.entries.items.len >= 1024))
+            (self.bytes + size > self.maximum_bytes or self.entries.items.len >= self.maximum_entries))
         {
             var oldest: usize = 0;
             for (self.entries.items, 0..) |entry, index| {
@@ -325,6 +326,30 @@ test "owned translation leases preserve words and release them on allocation fai
     const failed_words = try f.dupe(u32, &.{ 0x07230203, 29 });
     try std.testing.expectError(error.OutOfMemory, Lease.fromOwned(f, .{ .words = failed_words }));
     try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+}
+
+test "translation entry limit evicts least recently used module without invalidating leases" {
+    const a = std.testing.allocator;
+    var cache = Cache{ .maximum_entries = 2 };
+    defer cache.deinit(a);
+    var program = try rdna2.decodeProgram(a, &.{0xbf810000});
+    defer program.deinit(a);
+    const first = try cache.acquire(a, &program, .{ .stage = .compute, .local_size = .{ 1, 1, 1 } }, .{});
+    defer first.release();
+    const second = try cache.acquire(a, &program, .{ .stage = .compute, .local_size = .{ 2, 1, 1 } }, .{});
+    defer second.release();
+    const recent = try cache.acquire(a, &program, .{ .stage = .compute, .local_size = .{ 1, 1, 1 } }, .{});
+    defer recent.release();
+    const third = try cache.acquire(a, &program, .{ .stage = .compute, .local_size = .{ 3, 1, 1 } }, .{});
+    defer third.release();
+    try std.testing.expectEqual(@as(usize, 2), cache.entries.items.len);
+    try std.testing.expect(first.sameModule(recent));
+    for (cache.entries.items) |entry| try std.testing.expect(entry.shared != second.shared);
+    try std.testing.expectEqual(@as(u32, 0x07230203), second.view().words[0]);
+    cache.maximum_entries = 0;
+    const uncached = try cache.acquire(a, &program, .{ .stage = .compute, .local_size = .{ 4, 1, 1 } }, .{});
+    defer uncached.release();
+    try std.testing.expectEqual(@as(usize, 2), cache.entries.items.len);
 }
 
 test "retained translation owns immutable words after the original lease releases" {

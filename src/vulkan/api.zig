@@ -18,8 +18,18 @@ pub const Bool32 = u32;
 pub const DeviceSize = u64;
 
 pub const success: Result = 0;
+pub const error_out_of_host_memory: Result = -1;
 pub const error_out_of_device_memory: Result = -2;
 pub const error_device_lost: Result = -4;
+
+pub const PhysicalDeviceSubgroupProperties = extern struct {
+    s_type: u32 = 1000094000,
+    p_next: ?*anyopaque = null,
+    subgroup_size: u32 = 0,
+    supported_stages: Flags = 0,
+    supported_operations: Flags = 0,
+    quad_operations_in_all_stages: Bool32 = 0,
+};
 
 /// ABI prefix only; vkGetPhysicalDeviceProperties writes into a larger scratch
 /// allocation. Keep the two VkDeviceSize fields so limits retain native alignment.
@@ -54,6 +64,44 @@ pub const PhysicalDevicePropertiesPrefix = extern struct {
         max_compute_work_group_count: [3]u32,
         max_compute_work_group_invocations: u32,
         max_compute_work_group_size: [3]u32,
+        sub_pixel_precision_bits: u32,
+        sub_texel_precision_bits: u32,
+        mipmap_precision_bits: u32,
+        max_draw_indexed_index_value: u32,
+        max_draw_indirect_count: u32,
+        max_sampler_lod_bias: f32,
+        max_sampler_anisotropy: f32,
+        max_viewports: u32,
+        max_viewport_dimensions: [2]u32,
+        viewport_bounds_range: [2]f32,
+        viewport_sub_pixel_bits: u32,
+        min_memory_map_alignment: usize,
+        min_texel_buffer_offset_alignment: u64,
+        min_uniform_buffer_offset_alignment: u64,
+        min_storage_buffer_offset_alignment: u64,
+        min_texel_offset: i32,
+        max_texel_offset: u32,
+        min_texel_gather_offset: i32,
+        max_texel_gather_offset: u32,
+        min_interpolation_offset: f32,
+        max_interpolation_offset: f32,
+        sub_pixel_interpolation_offset_bits: u32,
+        max_framebuffer_width: u32,
+        max_framebuffer_height: u32,
+        max_framebuffer_layers: u32,
+        framebuffer_color_sample_counts: u32,
+        framebuffer_depth_sample_counts: u32,
+        framebuffer_stencil_sample_counts: u32,
+        framebuffer_no_attachments_sample_counts: u32,
+        max_color_attachments: u32,
+        sampled_image_color_sample_counts: u32,
+        sampled_image_integer_sample_counts: u32,
+        sampled_image_depth_sample_counts: u32,
+        sampled_image_stencil_sample_counts: u32,
+        storage_image_sample_counts: u32,
+        max_sample_mask_words: u32,
+        timestamp_compute_and_graphics: Bool32,
+        timestamp_period: f32,
     },
 };
 pub const not_ready: Result = 1;
@@ -91,6 +139,7 @@ pub const CommandBuffer = *opaque {};
 // The emulator is 64-bit. Vulkan non-dispatchable handles are pointer-sized on
 // every target we support, so an integer keeps null and ownership explicit.
 pub const CommandPool = u64;
+pub const QueryPool = u64;
 pub const Buffer = u64;
 pub const DeviceMemory = u64;
 pub const Fence = u64;
@@ -128,6 +177,9 @@ pub const structure_type_pipeline_shader_stage_create_info: u32 = 18;
 pub const structure_type_pipeline_vertex_input_state_create_info: u32 = 19;
 pub const structure_type_pipeline_input_assembly_state_create_info: u32 = 20;
 pub const structure_type_pipeline_viewport_state_create_info: u32 = 22;
+pub const structure_type_pipeline_dynamic_state_create_info: u32 = 27;
+pub const dynamic_state_viewport: u32 = 0;
+pub const dynamic_state_scissor: u32 = 1;
 pub const structure_type_pipeline_rasterization_state_create_info: u32 = 23;
 pub const structure_type_pipeline_multisample_state_create_info: u32 = 24;
 pub const structure_type_pipeline_depth_stencil_state_create_info: u32 = 25;
@@ -188,6 +240,7 @@ pub const memory_property_host_visible_bit: Flags = 0x0000_0002;
 pub const memory_property_host_coherent_bit: Flags = 0x0000_0004;
 pub const memory_property_host_cached_bit: Flags = 0x0000_0008;
 pub const memory_property_device_local_bit: Flags = 0x0000_0001;
+pub const memory_heap_device_local_bit: Flags = 0x0000_0001;
 
 pub const pipeline_bind_point_compute: u32 = 1;
 pub const pipeline_bind_point_graphics: u32 = 0;
@@ -903,6 +956,23 @@ pub const PipelineViewportStateCreateInfo = extern struct {
     scissors: [*]const Rect2D,
 };
 
+pub const PipelineDynamicStateCreateInfo = extern struct {
+    s_type: u32 = structure_type_pipeline_dynamic_state_create_info,
+    p_next: ?*const anyopaque = null,
+    flags: Flags = 0,
+    dynamic_state_count: u32,
+    dynamic_states: [*]const u32,
+};
+
+pub const QueryPoolCreateInfo = extern struct {
+    s_type: u32 = 11,
+    p_next: ?*const anyopaque = null,
+    flags: Flags = 0,
+    query_type: u32 = 2, // VK_QUERY_TYPE_TIMESTAMP
+    query_count: u32,
+    pipeline_statistics: Flags = 0,
+};
+
 pub const PipelineRasterizationStateCreateInfo = extern struct {
     s_type: u32 = structure_type_pipeline_rasterization_state_create_info,
     p_next: ?*const anyopaque = null,
@@ -999,7 +1069,7 @@ pub const GraphicsPipelineCreateInfo = extern struct {
     multisample_state: *const PipelineMultisampleStateCreateInfo,
     depth_stencil_state: ?*const PipelineDepthStencilStateCreateInfo = null,
     color_blend_state: *const PipelineColorBlendStateCreateInfo,
-    dynamic_state: ?*const anyopaque = null,
+    dynamic_state: ?*const PipelineDynamicStateCreateInfo = null,
     layout: PipelineLayout,
     render_pass: RenderPass,
     subpass: u32 = 0,
@@ -1230,6 +1300,13 @@ pub const PfnCreateFramebuffer = *const fn (Device, *const FramebufferCreateInfo
 pub const PfnDestroyFramebuffer = *const fn (Device, Framebuffer, ?*const anyopaque) callconv(call) void;
 pub const PfnDestroyPipeline = *const fn (Device, Pipeline, ?*const anyopaque) callconv(call) void;
 pub const PfnCmdBindPipeline = *const fn (CommandBuffer, u32, Pipeline) callconv(call) void;
+pub const PfnCreateQueryPool = *const fn (Device, *const QueryPoolCreateInfo, ?*const anyopaque, *QueryPool) callconv(call) Result;
+pub const PfnDestroyQueryPool = *const fn (Device, QueryPool, ?*const anyopaque) callconv(call) void;
+pub const PfnGetQueryPoolResults = *const fn (Device, QueryPool, u32, u32, usize, *anyopaque, DeviceSize, Flags) callconv(call) Result;
+pub const PfnCmdResetQueryPool = *const fn (CommandBuffer, QueryPool, u32, u32) callconv(call) void;
+pub const PfnCmdWriteTimestamp = *const fn (CommandBuffer, Flags, QueryPool, u32) callconv(call) void;
+pub const PfnCmdSetViewport = *const fn (CommandBuffer, u32, u32, [*]const Viewport) callconv(call) void;
+pub const PfnCmdSetScissor = *const fn (CommandBuffer, u32, u32, [*]const Rect2D) callconv(call) void;
 pub const PfnCmdBindDescriptorSets = *const fn (CommandBuffer, u32, PipelineLayout, u32, u32, [*]const DescriptorSet, u32, ?[*]const u32) callconv(call) void;
 pub const PfnCmdDispatch = *const fn (CommandBuffer, u32, u32, u32) callconv(call) void;
 pub const PfnCmdBeginRenderPass = *const fn (CommandBuffer, *const RenderPassBeginInfo, u32) callconv(call) void;

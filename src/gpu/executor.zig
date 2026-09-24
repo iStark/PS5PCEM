@@ -44,8 +44,15 @@ pub const Backend = struct {
         /// Synchronization values are live even when command and register
         /// reads are served from immutable submission snapshots.
         read_wait: ?*const fn (?*anyopaque, u64, []u8) bool = null,
+        /// Optional thread-safe copy from retained command/register bytes.
+        /// Must not access the renderer or live guest memory. False requests
+        /// an ordered owner-thread read instead (including generated commands).
+        read_snapshot: ?*const fn (?*anyopaque, u64, []u8) bool = null,
         acquire: ?*const fn (?*anyopaque, gpu_state.AcquireMem) bool = null,
         release: ?*const fn (?*anyopaque, gpu_state.ReleaseMem) bool = null,
+        /// Publish deferred internal release labels before the submission owner
+        /// exposes its completion to the guest. Called on the renderer owner.
+        drain_releases: ?*const fn (?*anyopaque) bool = null,
         wait: ?*const fn (?*anyopaque, gpu_state.WaitRegMem, bool) bool = null,
         write_data: ?*const fn (?*anyopaque, gpu_state.WriteData, []const u32) bool = null,
         dma_data: ?*const fn (?*anyopaque, gpu_state.DmaData) bool = null,
@@ -832,9 +839,23 @@ pub const DcbExecutor = struct {
         address: u64,
         count: u32,
     ) Error!void {
-        var pair: [8]u8 = undefined;
+        // Register lists are already captured as contiguous ranges by the
+        // scheduler. Read a bounded block instead of making an owner/worker
+        // round trip for every eight-byte pair. Backends with narrower memory
+        // mappings retain the original per-pair fallback and failure point.
+        var block: [256 * 8]u8 = undefined;
+        var block_end: usize = 0;
+        var block_start: usize = 0;
+        var block_available = false;
         for (0..count) |index| {
-            try self.backend.read(address + @as(u64, index) * pair.len, &pair);
+            if (index == block_end) {
+                block_start = index;
+                block_end = @min(index + block.len / 8, count);
+                const bytes = block[0 .. (block_end - block_start) * 8];
+                block_available = self.backend.vtable.read(self.backend.context, address + @as(u64, index) * 8, bytes);
+            }
+            const pair = block[(index - block_start) * 8 ..][0..8];
+            if (!block_available) try self.backend.read(address + @as(u64, index) * 8, pair);
             const raw_offset = std.mem.readInt(u32, pair[0..4], .little);
             const value = std.mem.readInt(u32, pair[4..8], .little);
             if (raw_offset == std.math.maxInt(u32)) continue;
@@ -1507,6 +1528,8 @@ const FakeBackend = struct {
     draws: usize = 0,
     dispatches: usize = 0,
     flips: usize = 0,
+    reads: usize = 0,
+    maximum_read_bytes: usize = std.math.maxInt(usize),
 
     fn interface(self: *FakeBackend) Backend {
         return .{ .context = self, .vtable = &vtable };
@@ -1533,6 +1556,8 @@ const FakeBackend = struct {
 
     fn read(context: ?*anyopaque, address: u64, bytes: []u8) bool {
         const self = from(context);
+        self.reads += 1;
+        if (bytes.len > self.maximum_read_bytes) return false;
         if (address < self.base) return false;
         const offset: usize = @intCast(address - self.base);
         if (offset + bytes.len > self.memory.len) return false;
@@ -1604,6 +1629,30 @@ test "direct and Gen5 indirect register packets share persistent state" {
     try testing.expect(state.readRegister(.context, 0x193) == null);
     try testing.expectEqual(@as(?u32, 0x3333), state.readRegister(.uconfig, 7));
     try testing.expectEqual(@as(?u32, 0xcafe_babe), state.readRegister(.uconfig, 8));
+}
+
+test "indirect register lists batch reads and retain narrow-mapping fallback" {
+    for ([_]usize{ std.math.maxInt(usize), 8 }) |maximum_read| {
+        var host = FakeBackend{ .maximum_read_bytes = maximum_read };
+        for (0..300) |index| host.putWords(0x1000 + index * 8, &.{ @intCast(index), @intCast(0x10000 + index) });
+        host.putWords(0x1000 + 63 * 8, &.{std.math.maxInt(u32)});
+        const stream = [_]u32{ command(pm4.set_context_reg_indirect, 4), 0x1000, 0, 0, 300 };
+        var state = gpu_state.State{};
+        var runner = DcbExecutor{ .state = &state, .backend = host.interface() };
+        _ = try runner.execute(&stream);
+        try testing.expectEqual(@as(usize, if (maximum_read == 8) 302 else 2), host.reads);
+        for (0..300) |index| try testing.expectEqual(
+            if (index == 63) @as(?u32, null) else @as(?u32, @intCast(0x10000 + index)),
+            state.readRegister(.context, @intCast(index)),
+        );
+    }
+    // A later unreadable pair must still fail after applying the valid prefix.
+    var host = FakeBackend{};
+    host.putWords(0x1ff8, &.{ 17, 0x12345678 });
+    var state = gpu_state.State{};
+    var runner = DcbExecutor{ .state = &state, .backend = host.interface() };
+    try testing.expectError(error.MemoryReadFailed, runner.execute(&.{ command(pm4.set_context_reg_indirect, 4), 0x1ff8, 0, 0, 2 }));
+    try testing.expectEqual(@as(?u32, 0x12345678), state.readRegister(.context, 17));
 }
 
 test "indexed offset draw retains index buffer state for the backend" {

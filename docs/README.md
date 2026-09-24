@@ -21,6 +21,7 @@ short and visual; implementation details live here.
 | Module map, developer tools, launcher/runtime behavior, and build profiles | [Architecture and toolchain overview](architecture/overview.md) |
 | RDNA2 instruction decoding, typed IR, CFG/SSA, and SPIR-V | [`rdna2`](architecture/rdna2.md) |
 | AGC/PM4 command streams, retained state, scheduling, and execution | [`gpu`](architecture/gpu.md) |
+| Parallel graphics/compute command decoding and ordered backend execution | [Command processors](architecture/command-processors.md) |
 | Host device, resources, synchronization, caches, and presentation | [`vulkan`](architecture/vulkan.md) |
 | Fixed guest ranges, sparse mappings, protection, and page tracking | [`memory`](architecture/memory.md) |
 | ELF64/SELF parsing, imports, mapping, relocation, and TLS | [`loader`](architecture/loader.md) |
@@ -33,6 +34,7 @@ short and visual; implementation details live here.
 
 - [Release notes](release-notes/)
 - [Screenshots and captures](images/)
+- [GPU submission and Yotei performance report, 24 September 2026](development/yotei-performance-2026-09-24.md)
 - [GitHub releases](https://github.com/iStark/PS5PCEM/releases)
 
 ## Project boundaries

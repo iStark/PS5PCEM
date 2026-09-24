@@ -288,6 +288,11 @@ fn beginCompletionBatch() void {
 fn finishCompletionBatch() void {
     std.debug.assert(completion_batch_active);
     completion_batch_active = false;
+    if (!drainBackendReleases()) {
+        batched_driver_completion_label = 0;
+        batched_release_count = 0;
+        return;
+    }
     if (batched_release_count != 0) {
         // RELEASE_MEM has already published its label by this point. Wake the
         // matching event in the same completion boundary: delaying it by even
@@ -309,8 +314,16 @@ fn finishCompletionBatch() void {
 fn discardCompletionBatch() void {
     std.debug.assert(completion_batch_active);
     completion_batch_active = false;
+    _ = drainBackendReleases();
     batched_driver_completion_label = 0;
     batched_release_count = 0;
+}
+
+fn drainBackendReleases() bool {
+    if (installed_backend) |backend| {
+        if (backend.vtable.drain_releases) |drain| return drain(backend.context);
+    }
+    return true;
 }
 
 fn recordUniqueReleaseContext(storage: []ReleaseContext, count: *usize, context: ReleaseContext) bool {
@@ -959,6 +972,11 @@ pub fn gpuGeneration(context: ?*anyopaque, address: u64, size: usize) u64 {
     const space = addressSpaceFromContext(context) orelse return 0;
     const resolved = resolveGuestMemoryAddress(address, size) orelse return 0;
     return space.gpuGeneration(resolved, size);
+}
+
+pub fn gpuTrackingEpoch(context: ?*anyopaque) u64 {
+    const space = addressSpaceFromContext(context) orelse return 0;
+    return space.gpuTrackingEpoch();
 }
 
 var shader_header_miss_logged: bool = false;
@@ -1747,6 +1765,15 @@ const executor_backend = gpu.DcbBackend{
 };
 
 var submission_scheduler = gpu.QueueScheduler.init(std.heap.page_allocator, executor_backend);
+var parallel_command_execution: bool = false;
+
+pub fn setParallelCommandExecution(enabled: bool) void {
+    execution_lock.lock();
+    defer execution_lock.unlock();
+    parallel_command_execution = enabled;
+    submission_scheduler.parallel_commands = enabled;
+    if (!enabled) submission_scheduler.command_pool.deinit();
+}
 
 /// Installs or removes the renderer behind the live HLE submission boundary.
 /// The execution lock guarantees that a detached backend is no longer inside a
@@ -1754,7 +1781,9 @@ var submission_scheduler = gpu.QueueScheduler.init(std.heap.page_allocator, exec
 pub fn attachBackend(backend: ?gpu.DcbBackend) void {
     execution_lock.lock();
     defer execution_lock.unlock();
+    _ = drainBackendReleases();
     installed_backend = backend;
+    if (backend == null) submission_scheduler.command_pool.deinit();
 }
 
 /// Presents a CPU/EOP VideoOut request through the same ordered backend used by
@@ -1773,6 +1802,7 @@ pub fn reset() void {
     installed_backend = null;
     submission_scheduler.deinit();
     submission_scheduler = gpu.QueueScheduler.init(std.heap.page_allocator, executor_backend);
+    submission_scheduler.parallel_commands = parallel_command_execution;
     traced_draw_states = 0;
     traced_shader_program_count = 0;
     traced_shader_programs = [_]u64{0} ** traced_shader_programs.len;
@@ -4166,6 +4196,44 @@ test "one completion batch coalesces duplicate release contexts" {
     try testing.expect(!recordUniqueReleaseContext(&contexts, &count, .{ .event_id = 0, .context_id = 11 }));
     try testing.expectEqual(@as(usize, 3), count);
     try testing.expectEqualSlices(ReleaseContext, &.{ graphics, compute, next }, &contexts);
+}
+
+test "completion batches drain renderer labels before publishing notifications" {
+    reset();
+    defer reset();
+    const Audit = struct {
+        drains: usize = 0,
+        accepted: bool = true,
+        fn read(_: ?*anyopaque, _: u64, _: []u8) bool {
+            return false;
+        }
+        fn write(_: ?*anyopaque, _: u64, _: []const u8) bool {
+            return false;
+        }
+        fn drain(raw: ?*anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.drains += 1;
+            // Driver notifications cannot have been enqueued before draining.
+            std.debug.assert(pending_completion_count == 0);
+            return self.accepted;
+        }
+        const vtable = gpu.DcbBackend.VTable{ .read = read, .write = write, .drain_releases = drain };
+    };
+    var audit = Audit{};
+    attachBackend(.{ .context = &audit, .vtable = &Audit.vtable });
+    beginCompletionBatch();
+    batched_driver_completion_label = 0x1000;
+    audit.accepted = false;
+    finishCompletionBatch();
+    try testing.expectEqual(@as(usize, 1), audit.drains);
+    try testing.expectEqual(@as(usize, 0), pending_completion_count);
+    try testing.expectEqual(@as(u64, 0), batched_driver_completion_label);
+    audit.accepted = true;
+    beginCompletionBatch();
+    discardCompletionBatch();
+    try testing.expectEqual(@as(usize, 2), audit.drains);
+    attachBackend(null);
+    try testing.expectEqual(@as(usize, 3), audit.drains);
 }
 
 test "release interrupts only notify their originating queue" {

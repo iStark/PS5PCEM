@@ -90,6 +90,19 @@ const Builder = struct {
 
 /// One compute module: binding 0 is tiled source, binding 1 is linear dest.
 pub fn build(gpa: std.mem.Allocator) std.mem.Allocator.Error![]u32 {
+    return buildSpecialized(gpa, null);
+}
+
+/// Layout invariants known before dispatch. Extents, pitches, array slices and
+/// mip-tail offsets remain push constants and may change on every dispatch.
+pub const Specialization = struct {
+    flags: u32,
+    block_width: u32,
+    block_height: u32,
+    block_depth: u32,
+};
+
+pub fn buildSpecialized(gpa: std.mem.Allocator, specialization: ?Specialization) std.mem.Allocator.Error![]u32 {
     var b = Builder{ .gpa = gpa };
     errdefer b.deinit();
     try b.words.appendSlice(gpa, &.{ 0x0723_0203, 0x0001_0000, 0, 0, 0 });
@@ -194,16 +207,16 @@ pub fn build(gpa: std.mem.Allocator) std.mem.Allocator.Error![]u32 {
 
     const src_lo = try loadParam(&b, uint_ty, ptr_push_uint, params_var, 0);
     const dst_lo = try loadParam(&b, uint_ty, ptr_push_uint, params_var, 2);
-    const flags = try loadParam(&b, uint_ty, ptr_push_uint, params_var, 20);
+    const flags = if (specialization) |key| try b.constant(uint_ty, key.flags) else try loadParam(&b, uint_ty, ptr_push_uint, params_var, 20);
     const bpp_log = try b.bin(199, uint_ty, try b.bin(194, uint_ty, flags, c4), try b.constant(uint_ty, 0xf));
     const bpp = try b.bin(196, uint_ty, c1, bpp_log);
     const family = try b.bin(199, uint_ty, try b.bin(194, uint_ty, flags, c8), try b.constant(uint_ty, 0xff));
     const kind = try b.bin(199, uint_ty, try b.bin(194, uint_ty, flags, try b.constant(uint_ty, 24)), try b.constant(uint_ty, 0xff));
     const tail_x = try loadParam(&b, uint_ty, ptr_push_uint, params_var, 18);
     const tail_y = try loadParam(&b, uint_ty, ptr_push_uint, params_var, 19);
-    const block_w = try loadParam(&b, uint_ty, ptr_push_uint, params_var, 10);
-    const block_h = try loadParam(&b, uint_ty, ptr_push_uint, params_var, 11);
-    const block_d_raw = try loadParam(&b, uint_ty, ptr_push_uint, params_var, 12);
+    const block_w = if (specialization) |key| try b.constant(uint_ty, key.block_width) else try loadParam(&b, uint_ty, ptr_push_uint, params_var, 10);
+    const block_h = if (specialization) |key| try b.constant(uint_ty, key.block_height) else try loadParam(&b, uint_ty, ptr_push_uint, params_var, 11);
+    const block_d_raw = if (specialization) |key| try b.constant(uint_ty, key.block_depth) else try loadParam(&b, uint_ty, ptr_push_uint, params_var, 12);
     const block_bytes = try loadParam(&b, uint_ty, ptr_push_uint, params_var, 13);
     const blocks_per_row = try loadParam(&b, uint_ty, ptr_push_uint, params_var, 14);
     const source_slice = try loadParam(&b, uint_ty, ptr_push_uint, params_var, 16);

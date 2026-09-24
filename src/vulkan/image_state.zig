@@ -58,8 +58,14 @@ pub const shader_read_usage = Usage{
 pub const storage_usage = Usage{
     .layout = vk.image_layout_general,
     .access = vk.access_shader_read_bit | vk.access_shader_write_bit,
-    .stages = vk.pipeline_stage_compute_shader_bit |
-        vk.pipeline_stage_fragment_shader_bit,
+    .stages = shader_read_usage.stages,
+};
+
+/// Sampling a resident storage image keeps GENERAL, but does not write it.
+pub const storage_read_usage = Usage{
+    .layout = vk.image_layout_general,
+    .access = vk.access_shader_read_bit,
+    .stages = shader_read_usage.stages,
 };
 
 pub const transfer_source_usage = Usage{
@@ -139,11 +145,14 @@ pub const Transition = struct {
 };
 
 pub const Tracker = struct {
-    cells: std.ArrayList(Cell) = .empty,
+    const ImageCells = struct { allocator: std.mem.Allocator, cells: []Cell };
+    images: std.AutoHashMapUnmanaged(vk.Image, ImageCells) = .empty,
     optimize_barriers: bool = true,
 
     pub fn deinit(self: *Tracker, allocator: std.mem.Allocator) void {
-        self.cells.deinit(allocator);
+        var entries = self.images.valueIterator();
+        while (entries.next()) |entry| entry.allocator.free(entry.cells);
+        self.images.deinit(allocator);
         self.* = .{};
     }
 
@@ -154,9 +163,7 @@ pub const Tracker = struct {
         range: SubresourceRange,
     ) Error!void {
         if (!range.valid()) return Error.InvalidSubresourceRange;
-        for (self.cells.items) |cell| {
-            if (cell.image == image) return Error.ImageAlreadyRegistered;
-        }
+        if (self.images.contains(image)) return Error.ImageAlreadyRegistered;
         var aspect_count: usize = 0;
         var bits = range.aspect_mask;
         while (bits != 0) : (bits &= bits - 1) aspect_count += 1;
@@ -164,7 +171,9 @@ pub const Tracker = struct {
             return Error.InvalidSubresourceRange;
         const cell_count = std.math.mul(usize, aspect_count, mip_layers) catch
             return Error.InvalidSubresourceRange;
-        try self.cells.ensureUnusedCapacity(allocator, cell_count);
+        const cells = try allocator.alloc(Cell, cell_count);
+        errdefer allocator.free(cells);
+        var cursor: usize = 0;
 
         bits = range.aspect_mask;
         while (bits != 0) : (bits &= bits - 1) {
@@ -173,23 +182,22 @@ pub const Tracker = struct {
             while (mip < range.level_count) : (mip += 1) {
                 var layer: u32 = 0;
                 while (layer < range.layer_count) : (layer += 1) {
-                    self.cells.appendAssumeCapacity(.{
+                    cells[cursor] = .{
                         .image = image,
                         .aspect = aspect,
                         .mip_level = range.base_mip_level + mip,
                         .array_layer = range.base_array_layer + layer,
-                    });
+                    };
+                    cursor += 1;
                 }
             }
         }
+        try self.images.put(allocator, image, .{ .allocator = allocator, .cells = cells });
     }
 
     pub fn forgetImage(self: *Tracker, image: vk.Image) void {
-        var index = self.cells.items.len;
-        while (index > 0) {
-            index -= 1;
-            if (self.cells.items[index].image == image) _ = self.cells.swapRemove(index);
-        }
+        const removed = self.images.fetchRemove(image) orelse return;
+        removed.value.allocator.free(removed.value.cells);
     }
 
     pub fn current(
@@ -199,7 +207,8 @@ pub const Tracker = struct {
         mip_level: u32,
         array_layer: u32,
     ) ?Usage {
-        for (self.cells.items) |cell| {
+        const cells = (self.images.get(image) orelse return null).cells;
+        for (cells) |cell| {
             if (cell.image == image and cell.aspect == aspect and
                 cell.mip_level == mip_level and cell.array_layer == array_layer)
             {
@@ -220,6 +229,9 @@ pub const Tracker = struct {
         output: []Transition,
     ) Error!usize {
         if (!range.valid()) return Error.InvalidSubresourceRange;
+        // Layout/hazard lookup is local to this image. A global cell scan made
+        // each ordinary binding proportional to every resident texture mip.
+        const cells = (self.images.get(image) orelse return Error.ImageNotRegistered).cells;
         var matched = false;
         // Uploads transition whole cube arrays (hundreds of mip/face cells).
         // A complete range with identical prior usage needs only one barrier.
@@ -227,7 +239,7 @@ pub const Tracker = struct {
         var uniform: ?Usage = null;
         var same_usage = true;
         var covered: u64 = 0;
-        for (self.cells.items) |cell| {
+        for (cells) |cell| {
             if (!cell.matches(image, range)) continue;
             covered += 1;
             if (uniform) |previous| {
@@ -252,13 +264,13 @@ pub const Tracker = struct {
                     .subresource_range = range.toVulkan(),
                 },
             };
-            for (self.cells.items) |*cell| if (cell.matches(image, range)) {
+            for (cells) |*cell| if (cell.matches(image, range)) {
                 cell.usage = next;
             };
             return 1;
         }
         var required: usize = 0;
-        for (self.cells.items, 0..) |cell, cell_index| {
+        for (cells, 0..) |cell, cell_index| {
             if (cell.image != image or range.aspect_mask & cell.aspect == 0 or
                 cell.mip_level < range.base_mip_level or
                 cell.mip_level - range.base_mip_level >= range.level_count or
@@ -278,7 +290,7 @@ pub const Tracker = struct {
             // separateDepthStencilLayouts. Keeping read hazards is independent
             // of combining their aspect masks.
             {
-                for (self.cells.items[0..cell_index]) |earlier| {
+                for (cells[0..cell_index]) |earlier| {
                     if (earlier.image == image and range.aspect_mask & earlier.aspect != 0 and
                         earlier.mip_level == cell.mip_level and earlier.array_layer == cell.array_layer and
                         earlier.usage.eql(previous) and
@@ -295,7 +307,7 @@ pub const Tracker = struct {
         if (required > output.len) return Error.TransitionCapacityExceeded;
 
         var count: usize = 0;
-        for (self.cells.items) |*cell| {
+        for (cells) |*cell| {
             if (cell.image != image or range.aspect_mask & cell.aspect == 0 or
                 cell.mip_level < range.base_mip_level or
                 cell.mip_level - range.base_mip_level >= range.level_count or
@@ -501,4 +513,63 @@ test "large uniform cube arrays share barriers without losing per-face state" {
     try std.testing.expectError(Error.TransitionCapacityExceeded, tracker.transition(19, range, transfer_source_usage, output[0..256]));
     try std.testing.expectEqual(storage_usage, tracker.current(19, vk.image_aspect_color_bit, 0, 1).?);
     try std.testing.expectEqual(@as(usize, 612), try tracker.transition(19, range, transfer_source_usage, &output));
+}
+
+test "image lookup survives rehashing removal and reuse of Vulkan handles" {
+    var tracker = Tracker{};
+    defer tracker.deinit(std.testing.allocator);
+    const range = SubresourceRange{ .aspect_mask = vk.image_aspect_color_bit, .level_count = 3 };
+    var output: [3]Transition = undefined;
+    for (1..1025) |image| {
+        try tracker.registerImage(std.testing.allocator, image, range);
+        _ = try tracker.transition(image, range, if (image % 2 == 0) storage_usage else shader_read_usage, &output);
+    }
+    for (1..1025) |image| {
+        if (image % 3 != 0) continue;
+        tracker.forgetImage(image);
+        try std.testing.expectEqual(null, tracker.current(image, vk.image_aspect_color_bit, 0, 0));
+        try std.testing.expectError(Error.ImageNotRegistered, tracker.transition(image, range, shader_read_usage, &output));
+        try tracker.registerImage(std.testing.allocator, image, .{ .aspect_mask = vk.image_aspect_color_bit });
+    }
+    for (1..1025) |image| {
+        const expected = if (image % 3 == 0) undefined_usage else if (image % 2 == 0) storage_usage else shader_read_usage;
+        try std.testing.expectEqual(expected, tracker.current(image, vk.image_aspect_color_bit, 0, 0).?);
+        if (image % 3 == 0) try std.testing.expectEqual(null, tracker.current(image, vk.image_aspect_color_bit, 1, 0));
+        try std.testing.expectError(Error.ImageAlreadyRegistered, tracker.registerImage(std.testing.allocator, image, range));
+    }
+}
+
+fn checkTrackerAllocationFailures(allocator: std.mem.Allocator) !void {
+    var tracker = Tracker{};
+    defer tracker.deinit(allocator);
+    for (1..33) |image| try tracker.registerImage(allocator, image, .{
+        .aspect_mask = vk.image_aspect_depth_bit | vk.image_aspect_stencil_bit,
+        .level_count = 3,
+        .layer_count = 6,
+    });
+    tracker.forgetImage(7);
+    try tracker.registerImage(allocator, 7, .{ .aspect_mask = vk.image_aspect_color_bit });
+}
+
+test "image registration releases cells when allocation or map growth fails" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkTrackerAllocationFailures, .{});
+}
+
+test "GENERAL image reads skip only repeated reads and retain write hazards" {
+    for ([_]bool{ false, true }) |optimized| {
+        var tracker = Tracker{ .optimize_barriers = optimized };
+        defer tracker.deinit(std.testing.allocator);
+        const range = SubresourceRange{ .aspect_mask = vk.image_aspect_color_bit };
+        try tracker.registerImage(std.testing.allocator, 31, range);
+        var barriers: [1]Transition = undefined;
+        _ = try tracker.transition(31, range, storage_usage, &barriers);
+        try std.testing.expectEqual(@as(usize, 1), try tracker.transition(31, range, storage_read_usage, &barriers));
+        try std.testing.expect(barriers[0].barrier.source_access_mask & vk.access_shader_write_bit != 0);
+        try std.testing.expectEqual(vk.access_shader_read_bit, barriers[0].barrier.destination_access_mask);
+        try std.testing.expect(barriers[0].destination_stages & vk.pipeline_stage_vertex_shader_bit != 0);
+        try std.testing.expectEqual(@as(usize, if (optimized) 0 else 1), try tracker.transition(31, range, storage_read_usage, &barriers));
+        try std.testing.expectEqual(@as(usize, 1), try tracker.transition(31, range, storage_usage, &barriers));
+        try std.testing.expect(barriers[0].barrier.destination_access_mask & vk.access_shader_write_bit != 0);
+        try std.testing.expectEqual(@as(usize, 1), try tracker.transition(31, range, storage_usage, &barriers));
+    }
 }

@@ -335,9 +335,10 @@ const GpuPageTracker = struct {
     enabled: bool = false,
 
     fn nextGeneration(self: *GpuPageTracker) u64 {
-        self.generation_counter +%= 1;
-        if (self.generation_counter == 0) self.generation_counter = 1;
-        return self.generation_counter;
+        const next = @atomicLoad(u64, &self.generation_counter, .monotonic) +% 1;
+        const value = if (next == 0) 1 else next;
+        @atomicStore(u64, &self.generation_counter, value, .release);
+        return value;
     }
 
     fn deinit(self: *GpuPageTracker, allocator: std.mem.Allocator) void {
@@ -901,8 +902,15 @@ pub const AddressSpace = struct {
         return if (fingerprint == 0) 1 else fingerprint;
     }
 
+    /// Epoch for caches of page-generation queries. A native write fault must
+    /// invalidate those queries even when no renderer write callback runs.
+    pub fn gpuTrackingEpoch(self: *const AddressSpace) u64 {
+        return @atomicLoad(u64, &self.gpu_tracker.generation_counter, .acquire);
+    }
+
     /// Returns the current ordered generation fingerprint, or zero when the
-    /// range has not yet been registered as a GPU source.
+    /// range is untracked or writable without a watch. After the first write
+    /// fault, further native writes are invisible until trackGpuRead rearms it.
     pub fn gpuGeneration(self: *AddressSpace, address: u64, size: usize) u64 {
         if (size == 0) return 0;
         const range_end = std.math.add(u64, address, @as(u64, @intCast(size))) catch return 0;
@@ -917,6 +925,7 @@ pub const AddressSpace = struct {
         var page = first_page;
         while (page < end_page) : (page += page_size) {
             const tracked = tracker.pages.get(page) orelse return 0;
+            if (tracked.restore_protection.write and !tracked.armed) return 0;
             fingerprint ^= page;
             fingerprint *%= 0x100_0000_01b3;
             fingerprint ^= tracked.generation;
@@ -1420,6 +1429,7 @@ pub const AddressSpace = struct {
         var page = first_page;
         while (page < end_page) : (page += page_size) {
             const removed = tracker.pages.fetchRemove(page) orelse continue;
+            _ = tracker.nextGeneration();
             if (removed.value.armed) {
                 hostProtect(page, page_size, removed.value.restore_protection) catch {};
             }
@@ -2412,21 +2422,34 @@ test "GPU page tracker advances generations on HLE and native writes" {
     space.enableGpuMemoryTracking();
 
     const first = try space.trackGpuRead(address, @intCast(2 * page_size));
+    const first_epoch = space.gpuTrackingEpoch();
     try testing.expect(first != 0);
     try testing.expectEqual(first, space.gpuGeneration(address, @intCast(2 * page_size)));
 
     try space.write(address + 8, "changed");
     const after_hle_write = space.gpuGeneration(address, @intCast(2 * page_size));
-    try testing.expect(after_hle_write != 0 and after_hle_write != first);
+    try testing.expectEqual(@as(u64, 0), after_hle_write);
+    try testing.expect(space.gpuTrackingEpoch() != first_epoch);
 
-    _ = try space.trackGpuRead(address, @intCast(2 * page_size));
+    const rearmed = try space.trackGpuRead(address, @intCast(2 * page_size));
+    try testing.expect(rearmed != 0 and rearmed != first);
+    try testing.expectEqual(rearmed, space.gpuGeneration(address, @intCast(2 * page_size)));
+    const rearmed_epoch = space.gpuTrackingEpoch();
     try testing.expect(space.handleGpuTrackedWriteFault(address + page_size + 4));
     const after_native_write = space.gpuGeneration(address, @intCast(2 * page_size));
-    try testing.expect(after_native_write != after_hle_write);
+    try testing.expectEqual(@as(u64, 0), after_native_write);
+    try testing.expect(space.gpuTrackingEpoch() != rearmed_epoch);
     const native_pointer: *u8 = @ptrFromInt(address + page_size + 4);
     native_pointer.* = 0xa5;
+    native_pointer.* = 0x3c; // A second store does not fault or advance the epoch.
+    try testing.expectEqual(@as(u64, 0), space.gpuGeneration(address, @intCast(2 * page_size)));
+    const final = try space.trackGpuRead(address, @intCast(2 * page_size));
+    try testing.expect(final != 0 and final != rearmed);
+    try testing.expectEqual(final, space.gpuGeneration(address, @intCast(2 * page_size)));
+    const before_unmap = space.gpuTrackingEpoch();
 
     try space.unmap(address, 2 * page_size);
+    try testing.expect(space.gpuTrackingEpoch() != before_unmap);
     try testing.expectEqual(@as(u64, 0), space.gpuGeneration(address, @intCast(2 * page_size)));
 }
 

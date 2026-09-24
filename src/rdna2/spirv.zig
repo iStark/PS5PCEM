@@ -393,6 +393,18 @@ pub const Options = struct {
     workgroup_memory_storage_slot: ?u32 = null,
     /// Per-invocation scratch used by graphics DS addtid spill/fill pairs.
     private_memory_size_bytes: u32 = 0,
+    /// Replace a fully proven graphics spill allocation with scalar variables.
+    scalarize_private_spills: bool = true,
+    /// Experimental lowering of forward selections inside disjoint loops.
+    /// GPU probes pass, but a large native fragment still causes DeviceLost;
+    /// retain the established dispatcher until that regression is isolated.
+    structure_branch_loops: bool = false,
+    /// Avoid out-of-range READLANE 63 in a proven packed-index fragment
+    /// minimum reduction when the host subgroup has fewer than 64 lanes.
+    normalize_fragment_min: bool = false,
+    /// Use raster-quad operations for constant-source DPP quad broadcasts.
+    /// The caller must support subgroup Quad operations in the fragment stage.
+    fragment_quad_broadcasts: bool = false,
     /// Exposes the persistent 64 KiB Global Data Share as a storage buffer.
     gds_storage: bool = false,
     /// POS/PARAM values encoded in a terminal NGG LDS record. When present,
@@ -873,6 +885,7 @@ const Builder = struct {
     body: std.ArrayList(u32) = .empty,
     constants: std.ArrayList(Constant) = .empty,
     lane_spills: std.ArrayList(LaneSpill) = .empty,
+    private_spills: std.ArrayList(struct { pc: u32, word: u32, pointer: u32, declared: bool }) = .empty,
     writing_lane: bool = false,
     lane_spill_pointer_type: u32 = 0,
     registers: [384]Value = [_]Value{.{}} ** 384,
@@ -1015,7 +1028,12 @@ const Builder = struct {
     /// only report the mistake as DEVICE_LOST when a large compute kernel runs,
     /// so track the emitted operations and declare their exact requirements.
     uses_group_shuffle: bool = false,
+    uses_group_quad: bool = false,
+    fragment_quad_broadcasts: bool,
+    uses_group_arithmetic: bool = false,
     lane_mask_scan_pcs: []const u32 = &.{},
+    fragment_min_pcs: []const @import("fragment_min.zig").Reduction = &.{},
+    fragment_min_values: std.AutoHashMapUnmanaged(u32, u32) = .empty,
     local_vcc_pcs: []const u32 = &.{},
     uses_group_shuffle_relative: bool = false,
     scalar_specializations: []const ScalarRegister,
@@ -1091,6 +1109,7 @@ const Builder = struct {
             .wave32 = options.wave32,
             .fragment_extent = options.fragment_extent,
             .fragment_inputs = options.fragment_inputs,
+            .fragment_quad_broadcasts = options.fragment_quad_broadcasts,
             .fragment_per_vertex_mask = options.fragment_per_vertex_mask,
             .fragment_custom_interpolation_mask = options.fragment_custom_interpolation_mask,
             .scalar_specializations = options.scalar_registers,
@@ -1716,11 +1735,13 @@ const Builder = struct {
     }
 
     fn deinit(self: *Builder) void {
+        self.fragment_min_values.deinit(self.allocator);
         self.annotations.deinit(self.allocator);
         self.declarations.deinit(self.allocator);
         self.body.deinit(self.allocator);
         self.constants.deinit(self.allocator);
         self.lane_spills.deinit(self.allocator);
+        self.private_spills.deinit(self.allocator);
         self.flat_memory_headers.deinit(self.allocator);
     }
 
@@ -1747,7 +1768,9 @@ const Builder = struct {
             @memset(&self.buffer_extents, .{});
         }
         switch (opcode) {
+            354 => self.uses_group_arithmetic = true, // UMin reduction
             345, 346 => self.uses_group_shuffle = true, // Shuffle / ShuffleXor
+            365 => self.uses_group_quad = true, // QuadBroadcast
             347, 348 => self.uses_group_shuffle_relative = true, // ShuffleUp / ShuffleDown
             else => {},
         }
@@ -1908,6 +1931,14 @@ const Builder = struct {
                 const source_lane = self.id();
                 try self.emit(&self.body, 197, &.{ self.bits_type, source_lane, group_base, selector }); // OpBitwiseOr
                 try self.emit(&self.body, 345, &.{ self.bits_type, shuffled, scope, raw, source_lane }); // OpGroupNonUniformShuffle
+            } else if (self.stage == .fragment and self.fragment_quad_broadcasts and
+                (op.dpp_ctrl == 0x00 or op.dpp_ctrl == 0x55 or op.dpp_ctrl == 0xaa or op.dpp_ctrl == 0xff))
+            {
+                // Unlike a generic subgroup shuffle, a quad operation includes
+                // the helper invocations needed at primitive edges. Each of
+                // these controls selects the same source for all four lanes,
+                // so the required uniform QuadBroadcast index is constant.
+                try self.emit(&self.body, 365, &.{ self.bits_type, shuffled, scope, raw, try self.constant(.bits32, op.dpp_ctrl & 3) });
             } else if (op.dpp_ctrl <= 0x0ff) { // quad_perm
                 const lane = host_lane;
                 const quad_lane = try self.andBits(lane, 3);
@@ -7288,6 +7319,13 @@ const Builder = struct {
     }
 
     fn dsWriteAddtid(self: *Builder, inst: instruction.Instruction) Error!void {
+        if (self.privateSpillPointer(inst.pc)) |pointer| {
+            const value = try self.source(inst.src1, .bits32);
+            if (try self.writePredicate(null)) |predicate| {
+                try self.guardedStore(predicate, pointer, value);
+            } else try self.emit(&self.body, 62, &.{ pointer, value });
+            return;
+        }
         const address = try self.dsAddtidAddress(inst);
         const access = if (self.stage == .compute)
             try self.workgroupAccess(address)
@@ -7298,6 +7336,12 @@ const Builder = struct {
     }
 
     fn dsReadAddtid(self: *Builder, inst: instruction.Instruction) Error!void {
+        if (self.privateSpillPointer(inst.pc)) |pointer| {
+            const value = self.id();
+            try self.emit(&self.body, 61, &.{ self.bits_type, value, pointer });
+            try self.destination(inst.dst, .{ .id = value, .value_type = .bits32 });
+            return;
+        }
         const address = try self.dsAddtidAddress(inst);
         const access = if (self.stage == .compute)
             try self.workgroupAccess(address)
@@ -7999,6 +8043,13 @@ const Builder = struct {
 
     fn readLane(self: *Builder, inst: instruction.Instruction) Error!void {
         const source_value = try self.source(inst.src0, .bits32);
+        for (self.fragment_min_pcs) |reduction| {
+            if (std.mem.indexOfScalar(u32, &reduction.read_pcs, inst.pc) != null) {
+                const minimum = self.fragment_min_values.get(reduction.start_pc) orelse return Error.UnsupportedControlFlow;
+                try self.destination(inst.dst, .{ .id = minimum, .value_type = .bits32 });
+                return;
+            }
+        }
         const lane = try self.andBits(try self.source(inst.src1, .bits32), if (self.wave32) 31 else 63);
         if (self.wave64_workgroup) {
             try self.destination(inst.dst, .{ .id = try self.waveShuffle(source_value, lane), .value_type = .bits32 });
@@ -8091,6 +8142,36 @@ const Builder = struct {
             try self.emit(&self.declarations, 59, &.{ self.lane_spill_pointer_type, value, 6, zero });
             try self.emit(&self.declarations, 59, &.{ self.lane_spill_pointer_type, valid, 6, zero });
             try self.lane_spills.append(self.allocator, .{ .vgpr = inst.dst.reg, .lane = lane, .value = value, .valid = valid });
+        }
+    }
+
+    fn privateSpillPointer(self: *const Builder, pc: u32) ?u32 {
+        for (self.private_spills.items) |spill| {
+            if (spill.pc == pc) return spill.pointer;
+        }
+        return null;
+    }
+
+    fn configurePrivateSpills(self: *Builder, instructions: []const instruction.Instruction, graph: *const control_flow.Graph) Error!void {
+        if (self.stage != .fragment or self.private_memory_words == 0) return;
+        const accesses = try @import("private_spills.zig").scan(self.allocator, instructions, graph, self.private_memory_words);
+        defer self.allocator.free(accesses);
+        for (accesses) |access| {
+            var pointer: u32 = 0;
+            for (self.private_spills.items) |spill| {
+                if (spill.word == access.word) {
+                    pointer = spill.pointer;
+                    break;
+                }
+            }
+            const declared = pointer == 0;
+            if (declared) {
+                pointer = self.id();
+                // Preserve undefined-before-write semantics; do not invent a
+                // zero value for an uninitialized guest spill.
+                try self.emit(&self.declarations, 59, &.{ self.private_word_pointer_type, pointer, 6 });
+            }
+            try self.private_spills.append(self.allocator, .{ .pc = access.pc, .word = access.word, .pointer = pointer, .declared = declared });
         }
     }
 
@@ -9991,6 +10072,16 @@ const Builder = struct {
     }
 
     fn lower(self: *Builder, source_inst: instruction.Instruction) Error!void {
+        for (self.fragment_min_pcs) |reduction| {
+            if (reduction.start_pc != source_inst.pc) continue;
+            // Reduce the original inputs: a shuffle from an inactive fragment
+            // invocation can be undefined even within a host subgroup. Keep
+            // the guest row/prefix values intact for subsequent VGPR uses.
+            const value = try self.source(source_inst.src1, .bits32);
+            const minimum = self.id();
+            try self.emit(&self.body, 354, &.{ self.bits_type, minimum, try self.constant(.bits32, 3), 0, value });
+            try self.fragment_min_values.put(self.allocator, reduction.start_pc, minimum);
+        }
         if (self.synchronize_wave64_lds and source_inst.family == .ds and !source_inst.gds) {
             switch (source_inst.opcode) {
                 .ds_swizzle_b32, .ds_append, .ds_consume => {},
@@ -10684,17 +10775,32 @@ fn mergeIncomingStates(
         values.clearRetainingCapacity();
         parents.clearRetainingCapacity();
         var missing = false;
+        var defined = false;
         var differs = false;
         var first = Value{};
         for (predecessor_indices.items, 0..) |incoming_index, index| {
             const state = incoming[incoming_index];
             const value = state.registers[reg];
             if (value.id == 0) missing = true;
+            if (value.id != 0) defined = true;
             if (index == 0) first = value else if (value.id != first.id) differs = true;
             try values.append(builder.allocator, value);
             try parents.append(builder.allocator, parent_labels[incoming_index]);
         }
-        if (missing) continue;
+        if (!defined) continue;
+        if (missing) {
+            // A register can be written under a predicate and consumed only
+            // under that same predicate later. An uninitialized incoming arm
+            // must not erase the defined arm at the first join. Preserve its
+            // value with a phi; the unwritten hardware register is unspecified.
+            // Leave wholly undefined registers unknown so missing ABI inputs
+            // still report UndefinedRegister instead of fabricating a value.
+            const undefined_bits = builder.id();
+            try builder.emit(&builder.declarations, 1, &.{ builder.bits_type, undefined_bits }); // OpUndef
+            for (values.items) |*value| {
+                if (value.id == 0) value.* = .{ .id = undefined_bits, .value_type = .bits32 };
+            }
+        }
         merged.registers[reg] = if (!differs)
             first
         else
@@ -11160,6 +11266,144 @@ fn translateStructuredLoops(builder: *Builder, instructions: []const instruction
             try builder.emit(&builder.body, 249, &.{labels[block.index + 1]});
         } else {
             return Error.UnsupportedControlFlow;
+        }
+    }
+}
+
+const BranchLoopBlock = @import("branch_loops.zig").Block;
+
+fn branchLoopEntry(blocks: []const BranchLoopBlock, labels: []const u32, headers: []const u32, target: u32) u32 {
+    return if (blocks[target].loop_header == target) headers[target] else labels[target];
+}
+
+fn branchLoopForwardLabel(blocks: []const BranchLoopBlock, labels: []const u32, headers: []const u32, merges: []const u32, source: u32, target: u32) u32 {
+    var i: usize = source + 1;
+    while (i != 0) {
+        i -= 1;
+        if (blocks[i].kind == .selection and blocks[i].target == target) return merges[i];
+    }
+    return branchLoopEntry(blocks, labels, headers, target);
+}
+
+fn emitBranchLoopBudgetCheck(builder: *Builder, iteration: u32) Error!void {
+    const exhausted = builder.id();
+    try builder.emit(&builder.body, 174, &.{ builder.bool_type, exhausted, iteration, try builder.constant(.bits32, builder.maximum_dispatcher_iterations) });
+    const stop_label = builder.id();
+    const run_label = builder.id();
+    try builder.emit(&builder.body, 247, &.{ run_label, 0 });
+    try builder.emit(&builder.body, 250, &.{ exhausted, stop_label, run_label });
+    try builder.emit(&builder.body, 248, &.{stop_label});
+    try builder.returnFromShader();
+    try builder.emit(&builder.body, 248, &.{run_label});
+}
+
+/// Unlike the canonical-loop path, the loop header is synthetic and contains
+/// no guest instructions. Bounds checks and predicated stores can consequently
+/// introduce selections anywhere in a guest block without moving OpLoopMerge.
+fn translateBranchLoops(builder: *Builder, instructions: []const instruction.Instruction, graph: *const control_flow.Graph, blocks: []const BranchLoopBlock) Error!void {
+    const a = builder.allocator;
+    const labels = try a.alloc(u32, blocks.len);
+    defer a.free(labels);
+    const headers = try a.alloc(u32, blocks.len);
+    defer a.free(headers);
+    const loop_merges = try a.alloc(u32, blocks.len);
+    defer a.free(loop_merges);
+    const merges = try a.alloc(u32, blocks.len);
+    defer a.free(merges);
+    for (labels, headers, loop_merges, merges) |*label, *header, *loop_merge, *merge| {
+        label.* = builder.id();
+        header.* = builder.id();
+        loop_merge.* = builder.id();
+        merge.* = builder.id();
+    }
+    try configureMutableLoopState(builder, instructions);
+    // Preserve the dispatcher's block-visit guard. A reducible CFG proves the
+    // shape of a loop, not its termination with emulated wave/register state.
+    // In particular a uniform bound read from guest memory can be malformed.
+    builder.dispatch_iteration_pointer = builder.id();
+    try emitMutableLoopPrelude(builder, branchLoopEntry(blocks, labels, headers, 0));
+    for (graph.blocks.items) |block| {
+        const i = block.index;
+        const plan = blocks[i];
+        if (i != 0 and blocks[i - 1].kind == .loop_exit) {
+            // A private merge avoids naming a loop's continue block as an
+            // inner selection's merge, even when its fallthrough is the latch.
+            try builder.emit(&builder.body, 248, &.{merges[i - 1]});
+            try builder.emit(&builder.body, 249, &.{branchLoopForwardLabel(blocks, labels, headers, merges, i - 1, i)});
+        }
+        if (i != 0 and blocks[i - 1].latch == i - 1) {
+            const head = blocks[i - 1].loop_header;
+            try builder.emit(&builder.body, 248, &.{loop_merges[head]});
+            try builder.emit(&builder.body, 249, &.{branchLoopForwardLabel(blocks, labels, headers, merges, head, i)});
+        }
+        // Multiple nested forward skips can share a guest merge. Each SPIR-V
+        // selection needs its own label, chained from the inside out.
+        var j: usize = i;
+        while (j != 0) {
+            j -= 1;
+            if (blocks[j].kind != .selection or blocks[j].target != i) continue;
+            try builder.emit(&builder.body, 248, &.{merges[j]});
+            const next = if (j == 0) branchLoopEntry(blocks, labels, headers, i) else branchLoopForwardLabel(blocks, labels, headers, merges, @intCast(j - 1), i);
+            try builder.emit(&builder.body, 249, &.{next});
+        }
+        if (plan.loop_header == i) {
+            try builder.emit(&builder.body, 248, &.{headers[i]});
+            try builder.emit(&builder.body, 246, &.{ loop_merges[i], labels[plan.latch], 0 });
+            try builder.emit(&builder.body, 249, &.{labels[i]});
+        }
+        try builder.emit(&builder.body, 248, &.{labels[i]});
+        const iteration = builder.id();
+        try builder.emit(&builder.body, 61, &.{ builder.bits_type, iteration, builder.dispatch_iteration_pointer });
+        // A continue construct must reach its back-edge block on every path;
+        // returning from it would violate SPIR-V's post-dominance rule. Its
+        // predecessors check the next visit before entering the continue.
+        if (plan.latch != i) try emitBranchLoopBudgetCheck(builder, iteration);
+        const next_iteration = builder.id();
+        try builder.emit(&builder.body, 128, &.{ builder.bits_type, next_iteration, iteration, try builder.constant(.bits32, 1) });
+        try builder.emit(&builder.body, 62, &.{ builder.dispatch_iteration_pointer, next_iteration });
+        try loadMutableControlState(builder);
+        const first: usize = block.first_instruction;
+        const end = first + block.instruction_count;
+        const last = instructions[end - 1];
+        for (instructions[first..end]) |inst| {
+            if (inst.opcode.isBranch() or inst.opcode.isProgramEnd()) continue;
+            try lowerDiagnosed(builder, inst);
+        }
+        if (plan.latch != i and plan.latch != @import("branch_loops.zig").none and
+            (i + 1 == plan.latch or plan.target == plan.latch))
+        {
+            try emitBranchLoopBudgetCheck(builder, next_iteration);
+        }
+        if (last.opcode.isProgramEnd()) {
+            try builder.returnFromShader();
+        } else if (last.opcode == .s_branch) {
+            try storeMutableControlState(builder);
+            try builder.emit(&builder.body, 249, &.{headers[plan.loop_header]});
+        } else if (last.opcode.isBranch()) {
+            const predicate = directBranchCondition(last.opcode) orelse return Error.UnsupportedControlFlow;
+            var condition = try structuredCondition(builder, predicate[0]);
+            if (!predicate[1]) {
+                const inverted = builder.id();
+                try builder.emit(&builder.body, 168, &.{ builder.bool_type, inverted, condition });
+                condition = inverted;
+            }
+            try storeMutableControlState(builder);
+            if (plan.latch == i) {
+                // The conditional back edge is also the loop's exit test.
+                // It closes the continue construct, not a new selection.
+                try builder.emit(&builder.body, 250, &.{ condition, headers[plan.loop_header], loop_merges[plan.loop_header] });
+                continue;
+            }
+            const taken = if (plan.kind == .loop_exit)
+                (if (plan.target == plan.latch) labels[plan.latch] else loop_merges[plan.loop_header])
+            else
+                merges[i];
+            const fallthrough = if (plan.kind == .loop_exit) merges[i] else branchLoopForwardLabel(blocks, labels, headers, merges, i, i + 1);
+            try builder.emit(&builder.body, 247, &.{ merges[i], 0 });
+            try builder.emit(&builder.body, 250, &.{ condition, taken, fallthrough });
+        } else {
+            try storeMutableControlState(builder);
+            try builder.emit(&builder.body, 249, &.{branchLoopForwardLabel(blocks, labels, headers, merges, i, i + 1)});
         }
     }
 }
@@ -11641,8 +11885,14 @@ fn assemble(allocator: std.mem.Allocator, builder: *Builder, options: Options) E
     }
     try appendInstruction(allocator, &words, 17, &.{61}); // OpCapability GroupNonUniform
     try appendInstruction(allocator, &words, 17, &.{64}); // OpCapability GroupNonUniformBallot
+    if (builder.uses_group_arithmetic) {
+        try appendInstruction(allocator, &words, 17, &.{63}); // GroupNonUniformArithmetic
+    }
     if (builder.uses_group_shuffle) {
         try appendInstruction(allocator, &words, 17, &.{65}); // OpCapability GroupNonUniformShuffle
+    }
+    if (builder.uses_group_quad) {
+        try appendInstruction(allocator, &words, 17, &.{68}); // GroupNonUniformQuad
     }
     if (builder.uses_group_shuffle_relative) {
         try appendInstruction(allocator, &words, 17, &.{66}); // OpCapability GroupNonUniformShuffleRelative
@@ -11724,6 +11974,9 @@ fn assemble(allocator: std.mem.Allocator, builder: *Builder, options: Options) E
     if (builder.private_memory != 0) try entry_point.append(allocator, builder.private_memory);
     if (builder.fragment_valid_mask != 0) try entry_point.append(allocator, builder.fragment_valid_mask);
     for (builder.lane_spills.items) |spill| try entry_point.appendSlice(allocator, &.{ spill.value, spill.valid });
+    for (builder.private_spills.items) |spill| {
+        if (spill.declared) try entry_point.append(allocator, spill.pointer);
+    }
     if (builder.local_invocation_index != 0) try entry_point.append(allocator, builder.local_invocation_index);
     if (builder.subgroup_local_invocation_id != 0) try entry_point.append(allocator, builder.subgroup_local_invocation_id);
     if (builder.workgroup_id_input != 0) try entry_point.append(allocator, builder.workgroup_id_input);
@@ -11978,12 +12231,19 @@ fn translateInstructions(
     try builder.configureLaneSpills(instructions);
     var graph = try control_flow.buildInstructionsWithBarriers(allocator, instructions, builder.converged_workgroup_dispatch);
     defer graph.deinit(allocator);
+    if (effective.scalarize_private_spills) try builder.configurePrivateSpills(instructions, &graph);
     const lane_mask_scans = if (effective.stage == .fragment and !effective.wave32)
         try @import("lane_mask_provenance.zig").scanPcs(allocator, instructions, &graph)
     else
         try allocator.alloc(u32, 0);
     defer allocator.free(lane_mask_scans);
     builder.lane_mask_scan_pcs = lane_mask_scans;
+    const fragment_min_pcs = if (effective.normalize_fragment_min and effective.stage == .fragment and !effective.wave32)
+        try @import("fragment_min.zig").scan(allocator, instructions, &graph)
+    else
+        try allocator.alloc(@import("fragment_min.zig").Reduction, 0);
+    defer allocator.free(fragment_min_pcs);
+    builder.fragment_min_pcs = fragment_min_pcs;
     const local_vcc_pcs = if (effective.wave64_workgroup)
         try @import("local_vcc.zig").scanPcs(allocator, instructions, &graph)
     else
@@ -12004,7 +12264,14 @@ fn translateInstructions(
         for (instructions) |inst| try lowerDiagnosed(&builder, inst);
         try builder.returnFromShader();
     } else {
-        const structured_result = if (graph.back_edge_count == 0)
+        const branch_loop_plan = if (effective.structure_branch_loops and !effective.report_dispatcher_exhaustion)
+            try @import("branch_loops.zig").analyze(allocator, instructions, &graph)
+        else
+            null;
+        defer if (branch_loop_plan) |plan| allocator.free(plan);
+        const structured_result = if (branch_loop_plan) |plan|
+            translateBranchLoops(&builder, instructions, &graph, plan)
+        else if (graph.back_edge_count == 0)
             translateStructured(&builder, instructions, &graph)
         else
             translateStructuredLoops(&builder, instructions, &graph);
@@ -12019,8 +12286,10 @@ fn translateInstructions(
             builder = try Builder.init(allocator, effective);
             builder_alive = true;
             builder.lane_mask_scan_pcs = lane_mask_scans;
+            builder.fragment_min_pcs = fragment_min_pcs;
             builder.local_vcc_pcs = local_vcc_pcs;
             try builder.configureLaneSpills(instructions);
+            if (effective.scalarize_private_spills) try builder.configurePrivateSpills(instructions, &graph);
             translateDispatcher(&builder, instructions, &graph) catch |dispatch_err| {
                 if (dispatch_err != Error.UnsupportedControlFlow) return dispatch_err;
                 if (!effective.allow_control_flow_fallback) return err;
@@ -12029,6 +12298,7 @@ fn translateInstructions(
                 builder = try Builder.init(allocator, effective);
                 builder_alive = true;
                 builder.lane_mask_scan_pcs = lane_mask_scans;
+                builder.fragment_min_pcs = fragment_min_pcs;
                 builder.local_vcc_pcs = local_vcc_pcs;
                 try builder.configureLaneSpills(instructions);
                 builder.used_control_flow_fallback = true;
@@ -14978,12 +15248,13 @@ test "fragment DS addtid spill and fill use private per-invocation scratch" {
     });
     try program.instructions.append(std.testing.allocator, .{ .pc = 24, .opcode = .s_endpgm });
 
-    var module = try translate(std.testing.allocator, &program, .{ .stage = .fragment });
-    defer module.deinit(std.testing.allocator);
-    try std.testing.expect(containsOpcode(module.words, 28)); // OpTypeArray
-    try std.testing.expect(containsOpcode(module.words, 65)); // OpAccessChain
-    try std.testing.expect(containsOpcode(module.words, 62)); // OpStore
-    try std.testing.expect(containsOpcode(module.words, 61)); // OpLoad
+    for ([_]bool{ false, true }) |scalarize| {
+        var module = try translate(std.testing.allocator, &program, .{ .stage = .fragment, .scalarize_private_spills = scalarize });
+        defer module.deinit(std.testing.allocator);
+        try std.testing.expectEqual(!scalarize, containsOpcode(module.words, 65)); // indexed array only in the fallback
+        try std.testing.expect(containsOpcode(module.words, 62)); // OpStore
+        try std.testing.expect(containsOpcode(module.words, 61)); // OpLoad
+    }
 }
 
 test "compute DS addtid uses lane-indexed workgroup memory" {
@@ -15293,6 +15564,39 @@ test "forward scalar selection lowers with a structured merge and register phi" 
     try std.testing.expect(containsOpcode(module.words, 247)); // OpSelectionMerge
     try std.testing.expect(containsOpcode(module.words, 250)); // OpBranchConditional
     try std.testing.expect(containsOpcode(module.words, 245)); // OpPhi
+}
+
+test "correlated selections preserve registers defined on one incoming arm" {
+    const decoder = @import("decoder.zig");
+    // s4 != 0 writes v70 in the first selection. s4 == 0 writes it in
+    // the second. Every path reaching the final use has a defined value,
+    // although the first merge has an uninitialized incoming arm.
+    const code = [_]u32{
+        0xbf06_8004, // s_cmp_eq_u32 s4, 0
+        0xbf85_0001, // s_cbranch_scc1 -> second compare
+        0x7e8c_02aa, // v_mov_b32 v70, 42
+        0xbf06_8004,
+        0xbf84_0001, // s_cbranch_scc0 -> use
+        0x7e8c_0291, // v_mov_b32 v70, 17
+        0x7e02_0346, // v_mov_b32 v1, v70
+        0xbf81_0000,
+    };
+    var program = try decoder.decodeProgram(std.testing.allocator, &code);
+    defer program.deinit(std.testing.allocator);
+    var module = try translate(std.testing.allocator, &program, .{
+        .stage = .compute,
+        .scalar_registers = &.{.{ .register = 4, .value = 1 }},
+        .allow_control_flow_fallback = false,
+    });
+    defer module.deinit(std.testing.allocator);
+    try std.testing.expect(!module.used_control_flow_fallback);
+    try std.testing.expect(!module.used_dispatcher);
+    try std.testing.expect(containsOpcode(module.words, 1)); // OpUndef on the unwritten arm only
+    try std.testing.expect(countOpcode(module.words, 245) >= 2); // both selections retain v70
+
+    var undefined_program = try decoder.decodeProgram(std.testing.allocator, &.{ 0x7e02_0346, 0xbf81_0000 });
+    defer undefined_program.deinit(std.testing.allocator);
+    try std.testing.expectError(Error.UndefinedRegister, translate(std.testing.allocator, &undefined_program, .{ .stage = .compute }));
 }
 
 test "terminal conditional paths use an unreachable synthetic merge" {
@@ -15959,6 +16263,26 @@ test "DPP quad_perm shuffles from the selected lane of the quad" {
     defer module.deinit(std.testing.allocator);
     try std.testing.expect(containsOpcode(module.words, 345)); // OpGroupNonUniformShuffle
     try std.testing.expect(containsOpcodeWithFirstOperand(module.words, 17, 65)); // capability
+}
+
+test "fragment quad broadcasts require the option and a uniform quad selector" {
+    for ([_]Stage{ .fragment, .compute }) |stage| for ([_]bool{ false, true }) |enabled| {
+        for ([_]u9{ 0x00, 0x55, 0xaa, 0xff, 0x1b, 0x111 }) |control| {
+            var program = instruction.Program{ .code = &.{}, .instructions = .empty };
+            defer program.deinit(std.testing.allocator);
+            try program.instructions.appendSlice(std.testing.allocator, &.{
+                .{ .pc = 0, .opcode = .v_mov_b32, .dst = .{ .kind = .vgpr, .reg = 1 }, .src0 = .{ .kind = .integer_inline_constant, .value = 1, .dpp = true, .dpp_ctrl = control }, .src_count = 1 },
+                .{ .pc = 8, .opcode = .s_endpgm },
+            });
+            var module = try translate(std.testing.allocator, &program, .{ .stage = stage, .fragment_quad_broadcasts = enabled });
+            defer module.deinit(std.testing.allocator);
+            const quad = stage == .fragment and enabled and control != 0x1b and control != 0x111;
+            try std.testing.expectEqual(quad, containsOpcode(module.words, 365));
+            try std.testing.expectEqual(quad, containsOpcodeWithFirstOperand(module.words, 17, 68));
+            try std.testing.expectEqual(!quad and control != 0x111, containsOpcode(module.words, 345));
+            try std.testing.expectEqual(control == 0x111, containsOpcode(module.words, 347));
+        }
+    };
 }
 
 test "DPP8 selects a source lane within each eight-lane group" {

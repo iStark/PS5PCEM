@@ -26,6 +26,15 @@ pub const Pool = struct {
     worker_count: usize = 0,
     start_failed: bool = false,
 
+    pub const RangeFunction = *const fn (*anyopaque, usize, usize, usize) void;
+    const RangeTask = struct {
+        context: *anyopaque,
+        function: RangeFunction,
+        first: usize,
+        end: usize,
+        participant: usize,
+    };
+
     const Worker = struct {
         thread: ?std.Thread = null,
         ready: std.Io.Event = .unset,
@@ -36,13 +45,16 @@ pub const Pool = struct {
         hashes: ?*[maximum_participants]u64 = null,
         first_hash: usize = 0,
         end_hash: usize = 0,
+        range_task: ?RangeTask = null,
 
         fn run(self: *Worker, io: std.Io) void {
             while (true) {
                 self.ready.waitUncancelable(io);
                 self.ready.reset();
                 if (self.stop) return;
-                if (self.hashes) |hashes| {
+                if (self.range_task) |task| {
+                    task.function(task.context, task.first, task.end, task.participant);
+                } else if (self.hashes) |hashes| {
                     hashPartitions(self.source, hashes, self.first_hash, self.end_hash);
                 } else {
                     @memcpy(self.destination, self.source);
@@ -117,6 +129,30 @@ pub const Pool = struct {
         return std.hash.Wyhash.hash(0, &digest);
     }
 
+    /// Synchronously partition independent work across the same copy helpers.
+    /// Each callback owns [first, end) and its participant's result slot. A
+    /// nested/busy call runs inline; no callback or context survives return.
+    pub fn forRanges(self: *Pool, units: usize, context: *anyopaque, function: RangeFunction) void {
+        if (units == 0) return;
+        const participants: u8 = @intCast(@min(units, self.participants.load(.acquire)));
+        if (builtin.single_threaded or participants <= 1 or !self.lock.tryLock()) {
+            function(context, 0, units, 0);
+            return;
+        }
+        defer self.lock.unlock();
+        const count = self.prepareWorkers(participants);
+        const io = self.threaded.?.io();
+        var first: usize = 0;
+        for (self.workers[0..count], 0..) |*worker, index| {
+            const end = units / (count + 1) * (index + 1);
+            worker.range_task = .{ .context = context, .function = function, .first = first, .end = end, .participant = index };
+            worker.ready.set(io);
+            first = end;
+        }
+        function(context, first, units, count);
+        self.joinWorkers(count);
+    }
+
     fn hashPartitions(source: []const u8, hashes: *[maximum_participants]u64, first: usize, end: usize) void {
         const stride = std.mem.alignBackward(usize, source.len / maximum_participants, 64);
         for (first..end) |index| {
@@ -149,6 +185,7 @@ pub const Pool = struct {
             worker.hashes = null;
             worker.source = &.{};
             worker.destination = &.{};
+            worker.range_task = null;
         }
     }
 
@@ -197,6 +234,47 @@ test "parallel copies join before return and preserve unaligned boundaries" {
     pool.deinit();
     pool.copy(destination[0..size], source[0..size]);
     try std.testing.expectEqualSlices(u8, source[0..size], destination[0..size]);
+}
+
+test "range transforms join disjoint partitions and allow nested pool operations" {
+    const Work = struct {
+        pool: *Pool,
+        values: [37]u32 = @splat(0),
+        calls: [Pool.maximum_participants]usize = @splat(0),
+        fn run(raw: *anyopaque, first: usize, end: usize, participant: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls[participant] += 1;
+            var nested: [2]u32 = @splat(0);
+            self.pool.forRanges(nested.len, &nested, fillNested);
+            for (first..end) |i| self.values[i] += @as(u32, @intCast(i)) + nested[0] + nested[1];
+        }
+        fn fillNested(raw: *anyopaque, first: usize, end: usize, _: usize) void {
+            const values: *[2]u32 = @ptrCast(@alignCast(raw));
+            for (first..end) |i| values[i] += 0x2d;
+        }
+    };
+    var pool = Pool{ .participants = .init(4) };
+    defer pool.deinit();
+    const source = try std.testing.allocator.alloc(u8, Pool.minimum_bytes + 17);
+    defer std.testing.allocator.free(source);
+    const destination = try std.testing.allocator.alloc(u8, source.len);
+    defer std.testing.allocator.free(destination);
+    for (source, 0..) |*byte, i| byte.* = @truncate(i *% 17 +% (i >> 9));
+    var serial = Pool{};
+    defer serial.deinit();
+    const expected_hash = serial.fingerprint(source);
+    for ([_]bool{ false, true }) |busy| {
+        var work = Work{ .pool = &pool };
+        if (busy) try std.testing.expect(pool.lock.tryLock());
+        pool.forRanges(work.values.len, &work, Work.run);
+        if (busy) pool.lock.unlock();
+        for (work.values, 0..) |value, i| try std.testing.expectEqual(@as(u32, @intCast(i)) + 0x5a, value);
+        try std.testing.expectEqual(@as(usize, if (busy) 1 else 4), @reduce(.Add, @as(@Vector(4, usize), work.calls)));
+        // A following ordinary job must not call the retained transform again.
+        pool.copy(destination, source);
+        try std.testing.expectEqualSlices(u8, source, destination);
+        try std.testing.expectEqual(expected_hash, pool.fingerprint(destination));
+    }
 }
 
 test "parallel copy concurrent callers and unavailable workers preserve every byte" {

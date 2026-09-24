@@ -542,6 +542,10 @@ fn run(init: std.process.Init) !bool {
         "PS5_CPU_WAIT_DIAGNOSTICS",
     ) catch false;
     const enable_vulkan_validation = init.minimal.environ.containsUnempty(allocator, "PS5_VULKAN_VALIDATION") catch false;
+    if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_TIMESTAMPS")) |text| {
+        defer allocator.free(text);
+        @atomicStore(bool, &vulkan.backend.gpu_timestamp_profiling, std.mem.eql(u8, std.mem.trim(u8, text, " \t\r\n"), "1"), .monotonic);
+    } else |_| {}
     const capture_first_graphics_frame = init.minimal.environ.containsUnempty(allocator, "PS5_CAPTURE_FIRST_FRAME") catch false;
     const trace_graphics_frame: ?u64 = if (init.minimal.environ.getAlloc(allocator, "PS5_TRACE_GRAPHICS_FRAME")) |text| parse: {
         defer allocator.free(text);
@@ -610,6 +614,10 @@ fn run(init: std.process.Init) !bool {
         defer allocator.free(text);
         break :workers std.math.clamp(std.fmt.parseInt(usize, std.mem.trim(u8, text, " \t\r\n"), 10) catch 2, 1, 4);
     } else |_| 2;
+    const parallel_commands = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_PARALLEL_COMMANDS")) |text| enabled: {
+        defer allocator.free(text);
+        break :enabled !std.mem.eql(u8, std.mem.trim(u8, text, " \t\r\n"), "0");
+    } else |_| true;
     // Use title-isolated catalogs and a versioned descriptor ABI directory.
     // Unknown/nonstandard title identifiers simply run without disk warmup.
     const safe_shader_title = title_identifier.len == 9 and std.mem.startsWith(u8, title_identifier, "PPSA") and
@@ -650,6 +658,10 @@ fn run(init: std.process.Init) !bool {
     // forces one submit/fence/readback for every dispatch.
     const defer_small_storage_writes = !force_eager_storage_writes;
     const enable_automatic_deferred_storage_writes = defer_small_storage_writes;
+    const defer_internal_releases = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_DEFER_INTERNAL_RELEASES")) |text| enabled: {
+        defer allocator.free(text);
+        break :enabled std.mem.eql(u8, std.mem.trim(u8, text, " \t\r\n"), "1");
+    } else |_| false;
     const enable_gpu_page_tracker = enable_gpu_experimental or
         (init.minimal.environ.containsUnempty(allocator, "PS5_GPU_PAGE_TRACKER") catch false);
     const enable_host_import = !enable_gpu_page_tracker and builtin.os.tag == .windows and
@@ -677,19 +689,56 @@ fn run(init: std.process.Init) !bool {
         defer allocator.free(text);
         break :parse std.math.clamp(std.fmt.parseInt(usize, text, 10) catch default_storage_image_mib, 128, 4096);
     } else |_| default_storage_image_mib;
-    const default_compute_translation_mib: usize = if (std.ascii.eqlIgnoreCase(title_identifier, yotei_title_id)) 512 else 256;
+    const sampled_image_cache_mib = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_SAMPLED_IMAGE_CACHE_MIB")) |text| parse: {
+        defer allocator.free(text);
+        break :parse std.math.clamp(std.fmt.parseInt(u64, text, 10) catch 2048, 128, 8192);
+    } else |_| 2048;
+    const prefer_nonlocal_sampled_images = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_NONLOCAL_SAMPLED_IMAGES")) |text| enabled: {
+        defer allocator.free(text);
+        break :enabled !std.mem.eql(u8, text, "0");
+    } else |_| false;
+    const sampled_image_device_mib = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_SAMPLED_DEVICE_CACHE_MIB")) |text| parse: {
+        defer allocator.free(text);
+        break :parse std.math.clamp(std.fmt.parseInt(u64, text, 10) catch 3072, 0, 8192);
+    } else |_| 3072;
+    const default_compute_translation_mib: usize = if (std.ascii.eqlIgnoreCase(title_identifier, yotei_title_id)) 1024 else 256;
     const compute_translation_cache_mib = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_COMPUTE_TRANSLATION_CACHE_MIB")) |text| parse: {
         defer allocator.free(text);
         break :parse std.math.clamp(std.fmt.parseInt(usize, text, 10) catch default_compute_translation_mib, 64, 1024);
     } else |_| default_compute_translation_mib;
-    const device_storage_mib = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_DEVICE_STORAGE_MIB")) |text| parse: {
+    const default_graphics_translation_mib: usize = if (std.ascii.eqlIgnoreCase(title_identifier, yotei_title_id)) 512 else 256;
+    const graphics_translation_cache_mib = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_GRAPHICS_TRANSLATION_CACHE_MIB")) |text| parse: {
+        defer allocator.free(text);
+        break :parse std.math.clamp(std.fmt.parseInt(usize, text, 10) catch default_graphics_translation_mib, 64, 1024);
+    } else |_| default_graphics_translation_mib;
+    const device_storage_mib: usize = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_DEVICE_STORAGE_MIB")) |text| parse: {
         defer allocator.free(text);
         break :parse @min(std.fmt.parseInt(usize, text, 10) catch 0, 2048);
     } else |_| 0;
+    const device_storage_min_kib: usize = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_DEVICE_STORAGE_MIN_KIB")) |text| parse: {
+        defer allocator.free(text);
+        break :parse @min(std.fmt.parseInt(usize, text, 10) catch 256, 65536);
+    } else |_| 256;
     const storage_rename_mib: usize = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_STORAGE_RENAME_MIB")) |text| parse: {
         defer allocator.free(text);
         break :parse @min(std.fmt.parseInt(usize, text, 10) catch 0, 256);
     } else |_| 0;
+    const device_detile_sources = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_DEVICE_DETILE_INPUT")) |text| parse: {
+        defer allocator.free(text);
+        break :parse text.len != 0 and !std.mem.eql(u8, text, "0");
+    } else |_| false;
+    const queued_host_storage_uploads = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_QUEUED_HOST_UPLOADS")) |text| parse: {
+        defer allocator.free(text);
+        break :parse text.len != 0 and !std.mem.eql(u8, text, "0");
+    } else |_| false;
+    const retain_storage_buffers = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_RETAIN_STORAGE_BUFFERS")) |text| parse: {
+        defer allocator.free(text);
+        break :parse text.len != 0 and !std.mem.eql(u8, text, "0");
+    } else |_| false;
+    const storage_buffer_cache_mib = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_STORAGE_BUFFER_CACHE_MIB")) |text| parse: {
+        defer allocator.free(text);
+        break :parse std.math.clamp(std.fmt.parseInt(usize, text, 10) catch 4096, 128, 4096);
+    } else |_| 4096;
 
     // What the rendering preset actually selects. Both of these trade a
     // little fidelity margin for throughput once the sampled cache is over
@@ -763,14 +812,25 @@ fn run(init: std.process.Init) !bool {
             .compute_warmup_directory = compute_warmup_directory,
             .enable_canonical_image_aliases = enable_canonical_aliases,
             .enable_timeline_scheduler = enable_timeline_scheduler,
+            .defer_shader_fault_checks = enable_timeline_scheduler,
+            .defer_internal_releases = defer_internal_releases,
+            .prefer_nonlocal_sampled_images = prefer_nonlocal_sampled_images,
+            .sampled_image_device_budget_bytes = sampled_image_device_mib * 1024 * 1024,
             .defer_small_storage_writes = defer_small_storage_writes,
             .enable_depth_transfer = enable_depth_transfer,
             .enable_image_state_optimization = enable_image_state_optimization,
             .render_target_cache_limit = render_target_cache_limit,
             .storage_image_cache_limit = storage_image_cache_mib * 1024 * 1024,
+            .sampled_image_cache_budget_bytes = sampled_image_cache_mib * 1024 * 1024,
+            .device_detile_sources = device_detile_sources,
             .compute_translation_cache_limit = compute_translation_cache_mib * 1024 * 1024,
+            .graphics_translation_cache_limit = graphics_translation_cache_mib * 1024 * 1024,
             .device_storage_budget_bytes = device_storage_mib * 1024 * 1024,
+            .device_storage_min_bytes = device_storage_min_kib * 1024,
             .storage_buffer_rename_budget_bytes = storage_rename_mib * 1024 * 1024,
+            .queued_host_storage_uploads = queued_host_storage_uploads,
+            .retain_clean_storage_buffers = retain_storage_buffers,
+            .storage_buffer_cache_budget_bytes = storage_buffer_cache_mib * 1024 * 1024,
             .enable_host_import = enable_host_import,
             .native_window = .{
                 .instance = native.instance,
@@ -822,7 +882,12 @@ fn run(init: std.process.Init) !bool {
                 runtime.firmware.libs.agc_submit.gpuGeneration
             else
                 null,
+            .gpu_tracking_epoch = if (enable_gpu_page_tracker)
+                runtime.firmware.libs.agc_submit.gpuTrackingEpoch
+            else
+                null,
         };
+        runtime.firmware.libs.agc_submit.setParallelCommandExecution(parallel_commands);
         runtime.firmware.libs.agc_submit.attachBackend(renderer.dcbBackend(guest_memory));
         const video_sink = renderer.videoFrameSink();
         runtime.firmware.libs.videodec2.attachVideoFrameSink(.{
@@ -838,8 +903,9 @@ fn run(init: std.process.Init) !bool {
         });
         try out.print("  scanout channel order uses the registered buffer set\n", .{});
         try out.print("  pipeline compiler workers={d} warmup={s}\n", .{ pipeline_compiler_workers, compute_warmup_directory orelse "disabled" });
+        try out.print("  command processors={d}, bounded lookahead=4 per queue\n", .{if (parallel_commands) @as(u8, 2) else 0});
         try out.print(
-            "  GPU flags ir={d} ssa={d} async_pso={d} aliases={d} depth_io={d} image_state_opt={d} timeline={d} timeline_auto={d} defer_storage={d} defer_storage_auto={d} page_tracker={d} buffer_content_cache={d} copy_workers={d} render_targets={d} storage_image_mib={d} compute_translation_mib={d}\n",
+            "  GPU flags ir={d} ssa={d} async_pso={d} aliases={d} depth_io={d} image_state_opt={d} timeline={d} timeline_auto={d} defer_storage={d} defer_storage_auto={d} page_tracker={d} buffer_content_cache={d} copy_workers={d} render_targets={d} storage_image_mib={d} compute_translation_mib={d} graphics_translation_mib={d}\n",
             .{
                 @intFromBool(enable_shader_ir),
                 @intFromBool(enable_shader_ssa),
@@ -857,6 +923,7 @@ fn run(init: std.process.Init) !bool {
                 render_target_cache_limit,
                 storage_image_cache_mib,
                 compute_translation_cache_mib,
+                graphics_translation_cache_mib,
             },
         );
     }

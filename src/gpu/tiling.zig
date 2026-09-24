@@ -12,6 +12,7 @@
 const std = @import("std");
 const resources = @import("resources.zig");
 const shaders = @import("shaders.zig");
+const parallel_copy = @import("parallel_copy.zig");
 
 pub const Error = error{
     InvalidExtent,
@@ -898,6 +899,17 @@ pub const Layout = struct {
         source: []const u8,
         destination: []u8,
     ) Error!void {
+        return self.copyElementsUsingPool(to_tiled, element_bytes, source, destination, &parallel_copy.guest_copy_pool);
+    }
+
+    fn copyElementsUsingPool(
+        self: Layout,
+        comptime to_tiled: bool,
+        comptime element_bytes: usize,
+        source: []const u8,
+        destination: []u8,
+        pool: *parallel_copy.Pool,
+    ) Error!void {
         const row_bytes = @as(usize, self.width) * element_bytes;
         if (self.block.tile_mode.isLinear()) {
             const tiled_row_bytes = @as(usize, self.row_pitch_elements) * element_bytes;
@@ -921,34 +933,70 @@ pub const Layout = struct {
         if (self.block.width > x_offsets.len or self.block.height > y_offsets.len) return Error.UnsupportedTileMode;
         for (0..self.block.width) |x| x_offsets[x] = try self.block.byteOffset(@intCast(x), 0);
         for (0..self.block.height) |y| y_offsets[y] = try self.block.byteOffset(0, @intCast(y));
-        for (0..self.layers) |layer_index| {
+        const Work = struct {
+            layout: Layout,
+            source: []const u8,
+            destination: []u8,
+            x_offsets: *const [256]u32,
+            y_offsets: *const [256]u32,
+            errors: [parallel_copy.Pool.maximum_participants]?Error = @splat(null),
+
+            fn run(raw: *anyopaque, first: usize, end: usize, participant: usize) void {
+                const work: *@This() = @ptrCast(@alignCast(raw));
+                work.layout.copyElementRows(to_tiled, element_bytes, work.source, work.destination, work.x_offsets, work.y_offsets, first, end) catch |err| {
+                    work.errors[participant] = err;
+                };
+            }
+        };
+        var work = Work{ .layout = self, .source = source, .destination = destination, .x_offsets = &x_offsets, .y_offsets = &y_offsets };
+        const rows = @as(usize, self.layers) * self.blocks_per_column;
+        if (self.staging_bytes >= 1024 * 1024)
+            pool.forRanges(rows, &work, Work.run)
+        else
+            Work.run(&work, 0, rows, 0);
+        for (work.errors) |failure| if (failure) |err| return err;
+    }
+
+    fn copyElementRows(
+        self: Layout,
+        comptime to_tiled: bool,
+        comptime element_bytes: usize,
+        source: []const u8,
+        destination: []u8,
+        x_offsets: *const [256]u32,
+        y_offsets: *const [256]u32,
+        first: usize,
+        end: usize,
+    ) Error!void {
+        // Macro-block rows touch disjoint tiled blocks and linear rows. This
+        // includes clipped edge blocks and nonzero array-view base slices.
+        for (first..end) |row_index| {
+            const layer_index = row_index / self.blocks_per_column;
             const physical_slice: u32 = try addU32(self.first_slice, @intCast(layer_index));
             const tiled_slice: usize = @intCast(try add(try multiply(self.source_slice_bytes, physical_slice), self.source_base_offset));
             const staging_slice: usize = @intCast(try multiply(self.staging_slice_bytes, layer_index));
-            for (0..self.blocks_per_column) |block_y_index| {
-                const block_y: u32 = @intCast(block_y_index);
-                const y_base = block_y * self.block.height;
-                if (y_base >= self.height) continue;
-                const copy_height = @min(self.block.height, self.height - y_base);
-                for (0..self.blocks_per_row) |block_x_index| {
-                    const block_x: u32 = @intCast(block_x_index);
-                    const x_base = block_x * self.block.width;
-                    if (x_base >= self.width) continue;
-                    const copy_width = @min(self.block.width, self.width - x_base);
-                    const block_index = @as(usize, block_y) * self.blocks_per_row + block_x;
-                    const tiled_block = tiled_slice + block_index * self.block.bytes;
-                    const block_xor = try self.block.blockXor(block_x, block_y, physical_slice);
-                    for (0..copy_height) |local_y| {
-                        const linear_row = staging_slice +
-                            ((@as(usize, y_base) + local_y) * self.width + x_base) * element_bytes;
-                        const row_xor = y_offsets[local_y] ^ block_xor;
-                        for (0..copy_width) |local_x| {
-                            const tiled = tiled_block + (x_offsets[local_x] ^ row_xor);
-                            const linear = linear_row + local_x * element_bytes;
-                            const src = if (to_tiled) linear else tiled;
-                            const dst = if (to_tiled) tiled else linear;
-                            @memcpy(destination[dst..][0..element_bytes], source[src..][0..element_bytes]);
-                        }
+            const block_y: u32 = @intCast(row_index % self.blocks_per_column);
+            const y_base = block_y * self.block.height;
+            if (y_base >= self.height) continue;
+            const copy_height = @min(self.block.height, self.height - y_base);
+            for (0..self.blocks_per_row) |block_x_index| {
+                const block_x: u32 = @intCast(block_x_index);
+                const x_base = block_x * self.block.width;
+                if (x_base >= self.width) continue;
+                const copy_width = @min(self.block.width, self.width - x_base);
+                const block_index = @as(usize, block_y) * self.blocks_per_row + block_x;
+                const tiled_block = tiled_slice + block_index * self.block.bytes;
+                const block_xor = try self.block.blockXor(block_x, block_y, physical_slice);
+                for (0..copy_height) |local_y| {
+                    const linear_row = staging_slice +
+                        ((@as(usize, y_base) + local_y) * self.width + x_base) * element_bytes;
+                    const row_xor = y_offsets[local_y] ^ block_xor;
+                    for (0..copy_width) |local_x| {
+                        const tiled = tiled_block + (x_offsets[local_x] ^ row_xor);
+                        const linear = linear_row + local_x * element_bytes;
+                        const src = if (to_tiled) linear else tiled;
+                        const dst = if (to_tiled) tiled else linear;
+                        @memcpy(destination[dst..][0..element_bytes], source[src..][0..element_bytes]);
                     }
                 }
             }
@@ -3480,4 +3528,40 @@ test "volume color attachments and sampled images share all slice addresses" {
             try testing.expectEqual(try sampled.sourceByteOffset(@intCast(x), @intCast(y), @intCast(z), 0), try attachment.sourceByteOffset(@intCast(x), @intCast(y), @intCast(z)));
         };
     }
+}
+
+test "parallel macro rows preserve tiled padding clipped blocks and array slices" {
+    var serial = parallel_copy.Pool{};
+    defer serial.deinit();
+    var parallel = parallel_copy.Pool{ .participants = .init(4) };
+    defer parallel.deinit();
+    const allocator = std.testing.allocator;
+    inline for (.{ 1, 2, 4, 8, 16 }) |bytes| {
+        for ([_]resources.TileMode{ .standard_256b, .standard_4kb, .standard_64kb, .partially_resident, .render_target }) |mode| {
+            const layout = try Layout.init(.{ .tile_mode = mode, .width = 769, .height = 515, .layers = 3, .first_slice = 1 }, bytes);
+            const linear = try allocator.alloc(u8, @intCast(layout.staging_bytes));
+            defer allocator.free(linear);
+            const expected = try allocator.alloc(u8, @intCast(layout.required_source_bytes));
+            defer allocator.free(expected);
+            const actual = try allocator.alloc(u8, expected.len);
+            defer allocator.free(actual);
+            const roundtrip = try allocator.alloc(u8, linear.len);
+            defer allocator.free(roundtrip);
+            for (linear, 0..) |*byte, i| byte.* = @truncate(i *% 17 +% (i >> 7));
+            @memset(expected, 0xc3);
+            @memset(actual, 0xc3);
+            try layout.copyElementsUsingPool(true, bytes, linear, expected, &serial);
+            try layout.copyElementsUsingPool(true, bytes, linear, actual, &parallel);
+            try std.testing.expectEqualSlices(u8, expected, actual);
+            try layout.copyElementsUsingPool(false, bytes, actual, roundtrip, &parallel);
+            try std.testing.expectEqualSlices(u8, linear, roundtrip);
+            // Point checks use the independent checked address equation.
+            for ([_]u32{ 0, 1, 258, 514 }) |y| for ([_]u32{ 0, 255, 768 }) |x| for (0..3) |slice| {
+                const tiled: usize = @intCast(try layout.sourceByteOffset(x, y, @intCast(slice)));
+                const linear_offset: usize = @intCast(try layout.stagingByteOffset(x, y, @intCast(slice)));
+                try std.testing.expectEqualSlices(u8, linear[linear_offset..][0..bytes], actual[tiled..][0..bytes]);
+            };
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 3), parallel.worker_count);
 }
