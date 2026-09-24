@@ -97,16 +97,20 @@ function Sign-ReleaseFile([string] $Path) {
         return
     }
     $signature = Set-AuthenticodeSignature -LiteralPath $Path -Certificate $certificate -HashAlgorithm SHA256 -TimestampServer $TimestampServer -IncludeChain All
-    # A self-signed certificate can never report Valid: the chain ends at a root
-    # no machine trusts, and that is a property of the certificate rather than a
-    # fault in the signature. Accept exactly that case -- signed, by the
-    # certificate we were handed, untrusted root -- and nothing else. A missing
-    # signature, a tampered file or a different signer still stops the build.
+    # A self-signed certificate can report UnknownError when its root is not
+    # trusted locally. Require the selected signer and a timestamp regardless
+    # of the chain status; release verification also checks the signed payload.
     $signedByUs = $signature.Status -eq "UnknownError" -and
         $signature.SignerCertificate -and
         $signature.SignerCertificate.Thumbprint -eq $certificate.Thumbprint
     if ($signature.Status -ne "Valid" -and -not $signedByUs) {
         throw "Authenticode signing failed for $Path`: $($signature.StatusMessage)"
+    }
+    if (-not $signature.SignerCertificate -or $signature.SignerCertificate.Thumbprint -ne $certificate.Thumbprint) {
+        throw "Unexpected Authenticode signer for $Path"
+    }
+    if (-not $signature.TimeStamperCertificate) {
+        throw "Authenticode timestamp is missing for $Path"
     }
     if ($signedByUs) {
         Write-Warning "Signed with an untrusted root; Windows will report an unknown publisher: $Path"
@@ -118,6 +122,7 @@ try {
     if (-not $SkipBuild) {
         Invoke-Checked { zig build build-game-run "-Doptimize=$Optimize" } "game-run build"
         Invoke-Checked { zig build build-launcher "-Doptimize=$Optimize" } "launcher build"
+        Invoke-Checked { zig build build-pkgextractor "-Doptimize=$Optimize" } "package extractor build"
     }
 
     New-Item -ItemType Directory -Path $distRoot -Force | Out-Null
@@ -130,6 +135,7 @@ try {
     $releaseFiles = @(
         @{ Source = (Join-Path $binaryRoot "ps5pcem.exe"); Destination = "ps5pcem.exe" },
         @{ Source = (Join-Path $binaryRoot "game-run.exe"); Destination = "game-run.exe" },
+        @{ Source = (Join-Path $binaryRoot "pkgextractor.exe"); Destination = "pkgextractor.exe" },
         @{ Source = "README.md"; Destination = "README.md" },
         @{ Source = "LICENSE"; Destination = "LICENSE" },
         @{ Source = "VERSION"; Destination = "VERSION" },
@@ -156,7 +162,7 @@ PS5PCEM $Version - Windows x64 prototype
 2. Run ps5pcem.exe.
 3. Choose a directory containing a decrypted game you are legally allowed to use.
 
-Keep ps5pcem.exe and game-run.exe together. The portable build stores ps5pcem.ini,
+Keep ps5pcem.exe, game-run.exe and pkgextractor.exe together. The portable build stores ps5pcem.ini,
 savedata, logs and caches beside the application. Games, firmware and system files
 are not included. This prototype is incomplete and many titles will not work yet.
 "@
@@ -164,6 +170,7 @@ are not included. This prototype is incomplete and many titles will not work yet
 
     Sign-ReleaseFile (Join-Path $stageRoot "ps5pcem.exe")
     Sign-ReleaseFile (Join-Path $stageRoot "game-run.exe")
+    Sign-ReleaseFile (Join-Path $stageRoot "pkgextractor.exe")
 
     $portableZip = Join-Path $distRoot "$stageName.zip"
     Assert-ChildPath $distRoot $portableZip

@@ -29,6 +29,7 @@ if (-not $AllowUnsigned) {
     foreach ($path in @(
         (Join-Path $stageRoot "ps5pcem.exe"),
         (Join-Path $stageRoot "game-run.exe"),
+        (Join-Path $stageRoot "pkgextractor.exe"),
         $installer
     )) {
         $signature = Get-AuthenticodeSignature -LiteralPath $path
@@ -38,6 +39,9 @@ if (-not $AllowUnsigned) {
         $untrustedRoot = $signature.Status -eq "UnknownError" -and $signature.SignerCertificate
         if ($signature.Status -ne "Valid" -and -not $untrustedRoot) {
             throw "Refusing to publish an unsigned artifact: $path"
+        }
+        if (-not $signature.TimeStamperCertificate) {
+            throw "Refusing to publish an artifact without a signing timestamp: $path"
         }
     }
 }
@@ -69,9 +73,10 @@ try {
         $portable, $installer, $checksums,
         "--verify-tag",
         "--title", "PS5PCEM $Version",
-        "--notes-file", $notes,
-        "--prerelease"
+        "--notes-file", $notes
     )
+    if ($Version.Contains('-')) { $arguments += "--prerelease" }
+    else { $arguments += "--latest" }
     if ($Draft) { $arguments += "--draft" }
     & gh @arguments
     if ($LASTEXITCODE -ne 0) { throw "GitHub release creation failed" }

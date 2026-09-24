@@ -1,8 +1,8 @@
 #ifndef MyAppVersion
-  #define MyAppVersion "0.3.0-alpha.2"
+  #define MyAppVersion "0.3.2"
 #endif
 #ifndef MyNumericVersion
-  #define MyNumericVersion "0.3.0.2"
+  #define MyNumericVersion "0.3.2.0"
 #endif
 #ifndef SourceDir
   #define SourceDir "."
@@ -57,6 +57,7 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 [Files]
 Source: "{#SourceDir}\ps5pcem.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceDir}\game-run.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#SourceDir}\pkgextractor.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceDir}\README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceDir}\README-PORTABLE.txt"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceDir}\LICENSE"; DestDir: "{app}"; Flags: ignoreversion

@@ -32,15 +32,16 @@ built for verification, but the publishing script rejects it:
 # Local packaging test only
 .\scripts\package-release.ps1 -AllowUnsigned
 
-# Public package: signs both applications and the installer with SHA-256
+# Public package: signs all three applications and the installer with SHA-256
 .\scripts\package-release.ps1 -CertificateThumbprint "YOUR_CODE_SIGNING_CERT_THUMBPRINT"
 
-# Push main/tag and create the GitHub prerelease from the verified artifacts
+# Push main/tag and create the GitHub release from the verified artifacts
+# Versions with a suffix, such as -beta.1, are published as prereleases.
 .\scripts\publish-release.ps1
 ```
 
 The portable archive and installer contain only `ps5pcem.exe`, `game-run.exe`,
-documentation, licensing, version, and branding files. Generated settings,
+`pkgextractor.exe`, documentation, licensing, version, and branding files. Generated settings,
 caches, and savedata are intentionally not packaged.
 
 ## Usage

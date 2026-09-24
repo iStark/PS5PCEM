@@ -21,10 +21,11 @@ What this means in practice, for anyone building on this:
 
 There is no warranty; see sections 15 and 16 of the license.
 
-The build fetches two hash-pinned audio decoder dependencies: LibAtrac9 under
-the MIT license and minimp3 under CC0. Their source archives retain the upstream
-license texts; neither dependency contains console firmware or proprietary SDK
-code.
+The build uses four hash-pinned audio decoder dependencies: LibAtrac9 (MIT),
+minimp3 (CC0), FAAD2 (GPL-2.0-or-later), and Opus (BSD). Their upstream notices
+and license texts are included in [licenses](licenses/README.md), which is also
+shipped in the Windows packages. Dependency versions and source archives are
+pinned in [build.zig.zon](../build.zig.zon).
 
 ## Legal note
 
