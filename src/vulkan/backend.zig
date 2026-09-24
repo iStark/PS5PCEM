@@ -1234,6 +1234,21 @@ fn savePipelineCacheBytes(self: *Renderer) void {
     _ = self.pipeline_cache_saver.checkpoint(pipelineCacheSaveSource(self), now_ns);
 }
 
+/// A release label, or a DMA write queued behind one, waiting for the device
+/// work before it (up to `tick`) to finish before it reaches guest memory.
+const DeferredRelease = struct {
+    tick: u64,
+    release: gpu.state.ReleaseMem,
+    /// Bytes a DMA_DATA wrote over a pending label, published in its place.
+    fixed: ?[8]u8 = null,
+    fixed_size: u8 = 0,
+
+    fn size(self: DeferredRelease) usize {
+        if (self.fixed != null) return self.fixed_size;
+        return if (self.release.data_selection == 1) 4 else 8;
+    }
+};
+
 const GuestBufferEntry = struct {
     descriptor_index: u32,
     guest_address: u64,
@@ -4146,7 +4161,7 @@ pub const Renderer = struct {
     release_callbacks: u64 = 0,
     defer_internal_releases: bool = false,
     deferred_internal_release_count: usize = 0,
-    deferred_internal_releases: [256]struct { tick: u64, release: gpu.state.ReleaseMem } = undefined,
+    deferred_internal_releases: [256]DeferredRelease = undefined,
     publishing_internal_release: bool = false,
     internal_releases_deferred: u64 = 0,
     wait_callbacks: u64 = 0,
@@ -4240,6 +4255,7 @@ pub const Renderer = struct {
     reported_mip_surveys: u32 = 0,
     reported_materializations: u32 = 0,
     last_flush_caller: usize = 0,
+    release_drain_caller: usize = 0,
     depth_target_count: u32 = 0,
     reported_resident_rejects: u32 = 0,
     frame_profile: FrameProfile = .{},
@@ -15474,7 +15490,9 @@ pub const Renderer = struct {
     /// Publishes only the deferred writeback for one guest address, used
     /// before guest memory at that address is staged or read.
     fn flushPendingGuestWrite(self: *Renderer, address: u64, visible_bytes: usize) anyerror!void {
+        self.release_drain_caller = @returnAddress();
         try self.drainInternalReleasesForRange(address, visible_bytes);
+        self.release_drain_caller = 0;
         // Twenty call sites reach here and seven of them a frame pull ninety
         // megabytes off the device. Record who asked rather than tagging every
         // caller by hand; the address maps back through the PDB.
@@ -24938,6 +24956,7 @@ pub const Renderer = struct {
 
     const dcb_vtable = gpu.DcbBackend.VTable{
         .read = dcbRead,
+        .read_wait = dcbReadWait,
         .write = dcbWrite,
         .acquire = dcbAcquire,
         .release = dcbRelease,
@@ -24953,6 +24972,47 @@ pub const Renderer = struct {
 
     fn fromContext(context: ?*anyopaque) *Renderer {
         return @ptrCast(@alignCast(context.?));
+    }
+
+    /// Whether a DMA_DATA packet puts bytes anywhere. Engines interleave
+    /// four-byte ordering markers aimed at null or tiny sentinel addresses
+    /// (the first guest page is never mapped) and clock/counter selectors that
+    /// this renderer does not model; neither has anything to synchronize.
+    fn dmaMovesBytes(dma: gpu.state.DmaData) bool {
+        if (dma.byte_count == 0 or dma.source > 3) return false;
+        return switch (dma.destination) {
+            0, 3 => dma.destination_address >= 0x1_0000,
+            1 => true,
+            else => false,
+        };
+    }
+
+    /// Records queued draws and dispatches without waiting for the device, so
+    /// they snapshot guest memory before a command-processor write changes it.
+    /// Deferred release labels stay deferred: they publish as their work
+    /// retires, not because an unrelated packet came along.
+    fn recordDrawBatch(self: *Renderer, operation: []const u8) bool {
+        self.finishDrawBatchRecording(true) catch |err| {
+            self.last_sync_error = err;
+            std.debug.print(
+                "[vulkan dcb] {s} batch failed: {s}\n",
+                .{ operation, @errorName(err) },
+            );
+            return false;
+        };
+        self.last_sync_error = null;
+        return true;
+    }
+
+    /// Waits for queued readers of imported guest pages overlapping a range.
+    /// Those buffers alias guest memory, so a host write lands under work
+    /// still reading them; every other cached copy was staged when recorded.
+    fn waitForMappedReaders(self: *Renderer, address: u64, size: usize) Error!void {
+        for (self.guest_buffers.items) |*entry| {
+            if (entry.device_local.host_mapping == null) continue;
+            if (!byteRangesOverlap(address, size, entry.guest_address, entry.size)) continue;
+            try self.waitForStorageBufferUse(entry);
+        }
     }
 
     fn synchronizeDrawBatch(self: *Renderer, operation: []const u8) bool {
@@ -24988,6 +25048,53 @@ pub const Renderer = struct {
         self.flushPendingGuestWrite(address, bytes.len) catch return false;
         const memory = self.guest_memory orelse return false;
         return memory.read(memory.context, address, bytes);
+    }
+
+    /// A WAIT_REG_MEM or predicate read observes memory in stream order: every
+    /// command after it is queued behind the release that writes the label.
+    /// Labels still waiting to be published therefore answer with the value
+    /// they will publish, so the command processor need not wait for the
+    /// device. Timestamps are only known once published and still wait.
+    fn dcbReadWait(context: ?*anyopaque, address: u64, bytes: []u8) bool {
+        const self = fromContext(context);
+        if (self.flat_memory_fault_failed or self.sampled_fault_failed) return false;
+        if (!self.readProjectedReleases(address, bytes)) return dcbRead(context, address, bytes);
+        return true;
+    }
+
+    fn readProjectedReleases(self: *Renderer, address: u64, bytes: []u8) bool {
+        if (self.publishing_internal_release) return false;
+        const pending = self.deferred_internal_releases[0..self.deferred_internal_release_count];
+        var covered = false;
+        for (pending) |entry| {
+            if (!byteRangesOverlap(address, bytes.len, entry.release.address, entry.size())) continue;
+            if (entry.fixed == null and entry.release.data_selection != 1) return false;
+            covered = true;
+        }
+        if (!covered) return false;
+        // Deferred labels never overlap a cached guest buffer, so the bytes
+        // around them are CPU-owned and current in guest memory.
+        for (self.guest_buffers.items) |entry| {
+            if (byteRangesOverlap(address, bytes.len, entry.guest_address, entry.size)) return false;
+        }
+        const memory = self.guest_memory orelse return false;
+        if (!memory.read(memory.context, address, bytes)) return false;
+        for (pending) |entry| {
+            const size = entry.size();
+            if (!byteRangesOverlap(address, bytes.len, entry.release.address, size)) continue;
+            var value: [8]u8 = undefined;
+            if (entry.fixed) |fixed| {
+                value = fixed;
+            } else {
+                std.mem.writeInt(u32, value[0..4], @truncate(entry.release.data), .little);
+            }
+            const start = @max(address, entry.release.address);
+            const end = @min(address + bytes.len, entry.release.address + size);
+            const destination = bytes[@intCast(start - address)..@intCast(end - address)];
+            const source_offset: usize = @intCast(start - entry.release.address);
+            @memcpy(destination, value[source_offset..][0..destination.len]);
+        }
+        return true;
     }
 
     fn prepareCmaskWrite(self: *Renderer, address: u64, size: usize) anyerror!void {
@@ -25147,17 +25254,19 @@ pub const Renderer = struct {
 
     fn tryDeferInternalRelease(self: *Renderer, release: gpu.state.ReleaseMem) Error!bool {
         // 64-bit retirement labels have an HLE publication hook; interrupting
-        // releases also wake guest threads. Keep both synchronous here.
+        // releases also wake guest threads. Keep both synchronous here. Cache
+        // flush and invalidate bits need nothing more: device writes reach
+        // guest memory only through writeback, which publication performs.
         if (!self.defer_internal_releases or !self.timeline_scheduler_enabled or
             self.imported_allocations.items.len != 0 or release.interrupt != 0 or
-            release.gcr_control != 0 or release.address == 0 or release.destination > 1 or
+            release.address == 0 or release.destination > 1 or
             (release.data_selection != 1 and release.data_selection != 3 and release.data_selection != 4)) return false;
         const size: usize = if (release.data_selection == 1) 4 else 8;
-        // CPU-consumed compute output must be published before its label. An
-        // aliased buffer also needs the ordinary writeback/invalidation path.
+        // A label inside a cached buffer needs the ordinary writeback and
+        // invalidation path. CPU-consumed compute output written before the
+        // label is published with it, when the label is (drainInternalReleases).
         for (self.guest_buffers.items) |entry| {
-            if ((entry.gpu_dirty and entry.size < deferred_storage_write_min_bytes) or
-                byteRangesOverlap(release.address, size, entry.guest_address, entry.size)) return false;
+            if (byteRangesOverlap(release.address, size, entry.guest_address, entry.size)) return false;
         }
         if (self.deferred_internal_release_count == self.deferred_internal_releases.len)
             try self.drainInternalReleases(self.deferred_internal_release_count);
@@ -25165,17 +25274,65 @@ pub const Renderer = struct {
         self.deferred_internal_releases[self.deferred_internal_release_count] = .{ .tick = self.submitted_tick, .release = release };
         self.deferred_internal_release_count += 1;
         self.internal_releases_deferred +|= 1;
+        try self.publishRetiredInternalReleases();
         return true;
+    }
+
+    /// Publishes, without waiting, the deferred labels whose work the device
+    /// has already finished, so guest threads polling them see completion as
+    /// soon as it happens rather than at the end of their submission.
+    fn publishRetiredInternalReleases(self: *Renderer) Error!void {
+        if (self.deferred_internal_release_count == 0 or self.publishing_internal_release) return;
+        try self.refreshGpuProgress();
+        var count: usize = 0;
+        while (count < self.deferred_internal_release_count and
+            self.deferred_internal_releases[count].tick <= self.completed_tick) count += 1;
+        if (count == 0) return;
+        // Publication writes back small compute output first. Unless all of it
+        // is retired too, that writeback would wait; leave it to a draining
+        // point that is allowed to.
+        for (self.guest_buffers.items) |entry| {
+            if (entry.gpu_dirty and entry.size < deferred_storage_write_min_bytes and
+                entry.last_gpu_use > self.completed_tick) return;
+        }
+        try self.drainInternalReleases(count);
     }
 
     fn drainInternalReleasesForRange(self: *Renderer, address: u64, size: usize) Error!void {
         if (self.publishing_internal_release) return;
         var count: usize = 0;
         for (self.deferred_internal_releases[0..self.deferred_internal_release_count], 0..) |pending, index| {
-            const bytes: usize = if (pending.release.data_selection == 1) 4 else 8;
-            if (byteRangesOverlap(address, size, pending.release.address, bytes)) count = index + 1;
+            if (byteRangesOverlap(address, size, pending.release.address, pending.size())) count = index + 1;
         }
         try self.drainInternalReleases(count);
+    }
+
+    /// Queues a small DMA_DATA write that lands on a label still waiting to be
+    /// published. Written now, it would be overwritten by that older label;
+    /// queued behind it, both reach guest memory in stream order without
+    /// waiting for the device. Returns false when the write must go direct.
+    fn tryDeferDmaOverRelease(self: *Renderer, address: u64, bytes: []const u8) Error!bool {
+        if (bytes.len > 8 or self.publishing_internal_release) return false;
+        const covers_pending = for (self.deferred_internal_releases[0..self.deferred_internal_release_count]) |pending| {
+            if (byteRangesOverlap(address, bytes.len, pending.release.address, pending.size())) break true;
+        } else false;
+        if (!covers_pending) return false;
+        // Cached buffers and images need the ordinary invalidation path.
+        for (self.guest_buffers.items) |entry| {
+            if (byteRangesOverlap(address, bytes.len, entry.guest_address, entry.size)) return false;
+        }
+        if (self.deferred_internal_release_count == self.deferred_internal_releases.len) return false;
+        var entry = DeferredRelease{
+            .tick = self.submitted_tick,
+            .release = std.mem.zeroes(gpu.state.ReleaseMem),
+            .fixed_size = @intCast(bytes.len),
+        };
+        entry.release.address = address;
+        entry.fixed = @splat(0);
+        @memcpy(entry.fixed.?[0..bytes.len], bytes);
+        self.deferred_internal_releases[self.deferred_internal_release_count] = entry;
+        self.deferred_internal_release_count += 1;
+        return true;
     }
 
     fn drainInternalReleases(self: *Renderer, count: usize) Error!void {
@@ -25183,9 +25340,13 @@ pub const Renderer = struct {
         std.debug.assert(count <= self.deferred_internal_release_count);
         // One wait covers this FIFO prefix. Later commands may remain in
         // flight; a label read need only observe its own preceding work.
-        try self.waitForTick(self.deferred_internal_releases[count - 1].tick);
+        const caller = if (self.release_drain_caller != 0) self.release_drain_caller else @returnAddress();
+        try self.waitForTickFrom(self.deferred_internal_releases[count - 1].tick, caller);
         self.publishing_internal_release = true;
         defer self.publishing_internal_release = false;
+        // As at a synchronous release: small compute output a CPU thread reads
+        // after the label must reach guest memory before the label does.
+        if (!self.publishDeferredSmallStorageWrites()) return Error.GuestMemoryWriteFailed;
         var published: usize = 0;
         defer {
             const remaining = self.deferred_internal_release_count - published;
@@ -25193,10 +25354,17 @@ pub const Renderer = struct {
             self.deferred_internal_release_count = remaining;
         }
         while (published < count) : (published += 1) {
-            const release = self.deferred_internal_releases[published].release;
+            const pending = self.deferred_internal_releases[published];
+            const release = pending.release;
+            const size = pending.size();
             var bytes: [8]u8 = undefined;
-            const size: usize = if (release.data_selection == 1) 4 else 8;
-            if (size == 4) std.mem.writeInt(u32, bytes[0..4], @truncate(release.data), .little) else std.mem.writeInt(u64, &bytes, releaseTimestampCounter(), .little);
+            if (pending.fixed) |fixed| {
+                bytes = fixed;
+            } else if (size == 4) {
+                std.mem.writeInt(u32, bytes[0..4], @truncate(release.data), .little);
+            } else {
+                std.mem.writeInt(u64, &bytes, releaseTimestampCounter(), .little);
+            }
             if (!dcbWrite(self, release.address, bytes[0..size])) return Error.GuestMemoryWriteFailed;
         }
     }
@@ -25236,7 +25404,7 @@ pub const Renderer = struct {
         return true;
     }
 
-    fn dcbWait(context: ?*anyopaque, _: gpu.state.WaitRegMem, _: bool) bool {
+    fn dcbWait(context: ?*anyopaque, _: gpu.state.WaitRegMem, satisfied: bool) bool {
         const self = fromContext(context);
         self.wait_callbacks += 1;
         // The command processor has already performed the checked label read.
@@ -25244,6 +25412,19 @@ pub const Renderer = struct {
         // forcing all earlier device work through a host fence here turns a
         // GPU-side dependency into a CPU/GPU round trip. RELEASE_MEM and exact
         // readbacks remain the points that publish device work to the host.
+        //
+        // An unsatisfied wait parks this stream until a CPU thread acts, and
+        // that thread may itself be polling a deferred label from earlier in
+        // the stream. Publish every deferred label before parking.
+        const published = if (satisfied)
+            self.publishRetiredInternalReleases()
+        else
+            self.drainInternalReleases(self.deferred_internal_release_count);
+        published catch |err| {
+            self.last_sync_error = err;
+            std.debug.print("[vulkan dcb] release publication at wait failed: {s}\n", .{@errorName(err)});
+            return false;
+        };
         self.last_sync_error = null;
         return true;
     }
@@ -25304,7 +25485,18 @@ pub const Renderer = struct {
     fn dcbDmaData(context: ?*anyopaque, dma: gpu.state.DmaData) bool {
         const self = fromContext(context);
         self.dma_data_callbacks += 1;
-        if (!self.synchronizeDrawBatch("dma-data")) return false;
+        if (!dmaMovesBytes(dma)) return true;
+        // A CP DMA follows the draws before it in queue order but does not wait
+        // for them to finish; the stream asks for that with its own release
+        // and acquire packets. Record queued work so it snapshots the guest
+        // bytes it was given, and let the exact range flushes below publish
+        // GPU output under the source and destination. Only GDS, whose host
+        // shadow is read without a wait, still needs the whole device idle.
+        const synchronized = if (dma.source == 1 or dma.destination == 1)
+            self.synchronizeDrawBatch("dma-data")
+        else
+            self.recordDrawBatch("dma-data");
+        if (!synchronized) return false;
         if (self.dma_data_callbacks <= 16) {
             std.debug.print(
                 "[vulkan dcb] DMA_DATA #{d} src={d}@0x{x} dst={d}@0x{x} bytes=0x{x}\n",
@@ -25353,7 +25545,9 @@ pub const Renderer = struct {
                 // never mapped), so the packet carries ordering bits only.
                 // Rejecting it aborts the whole DCB before its completion IRQ.
                 if (dma.destination_address < 0x1_0000) return true;
+                if (self.tryDeferDmaOverRelease(dma.destination_address, bytes) catch return false) return true;
                 self.flushPendingGuestWrite(dma.destination_address, byte_count) catch return false;
+                self.waitForMappedReaders(dma.destination_address, byte_count) catch return false;
                 self.prepareCmaskWrite(dma.destination_address, byte_count) catch return false;
                 self.prepareHtileWrite(dma.destination_address, byte_count);
                 if (!memory.write(memory.context, dma.destination_address, bytes)) return false;

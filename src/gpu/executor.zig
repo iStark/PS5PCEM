@@ -393,7 +393,7 @@ pub const DcbExecutor = struct {
                 }
                 const predicate_address = (@as(u64, packet.body[1]) << 32) | packet.body[0];
                 if (predicate_address == 0) return Error.InvalidPacket;
-                if (try self.readU32(predicate_address) == 0) {
+                if (try self.readWaitU32(predicate_address) == 0) {
                     const skip_words: usize = packet.body[3] & 0x3fff;
                     if (skip_words > stream.len - walker.index) return Error.InvalidPacket;
                     walker.index += skip_words;
@@ -510,7 +510,7 @@ pub const DcbExecutor = struct {
             const mask = (@as(u64, body[4]) << 32) | body[3];
             const reference = (@as(u64, body[6]) << 32) | body[5];
             // ALWAYS branches link command arenas without a readable predicate.
-            const observed = if (function == 0) 0 else try self.readU64(compare_address);
+            const observed = if (function == 0) 0 else try self.readWaitU64(compare_address);
             const take_then = compareWait(observed, reference, mask, function);
             if (take_then) {
                 selected_address = then_address;
@@ -1403,21 +1403,27 @@ pub const DcbExecutor = struct {
         }
     }
 
-    fn readU32(self: *DcbExecutor, address: u64) Error!u32 {
+    /// Predicates are read in stream order, like WAIT_REG_MEM operands.
+    fn readWait(self: *DcbExecutor, address: u64, bytes: []u8) Error!void {
+        const callback = self.backend.vtable.read_wait orelse self.backend.vtable.read;
+        if (!callback(self.backend.context, address, bytes)) return Error.MemoryReadFailed;
+    }
+
+    fn readWaitU32(self: *DcbExecutor, address: u64) Error!u32 {
         var bytes: [4]u8 = undefined;
-        try self.backend.read(address, &bytes);
+        try self.readWait(address, &bytes);
         return std.mem.readInt(u32, &bytes, .little);
+    }
+
+    fn readWaitU64(self: *DcbExecutor, address: u64) Error!u64 {
+        var bytes: [8]u8 = undefined;
+        try self.readWait(address, &bytes);
+        return std.mem.readInt(u64, &bytes, .little);
     }
 
     fn readTrackedRegister(self: *DcbExecutor, absolute: u32) u64 {
         const location = registerLocation(absolute) orelse return 0;
         return self.state.readRegister(location.space, location.offset) orelse 0;
-    }
-
-    fn readU64(self: *DcbExecutor, address: u64) Error!u64 {
-        var bytes: [8]u8 = undefined;
-        try self.backend.read(address, &bytes);
-        return std.mem.readInt(u64, &bytes, .little);
     }
 
     fn writeU32(self: *DcbExecutor, address: u64, value: u32) Error!void {

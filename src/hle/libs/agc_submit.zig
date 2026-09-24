@@ -1281,6 +1281,16 @@ fn backendRead(_: ?*anyopaque, address: u64, bytes: []u8) bool {
     return readGuestMemory(null, address, bytes);
 }
 
+/// Stream-ordered operand reads (WAIT_REG_MEM, predicates) may see a label
+/// the backend has queued but not yet published.
+fn backendReadWait(_: ?*anyopaque, address: u64, bytes: []u8) bool {
+    if (installed_backend) |backend| {
+        const callback = backend.vtable.read_wait orelse backend.vtable.read;
+        return callback(backend.context, address, bytes);
+    }
+    return readGuestMemory(null, address, bytes);
+}
+
 /// Publishes a label write into the retained snapshots of both queues.
 ///
 /// Command arenas place synchronization labels beside the packets that read
@@ -1747,6 +1757,7 @@ fn presentUnconsumedConstructedFlip(submission: Submission, outcome: SubmitOutco
 
 const executor_backend_vtable = gpu.DcbBackend.VTable{
     .read = backendRead,
+    .read_wait = backendReadWait,
     .write = backendWrite,
     .acquire = backendAcquire,
     .release = backendRelease,
