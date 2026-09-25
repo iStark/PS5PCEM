@@ -149,11 +149,6 @@ fn collectStorageImages(allocator: std.mem.Allocator, instructions: []const rdna
 pub const Pool = struct {
     pub const maximum_entry_count = 32 * 1024 * 1024 / @sizeOf(scalar.ScalarRegisters);
     entries: [2][]scalar.ScalarRegisters = @splat(&.{}),
-    /// Last walks, keyed by the decoded program and the guest addresses its
-    /// scalar loads read. A repeat with the same bytes copies the snapshots
-    /// instead of stepping the program again.
-    walks: [32]WalkCache = @splat(.{}),
-    next_walk: usize = 0,
     /// Diagnostic control: disabled uses fresh lists and allocations.
     enabled: bool = true,
 
@@ -221,21 +216,13 @@ pub const Pool = struct {
         const snapshots = storage[0..pcs.len];
         var walked: u32 = 0;
         if (pcs.len != 0) {
-            const user_hash = hashUserData(bindings);
-            if (self.recallWalk(instructions, kind, user_hash, reader, snapshots)) {
-                walked = 0;
-            } else {
-                // The evaluator overwrites visited snapshots and clears skipped
-                // blocks before returning. No values live across preparations,
-                // even after an early stop or failed read.
-                const steps = if (plan_reused) plan.?.scalar_steps else null;
-                const evaluation = scalar.evaluateDecodedResourceStateAtCheckpoints(reader, bindings, instructions, pcs, snapshots, steps);
-                walked = evaluation.instruction_count;
-                self.rememberWalk(allocator, instructions, kind, user_hash, &evaluation, snapshots) catch |err| {
-                    allocator.free(storage);
-                    return err;
-                };
-            }
+            // The evaluator overwrites visited snapshots and clears skipped
+            // blocks before returning. No values live across preparations,
+            // even after an early stop or failed read. Scalar steps skip
+            // vector instructions that cannot change those snapshots.
+            const steps = if (plan_reused) plan.?.scalar_steps else null;
+            const evaluation = scalar.evaluateDecodedResourceStateAtCheckpoints(reader, bindings, instructions, pcs, snapshots, steps);
+            walked = evaluation.instruction_count;
         }
         return .{
             .pcs = pcs,
@@ -256,127 +243,8 @@ pub const Pool = struct {
             allocator.free(entry.*);
             entry.* = &.{};
         }
-        for (&self.walks) |*walk| walk.deinit(allocator);
-    }
-
-    fn recallWalk(
-        self: *const Pool,
-        instructions: []const rdna2.Instruction,
-        kind: Kind,
-        user_hash: u64,
-        reader: shaders.MemoryReader,
-        snapshots: []scalar.ScalarRegisters,
-    ) bool {
-        if (!self.enabled) return false;
-        for (self.walks) |walk| {
-            if (!walk.occupied or walk.instructions != instructions.ptr or walk.instruction_len != instructions.len) continue;
-            if (walk.kind != kind or walk.user_hash != user_hash or walk.snapshots.len != snapshots.len) continue;
-            const current = hashLiveLoads(reader, walk.loads) orelse continue;
-            if (current != walk.load_hash) continue;
-            for (snapshots, walk.snapshots) |*destination, source| destination.* = source;
-            return true;
-        }
-        return false;
-    }
-
-    fn rememberWalk(
-        self: *Pool,
-        allocator: std.mem.Allocator,
-        instructions: []const rdna2.Instruction,
-        kind: Kind,
-        user_hash: u64,
-        evaluation: *const scalar.Evaluation,
-        snapshots: []const scalar.ScalarRegisters,
-    ) !void {
-        if (!self.enabled or snapshots.len == 0 or evaluation.memory_read_failed) return;
-        if (evaluation.stop_reason == .inaccessible_memory or evaluation.stop_reason == .invalid_address) return;
-        var reusable: ?usize = null;
-        for (self.walks, 0..) |walk, index| {
-            if (walk.occupied and walk.instructions == instructions.ptr and walk.instruction_len == instructions.len and walk.kind == kind) {
-                reusable = index;
-                break;
-            }
-            if (!walk.occupied and reusable == null) reusable = index;
-        }
-        const index = reusable orelse slot: {
-            const slot = self.next_walk % self.walks.len;
-            self.next_walk +%= 1;
-            break :slot slot;
-        };
-        const walk = &self.walks[index];
-        if (walk.occupied) walk.deinit(allocator);
-        const recorded = evaluation.loadSlice();
-        const loads = try allocator.alloc(LoadRef, recorded.len);
-        errdefer allocator.free(loads);
-        for (loads, recorded) |*destination, source| {
-            destination.* = .{ .address = source.address, .words = @intCast(@min(source.word_count, 16)) };
-        }
-        const copy = try allocator.alloc(scalar.ScalarRegisters, snapshots.len);
-        errdefer allocator.free(copy);
-        @memcpy(copy, snapshots);
-        walk.* = .{
-            .instructions = instructions.ptr,
-            .instruction_len = instructions.len,
-            .kind = kind,
-            .user_hash = user_hash,
-            .load_hash = hashRecordedLoads(recorded),
-            .loads = loads,
-            .snapshots = copy,
-            .occupied = true,
-        };
     }
 };
-
-const LoadRef = struct { address: u64, words: u8 };
-
-const WalkCache = struct {
-    instructions: [*]const rdna2.Instruction = undefined,
-    instruction_len: usize = 0,
-    kind: Kind = .resource,
-    user_hash: u64 = 0,
-    load_hash: u64 = 0,
-    loads: []LoadRef = &.{},
-    snapshots: []scalar.ScalarRegisters = &.{},
-    occupied: bool = false,
-
-    fn deinit(self: *WalkCache, allocator: std.mem.Allocator) void {
-        allocator.free(self.loads);
-        allocator.free(self.snapshots);
-        self.* = .{};
-    }
-};
-
-fn hashUserData(bindings: *const shaders.StageBindings) u64 {
-    var hasher = std.hash.Wyhash.init(bindings.program_address);
-    hasher.update(std.mem.sliceAsBytes(bindings.user_data[0..bindings.user_data_count]));
-    hasher.update(std.mem.asBytes(&bindings.scalar_user_data_base));
-    hasher.update(std.mem.asBytes(&bindings.resource_instruction_budget));
-    return hasher.final();
-}
-
-fn hashRecordedLoads(loads: []const scalar.ScalarLoad) u64 {
-    var hasher = std.hash.Wyhash.init(loads.len);
-    for (loads) |load| {
-        const words = @min(load.word_count, 16);
-        hasher.update(std.mem.asBytes(&load.address));
-        hasher.update(std.mem.sliceAsBytes(load.values[0..words]));
-    }
-    return hasher.final();
-}
-
-fn hashLiveLoads(reader: shaders.MemoryReader, loads: []const LoadRef) ?u64 {
-    var hasher = std.hash.Wyhash.init(loads.len);
-    for (loads) |load| {
-        var words: [16]u32 = undefined;
-        var index: usize = 0;
-        while (index < load.words) : (index += 1) {
-            words[index] = reader.readU32(load.address + index * 4) catch return null;
-        }
-        hasher.update(std.mem.asBytes(&load.address));
-        hasher.update(std.mem.sliceAsBytes(words[0..load.words]));
-    }
-    return hasher.final();
-}
 
 pub fn needsCheckpoint(inst: rdna2.Instruction, kind: Kind) bool {
     return switch (kind) {
@@ -529,9 +397,7 @@ test "checkpoint reuse keeps guest reads fresh and clears skipped or failed stat
         defer reused.release();
         try std.testing.expect(reused.plan_reused);
         try std.testing.expectEqual(iteration != 0, reused.scratch_reused);
-        // A rejected address-cache probe reads every recorded scalar load, then
-        // the walk reads those loads again. A hit stops after the probe.
-        try std.testing.expect(memory.reads >= expected_reads and memory.reads <= expected_reads * 2);
+        try std.testing.expectEqual(expected_reads, memory.reads);
         try std.testing.expectEqualSlices(u32, fresh.pcs, reused.pcs);
         try std.testing.expectEqualDeep(fresh.snapshots, reused.snapshots);
         try std.testing.expectEqual(@as(usize, 2), reused.pcs.len);
@@ -697,6 +563,6 @@ test "scalar steps skip vector instructions and a repeated walk reuses the load 
     try std.testing.expectEqual(@as(u32, 9), first.snapshots[0][4].value);
     var second = try pool.prepare(allocator, &instructions, &plan, .resource, memory.reader(), &bindings);
     defer second.release();
-    try std.testing.expectEqual(@as(u32, 0), second.instructions_walked);
+    try std.testing.expectEqual(first.instructions_walked, second.instructions_walked);
     try std.testing.expectEqual(@as(u32, 9), second.snapshots[0][4].value);
 }
