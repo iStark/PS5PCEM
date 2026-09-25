@@ -83,7 +83,11 @@ found, and can invoke the package extractor on a debug package directly.
     </td>
   </tr>
   <tr>
-    <td colspan="2" align="center">
+    <td width="50%" align="center">
+      <img src="docs/images/yotei-character-scene.png" alt="Ghost of Yotei scene with masked characters captured from PS5PCEM"><br>
+      <sub>Ghost of Yotei &mdash; character scene (development capture, September 26, 2026; rendering artifacts remain)</sub>
+    </td>
+    <td width="50%" align="center">
       <img src="docs/images/yotei-tree-scene.png" alt="Ghost of Yotei tree scene captured from PS5PCEM"><br>
       <sub>Ghost of Yotei &mdash; tree scene (development capture, September 23, 2026)</sub>
     </td>
