@@ -3173,6 +3173,9 @@ const ComputeResources = struct {
     flat_memory_fault: ?DrawUploadSlice = null,
     sampled_image_fault: ?DrawUploadSlice = null,
     storage_images: [maximum_storage_images]PreparedStorageImage = undefined,
+    /// Parallel to `storage_images`. Equal keys still confirm every field;
+    /// the key only skips the ones that cannot match.
+    storage_image_keys: [maximum_storage_images]u64 = @splat(0),
     storage_image_count: usize = 0,
     // One resident image may be loaded into the same T# SGPR range at several
     // instruction PCs. Keep physical Vulkan images bounded separately from the
@@ -10396,25 +10399,15 @@ pub const Renderer = struct {
             };
             var descriptor_index: ?u32 = null;
             const dedup_started = hostTimestampNs();
+            const dedup_key = storageImageDedupKey(descriptor);
             self.frame_profile.compute_image_dedup_steps +|= result.storage_image_count;
-            defer self.frame_profile.compute_image_dedup_ns +|= elapsedHostNanoseconds(dedup_started);
-            for (result.storage_images[0..result.storage_image_count], 0..) |*existing, index| {
-                if (existing.descriptor.address == descriptor.address and
-                    existing.descriptor.width == descriptor.width and
-                    existing.descriptor.height == descriptor.height and
-                    existing.descriptor.depth_or_layers == descriptor.depth_or_layers and
-                    existing.descriptor.unified_format == descriptor.unified_format and
-                    existing.descriptor.tile_mode == descriptor.tile_mode and
-                    existing.descriptor.image_type == descriptor.image_type and
-                    existing.descriptor.viewBaseLevel() == descriptor.viewBaseLevel() and
-                    existing.descriptor.viewMipLevels() == descriptor.viewMipLevels() and
-                    existing.descriptor.base_array == descriptor.base_array)
-                {
-                    if (writable) existing.writable = true;
-                    descriptor_index = @intCast(index);
-                    break;
-                }
+            for (result.storage_images[0..result.storage_image_count], result.storage_image_keys[0..result.storage_image_count], 0..) |*existing, key, index| {
+                if (key != dedup_key or !sameStorageImageBinding(existing.descriptor, descriptor)) continue;
+                if (writable) existing.writable = true;
+                descriptor_index = @intCast(index);
+                break;
             }
+            self.frame_profile.compute_image_dedup_ns +|= elapsedHostNanoseconds(dedup_started);
             if (descriptor_index == null) {
                 if (result.storage_image_count >= maximum_storage_images) {
                     std.debug.print(
@@ -10424,6 +10417,7 @@ pub const Renderer = struct {
                     return Error.StorageImageCapacityExceeded;
                 }
                 const index: u32 = @intCast(result.storage_image_count);
+                result.storage_image_keys[index] = dedup_key;
                 self.frame_profile.staged_images.note(descriptor.address);
                 const stage_started = hostTimestampNs();
                 result.storage_images[result.storage_image_count] = self.stageStorageImage(
@@ -20573,6 +20567,13 @@ pub const Renderer = struct {
             if (memory.gpu_generation) |generation| {
                 if (generation(memory.context, cached.descriptor.address, cached.allocation_bytes) == cached.guest_page_generation) return false;
             }
+        } else if (cached.guest_content_hash_valid and memory.fingerprint == null) {
+            // Nothing has cleared the hash since the image was uploaded or
+            // published, and this guest has no in-place fingerprint. Reading
+            // the allocation here only to hash it repeats a result we already
+            // stored. A command-processor write drops the flag; the page
+            // tracker, when enabled, takes the generation path above.
+            return false;
         }
         // Native memory can fingerprint the backing without copying or detiling
         // it. Only a changed allocation needs the more expensive texel check.
@@ -21234,6 +21235,8 @@ pub const Renderer = struct {
             // copying the complete allocation into a temporary host buffer.
             const unchanged = if (guest_page_generation != 0)
                 cached.guest_page_generation == guest_page_generation
+            else if (cached.guest_content_hash_valid and memory.fingerprint == null)
+                true
             else if (cached.guest_content_hash_valid)
                 if (memory.fingerprint) |fingerprint| fingerprint(memory.context, descriptor.address, allocation_bytes) == cached.guest_content_hash else false
             else
@@ -29634,6 +29637,38 @@ fn storageImageOverlapsSampledDescriptor(a: gpu.ImageDescriptor, b: gpu.ImageDes
         storageImageTypesCanAlias(a.image_type, b.image_type) and
         a.viewBaseLevel() == b.viewBaseLevel() and
         a.viewMipLevels() == b.viewMipLevels();
+}
+
+fn storageImageDedupKey(descriptor: gpu.ImageDescriptor) u64 {
+    var key = descriptor.address;
+    key *%= 0x9e3779b97f4a7c15;
+    key ^= descriptor.width;
+    key *%= 0xbf58476d1ce4e5b9;
+    key ^= descriptor.height;
+    key ^= @as(u64, descriptor.depth_or_layers) << 32;
+    key ^= @as(u64, descriptor.unified_format) << 17;
+    key ^= @as(u64, @intFromEnum(descriptor.tile_mode));
+    key ^= @as(u64, @intFromEnum(descriptor.image_type)) << 8;
+    key ^= @as(u64, descriptor.viewBaseLevel()) << 24;
+    key ^= @as(u64, descriptor.viewMipLevels()) << 40;
+    key ^= @as(u64, descriptor.base_array) << 48;
+    return key;
+}
+
+/// Fields the compute storage-image pass uses to reuse one physical image.
+/// Tile mode stays in the key: two T#s of one allocation can still disagree
+/// on tiling and must not share a descriptor slot inside one dispatch.
+fn sameStorageImageBinding(a: gpu.ImageDescriptor, b: gpu.ImageDescriptor) bool {
+    return a.address == b.address and
+        a.width == b.width and
+        a.height == b.height and
+        a.depth_or_layers == b.depth_or_layers and
+        a.unified_format == b.unified_format and
+        a.tile_mode == b.tile_mode and
+        a.image_type == b.image_type and
+        a.viewBaseLevel() == b.viewBaseLevel() and
+        a.viewMipLevels() == b.viewMipLevels() and
+        a.base_array == b.base_array;
 }
 
 fn sameStorageImageDescriptor(a: gpu.ImageDescriptor, b: gpu.ImageDescriptor) bool {
