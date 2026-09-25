@@ -290,6 +290,7 @@ pub const ScalarDefinitionCache = struct {
     allocation_failed: bool = false,
     bounds: std.AutoHashMapUnmanaged(Key, ?u32) = .empty,
     lanes: std.AutoHashMapUnmanaged(LaneKey, ?LaneDefinitions) = .empty,
+    vector_origins: std.AutoHashMapUnmanaged(Key, ?VectorEntryOrigins) = .empty,
     index_allocation_failed: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, instructions: []const Instruction, graph: *const Graph) ScalarDefinitionCache {
@@ -301,6 +302,20 @@ pub const ScalarDefinitionCache = struct {
         self.saved_origins.deinit(self.allocator);
         self.bounds.deinit(self.allocator);
         self.lanes.deinit(self.allocator);
+        self.vector_origins.deinit(self.allocator);
+    }
+
+    pub fn vectorEntryOrigins(self: *ScalarDefinitionCache, before: usize, register: u32) ?VectorEntryOrigins {
+        if (!static_query_cache_enabled.load(.monotonic)) return vectorOrigins(self.instructions, &self.graph, before, register, 0);
+        const key = Key{ .before = before, .register = register };
+        if (self.vector_origins.get(key)) |value| return value;
+        const value = vectorOrigins(self.instructions, &self.graph, before, register, 0);
+        if (!self.index_allocation_failed and self.vector_origins.count() < maximum_index_queries) {
+            self.vector_origins.put(self.allocator, key, value) catch {
+                self.index_allocation_failed = true;
+            };
+        }
+        return value;
     }
 
     pub fn indexUpperBound(self: *ScalarDefinitionCache, before: usize, register: u32) ?u32 {
@@ -899,6 +914,120 @@ fn requiresFallthrough(graph: *const Graph, definition: usize, use: usize, guard
 
 /// Exclusive upper bound of an SGPR on shader entry.
 pub const EntryBound = struct { register: u32, limit: u32 };
+
+/// A value selected only from unchanged entry VGPRs and integer constants.
+/// This proof is shader-local; actual draw limits are never cached with it.
+pub const VectorEntryOrigins = struct {
+    registers: u256 = 0,
+    constant_max: u32 = 0,
+
+    pub fn upperBound(self: VectorEntryOrigins, entries: []const EntryBound) ?u32 {
+        var remaining = self.registers;
+        var maximum = self.constant_max;
+        for (entries) |entry| {
+            if (entry.register >= 256 or entry.limit == 0) continue;
+            const bit = @as(u256, 1) << @as(u8, @intCast(entry.register));
+            if (remaining & bit == 0) continue;
+            maximum = @max(maximum, entry.limit - 1);
+            remaining &= ~bit;
+        }
+        if (remaining != 0) return null;
+        return std.math.add(u32, maximum, 1) catch null;
+    }
+};
+
+fn plainVectorOperand(op: rdna2.Operand) bool {
+    return !op.absolute and !op.negate and !op.negate_hi and !op.dpp and !op.dpp8 and
+        !op.op_sel and !op.op_sel_hi and !op.sdwa_sext and op.sdwa_sel == 6 and
+        op.omod == 0 and !op.clamp;
+}
+
+fn operandVectorOrigins(instructions: []const Instruction, graph: *const Graph, before: usize, op: rdna2.Operand, depth: u8) ?VectorEntryOrigins {
+    if (!plainVectorOperand(op)) return null;
+    if (immediate(op)) |value| return .{ .constant_max = value };
+    if (op.kind != .vgpr) return null;
+    return vectorOrigins(instructions, graph, before, op.reg, depth);
+}
+
+/// Follow MOV/CNDMASK only, preserving control-flow and EXEC coverage proofs.
+/// Unknown arithmetic, memory indices, partial writes and loop-carried values
+/// deliberately retain the full descriptor instead of guessing a mesh index.
+pub fn vectorOrigins(instructions: []const Instruction, graph: *const Graph, before: usize, register: u32, depth: u8) ?VectorEntryOrigins {
+    if (depth >= 16 or register >= 256) return null;
+    const incoming = reachingDefinitions(instructions, graph, before, .{ .register = register, .lane = std.math.maxInt(u32) }) orelse return null;
+    if (incoming.entry and incoming.count == 0) return .{ .registers = @as(u256, 1) << @as(u8, @intCast(register)) };
+    const definitions = vectorLaneDefinitions(instructions, graph, before, register) orelse return null;
+    var result = VectorEntryOrigins{};
+    for (definitions.items[0..definitions.count]) |definition| {
+        const inst = instructions[definition.instruction];
+        if (definition.component != 0 or !plainVectorOperand(inst.dst)) return null;
+        if (inst.opcode != .v_mov_b32 and inst.opcode != .v_cndmask_b32) return null;
+        const a = operandVectorOrigins(instructions, graph, definition.instruction, inst.src0, depth + 1) orelse return null;
+        result.registers |= a.registers;
+        result.constant_max = @max(result.constant_max, a.constant_max);
+        if (inst.opcode == .v_cndmask_b32) {
+            const b = operandVectorOrigins(instructions, graph, definition.instruction, inst.src1, depth + 1) orelse return null;
+            result.registers |= b.registers;
+            result.constant_max = @max(result.constant_max, b.constant_max);
+        }
+    }
+    return result;
+}
+
+test "vertex fetch origins cache proofs but not changing draw limits" {
+    const v5 = rdna2.Operand{ .kind = .vgpr, .reg = 5 };
+    const v8 = rdna2.Operand{ .kind = .vgpr, .reg = 8 };
+    const v0 = rdna2.Operand{ .kind = .vgpr, .reg = 0 };
+    const instructions = [_]Instruction{
+        .{ .pc = 0, .opcode = .v_cndmask_b32, .dst = v0, .src0 = v8, .src1 = v5 },
+        .{ .pc = 4, .opcode = .v_mov_b32, .dst = .{ .kind = .vgpr, .reg = 1 }, .src0 = v0 },
+        .{ .pc = 8, .opcode = .s_endpgm },
+    };
+    var graph = try rdna2.control_flow.buildInstructions(std.testing.allocator, &instructions);
+    defer graph.deinit(std.testing.allocator);
+    var cache = ScalarDefinitionCache.init(std.testing.allocator, &instructions, &graph);
+    defer cache.deinit();
+    for ([_]u32{ 12, 320, 3 }) |vertices| {
+        const origins = cache.vectorEntryOrigins(2, 1).?;
+        try std.testing.expectEqual(@as(?u32, @max(vertices, 7)), origins.upperBound(&.{ .{ .register = 5, .limit = vertices }, .{ .register = 8, .limit = 7 } }));
+        try std.testing.expect(origins.upperBound(&.{.{ .register = 5, .limit = vertices }}) == null);
+    }
+    try std.testing.expectEqual(@as(u32, 1), cache.vector_origins.count());
+    try std.testing.expect((VectorEntryOrigins{ .constant_max = std.math.maxInt(u32) }).upperBound(&.{}) == null);
+}
+
+test "vertex fetch origins reject unknown lanes, modifiers and loop-carried indices" {
+    const v0 = rdna2.Operand{ .kind = .vgpr, .reg = 0 };
+    const exec = rdna2.Operand{ .kind = .exec_lo };
+    const saved = rdna2.Operand{ .kind = .sgpr, .reg = 10 };
+    var instructions = [_]Instruction{
+        .{ .pc = 0, .opcode = .s_mov_b64, .dst = saved, .src0 = exec },
+        .{ .pc = 4, .opcode = .s_nop },
+        .{ .pc = 8, .opcode = .v_mov_b32, .dst = v0, .src0 = .{ .kind = .vgpr, .reg = 5 } },
+        .{ .pc = 12, .opcode = .s_nop },
+        .{ .pc = 16, .opcode = .s_endpgm },
+    };
+    var graph = try rdna2.control_flow.buildInstructions(std.testing.allocator, &instructions);
+    defer graph.deinit(std.testing.allocator);
+    try std.testing.expect(vectorOrigins(&instructions, &graph, 4, 0, 0) != null);
+    instructions[2].src0.dpp8 = true;
+    try std.testing.expect(vectorOrigins(&instructions, &graph, 4, 0, 0) == null);
+    instructions[2].src0.dpp8 = false;
+    instructions[2].dst.sdwa_sel = 4;
+    try std.testing.expect(vectorOrigins(&instructions, &graph, 4, 0, 0) == null);
+    instructions[2].dst.sdwa_sel = 6;
+    instructions[1] = .{ .pc = 4, .opcode = .s_and_saveexec_b64, .dst = saved, .src0 = .{ .kind = .integer_inline_constant, .value = 1 } };
+    instructions[3] = .{ .pc = 12, .opcode = .s_mov_b64, .dst = exec, .src0 = saved };
+    try std.testing.expect(vectorOrigins(&instructions, &graph, 4, 0, 0) == null);
+    instructions[1] = .{ .pc = 4, .opcode = .s_nop };
+    instructions[3] = .{ .pc = 12, .opcode = .s_cbranch_scc1, .branch_target = 8 };
+    instructions[2].src0 = v0;
+    var loop = try rdna2.control_flow.buildInstructions(std.testing.allocator, &instructions);
+    defer loop.deinit(std.testing.allocator);
+    try std.testing.expect(vectorOrigins(&instructions, &loop, 4, 0, 0) == null);
+    instructions[2].opcode = .buffer_load_dword;
+    try std.testing.expect(vectorOrigins(&instructions, &loop, 4, 0, 0) == null);
+}
 
 /// Follow the actual reaching definition back to a bounded system input.
 /// Reusing an SGPR later in the shader must not reuse its entry bound.

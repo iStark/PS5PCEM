@@ -67,6 +67,7 @@ const download_data_home = "out/download0";
 const terminator_2d_title_id = "PPSA25872";
 const tetris_effect_connected_title_id = "PPSA07923";
 const yotei_title_id = "PPSA26344";
+const quake_ii_title_id = "PPSA09477";
 const terminator_audio_latency_ms: u16 = 128;
 
 /// Compatibility stays the global default, while profiles enable only paths
@@ -667,8 +668,19 @@ fn run(init: std.process.Init) !bool {
         const request = std.mem.trim(u8, text, " \t\r\n");
         break :enabled request.len != 0 and !std.mem.eql(u8, request, "0");
     } else |_| true;
-    const enable_gpu_page_tracker = enable_gpu_experimental or
-        (init.minimal.environ.containsUnempty(allocator, "PS5_GPU_PAGE_TRACKER") catch false);
+    // Quake's static arenas and small model views benefit from page-tracked
+    // retained buffers. Keep this measured profile local to the tested title;
+    // explicit zero values allow each optimization to be disabled separately.
+    const use_quake_buffer_profile = std.ascii.eqlIgnoreCase(title_identifier, quake_ii_title_id);
+    const enable_gpu_page_tracker = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_PAGE_TRACKER")) |text| enabled: {
+        defer allocator.free(text);
+        const request = std.mem.trim(u8, text, " \t\r\n");
+        break :enabled request.len != 0 and !std.mem.eql(u8, request, "0");
+    } else |_| enable_gpu_experimental or use_quake_buffer_profile;
+    const bound_vertex_fetches = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_BOUND_VERTEX_FETCHES")) |text| enabled: {
+        defer allocator.free(text);
+        break :enabled text.len != 0 and !std.mem.eql(u8, text, "0");
+    } else |_| use_quake_buffer_profile;
     const enable_host_import = !enable_gpu_page_tracker and builtin.os.tag == .windows and
         (init.minimal.environ.containsUnempty(allocator, "PS5_GPU_HOST_IMPORT") catch false);
     // Yotei repeatedly binds multi-megabyte material buffers whose contents
@@ -720,10 +732,11 @@ fn run(init: std.process.Init) !bool {
         defer allocator.free(text);
         break :parse std.math.clamp(std.fmt.parseInt(usize, text, 10) catch default_graphics_translation_mib, 64, 1024);
     } else |_| default_graphics_translation_mib;
+    const default_device_storage_mib: usize = if (use_quake_buffer_profile) 512 else 0;
     const device_storage_mib: usize = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_DEVICE_STORAGE_MIB")) |text| parse: {
         defer allocator.free(text);
-        break :parse @min(std.fmt.parseInt(usize, text, 10) catch 0, 2048);
-    } else |_| 0;
+        break :parse @min(std.fmt.parseInt(usize, text, 10) catch default_device_storage_mib, 2048);
+    } else |_| default_device_storage_mib;
     const device_storage_min_kib: usize = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_DEVICE_STORAGE_MIN_KIB")) |text| parse: {
         defer allocator.free(text);
         break :parse @min(std.fmt.parseInt(usize, text, 10) catch 256, 65536);
@@ -743,7 +756,7 @@ fn run(init: std.process.Init) !bool {
     const retain_storage_buffers = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_RETAIN_STORAGE_BUFFERS")) |text| parse: {
         defer allocator.free(text);
         break :parse text.len != 0 and !std.mem.eql(u8, text, "0");
-    } else |_| false;
+    } else |_| use_quake_buffer_profile;
     const storage_buffer_cache_mib = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_STORAGE_BUFFER_CACHE_MIB")) |text| parse: {
         defer allocator.free(text);
         break :parse std.math.clamp(std.fmt.parseInt(usize, text, 10) catch 4096, 128, 4096);
@@ -839,6 +852,8 @@ fn run(init: std.process.Init) !bool {
             .storage_buffer_rename_budget_bytes = storage_rename_mib * 1024 * 1024,
             .queued_host_storage_uploads = queued_host_storage_uploads,
             .retain_clean_storage_buffers = retain_storage_buffers,
+            .cache_storage_buffer_contents = enable_gpu_buffer_content_cache,
+            .bound_vertex_fetches = bound_vertex_fetches,
             .storage_buffer_cache_budget_bytes = storage_buffer_cache_mib * 1024 * 1024,
             .enable_host_import = enable_host_import,
             .native_window = .{
@@ -878,9 +893,9 @@ fn run(init: std.process.Init) !bool {
             .context = if (enable_gpu_page_tracker) address_space else null,
             .read = runtime.firmware.libs.agc_submit.readGuestMemory,
             .write = runtime.firmware.libs.agc_submit.writeGuestMemory,
-            // In-place fingerprints let an unchanged GPU buffer stay bound.
-            // Without this, every graphics draw reads the guest bytes back
-            // into a new upload after a readback of the same device copy.
+            // Images must detect native CPU writes even without page tracking.
+            // Repeated full-buffer hashing is controlled separately by
+            // cache_storage_buffer_contents: it can cost more than uploads.
             .fingerprint = runtime.firmware.libs.agc_submit.fingerprintGuestMemory,
             .shader_header = runtime.firmware.libs.agc_submit.findShaderHeader,
             .track_gpu_read = if (enable_gpu_page_tracker)
@@ -914,6 +929,9 @@ fn run(init: std.process.Init) !bool {
         try out.print("  scanout channel order uses the registered buffer set\n", .{});
         try out.print("  pipeline compiler workers={d} warmup={s}\n", .{ pipeline_compiler_workers, compute_warmup_directory orelse "disabled" });
         try out.print("  command processors={d}, bounded lookahead=4 per queue\n", .{if (parallel_commands) @as(u8, 2) else 0});
+        try out.print("  buffer profile quake={d} retain={d} bounded_vertex={d} device_mib={d}\n", .{
+            @intFromBool(use_quake_buffer_profile), @intFromBool(retain_storage_buffers), @intFromBool(bound_vertex_fetches), device_storage_mib,
+        });
         try out.print(
             "  GPU flags ir={d} ssa={d} async_pso={d} aliases={d} depth_io={d} image_state_opt={d} timeline={d} timeline_auto={d} defer_storage={d} defer_storage_auto={d} page_tracker={d} buffer_content_cache={d} copy_workers={d} render_targets={d} storage_image_mib={d} compute_translation_mib={d} graphics_translation_mib={d}\n",
             .{

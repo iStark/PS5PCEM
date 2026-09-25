@@ -967,7 +967,15 @@ pub const AddressSpace = struct {
         defer tracker.lock.unlock();
         if (!tracker.enabled) return false;
         const tracked = tracker.pages.getPtr(page) orelse return false;
-        if (!tracked.armed or !tracked.restore_protection.write) return false;
+        if (!tracked.restore_protection.write) return false;
+        if (!tracked.armed) {
+            // Two writers can fault before either handler gets this lock.
+            // The first handler (or an HLE write) already restored access;
+            // the second must retry its store instead of killing the guest.
+            // Only accept a now-writable host address: unrelated protection
+            // faults and unmapped pages still belong to the normal handler.
+            return windowsRangeAccessible(fault_address, 1, .write);
+        }
         hostProtect(page, page_size, tracked.restore_protection) catch return false;
         tracked.armed = false;
         tracked.generation = tracker.nextGeneration();
@@ -2451,6 +2459,30 @@ test "GPU page tracker advances generations on HLE and native writes" {
     try space.unmap(address, 2 * page_size);
     try testing.expect(space.gpuTrackingEpoch() != before_unmap);
     try testing.expectEqual(@as(u64, 0), space.gpuGeneration(address, @intCast(2 * page_size)));
+}
+
+test "GPU page tracker accepts a delayed write fault only after access was restored" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    var space = try AddressSpace.init(testing.allocator);
+    defer space.deinit();
+    const address = system_managed.start + 4 * page_size;
+    try space.mapFixed(address, page_size, .read_write, .private, null);
+    space.enableGpuMemoryTracking();
+    _ = try space.trackGpuRead(address, 4);
+    try testing.expect(space.handleGpuTrackedWriteFault(address));
+    const epoch = space.gpuTrackingEpoch();
+    // A second exception was raised before the first handler disarmed it.
+    try testing.expect(space.handleGpuTrackedWriteFault(address + 4));
+    try testing.expectEqual(epoch, space.gpuTrackingEpoch());
+    try testing.expectEqual(@as(u64, 0), space.gpuGeneration(address, 4));
+    // Do not swallow a real protection fault merely because a watch existed.
+    try hostProtect(address, page_size, .read_only);
+    try testing.expect(!space.handleGpuTrackedWriteFault(address));
+    try space.protect(address, page_size, .read_only);
+    _ = try space.trackGpuRead(address, 4);
+    try testing.expect(!space.handleGpuTrackedWriteFault(address));
+    try space.unmap(address, page_size);
+    try testing.expect(!space.handleGpuTrackedWriteFault(address));
 }
 
 test "automatic mappings use aligned first fit in the requested area" {

@@ -154,6 +154,28 @@ pub const Evaluation = struct {
     /// preparation might be able to read, so that walk must not be cached.
     memory_read_failed: bool = false,
 
+    /// Load storage is read only through load_count. Do not copy/clear all 512
+    /// records merely to start a fresh draw-local scalar walk.
+    pub fn reset(self: *Evaluation) void {
+        @memset(&self.registers, .{});
+        self.load_count = 0;
+        self.instruction_count = 0;
+        self.stop_pc = 0;
+        self.stop_reason = .instruction_limit;
+        self.memory_read_failed = false;
+    }
+
+    pub fn copyFrom(self: *Evaluation, source_: *const Evaluation) void {
+        if (self == source_) return;
+        self.registers = source_.registers;
+        @memcpy(self.loads[0..source_.load_count], source_.loadSlice());
+        self.load_count = source_.load_count;
+        self.instruction_count = source_.instruction_count;
+        self.stop_pc = source_.stop_pc;
+        self.stop_reason = source_.stop_reason;
+        self.memory_read_failed = source_.memory_read_failed;
+    }
+
     pub fn register(self: *const Evaluation, index: u8) ?ScalarValue {
         const value = self.registers[index];
         return if (value.known) value else null;
@@ -423,6 +445,15 @@ pub fn evaluateDecodedResourceState(
     return evaluate(reader, bindings, null, true, instructions, null, null);
 }
 
+pub fn evaluateDecodedResourceStateInto(
+    result: *Evaluation,
+    reader: shaders.MemoryReader,
+    bindings: *const shaders.StageBindings,
+    instructions: []const rdna2.Instruction,
+) void {
+    evaluateInto(result, reader, bindings, null, true, instructions, null, null);
+}
+
 const RegisterCheckpointCollector = struct {
     pcs: []const u32,
     snapshots: []ScalarRegisters,
@@ -478,14 +509,27 @@ pub fn evaluateDecodedResourceStateAtCheckpoints(
     snapshots: []ScalarRegisters,
     steps: ?[]const u32,
 ) Evaluation {
+    var result: Evaluation = undefined;
+    evaluateDecodedResourceStateAtCheckpointsInto(&result, reader, bindings, instructions, checkpoint_pcs, snapshots, steps);
+    return result;
+}
+
+pub fn evaluateDecodedResourceStateAtCheckpointsInto(
+    result: *Evaluation,
+    reader: shaders.MemoryReader,
+    bindings: *const shaders.StageBindings,
+    instructions: []const rdna2.Instruction,
+    checkpoint_pcs: []const u32,
+    snapshots: []ScalarRegisters,
+    steps: ?[]const u32,
+) void {
     std.debug.assert(checkpoint_pcs.len == snapshots.len);
     var collector = RegisterCheckpointCollector{
         .pcs = checkpoint_pcs,
         .snapshots = snapshots,
     };
-    const result = evaluate(reader, bindings, null, true, instructions, &collector, steps);
-    collector.finish(&result);
-    return result;
+    evaluateInto(result, reader, bindings, null, true, instructions, &collector, steps);
+    collector.finish(result);
 }
 
 /// Recovers descriptor state immediately before one vector-memory instruction.
@@ -559,7 +603,22 @@ fn evaluate(
     checkpoint_collector: ?*RegisterCheckpointCollector,
     steps: ?[]const u32,
 ) Evaluation {
-    var result = Evaluation{};
+    var result: Evaluation = undefined;
+    evaluateInto(&result, reader, bindings, end_pc, follow_lane_mask_fallthrough, decoded_instructions, checkpoint_collector, steps);
+    return result;
+}
+
+fn evaluateInto(
+    result: *Evaluation,
+    reader: shaders.MemoryReader,
+    bindings: *const shaders.StageBindings,
+    end_pc: ?u32,
+    follow_lane_mask_fallthrough: bool,
+    decoded_instructions: ?[]const rdna2.Instruction,
+    checkpoint_collector: ?*RegisterCheckpointCollector,
+    steps: ?[]const u32,
+) void {
+    result.reset();
     const scalar_base: usize = bindings.scalar_user_data_base;
     const available = @min(
         @as(usize, bindings.user_data_count),
@@ -587,7 +646,7 @@ fn evaluate(
         if (steps) |list| {
             const instructions = decoded_instructions orelse {
                 result.stop_reason = .end_program;
-                return result;
+                return;
             };
             // A writelane makes later vector destinations able to clobber a
             // spill. Visit every instruction until that slot is gone, then
@@ -597,7 +656,7 @@ fn evaluate(
                 const index = stepIndexAtOrAfter(instructions, list, pc);
                 if (index == list.len) {
                     result.stop_reason = .end_program;
-                    return result;
+                    return;
                 }
                 current_step = index;
                 const step_pc = instructions[list[index]].pc;
@@ -606,14 +665,15 @@ fn evaluate(
             }
         }
         result.stop_pc = pc;
-        if (checkpoint_collector) |collector| collector.captureBefore(&result, pc);
+        if (checkpoint_collector) |collector| collector.captureBefore(result, pc);
         if (end_pc) |end| {
             if (pc >= end) {
                 result.stop_reason = .prefix_complete;
-                return result;
+                return;
             }
         }
-        const inst = if (decoded_instructions) |instructions| decoded: {
+        var live_instruction: rdna2.Instruction = undefined;
+        const inst: *const rdna2.Instruction = if (decoded_instructions) |instructions| decoded: {
             // Most resource instructions are visited in order. Search only
             // after a branch or a gap in the decoder's instruction stream.
             if (decoded_cursor >= instructions.len or instructions[decoded_cursor].pc != pc) {
@@ -621,9 +681,9 @@ fn evaluate(
             }
             if (decoded_cursor == instructions.len) {
                 result.stop_reason = .end_program;
-                return result;
+                return;
             }
-            const candidate = instructions[decoded_cursor];
+            const candidate = &instructions[decoded_cursor];
             if (candidate.pc != pc) {
                 // The cached decoder omitted an unknown word. Resume at its
                 // next known instruction just as the live decoder skips an
@@ -638,10 +698,10 @@ fn evaluate(
             var words = [_]u32{ 0, 0 };
             words[0] = reader.readU32(addProgramAddress(bindings.program_address, pc) orelse {
                 result.stop_reason = .invalid_address;
-                return result;
+                return;
             }) catch {
                 result.stop_reason = .inaccessible_code;
-                return result;
+                return;
             };
 
             // Decode may need a second word; unknown major families are skipped so a
@@ -649,18 +709,20 @@ fn evaluate(
             // unrecognised packet was producing MissingStorageDescriptor on every
             // resource the shader used after that point.
             if (rdna2.decodeInstruction(pc, words[0..1], 0)) |decoded| {
-                break :live decoded;
+                live_instruction = decoded;
+                break :live &live_instruction;
             } else |err| switch (err) {
                 error.MissingLiteralConstant, error.TruncatedInstruction => {
                     words[1] = reader.readU32(addProgramAddress(bindings.program_address, pc + 4) orelse {
                         result.stop_reason = .invalid_address;
-                        return result;
+                        return;
                     }) catch {
                         result.stop_reason = .inaccessible_code;
-                        return result;
+                        return;
                     };
                     if (rdna2.decodeInstruction(pc, &words, 0)) |decoded| {
-                        break :live decoded;
+                        live_instruction = decoded;
+                        break :live &live_instruction;
                     } else |_| {
                         lane_spills = .{};
                         pc +%= if (words[0] & 0xc000_0000 == 0xc000_0000) @as(u32, 8) else 4;
@@ -680,44 +742,44 @@ fn evaluate(
         };
         result.instruction_count += 1;
 
-        if (inst.opcode != .v_writelane_b32) lane_spills.invalidateInstruction(inst);
+        if (inst.opcode != .v_writelane_b32) lane_spills.invalidateInstruction(inst.*);
 
         if (inst.opcode == .unsupported) {
             // Skip unknown opcodes inside a known family; do not abort the prolog.
-            invalidateDestination(&result, inst.dst, @max(inst.data_words, 1));
+            invalidateDestination(result, inst.dst, @max(inst.data_words, 1));
             pc +%= inst.word_count * 4;
             continue;
         }
         if (inst.family == .smem) {
-            if (!executeSmem(&result, reader, bindings, inst)) {
+            if (!executeSmem(result, reader, bindings, inst.*)) {
                 result.memory_read_failed = true;
                 if (!follow_lane_mask_fallthrough) {
                     if (result.stop_reason == .instruction_limit) result.stop_reason = .inaccessible_memory;
-                    return result;
+                    return;
                 }
                 // A lane-dependent address may be unavailable to this scalar
                 // walk. It does not prevent a later, independent descriptor
                 // load from succeeding. Invalidate the failed load and keep
                 // walking instead of filling every remaining checkpoint with
                 // stale registers from before the failure.
-                invalidateDestination(&result, inst.dst, inst.data_words);
+                invalidateDestination(result, inst.dst, inst.data_words);
                 result.stop_reason = .instruction_limit;
             }
         } else switch (inst.opcode) {
             .s_endpgm, .s_code_end => {
                 result.stop_reason = .end_program;
-                return result;
+                return;
             },
             .s_setpc_b64 => {
                 if (setpc_follows < 8) {
-                    if (setpcDestinationPc(&result, bindings.program_address, inst)) |dest_pc| {
+                    if (setpcDestinationPc(result, bindings.program_address, inst.*)) |dest_pc| {
                         setpc_follows += 1;
                         pc = dest_pc;
                         continue;
                     }
                 }
                 result.stop_reason = .branch;
-                return result;
+                return;
             },
             .s_branch,
             .s_cbranch_scc0,
@@ -740,7 +802,7 @@ fn evaluate(
                             const loop_begin = decodedInstructionIndexAtOrAfter(instructions, inst.branch_target);
                             for (instructions[loop_begin..]) |loop_inst| {
                                 if (loop_inst.pc >= inst.pc) break;
-                                invalidateDestination(&result, loop_inst.dst, @max(loop_inst.data_words, destinationWords(loop_inst.opcode)));
+                                invalidateDestination(result, loop_inst.dst, @max(loop_inst.data_words, destinationWords(loop_inst.opcode)));
                                 lane_spills.invalidateInstruction(loop_inst);
                             }
                             scc = null;
@@ -789,12 +851,12 @@ fn evaluate(
                     continue;
                 }
                 result.stop_reason = .branch;
-                return result;
+                return;
             },
             .s_nop, .s_waitcnt, .s_barrier, .s_sleep, .s_sendmsg, .s_ttrace_data, .s_inst_prefetch => {},
-            .v_writelane_b32 => lane_spills.store(&result, inst),
-            .v_readlane_b32 => lane_spills.restore(&result, inst),
-            else => executeScalar(&result, bindings.program_address, inst, &scc),
+            .v_writelane_b32 => lane_spills.store(result, inst.*),
+            .v_readlane_b32 => lane_spills.restore(result, inst.*),
+            else => executeScalar(result, bindings.program_address, inst.*, &scc),
         }
         if (steps != null and !dense_walk) {
             if (lane_spills.occupied != 0) {
@@ -806,7 +868,7 @@ fn evaluate(
                 if (current_step + 1 >= list.len) {
                     result.stop_pc = pc +% inst.word_count * 4;
                     result.stop_reason = .end_program;
-                    return result;
+                    return;
                 }
                 pc = instructions[list[current_step + 1]].pc;
             }
@@ -817,7 +879,7 @@ fn evaluate(
 
     result.stop_pc = pc;
     result.stop_reason = .instruction_limit;
-    return result;
+    return;
 }
 
 fn resourceLoopHasUnresolvedExit(instructions: []const rdna2.Instruction, loop_start: u32, back_edge: u32, unknown_scalar_exits: *const std.StaticBitSet(64 * 1024)) bool {
@@ -2001,6 +2063,45 @@ test "scalar provenance follows an SRT pointer through ALU and SMEM" {
     try std.testing.expectEqual(@as(u32, 0x1122_3344), result.register(8).?.value);
     try std.testing.expect(result.register(8).?.sources.memory);
     try std.testing.expect(result.register(8).?.sources.user_data);
+}
+
+test "reused scalar evaluation refreshes guest loads and clears failed or abandoned state" {
+    var storage = [_]u8{0} ** 32;
+    var memory = TestMemory{ .base = 0x4000, .bytes = &storage };
+    var bindings = testBindings(0x3000, 0x4000);
+    const code = [_]u32{ 0xf404_0200, 125 << 25, 0xbf81_0000 };
+    var program = try rdna2.decodeProgram(std.testing.allocator, &code);
+    defer program.deinit(std.testing.allocator);
+    var result: Evaluation = undefined;
+    memory.write(0x4000, 17);
+    memory.write(0x4004, 23);
+    evaluateDecodedResourceStateInto(&result, memory.reader(), &bindings, program.instructions.items);
+    try std.testing.expectEqual(@as(usize, 1), result.load_count);
+    try std.testing.expectEqual(@as(u32, 17), result.register(8).?.value);
+    var saved: Evaluation = undefined;
+    saved.copyFrom(&result);
+    saved.copyFrom(&saved);
+
+    memory.write(0x4000, 71);
+    evaluateDecodedResourceStateInto(&result, memory.reader(), &bindings, program.instructions.items);
+    try std.testing.expectEqual(@as(u32, 71), result.register(8).?.value);
+    try std.testing.expectEqual(@as(u32, 71), result.loadSlice()[0].values[0]);
+    try std.testing.expectEqual(@as(u32, 17), saved.register(8).?.value);
+    try std.testing.expectEqual(@as(u32, 17), saved.loadSlice()[0].values[0]);
+
+    memory.bytes = storage[0..0];
+    evaluateDecodedResourceStateInto(&result, memory.reader(), &bindings, program.instructions.items);
+    try std.testing.expect(result.memory_read_failed);
+    try std.testing.expect(result.register(8) == null);
+    try std.testing.expectEqual(@as(usize, 0), result.load_count);
+    bindings.resource_instruction_budget = 0;
+    evaluateDecodedResourceStateInto(&result, memory.reader(), &bindings, program.instructions.items);
+    try std.testing.expect(!result.memory_read_failed);
+    try std.testing.expectEqual(StopReason.instruction_limit, result.stop_reason);
+    try std.testing.expectEqual(@as(u32, 0), result.instruction_count);
+    try std.testing.expectEqual(@as(u32, 0), result.stop_pc);
+    try std.testing.expectEqual(@as(usize, 0), result.load_count);
+    try std.testing.expect(result.register(8) == null);
 }
 
 test "NGG scalar user data starts at s8" {

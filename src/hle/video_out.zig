@@ -113,6 +113,7 @@ var vblank_count: u64 = 0;
 var open_process_time_us: u64 = 0;
 var last_flip_argument: i64 = 0;
 var has_last_flip_argument: bool = false;
+var next_flip_time_us: u64 = 0;
 // The currently modeled VideoOut ABI distinguishes HD (1) and UHD (2).
 // Keep this independent of registered buffers: games may render internally at
 // a higher resolution than the selected output. Do not invent 1440p/8K ABI IDs.
@@ -143,6 +144,7 @@ pub fn reset() void {
     open_process_time_us = 0;
     last_flip_argument = 0;
     has_last_flip_argument = false;
+    next_flip_time_us = 0;
     output_resolution_class = 1;
 }
 
@@ -154,7 +156,36 @@ pub fn open(index: i32) bool {
     opened = true;
     vblank_count = 0;
     open_process_time_us = 0;
+    next_flip_time_us = 0;
     return true;
+}
+
+/// Pace completed flips without adding a full refresh interval to slow frames.
+/// Reserve under the VideoOut lock; the caller sleeps after releasing it.
+pub fn reserveFlipDelay(process_time_us: u64) u32 {
+    lock.lock();
+    defer lock.unlock();
+    if (!opened) return 0;
+    const interval_us: u64 = 16_667;
+    const deadline = @max(next_flip_time_us, process_time_us);
+    const delay = deadline - process_time_us;
+    next_flip_time_us = deadline +| interval_us;
+    return @intCast(@min(delay, std.math.maxInt(u32)));
+}
+
+test "flip pacing credits rendering time and does not catch up missed frames" {
+    reset();
+    defer reset();
+    try std.testing.expectEqual(@as(u32, 0), reserveFlipDelay(1_000));
+    try std.testing.expect(open(0));
+    try std.testing.expectEqual(@as(u32, 0), reserveFlipDelay(1_000));
+    try std.testing.expectEqual(@as(u32, 13_667), reserveFlipDelay(4_000));
+    try std.testing.expectEqual(@as(u32, 16_001), reserveFlipDelay(18_333));
+    try std.testing.expectEqual(@as(u32, 0), reserveFlipDelay(100_000));
+    try std.testing.expectEqual(@as(u32, 15_667), reserveFlipDelay(101_000));
+    try std.testing.expect(close(primary_handle));
+    try std.testing.expect(open(0));
+    try std.testing.expectEqual(@as(u32, 0), reserveFlipDelay(102_000));
 }
 
 /// Records process time at open so GetVblankStatus can report elapsed time.

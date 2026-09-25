@@ -3217,13 +3217,17 @@ fn runInternalReleaseQueueProbe(allocator: std.mem.Allocator) !void {
         release.data = i + 100;
         try std.testing.expect(backend.vtable.release.?(backend.context, release));
     }
-    try std.testing.expectEqual(@as(usize, 4), renderer.deferred_internal_release_count);
+    // Completed ticks may publish inline; only the queue bound and final
+    // values are invariant, not the number still pending on a fast GPU.
+    try std.testing.expect(renderer.deferred_internal_release_count <= 256);
     try std.testing.expect(backend.vtable.drain_releases.?(backend.context));
     for (0..260) |i| try std.testing.expectEqual(@as(u32, @intCast(i + 100)), std.mem.readInt(u32, audit.guest.bytes[0x2000 + i * 4 ..][0..4], .little));
     release.address = 0x9000;
     release.data = 123;
-    try std.testing.expect(backend.vtable.release.?(backend.context, release));
     audit.reject = true;
+    // Publication can fail inside release itself or at the later drain.
+    // Either path must retain the label so the next consumer can retry it.
+    _ = backend.vtable.release.?(backend.context, release);
     try std.testing.expect(!backend.vtable.drain_releases.?(backend.context));
     try std.testing.expectEqual(@as(usize, 1), renderer.deferred_internal_release_count);
     audit.reject = false;
@@ -3237,6 +3241,7 @@ fn runInternalReleaseQueueProbe(allocator: std.mem.Allocator) !void {
     _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
     release.address = 0xa000;
     try std.testing.expect(backend.vtable.release.?(backend.context, release));
+    try std.testing.expect(backend.vtable.drain_releases.?(backend.context));
     try std.testing.expectEqual(@as(usize, 0), renderer.deferred_internal_release_count);
     try std.testing.expectEqual(@as(u32, 77), std.mem.readInt(u32, audit.guest.bytes[0x6000..][0..4], .little));
     try std.testing.expectEqual(@as(u32, 123), std.mem.readInt(u32, audit.guest.bytes[0xa000..][0..4], .little));
@@ -3245,9 +3250,10 @@ fn runInternalReleaseQueueProbe(allocator: std.mem.Allocator) !void {
     release.data_selection = 2;
     release.data = 0x1122334455667788;
     try std.testing.expect(backend.vtable.release.?(backend.context, release));
+    try std.testing.expect(backend.vtable.drain_releases.?(backend.context));
     try std.testing.expectEqual(@as(usize, 0), renderer.deferred_internal_release_count);
     try std.testing.expectEqual(release.data, std.mem.readInt(u64, audit.guest.bytes[0xb000..][0..8], .little));
-    std.debug.print("Internal release queue passed: GPU producer, FIFO reads, unrelated reads, overlapping writes, bounded rollover, failed publication, staging consumer and small-output/interrupt fallback\n", .{});
+    std.debug.print("Internal release queue passed: GPU producer, FIFO reads, unrelated reads, overlapping writes, bounded rollover, failed publication, staging consumer and small-output/interrupt publication\n", .{});
 }
 
 fn runDeferredReleaseProbe(allocator: std.mem.Allocator) !void {
@@ -7189,7 +7195,36 @@ fn runPackedHalfClearProbe(allocator: std.mem.Allocator) !void {
         try renderer.flushPendingGuestWrites();
         for (0..8192) |i| try std.testing.expectEqual(value, std.mem.readInt(u32, guest.bytes[0x2000 + i * 4 ..][0..4], .little));
     }
-    std.debug.print("packed half clears passed: RGBA16F patterns, active/unbound targets, partial fill guards and queued uniform resident-buffer fills\n", .{});
+    // Four-byte G-buffer targets use the same 16-byte raw store. Exercise
+    // both RG16F and signed normal bytes with actual GPU attachment writes,
+    // including the compute clear before graphics rebinds the attachment.
+    for ([_]struct { format: u32, number: u32, patterns: [3]u32 }{
+        .{ .format = 5, .number = 7, .patterns = .{ 0, 0xb4003800, 0x40003a00 } },
+        .{ .format = 10, .number = 1, .patterns = .{ 0x7f000000, 0x7f817f00, 0x3f1fc15f } },
+    }, 0..) |target, target_index| {
+        const address: u32 = @intCast(0x10000 + target_index * 0x4000);
+        try state.writeRegister(.context, 0x31c, (target.format << 2) | (target.number << 8));
+        try state.writeRegister(.shader, 0x240, address);
+        try state.writeRegister(.shader, 0x242, 1024);
+        for ([_]bool{ false, true }) |unbound| {
+            for (target.patterns) |pattern| {
+                try state.writeRegister(.context, 0x318, address >> 8);
+                _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 0 });
+                if (renderer.last_draw_error) |err| return err;
+                if (unbound) try state.writeRegister(.context, 0x318, 0);
+                for (0..4) |i| try state.writeRegister(.shader, 0x244 + @as(u32, @intCast(i)), pattern);
+                const before = renderer.frame_profile.readback_bytes;
+                const cleared = try renderer.dispatchRdna2State(&state, .{ 64, 1, 1 }, .{ 16, 1, 1 });
+                try std.testing.expectEqual(@as(usize, 0), cleared.spirv_words);
+                try std.testing.expectEqual(before, renderer.frame_profile.readback_bytes);
+                try renderer.flushPendingGuestWrites();
+                for (0..64 * 64) |pixel| {
+                    try std.testing.expectEqual(pattern, std.mem.readInt(u32, guest.bytes[address + pixel * 4 ..][0..4], .little));
+                }
+            }
+        }
+    }
+    std.debug.print("packed clears passed: RGBA16F/RG16F/RGBA8_SNORM patterns, active/unbound targets, partial fill guards and queued resident-buffer fills\n", .{});
 }
 
 fn runDccSingleClearProbe(allocator: std.mem.Allocator) !void {
@@ -10032,6 +10067,17 @@ fn runRetainedBufferCapacityProbe(allocator: std.mem.Allocator, device_budget: u
     renderer.draw_batch_active = false;
     renderer.current_descriptor_slot = null;
     renderer.descriptor_set = renderer.descriptor_sets[0];
+    @memset(&renderer.active_storage_buffers, 0);
+    // Once full, retained mode must evict the oldest eligible range, not
+    // whichever hot allocation used the destination descriptor slot first.
+    // Rewarm the large source and replace that slot with another small range;
+    // cold constants must be discarded before this frequently used source.
+    const hot = try renderer.stageGuestStorageBufferAt(0, 0x10000, source_bytes);
+    _ = try renderer.stageGuestStorageBufferAt(0, 0x9800, 4);
+    const retained_hot = for (renderer.guest_buffers.items) |cached| {
+        if (cached.guest_address == 0x10000 and cached.size == source_bytes) break cached;
+    } else return error.EvictedHotRetainedBuffer;
+    try std.testing.expectEqual(hot.buffer, retained_hot.device_local.handle);
     std.debug.print("retained backing capacity passed: 8 MiB -> 4 bytes, queued old reader preserved, device_budget={d}\n", .{device_budget});
 }
 
@@ -11418,6 +11464,10 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--fragment-quad-broadcasts")) {
         try runRendererProbe(allocator, vulkan.Renderer.probeFragmentQuadBroadcasts);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--bounded-vertex-fetches")) {
+        try runRendererProbe(allocator, vulkan.Renderer.probeBoundedVertexFetches);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--private-spills")) {

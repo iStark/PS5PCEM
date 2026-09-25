@@ -1329,16 +1329,35 @@ fn triggerAgcUserInterrupt() void {
 }
 
 const DeferredReleaseNote = struct {
+    id: u64,
     release: gpu.state.ReleaseMem,
     event_id: u32,
 };
 var deferred_release_notes: [256]DeferredReleaseNote = undefined;
 var deferred_release_note_count: usize = 0;
+var next_deferred_release_id: u64 = 0;
 
-fn noteDeferredRelease(value: gpu.state.ReleaseMem, event_id: u32) void {
-    if (deferred_release_note_count == deferred_release_notes.len) return;
-    deferred_release_notes[deferred_release_note_count] = .{ .release = value, .event_id = event_id };
+fn noteDeferredRelease(value: gpu.state.ReleaseMem, event_id: u32) ?u64 {
+    if (deferred_release_note_count == deferred_release_notes.len) return null;
+    next_deferred_release_id +%= 1;
+    const id = next_deferred_release_id;
+    deferred_release_notes[deferred_release_note_count] = .{ .id = id, .release = value, .event_id = event_id };
     deferred_release_note_count += 1;
+    return id;
+}
+
+fn removeDeferredRelease(id: u64) bool {
+    for (deferred_release_notes[0..deferred_release_note_count], 0..) |note, index| {
+        if (note.id != id) continue;
+        deferred_release_note_count -= 1;
+        std.mem.copyForwards(
+            DeferredReleaseNote,
+            deferred_release_notes[index..deferred_release_note_count],
+            deferred_release_notes[index + 1 .. deferred_release_note_count + 1],
+        );
+        return true;
+    }
+    return false;
 }
 
 /// The renderer calls this after a queued label reaches guest memory.
@@ -1348,14 +1367,9 @@ pub fn observeDeferredRelease(value: gpu.state.ReleaseMem) void {
         const note = deferred_release_notes[index];
         if (note.release.address != value.address or note.release.data != value.data or
             note.release.data_selection != value.data_selection) continue;
+        _ = removeDeferredRelease(note.id);
         publishSynchronousRetirement(note.release);
         triggerReleaseInterrupt(note.release, note.event_id);
-        deferred_release_note_count -= 1;
-        std.mem.copyForwards(
-            DeferredReleaseNote,
-            deferred_release_notes[index..deferred_release_note_count],
-            deferred_release_notes[index + 1 .. deferred_release_note_count + 1],
-        );
         return;
     }
 }
@@ -1496,8 +1510,19 @@ fn backendRelease(context: ?*anyopaque, value: gpu.state.ReleaseMem) bool {
         readGuestMemory(null, value.address, old_label[0..label_size]);
     if (installed_backend) |backend| {
         if (backend.vtable.release) |callback| {
+            // The renderer can publish an already-completed tick inside the
+            // callback. Register its notification first, and identify it by
+            // token so synchronous/failing callbacks remove only their note.
+            const note_id = if (backend.vtable.release_queued != null) reserve: {
+                if (deferred_release_note_count == deferred_release_notes.len and !drainBackendReleases()) return false;
+                break :reserve noteDeferredRelease(value, event_id) orelse return false;
+            } else @as(?u64, null);
             const accepted = callback(backend.context, value);
             const queued = if (backend.vtable.release_queued) |query| query(backend.context) else false;
+            const notification_pending = if (!accepted or !queued)
+                if (note_id) |id| removeDeferredRelease(id) else true
+            else
+                false;
             if (reports_interrupt and interrupt_release_reports < 64) {
                 var new_label: [8]u8 = [_]u8{0} ** 8;
                 const new_label_valid = label_size != 0 and
@@ -1528,10 +1553,9 @@ fn backendRelease(context: ?*anyopaque, value: gpu.state.ReleaseMem) bool {
             // and release-label write. Waking before callback completion lets
             // the driver consume the event while the old fence is still set.
             if (accepted and queued) {
-                noteDeferredRelease(value, event_id);
                 return true;
             }
-            if (accepted) {
+            if (accepted and notification_pending) {
                 publishSynchronousRetirement(value);
                 triggerReleaseInterrupt(value, event_id);
             }
@@ -1848,6 +1872,8 @@ pub fn reset() void {
     defer execution_lock.unlock();
     gpu.parallel_copy.guest_copy_pool.deinit();
     installed_backend = null;
+    deferred_release_note_count = 0;
+    next_deferred_release_id = 0;
     submission_scheduler.deinit();
     submission_scheduler = gpu.QueueScheduler.init(std.heap.page_allocator, executor_backend);
     submission_scheduler.parallel_commands = parallel_command_execution;
@@ -4043,6 +4069,71 @@ test "wait recovery chooses a value matching every comparison family" {
     wait.compare_function = 3;
     wait.reference = 0x100;
     try testing.expectEqual(@as(?u64, null), satisfyingWaitValue(wait));
+}
+
+test "release notification survives inline completion and cleans synchronous or failed reservations" {
+    const Audit = struct {
+        const Mode = enum { inline_completion, deferred, synchronous, rejected };
+        mode: Mode,
+        fn read(_: ?*anyopaque, _: u64, _: []u8) bool {
+            return false;
+        }
+        fn write(_: ?*anyopaque, _: u64, _: []const u8) bool {
+            return false;
+        }
+        fn release(raw: ?*anyopaque, value: gpu.state.ReleaseMem) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.mode == .inline_completion) observeDeferredRelease(value);
+            return self.mode != .rejected;
+        }
+        fn queued(raw: ?*anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            return self.mode == .inline_completion or self.mode == .deferred;
+        }
+        const vtable = gpu.DcbBackend.VTable{ .read = read, .write = write, .release = release, .release_queued = queued };
+    };
+    for ([_]Audit.Mode{ .inline_completion, .deferred, .synchronous, .rejected }) |mode| {
+        reset();
+        defer reset();
+        var audit = Audit{ .mode = mode };
+        attachBackend(.{ .context = &audit, .vtable = &Audit.vtable });
+        var value = std.mem.zeroes(gpu.state.ReleaseMem);
+        value.data_selection = 2;
+        value.data = 123;
+        value.interrupt = 2;
+        value.interrupt_context_id = 38;
+        try testing.expectEqual(mode != .rejected, backendRelease(@ptrFromInt(0x52), value));
+        if (mode == .deferred) {
+            try testing.expectEqual(@as(usize, 1), deferred_release_note_count);
+            try testing.expectEqual(@as(usize, 0), pending_completion_count);
+            observeDeferredRelease(value);
+        }
+        try testing.expectEqual(@as(usize, 0), deferred_release_note_count);
+        const expected: usize = if (mode == .rejected) 0 else 1;
+        try testing.expectEqual(expected, pending_completion_count);
+        // Inline completion must not be lost or published a second time.
+        observeDeferredRelease(value);
+        try testing.expectEqual(expected, pending_completion_count);
+        if (expected != 0) {
+            const completion = pending_completions[pending_completion_head];
+            try testing.expectEqual(@as(u32, 0x52), completion.event_id);
+            try testing.expectEqual(@as(u32, 38), completion.context_id);
+        }
+    }
+}
+
+test "deferred release reservations never silently overflow and reset drops stale notes" {
+    reset();
+    defer reset();
+    const value = std.mem.zeroes(gpu.state.ReleaseMem);
+    const first = noteDeferredRelease(value, 0).?;
+    for (1..deferred_release_notes.len) |_| try testing.expect(noteDeferredRelease(value, 0) != null);
+    try testing.expectEqual(@as(?u64, null), noteDeferredRelease(value, 0));
+    try testing.expect(removeDeferredRelease(first));
+    try testing.expect(!removeDeferredRelease(first));
+    try testing.expect(noteDeferredRelease(value, 0) != null);
+    reset();
+    try testing.expectEqual(@as(usize, 0), deferred_release_note_count);
 }
 
 test "queued release interrupt suppresses submit fallback event" {

@@ -1370,7 +1370,8 @@ fn videoOutSubmitFlip(handle: i32, index: i32, mode: i32, argument: i64) callcon
         .mode = @bitCast(mode),
         .argument = argument,
     });
-    _ = kernel_threading.sceKernelUsleep(16_667);
+    const delay_us = video_out.reserveFlipDelay(kernel_runtime.processTimeMicroseconds());
+    if (delay_us != 0) _ = kernel_threading.sceKernelUsleep(delay_us);
     return errno.ok;
 }
 

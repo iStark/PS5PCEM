@@ -190,6 +190,23 @@ pub const Pool = struct {
         return true;
     }
 
+    /// Reservations are not sorted: a released hole can be filled after a
+    /// later allocation. Find the next occupied interval without scanning
+    /// every 16 KiB page of the multi-gigabyte pool.
+    fn nextReservation(self: *const Pool, start: u64, limit: u64) ?Reservation {
+        var next: ?Reservation = null;
+        for (self.reservations.items) |reservation| {
+            if (reservation.end() <= start or reservation.start >= limit) continue;
+            if (next == null or reservation.start < next.?.start) next = reservation;
+        }
+        return next;
+    }
+
+    fn alignedCandidate(start: u64, step: u64) ?u64 {
+        const rounded = std.math.add(u64, start, step - 1) catch return null;
+        return std.mem.alignBackward(u64, rounded, step);
+    }
+
     /// Reserves `len` bytes with the requested alignment, searching upward from
     /// `search_start` and stopping at `search_end`.
     ///
@@ -208,9 +225,15 @@ pub const Pool = struct {
     ) PoolError!u64 {
         const step = @max(alignment, page_size);
 
-        var candidate = std.mem.alignForward(u64, search_start, step);
-        while (candidate + len <= @min(search_end, self.size)) : (candidate += step) {
-            if (!self.isFree(candidate, len)) continue;
+        const limit = @min(search_end, self.size);
+        var candidate = alignedCandidate(search_start, step) orelse return error.OutOfDirectMemory;
+        while (candidate <= limit and len <= limit - candidate) {
+            if (self.nextReservation(candidate, limit)) |occupied| {
+                if (occupied.start < candidate + len) {
+                    candidate = alignedCandidate(occupied.end(), step) orelse return error.OutOfDirectMemory;
+                    continue;
+                }
+            }
 
             try self.reservations.append(gpa, .{
                 .start = candidate,
@@ -226,9 +249,8 @@ pub const Pool = struct {
     /// Largest run of unreserved memory inside a search window, as the guest
     /// would receive it: aligned up to `alignment`, and clipped to the pool.
     ///
-    /// Walked the same way `reserve` places a request, one aligned step at a
-    /// time, so what this reports is what an allocation of that size would
-    /// actually find rather than a total that no single request could use.
+    /// Walk free intervals, not pages. The result still names one allocatable
+    /// run, with the lowest address winning ties, rather than summing holes.
     pub fn largestFree(
         self: *const Pool,
         search_start: u64,
@@ -240,20 +262,20 @@ pub const Pool = struct {
         var best_start: u64 = 0;
         var best_len: u64 = 0;
 
-        var candidate = std.mem.alignForward(u64, search_start, step);
+        var candidate = alignedCandidate(search_start, step) orelse return null;
         while (candidate < limit) {
-            if (!self.isFree(candidate, page_size)) {
-                candidate += step;
-                continue;
+            const occupied = self.nextReservation(candidate, limit);
+            const free_end = if (occupied) |reservation| @min(limit, reservation.start) else limit;
+            if (free_end > candidate) {
+                // A partial final page cannot be reserved within the window.
+                const run_len = std.mem.alignBackward(u64, free_end - candidate, page_size);
+                if (run_len > best_len) {
+                    best_start = candidate;
+                    best_len = run_len;
+                }
             }
-            const run_start = candidate;
-            while (candidate < limit and self.isFree(candidate, page_size)) candidate += page_size;
-            const run_len = candidate - run_start;
-            if (run_len > best_len) {
-                best_start = run_start;
-                best_len = run_len;
-            }
-            candidate = std.mem.alignForward(u64, candidate + page_size, step);
+            const reservation = occupied orelse break;
+            candidate = alignedCandidate(reservation.end(), step) orelse break;
         }
         if (best_len == 0) return null;
         return .{ .start = best_start, .len = best_len };
@@ -1933,6 +1955,79 @@ test "reservations are aligned and do not overlap" {
     try testing.expect(b >= a + 4 * page_size);
     try testing.expectEqual(@as(u64, 0), b % page_size);
     try testing.expectEqual(@as(u64, 8 * page_size), p.used());
+}
+
+test "direct memory interval search matches a page map across fragmented windows" {
+    var p = Pool{ .size = 8 * page_size };
+    defer p.deinit(testing.allocator);
+    for (0..256) |mask| {
+        p.reservations.clearRetainingCapacity();
+        // Deliberately reverse the reservation order. Hole reuse does not
+        // preserve sorting in the real pool either.
+        for (0..8) |reverse| {
+            const page = 7 - reverse;
+            if (mask & (@as(usize, 1) << @intCast(page)) == 0) continue;
+            try p.reservations.append(testing.allocator, .{
+                .start = page * page_size,
+                .len = page_size,
+                .alignment = page_size,
+                .memory_type = .wb_onion,
+            });
+        }
+        for ([_]u64{ 0, 1, page_size, 2 * page_size + 7 }) |start| {
+            for ([_]u64{ 3 * page_size, 6 * page_size + 17, 8 * page_size, 9 * page_size }) |end| {
+                for ([_]u64{ page_size, 2 * page_size, 4 * page_size }) |alignment| {
+                    const limit = @min(end, p.size);
+                    var expected_start: u64 = 0;
+                    var expected_len: u64 = 0;
+                    var first_fit = [_]?u64{null} ** 3;
+                    const lengths = [_]u64{ page_size, 2 * page_size, 4 * page_size };
+                    var candidate = std.mem.alignForward(u64, start, alignment);
+                    while (candidate + page_size <= limit) : (candidate += alignment) {
+                        var cursor = candidate;
+                        while (cursor + page_size <= limit) : (cursor += page_size) {
+                            if (mask & (@as(usize, 1) << @intCast(cursor / page_size)) != 0) break;
+                        }
+                        const len = cursor - candidate;
+                        if (len > expected_len) {
+                            expected_len = len;
+                            expected_start = candidate;
+                        }
+                        for (lengths, 0..) |length, index| {
+                            if (first_fit[index] == null and len >= length) first_fit[index] = candidate;
+                        }
+                    }
+                    const largest = p.largestFree(start, end, alignment);
+                    if (expected_len == 0) {
+                        try testing.expect(largest == null);
+                    } else {
+                        try testing.expectEqual(expected_start, largest.?.start);
+                        try testing.expectEqual(expected_len, largest.?.len);
+                    }
+                    for (lengths, first_fit) |length, expected| {
+                        if (expected) |address| {
+                            try testing.expectEqual(address, try p.reserve(testing.allocator, start, end, length, alignment, .wb_onion));
+                            _ = p.reservations.pop();
+                        } else {
+                            try testing.expectError(error.OutOfDirectMemory, p.reserve(testing.allocator, start, end, length, alignment, .wb_onion));
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+test "direct memory search clips partial pages and rejects overflowing windows" {
+    var p = Pool{ .size = 8 * page_size };
+    defer p.deinit(testing.allocator);
+    try testing.expect(p.largestFree(0, page_size - 1, 0) == null);
+    const clipped = p.largestFree(1, 3 * page_size - 1, 0).?;
+    try testing.expectEqual(page_size, clipped.start);
+    try testing.expectEqual(page_size, clipped.len);
+    try testing.expect(p.largestFree(std.math.maxInt(u64) - 1, std.math.maxInt(u64), 0) == null);
+    try testing.expectError(error.OutOfDirectMemory, p.reserve(testing.allocator, std.math.maxInt(u64) - 1, std.math.maxInt(u64), page_size, 0, .wb_onion));
+    try testing.expectError(error.OutOfDirectMemory, p.reserve(testing.allocator, page_size, p.size, std.math.maxInt(u64), 0, .wb_onion));
 }
 
 test "a larger alignment is honoured" {

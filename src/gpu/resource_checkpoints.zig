@@ -151,6 +151,7 @@ pub const Pool = struct {
     entries: [2][]scalar.ScalarRegisters = @splat(&.{}),
     /// Diagnostic control: disabled uses fresh lists and allocations.
     enabled: bool = true,
+    evaluation: ?*scalar.Evaluation = null,
 
     pub const Lease = struct {
         pcs: []const u32,
@@ -213,6 +214,7 @@ pub const Pool = struct {
         }
         const scratch_reused = allocation != null;
         const storage = allocation orelse try allocator.alloc(scalar.ScalarRegisters, pcs.len);
+        errdefer allocator.free(storage);
         const snapshots = storage[0..pcs.len];
         var walked: u32 = 0;
         if (pcs.len != 0) {
@@ -221,7 +223,15 @@ pub const Pool = struct {
             // even after an early stop or failed read. Scalar steps skip
             // vector instructions that cannot change those snapshots.
             const steps = if (plan_reused) plan.?.scalar_steps else null;
-            const evaluation = scalar.evaluateDecodedResourceStateAtCheckpoints(reader, bindings, instructions, pcs, snapshots, steps);
+            const evaluation = self.evaluation orelse try allocator.create(scalar.Evaluation);
+            self.evaluation = null;
+            defer {
+                // A nested preparation owns different storage. Retain one
+                // idle allocation after the outer walk completes.
+                if (self.evaluation) |nested| allocator.destroy(nested);
+                self.evaluation = evaluation;
+            }
+            scalar.evaluateDecodedResourceStateAtCheckpointsInto(evaluation, reader, bindings, instructions, pcs, snapshots, steps);
             walked = evaluation.instruction_count;
         }
         return .{
@@ -239,6 +249,8 @@ pub const Pool = struct {
     }
 
     pub fn deinit(self: *Pool, allocator: std.mem.Allocator) void {
+        if (self.evaluation) |evaluation| allocator.destroy(evaluation);
+        self.evaluation = null;
         for (&self.entries) |*entry| {
             allocator.free(entry.*);
             entry.* = &.{};
@@ -483,9 +495,9 @@ test "checkpoint plan and scratch allocation failures release partial ownership"
 test "the storage-image list names exactly what a full walk would visit" {
     const allocator = std.testing.allocator;
     const opcodes = [_]rdna2.Opcode{
-        .s_load_dwordx4, .image_load,      .v_mov_b32,        .image_store,
-        .image_sample,   .image_store_mip, .s_nop,            .image_atomic_add,
-        .buffer_load_dword, .image_gather4, .image_atomic_fmax, .s_endpgm,
+        .s_load_dwordx4,    .image_load,      .v_mov_b32,         .image_store,
+        .image_sample,      .image_store_mip, .s_nop,             .image_atomic_add,
+        .buffer_load_dword, .image_gather4,   .image_atomic_fmax, .s_endpgm,
     };
     var instructions: [opcodes.len]rdna2.Instruction = undefined;
     for (opcodes, 0..) |opcode, index| {
@@ -523,9 +535,9 @@ test "typed buffer accesses get a resource checkpoint like their untyped forms" 
     // then reads the scalar state recorded at the instruction's PC. A typed
     // access missing from this list leaves that read without a checkpoint.
     const typed = [_]rdna2.Opcode{
-        .tbuffer_load_format_x,  .tbuffer_load_format_xy,
-        .tbuffer_load_format_xyz, .tbuffer_load_format_xyzw,
-        .tbuffer_store_format_x, .tbuffer_store_format_xy,
+        .tbuffer_load_format_x,    .tbuffer_load_format_xy,
+        .tbuffer_load_format_xyz,  .tbuffer_load_format_xyzw,
+        .tbuffer_store_format_x,   .tbuffer_store_format_xy,
         .tbuffer_store_format_xyz, .tbuffer_store_format_xyzw,
     };
     for (typed) |opcode| {

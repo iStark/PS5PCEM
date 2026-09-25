@@ -303,6 +303,11 @@ pub const Options = struct {
     /// Retain clean ranges by address across descriptor-slot changes. The
     /// budget is a growth limit; replacing a backing may exceed it temporarily.
     retain_clean_storage_buffers: bool = false,
+    /// Full-range fingerprints trade CPU work for fewer buffer uploads.
+    /// Keep image freshness checks independent of this performance option.
+    cache_storage_buffer_contents: bool = true,
+    /// Stage proven vertex/instance fetch prefixes instead of whole arenas.
+    bound_vertex_fetches: bool = false,
     storage_buffer_cache_budget_bytes: usize = 4 * 1024 * 1024 * 1024,
     /// Opt-in spare allocations for small CPU uploads with queued readers.
     /// Retired allocation bytes are bounded independently of the live cache.
@@ -1251,6 +1256,29 @@ const DeferredRelease = struct {
     }
 };
 
+const BufferPageObservation = struct {
+    address: u64 = 0,
+    span: usize = 0,
+    context: ?*anyopaque = null,
+    track: ?*const fn (?*anyopaque, u64, usize) u64 = null,
+    query_epoch: ?*const fn (?*anyopaque) u64 = null,
+    epoch: u64 = 0,
+    generation: u64 = 0,
+
+    fn observe(self: *@This(), memory: GuestMemory, address: u64, span: usize) u64 {
+        const track = memory.track_gpu_read orelse return 0;
+        const epoch = if (memory.gpu_tracking_epoch) |query| query(memory.context) else 0;
+        if (epoch != 0 and self.epoch == epoch and self.address == address and self.span == span and
+            self.context == memory.context and self.track == track and self.query_epoch == memory.gpu_tracking_epoch)
+            return self.generation;
+        const generation = track(memory.context, address, span);
+        // Keep the epoch from before the walk. A racing native write must
+        // force a fresh observation, not certify old pages with a new epoch.
+        self.* = .{ .address = address, .span = span, .context = memory.context, .track = track, .query_epoch = memory.gpu_tracking_epoch, .epoch = epoch, .generation = generation };
+        return generation;
+    }
+};
+
 const GuestBufferEntry = struct {
     descriptor_index: u32,
     guest_address: u64,
@@ -1266,8 +1294,64 @@ const GuestBufferEntry = struct {
     /// Ordered fingerprint of the 16 KiB guest pages copied into device_local.
     /// Zero selects the legacy upload path when tracking is unavailable.
     page_generation: u64 = 0,
+    page_observation: BufferPageObservation = .{},
     content_hash: ?u64 = null,
 };
+
+test "buffer page observations follow native epochs, range changes and racing writes" {
+    const Watch = struct {
+        epoch: u64 = 1,
+        generation: u64 = 10,
+        calls: usize = 0,
+        race: bool = false,
+        fn read(_: ?*anyopaque, _: u64, _: []u8) bool {
+            return false;
+        }
+        fn write(_: ?*anyopaque, _: u64, _: []const u8) bool {
+            return false;
+        }
+        fn query(context: ?*anyopaque) u64 {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            return self.epoch;
+        }
+        fn track(context: ?*anyopaque, _: u64, _: usize) u64 {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.calls += 1;
+            const value = self.generation;
+            if (self.race) {
+                self.epoch += 1;
+                self.generation += 1;
+                self.race = false;
+            }
+            return value;
+        }
+    };
+    var watch = Watch{};
+    var memory = GuestMemory{ .context = &watch, .read = Watch.read, .write = Watch.write, .track_gpu_read = Watch.track, .gpu_tracking_epoch = Watch.query };
+    var observation = BufferPageObservation{};
+    try std.testing.expectEqual(@as(u64, 10), observation.observe(memory, 0x1000, 4096));
+    try std.testing.expectEqual(@as(u64, 10), observation.observe(memory, 0x1000, 4096));
+    try std.testing.expectEqual(@as(usize, 1), watch.calls);
+    _ = observation.observe(memory, 0x1000, 8192);
+    _ = observation.observe(memory, 0x2000, 8192);
+    try std.testing.expectEqual(@as(usize, 3), watch.calls);
+    watch.epoch += 1;
+    watch.generation = 20;
+    watch.race = true;
+    try std.testing.expectEqual(@as(u64, 20), observation.observe(memory, 0x2000, 8192));
+    try std.testing.expectEqual(@as(u64, 21), observation.observe(memory, 0x2000, 8192));
+    try std.testing.expectEqual(@as(usize, 5), watch.calls);
+    memory.gpu_tracking_epoch = null;
+    _ = observation.observe(memory, 0x2000, 8192);
+    watch.generation = 30;
+    try std.testing.expectEqual(@as(u64, 30), observation.observe(memory, 0x2000, 8192));
+    try std.testing.expectEqual(@as(usize, 7), watch.calls);
+    memory.gpu_tracking_epoch = Watch.query;
+    _ = observation.observe(memory, 0x2000, 8192);
+    var replacement = Watch{ .epoch = watch.epoch, .generation = 40 };
+    memory.context = &replacement;
+    try std.testing.expectEqual(@as(u64, 40), observation.observe(memory, 0x2000, 8192));
+}
 
 const RetiredStorageBuffer = struct {
     buffer: OwnedBuffer,
@@ -2513,6 +2597,10 @@ const FrameProfile = struct {
     compute_translation_hits: u64 = 0,
     compute_translation_misses: u64 = 0,
     buffer_fingerprint_ns: u64 = 0,
+    buffer_page_ns: u64 = 0,
+    page_reused_bytes: u64 = 0,
+    bounded_vertex_bytes: u64 = 0,
+    bounded_vertex_fetches: u64 = 0,
     storage_buffer_waits: u64 = 0,
     storage_buffer_waits_avoided: u64 = 0,
     storage_buffer_renames: u64 = 0,
@@ -2970,6 +3058,7 @@ const SampledImageKey = struct {
 };
 
 const GraphicsResources = struct {
+    scalar_scratch: gpu.ScalarEvaluation = undefined,
     images: [maximum_sampled_images]PreparedSampledImage = undefined,
     image_count: usize = 0,
     descriptors: [maximum_sampled_images]gpu.ImageDescriptor = undefined,
@@ -3157,6 +3246,7 @@ const compute_watch_addresses = [_]u64{
 };
 
 const ComputeResources = struct {
+    scalar_scratch: gpu.ScalarEvaluation = undefined,
     mappings: [maximum_storage_mappings]gpu.ShaderSpirvStorageBufferBinding = undefined,
     mapping_count: usize = 0,
     scalar_registers: [gpu.scalar_provenance.maximum_scalar_specializations]gpu.ShaderSpirvScalarRegister = undefined,
@@ -3421,12 +3511,13 @@ fn validateVertexIndexMappings(
     reader: gpu.ShaderMemoryReader,
     resources: *ComputeResources,
     draw: GuestDraw,
+    precomputed_range: ?DrawVertexRange,
 ) void {
     const needs_range = for (resources.mappings[0..resources.mapping_count]) |mapping| {
         if (mapping.use_vertex_index and mapping.stride != 0) break true;
     } else false;
     if (!needs_range) return;
-    const range = drawVertexRange(reader, draw) orelse return;
+    const range = precomputed_range orelse drawVertexRange(reader, draw) orelse return;
     for (resources.mappings[0..resources.mapping_count]) |*mapping| {
         if (!mapping.use_vertex_index or mapping.stride == 0) continue;
         if (range.minimum < 0 or range.maximum < range.minimum) {
@@ -3581,6 +3672,117 @@ fn constantBufferFetchExtent(descriptor: gpu.BufferDescriptor, inst: gpu.ShaderI
     const end = @as(u64, scalar_offset) + @as(u64, @intCast(inst.memory_offset)) + element.bytes;
     if (end > maximum_staged_buffer_bytes) return descriptor.size_bytes;
     return @max(descriptor.size_bytes, end);
+}
+
+const DrawFetchBounds = struct {
+    entries: [2]gpu.index_bounds.EntryBound,
+
+    fn init(range: ?DrawVertexRange, draw: GuestDraw) ?DrawFetchBounds {
+        const vertices = range orelse return null;
+        if (vertices.minimum < 0 or vertices.maximum < vertices.minimum or vertices.maximum >= std.math.maxInt(u32) or draw.instance_count == 0) return null;
+        const instances = std.math.add(u32, draw.first_instance, draw.instance_count) catch return null;
+        return .{ .entries = .{
+            .{ .register = 5, .limit = @intCast(vertices.maximum + 1) },
+            .{ .register = 8, .limit = instances },
+        } };
+    }
+};
+
+fn vertexFetchesAreReadOnly(instructions: []const gpu.ShaderInstruction) bool {
+    for (instructions) |inst| {
+        if (inst.opcode == .unknown or inst.family == .flat) return false;
+        const name = @tagName(inst.opcode);
+        if (std.mem.startsWith(u8, name, "buffer_store") or std.mem.startsWith(u8, name, "tbuffer_store") or
+            std.mem.startsWith(u8, name, "buffer_atomic") or std.mem.startsWith(u8, name, "image_store") or
+            std.mem.startsWith(u8, name, "image_atomic") or std.mem.startsWith(u8, name, "s_store") or
+            std.mem.startsWith(u8, name, "s_buffer_store") or std.mem.startsWith(u8, name, "s_atomic") or
+            std.mem.startsWith(u8, name, "s_buffer_atomic")) return false;
+    }
+    return true;
+}
+
+fn vertexBufferFetchExtent(
+    descriptor: gpu.BufferDescriptor,
+    inst: gpu.ShaderInstruction,
+    scalar_offset: ?u32,
+    index_limit: ?u32,
+) u64 {
+    // Restrict this optimization to plain read-only formatted fetches. In
+    // particular, neither AGC attribute provenance nor IDXEN by itself proves
+    // that a shader indexes by the mesh's vertex number.
+    const formatted = switch (inst.opcode) {
+        .buffer_load_format_x, .buffer_load_format_xy, .buffer_load_format_xyz, .buffer_load_format_xyzw => true,
+        else => false,
+    };
+    if (!formatted or !inst.index_enable or inst.offset_enable or inst.memory_offset < 0 or
+        descriptor.stride == 0 or descriptor.swizzle_enabled or descriptor.add_thread_id) return descriptor.size_bytes;
+    const limit = index_limit orelse return descriptor.size_bytes;
+    if (limit == 0) return descriptor.size_bytes;
+    const offset = scalar_offset orelse return descriptor.size_bytes;
+    const element = gpu.elementLayoutForUnifiedFormat(descriptor.unified_format) orelse return descriptor.size_bytes;
+    const last = @as(u64, limit - 1) * descriptor.stride + offset + @as(u32, @intCast(inst.memory_offset));
+    // Preserve 32-bit address wrap and the original out-of-range behavior.
+    // Only shorten when every possible fetch is wholly inside the descriptor.
+    const end = last + element.bytes;
+    if (end > std.math.maxInt(u32) or end > descriptor.size_bytes) return descriptor.size_bytes;
+    // Full final records keep interleaved attributes on the same range; SSBO
+    // accesses use dwords even when the source element is byte-packed.
+    const aligned = std.mem.alignForward(u64, @max(end, @as(u64, limit) * descriptor.stride), 4);
+    return @min(descriptor.size_bytes, aligned);
+}
+
+fn vertexStagingPrefix(descriptor_bytes: u64, required_bytes: u64) u64 {
+    // A different exact prefix for every mesh destroys reuse of a static
+    // arena and can upload more than the original full-range cache. Restrict
+    // shortening to the grossly oversized descriptors and use stable 64 KiB
+    // buckets. Small/interleaved world ranges keep their shared full backing.
+    if (required_bytes > descriptor_bytes / 16) return descriptor_bytes;
+    const bucket = std.mem.alignForward(u64, required_bytes, 64 * 1024);
+    return if (bucket != 0 and bucket <= descriptor_bytes / 16) bucket else descriptor_bytes;
+}
+
+test "vertex staging buckets preserve static arena reuse and cover the proven prefix" {
+    const arena = 8 * 1024 * 1024;
+    try std.testing.expectEqual(@as(u64, 64 * 1024), vertexStagingPrefix(arena, 48));
+    try std.testing.expectEqual(vertexStagingPrefix(arena, 48), vertexStagingPrefix(arena, 63000));
+    try std.testing.expectEqual(@as(u64, 128 * 1024), vertexStagingPrefix(arena, 65537));
+    try std.testing.expectEqual(@as(u64, arena), vertexStagingPrefix(arena, 600000));
+    try std.testing.expectEqual(@as(u64, 512), vertexStagingPrefix(512, 16));
+    try std.testing.expectEqual(@as(u64, arena), vertexStagingPrefix(arena, 0));
+}
+
+test "bounded vertex fetch staging keeps offsets, instancing and full-range fallbacks" {
+    const descriptor = gpu.BufferDescriptor{
+        .address = 0x1000,
+        .stride = 24,
+        .record_count = 100000,
+        .size_bytes = 2400000,
+        .unified_format = 77,
+        .dst_select = .{ 4, 5, 6, 7 },
+        .swizzle_enabled = false,
+        .index_stride = 0,
+        .add_thread_id = false,
+        .out_of_bounds_select = 0,
+    };
+    var inst = gpu.ShaderInstruction{ .pc = 0, .family = .mubuf, .opcode = .buffer_load_format_xyzw, .index_enable = true };
+    try std.testing.expectEqual(@as(u64, 240), vertexBufferFetchExtent(descriptor, inst, 0, 10));
+    inst.memory_offset = 8;
+    try std.testing.expectEqual(@as(u64, 256), vertexBufferFetchExtent(descriptor, inst, 16, 10));
+    try std.testing.expectEqual(descriptor.size_bytes, vertexBufferFetchExtent(descriptor, inst, 16, null));
+    try std.testing.expectEqual(descriptor.size_bytes, vertexBufferFetchExtent(descriptor, inst, 16, 100000));
+    try std.testing.expectEqual(descriptor.size_bytes, vertexBufferFetchExtent(descriptor, inst, 16, std.math.maxInt(u32)));
+    inst.offset_enable = true;
+    try std.testing.expectEqual(descriptor.size_bytes, vertexBufferFetchExtent(descriptor, inst, 0, 10));
+    inst.offset_enable = false;
+    inst.opcode = .buffer_store_format_xyzw;
+    try std.testing.expectEqual(descriptor.size_bytes, vertexBufferFetchExtent(descriptor, inst, 0, 10));
+    try std.testing.expect(!vertexFetchesAreReadOnly(&.{inst}));
+    const bounds = DrawFetchBounds.init(.{ .minimum = 4, .maximum = 12 }, .{ .first_instance = 21, .instance_count = 3 }).?;
+    try std.testing.expectEqual(@as(u32, 13), bounds.entries[0].limit);
+    try std.testing.expectEqual(@as(u32, 24), bounds.entries[1].limit);
+    try std.testing.expect(DrawFetchBounds.init(.{ .minimum = -1, .maximum = 12 }, .{}) == null);
+    try std.testing.expect(DrawFetchBounds.init(.{ .minimum = 0, .maximum = 12 }, .{ .first_instance = std.math.maxInt(u32), .instance_count = 2 }) == null);
+    try std.testing.expect(DrawFetchBounds.init(null, .{}) == null);
 }
 
 fn matchVertexAttribute(
@@ -4323,6 +4525,8 @@ pub const Renderer = struct {
     gpu_feedback_snapshots: bool = true,
     storage_buffer_use_waits: bool = true,
     retain_clean_storage_buffers: bool = false,
+    cache_storage_buffer_contents: bool = true,
+    bound_vertex_fetches: bool = false,
     /// Diagnostic control for comparing readback waits independently of uploads.
     storage_buffer_read_use_waits: bool = true,
     /// Diagnostic opt-in while reconstructed NGG winding is being validated.
@@ -4965,6 +5169,8 @@ pub const Renderer = struct {
             .gpu_feedback_snapshots = options.gpu_feedback_snapshots,
             .storage_buffer_use_waits = options.storage_buffer_use_waits,
             .retain_clean_storage_buffers = options.retain_clean_storage_buffers,
+            .cache_storage_buffer_contents = options.cache_storage_buffer_contents,
+            .bound_vertex_fetches = options.bound_vertex_fetches,
             .storage_buffer_rename_budget_bytes = options.storage_buffer_rename_budget_bytes,
             .queued_host_storage_uploads = options.queued_host_storage_uploads,
             .storage_buffer_cache_budget_bytes = options.storage_buffer_cache_budget_bytes,
@@ -6177,12 +6383,13 @@ pub const Renderer = struct {
             // budget; allow its required bindings to exceed that soft limit.
             const cache_full = self.guest_buffers.items.len >=
                 @as(usize, if (self.retain_clean_storage_buffers) 512 else maximum_guest_buffers);
-            // Prefer the former allocation of this slot, unless another slot
-            // in the current descriptor set still names it. Cache hits can
-            // move a range between slots without transferring its ownership.
+            // Legacy slot reuse is appropriate only without retained ranges.
+            // At retained-cache capacity, choose by age below: the former
+            // slot owner can be the hottest vertex buffer while hundreds of
+            // old one-draw constants occupy the rest of the cache.
             var recycle_index: ?usize = null;
             for (self.guest_buffers.items, 0..) |entry, index| {
-                if ((!self.retain_clean_storage_buffers or cache_full) and
+                if (!self.retain_clean_storage_buffers and
                     (entry.device_local.host_mapping == null or cache_full) and
                     entry.descriptor_index == descriptor_index and
                     !self.storageBufferBoundElsewhere(entry.device_local.handle, descriptor_index))
@@ -6296,11 +6503,10 @@ pub const Renderer = struct {
         if (!entry.gpu_dirty) {
             try self.flushGuestStorageImageRange(guest_address, size);
             const previous_content_hash = entry.content_hash;
-            const tracked_generation = if (memory.track_gpu_read) |track|
-                track(memory.context, guest_address, size)
-            else
-                0;
-            const source_hash = if (tracked_generation == 0 and size >= self.storage_fingerprint_min_bytes and
+            const page_started = hostTimestampNs();
+            const tracked_generation = entry.page_observation.observe(memory, guest_address, size);
+            self.frame_profile.buffer_page_ns +|= elapsedHostNanoseconds(page_started);
+            const source_hash = if (self.cache_storage_buffer_contents and tracked_generation == 0 and size >= self.storage_fingerprint_min_bytes and
                 (!self.draw_uploads_enabled or cache_hit))
             hash: {
                 const fingerprint = memory.fingerprint orelse break :hash null;
@@ -6386,6 +6592,7 @@ pub const Renderer = struct {
                 } else {
                     self.frame_profile.resident_storage_bytes +%= size;
                     if (source_hash != null) self.frame_profile.content_reused_bytes +%= size;
+                    if (tracked_generation != 0) self.frame_profile.page_reused_bytes +%= size;
                 }
                 self.updateStorageDescriptorRange(descriptor_index, entry.device_local.handle, 0, size);
                 self.active_descriptor_set = self.descriptor_set;
@@ -7079,7 +7286,9 @@ pub const Renderer = struct {
         // then SPIR-V zeroed unspecialized s_load — UV collapsed to 0 and the
         // gather of the R8 cube always missed.
         const specialized_scalar_prefix_end: u32 = 0x0010_0000;
-        const scalar = gpu.scalar_provenance.evaluateDecodedResourceState(
+        var scalar: gpu.ScalarEvaluation = undefined;
+        gpu.scalar_provenance.evaluateDecodedResourceStateInto(
+            &scalar,
             reader,
             &bindings,
             analysis.program.instructions.items,
@@ -7095,6 +7304,7 @@ pub const Renderer = struct {
                 specialized_scalar_prefix_end,
                 null,
                 &.{},
+                null,
             ) catch |err| {
                 // Keep NVIDIA's command stream alive if a future kernel exceeds
                 // the fixed physical descriptor budget. Unsupported formats
@@ -8608,7 +8818,8 @@ pub const Renderer = struct {
                 continue;
             }
             const format = colorTargetFormat(candidate) orelse continue;
-            if (format.vulkan != vk.format_r8g8b8a8_unorm and format.vulkan != vk.format_r16g16b16a16_sfloat) continue;
+            if (format.vulkan != vk.format_r8g8b8a8_unorm and format.vulkan != vk.format_r8g8b8a8_snorm and
+                format.vulkan != vk.format_r16g16_sfloat and format.vulkan != vk.format_r16g16b16a16_sfloat) continue;
             if (packedBufferClearColor(format.vulkan, clear_words) == null) continue;
             const layout = gpu.SurfaceLayout.fromColorTarget(candidate) catch continue;
             if (layout.required_source_bytes != descriptor.size_bytes or layout.layers != 1) continue;
@@ -8627,7 +8838,8 @@ pub const Renderer = struct {
             var newest_sequence: u64 = 0;
             for (self.render_targets.items, 0..) |cached, index| {
                 if (cached.target.descriptor.address != descriptor.address or
-                    (cached.target.format.vulkan != vk.format_r8g8b8a8_unorm and cached.target.format.vulkan != vk.format_r16g16b16a16_sfloat) or
+                    (cached.target.format.vulkan != vk.format_r8g8b8a8_unorm and cached.target.format.vulkan != vk.format_r8g8b8a8_snorm and
+                        cached.target.format.vulkan != vk.format_r16g16_sfloat and cached.target.format.vulkan != vk.format_r16g16b16a16_sfloat) or
                     packedBufferClearColor(cached.target.format.vulkan, clear_words) == null or
                     cached.target.layout.required_source_bytes != descriptor.size_bytes or
                     cached.target.layout.layers != 1 or
@@ -9396,14 +9608,15 @@ pub const Renderer = struct {
         const instructions = analysis.program.instructions.items;
         // Checkpoints carry registers only. Reuse the empty load history
         // instead of reinitializing its 512 records for every instruction.
-        var scalar = gpu.ScalarEvaluation{};
+        const scalar = &result.scalar_scratch;
+        scalar.reset();
         for (instructions) |inst| {
             if (!isPointerScalarLoad(inst.opcode)) continue;
             const pointer_register = gpu.scalar_provenance.scalarRegisterIndex(inst.src0) orelse continue;
             if (pointer_register + 1 >= 128) continue;
             if (hasScalarLoadAt(proven_pointer_loads, inst.pc)) continue;
             scalar.registers = scalarRegistersAtCheckpoint(checkpoint_pcs, checkpoint_registers, inst.pc).*;
-            const table = try scalarPointerTablePlan(bindings, reader, analysis, &scalar, inst);
+            const table = try scalarPointerTablePlan(bindings, reader, analysis, scalar, inst);
             var pointers = PointerCandidates{};
             var offset: u64 = 0;
             var span: u64 = @as(u64, inst.data_words) * 4;
@@ -9417,10 +9630,10 @@ pub const Renderer = struct {
                 table_load_count += 1;
             } else {
                 if (scalar.registers[pointer_register].known and scalar.registers[pointer_register + 1].known) continue;
-                const known_offset = scalarMemoryOffset(inst, &scalar) orelse continue;
+                const known_offset = scalarMemoryOffset(inst, scalar) orelse continue;
                 if (known_offset < 0) continue;
                 offset = @intCast(known_offset);
-                pointers = (try resolveBufferPointerCandidates(bindings, reader, analysis, &scalar, @intCast(pointer_register), inst.pc)) orelse continue;
+                pointers = (try resolveBufferPointerCandidates(bindings, reader, analysis, scalar, @intCast(pointer_register), inst.pc)) orelse continue;
             }
             for (pointers.addresses[0..pointers.count]) |pointer| {
                 const first = (pointer + offset) & ~@as(u64, 3);
@@ -9933,6 +10146,7 @@ pub const Renderer = struct {
         specialized_scalar_prefix_end: u32,
         reserved_resources: ?*const ComputeResources,
         sampled_mappings: []const rdna2.spirv.SampledImageBinding,
+        draw_bounds: ?DrawFetchBounds,
     ) anyerror!*ComputeResources {
         const result = try ComputeResources.acquire(self);
         errdefer result.deinit(self);
@@ -9993,9 +10207,10 @@ pub const Renderer = struct {
 
         // Descriptor resolvers borrow this state read-only. Only the register
         // snapshot changes between checkpoints; the load history stays empty.
-        var instruction_scalar = gpu.ScalarEvaluation{};
+        const instruction_scalar = &result.scalar_scratch;
+        instruction_scalar.reset();
         const buffer_scan_started = hostTimestampNs();
-        for (instructions) |inst| {
+        for (instructions, 0..) |inst, instruction_index| {
             const is_store = switch (inst.opcode) {
                 .buffer_load_ubyte,
                 .buffer_load_sbyte,
@@ -10111,8 +10326,8 @@ pub const Renderer = struct {
                 bindings,
                 reader,
                 analysis,
-                &instruction_scalar,
-                &instruction_scalar,
+                instruction_scalar,
+                instruction_scalar,
                 resource_sgpr,
                 inst.pc,
             );
@@ -10137,7 +10352,7 @@ pub const Renderer = struct {
                 takePlausibleBufferDescriptor(attribute.buffer)
             else
                 null) orelse {
-                if (try self.prepareBufferTableCandidates(result, bindings, reader, analysis, &instruction_scalar, inst, is_store)) continue;
+                if (try self.prepareBufferTableCandidates(result, bindings, reader, analysis, instruction_scalar, inst, is_store)) continue;
                 self.traceSkippedStorage(bindings, inst, "unresolved descriptor", null);
                 if (log_verbose_gpu) {
                     const full = gpu.scalar_provenance.evaluatePrefix(reader, bindings);
@@ -10173,7 +10388,28 @@ pub const Renderer = struct {
                 );
                 continue;
             }
-            const staged_extent = constantBufferFetchExtent(descriptor, inst, &instruction_scalar.registers);
+            var staged_extent = constantBufferFetchExtent(descriptor, inst, &instruction_scalar.registers);
+            if (draw_bounds) |bounds| {
+                if (formatted_vertex_fetch and descriptor.stride != 0 and inst.index_enable and inst.src0.kind == .vgpr and !inst.src0.dpp and !inst.src0.dpp8 and
+                    !inst.src0.negate and !inst.src0.negate_hi and !inst.src0.absolute and inst.src0.sdwa_sel == 6 and
+                    !inst.src0.op_sel and !inst.src0.op_sel_hi and !inst.src0.sdwa_sext and inst.src0.omod == 0 and !inst.src0.clamp)
+                {
+                    const origins = origins: {
+                        if (analysis.scalar_definitions) |cache| {
+                            if (cache.matches(instructions, &analysis.graph)) break :origins cache.vectorEntryOrigins(instruction_index, inst.src0.reg);
+                        }
+                        if (instructions.ptr != analysis.program.instructions.items.ptr or instructions.len != analysis.program.instructions.items.len) break :origins null;
+                        break :origins gpu.index_bounds.vectorOrigins(instructions, &analysis.graph, instruction_index, inst.src0.reg, 0);
+                    };
+                    if (origins) |proven| {
+                        staged_extent = vertexStagingPrefix(descriptor.size_bytes, vertexBufferFetchExtent(descriptor, inst, if (vertex_attribute) |attribute| attribute.offset_bytes else vertexFetchScalarOffset(inst.src2, &instruction_scalar.registers), proven.upperBound(&bounds.entries)));
+                    }
+                }
+            }
+            if (staged_extent < descriptor.size_bytes) {
+                self.frame_profile.bounded_vertex_bytes +|= descriptor.size_bytes - staged_extent;
+                self.frame_profile.bounded_vertex_fetches +|= 1;
+            }
             const size = std.math.cast(usize, staged_extent) orelse {
                 self.traceSkippedStorage(bindings, inst, "descriptor size", descriptor);
                 if (log_verbose_gpu) std.debug.print(
@@ -10348,14 +10584,14 @@ pub const Renderer = struct {
                 bindings,
                 reader,
                 analysis,
-                &instruction_scalar,
+                instruction_scalar,
                 resource_sgpr,
                 inst.pc,
                 result.storage_image_mapping_count,
                 inst.imageResourceWords(),
             )) orelse {
                 if (!writable and bindings.stage == .compute and self.sampled_image_nonuniform_indexing) {
-                    if (try resolveBufferImageCandidates(bindings, reader, analysis, &instruction_scalar, inst)) |candidates| {
+                    if (try resolveBufferImageCandidates(bindings, reader, analysis, instruction_scalar, inst)) |candidates| {
                         var compressed = true;
                         for (candidates.words[0..candidates.count]) |words| {
                             const image = try gpu.resources.decodeImageDescriptor(&words);
@@ -10364,7 +10600,7 @@ pub const Renderer = struct {
                         if (compressed and !candidates.requires_null_check) continue;
                     }
                 }
-                self.reportResourceFailure(bindings, inst, &instruction_scalar);
+                self.reportResourceFailure(bindings, inst, instruction_scalar);
                 std.debug.print(
                     "[vulkan dcb] storage image pc=0x{x}: T# s{d}:s{d} unresolved\n",
                     .{ inst.pc, resource_sgpr, resource_sgpr + inst.imageResourceWords() - 1 },
@@ -10432,7 +10668,7 @@ pub const Renderer = struct {
                     index,
                     writable,
                 ) catch |err| {
-                    self.reportResourceFailure(bindings, inst, &instruction_scalar);
+                    self.reportResourceFailure(bindings, inst, instruction_scalar);
                     std.debug.print(
                         "[vulkan dcb] storage image pc=0x{x}: stage failed {s} addr=0x{x} {d}x{d}x{d} pitch={d} fmt={d} type={s} tile={f} levels={d}..{d} base_array={d} flags=0x{x} metadata=0x{x} dcc={any} cmask={any} fmask={any}\n",
                         .{
@@ -10547,18 +10783,18 @@ pub const Renderer = struct {
                 bindings,
                 reader,
                 analysis,
-                &instruction_scalar,
+                instruction_scalar,
                 resource_sgpr,
                 inst.pc,
                 descriptor_slot,
                 inst.imageResourceWords(),
             );
             const candidates = if (direct_image == null and self.sampled_image_nonuniform_indexing)
-                try resolveBufferImageCandidates(bindings, reader, analysis, &instruction_scalar, inst)
+                try resolveBufferImageCandidates(bindings, reader, analysis, instruction_scalar, inst)
             else
                 null;
             if (direct_image == null and candidates == null) {
-                self.reportResourceFailure(bindings, inst, &instruction_scalar);
+                self.reportResourceFailure(bindings, inst, instruction_scalar);
                 std.debug.print(
                     "[vulkan dcb] sampled image pc=0x{x}: T# s{d}:s{d} unresolved\n",
                     .{ inst.pc, resource_sgpr, resource_sgpr + inst.imageResourceWords() - 1 },
@@ -10600,12 +10836,12 @@ pub const Renderer = struct {
                         bindings,
                         reader,
                         analysis,
-                        &instruction_scalar,
+                        instruction_scalar,
                         sampler_sgpr,
                         inst.pc,
                         descriptor_slot,
                     )) orelse {
-                        self.reportResourceFailure(bindings, inst, &instruction_scalar);
+                        self.reportResourceFailure(bindings, inst, instruction_scalar);
                         std.debug.print(
                             "[vulkan dcb] sampled image pc=0x{x}: S# s{d}:s{d} unresolved\n",
                             .{ inst.pc, sampler_sgpr, sampler_sgpr + 3 },
@@ -10659,7 +10895,7 @@ pub const Renderer = struct {
                         sampled_dimension,
                         null,
                     ) catch |err| {
-                        self.reportResourceFailure(bindings, inst, &instruction_scalar);
+                        self.reportResourceFailure(bindings, inst, instruction_scalar);
                         std.debug.print(
                             "[vulkan dcb] sampled image pc=0x{x}: stage failed {s} dim={s} addr=0x{x} {d}x{d}x{d} pitch={d} fmt={d} type={s} tile={f} levels={d}..{d}\n",
                             .{ inst.pc, @errorName(err), @tagName(sampled_dimension), image_descriptor.address, image_descriptor.width, image_descriptor.height, image_descriptor.depth_or_layers, image_descriptor.pitch, image_descriptor.unified_format, @tagName(image_descriptor.image_type), image_descriptor.tile_mode, image_descriptor.base_level, image_descriptor.last_level },
@@ -14016,6 +14252,17 @@ pub const Renderer = struct {
         // difference is the whole question.
         self.frame_profile.target_readbacks +|= 1;
         const frame_bytes = try colorTargetFrameBytes(snapshot.target);
+        // Trace actual transfers, not thousands of already-current lookups.
+        if (@atomicLoad(bool, &trace_materialized_targets, .monotonic) and
+            (self.reported_materializations < 24 or self.flip_callbacks % 120 == 0))
+        {
+            self.reported_materializations +|= 1;
+            const target = snapshot.target;
+            std.debug.print(
+                "[gpu materialize] flip={d} @0x{x} {d}x{d} fmt={d} bytes={d} caller=0x{x}\n",
+                .{ self.flip_callbacks, target.descriptor.address, target.descriptor.width, target.descriptor.height, target.descriptor.format, frame_bytes, self.last_flush_caller },
+            );
+        }
 
         const command_buffer = try self.beginOneShot();
         defer self.releaseOneShot(command_buffer);
@@ -14154,17 +14401,6 @@ pub const Renderer = struct {
         }
         const index = selected orelse return false;
         self.frame_profile.materialize_target_hits +|= 1;
-        // Ten of these a frame move ninety megabytes off the device. Name them:
-        // whether that readback is avoidable depends on which surface it is and
-        // how often the same one comes back.
-        if (@atomicLoad(bool, &trace_materialized_targets, .monotonic) and self.reported_materializations < 24) {
-            self.reported_materializations += 1;
-            const target = self.render_targets.items[index].target;
-            std.debug.print(
-                "[gpu materialize] flip={d} @0x{x} {d}x{d} fmt={d} caller=0x{x}\n",
-                .{ self.flip_callbacks, address, target.descriptor.width, target.descriptor.height, target.descriptor.format, self.last_flush_caller },
-            );
-        }
         try self.materializeRenderTarget(index);
         return true;
     }
@@ -16704,6 +16940,82 @@ pub const Renderer = struct {
         std.debug.print("tessellation {s} inputs passed: fractional factors, patch IDs across groups, offchip offsets, changing factors, zero/OOB patch culling\n", .{@tagName(domain)});
     }
 
+    /// Compare actual rasterized output with full and proven-prefix SSBO views.
+    pub fn probeBoundedVertexFetches(self: *Renderer) anyerror!void {
+        const op = struct {
+            fn v(reg: u32) rdna2.Operand {
+                return .{ .kind = .vgpr, .reg = reg };
+            }
+            fn s(reg: u32) rdna2.Operand {
+                return .{ .kind = .sgpr, .reg = reg };
+            }
+            fn u(value: u32) rdna2.Operand {
+                return .{ .kind = .literal_constant, .value = value };
+            }
+        };
+        const source = try self.createBuffer(1024 * 1024, vk.buffer_usage_storage_buffer_bit, vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit);
+        defer self.destroyBuffer(source);
+        var records: [16][8]f32 = @splat(@splat(0));
+        const positions = [_][4]f32{ .{ -0.8, -0.8, 0.5, 1 }, .{ 0.8, -0.8, 0.5, 1 }, .{ 0, 0.8, 0.5, 1 } };
+        for (&records, 0..) |*record, index| {
+            @memcpy(record[0..4], &positions[index % 3]);
+            record[4..8].* = .{ @as(f32, @floatFromInt(index + 1)) / 16, 0.5, 0.25, 1 };
+        }
+        try self.writeMappedAt(source, 0, std.mem.asBytes(&records));
+        var fragment = try buildParameterProbeFragmentSpirv(self.allocator);
+        defer fragment.deinit(self.allocator);
+        const descriptor = gpu.BufferDescriptor{
+            .address = 0x1000,
+            .stride = 32,
+            .record_count = 32768,
+            .size_bytes = 1024 * 1024,
+            .unified_format = 77,
+            .dst_select = .{ 4, 5, 6, 7 },
+            .swizzle_enabled = false,
+            .index_stride = 0,
+            .add_thread_id = false,
+            .out_of_bounds_select = 0,
+        };
+        for ([_]bool{ false, true }) |per_vertex| {
+            var program = rdna2.Program{ .code = &.{}, .instructions = .empty };
+            defer program.deinit(self.allocator);
+            try program.instructions.appendSlice(self.allocator, &.{
+                .{ .pc = 0, .opcode = .s_mov_b64, .dst = op.s(4), .src0 = op.u(if (per_vertex) 0xffff_ffff else 0) },
+                .{ .pc = 8, .opcode = .v_cndmask_b32, .dst = op.v(0), .src0 = op.v(8), .src1 = op.v(5), .src2 = op.s(4) },
+                .{ .pc = 16, .family = .mubuf, .opcode = .buffer_load_format_xyzw, .dst = op.v(12), .src0 = op.v(5), .src1 = op.s(16), .src2 = op.u(0), .index_enable = true, .data_words = 4 },
+                .{ .pc = 24, .family = .mubuf, .opcode = .buffer_load_format_xyzw, .dst = op.v(16), .src0 = op.v(0), .src1 = op.s(16), .src2 = op.u(16), .index_enable = true, .data_words = 4 },
+                .{ .pc = 32, .family = .exp, .opcode = .exp, .export_target = 12, .export_enable = 15, .src0 = op.v(12), .src1 = op.v(13), .src2 = op.v(14), .src3 = op.v(15) },
+                .{ .pc = 40, .family = .exp, .opcode = .exp, .export_target = 32, .export_enable = 15, .export_done = true, .src0 = op.v(16), .src1 = op.v(17), .src2 = op.v(18), .src3 = op.v(19) },
+                .{ .pc = 48, .opcode = .s_endpgm },
+            });
+            var graph = try rdna2.control_flow.buildInstructions(self.allocator, program.instructions.items);
+            defer graph.deinit(self.allocator);
+            const origins = gpu.index_bounds.vectorOrigins(program.instructions.items, &graph, 3, 0, 0).?;
+            var module = try rdna2.translateSpirv(self.allocator, &program, .{
+                .stage = .vertex,
+                .vertex_index_vgpr = 5,
+                .storage_buffers = &.{.{ .resource_sgpr = 16, .descriptor_index = 0, .stride = 32, .unified_format = 77 }},
+            });
+            defer module.deinit(self.allocator);
+            for ([_]u32{ 4, 9 }) |first_instance| {
+                const draw = GuestDraw{ .vertex_count = 3, .instance_count = 2, .first_instance = first_instance };
+                const bounds = DrawFetchBounds.init(.{ .minimum = 0, .maximum = 2 }, draw).?;
+                const extent = vertexBufferFetchExtent(descriptor, program.instructions.items[3], 16, origins.upperBound(&bounds.entries));
+                try std.testing.expect(extent < 512);
+                var expected: [graphics_probe_width * graphics_probe_height * 4]u8 = undefined;
+                for ([_]u64{ descriptor.size_bytes, extent }, 0..) |range, pass| {
+                    try self.beginFrameDraw();
+                    self.updateStorageDescriptorRange(0, source.handle, 0, range);
+                    try self.drawGraphicsShaders(module.words, fragment.words, &.{}, &.{}, GraphicsPipelineState.default(graphics_probe_width, graphics_probe_height), null, &.{}, null, false, true, false, draw);
+                    if (pass == 0) @memcpy(&expected, &self.graphics_probe_frame) else try std.testing.expectEqualSlices(u8, &expected, &self.graphics_probe_frame);
+                }
+                const center = (graphics_probe_height / 2 * graphics_probe_width + graphics_probe_width / 2) * 4;
+                try std.testing.expect(expected[center] != 0 and expected[center + 1] != 0);
+            }
+        }
+        std.debug.print("bounded vertex fetches passed: full/prefix pixels match for vertex and instance selection, changing base instance\n", .{});
+    }
+
     pub fn probePrivateSpills(self: *Renderer) anyerror!void {
         const op = struct {
             fn v(reg: u32) rdna2.Operand {
@@ -17918,7 +18230,9 @@ pub const Renderer = struct {
         // recovered load at its producer PC; a final SGPR snapshot is invalid
         // for NGG shaders which reuse the same registers many times.
         const vertex_provenance_started = hostTimestampNs();
-        const vertex_scalar = gpu.scalar_provenance.evaluateDecodedResourceState(
+        var vertex_scalar: gpu.ScalarEvaluation = undefined;
+        gpu.scalar_provenance.evaluateDecodedResourceStateInto(
+            &vertex_scalar,
             reader,
             &vertex_bindings,
             vertex_instructions,
@@ -17948,7 +18262,8 @@ pub const Renderer = struct {
         // Attribute metadata helps resource discovery, but its V# register
         // names describe a later fetch, not the shader's entry ABI. Keep
         // synthetic descriptors out of the actual initial scalar values.
-        var vertex_scalar_mut = vertex_scalar;
+        var vertex_scalar_mut: gpu.ScalarEvaluation = undefined;
+        vertex_scalar_mut.copyFrom(&vertex_scalar);
         seedVertexBufferEvaluation(
             &vertex_bindings,
             reader,
@@ -17957,7 +18272,9 @@ pub const Renderer = struct {
         );
 
         const fragment_provenance_started = hostTimestampNs();
-        const fragment_scalar = gpu.scalar_provenance.evaluateDecodedResourceState(
+        var fragment_scalar: gpu.ScalarEvaluation = undefined;
+        gpu.scalar_provenance.evaluateDecodedResourceStateInto(
+            &fragment_scalar,
             reader,
             &fragment_bindings,
             fragment_analysis.program.instructions.items,
@@ -17982,6 +18299,12 @@ pub const Renderer = struct {
         // same storage-descriptor array as compute. Missing V#s are non-fatal:
         // translate without storage and skip MUBUF rather than abort the draw.
         const vertex_storage_started = hostTimestampNs();
+        const vertex_range: ?DrawVertexRange = if (self.bound_vertex_fetches and tessellation == null and vertexFetchesAreReadOnly(vertex_instructions)) range: {
+            // Index data can itself be a compute result. Publish it before
+            // proving a host-side bound, just as before staging any GPU output.
+            if (draw.index_count) |count| try self.flushPendingGuestWrite(draw.index_address, @as(usize, count) * @as(usize, if (draw.index_uint32) 4 else 2));
+            break :range drawVertexRange(reader, draw);
+        } else null;
         const vertex_storage = self.prepareComputeResources(
             &vertex_bindings,
             reader,
@@ -17991,6 +18314,7 @@ pub const Renderer = struct {
             vertex_scalar_end,
             null,
             graphics_resources.mappings[fragment_mapping_count..graphics_resources.mapping_count],
+            DrawFetchBounds.init(vertex_range, draw),
         ) catch |err| blk: {
             if (log_verbose_gpu or self.trace_resource_failures) std.debug.print(
                 "[vulkan dcb] vertex storage incomplete: {s}; translating without buffers flip={d} draw={d} vs=0x{x} ps=0x{x}\n",
@@ -18000,7 +18324,7 @@ pub const Renderer = struct {
         };
         self.frame_profile.graphics_storage_ns +|= elapsedHostNanoseconds(vertex_storage_started);
         defer vertex_storage.deinit(self);
-        validateVertexIndexMappings(reader, vertex_storage, draw);
+        validateVertexIndexMappings(reader, vertex_storage, draw, vertex_range);
         const capture_draw = @atomicLoad(u64, &capture_vertex_program, .monotonic) == vertex_address and
             @atomicLoad(u64, &capture_vertex_flip, .monotonic) == self.flip_callbacks + 1 and
             (@atomicLoad(u64, &capture_fragment_program, .monotonic) == 0 or
@@ -18388,17 +18712,17 @@ pub const Renderer = struct {
         // Pixel shaders use MUBUF/TBUFFER for constant and structured data as
         // well as sampled images.  Keep their descriptor slots disjoint from
         // the vertex resources already staged for this draw.
-        var fragment_scalar_mut = fragment_scalar;
         const fragment_storage_started = hostTimestampNs();
         const fragment_storage = self.prepareComputeResources(
             &fragment_bindings,
             reader,
             fragment_analysis,
             fragment_analysis.program.instructions.items,
-            &fragment_scalar_mut,
+            &fragment_scalar,
             fragment_scalar_end,
             vertex_storage,
             graphics_resources.mappings[0..fragment_mapping_count],
+            null,
         ) catch |err| blk: {
             if (fragmentShadowRecords(fragment_analysis)) return err;
             if (log_verbose_gpu or self.trace_resource_failures) std.debug.print(
@@ -19911,7 +20235,8 @@ pub const Renderer = struct {
         const scalar_checkpoint_pcs = checkpoints.pcs;
         const scalar_checkpoint_registers = checkpoints.snapshots;
 
-        var sampled_scalar = gpu.ScalarEvaluation{};
+        const sampled_scalar = &result.scalar_scratch;
+        sampled_scalar.reset();
         const sampled_scan_started = hostTimestampNs();
         defer self.frame_profile.graphics_sampled_scan_ns +|= elapsedHostNanoseconds(sampled_scan_started);
         for (instructions) |inst| {
@@ -19960,14 +20285,14 @@ pub const Renderer = struct {
                 bindings,
                 reader,
                 analysis,
-                &sampled_scalar,
+                sampled_scalar,
                 inst.src1.reg,
                 inst.pc,
                 image_slot,
                 inst.imageResourceWords(),
             )) orelse {
-                if (try self.appendIndirectGraphicsImages(result, bindings, reader, analysis, &sampled_scalar, inst, sampler_slot, render_target_write, extra_colors)) continue;
-                self.reportResourceFailure(bindings, inst, &sampled_scalar);
+                if (try self.appendIndirectGraphicsImages(result, bindings, reader, analysis, sampled_scalar, inst, sampler_slot, render_target_write, extra_colors)) continue;
+                self.reportResourceFailure(bindings, inst, sampled_scalar);
                 std.debug.print(
                     "[vulkan dcb] sampled image missing for s{d} (user_data={d} srt={any})\n",
                     .{ inst.src1.reg, bindings.user_data_count, bindings.srt_address != null },
@@ -19981,12 +20306,12 @@ pub const Renderer = struct {
                     bindings,
                     reader,
                     analysis,
-                    &sampled_scalar,
+                    sampled_scalar,
                     inst.src2.reg,
                     inst.pc,
                     sampler_slot,
                 )) orelse {
-                    self.reportResourceFailure(bindings, inst, &sampled_scalar);
+                    self.reportResourceFailure(bindings, inst, sampled_scalar);
                     std.debug.print(
                         "[vulkan dcb] sampler missing for s{d}\n",
                         .{inst.src2.reg},
@@ -20574,11 +20899,6 @@ pub const Renderer = struct {
             if (memory.gpu_generation) |generation| {
                 if (generation(memory.context, cached.descriptor.address, cached.allocation_bytes) == cached.guest_page_generation) return false;
             }
-        } else if (cached.guest_content_hash_valid) {
-            // A command-processor write clears this flag. The page tracker,
-            // when it is on, took the generation path above. Re-hashing a
-            // still-valid image only repeats a stored result.
-            return false;
         }
         // Native memory can fingerprint the backing without copying or detiling
         // it. Only a changed allocation needs the more expensive texel check.
@@ -21241,11 +21561,7 @@ pub const Renderer = struct {
             const unchanged = if (guest_page_generation != 0)
                 cached.guest_page_generation == guest_page_generation
             else if (cached.guest_content_hash_valid)
-                // A command-processor write clears this flag. Hashing the
-                // allocation again would only rediscover that it is current.
-                true
-            else if (memory.fingerprint) |fingerprint|
-                cached.guest_backing_hash != 0 and fingerprint(memory.context, descriptor.address, allocation_bytes) == cached.guest_content_hash
+                if (memory.fingerprint) |fingerprint| fingerprint(memory.context, descriptor.address, allocation_bytes) == cached.guest_content_hash else false
             else
                 false;
             if (unchanged) {
@@ -25085,7 +25401,7 @@ pub const Renderer = struct {
         var covered = false;
         for (pending) |entry| {
             if (!byteRangesOverlap(address, bytes.len, entry.release.address, entry.size())) continue;
-            if (entry.fixed == null and entry.release.data_selection != 1) return false;
+            if (entry.fixed == null and entry.release.data_selection != 1 and entry.release.data_selection != 2) return false;
             covered = true;
         }
         if (!covered) return false;
@@ -25102,8 +25418,10 @@ pub const Renderer = struct {
             var value: [8]u8 = undefined;
             if (entry.fixed) |fixed| {
                 value = fixed;
-            } else {
+            } else if (entry.release.data_selection == 1) {
                 std.mem.writeInt(u32, value[0..4], @truncate(entry.release.data), .little);
+            } else {
+                std.mem.writeInt(u64, &value, entry.release.data, .little);
             }
             const start = @max(address, entry.release.address);
             const end = @min(address + bytes.len, entry.release.address + size);
@@ -26349,8 +26667,8 @@ pub const Renderer = struct {
                 },
             );
             std.debug.print(
-                "[gpu buffers] flip={d} content_reused_kib={d} fingerprint_ms={d} materialize_ms={d} views_ms={d}\n",
-                .{ self.flip_callbacks, profile.content_reused_bytes / 1024, profile.buffer_fingerprint_ns / std.time.ns_per_ms, profile.stage_materialize_ns / std.time.ns_per_ms, profile.stage_views_ns / std.time.ns_per_ms },
+                "[gpu buffers] flip={d} content_reused_kib={d} fingerprint_ms={d} materialize_ms={d} views_ms={d} page_ms={d} page_reused_kib={d} vertex_trim_kib={d} vertex_trim_fetches={d}\n",
+                .{ self.flip_callbacks, profile.content_reused_bytes / 1024, profile.buffer_fingerprint_ns / std.time.ns_per_ms, profile.stage_materialize_ns / std.time.ns_per_ms, profile.stage_views_ns / std.time.ns_per_ms, profile.buffer_page_ns / std.time.ns_per_ms, profile.page_reused_bytes / 1024, profile.bounded_vertex_bytes / 1024, profile.bounded_vertex_fetches },
             );
             std.debug.print(
                 "[gpu compute scan] flip={d} buffers_ms={d}(stage={d},ptr={d}) images_ms={d} resolve_ms={d} stage_ms={d} probe={d}ms/{d} dedup={d}ms/{d} tail_ms={d}(loop={d}/stage={d}ms/{d},desc={d},flat={d},blk={d},slk={d}) dispatches={d} walked={d} images={d} distinct_buf={d}/{d} distinct_img={d}/{d}\n",
@@ -29597,10 +29915,12 @@ fn storageImageCanAliasRenderTarget(
 /// one complete native texel. Keep exceptional half values on the raw-buffer
 /// path: a Vulkan float clear need not preserve NaN payloads or subnormals.
 fn packedBufferClearColor(image_format: u32, words: [4]u32) ?vk.ClearColorValue {
-    if (image_format == vk.format_r16g16b16a16_sfloat) {
+    if (image_format == vk.format_r16g16_sfloat or image_format == vk.format_r16g16b16a16_sfloat) {
+        const channels: usize = if (image_format == vk.format_r16g16_sfloat) 2 else 4;
         if (words[0] != words[2] or words[1] != words[3]) return null;
-        var values: [4]f32 = undefined;
-        for (&values, 0..) |*value, channel| {
+        if (channels == 2 and words[0] != words[1]) return null;
+        var values: [4]f32 = @splat(0);
+        for (values[0..channels], 0..) |*value, channel| {
             const bits: u16 = @truncate(words[channel / 2] >> @as(u5, @intCast((channel % 2) * 16)));
             const magnitude = bits & 0x7fff;
             if (magnitude >= 0x7c00 or (magnitude != 0 and magnitude < 0x400)) return null;
@@ -29608,7 +29928,7 @@ fn packedBufferClearColor(image_format: u32, words: [4]u32) ?vk.ClearColorValue 
         }
         return .{ .float32 = values };
     }
-    if (image_format != vk.format_r8_unorm and image_format != vk.format_r8g8b8a8_unorm) return null;
+    if (image_format != vk.format_r8_unorm and image_format != vk.format_r8g8b8a8_unorm and image_format != vk.format_r8g8b8a8_snorm) return null;
     for (words[1..]) |word| if (word != words[0]) return null;
     var bytes: [4]u8 = undefined;
     std.mem.writeInt(u32, &bytes, words[0], .little);
@@ -29616,11 +29936,28 @@ fn packedBufferClearColor(image_format: u32, words: [4]u32) ?vk.ClearColorValue 
         for (bytes[1..]) |byte| if (byte != bytes[0]) return null;
     }
     var values: [4]f32 = undefined;
-    for (&values, bytes) |*value, byte| value.* = @as(f32, @floatFromInt(byte)) * (1.0 / 255.0);
+    for (&values, bytes) |*value, byte| {
+        if (image_format == vk.format_r8g8b8a8_snorm) {
+            const signed: i8 = @bitCast(byte);
+            // -128 and -127 both decode as -1. Clearing -1 need not reproduce
+            // -128, so preserve that raw pattern through the buffer path.
+            if (signed == -128) return null;
+            value.* = @as(f32, @floatFromInt(signed)) * (1.0 / 127.0);
+        } else {
+            value.* = @as(f32, @floatFromInt(byte)) * (1.0 / 255.0);
+        }
+    }
     return .{ .float32 = values };
 }
 
 test "packed clear patterns preserve native texels and reject lossy half conversion" {
+    const rg_clear = packedBufferClearColor(vk.format_r16g16_sfloat, @splat(0xb400_3800)).?;
+    try std.testing.expectEqualSlices(f32, &.{ 0.5, -0.25, 0, 0 }, &rg_clear.float32);
+    try std.testing.expectEqual(null, packedBufferClearColor(vk.format_r16g16_sfloat, .{ 1, 0, 1, 0 }));
+    try std.testing.expectEqual(null, packedBufferClearColor(vk.format_r16g16_sfloat, @splat(0x7e11)));
+    const snorm_clear = packedBufferClearColor(vk.format_r8g8b8a8_snorm, @splat(0x7f81_7f00)).?;
+    try std.testing.expectEqualSlices(f32, &.{ 0, 1, -1, 1 }, &snorm_clear.float32);
+    try std.testing.expectEqual(null, packedBufferClearColor(vk.format_r8g8b8a8_snorm, @splat(0x8000_0000)));
     const half_clear = packedBufferClearColor(vk.format_r16g16b16a16_sfloat, .{ 0xb400_3800, 0x4000_3a00, 0xb400_3800, 0x4000_3a00 }).?;
     try std.testing.expectEqualSlices(f32, &.{ 0.5, -0.25, 0.75, 2 }, &half_clear.float32);
     for ([_]u32{ 1, 0x7e11, 0x7c00, 0xfc00 }) |exceptional| {
@@ -33949,6 +34286,65 @@ test "retiring an older storage image binding preserves the current pass pin" {
     try std.testing.expectEqual(@as(usize, 0), renderer.storage_image_cache.items[0].pin_count);
 }
 
+test "wait projection handles 64-bit release halves and ordered overwrites without publishing CPU labels" {
+    const Memory = struct {
+        bytes: [32]u8 = @splat(0xcc),
+        fn read(raw: ?*anyopaque, address: u64, bytes: []u8) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (address < 0x1000 or address - 0x1000 > self.bytes.len or bytes.len > self.bytes.len - (address - 0x1000)) return false;
+            @memcpy(bytes, self.bytes[@intCast(address - 0x1000)..][0..bytes.len]);
+            return true;
+        }
+        fn write(_: ?*anyopaque, _: u64, _: []const u8) bool {
+            @panic("projected waits must not publish guest labels");
+        }
+    };
+    const renderer = try std.testing.allocator.create(Renderer);
+    defer std.testing.allocator.destroy(renderer);
+    var memory = Memory{};
+    renderer.publishing_internal_release = false;
+    renderer.guest_buffers = .empty;
+    renderer.guest_memory = .{ .context = &memory, .read = Memory.read, .write = Memory.write };
+    var release = std.mem.zeroes(gpu.state.ReleaseMem);
+    release.address = 0x1008;
+    release.data_selection = 2;
+    release.data = 0x1122334455667788;
+    renderer.deferred_internal_releases[0] = .{ .tick = 7, .release = release };
+    renderer.deferred_internal_release_count = 1;
+    var bytes: [24]u8 = undefined;
+    try std.testing.expect(renderer.readProjectedReleases(0x1000, &bytes));
+    try std.testing.expect(std.mem.allEqual(u8, bytes[0..8], 0xcc));
+    try std.testing.expectEqual(release.data, std.mem.readInt(u64, bytes[8..16], .little));
+    try std.testing.expect(std.mem.allEqual(u8, bytes[16..24], 0xcc));
+    var high: [4]u8 = undefined;
+    try std.testing.expect(renderer.readProjectedReleases(0x100c, &high));
+    try std.testing.expectEqual(@as(u32, 0x11223344), std.mem.readInt(u32, &high, .little));
+    // A later 32-bit label replaces just the upper half of the first label.
+    release.data_selection = 1;
+    release.address = 0x100c;
+    release.data = 0xaabbccdd;
+    renderer.deferred_internal_releases[1] = .{ .tick = 8, .release = release };
+    renderer.deferred_internal_release_count = 2;
+    try std.testing.expect(renderer.readProjectedReleases(0x1000, &bytes));
+    try std.testing.expectEqual(@as(u64, 0xaabbccdd55667788), std.mem.readInt(u64, bytes[8..16], .little));
+    // Timestamp values are not known before completion and cannot be projected.
+    renderer.deferred_internal_releases[1].release.data_selection = 3;
+    try std.testing.expect(!renderer.readProjectedReleases(0x1000, &bytes));
+    // A DMA overwrite queued behind the label also obeys stream order.
+    renderer.deferred_internal_releases[1].fixed = .{ 0x91, 0x92, 0, 0, 0, 0, 0, 0 };
+    renderer.deferred_internal_releases[1].fixed_size = 2;
+    try std.testing.expect(renderer.readProjectedReleases(0x1000, &bytes));
+    try std.testing.expectEqual(@as(u64, 0x1122929155667788), std.mem.readInt(u64, bytes[8..16], .little));
+    try std.testing.expect(std.mem.allEqual(u8, &memory.bytes, 0xcc));
+    try std.testing.expectEqual(@as(usize, 2), renderer.deferred_internal_release_count);
+    try std.testing.expect(!renderer.readProjectedReleases(0x1000, bytes[0..4]));
+    var resident: GuestBufferEntry = undefined;
+    resident.guest_address = 0x1000;
+    resident.size = 32;
+    renderer.guest_buffers = .{ .items = @as(*[1]GuestBufferEntry, @ptrCast(&resident)), .capacity = 1 };
+    try std.testing.expect(!renderer.readProjectedReleases(0x1000, &bytes));
+}
+
 test "a descriptor reused after an intermediate flush remains reserved by queued draws" {
     const mock = struct {
         fn end(_: vk.CommandBuffer) callconv(vk.call) vk.Result {
@@ -35240,7 +35636,7 @@ test "vertex index range batches checked reads and preserves signed bounds" {
     try std.testing.expectEqual(@as(usize, 0), memory.calls);
     const resources = try ComputeResources.init(std.testing.allocator);
     defer std.testing.allocator.destroy(resources);
-    validateVertexIndexMappings(reader, resources, .{ .index_address = 0x1000, .index_count = 4096 });
+    validateVertexIndexMappings(reader, resources, .{ .index_address = 0x1000, .index_count = 4096 }, null);
     try std.testing.expectEqual(@as(usize, 0), memory.calls);
     const direct = drawVertexRange(reader, .{ .first_vertex = 17, .vertex_count = 4 }).?;
     try std.testing.expectEqual(@as(i64, 17), direct.minimum);
