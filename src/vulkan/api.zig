@@ -398,6 +398,8 @@ pub const subpass_contents_inline: u32 = 0;
 pub const filter_nearest: u32 = 0;
 pub const format_b8g8r8a8_unorm: u32 = 44;
 pub const color_space_srgb_nonlinear_khr: u32 = 0;
+pub const present_mode_immediate_khr: u32 = 0;
+pub const present_mode_mailbox_khr: u32 = 1;
 pub const present_mode_fifo_khr: u32 = 2;
 pub const composite_alpha_opaque_bit_khr: Flags = 0x0000_0001;
 pub const surface_transform_identity_bit_khr: Flags = 0x0000_0001;
@@ -1234,6 +1236,7 @@ pub const PfnCreateWin32SurfaceKHR = *const fn (Instance, *const Win32SurfaceCre
 pub const PfnDestroySurfaceKHR = *const fn (Instance, Surface, ?*const anyopaque) callconv(call) void;
 pub const PfnGetPhysicalDeviceSurfaceSupportKHR = *const fn (PhysicalDevice, u32, Surface, *Bool32) callconv(call) Result;
 pub const PfnGetPhysicalDeviceSurfaceCapabilitiesKHR = *const fn (PhysicalDevice, Surface, *SurfaceCapabilitiesKHR) callconv(call) Result;
+pub const PfnGetPhysicalDeviceSurfacePresentModesKHR = *const fn (PhysicalDevice, Surface, *u32, ?[*]u32) callconv(call) Result;
 pub const PfnGetPhysicalDeviceSurfaceFormatsKHR = *const fn (PhysicalDevice, Surface, *u32, ?[*]SurfaceFormatKHR) callconv(call) Result;
 
 pub const PfnDestroyDevice = *const fn (Device, ?*const anyopaque) callconv(call) void;

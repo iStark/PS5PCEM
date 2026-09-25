@@ -166,7 +166,8 @@ pub fn reserveFlipDelay(process_time_us: u64) u32 {
     lock.lock();
     defer lock.unlock();
     if (!opened) return 0;
-    const interval_us: u64 = 16_667;
+    // 120 Hz. A finished frame no longer waits out a 60 Hz slot.
+    const interval_us: u64 = 8_333;
     const deadline = @max(next_flip_time_us, process_time_us);
     const delay = deadline - process_time_us;
     next_flip_time_us = deadline +| interval_us;
@@ -179,10 +180,10 @@ test "flip pacing credits rendering time and does not catch up missed frames" {
     try std.testing.expectEqual(@as(u32, 0), reserveFlipDelay(1_000));
     try std.testing.expect(open(0));
     try std.testing.expectEqual(@as(u32, 0), reserveFlipDelay(1_000));
-    try std.testing.expectEqual(@as(u32, 13_667), reserveFlipDelay(4_000));
-    try std.testing.expectEqual(@as(u32, 16_001), reserveFlipDelay(18_333));
+    try std.testing.expectEqual(@as(u32, 5_333), reserveFlipDelay(4_000));
+    try std.testing.expectEqual(@as(u32, 0), reserveFlipDelay(18_333));
     try std.testing.expectEqual(@as(u32, 0), reserveFlipDelay(100_000));
-    try std.testing.expectEqual(@as(u32, 15_667), reserveFlipDelay(101_000));
+    try std.testing.expectEqual(@as(u32, 7_333), reserveFlipDelay(101_000));
     try std.testing.expect(close(primary_handle));
     try std.testing.expect(open(0));
     try std.testing.expectEqual(@as(u32, 0), reserveFlipDelay(102_000));
@@ -195,7 +196,7 @@ pub fn noteOpenProcessTime(process_time_us: u64) void {
     open_process_time_us = process_time_us;
 }
 
-/// Advances the emulated display refresh once (~16.7 ms at 60 Hz).
+/// Advances the emulated display refresh once (~8.3 ms at 120 Hz).
 pub fn advanceVblank(process_time_us: u64, process_time_counter: u64) VblankStatus {
     lock.lock();
     defer lock.unlock();
@@ -223,7 +224,7 @@ pub fn vblankStatus(handle: i32, process_time_us: u64, process_time_counter: u64
         process_time_us - open_process_time_us
     else
         0;
-    const expected = elapsed / 16_667;
+    const expected = elapsed / 8_333;
     if (expected > vblank_count) vblank_count = expected;
     return .{
         .count = vblank_count,

@@ -1469,8 +1469,8 @@ fn videoOutDeleteVblankEvent(equeue: i64, handle: i32) callconv(abi.guest) i32 {
 
 fn videoOutWaitVblank(handle: i32) callconv(abi.guest) i32 {
     if (!validVideoHandle(handle)) return video_out_error_invalid_handle;
-    // Pace to ~60 Hz so titles that spin on vblank do not burn a core.
-    _ = kernel_threading.sceKernelUsleep(16_667);
+    // Pace to ~120 Hz so titles that spin on vblank do not burn a core.
+    _ = kernel_threading.sceKernelUsleep(8_333);
     _ = video_out.advanceVblank(
         kernel_runtime.processTimeMicroseconds(),
         kernel_runtime.processTimeCounter(),

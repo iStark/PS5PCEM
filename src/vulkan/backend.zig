@@ -578,6 +578,7 @@ const SurfaceFunctions = struct {
     destroy_surface: vk.PfnDestroySurfaceKHR,
     get_surface_support: vk.PfnGetPhysicalDeviceSurfaceSupportKHR,
     get_surface_capabilities: vk.PfnGetPhysicalDeviceSurfaceCapabilitiesKHR,
+    get_surface_present_modes: vk.PfnGetPhysicalDeviceSurfacePresentModesKHR,
     get_surface_formats: vk.PfnGetPhysicalDeviceSurfaceFormatsKHR,
 
     fn load(loader: *const Loader, instance_handle: vk.Instance) Error!SurfaceFunctions {
@@ -587,6 +588,7 @@ const SurfaceFunctions = struct {
             .destroy_surface = try loader.instance(instance_handle, vk.PfnDestroySurfaceKHR, "vkDestroySurfaceKHR"),
             .get_surface_support = try loader.instance(instance_handle, vk.PfnGetPhysicalDeviceSurfaceSupportKHR, "vkGetPhysicalDeviceSurfaceSupportKHR"),
             .get_surface_capabilities = try loader.instance(instance_handle, vk.PfnGetPhysicalDeviceSurfaceCapabilitiesKHR, "vkGetPhysicalDeviceSurfaceCapabilitiesKHR"),
+            .get_surface_present_modes = try loader.instance(instance_handle, vk.PfnGetPhysicalDeviceSurfacePresentModesKHR, "vkGetPhysicalDeviceSurfacePresentModesKHR"),
             .get_surface_formats = try loader.instance(instance_handle, vk.PfnGetPhysicalDeviceSurfaceFormatsKHR, "vkGetPhysicalDeviceSurfaceFormatsKHR"),
         };
     }
@@ -2625,6 +2627,8 @@ const FrameProfile = struct {
     graphics_pipeline_lookup_ns: u64 = 0,
     graphics_scalar_upload_ns: u64 = 0,
     graphics_record_ns: u64 = 0,
+    draw_reuse_hits: u64 = 0,
+    draw_reuse_misses: u64 = 0,
     sampled_stage_ns: u64 = 0,
     sampled_flush_ns: u64 = 0,
     sampled_generation_ns: u64 = 0,
@@ -4147,6 +4151,19 @@ pub const Renderer = struct {
     /// buffer. Ending and resetting a buffer for every copy was most of the
     /// host time in a Quake frame.
     open_batch_commands: bool = false,
+    /// Consecutive draws that bind the same shaders and user data skip
+    /// scalar walks and buffer staging and record into the open batch.
+    draw_reuse_valid: bool = false,
+    draw_reuse_key: u64 = 0,
+    draw_reuse_epoch: u64 = 0,
+    draw_reuse_vertex: ?spirv_cache.Lease = null,
+    draw_reuse_fragment: ?spirv_cache.Lease = null,
+    draw_reuse_vertex_scalars: [256]gpu.ShaderSpirvScalarRegister = undefined,
+    draw_reuse_fragment_scalars: [256]gpu.ShaderSpirvScalarRegister = undefined,
+    draw_reuse_vertex_scalar_count: usize = 0,
+    draw_reuse_fragment_scalar_count: usize = 0,
+    draw_reuse_pipeline: GraphicsPipelineState = undefined,
+    draw_reuse_bind_descriptors: bool = false,
     draw_uploads_enabled: bool = false,
     deferred_vulkan_objects: std.ArrayList(DeferredVulkanObjectEntry) = .empty,
     retired_storage_buffers: std.ArrayList(RetiredStorageBuffer) = .empty,
@@ -17561,6 +17578,27 @@ pub const Renderer = struct {
         return .{ .config = config, .factors = factors, .patch_count = patch_count };
     }
 
+    fn drawResourceKey(
+        vertex_address: u64,
+        fragment_address: u64,
+        vertex_bindings: *const gpu.ShaderBindings,
+        fragment_bindings: *const gpu.ShaderBindings,
+        target_address: u64,
+        depth_address: u64,
+        extra_colors: []const GuestColorTarget,
+    ) u64 {
+        var hasher = std.hash.Wyhash.init(vertex_address);
+        hasher.update(std.mem.asBytes(&fragment_address));
+        hasher.update(std.mem.asBytes(&target_address));
+        hasher.update(std.mem.asBytes(&depth_address));
+        hasher.update(std.mem.asBytes(&vertex_bindings.scalar_user_data_base));
+        hasher.update(std.mem.asBytes(&fragment_bindings.scalar_user_data_base));
+        hasher.update(std.mem.sliceAsBytes(vertex_bindings.user_data[0..vertex_bindings.user_data_count]));
+        hasher.update(std.mem.sliceAsBytes(fragment_bindings.user_data[0..fragment_bindings.user_data_count]));
+        for (extra_colors) |extra| hasher.update(std.mem.asBytes(&extra.descriptor.address));
+        return hasher.final();
+    }
+
     fn drawGuestGraphics(
         self: *Renderer,
         state: *const gpu.State,
@@ -17576,7 +17614,6 @@ pub const Renderer = struct {
             vertex_stage.programAddress(state) orelse 0,
             gpu.resources.ShaderStage.pixel.programAddress(state) orelse 0,
         };
-        try self.beginFrameDraw();
         const memory = self.guest_memory orelse return Error.GuestMemoryUnavailable;
         const render_state = gpu.resources.decodeRenderState(state);
         if (!self.reported_first_scissor_state) {
@@ -18010,6 +18047,44 @@ pub const Renderer = struct {
                 .srt_address = null,
                 .direct_pointers = .{},
             };
+        const draw_epoch = if (memory.gpu_tracking_epoch) |query| query(memory.context) else 0;
+        const draw_key = drawResourceKey(vertex_address, fragment_address, &vertex_bindings, &fragment_bindings, target.descriptor.address, if (depth_plane) |plane| plane.address else 0, extra_colors);
+        if (self.draw_reuse_valid and self.draw_batch_active and self.draw_reuse_key == draw_key and self.draw_reuse_epoch == draw_epoch) {
+            self.frame_profile.draw_reuse_hits +|= 1;
+            var reused_state = self.draw_reuse_pipeline;
+            reused_state.viewport_x_bits = pipeline_state.viewport_x_bits;
+            reused_state.viewport_y_bits = pipeline_state.viewport_y_bits;
+            reused_state.viewport_width_bits = pipeline_state.viewport_width_bits;
+            reused_state.viewport_height_bits = pipeline_state.viewport_height_bits;
+            reused_state.viewport_min_depth_bits = pipeline_state.viewport_min_depth_bits;
+            reused_state.viewport_max_depth_bits = pipeline_state.viewport_max_depth_bits;
+            reused_state.scissor_x = pipeline_state.scissor_x;
+            reused_state.scissor_y = pipeline_state.scissor_y;
+            reused_state.scissor_width = pipeline_state.scissor_width;
+            reused_state.scissor_height = pipeline_state.scissor_height;
+            reused_state.depth_bias_enable = pipeline_state.depth_bias_enable;
+            reused_state.depth_bias_constant_bits = pipeline_state.depth_bias_constant_bits;
+            reused_state.depth_bias_slope_bits = pipeline_state.depth_bias_slope_bits;
+            const reused_vertex = (self.draw_reuse_vertex orelse return Error.MissingGraphicsProgram).view();
+            const reused_fragment = (self.draw_reuse_fragment orelse return Error.MissingGraphicsProgram).view();
+            try self.drawGraphicsShaders(
+                reused_vertex.words,
+                reused_fragment.words,
+                self.draw_reuse_vertex_scalars[0..self.draw_reuse_vertex_scalar_count],
+                self.draw_reuse_fragment_scalars[0..self.draw_reuse_fragment_scalar_count],
+                reused_state,
+                if (depth_only) null else target,
+                extra_colors,
+                depth_plane,
+                render_state.depth_control.clear_enabled or render_state.depth_control.stencil_clear_enabled,
+                self.draw_reuse_bind_descriptors,
+                false,
+                draw,
+            );
+            return;
+        }
+        self.frame_profile.draw_reuse_misses +|= 1;
+        try self.beginFrameDraw();
         var fragment_specialization = if (@atomicLoad(bool, &graphics_uniform_specialization, .monotonic))
             try fragment_analysis.acquireUniformSpecialization(self.allocator, reader, &fragment_bindings, self.uniform_specialization_cache_enabled)
         else
@@ -19260,6 +19335,20 @@ pub const Renderer = struct {
                     pipeline_state.rectangle_completion = rectangle_completion;
                     pipeline_state.rectangle_parameter_mask = paired_parameter_mask;
                 }
+                const bind_descriptors = graphics_resources.mapping_count != 0 or
+                    vertex_storage.mapping_count != 0 or
+                    fragment_storage.mapping_count != 0 or
+                    fragment_storage.storage_image_count != 0;
+                self.rememberDrawReuse(
+                    draw_key,
+                    draw_epoch,
+                    vertex_lease,
+                    fragment_lease,
+                    vertex_scalar_regs[0..vertex_scalar_count],
+                    fragment_scalar_regs[0..fragment_scalar_count],
+                    pipeline_state,
+                    bind_descriptors,
+                );
                 try self.drawGraphicsShaders(
                     vertex_module.words,
                     fragment_words,
@@ -19271,10 +19360,7 @@ pub const Renderer = struct {
                     depth_plane,
                     render_state.depth_control.clear_enabled or
                         render_state.depth_control.stencil_clear_enabled,
-                    graphics_resources.mapping_count != 0 or
-                        vertex_storage.mapping_count != 0 or
-                        fragment_storage.mapping_count != 0 or
-                        fragment_storage.storage_image_count != 0,
+                    bind_descriptors,
                     false,
                     draw,
                 );
@@ -24589,10 +24675,45 @@ pub const Renderer = struct {
         self.dynamic_scalar_mapping = self.dynamic_scalar_mapping_base;
     }
 
+    fn invalidateDrawReuse(self: *Renderer) void {
+        if (self.draw_reuse_vertex) |lease| lease.release();
+        if (self.draw_reuse_fragment) |lease| lease.release();
+        self.draw_reuse_vertex = null;
+        self.draw_reuse_fragment = null;
+        self.draw_reuse_valid = false;
+    }
+
+    fn rememberDrawReuse(
+        self: *Renderer,
+        key: u64,
+        epoch: u64,
+        vertex_lease: spirv_cache.Lease,
+        fragment_lease: spirv_cache.Lease,
+        vertex_scalars: []const gpu.ShaderSpirvScalarRegister,
+        fragment_scalars: []const gpu.ShaderSpirvScalarRegister,
+        pipeline_state: GraphicsPipelineState,
+        bind_descriptors: bool,
+    ) void {
+        self.invalidateDrawReuse();
+        if (vertex_scalars.len > self.draw_reuse_vertex_scalars.len or fragment_scalars.len > self.draw_reuse_fragment_scalars.len) return;
+        self.draw_reuse_vertex = vertex_lease.retain();
+        self.draw_reuse_fragment = fragment_lease.retain();
+        @memcpy(self.draw_reuse_vertex_scalars[0..vertex_scalars.len], vertex_scalars);
+        @memcpy(self.draw_reuse_fragment_scalars[0..fragment_scalars.len], fragment_scalars);
+        self.draw_reuse_vertex_scalar_count = vertex_scalars.len;
+        self.draw_reuse_fragment_scalar_count = fragment_scalars.len;
+        self.draw_reuse_pipeline = pipeline_state;
+        self.draw_reuse_bind_descriptors = bind_descriptors;
+        self.draw_reuse_key = key;
+        self.draw_reuse_epoch = epoch;
+        self.draw_reuse_valid = true;
+    }
+
     fn beginDescriptorBatch(
         self: *Renderer,
         allow_draw_uploads: bool,
     ) (Error || std.mem.Allocator.Error)!void {
+        self.invalidateDrawReuse();
         self.retireDrawUploadSpills();
         self.draw_upload_batch_uses_ring = false;
         self.sampled_image_batch +%= 1;
@@ -26757,7 +26878,7 @@ pub const Renderer = struct {
                 self.flip_callbacks, profile.cold_storage_images, profile.cold_storage_image_bytes,
             });
             std.debug.print(
-                "[gpu draw] flip={d} shader_check_ms={d} storage_ms={d} setup_ms={d} pipeline_lookup_ms={d} scalar_upload_ms={d} record_ms={d}\n",
+                "[gpu draw] flip={d} shader_check_ms={d} storage_ms={d} setup_ms={d} pipeline_lookup_ms={d} scalar_upload_ms={d} record_ms={d} reuse={d}/{d}\n",
                 .{
                     self.flip_callbacks,
                     profile.shader_validation_ns / std.time.ns_per_ms,
@@ -26766,6 +26887,8 @@ pub const Renderer = struct {
                     profile.graphics_pipeline_lookup_ns / std.time.ns_per_ms,
                     profile.graphics_scalar_upload_ns / std.time.ns_per_ms,
                     profile.graphics_record_ns / std.time.ns_per_ms,
+                    profile.draw_reuse_hits,
+                    profile.draw_reuse_misses,
                 },
             );
         }
@@ -32942,6 +33065,22 @@ fn destroyWindowSwapchain(
     presentation.render_complete = &.{};
 }
 
+fn selectPresentMode(surface_functions: SurfaceFunctions, physical_device: vk.PhysicalDevice, surface: vk.Surface) u32 {
+    var count: u32 = 0;
+    if (surface_functions.get_surface_present_modes(physical_device, surface, &count, null) != vk.success or count == 0) {
+        return vk.present_mode_fifo_khr;
+    }
+    var modes: [8]u32 = undefined;
+    count = @min(count, modes.len);
+    if (surface_functions.get_surface_present_modes(physical_device, surface, &count, &modes) != vk.success) {
+        return vk.present_mode_fifo_khr;
+    }
+    const available = modes[0..count];
+    for (available) |mode| if (mode == vk.present_mode_mailbox_khr) return mode;
+    for (available) |mode| if (mode == vk.present_mode_immediate_khr) return mode;
+    return vk.present_mode_fifo_khr;
+}
+
 fn createWindowPresentation(
     allocator: std.mem.Allocator,
     physical_device: vk.PhysicalDevice,
@@ -33011,7 +33150,7 @@ fn createWindowPresentation(
         .image_usage = vk.image_usage_transfer_dst_bit,
         .pre_transform = capabilities.current_transform,
         .composite_alpha = composite_alpha,
-        .present_mode = vk.present_mode_fifo_khr,
+        .present_mode = selectPresentMode(surface_functions, physical_device, surface),
     };
     var swapchain: vk.Swapchain = 0;
     if (swapchain_functions.create_swapchain(device, &create_info, null, &swapchain) != vk.success) {
