@@ -81,6 +81,8 @@ const Phrase = enum {
     sound_output_description,
     fps_counter,
     fps_counter_description,
+    game_performance,
+    game_performance_description,
     output_resolution,
     output_resolution_description,
     status_resolution_saved,
@@ -158,6 +160,7 @@ var sound_enabled = true;
 var show_fps = false;
 var output_mode = display_mode.default;
 var render_preset = performance_mode.default;
+var game_performance = true;
 var mapping = mapping_defaults;
 var capture_mapping: ?usize = null;
 var game_folder: [1024]u16 = [_]u16{0} ** 1024;
@@ -249,6 +252,8 @@ fn tr(phrase: Phrase) []const u8 {
             .sound_output_description => "Disabling sound does not affect AudioOut timing",
             .fps_counter => "FPS counter",
             .fps_counter_description => "Show the measured frame rate in the game window title",
+            .game_performance => "Performance",
+            .game_performance_description => "Prefer the game's performance mode when supported.",
             .output_resolution => "OUTPUT RESOLUTION",
             .output_resolution_description => "Window size and display profile; games choose their internal resolution. Applied on next launch.",
             .status_resolution_saved => "Output resolution saved for the next launch",
@@ -339,6 +344,8 @@ fn tr(phrase: Phrase) []const u8 {
             .sound_output_description => "关闭声音不会影响 AudioOut 时序",
             .fps_counter => "帧率显示",
             .fps_counter_description => "在游戏窗口标题中显示实测帧率",
+            .game_performance => "性能模式",
+            .game_performance_description => "优先选择游戏的性能模式（如果支持）。",
             .output_resolution => "输出分辨率",
             .output_resolution_description => "设置窗口大小和显示模式；内部分辨率由游戏决定。下次启动时生效。",
             .status_resolution_saved => "输出分辨率已保存，下次启动时生效",
@@ -429,6 +436,8 @@ fn tr(phrase: Phrase) []const u8 {
             .sound_output_description => "Desactivar el sonido no afecta a la sincronización de AudioOut",
             .fps_counter => "Contador de FPS",
             .fps_counter_description => "Muestra los FPS medidos en el título de la ventana del juego",
+            .game_performance => "Rendimiento",
+            .game_performance_description => "Preferir el modo rendimiento del juego si lo admite.",
             .output_resolution => "RESOLUCIÓN DE SALIDA",
             .output_resolution_description => "Tamaño de ventana y perfil de pantalla; el juego decide la resolución interna. Se aplica al volver a iniciar.",
             .status_resolution_saved => "Resolución guardada para el próximo inicio",
@@ -519,6 +528,8 @@ fn tr(phrase: Phrase) []const u8 {
             .sound_output_description => "تعطيل الصوت لا يؤثر على توقيت AudioOut",
             .fps_counter => "عداد الإطارات",
             .fps_counter_description => "عرض معدل الإطارات المقاس في عنوان نافذة اللعبة",
+            .game_performance => "الأداء",
+            .game_performance_description => "تفضيل وضع أداء اللعبة عند دعمه.",
             .output_resolution => "دقة الإخراج",
             .output_resolution_description => "حجم النافذة ووضع العرض؛ تختار اللعبة الدقة الداخلية. يُطبّق عند التشغيل التالي.",
             .status_resolution_saved => "تم حفظ دقة الإخراج للتشغيل التالي",
@@ -609,6 +620,8 @@ fn tr(phrase: Phrase) []const u8 {
             .sound_output_description => "Desativar o som não afeta a sincronização do AudioOut",
             .fps_counter => "Contador de FPS",
             .fps_counter_description => "Mostrar a taxa de quadros medida no título da janela do jogo",
+            .game_performance => "Desempenho",
+            .game_performance_description => "Preferir o modo desempenho do jogo, se disponível.",
             .output_resolution => "RESOLUÇÃO DE SAÍDA",
             .output_resolution_description => "Tamanho da janela e perfil de tela; o jogo escolhe a resolução interna. Aplicado na próxima execução.",
             .status_resolution_saved => "Resolução salva para a próxima execução",
@@ -699,6 +712,8 @@ fn tr(phrase: Phrase) []const u8 {
             .sound_output_description => "Отключение не нарушает тайминг AudioOut",
             .fps_counter => "Счётчик FPS",
             .fps_counter_description => "Показывать частоту кадров в заголовке окна игры",
+            .game_performance => "Performance",
+            .game_performance_description => "Режим Performance, если игра учитывает системный пресет.",
             .output_resolution => "РАЗРЕШЕНИЕ ВЫВОДА",
             .output_resolution_description => "Размер окна и режим дисплея; внутреннее разрешение выбирает игра. Применяется при следующем запуске.",
             .status_resolution_saved => "Разрешение сохранено для следующего запуска",
@@ -789,6 +804,8 @@ fn tr(phrase: Phrase) []const u8 {
             .sound_output_description => "Deaktivieren beeinflusst das AudioOut-Timing nicht",
             .fps_counter => "FPS-Anzeige",
             .fps_counter_description => "Bildrate im Titel des Spielfensters anzeigen",
+            .game_performance => "Leistung",
+            .game_performance_description => "Leistungsmodus des Spiels bevorzugen, falls unterstützt.",
             .output_resolution => "AUSGABEAUFLÖSUNG",
             .output_resolution_description => "Fenstergröße und Anzeigeprofil; das Spiel wählt die interne Auflösung. Gilt ab dem nächsten Start.",
             .status_resolution_saved => "Auflösung für den nächsten Start gespeichert",
@@ -879,6 +896,8 @@ fn tr(phrase: Phrase) []const u8 {
             .sound_output_description => "La désactivation n'affecte pas le rythme AudioOut",
             .fps_counter => "Compteur FPS",
             .fps_counter_description => "Afficher la fréquence d'images dans le titre de la fenêtre",
+            .game_performance => "Performance",
+            .game_performance_description => "Préférer le mode performance du jeu, si disponible.",
             .output_resolution => "RÉSOLUTION DE SORTIE",
             .output_resolution_description => "Taille de fenêtre et profil d’affichage ; le jeu choisit sa résolution interne. Appliqué au prochain lancement.",
             .status_resolution_saved => "Résolution enregistrée pour le prochain lancement",
@@ -1291,8 +1310,9 @@ const language_rects = [_]Rect{
 };
 
 const settings_toggle_rects = [_]Rect{
-    .{ .left = 282, .top = 464, .right = 676, .bottom = 548 },
-    .{ .left = 690, .top = 464, .right = 1086, .bottom = 548 },
+    .{ .left = 282, .top = 464, .right = 540, .bottom = 548 },
+    .{ .left = 554, .top = 464, .right = 812, .bottom = 548 },
+    .{ .left = 826, .top = 464, .right = 1086, .bottom = 548 },
 };
 
 // The resolution row was four cards across the full content width. The
@@ -1468,10 +1488,14 @@ fn handleSettingsClick(x: i32, y: i32) void {
         sound_enabled = !sound_enabled;
         saveSettings();
         setStatusPhrase(if (sound_enabled) .status_sound_on else .status_sound_off, false);
-    } else {
+    } else if (toggle == 1) {
         show_fps = !show_fps;
         saveSettings();
         setStatusPhrase(if (show_fps) .status_fps_on else .status_fps_off, false);
+    } else {
+        game_performance = !game_performance;
+        saveSettings();
+        setStatusPhrase(.status_preset_saved, false);
     }
 }
 
@@ -2322,7 +2346,7 @@ fn drawSettings(dc: Win32.DeviceContext) void {
     }
     localizedText(dc, .render_preset_description, .{ .left = 796, .top = 420, .right = 1086, .bottom = 458 }, 0x009b9088, small_font, Win32.dt_left | Win32.dt_word_break);
 
-    for (settings_toggle_rects, [_]Phrase{ .sound_output, .fps_counter }, [_]Phrase{ .sound_output_description, .fps_counter_description }, [_]bool{ sound_enabled, show_fps }) |rectangle, heading, description, enabled| {
+    for (settings_toggle_rects, [_]Phrase{ .sound_output, .fps_counter, .game_performance }, [_]Phrase{ .sound_output_description, .fps_counter_description, .game_performance_description }, [_]bool{ sound_enabled, show_fps, game_performance }) |rectangle, heading, description, enabled| {
         card(dc, rectangle);
         localizedText(dc, heading, .{ .left = rectangle.left + 20, .top = 476, .right = rectangle.right - 90, .bottom = 501 }, 0x00f4f0ea, medium_font, Win32.dt_left | Win32.dt_end_ellipsis);
         localizedText(dc, description, .{ .left = rectangle.left + 20, .top = 507, .right = rectangle.right - 20, .bottom = 544 }, 0x008b817a, small_font, Win32.dt_left | Win32.dt_word_break);
@@ -2609,6 +2633,7 @@ fn launchGame(owner: Win32.Window) void {
     resolution_value[resolution_length] = 0;
     _ = Win32.SetEnvironmentVariableW(w(display_mode.environment_name), @ptrCast(&resolution_value));
     _ = Win32.SetEnvironmentVariableW(w(performance_mode.environment_name), presetEnvironment());
+    _ = Win32.SetEnvironmentVariableW(w("PS5_GAME_PRESET"), if (game_performance) w("performance") else w("default"));
     _ = Win32.SetEnvironmentVariableW(w("PS5_INPUT_MODE"), inputModeEnvironment());
     var controller_value = [_:0]u16{@as(u16, '0') + controller_index};
     _ = Win32.SetEnvironmentVariableW(w("PS5_CONTROLLER_INDEX"), &controller_value);
@@ -2774,6 +2799,7 @@ fn loadSettings() void {
     show_fps = Win32.GetPrivateProfileIntW(w("launcher"), w("show_fps"), 0, @ptrCast(&ini_path)) != 0;
     output_mode = display_mode.Mode.fromHeight(Win32.GetPrivateProfileIntW(w("launcher"), w("output_resolution"), display_mode.default.height(), @ptrCast(&ini_path))) orelse display_mode.default;
     render_preset = performance_mode.Mode.fromIndex(Win32.GetPrivateProfileIntW(w("launcher"), w("render_preset"), @intFromEnum(performance_mode.default), @ptrCast(&ini_path))) orelse performance_mode.default;
+    game_performance = Win32.GetPrivateProfileIntW(w("launcher"), w("game_performance"), 1, @ptrCast(&ini_path)) != 0;
     const mode_value = Win32.GetPrivateProfileIntW(w("launcher"), w("input_mode"), 2, @ptrCast(&ini_path));
     if (mode_value <= 2) input_mode = @enumFromInt(mode_value);
     const language_value = Win32.GetPrivateProfileIntW(w("launcher"), w("language"), 0, @ptrCast(&ini_path));
@@ -2795,6 +2821,7 @@ fn saveSettings() void {
     writeIniInt(w("launcher"), w("show_fps"), @intFromBool(show_fps));
     writeIniInt(w("launcher"), w("output_resolution"), output_mode.height());
     writeIniInt(w("launcher"), w("render_preset"), @intFromEnum(render_preset));
+    writeIniInt(w("launcher"), w("game_performance"), @intFromBool(game_performance));
     writeIniInt(w("launcher"), w("input_mode"), @intFromEnum(input_mode));
     writeIniInt(w("launcher"), w("language"), @intFromEnum(language));
     writeIniInt(w("launcher"), w("controller_index"), controller_index);

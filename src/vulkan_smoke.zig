@@ -4045,7 +4045,7 @@ const SampledAllocationFailure = struct {
     }
 };
 
-fn runPipelineWarmupProbe(allocator: std.mem.Allocator, directory: []const u8, workers: usize) !void {
+fn runPipelineWarmupProbe(allocator: std.mem.Allocator, directory: []const u8, workers: usize, adaptive: bool) !void {
     const Observer = struct {
         const vk = vulkan.api;
         var original: vk.PfnCreateComputePipelines = undefined;
@@ -4071,6 +4071,7 @@ fn runPipelineWarmupProbe(allocator: std.mem.Allocator, directory: []const u8, w
     var renderer = try vulkan.Renderer.init(allocator, .{
         .enable_async_pipeline_compilation = true,
         .pipeline_compiler_workers = workers,
+        .adaptive_compiler_workers = adaptive,
         .compute_warmup_directory = directory,
     });
     defer renderer.deinit();
@@ -4100,9 +4101,9 @@ fn runPipelineWarmupProbe(allocator: std.mem.Allocator, directory: []const u8, w
     try std.testing.expectEqual(@as(usize, 0), renderer.compute_pipelines.items.len);
     try std.testing.expectEqual(@as(u32, 0), Observer.live_pipelines.load(.acquire));
     try std.testing.expect(Observer.peak.load(.acquire) <= workers);
-    if (workers > 1) try std.testing.expect(Observer.peak.load(.acquire) > 1);
-    std.debug.print("pipeline warmup passed: jobs={d} workers={d} concurrent_driver_calls={d} elapsed_ms={d} retained_pipelines=0\n", .{
-        warmup.jobs.items.len, workers, Observer.peak.load(.acquire), @divTrunc(elapsed, std.time.ns_per_ms),
+    if (workers > 1 and !adaptive) try std.testing.expect(Observer.peak.load(.acquire) > 1);
+    std.debug.print("pipeline warmup passed: jobs={d} workers={d} adaptive={any} concurrent_driver_calls={d} elapsed_ms={d} retained_pipelines=0\n", .{
+        warmup.jobs.items.len, workers, adaptive, Observer.peak.load(.acquire), @divTrunc(elapsed, std.time.ns_per_ms),
     });
 }
 
@@ -11585,8 +11586,9 @@ pub fn main(init: std.process.Init) !void {
         try runSampledAllocationPressureProbe(allocator);
         return;
     }
-    if (args.len == 3 and (std.mem.eql(u8, args[1], "--pipeline-warmup") or std.mem.eql(u8, args[1], "--pipeline-warmup-serial"))) {
-        try runPipelineWarmupProbe(allocator, args[2], if (std.mem.eql(u8, args[1], "--pipeline-warmup-serial")) 1 else 2);
+    if (args.len == 3 and (std.mem.eql(u8, args[1], "--pipeline-warmup") or std.mem.eql(u8, args[1], "--pipeline-warmup-serial") or std.mem.eql(u8, args[1], "--pipeline-warmup-adaptive"))) {
+        const adaptive = std.mem.eql(u8, args[1], "--pipeline-warmup-adaptive");
+        try runPipelineWarmupProbe(allocator, args[2], if (adaptive) 4 else if (std.mem.eql(u8, args[1], "--pipeline-warmup-serial")) 1 else 2, adaptive);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--sampled-scratch")) {
@@ -12336,8 +12338,24 @@ pub fn main(init: std.process.Init) !void {
         return error.InvalidPresentedFrame;
     }
 
-    try runFragmentScalarReuseProbe(allocator, &renderer, &guest, backend, &state, color_target_address);
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--resource-workers")) {
+        for ([_]usize{ 0, 1, 2, 4, 4 }, 0..) |workers, mode| {
+            renderer.resource_preparation.worker_limit = workers;
+            renderer.resource_preparation.adaptive = mode == 4;
+            // Exercise the worker path even for this deliberately tiny shader.
+            renderer.resource_preparation.minimum_steps = 0;
+            const before = renderer.resource_preparation.stats;
+            try runFragmentScalarReuseProbe(allocator, &renderer, &guest, backend, &state, color_target_address);
+            if (workers != 0) {
+                try std.testing.expect(renderer.resource_preparation.stats.submitted >= before.submitted + 2);
+                try std.testing.expect(renderer.resource_preparation.stats.used >= before.used + 4);
+                try std.testing.expectEqual(before.fallback, renderer.resource_preparation.stats.fallback);
+            }
+        }
+        std.debug.print("resource workers passed: serial/1/2/4/adaptive Vulkan pixels, changed textures and scalar values, T#/S#/V# register lifetimes\n", .{});
+    } else try runFragmentScalarReuseProbe(allocator, &renderer, &guest, backend, &state, color_target_address);
     try runFragmentStorageProbe(allocator, &renderer, &guest, backend, &state, color_target_address);
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--resource-workers")) return;
     try runIndexedCopyKernel(allocator, &renderer, &guest, backend);
     try runStorageImageCopyKernel(allocator, &renderer, &guest, backend);
 

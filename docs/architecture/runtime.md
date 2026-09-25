@@ -37,7 +37,15 @@ The launcher defaults to **1080p** and saves the selected output resolution in
 use `PS5_OUTPUT_RESOLUTION=1080|1440|2160|4320`; `1080p`, `1440p`, `4K` and `8K`
 are accepted aliases. An absent or invalid value uses 1080p.
 
-This preference selects the requested window size and the guest display
+The launcher's **Performance** switch is enabled by default and passes
+`PS5_GAME_PRESET=performance` to the runner. Turning it off passes `default`.
+The preference is saved as `launcher.game_performance` and returned through
+`sceUserServiceGetGamePresets`. Games may use their own saved setting instead.
+Direct runner launches without this variable retain the game-default preference.
+This is separate from the host Speed/Graphics preset and does not impose a
+render-target size limit. See [the implementation and native findings](../development/game-presets-2026-09-26.md).
+
+The output-resolution preference selects the requested window size and the guest display
 profile. The window fits the desktop work area while preserving its aspect
 ratio. The currently implemented VideoOut status ABI reports class 1 for
 1080p/1440p and class 2 for 4K/8K; separate native 1440p and 8K guest modes are

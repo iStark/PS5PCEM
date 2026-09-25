@@ -324,10 +324,21 @@ fn run(init: std.process.Init) !bool {
             break :mode performance_mode.default;
         };
     } else |_| performance_mode.default;
+    const user_service = runtime.firmware.libs.user_service;
+    const game_preset = if (init.minimal.environ.getAlloc(allocator, user_service.game_preset_environment)) |value| mode: {
+        defer allocator.free(value);
+        break :mode user_service.GamePresetPriority.parse(value) orelse {
+            try stderr.print("Invalid {s}='{s}'; using game default\n", .{ user_service.game_preset_environment, value });
+            try stderr.flush();
+            break :mode user_service.GamePresetPriority.game_default;
+        };
+    } else |_| user_service.GamePresetPriority.game_default;
+    user_service.configureGamePreset(game_preset);
     try out.print("  Output  {d}x{d}, VideoOut class {d}; internal rendering is game-controlled\n", .{
         output_mode.width(), output_mode.height(), runtime.firmware.video_out.outputResolutionClass(),
     });
     try out.print("  Preset  {s}\n", .{render_preset.label()});
+    try out.print("  Game preference  {s}; applied by titles that read system game presets\n", .{game_preset.label()});
     try out.flush();
 
     var preload_modules: std.ArrayList([]const u8) = .empty;
@@ -611,14 +622,27 @@ fn run(init: std.process.Init) !bool {
         defer allocator.free(text);
         break :enabled !std.mem.eql(u8, std.mem.trim(u8, text, " \t\r\n"), "0");
     } else |_| true;
+    const adaptive_cpu_workers = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_ADAPTIVE_WORKERS")) |text| enabled: {
+        defer allocator.free(text);
+        break :enabled !std.mem.eql(u8, std.mem.trim(u8, text, " \t\r\n"), "0");
+    } else |_| true;
+    const cpu_worker_limits = gpu.cpu_workers.policy.defaults(std.Thread.getCpuCount() catch 2);
+    var adaptive_compiler_workers = adaptive_cpu_workers;
     const pipeline_compiler_workers = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_COMPILER_WORKERS")) |text| workers: {
         defer allocator.free(text);
+        adaptive_compiler_workers = false;
         break :workers std.math.clamp(std.fmt.parseInt(usize, std.mem.trim(u8, text, " \t\r\n"), 10) catch 2, 1, 4);
-    } else |_| 2;
+    } else |_| if (adaptive_cpu_workers) cpu_worker_limits.compilers else 2;
     const parallel_commands = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_PARALLEL_COMMANDS")) |text| enabled: {
         defer allocator.free(text);
         break :enabled !std.mem.eql(u8, std.mem.trim(u8, text, " \t\r\n"), "0");
     } else |_| true;
+    var adaptive_resource_workers = adaptive_cpu_workers;
+    const resource_preparation_workers = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_RESOURCE_WORKERS")) |text| workers: {
+        defer allocator.free(text);
+        adaptive_resource_workers = false;
+        break :workers std.math.clamp(std.fmt.parseInt(usize, std.mem.trim(u8, text, " \t\r\n"), 10) catch 2, 0, gpu.resource_preparation.Pool.maximum_workers);
+    } else |_| if (adaptive_cpu_workers) cpu_worker_limits.resources else 2;
     // Use title-isolated catalogs and a versioned descriptor ABI directory.
     // Unknown/nonstandard title identifiers simply run without disk warmup.
     const safe_shader_title = title_identifier.len == 9 and std.mem.startsWith(u8, title_identifier, "PPSA") and
@@ -839,6 +863,9 @@ fn run(init: std.process.Init) !bool {
             .enable_shader_ssa_optimization = enable_shader_ssa,
             .enable_async_pipeline_compilation = enable_async_pipelines,
             .pipeline_compiler_workers = pipeline_compiler_workers,
+            .adaptive_compiler_workers = adaptive_compiler_workers,
+            .resource_preparation_workers = resource_preparation_workers,
+            .adaptive_resource_workers = adaptive_resource_workers,
             .compute_warmup_directory = compute_warmup_directory,
             .enable_canonical_image_aliases = enable_canonical_aliases,
             .enable_timeline_scheduler = enable_timeline_scheduler,
@@ -937,8 +964,9 @@ fn run(init: std.process.Init) !bool {
             native.height,
         });
         try out.print("  scanout channel order uses the registered buffer set\n", .{});
-        try out.print("  pipeline compiler workers={d} warmup={s}\n", .{ pipeline_compiler_workers, compute_warmup_directory orelse "disabled" });
+        try out.print("  pipeline compiler worker limit={d} adaptive={any} warmup={s}\n", .{ pipeline_compiler_workers, adaptive_compiler_workers, compute_warmup_directory orelse "disabled" });
         try out.print("  command processors={d}, bounded lookahead=4 per queue\n", .{if (parallel_commands) @as(u8, 2) else 0});
+        try out.print("  CPU resource preparation worker limit={d} adaptive={any}\n", .{ resource_preparation_workers, adaptive_resource_workers });
         try out.print("  buffer profile quake={d} retain={d} bounded_vertex={d} device_mib={d}\n", .{
             @intFromBool(use_quake_buffer_profile), @intFromBool(retain_storage_buffers), @intFromBool(bound_vertex_fetches), device_storage_mib,
         });

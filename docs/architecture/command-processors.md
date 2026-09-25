@@ -34,6 +34,55 @@ existing execution lock. Detaching the backend or resetting the scheduler joins
 idle workers before releasing their resources. A worker startup failure falls
 back to serial execution before starting either job.
 
+CPU resource preparation and pipeline compilation use separate instances of
+one bounded priority queue. `game-run` enables adaptive admission by default.
+Each pool starts with one active worker and can admit up to four, subject to a
+host CPU budget. The default budget divides logical CPUs minus two between the
+pools, with a minimum of one per pool on hosts with at least three logical CPUs.
+On one/two-CPU hosts, resource helpers are disabled and compilation uses one.
+The existing command processors and copy pool have separate limits.
+
+`PS5_GPU_RESOURCE_WORKERS=0..4` and `PS5_GPU_COMPILER_WORKERS=1..4` select fixed
+limits for their respective pools. One resource worker handles either shader
+stage; stages are no longer tied to worker indices. `PS5_GPU_ADAPTIVE_WORKERS=0`
+disables both controllers and restores the two-worker defaults unless overridden.
+Library callers opt into each controller separately through renderer options.
+
+The controller measures job duration and queue delay, raises admission by one
+under sustained demand, and lowers it for cheap jobs or after an idle interval
+on the next submission. Changes are at least 100 ms apart; idle decay requires
+500 ms. Jobs averaging less than 25 microseconds do not justify extra workers.
+These measurements are elapsed host time, not sampled CPU utilization. The
+controller does not claim to optimize frame time or measure GPU occupancy.
+Excess threads sleep and remain reusable; reducing a limit never interrupts an
+accepted job. Foreground compilation retains priority over queued warmups.
+Diagnostics do not alter admission decisions.
+
+For eligible graphics shaders, the owner captures guest reads during the normal
+sampled-resource checkpoint walk. Separate scalar-state and storage-checkpoint
+jobs use that immutable snapshot while the owner resolves and stages textures.
+The two shader stages can supply up to four independent jobs. Scalar consumers
+wait only for the scalar job, rather than also waiting for checkpoint work.
+Stages without sampled images capture their normal full scalar walk and offload
+the remaining storage checkpoints. Shaders with fewer than 256 indexed scalar
+steps remain inline. Inlined fetch programs without a matching immutable plan
+also retain the original path.
+
+Helpers never call the renderer or guest-memory callbacks. The owner validates
+captured bytes before consuming results using the normal GPU metadata publication
+path. Missing, inconsistent or changed snapshots retain live serial evaluation.
+Each job has independent failure state; shared snapshot reads are immutable.
+Checkpoint scratch belongs to a stage job and transfers to its owner only after
+completion. All jobs join on every draw exit before plans and bindings expire;
+shutdown drains the queues before freeing scratch. Vulkan allocation, descriptor
+writes, submission and synchronization still run on their ordered owner thread.
+Compute dispatch resource staging is unchanged.
+
+`[gpu resource workers]` reports jobs, consumed results, fallbacks, worker/wait
+time, active admission limit, created threads, peak simultaneous jobs, average
+job/queue time and controller changes. `[gpu compiler workers]` reports the
+compiler limit, activity, backlog, completion count and controller changes.
+
 Large CPU tile/detile transforms also share the existing bounded copy pool
 (`PS5_GPU_COPY_WORKERS`, default four participants including the caller for
 Yotei, one for other titles).

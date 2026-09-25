@@ -260,6 +260,7 @@ pub const Options = struct {
     /// Runs first-use Vulkan pipeline creation on the compiler worker.
     enable_async_pipeline_compilation: bool = false,
     pipeline_compiler_workers: usize = 2,
+    adaptive_compiler_workers: bool = false,
     /// Optional per-title catalog. SPIR-V is warmed into the driver cache,
     /// never dispatched; no device objects are retained by warmup jobs.
     compute_warmup_directory: ?[]const u8 = null,
@@ -309,6 +310,8 @@ pub const Options = struct {
     /// Stage proven vertex/instance fetch prefixes instead of whole arenas.
     bound_vertex_fetches: bool = false,
     reuse_graphics_resources: bool = true,
+    resource_preparation_workers: usize = 2,
+    adaptive_resource_workers: bool = false,
     storage_buffer_cache_budget_bytes: usize = 4 * 1024 * 1024 * 1024,
     storage_buffer_cache_entries: usize = 2048,
     /// Opt-in spare allocations for small CPU uploads with queued readers.
@@ -4625,6 +4628,9 @@ pub const Renderer = struct {
 
     image_scratch: @import("scratch_pool.zig").Pool = .{},
     checkpoint_scratch: gpu.resource_checkpoints.Pool = .{},
+    resource_preparation: gpu.resource_preparation.Pool = .{},
+    resource_preparation_in_use: bool = false,
+    resource_preparation_bindings: [2]?*const gpu.ShaderBindings = @splat(null),
     uniform_specialization_cache_enabled: bool = true,
     prepared_program_keys_enabled: bool = true,
     /// Diagnostic switch for comparing the transient and resident upload paths.
@@ -4652,6 +4658,7 @@ pub const Renderer = struct {
     device_storage_min_bytes: usize = 0,
 
     fn destroyResourcePools(self: *Renderer) void {
+        self.resource_preparation.deinit();
         self.image_scratch.deinit(self.allocator);
         self.checkpoint_scratch.deinit(self.allocator);
         for (self.free_compute_resources[0..self.free_compute_resource_count]) |resource| resource.destroy(self.allocator);
@@ -5223,7 +5230,7 @@ pub const Renderer = struct {
             .descriptor_set = descriptor_set,
             .compute_pipeline_layout = compute_pipeline_layout,
             .driver_pipeline_cache = driver_pipeline_cache,
-            .pipeline_compile_queue = .{ .worker_limit = std.math.clamp(options.pipeline_compiler_workers, 1, pipeline_compiler.Queue.maximum_workers) },
+            .pipeline_compile_queue = .{ .worker_limit = std.math.clamp(options.pipeline_compiler_workers, 1, pipeline_compiler.Queue.maximum_workers), .adaptation = .{ .enabled = options.adaptive_compiler_workers } },
             .memory_properties = memory_properties,
             .host_import_alignment = host_properties.alignment,
             .host_import_properties = if (host_import)
@@ -5286,6 +5293,7 @@ pub const Renderer = struct {
             .cache_storage_buffer_contents = options.cache_storage_buffer_contents,
             .bound_vertex_fetches = options.bound_vertex_fetches,
             .reuse_graphics_resources = options.reuse_graphics_resources,
+            .resource_preparation = .{ .worker_limit = @min(options.resource_preparation_workers, gpu.resource_preparation.Pool.maximum_workers), .adaptive = options.adaptive_resource_workers },
             .storage_buffer_rename_budget_bytes = options.storage_buffer_rename_budget_bytes,
             .queued_host_storage_uploads = options.queued_host_storage_uploads,
             .storage_buffer_cache_budget_bytes = options.storage_buffer_cache_budget_bytes,
@@ -10221,7 +10229,23 @@ pub const Renderer = struct {
     ) !gpu.resource_checkpoints.Pool.Lease {
         const started = hostTimestampNs();
         defer self.frame_profile.checkpoint_prepare_ns +|= elapsedHostNanoseconds(started);
-        const lease = try self.checkpoint_scratch.prepare(
+        var prepared: ?gpu.resource_checkpoints.Pool.Lease = null;
+        if (kind == .sampled) {
+            for (self.resource_preparation_bindings, 0..) |expected, slot| {
+                if (expected != bindings) continue;
+                prepared = try self.resource_preparation.startSampled(
+                    slot,
+                    reader,
+                    bindings,
+                    analysis.program.instructions.items,
+                    if (analysis.resource_checkpoints) |*plan| plan else null,
+                    &self.checkpoint_scratch,
+                    self.allocator,
+                );
+                break;
+            }
+        }
+        const lease = prepared orelse self.resource_preparation.take(analysis.program.instructions.items, bindings, kind, reader) orelse try self.checkpoint_scratch.prepare(
             self.allocator,
             analysis.program.instructions.items,
             if (analysis.resource_checkpoints) |*plan| plan else null,
@@ -18489,6 +18513,19 @@ pub const Renderer = struct {
                 .{ vertex_address, @tagName(vertex_stage) },
             );
         }
+        // Workers only see a draw-local snapshot. Actual memory reads and GPU
+        // publication remain on this thread, including validation at consume.
+        // Join before the analysis leases and stack bindings go out of scope.
+        const owns_preparation = !self.resource_preparation_in_use;
+        if (owns_preparation) {
+            self.resource_preparation_in_use = true;
+            self.resource_preparation_bindings = .{ &fragment_bindings, if (vertex_instructions.ptr == vertex_analysis.program.instructions.items.ptr and vertex_instructions.len == vertex_analysis.program.instructions.items.len) &vertex_bindings else null };
+        }
+        defer if (owns_preparation) {
+            self.resource_preparation.finish();
+            self.resource_preparation_in_use = false;
+            self.resource_preparation_bindings = @splat(null);
+        };
         const resource_started = hostTimestampNs();
         const graphics_resources = try self.prepareGraphicsResources(
             &fragment_bindings,
@@ -18544,7 +18581,9 @@ pub const Renderer = struct {
         // for NGG shaders which reuse the same registers many times.
         const vertex_provenance_started = hostTimestampNs();
         var vertex_scalar: gpu.ScalarEvaluation = undefined;
-        gpu.scalar_provenance.evaluateDecodedResourceStateInto(
+        const prepared_vertex = owns_preparation and (self.resource_preparation.takeScalar(1, &vertex_bindings, vertex_instructions, reader, &vertex_scalar) or
+            self.resource_preparation.startScalar(1, reader, &vertex_bindings, vertex_instructions, if (vertex_analysis.resource_checkpoints) |*plan| plan else null, &vertex_scalar));
+        if (!prepared_vertex) gpu.scalar_provenance.evaluateDecodedResourceStateInto(
             &vertex_scalar,
             reader,
             &vertex_bindings,
@@ -18586,7 +18625,9 @@ pub const Renderer = struct {
 
         const fragment_provenance_started = hostTimestampNs();
         var fragment_scalar: gpu.ScalarEvaluation = undefined;
-        gpu.scalar_provenance.evaluateDecodedResourceStateInto(
+        const prepared_fragment = owns_preparation and (self.resource_preparation.takeScalar(0, &fragment_bindings, fragment_analysis.program.instructions.items, reader, &fragment_scalar) or
+            self.resource_preparation.startScalar(0, reader, &fragment_bindings, fragment_analysis.program.instructions.items, if (fragment_analysis.resource_checkpoints) |*plan| plan else null, &fragment_scalar));
+        if (!prepared_fragment) gpu.scalar_provenance.evaluateDecodedResourceStateInto(
             &fragment_scalar,
             reader,
             &fragment_bindings,
@@ -27355,6 +27396,19 @@ pub const Renderer = struct {
             std.debug.print(
                 "[gpu checkpoints] flip={d} prepare_us={d} calls={d} walked={d} list_builds={d} scratch_allocations={d}\n",
                 .{ self.flip_callbacks, profile.checkpoint_prepare_ns / std.time.ns_per_us, profile.checkpoint_preparations, profile.checkpoint_instructions, profile.checkpoint_plan_misses, profile.checkpoint_scratch_misses },
+            );
+            const preparation_stats = self.resource_preparation.stats;
+            if (preparation_stats.submitted != 0) {
+                const workers = self.resource_preparation.queue.status();
+                std.debug.print(
+                    "[gpu resource workers] flip={d} cumulative_jobs={d} used={d} fallback={d} worker_ms={d} wait_ms={d} limit={d} threads={d} peak={d} auto={any} changes={d}/{d} job_us={d} queue_us={d}\n",
+                    .{ self.flip_callbacks, preparation_stats.submitted, preparation_stats.used, preparation_stats.fallback, preparation_stats.worker_ns / std.time.ns_per_ms, preparation_stats.wait_ns / std.time.ns_per_ms, workers.limit, workers.threads, workers.peak_active, workers.adaptation.enabled, workers.adaptation.increases, workers.adaptation.decreases, workers.adaptation.average_job_ns / std.time.ns_per_us, workers.adaptation.average_wait_ns / std.time.ns_per_us },
+                );
+            }
+            const compilers = self.pipeline_compile_queue.status();
+            if (compilers.completed != 0 or compilers.outstanding != 0) std.debug.print(
+                "[gpu compiler workers] flip={d} limit={d} threads={d} active={d} pending={d} completed={d} peak={d} auto={any} changes={d}/{d}\n",
+                .{ self.flip_callbacks, compilers.limit, compilers.threads, compilers.active, compilers.outstanding - compilers.active, compilers.completed, compilers.peak_active, compilers.adaptation.enabled, compilers.adaptation.increases, compilers.adaptation.decreases },
             );
             // Separated from the fence total: waiting because the command
             // buffer pool ran dry is a cost of how the frame was cut up, not
@@ -36702,6 +36756,7 @@ test "prepared resource pools reset bindings and keep active loans distinct" {
     renderer.allocator = std.testing.allocator;
     renderer.image_scratch = .{};
     renderer.checkpoint_scratch = .{};
+    renderer.resource_preparation = .{};
     renderer.free_compute_resource_count = 0;
     renderer.free_graphics_resource_count = 0;
     defer renderer.destroyResourcePools();
