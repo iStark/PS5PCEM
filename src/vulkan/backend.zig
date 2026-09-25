@@ -4143,6 +4143,10 @@ pub const Renderer = struct {
     recording_command_buffer: ?vk.CommandBuffer = null,
     recording_command_slot: ?usize = null,
     draw_batch_active: bool = false,
+    /// While a draw batch is open, barriers and draws append to one command
+    /// buffer. Ending and resetting a buffer for every copy was most of the
+    /// host time in a Quake frame.
+    open_batch_commands: bool = false,
     draw_uploads_enabled: bool = false,
     deferred_vulkan_objects: std.ArrayList(DeferredVulkanObjectEntry) = .empty,
     retired_storage_buffers: std.ArrayList(RetiredStorageBuffer) = .empty,
@@ -24376,6 +24380,9 @@ pub const Renderer = struct {
     }
 
     fn beginOneShot(self: *Renderer) (Error || std.mem.Allocator.Error)!vk.CommandBuffer {
+        if (self.open_batch_commands) {
+            if (self.recording_command_buffer) |command_buffer| return command_buffer;
+        }
         if (self.recording_command_buffer != null) return Error.CommandBufferBeginFailed;
         const slot = try self.ensureFrameCommandBuffer();
         self.collectGpuTimestamp(slot);
@@ -24401,7 +24408,9 @@ pub const Renderer = struct {
     fn releaseOneShot(self: *Renderer, command_buffer: vk.CommandBuffer) void {
         // A failed recording never enters the pending prefix and is reset for
         // reuse. A few isolated validation paths still allocate private
-        // command buffers and release them here.
+        // command buffers and release them here. An open batch buffer already
+        // holds earlier draws, so a later release must not wipe it.
+        if (self.open_batch_commands and self.recording_command_buffer == command_buffer) return;
         if (self.recording_command_buffer != null and
             self.recording_command_buffer.? == command_buffer)
         {
@@ -24419,18 +24428,18 @@ pub const Renderer = struct {
         self.device_functions.free_command_buffers(self.device, self.command_pool, 1, @ptrCast(&command_buffer));
     }
 
-    fn submitOneShot(self: *Renderer, command_buffer: vk.CommandBuffer) (Error || std.mem.Allocator.Error)!void {
-        if (self.recording_command_buffer == null or
-            self.recording_command_buffer.? != command_buffer)
-        {
-            return Error.CommandBufferEndFailed;
-        }
-        if (self.cmd_set_checkpoint) |checkpoint| checkpoint(command_buffer, @ptrFromInt((self.recording_checkpoint_program & ~@as(u64, 3)) | 2));
+    fn endOpenCommandBuffer(self: *Renderer) (Error || std.mem.Allocator.Error)!void {
+        const command_buffer = self.recording_command_buffer orelse {
+            self.open_batch_commands = false;
+            return;
+        };
         const slot = self.recording_command_slot orelse return Error.CommandBufferEndFailed;
+        if (self.cmd_set_checkpoint) |checkpoint| checkpoint(command_buffer, @ptrFromInt((self.recording_checkpoint_program & ~@as(u64, 3)) | 2));
         if (self.gpu_timestamp_slots[slot].active) self.device_functions.cmd_write_timestamp(command_buffer, vk.pipeline_stage_bottom_of_pipe_bit, self.gpu_timestamp_pool, @intCast(slot * 2 + 1));
         if (self.device_functions.end_command_buffer(command_buffer) != vk.success) return Error.CommandBufferEndFailed;
         self.recording_command_buffer = null;
         self.recording_command_slot = null;
+        self.open_batch_commands = false;
         errdefer {
             _ = self.device_functions.reset_command_buffer(command_buffer, 0);
             self.command_buffer_ticks.items[slot] = 0;
@@ -24440,6 +24449,15 @@ pub const Renderer = struct {
         errdefer _ = self.pending_command_buffers.pop();
         try self.pending_command_slots.append(self.allocator, slot);
         errdefer _ = self.pending_command_slots.pop();
+        self.frame_profile.command_buffers += 1;
+    }
+
+    fn submitOneShot(self: *Renderer, command_buffer: vk.CommandBuffer) (Error || std.mem.Allocator.Error)!void {
+        if (self.recording_command_buffer == null or
+            self.recording_command_buffer.? != command_buffer)
+        {
+            return Error.CommandBufferEndFailed;
+        }
         if (self.draw_batch_active) {
             if (self.current_descriptor_slot) |descriptor_slot| {
                 var found = false;
@@ -24468,12 +24486,15 @@ pub const Renderer = struct {
             const entry = &self.guest_buffers.items[index];
             if (entry.device_local.handle == handle) entry.last_gpu_use = command_buffer_pending_tick;
         }
-        self.frame_profile.command_buffers += 1;
         const trace_completion = if (self.trace_gpu_completion_from_frame) |first|
             self.flip_callbacks + 1 >= first
         else
             false;
-        if (self.draw_batch_active and !trace_completion) return;
+        if (self.draw_batch_active and !trace_completion) {
+            self.open_batch_commands = true;
+            return;
+        }
+        try self.endOpenCommandBuffer();
         if (trace_completion) std.debug.print(
             "[gpu completion] begin frame={d} tick={d} programs=0x{x}/0x{x} commands={d}\n",
             .{ self.flip_callbacks + 1, self.submitted_tick + 1, self.trace_gpu_programs[0], self.trace_gpu_programs[1], self.pending_command_buffers.items.len },
@@ -24494,6 +24515,10 @@ pub const Renderer = struct {
 
     fn flushQueuedCommandsSignaling(self: *Renderer, present_semaphore: ?vk.Semaphore) Error!void {
         if (self.device_lost) return Error.DeviceLost;
+        if (self.open_batch_commands) self.endOpenCommandBuffer() catch |err| switch (err) {
+            error.OutOfMemory => return Error.MemoryAllocationFailed,
+            else => |other| return other,
+        };
         if (self.recording_command_buffer != null) return Error.CommandBufferEndFailed;
         if (self.pending_command_buffers.items.len == 0 and present_semaphore == null) {
             try self.refreshGpuProgress();
