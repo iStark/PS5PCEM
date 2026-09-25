@@ -308,7 +308,9 @@ pub const Options = struct {
     cache_storage_buffer_contents: bool = true,
     /// Stage proven vertex/instance fetch prefixes instead of whole arenas.
     bound_vertex_fetches: bool = false,
+    reuse_graphics_resources: bool = true,
     storage_buffer_cache_budget_bytes: usize = 4 * 1024 * 1024 * 1024,
+    storage_buffer_cache_entries: usize = 2048,
     /// Opt-in spare allocations for small CPU uploads with queued readers.
     /// Retired allocation bytes are bounded independently of the live cache.
     storage_buffer_rename_budget_bytes: usize = 0,
@@ -873,6 +875,7 @@ const DrawUploadCacheEntry = struct {
     guest_address: u64,
     size: usize,
     upload: DrawUploadSlice,
+    source_hash: ?u64 = null,
 };
 
 const DeferredVulkanObject = union(enum) {
@@ -899,6 +902,7 @@ const command_buffer_pending_tick = std.math.maxInt(u64);
 // keeping hundreds of individual Vulkan allocations alive after the title has
 // moved its ring buffers on, while still covering every descriptor in a draw.
 const maximum_guest_buffers = maximum_storage_descriptors;
+const maximum_retained_buffer_entries = 4096;
 pub const maximum_storage_descriptors = 64;
 const maximum_storage_images = rdna2.spirv.maximum_storage_images;
 const dynamic_scalar_descriptor_binding = 2 + maximum_storage_images;
@@ -2628,7 +2632,13 @@ const FrameProfile = struct {
     graphics_scalar_upload_ns: u64 = 0,
     graphics_record_ns: u64 = 0,
     draw_reuse_hits: u64 = 0,
+    draw_reuse_scalar_hits: u64 = 0,
     draw_reuse_misses: u64 = 0,
+    draw_reuse_rejections: [6]u64 = @splat(0),
+    draw_reuse_tracked_reads: u64 = 0,
+    buffer_cache_hits: u64 = 0,
+    buffer_cache_misses: u64 = 0,
+    buffer_cache_evictions: u64 = 0,
     sampled_stage_ns: u64 = 0,
     sampled_flush_ns: u64 = 0,
     sampled_generation_ns: u64 = 0,
@@ -2741,6 +2751,20 @@ test "packed clear staging preserves both patterns and initializes growth" {
     try std.testing.expectEqual(@as(u32, 0xcdcd_cdcd), guarded[36]);
     try std.testing.expect(std.mem.allEqual(u32, guarded[1..36], 0x3c00_3c00));
 }
+
+const ReuseImageBinding = struct {
+    binding: u32,
+    element: u32,
+    info: vk.DescriptorImageInfo,
+};
+
+const ReuseStorageImage = struct {
+    index: u32,
+    view: vk.ImageView,
+};
+
+const ReuseBufferRead = struct { address: u64, hash: u64, size: usize };
+const ReuseShaderRead = struct { address: u64, byte_count: u8, values: [16]u32 = @splat(0) };
 
 const PreparedSampledImage = struct {
     image: OwnedImage,
@@ -3062,6 +3086,7 @@ const SampledImageKey = struct {
 };
 
 const GraphicsResources = struct {
+    scalar_reuse_safe: bool = true,
     scalar_scratch: gpu.ScalarEvaluation = undefined,
     images: [maximum_sampled_images]PreparedSampledImage = undefined,
     image_count: usize = 0,
@@ -3087,6 +3112,7 @@ const GraphicsResources = struct {
         if (renderer.free_graphics_resource_count == 0) return init(renderer.allocator);
         renderer.free_graphics_resource_count -= 1;
         const result = renderer.free_graphics_resources[renderer.free_graphics_resource_count];
+        result.scalar_reuse_safe = true;
         result.image_count = 0;
         result.mapping_count = 0;
         result.image_lookup.clearRetainingCapacity();
@@ -3250,6 +3276,8 @@ const compute_watch_addresses = [_]u64{
 };
 
 const ComputeResources = struct {
+    scalar_reuse_safe: bool = true,
+    vertex_index_proof: VertexIndexProof = .{},
     scalar_scratch: gpu.ScalarEvaluation = undefined,
     mappings: [maximum_storage_mappings]gpu.ShaderSpirvStorageBufferBinding = undefined,
     mapping_count: usize = 0,
@@ -3295,6 +3323,8 @@ const ComputeResources = struct {
         if (renderer.free_compute_resource_count == 0) return init(renderer.allocator);
         renderer.free_compute_resource_count -= 1;
         const result = renderer.free_compute_resources[renderer.free_compute_resource_count];
+        result.scalar_reuse_safe = true;
+        result.vertex_index_proof = .{};
         // Only occupied slots and the prefixes named by these counts are read.
         // Preserve the unused multi-megabyte arrays across draws/dispatches.
         result.mapping_count = 0;
@@ -3468,6 +3498,23 @@ const DrawVertexRange = struct {
     maximum: i64,
 };
 
+// Keep the decisions made by validateVertexIndexMappings, including attributes
+// that it converted to guest indexing. Different meshes may share the same
+// descriptors as long as they stay on the same side of every extent boundary.
+const VertexIndexProof = struct {
+    needed: bool = false,
+    valid: bool = true,
+    minimum_maximum: u64 = 0,
+    maximum: u64 = std.math.maxInt(u64),
+
+    fn accepts(self: VertexIndexProof, range: ?DrawVertexRange) bool {
+        if (!self.needed) return true;
+        const vertices = range orelse return false;
+        return self.valid and vertices.minimum >= 0 and vertices.maximum >= vertices.minimum and
+            vertices.maximum >= self.minimum_maximum and vertices.maximum <= self.maximum;
+    }
+};
+
 /// Return the effective Vulkan VertexIndex range for this draw. AGC attribute
 /// tables also describe small per-draw lookup buffers; those buffers must keep
 /// the guest-computed MUBUF index instead of being indexed by a mesh index that
@@ -3521,10 +3568,15 @@ fn validateVertexIndexMappings(
         if (mapping.use_vertex_index and mapping.stride != 0) break true;
     } else false;
     if (!needs_range) return;
-    const range = precomputed_range orelse drawVertexRange(reader, draw) orelse return;
+    resources.vertex_index_proof.needed = true;
+    const range = precomputed_range orelse drawVertexRange(reader, draw) orelse {
+        resources.vertex_index_proof.valid = false;
+        return;
+    };
     for (resources.mappings[0..resources.mapping_count]) |*mapping| {
         if (!mapping.use_vertex_index or mapping.stride == 0) continue;
         if (range.minimum < 0 or range.maximum < range.minimum) {
+            resources.vertex_index_proof.valid = false;
             mapping.use_vertex_index = false;
             continue;
         }
@@ -3533,14 +3585,19 @@ fn validateVertexIndexMappings(
             @as(u64, @intCast(range.maximum)) + 1,
             mapping.stride,
         ) catch {
+            resources.vertex_index_proof.valid = false;
             mapping.use_vertex_index = false;
             continue;
         };
         const extent = mapping.extent_bytes orelse continue;
+        const record_count = extent / mapping.stride;
         if (required > extent) {
             // This is a lookup/indirection buffer from the same AGC attribute
             // table, not a record array indexed by the draw's mesh indices.
             mapping.use_vertex_index = false;
+            resources.vertex_index_proof.minimum_maximum = @max(resources.vertex_index_proof.minimum_maximum, record_count);
+        } else {
+            resources.vertex_index_proof.maximum = @min(resources.vertex_index_proof.maximum, record_count - 1);
         }
     }
 }
@@ -3689,6 +3746,13 @@ const DrawFetchBounds = struct {
             .{ .register = 5, .limit = @intCast(vertices.maximum + 1) },
             .{ .register = 8, .limit = instances },
         } };
+    }
+
+    fn contains(self: DrawFetchBounds, other: DrawFetchBounds) bool {
+        for (self.entries, other.entries) |cached, current| {
+            if (cached.register != current.register or current.limit > cached.limit) return false;
+        }
+        return true;
     }
 };
 
@@ -4154,6 +4218,17 @@ pub const Renderer = struct {
     /// Consecutive draws that bind the same shaders and user data skip
     /// scalar walks and buffer staging and record into the open batch.
     draw_reuse_valid: bool = false,
+    draw_reuse_input_key: u64 = 0,
+    draw_reuse_fetch_bounds: ?DrawFetchBounds = null,
+    draw_reuse_index_proof: VertexIndexProof = .{},
+    draw_reuse_loads: [128]ReuseShaderRead = undefined,
+    draw_reuse_sorted_loads: [128]*const ReuseShaderRead = undefined,
+    draw_reuse_load_count: usize = 0,
+    draw_reuse_recording: bool = false,
+    draw_reuse_reads_complete: bool = false,
+    draw_reuse_buffer_reads: [maximum_storage_descriptors]ReuseBufferRead = undefined,
+    draw_reuse_buffer_read_count: usize = 0,
+    draw_upload_source_scratch: std.ArrayList(u8) = .empty,
     draw_reuse_key: u64 = 0,
     draw_reuse_epoch: u64 = 0,
     draw_reuse_vertex: ?spirv_cache.Lease = null,
@@ -4164,6 +4239,20 @@ pub const Renderer = struct {
     draw_reuse_fragment_scalar_count: usize = 0,
     draw_reuse_pipeline: GraphicsPipelineState = undefined,
     draw_reuse_bind_descriptors: bool = false,
+    draw_reuse_shape_key: u64 = 0,
+    draw_reuse_shape_valid: bool = false,
+    draw_reuse_vertex_mask: u64 = 0,
+    draw_reuse_fragment_mask: u64 = 0,
+    /// A scalar-only draw needs a fresh descriptor slot without dropping the
+    /// shader and descriptor snapshot captured for that shape.
+    preserve_draw_reuse: bool = false,
+    draw_reuse_storage: [maximum_storage_descriptors]vk.DescriptorBufferInfo = undefined,
+    draw_reuse_storage_used: [maximum_storage_descriptors]bool = @splat(false),
+    draw_reuse_storage_cache: [maximum_storage_descriptors]?usize = @splat(null),
+    draw_reuse_images: [48]ReuseImageBinding = undefined,
+    draw_reuse_image_count: usize = 0,
+    draw_reuse_storage_images: [16]ReuseStorageImage = undefined,
+    draw_reuse_storage_image_count: usize = 0,
     draw_uploads_enabled: bool = false,
     deferred_vulkan_objects: std.ArrayList(DeferredVulkanObjectEntry) = .empty,
     retired_storage_buffers: std.ArrayList(RetiredStorageBuffer) = .empty,
@@ -4272,9 +4361,11 @@ pub const Renderer = struct {
     magnify_source_height: u32 = 0,
     magnify_source_format: u32 = 0,
     guest_buffers: std.ArrayList(GuestBufferEntry) = .empty,
-    guest_buffer_address_index: @import("sampled_image_index.zig").Index(512) = .{},
+    guest_buffer_address_index: @import("sampled_image_index.zig").Index(maximum_retained_buffer_entries) = .{},
     active_storage_buffers: [maximum_storage_descriptors]vk.Buffer = @splat(0),
     active_storage_offsets: [maximum_storage_descriptors]vk.DeviceSize = @splat(0),
+    active_storage_ranges: [maximum_storage_descriptors]vk.DeviceSize = @splat(0),
+    active_storage_source_hashes: [maximum_storage_descriptors]?u64 = @splat(null),
     active_storage_cache_indices: [maximum_storage_descriptors]?usize = @splat(null),
     guest_buffer_sequence: u64 = 0,
     gds_storage: std.ArrayList(u8) = .empty,
@@ -4548,11 +4639,13 @@ pub const Renderer = struct {
     retain_clean_storage_buffers: bool = false,
     cache_storage_buffer_contents: bool = true,
     bound_vertex_fetches: bool = false,
+    reuse_graphics_resources: bool = true,
     /// Diagnostic control for comparing readback waits independently of uploads.
     storage_buffer_read_use_waits: bool = true,
     /// Diagnostic opt-in while reconstructed NGG winding is being validated.
     honor_guest_culling: bool = false,
     storage_buffer_cache_budget_bytes: usize = 4 * 1024 * 1024 * 1024,
+    storage_buffer_cache_entries: usize = 2048,
     storage_buffer_rename_budget_bytes: usize = 0,
     queued_host_storage_uploads: bool = false,
     device_storage_budget_bytes: usize = 0,
@@ -5192,9 +5285,11 @@ pub const Renderer = struct {
             .retain_clean_storage_buffers = options.retain_clean_storage_buffers,
             .cache_storage_buffer_contents = options.cache_storage_buffer_contents,
             .bound_vertex_fetches = options.bound_vertex_fetches,
+            .reuse_graphics_resources = options.reuse_graphics_resources,
             .storage_buffer_rename_budget_bytes = options.storage_buffer_rename_budget_bytes,
             .queued_host_storage_uploads = options.queued_host_storage_uploads,
             .storage_buffer_cache_budget_bytes = options.storage_buffer_cache_budget_bytes,
+            .storage_buffer_cache_entries = std.math.clamp(options.storage_buffer_cache_entries, maximum_guest_buffers, maximum_retained_buffer_entries),
             .device_storage_budget_bytes = options.device_storage_budget_bytes,
             .device_storage_min_bytes = options.device_storage_min_bytes,
             .window_presentation = window_presentation,
@@ -5354,6 +5449,7 @@ pub const Renderer = struct {
         for (self.imported_allocations.items) |allocation| self.releaseImportedAllocation(allocation);
         self.imported_allocations.deinit(self.allocator);
         self.draw_upload_cache.deinit(self.allocator);
+        self.draw_upload_source_scratch.deinit(self.allocator);
         for (self.draw_upload_spills.items) |buffer| self.destroyBuffer(buffer);
         self.draw_upload_spills.deinit(self.allocator);
         if (self.flat_fault_buffer) |buffer| self.destroyBuffer(buffer);
@@ -6242,6 +6338,7 @@ pub const Renderer = struct {
             }
             self.guest_buffer_address_index.invalidate();
             _ = self.guest_buffers.swapRemove(index);
+            self.frame_profile.buffer_cache_evictions +|= 1;
             reclaimed = true;
         }
         // Retired objects may share a timeline tick with unrelated queued
@@ -6403,7 +6500,7 @@ pub const Renderer = struct {
             // pressure. The current dispatch may itself need more than the
             // budget; allow its required bindings to exceed that soft limit.
             const cache_full = self.guest_buffers.items.len >=
-                @as(usize, if (self.retain_clean_storage_buffers) 512 else maximum_guest_buffers);
+                @as(usize, if (self.retain_clean_storage_buffers) self.storage_buffer_cache_entries else maximum_guest_buffers);
             // Legacy slot reuse is appropriate only without retained ranges.
             // At retained-cache capacity, choose by age below: the former
             // slot owner can be the hottest vertex buffer while hundreds of
@@ -6474,6 +6571,7 @@ pub const Renderer = struct {
                 // arena; writable resident ranges are fence-completed by the
                 // readback below before this backing allocation is recycled.
                 const victim_index = recycle_index.?;
+                self.frame_profile.buffer_cache_evictions +|= 1;
                 if (self.guest_buffers.items[victim_index].gpu_dirty) {
                     try self.flushGuestStorageBuffer(victim_index);
                 }
@@ -6508,8 +6606,10 @@ pub const Renderer = struct {
                 recycled_entry = true;
             }
             self.buffer_cache_misses += 1;
+            self.frame_profile.buffer_cache_misses +|= 1;
         } else {
             self.buffer_cache_hits += 1;
+            self.frame_profile.buffer_cache_hits +|= 1;
         }
 
         const entry = &self.guest_buffers.items[entry_index.?];
@@ -6517,7 +6617,7 @@ pub const Renderer = struct {
         if (entry.device_local.host_mapping != null) {
             try self.flushGuestStorageImageRange(guest_address, size);
             self.frame_profile.resident_storage_bytes +%= size;
-            self.updateStorageDescriptorRange(descriptor_index, entry.device_local.handle, 0, size);
+            self.updateStorageDescriptorRangeKnown(descriptor_index, entry.device_local.handle, 0, size, entry_index);
             self.active_descriptor_set = self.descriptor_set;
             return .{ .buffer = entry.device_local.handle, .descriptor_set = self.descriptor_set, .descriptor_index = descriptor_index, .size = size, .allocation_cache_hit = cache_hit };
         }
@@ -6615,7 +6715,7 @@ pub const Renderer = struct {
                     if (source_hash != null) self.frame_profile.content_reused_bytes +%= size;
                     if (tracked_generation != 0) self.frame_profile.page_reused_bytes +%= size;
                 }
-                self.updateStorageDescriptorRange(descriptor_index, entry.device_local.handle, 0, size);
+                self.updateStorageDescriptorRangeKnown(descriptor_index, entry.device_local.handle, 0, size, entry_index);
                 self.active_descriptor_set = self.descriptor_set;
                 return .{
                     .buffer = entry.device_local.handle,
@@ -6638,6 +6738,7 @@ pub const Renderer = struct {
                         cached.upload.offset,
                         size,
                     );
+                    self.active_storage_source_hashes[descriptor_index] = if (cached.size == size) cached.source_hash else null;
                     self.active_descriptor_set = self.descriptor_set;
                     return .{
                         .buffer = cached.upload.buffer,
@@ -6651,9 +6752,7 @@ pub const Renderer = struct {
                 const mapping = try self.mapDrawUpload(upload);
                 defer mapping.release(self);
                 const destination = mapping.bytes;
-                if (!memory.read(memory.context, guest_address, destination)) {
-                    return Error.GuestMemoryReadFailed;
-                }
+                const upload_hash = try self.copyDrawUploadSource(memory, guest_address, destination);
                 self.advanceGuestBufferContents(entry);
                 self.frame_profile.upload_bytes +%= size;
                 self.frame_profile.storage_upload_bytes +%= size;
@@ -6662,6 +6761,7 @@ pub const Renderer = struct {
                     .guest_address = guest_address,
                     .size = size,
                     .upload = upload,
+                    .source_hash = upload_hash,
                 });
                 self.updateStorageDescriptorRange(
                     descriptor_index,
@@ -6669,6 +6769,7 @@ pub const Renderer = struct {
                     upload.offset,
                     upload.size,
                 );
+                self.active_storage_source_hashes[descriptor_index] = upload_hash;
                 self.active_descriptor_set = self.descriptor_set;
                 return .{
                     .buffer = upload.buffer,
@@ -6715,7 +6816,7 @@ pub const Renderer = struct {
         }
         // Allocation capacity can exceed this guest range after recycling.
         // OpArrayLength must see the current range, not stale backing bytes.
-        self.updateStorageDescriptorRange(descriptor_index, entry.device_local.handle, 0, size);
+        self.updateStorageDescriptorRangeKnown(descriptor_index, entry.device_local.handle, 0, size, entry_index);
         self.active_descriptor_set = self.descriptor_set;
         return .{
             .buffer = entry.device_local.handle,
@@ -6784,7 +6885,9 @@ pub const Renderer = struct {
     }
 
     fn flushGuestStorageRange(self: *Renderer, address: u64, size: usize) (Error || std.mem.Allocator.Error)!void {
-        for (self.guest_buffers.items, 0..) |entry, index| {
+        var candidates = self.guest_buffer_address_index.candidates(self.guest_buffers.items, address);
+        while (candidates.next()) |index| {
+            const entry = self.guest_buffers.items[index];
             if (!entry.gpu_dirty) continue;
             // Guest V# record counts are occasionally conservative enough to
             // span unrelated fence/label allocations. A four-byte command
@@ -6915,6 +7018,9 @@ pub const Renderer = struct {
             self.frame_profile.shader_metadata_scans_skipped +|= 1;
         }
         const success = memory.read(memory.context, address, bytes);
+        if (self.draw_reuse_recording) {
+            if (success) self.recordDrawReuseRead(address, bytes) else self.draw_reuse_reads_complete = false;
+        }
         if (!success and self.trace_resource_failures) self.last_shader_read_failure = .{
             .address = address,
             .size = bytes.len,
@@ -10188,6 +10294,9 @@ pub const Renderer = struct {
             (gpu.VertexBindings.capture(bindings, reader) catch null)
         else
             null;
+        // Metadata reads are checked for exact reuse. Pin all USER words for
+        // scalar-only reuse because their metadata dependency is not tainted.
+        if (vertex_table != null) result.scalar_reuse_safe = false;
         var used_vertex_attributes: [maximum_vertex_attributes]bool = @splat(false);
         result.scalar_count = collectScalarLoadSpecializations(scalar, &result.scalar_registers);
         result.scalar_count = mergeUserDataScalars(
@@ -10335,6 +10444,7 @@ pub const Renderer = struct {
                 scalar_checkpoint_registers,
                 inst.pc,
             ).*;
+            if (!scalarRegistersKnown(instruction_scalar, resource_sgpr, 4)) result.scalar_reuse_safe = false;
             // The instruction-local scalar state is authoritative. Attribute
             // tables are ordered by semantic/location, while shader fetches
             // are free to consume those attributes in a different order. In
@@ -17024,9 +17134,18 @@ pub const Renderer = struct {
                 const extent = vertexBufferFetchExtent(descriptor, program.instructions.items[3], 16, origins.upperBound(&bounds.entries));
                 try std.testing.expect(extent < 512);
                 var expected: [graphics_probe_width * graphics_probe_height * 4]u8 = undefined;
-                for ([_]u64{ descriptor.size_bytes, extent }, 0..) |range, pass| {
+                for ([_]u64{ descriptor.size_bytes, extent, extent }, 0..) |range, pass| {
+                    if (pass == 1) self.descriptor_cursor = self.descriptor_sets.len - 1;
                     try self.beginFrameDraw();
-                    self.updateStorageDescriptorRange(0, source.handle, 0, range);
+                    if (pass == 2) {
+                        @memset(&self.draw_reuse_storage_used, false);
+                        self.draw_reuse_storage_used[0] = true;
+                        self.draw_reuse_storage[0] = .{ .buffer = source.handle, .offset = 0, .range = range };
+                        self.draw_reuse_storage_cache[0] = null;
+                        self.draw_reuse_image_count = 0;
+                        self.draw_reuse_storage_image_count = 0;
+                        self.replayDrawDescriptors();
+                    } else self.updateStorageDescriptorRange(0, source.handle, 0, range);
                     try self.drawGraphicsShaders(module.words, fragment.words, &.{}, &.{}, GraphicsPipelineState.default(graphics_probe_width, graphics_probe_height), null, &.{}, null, false, true, false, draw);
                     if (pass == 0) @memcpy(&expected, &self.graphics_probe_frame) else try std.testing.expectEqualSlices(u8, &expected, &self.graphics_probe_frame);
                 }
@@ -17034,7 +17153,7 @@ pub const Renderer = struct {
                 try std.testing.expect(expected[center] != 0 and expected[center + 1] != 0);
             }
         }
-        std.debug.print("bounded vertex fetches passed: full/prefix pixels match for vertex and instance selection, changing base instance\n", .{});
+        std.debug.print("bounded vertex fetches passed: full/prefix/replayed pixels match for vertex and instance selection, changing base instance and descriptor-ring wrap\n", .{});
     }
 
     pub fn probePrivateSpills(self: *Renderer) anyerror!void {
@@ -17595,6 +17714,62 @@ pub const Renderer = struct {
         hasher.update(std.mem.asBytes(&fragment_bindings.scalar_user_data_base));
         hasher.update(std.mem.sliceAsBytes(vertex_bindings.user_data[0..vertex_bindings.user_data_count]));
         hasher.update(std.mem.sliceAsBytes(fragment_bindings.user_data[0..fragment_bindings.user_data_count]));
+        std.hash.autoHash(&hasher, vertex_bindings.srt_address);
+        std.hash.autoHash(&hasher, vertex_bindings.direct_pointers);
+        std.hash.autoHash(&hasher, vertex_bindings.metadata);
+        std.hash.autoHash(&hasher, vertex_bindings.user_data_count);
+        std.hash.autoHash(&hasher, fragment_bindings.srt_address);
+        std.hash.autoHash(&hasher, fragment_bindings.direct_pointers);
+        std.hash.autoHash(&hasher, fragment_bindings.metadata);
+        std.hash.autoHash(&hasher, fragment_bindings.user_data_count);
+
+        for (extra_colors) |extra| hasher.update(std.mem.asBytes(&extra.descriptor.address));
+        return hasher.final();
+    }
+
+    fn hashMaskedUserData(hasher: *std.hash.Wyhash, words: []const u32, mask: u64) void {
+        var bits = mask;
+        while (bits != 0) {
+            const index = @ctz(bits);
+            if (index < words.len) hasher.update(std.mem.asBytes(&words[index]));
+            bits &= bits - 1;
+        }
+        if (words.len > 64) hasher.update(std.mem.sliceAsBytes(words[64..]));
+    }
+
+    /// Shader, targets and the user-data words that form buffer or image
+    /// addresses. Immediate constants are left out so a new transform can keep
+    /// the resident descriptors.
+    fn drawBindingKey(
+        vertex_address: u64,
+        fragment_address: u64,
+        vertex_bindings: *const gpu.ShaderBindings,
+        fragment_bindings: *const gpu.ShaderBindings,
+        target_address: u64,
+        depth_address: u64,
+        extra_colors: []const GuestColorTarget,
+        vertex_mask: u64,
+        fragment_mask: u64,
+        epoch: u64,
+    ) u64 {
+        var hasher = std.hash.Wyhash.init(vertex_address);
+        hasher.update(std.mem.asBytes(&fragment_address));
+        hasher.update(std.mem.asBytes(&target_address));
+        hasher.update(std.mem.asBytes(&depth_address));
+        hasher.update(std.mem.asBytes(&epoch));
+        hasher.update(std.mem.asBytes(&vertex_bindings.scalar_user_data_base));
+        hasher.update(std.mem.asBytes(&fragment_bindings.scalar_user_data_base));
+        std.hash.autoHash(&hasher, vertex_bindings.srt_address);
+        std.hash.autoHash(&hasher, vertex_bindings.direct_pointers);
+        std.hash.autoHash(&hasher, vertex_bindings.metadata);
+        std.hash.autoHash(&hasher, vertex_bindings.user_data_count);
+        std.hash.autoHash(&hasher, fragment_bindings.srt_address);
+        std.hash.autoHash(&hasher, fragment_bindings.direct_pointers);
+        std.hash.autoHash(&hasher, fragment_bindings.metadata);
+        std.hash.autoHash(&hasher, fragment_bindings.user_data_count);
+
+        hashMaskedUserData(&hasher, vertex_bindings.user_data[0..vertex_bindings.user_data_count], vertex_mask);
+        hashMaskedUserData(&hasher, fragment_bindings.user_data[0..fragment_bindings.user_data_count], fragment_mask);
         for (extra_colors) |extra| hasher.update(std.mem.asBytes(&extra.descriptor.address));
         return hasher.final();
     }
@@ -18047,9 +18222,22 @@ pub const Renderer = struct {
                 .srt_address = null,
                 .direct_pointers = .{},
             };
+        const draw_input_key = drawReuseInputKey(state, pipeline_state, vertex_stage, render_state.primitive_type, vertex_analysis, fragment_analysis);
         const draw_epoch = if (memory.gpu_tracking_epoch) |query| query(memory.context) else 0;
         const draw_key = drawResourceKey(vertex_address, fragment_address, &vertex_bindings, &fragment_bindings, target.descriptor.address, if (depth_plane) |plane| plane.address else 0, extra_colors);
-        if (self.draw_reuse_valid and self.draw_batch_active and self.draw_reuse_key == draw_key and self.draw_reuse_epoch == draw_epoch) {
+        const reuse_matches = self.reuse_graphics_resources and !self.traceCurrentGraphicsFrame() and self.draw_reuse_valid and self.draw_batch_active and
+            drawReuseShapeSafe(vertex_stage, render_state.primitive_type, draw) and
+            draw_epoch != 0 and self.draw_reuse_epoch == draw_epoch and self.draw_reuse_input_key == draw_input_key;
+        const exact_reuse = reuse_matches and self.draw_reuse_key == draw_key;
+        const scalar_reuse = reuse_matches and self.draw_reuse_shape_valid and
+            self.draw_reuse_shape_key == drawBindingKey(vertex_address, fragment_address, &vertex_bindings, &fragment_bindings, target.descriptor.address, if (depth_plane) |plane| plane.address else 0, extra_colors, self.draw_reuse_vertex_mask, self.draw_reuse_fragment_mask, draw_epoch);
+        const reuse_memory_matches = (exact_reuse or scalar_reuse) and
+            scalarLoadsMatch(memory, self.draw_reuse_sorted_loads[0..self.draw_reuse_load_count]) and
+            self.drawReuseBufferReadsMatch(memory) and
+            self.drawReuseBoundsMatch(reader, draw) and
+            self.draw_reuse_valid and self.draw_batch_active and
+            (if (memory.gpu_tracking_epoch) |query| query(memory.context) == draw_epoch else false);
+        if (exact_reuse and reuse_memory_matches) {
             self.frame_profile.draw_reuse_hits +|= 1;
             var reused_state = self.draw_reuse_pipeline;
             reused_state.viewport_x_bits = pipeline_state.viewport_x_bits;
@@ -18083,8 +18271,54 @@ pub const Renderer = struct {
             );
             return;
         }
+        if (scalar_reuse and reuse_memory_matches) {
+            self.frame_profile.draw_reuse_scalar_hits +|= 1;
+            patchReusedUserDataScalars(self.draw_reuse_vertex_scalars[0..self.draw_reuse_vertex_scalar_count], &vertex_bindings);
+            patchReusedUserDataScalars(self.draw_reuse_fragment_scalars[0..self.draw_reuse_fragment_scalar_count], &fragment_bindings);
+            var reused_state = self.draw_reuse_pipeline;
+            reused_state.viewport_x_bits = pipeline_state.viewport_x_bits;
+            reused_state.viewport_y_bits = pipeline_state.viewport_y_bits;
+            reused_state.viewport_width_bits = pipeline_state.viewport_width_bits;
+            reused_state.viewport_height_bits = pipeline_state.viewport_height_bits;
+            reused_state.viewport_min_depth_bits = pipeline_state.viewport_min_depth_bits;
+            reused_state.viewport_max_depth_bits = pipeline_state.viewport_max_depth_bits;
+            reused_state.scissor_x = pipeline_state.scissor_x;
+            reused_state.scissor_y = pipeline_state.scissor_y;
+            reused_state.scissor_width = pipeline_state.scissor_width;
+            reused_state.scissor_height = pipeline_state.scissor_height;
+            reused_state.depth_bias_enable = pipeline_state.depth_bias_enable;
+            reused_state.depth_bias_constant_bits = pipeline_state.depth_bias_constant_bits;
+            reused_state.depth_bias_slope_bits = pipeline_state.depth_bias_slope_bits;
+            self.preserve_draw_reuse = true;
+            defer self.preserve_draw_reuse = false;
+            try self.beginFrameDraw();
+            self.replayDrawDescriptors();
+            const reused_vertex = (self.draw_reuse_vertex orelse return Error.MissingGraphicsProgram).view();
+            const reused_fragment = (self.draw_reuse_fragment orelse return Error.MissingGraphicsProgram).view();
+            try self.drawGraphicsShaders(
+                reused_vertex.words,
+                reused_fragment.words,
+                self.draw_reuse_vertex_scalars[0..self.draw_reuse_vertex_scalar_count],
+                self.draw_reuse_fragment_scalars[0..self.draw_reuse_fragment_scalar_count],
+                reused_state,
+                if (depth_only) null else target,
+                extra_colors,
+                depth_plane,
+                render_state.depth_control.clear_enabled or render_state.depth_control.stencil_clear_enabled,
+                self.draw_reuse_bind_descriptors,
+                false,
+                draw,
+            );
+            self.draw_reuse_key = draw_key;
+            self.draw_reuse_epoch = draw_epoch;
+            return;
+        }
         self.frame_profile.draw_reuse_misses +|= 1;
         try self.beginFrameDraw();
+        self.draw_reuse_load_count = 0;
+        self.draw_reuse_reads_complete = true;
+        self.draw_reuse_recording = self.reuse_graphics_resources and draw_epoch != 0;
+        defer self.draw_reuse_recording = false;
         var fragment_specialization = if (@atomicLoad(bool, &graphics_uniform_specialization, .monotonic))
             try fragment_analysis.acquireUniformSpecialization(self.allocator, reader, &fragment_bindings, self.uniform_specialization_cache_enabled)
         else
@@ -18379,11 +18613,15 @@ pub const Renderer = struct {
         // translate without storage and skip MUBUF rather than abort the draw.
         const vertex_storage_started = hostTimestampNs();
         const vertex_range: ?DrawVertexRange = if (self.bound_vertex_fetches and tessellation == null and vertexFetchesAreReadOnly(vertex_instructions)) range: {
+            const recording = self.draw_reuse_recording;
+            self.draw_reuse_recording = false;
+            defer self.draw_reuse_recording = recording;
             // Index data can itself be a compute result. Publish it before
             // proving a host-side bound, just as before staging any GPU output.
             if (draw.index_count) |count| try self.flushPendingGuestWrite(draw.index_address, @as(usize, count) * @as(usize, if (draw.index_uint32) 4 else 2));
             break :range drawVertexRange(reader, draw);
         } else null;
+        const bounded_fetches_before = self.frame_profile.bounded_vertex_fetches;
         const vertex_storage = self.prepareComputeResources(
             &vertex_bindings,
             reader,
@@ -18403,7 +18641,12 @@ pub const Renderer = struct {
         };
         self.frame_profile.graphics_storage_ns +|= elapsedHostNanoseconds(vertex_storage_started);
         defer vertex_storage.deinit(self);
-        validateVertexIndexMappings(reader, vertex_storage, draw, vertex_range);
+        {
+            const recording = self.draw_reuse_recording;
+            self.draw_reuse_recording = false;
+            defer self.draw_reuse_recording = recording;
+            validateVertexIndexMappings(reader, vertex_storage, draw, vertex_range);
+        }
         const capture_draw = @atomicLoad(u64, &capture_vertex_program, .monotonic) == vertex_address and
             @atomicLoad(u64, &capture_vertex_flip, .monotonic) == self.flip_callbacks + 1 and
             (@atomicLoad(u64, &capture_fragment_program, .monotonic) == 0 or
@@ -19339,15 +19582,35 @@ pub const Renderer = struct {
                     vertex_storage.mapping_count != 0 or
                     fragment_storage.mapping_count != 0 or
                     fragment_storage.storage_image_count != 0;
+                // Metadata can resolve inline USER descriptors and optional
+                // vertex-table pointers outside scalar provenance. Exact reuse
+                // validates its memory transcript; scalar-only reuse keeps all
+                // USER words pinned until those metadata dependencies are mapped.
+                const vertex_reuse_mask = if (vertex_bindings.metadata == null and vertex_storage.scalar_reuse_safe and graphics_resources.scalar_reuse_safe) vertex_scalar.address_user_data_mask else std.math.maxInt(u64);
+                const fragment_reuse_mask = if (fragment_bindings.metadata == null and fragment_storage.scalar_reuse_safe and graphics_resources.scalar_reuse_safe) fragment_scalar.address_user_data_mask else std.math.maxInt(u64);
                 self.rememberDrawReuse(
                     draw_key,
+                    draw_input_key,
+                    if (self.frame_profile.bounded_vertex_fetches != bounded_fetches_before) DrawFetchBounds.init(vertex_range, draw) else null,
+                    &vertex_scalar,
+                    &fragment_scalar,
+                    tessellation == null and vertex_instruction_storage.items.len == 0 and fragment_specialization == null and
+                        drawReuseShapeSafe(vertex_stage, render_state.primitive_type, draw) and
+                        fragment_words.ptr == fragment_module.words.ptr and vertexFetchesAreReadOnly(vertex_instructions) and
+                        vertexFetchesAreReadOnly(fragment_analysis.program.instructions.items),
+                    drawBindingKey(vertex_address, fragment_address, &vertex_bindings, &fragment_bindings, target.descriptor.address, if (depth_plane) |plane| plane.address else 0, extra_colors, vertex_reuse_mask, fragment_reuse_mask, draw_epoch),
                     draw_epoch,
+                    vertex_reuse_mask,
+                    fragment_reuse_mask,
                     vertex_lease,
                     fragment_lease,
                     vertex_scalar_regs[0..vertex_scalar_count],
                     fragment_scalar_regs[0..fragment_scalar_count],
                     pipeline_state,
                     bind_descriptors,
+                    graphics_resources,
+                    vertex_storage,
+                    fragment_storage,
                 );
                 try self.drawGraphicsShaders(
                     vertex_module.words,
@@ -20371,6 +20634,8 @@ pub const Renderer = struct {
                 scalar_checkpoint_registers,
                 inst.pc,
             ).*;
+            if (!scalarRegistersKnown(sampled_scalar, inst.src1.reg, inst.imageResourceWords()) or
+                (!image_fetch and !scalarRegistersKnown(sampled_scalar, inst.src2.reg, 4))) result.scalar_reuse_safe = false;
             const image_descriptor = (try resolveComputeSampledImageDescriptor(
                 bindings,
                 reader,
@@ -20750,6 +21015,22 @@ pub const Renderer = struct {
         offset: vk.DeviceSize,
         range: vk.DeviceSize,
     ) void {
+        const cache_index: ?usize = if (self.draw_upload_buffer != null and buffer == self.draw_upload_buffer.?.handle)
+            null
+        else for (self.guest_buffers.items, 0..) |entry, index| {
+            if (entry.device_local.handle == buffer) break index;
+        } else null;
+        self.updateStorageDescriptorRangeKnown(descriptor_index, buffer, offset, range, cache_index);
+    }
+
+    fn updateStorageDescriptorRangeKnown(
+        self: *Renderer,
+        descriptor_index: u32,
+        buffer: vk.Buffer,
+        offset: vk.DeviceSize,
+        range: vk.DeviceSize,
+        cache_index: ?usize,
+    ) void {
         const buffer_info = vk.DescriptorBufferInfo{
             .buffer = buffer,
             .offset = offset,
@@ -20766,9 +21047,9 @@ pub const Renderer = struct {
         self.device_functions.update_descriptor_sets(self.device, 1, @ptrCast(&write), 0, null);
         self.active_storage_buffers[descriptor_index] = buffer;
         self.active_storage_offsets[descriptor_index] = offset;
-        self.active_storage_cache_indices[descriptor_index] = for (self.guest_buffers.items, 0..) |entry, index| {
-            if (entry.device_local.handle == buffer) break index;
-        } else null;
+        self.active_storage_ranges[descriptor_index] = range;
+        self.active_storage_cache_indices[descriptor_index] = cache_index;
+        self.active_storage_source_hashes[descriptor_index] = null;
         if (self.draw_upload_buffer) |ring| {
             if (buffer == ring.handle) self.draw_upload_batch_uses_ring = true;
         }
@@ -24671,6 +24952,8 @@ pub const Renderer = struct {
         self.active_descriptor_set = null;
         @memset(&self.active_storage_buffers, 0);
         @memset(&self.active_storage_offsets, 0);
+        @memset(&self.active_storage_ranges, 0);
+        @memset(&self.active_storage_source_hashes, null);
         @memset(&self.active_storage_cache_indices, null);
         self.dynamic_scalar_mapping = self.dynamic_scalar_mapping_base;
     }
@@ -24681,21 +24964,78 @@ pub const Renderer = struct {
         self.draw_reuse_vertex = null;
         self.draw_reuse_fragment = null;
         self.draw_reuse_valid = false;
+        self.draw_reuse_shape_valid = false;
     }
 
     fn rememberDrawReuse(
         self: *Renderer,
         key: u64,
+        input_key: u64,
+        fetch_bounds: ?DrawFetchBounds,
+        vertex_scalar: *const gpu.ScalarEvaluation,
+        fragment_scalar: *const gpu.ScalarEvaluation,
+        eligible: bool,
+        shape_key: u64,
         epoch: u64,
+        vertex_mask: u64,
+        fragment_mask: u64,
         vertex_lease: spirv_cache.Lease,
         fragment_lease: spirv_cache.Lease,
         vertex_scalars: []const gpu.ShaderSpirvScalarRegister,
         fragment_scalars: []const gpu.ShaderSpirvScalarRegister,
         pipeline_state: GraphicsPipelineState,
         bind_descriptors: bool,
+        graphics: *const GraphicsResources,
+        vertex_storage: *const ComputeResources,
+        storage: *const ComputeResources,
     ) void {
+        self.draw_reuse_recording = false;
         self.invalidateDrawReuse();
+        if (!self.reuse_graphics_resources or !eligible or epoch == 0) {
+            self.frame_profile.draw_reuse_rejections[0] +|= 1;
+            return;
+        }
+        if (!self.draw_reuse_reads_complete) {
+            self.frame_profile.draw_reuse_rejections[1] +|= 1;
+            return;
+        }
+        if (vertex_scalar.memory_read_failed or fragment_scalar.memory_read_failed or
+            vertex_scalar.stop_reason != .end_program or fragment_scalar.stop_reason != .end_program)
+        {
+            self.frame_profile.draw_reuse_rejections[2] +|= 1;
+            return;
+        }
+        if (!drawReuseStorageSafe(vertex_storage) or !drawReuseStorageSafe(storage)) {
+            self.frame_profile.draw_reuse_rejections[3] +|= 1;
+            return;
+        }
+        for (graphics.images[0..graphics.image_count]) |image| {
+            // Temporary views and render-target snapshots are retired after
+            // their owning draw; they cannot be replayed without a new lease.
+            if (image.owns_view or image.owns_sampler or image.owns_image or
+                image.storage_cache_index != null or image.render_target_index != null)
+            {
+                self.frame_profile.draw_reuse_rejections[4] +|= 1;
+                return;
+            }
+        }
+        const check_count = selectDrawReuseReads(self.guest_memory.?, self.draw_reuse_loads[0..self.draw_reuse_load_count], &self.draw_reuse_sorted_loads);
+        self.frame_profile.draw_reuse_tracked_reads +|= self.draw_reuse_load_count - check_count;
+        self.draw_reuse_load_count = check_count;
+        self.draw_reuse_input_key = input_key;
+        self.draw_reuse_fetch_bounds = fetch_bounds;
+        self.draw_reuse_index_proof = vertex_storage.vertex_index_proof;
         if (vertex_scalars.len > self.draw_reuse_vertex_scalars.len or fragment_scalars.len > self.draw_reuse_fragment_scalars.len) return;
+        const shape_ok = self.captureDrawReuseResources(graphics, storage);
+        if (!shape_ok) {
+            self.frame_profile.draw_reuse_rejections[5] +|= 1;
+            return;
+        }
+        self.draw_reuse_buffer_read_count = 0;
+        if (!self.captureDrawReuseBufferReads(vertex_storage) or !self.captureDrawReuseBufferReads(storage)) {
+            self.frame_profile.draw_reuse_rejections[5] +|= 1;
+            return;
+        }
         self.draw_reuse_vertex = vertex_lease.retain();
         self.draw_reuse_fragment = fragment_lease.retain();
         @memcpy(self.draw_reuse_vertex_scalars[0..vertex_scalars.len], vertex_scalars);
@@ -24705,15 +25045,185 @@ pub const Renderer = struct {
         self.draw_reuse_pipeline = pipeline_state;
         self.draw_reuse_bind_descriptors = bind_descriptors;
         self.draw_reuse_key = key;
+        self.draw_reuse_shape_key = shape_key;
         self.draw_reuse_epoch = epoch;
+        self.draw_reuse_vertex_mask = vertex_mask;
+        self.draw_reuse_fragment_mask = fragment_mask;
+        self.draw_reuse_shape_valid = shape_ok;
         self.draw_reuse_valid = true;
+    }
+
+    fn captureDrawReuseResources(self: *Renderer, graphics: *const GraphicsResources, storage: *const ComputeResources) bool {
+        if (graphics.image_count > self.draw_reuse_images.len or storage.storage_image_count > self.draw_reuse_storage_images.len) return false;
+        @memset(&self.draw_reuse_storage_used, false);
+        for (self.active_storage_buffers, self.active_storage_offsets, self.active_storage_ranges, self.active_storage_cache_indices, 0..) |buffer, offset, range, cache, index| {
+            if (buffer != 0 and cache == null and
+                (self.draw_upload_buffer == null or buffer != self.draw_upload_buffer.?.handle)) return false;
+            self.draw_reuse_storage_used[index] = buffer != 0;
+            self.draw_reuse_storage[index] = .{ .buffer = buffer, .offset = offset, .range = range };
+            self.draw_reuse_storage_cache[index] = cache;
+        }
+        var bindings: [48]u32 = undefined;
+        sampledImageDescriptorBindings(graphics.mappings[0..graphics.mapping_count], bindings[0..graphics.image_count]);
+        for (graphics.images[0..graphics.image_count], 0..) |image, index| {
+            if (bindings[index] == std.math.maxInt(u32)) return false;
+            self.draw_reuse_images[index] = .{
+                .binding = bindings[index],
+                .element = @intCast(index),
+                .info = .{ .sampler = image.sampler, .image_view = image.view, .image_layout = image.descriptor_layout },
+            };
+        }
+        self.draw_reuse_image_count = graphics.image_count;
+        for (storage.storage_images[0..storage.storage_image_count], 0..) |image, index| {
+            self.draw_reuse_storage_images[index] = .{ .index = @intCast(index), .view = image.view };
+        }
+        self.draw_reuse_storage_image_count = storage.storage_image_count;
+        return true;
+    }
+
+    fn drawReuseBoundsMatch(self: *Renderer, reader: gpu.ShaderMemoryReader, draw: GuestDraw) bool {
+        if (!self.draw_reuse_index_proof.needed and self.draw_reuse_fetch_bounds == null) return true;
+        // The index source may be GPU-produced even though the vertex buffers
+        // themselves are read-only. Check the current contents, not its address.
+        if (draw.index_count) |count| self.flushPendingGuestWrite(draw.index_address, @as(usize, count) * @as(usize, if (draw.index_uint32) 4 else 2)) catch return false;
+        const range = drawVertexRange(reader, draw);
+        if (!self.draw_reuse_index_proof.accepts(range)) return false;
+        if (self.draw_reuse_fetch_bounds) |cached| {
+            const current = DrawFetchBounds.init(range, draw) orelse return false;
+            if (!cached.contains(current)) return false;
+        }
+        return true;
+    }
+
+    fn recordDrawReuseRead(self: *Renderer, address: u64, bytes: []const u8) void {
+        if (!self.draw_reuse_reads_complete or bytes.len == 0) return;
+        if (bytes.len > 64) {
+            self.draw_reuse_reads_complete = false;
+            return;
+        }
+        for (self.draw_reuse_loads[0..self.draw_reuse_load_count]) |*read| {
+            if (read.address == address and read.byte_count == bytes.len) {
+                if (!std.mem.eql(u8, reuseReadBytes(read), bytes)) self.draw_reuse_reads_complete = false;
+                return;
+            }
+        }
+        if (self.draw_reuse_load_count == self.draw_reuse_loads.len) {
+            self.draw_reuse_reads_complete = false;
+            return;
+        }
+        const read = &self.draw_reuse_loads[self.draw_reuse_load_count];
+        read.* = .{ .address = address, .byte_count = @intCast(bytes.len) };
+        @memcpy(std.mem.sliceAsBytes(&read.values)[0..bytes.len], bytes);
+        self.draw_reuse_load_count += 1;
+    }
+
+    fn captureDrawReuseBufferReads(self: *Renderer, resources: *const ComputeResources) bool {
+        const memory = self.guest_memory orelse return false;
+        for (resources.occupied, resources.addresses, resources.sizes, 0..) |occupied, address, size, slot| {
+            if (!occupied or address == 0 or size == 0) continue;
+            if (self.active_storage_cache_indices[slot]) |index| {
+                if (index >= self.guest_buffers.items.len) return false;
+                const entry = self.guest_buffers.items[index];
+                const generation = if (memory.gpu_generation) |query| query(memory.context, address, size) else 0;
+                if (generation == 0 or generation != entry.page_generation) return false;
+            } else {
+                const ring = self.draw_upload_buffer orelse return false;
+                if (self.active_storage_buffers[slot] != ring.handle or size > 256 * 1024) return false;
+                if (self.draw_reuse_buffer_read_count == self.draw_reuse_buffer_reads.len) return false;
+                const source_hash = self.active_storage_source_hashes[slot] orelse return false;
+                self.draw_reuse_buffer_reads[self.draw_reuse_buffer_read_count] = .{
+                    .address = address,
+                    .hash = source_hash,
+                    .size = size,
+                };
+                self.draw_reuse_buffer_read_count += 1;
+            }
+        }
+        return true;
+    }
+
+    fn drawReuseBufferReadsMatch(self: *Renderer, memory: GuestMemory) bool {
+        if (self.draw_reuse_buffer_read_count == 0) return true;
+        var scratch: [4096]u8 = undefined;
+        for (self.draw_reuse_buffer_reads[0..self.draw_reuse_buffer_read_count]) |read| {
+            if (memory.fingerprint) |fingerprint| {
+                if (fingerprint(memory.context, read.address, read.size) != read.hash) return false;
+                continue;
+            }
+            var hash = std.hash.Wyhash.init(0);
+            var offset: usize = 0;
+            while (offset < read.size) {
+                const length = @min(scratch.len, read.size - offset);
+                if (!memory.read(memory.context, read.address + offset, scratch[0..length])) return false;
+                hash.update(scratch[0..length]);
+                offset += length;
+            }
+            if (hash.final() != read.hash) return false;
+        }
+        return true;
+    }
+
+    fn copyDrawUploadSource(self: *Renderer, memory: GuestMemory, address: u64, destination: []u8) Error!?u64 {
+        if (self.reuse_graphics_resources and destination.len <= 256 * 1024) {
+            // Hash exactly the bytes uploaded, before writing GPU upload memory.
+            // Never read the possibly write-combined Vulkan mapping on the CPU.
+            self.draw_upload_source_scratch.resize(self.allocator, destination.len) catch {
+                if (!memory.read(memory.context, address, destination)) return Error.GuestMemoryReadFailed;
+                return null;
+            };
+            const source = self.draw_upload_source_scratch.items;
+            if (!memory.read(memory.context, address, source)) return Error.GuestMemoryReadFailed;
+            const hash = gpu.parallel_copy.fingerprint(source);
+            @memcpy(destination, source);
+            return hash;
+        }
+        if (!memory.read(memory.context, address, destination)) return Error.GuestMemoryReadFailed;
+        return null;
+    }
+
+    fn replayDrawDescriptors(self: *Renderer) void {
+        var writes: [maximum_storage_descriptors + 48]vk.WriteDescriptorSet = undefined;
+        var count: usize = 0;
+        for (self.draw_reuse_storage, 0..) |info, index| {
+            if (!self.draw_reuse_storage_used[index] or info.buffer == 0) continue;
+            writes[count] = .{
+                .destination_set = self.descriptor_set,
+                .destination_binding = 0,
+                .destination_array_element = @intCast(index),
+                .descriptor_count = 1,
+                .descriptor_type = vk.descriptor_type_storage_buffer,
+                .buffer_info = @ptrCast(&self.draw_reuse_storage[index]),
+            };
+            count += 1;
+            self.active_storage_buffers[index] = info.buffer;
+            self.active_storage_offsets[index] = info.offset;
+            self.active_storage_ranges[index] = info.range;
+            self.active_storage_cache_indices[index] = self.draw_reuse_storage_cache[index];
+            if (self.draw_upload_buffer) |ring| {
+                if (info.buffer == ring.handle) self.draw_upload_batch_uses_ring = true;
+            }
+        }
+        for (self.draw_reuse_images[0..self.draw_reuse_image_count]) |*image| {
+            writes[count] = .{
+                .destination_set = self.descriptor_set,
+                .destination_binding = image.binding,
+                .destination_array_element = image.element,
+                .descriptor_count = 1,
+                .descriptor_type = vk.descriptor_type_combined_image_sampler,
+                .image_info = @ptrCast(&image.info),
+            };
+            count += 1;
+        }
+        std.debug.assert(self.draw_reuse_storage_image_count == 0);
+        if (count != 0) self.device_functions.update_descriptor_sets(self.device, @intCast(count), &writes, 0, null);
+        self.active_descriptor_set = self.descriptor_set;
     }
 
     fn beginDescriptorBatch(
         self: *Renderer,
         allow_draw_uploads: bool,
     ) (Error || std.mem.Allocator.Error)!void {
-        self.invalidateDrawReuse();
+        if (!self.preserve_draw_reuse) self.invalidateDrawReuse();
         self.retireDrawUploadSpills();
         self.draw_upload_batch_uses_ring = false;
         self.sampled_image_batch +%= 1;
@@ -24771,6 +25281,8 @@ pub const Renderer = struct {
         self.active_descriptor_set = null;
         @memset(&self.active_storage_buffers, 0);
         @memset(&self.active_storage_offsets, 0);
+        @memset(&self.active_storage_ranges, 0);
+        @memset(&self.active_storage_source_hashes, null);
         @memset(&self.active_storage_cache_indices, null);
         const base = self.dynamic_scalar_mapping_base orelse return Error.InvalidStorageDescriptor;
         const word_offset = slot * descriptor_scalar_stride / @sizeOf(u32);
@@ -26816,6 +27328,10 @@ pub const Renderer = struct {
                 "[gpu buffers] flip={d} content_reused_kib={d} fingerprint_ms={d} materialize_ms={d} views_ms={d} page_ms={d} page_reused_kib={d} vertex_trim_kib={d} vertex_trim_fetches={d}\n",
                 .{ self.flip_callbacks, profile.content_reused_bytes / 1024, profile.buffer_fingerprint_ns / std.time.ns_per_ms, profile.stage_materialize_ns / std.time.ns_per_ms, profile.stage_views_ns / std.time.ns_per_ms, profile.buffer_page_ns / std.time.ns_per_ms, profile.page_reused_bytes / 1024, profile.bounded_vertex_bytes / 1024, profile.bounded_vertex_fetches },
             );
+            std.debug.print("[gpu buffer cache] flip={d} hit={d} miss={d} evict={d} limit={d}\n", .{
+                self.flip_callbacks,                                                                                 profile.buffer_cache_hits, profile.buffer_cache_misses, profile.buffer_cache_evictions,
+                if (self.retain_clean_storage_buffers) self.storage_buffer_cache_entries else maximum_guest_buffers,
+            });
             std.debug.print(
                 "[gpu compute scan] flip={d} buffers_ms={d}(stage={d},ptr={d}) images_ms={d} resolve_ms={d} stage_ms={d} probe={d}ms/{d} dedup={d}ms/{d} tail_ms={d}(loop={d}/stage={d}ms/{d},desc={d},flat={d},blk={d},slk={d}) dispatches={d} walked={d} images={d} distinct_buf={d}/{d} distinct_img={d}/{d}\n",
                 .{ self.flip_callbacks, profile.compute_buffer_scan_ns / std.time.ns_per_ms, profile.compute_buffer_stage_ns / std.time.ns_per_ms, profile.compute_pointer_memory_ns / std.time.ns_per_ms, profile.compute_image_scan_ns / std.time.ns_per_ms, profile.compute_image_resolve_ns / std.time.ns_per_ms, profile.compute_image_stage_ns / std.time.ns_per_ms, profile.compute_sampled_probe_ns / std.time.ns_per_ms, profile.compute_sampled_probe_steps, profile.compute_image_dedup_ns / std.time.ns_per_ms, profile.compute_image_dedup_steps, profile.compute_tail_ns / std.time.ns_per_ms, profile.compute_sampled_loop_ns / std.time.ns_per_ms, profile.compute_sampled_stage_ns / std.time.ns_per_ms, profile.compute_sampled_stages, profile.compute_descriptor_update_ns / std.time.ns_per_ms, profile.compute_flat_memory_ns / std.time.ns_per_ms, profile.compute_buffer_lookup_ns / std.time.ns_per_ms, profile.compute_sampled_lookup_ns / std.time.ns_per_ms, profile.dispatches, profile.compute_instructions_walked, profile.compute_images_resolved, profile.staged_buffers.distinct, profile.staged_buffers.total, profile.staged_images.distinct, profile.staged_images.total },
@@ -26878,7 +27394,7 @@ pub const Renderer = struct {
                 self.flip_callbacks, profile.cold_storage_images, profile.cold_storage_image_bytes,
             });
             std.debug.print(
-                "[gpu draw] flip={d} shader_check_ms={d} storage_ms={d} setup_ms={d} pipeline_lookup_ms={d} scalar_upload_ms={d} record_ms={d} reuse={d}/{d}\n",
+                "[gpu draw] flip={d} shader_check_ms={d} storage_ms={d} setup_ms={d} pipeline_lookup_ms={d} scalar_upload_ms={d} record_ms={d} reuse={d}/{d}/{d}\n",
                 .{
                     self.flip_callbacks,
                     profile.shader_validation_ns / std.time.ns_per_ms,
@@ -26888,9 +27404,14 @@ pub const Renderer = struct {
                     profile.graphics_scalar_upload_ns / std.time.ns_per_ms,
                     profile.graphics_record_ns / std.time.ns_per_ms,
                     profile.draw_reuse_hits,
+                    profile.draw_reuse_scalar_hits,
                     profile.draw_reuse_misses,
                 },
             );
+            std.debug.print("[gpu draw reuse] flip={d} reject(scope/reads/scalar/storage/images/source)={d}/{d}/{d}/{d}/{d}/{d} tracked_reads={d}\n", .{
+                self.flip_callbacks,              profile.draw_reuse_rejections[0], profile.draw_reuse_rejections[1], profile.draw_reuse_rejections[2],
+                profile.draw_reuse_rejections[3], profile.draw_reuse_rejections[4], profile.draw_reuse_rejections[5], profile.draw_reuse_tracked_reads,
+            });
         }
         self.sampled_address_census.clearRetainingCapacity();
         self.sampled_census_incomplete = false;
@@ -29461,6 +29982,333 @@ fn collectScalarLoadSpecializations(
         }
     }
     return count;
+}
+
+fn drawReuseShapeSafe(stage: gpu.resources.ShaderStage, primitive: u32, draw: GuestDraw) bool {
+    // Rectangle completion specializes geometry from the draw's shape or
+    // actual indexed corner data, not just its shaders and resource bindings.
+    return primitive != 7 and primitive != 17 and
+        !(stage == .export_shader and primitive == 4 and draw.index_count == 3);
+}
+
+test "draw resource reuse excludes draw-dependent rectangle completion" {
+    try std.testing.expect(drawReuseShapeSafe(.vertex, 4, .{ .index_count = 3 }));
+    try std.testing.expect(drawReuseShapeSafe(.export_shader, 4, .{ .index_count = 6 }));
+    try std.testing.expect(!drawReuseShapeSafe(.export_shader, 4, .{ .index_count = 3 }));
+    try std.testing.expect(!drawReuseShapeSafe(.vertex, 7, .{ .vertex_count = 3 }));
+    try std.testing.expect(!drawReuseShapeSafe(.vertex, 17, .{ .vertex_count = 6 }));
+}
+
+fn drawReuseInputKey(state: *const gpu.State, pipeline: GraphicsPipelineState, stage: gpu.resources.ShaderStage, primitive: u32, vertex: *const gpu.ShaderAnalysis, fragment: *const gpu.ShaderAnalysis) u64 {
+    var hasher = std.hash.Wyhash.init(0);
+    std.hash.autoHash(&hasher, pipeline.pipelineKey());
+    std.hash.autoHash(&hasher, stage);
+    std.hash.autoHash(&hasher, primitive);
+    // The analysis owns immutable decoded instructions; changed programs are
+    // assigned a new analysis before this lookup.
+    std.hash.autoHash(&hasher, @intFromPtr(vertex.program.instructions.items.ptr));
+    std.hash.autoHash(&hasher, @intFromPtr(fragment.program.instructions.items.ptr));
+    for (0..32) |attribute| std.hash.autoHash(&hasher, state.readRegister(.context, 0x191 + @as(u32, @intCast(attribute))));
+    return hasher.final();
+}
+
+fn drawReuseStorageSafe(resources: *const ComputeResources) bool {
+    if (resources.storage_image_count != 0 or resources.flat_memory_count != 0 or
+        resources.flat_memory_fault != null or resources.sampled_image_fault != null or
+        resources.scalar_memory_count != 0) return false;
+    for (resources.occupied, resources.writable) |occupied, writable| {
+        if (occupied and writable) return false;
+    }
+    if (!resources.vertex_index_proof.valid) return false;
+    return true;
+}
+
+fn scalarRegistersKnown(scalar: *const gpu.ScalarEvaluation, first: u32, count: u32) bool {
+    if (first > scalar.registers.len or count > scalar.registers.len - first) return false;
+    for (scalar.registers[first..][0..count]) |value| if (!value.known) return false;
+    return true;
+}
+
+fn reuseReadBytes(read: anytype) []const u8 {
+    const length: usize = if (@hasField(@TypeOf(read.*), "byte_count")) read.byte_count else @as(usize, read.word_count) * 4;
+    return std.mem.sliceAsBytes(&read.values)[0..length];
+}
+
+fn reuseReadAt(loads: anytype, index: usize) *const switch (@typeInfo(@TypeOf(loads[0]))) {
+    .pointer => |pointer| pointer.child,
+    else => @TypeOf(loads[0]),
+} {
+    return switch (@typeInfo(@TypeOf(loads[0]))) {
+        .pointer => loads[index],
+        else => &loads[index],
+    };
+}
+
+fn selectDrawReuseReads(memory: GuestMemory, reads: []const ReuseShaderRead, output: []*const ReuseShaderRead) usize {
+    for (reads, 0..) |*read, index| output[index] = read;
+    std.mem.sortUnstable(*const ReuseShaderRead, output[0..reads.len], {}, struct {
+        fn less(_: void, a: *const ReuseShaderRead, b: *const ReuseShaderRead) bool {
+            return a.address < b.address;
+        }
+    }.less);
+    const generation = memory.gpu_generation orelse return reads.len;
+    var count: usize = 0;
+    var first: usize = 0;
+    while (first < reads.len) {
+        const address = output[first].address;
+        var length: usize = output[first].byte_count;
+        var end = first + 1;
+        while (end < reads.len) : (end += 1) {
+            const next = output[end];
+            if (next.address - address > 4096) break;
+            const extent = next.address - address + next.byte_count;
+            if (extent > 4096) break;
+            length = @max(length, @as(usize, @intCast(extent)));
+        }
+        // Reuse already checks the global tracking epoch. Query a neighboring
+        // group once, without arming any new pages. An untracked gap merely
+        // keeps the group's explicit byte checks; it cannot certify a source.
+        if (generation(memory.context, address, length) == 0) {
+            std.mem.copyForwards(*const ReuseShaderRead, output[count..][0 .. end - first], output[first..end]);
+            count += end - first;
+        }
+        first = end;
+    }
+    return count;
+}
+
+test "draw reuse retains untracked reads and never arms additional CPU pages" {
+    const Source = struct {
+        watched: bool = true,
+        queries: usize = 0,
+        fn generation(context: ?*anyopaque, address: u64, size: usize) u64 {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.queries += 1;
+            return if (self.watched and address == 0x4000 and size <= 8) 19 else 0;
+        }
+        fn track(_: ?*anyopaque, _: u64, _: usize) u64 {
+            @panic("reuse validation must not add page protection");
+        }
+        fn read(_: ?*anyopaque, _: u64, _: []u8) bool {
+            return false;
+        }
+        fn write(_: ?*anyopaque, _: u64, _: []const u8) bool {
+            return false;
+        }
+    };
+    var source = Source{};
+    const memory = GuestMemory{ .context = &source, .read = Source.read, .write = Source.write, .gpu_generation = Source.generation, .track_gpu_read = Source.track };
+    const reads = [_]ReuseShaderRead{
+        .{ .address = 0x6000, .byte_count = 4 },
+        .{ .address = 0x4000, .byte_count = 4 },
+        .{ .address = 0x5000, .byte_count = 2 },
+        .{ .address = 0x4004, .byte_count = 4 },
+    };
+    var output: [4]*const ReuseShaderRead = undefined;
+    try std.testing.expectEqual(@as(usize, 2), selectDrawReuseReads(memory, &reads, &output));
+    try std.testing.expectEqual(@as(usize, 3), source.queries);
+    try std.testing.expectEqual(@as(u64, 0x5000), output[0].address);
+    try std.testing.expectEqual(@as(u64, 0x6000), output[1].address);
+    source.watched = false;
+    try std.testing.expectEqual(@as(usize, 4), selectDrawReuseReads(memory, &reads, &output));
+    try std.testing.expectEqual(@as(u64, 0x4000), output[0].address);
+}
+
+fn scalarLoadsMatch(memory: GuestMemory, loads: anytype) bool {
+    // Loads are sorted at capture. Amortize checked guest-address resolution
+    // across nearby constants without protecting frequently written CPU pages.
+    // Ignore gaps: unrelated bytes in the same allocation are allowed to change.
+    var bytes: [4096]u8 = undefined;
+    var first: usize = 0;
+    while (first < loads.len) {
+        const first_read = reuseReadAt(loads, first);
+        const address = first_read.address;
+        var length = reuseReadBytes(first_read).len;
+        var end = first + 1;
+        while (end < loads.len) : (end += 1) {
+            const next = reuseReadAt(loads, end);
+            if (next.address < address or next.address - address > bytes.len) break;
+            const extent = next.address - address + reuseReadBytes(next).len;
+            if (extent > bytes.len) break;
+            length = @max(length, @as(usize, @intCast(extent)));
+        }
+        if (!memory.read(memory.context, address, bytes[0..length])) return false;
+        for (first..end) |index| {
+            const load = reuseReadAt(loads, index);
+            const offset: usize = @intCast(load.address - address);
+            if (!std.mem.eql(u8, bytes[offset..][0..reuseReadBytes(load).len], reuseReadBytes(load))) return false;
+        }
+        first = end;
+    }
+    return true;
+}
+
+fn patchReusedUserDataScalars(scalars: []gpu.ShaderSpirvScalarRegister, bindings: *const gpu.ShaderBindings) void {
+    for (scalars) |*entry| {
+        if (entry.producer_pc == null) {
+            if (entry.register < bindings.scalar_user_data_base) continue;
+            const index = entry.register - bindings.scalar_user_data_base;
+            if (index >= bindings.user_data_count) continue;
+            entry.value = bindings.user_data[index];
+        }
+    }
+}
+
+test "draw reuse rereads untracked scalar loads and patches only entry values" {
+    const Memory = struct {
+        word: u32 = 17,
+        accessible: bool = true,
+        fn read(context: ?*anyopaque, address: u64, bytes: []u8) bool {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            if (!self.accessible or address != 0x4000 or bytes.len != 4) return false;
+            std.mem.writeInt(u32, bytes[0..4], self.word, .little);
+            return true;
+        }
+        fn write(_: ?*anyopaque, _: u64, _: []const u8) bool {
+            return false;
+        }
+    };
+    var source = Memory{};
+    const memory = GuestMemory{ .context = &source, .read = Memory.read, .write = Memory.write };
+    var load = std.mem.zeroes(gpu.scalar_provenance.ScalarLoad);
+    load.address = 0x4000;
+    load.word_count = 1;
+    load.values[0] = 17;
+    try std.testing.expect(scalarLoadsMatch(memory, &[_]gpu.scalar_provenance.ScalarLoad{load}));
+    source.word = 23;
+    try std.testing.expect(!scalarLoadsMatch(memory, &[_]gpu.scalar_provenance.ScalarLoad{load}));
+    source.word = 17;
+    source.accessible = false;
+    try std.testing.expect(!scalarLoadsMatch(memory, &[_]gpu.scalar_provenance.ScalarLoad{load}));
+    var bindings = std.mem.zeroes(gpu.ShaderBindings);
+    bindings.scalar_user_data_base = 8;
+    bindings.user_data_count = 1;
+    bindings.user_data[0] = 42;
+    var scalars = [_]gpu.ShaderSpirvScalarRegister{
+        .{ .register = 3, .value = 0x4040 },
+        .{ .register = 8, .value = 17 },
+        .{ .register = 8, .value = 99, .producer_pc = 4 },
+    };
+    patchReusedUserDataScalars(&scalars, &bindings);
+    try std.testing.expectEqual(@as(u32, 0x4040), scalars[0].value);
+    try std.testing.expectEqual(@as(u32, 42), scalars[1].value);
+    try std.testing.expectEqual(@as(u32, 99), scalars[2].value);
+}
+
+test "draw reuse batches adjacent scalar reads and ignores unrelated bytes" {
+    const Source = struct {
+        bytes: [32]u8 = @splat(0),
+        reads: usize = 0,
+        fn read(context: ?*anyopaque, address: u64, out: []u8) bool {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.reads += 1;
+            if (address < 0x4000 or address - 0x4000 + out.len > self.bytes.len) return false;
+            @memcpy(out, self.bytes[@intCast(address - 0x4000)..][0..out.len]);
+            return true;
+        }
+        fn write(_: ?*anyopaque, _: u64, _: []const u8) bool {
+            return false;
+        }
+    };
+    var source = Source{};
+    const memory = GuestMemory{ .context = &source, .read = Source.read, .write = Source.write };
+    var loads: [2]gpu.scalar_provenance.ScalarLoad = @splat(std.mem.zeroes(gpu.scalar_provenance.ScalarLoad));
+    loads[0].address = 0x4000;
+    loads[1].address = 0x4010;
+    for (&loads) |*load| load.word_count = 1;
+    try std.testing.expect(scalarLoadsMatch(memory, &loads));
+    try std.testing.expectEqual(@as(usize, 1), source.reads);
+    const pointers = [_]*const gpu.scalar_provenance.ScalarLoad{ &loads[0], &loads[1] };
+    try std.testing.expect(scalarLoadsMatch(memory, &pointers));
+    source.bytes[8] = 9;
+    try std.testing.expect(scalarLoadsMatch(memory, &loads));
+    source.bytes[16] = 9;
+    try std.testing.expect(!scalarLoadsMatch(memory, &loads));
+    try std.testing.expect(!scalarLoadsMatch(memory, &pointers));
+    source.bytes[16] = 0;
+    loads[1].address = 0x4020;
+    try std.testing.expect(!scalarLoadsMatch(memory, &loads));
+}
+
+test "draw reuse fingerprints exactly the uploaded bytes without reading the GPU mapping" {
+    const Source = struct {
+        bytes: [16]u8 = @splat(7),
+        fn read(context: ?*anyopaque, address: u64, out: []u8) bool {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            if (address < 0x4000 or address - 0x4000 + out.len > self.bytes.len) return false;
+            @memcpy(out, self.bytes[@intCast(address - 0x4000)..][0..out.len]);
+            return true;
+        }
+        fn write(_: ?*anyopaque, _: u64, _: []const u8) bool {
+            return false;
+        }
+    };
+    var source = Source{};
+    const memory = GuestMemory{ .context = &source, .read = Source.read, .write = Source.write };
+    var ring = source.bytes;
+    const renderer = try std.testing.allocator.create(Renderer);
+    defer std.testing.allocator.destroy(renderer);
+    renderer.allocator = std.testing.allocator;
+    renderer.reuse_graphics_resources = true;
+    renderer.guest_memory = memory;
+    renderer.active_storage_cache_indices = @splat(null);
+    renderer.active_storage_buffers = @splat(0);
+    renderer.active_storage_buffers[0] = 123;
+    renderer.active_storage_offsets = @splat(0);
+    renderer.active_storage_source_hashes = @splat(null);
+    renderer.draw_upload_buffer = .{ .handle = 123, .memory = 456, .size = ring.len };
+    renderer.draw_upload_mapping = &ring;
+    renderer.draw_reuse_buffer_read_count = 0;
+    renderer.draw_upload_source_scratch = .empty;
+    defer renderer.draw_upload_source_scratch.deinit(std.testing.allocator);
+    renderer.active_storage_source_hashes[0] = try renderer.copyDrawUploadSource(memory, 0x4000, &ring);
+    try std.testing.expectEqualSlices(u8, &source.bytes, &ring);
+    const resources = try ComputeResources.init(std.testing.allocator);
+    defer std.testing.allocator.destroy(resources);
+    resources.occupied[0] = true;
+    resources.addresses[0] = 0x4000;
+    resources.sizes[0] = ring.len;
+    try std.testing.expect(renderer.captureDrawReuseBufferReads(resources));
+    // Capture and validation do not read the GPU mapping. Its actual lifetime
+    // is protected independently by descriptor/ring retirement.
+    renderer.draw_upload_mapping = null;
+    try std.testing.expect(renderer.drawReuseBufferReadsMatch(memory));
+    source.bytes[3] = 8;
+    try std.testing.expect(!renderer.drawReuseBufferReadsMatch(memory));
+}
+
+test "draw reuse records descriptor metadata and rejects inconsistent observations" {
+    const renderer = try std.testing.allocator.create(Renderer);
+    defer std.testing.allocator.destroy(renderer);
+    renderer.draw_reuse_reads_complete = true;
+    renderer.draw_reuse_load_count = 0;
+    renderer.recordDrawReuseRead(0x4000, &.{ 3, 4 });
+    renderer.recordDrawReuseRead(0x4000, &.{ 3, 4 });
+    try std.testing.expectEqual(@as(usize, 1), renderer.draw_reuse_load_count);
+    try std.testing.expectEqualSlices(u8, &.{ 3, 4 }, reuseReadBytes(&renderer.draw_reuse_loads[0]));
+    try std.testing.expect(renderer.draw_reuse_reads_complete);
+    renderer.recordDrawReuseRead(0x4000, &.{ 3, 5 });
+    try std.testing.expect(!renderer.draw_reuse_reads_complete);
+    renderer.draw_reuse_reads_complete = true;
+    renderer.recordDrawReuseRead(0x5000, &@as([65]u8, @splat(0)));
+    try std.testing.expect(!renderer.draw_reuse_reads_complete);
+}
+
+test "draw binding reuse keys distinguish pointers and permit only unmasked constants" {
+    var vertex = std.mem.zeroes(gpu.ShaderBindings);
+    var fragment = vertex;
+    vertex.user_data_count = 3;
+    vertex.user_data[0..3].* = .{ 1, 2, 3 };
+    const key = Renderer.drawBindingKey(0x1000, 0x2000, &vertex, &fragment, 0x3000, 0, &.{}, 3, 0, 1);
+    vertex.user_data[2] = 9;
+    try std.testing.expectEqual(key, Renderer.drawBindingKey(0x1000, 0x2000, &vertex, &fragment, 0x3000, 0, &.{}, 3, 0, 1));
+    vertex.user_data[0] = 2;
+    try std.testing.expect(key != Renderer.drawBindingKey(0x1000, 0x2000, &vertex, &fragment, 0x3000, 0, &.{}, 3, 0, 1));
+    vertex.user_data[0] = 1;
+    vertex.direct_pointers.fetch_shader = 0x8000;
+    try std.testing.expect(key != Renderer.drawBindingKey(0x1000, 0x2000, &vertex, &fragment, 0x3000, 0, &.{}, 3, 0, 1));
+    vertex.direct_pointers.fetch_shader = null;
+    try std.testing.expect(key != Renderer.drawBindingKey(0x1000, 0x2000, &vertex, &fragment, 0x3000, 0, &.{}, 3, 0, 2));
 }
 
 fn mergeUserDataScalars(
@@ -34522,6 +35370,10 @@ test "a descriptor reused after an intermediate flush remains reserved by queued
     const renderer = try std.testing.allocator.create(Renderer);
     defer std.testing.allocator.destroy(renderer);
     renderer.allocator = std.testing.allocator;
+    renderer.draw_reuse_vertex = null;
+    renderer.draw_reuse_fragment = null;
+    renderer.preserve_draw_reuse = false;
+    renderer.sampled_image_batch = 0;
     renderer.device = @ptrFromInt(1);
     renderer.device_functions.end_command_buffer = mock.end;
     renderer.device_functions.get_semaphore_counter_value = mock.progress;
@@ -35805,6 +36657,35 @@ test "vertex index range batches checked reads and preserves signed bounds" {
     const direct = drawVertexRange(reader, .{ .first_vertex = 17, .vertex_count = 4 }).?;
     try std.testing.expectEqual(@as(i64, 17), direct.minimum);
     try std.testing.expectEqual(@as(i64, 20), direct.maximum);
+}
+
+test "draw reuse preserves both mesh and lookup index decisions across extent boundaries" {
+    const resources = try ComputeResources.init(std.testing.allocator);
+    defer std.testing.allocator.destroy(resources);
+    resources.mapping_count = 2;
+    for (resources.mappings[0..2], [_]u32{ 1600, 160 }, 0..) |*mapping, extent, slot| {
+        mapping.* = .{ .resource_sgpr = 0, .descriptor_index = @intCast(slot), .stride = 16, .use_vertex_index = true, .extent_bytes = extent };
+    }
+    const reader = gpu.ShaderMemoryReader{ .context = null, .read_fn = struct {
+        fn read(_: ?*anyopaque, _: u64, _: []u8) bool {
+            return false;
+        }
+    }.read };
+    validateVertexIndexMappings(reader, resources, .{}, .{ .minimum = 0, .maximum = 30 });
+    try std.testing.expect(resources.mappings[0].use_vertex_index);
+    try std.testing.expect(!resources.mappings[1].use_vertex_index);
+    const proof = resources.vertex_index_proof;
+    try std.testing.expect(proof.accepts(.{ .minimum = 3, .maximum = 10 }));
+    try std.testing.expect(proof.accepts(.{ .minimum = 0, .maximum = 99 }));
+    try std.testing.expect(!proof.accepts(.{ .minimum = 0, .maximum = 9 }));
+    try std.testing.expect(!proof.accepts(.{ .minimum = 0, .maximum = 100 }));
+    try std.testing.expect(!proof.accepts(.{ .minimum = -1, .maximum = 30 }));
+    try std.testing.expect(!proof.accepts(null));
+
+    const cached = DrawFetchBounds.init(.{ .minimum = 0, .maximum = 99 }, .{ .first_instance = 4, .instance_count = 3 }).?;
+    try std.testing.expect(cached.contains(DrawFetchBounds.init(.{ .minimum = 10, .maximum = 50 }, .{ .first_instance = 5, .instance_count = 2 }).?));
+    try std.testing.expect(!cached.contains(DrawFetchBounds.init(.{ .minimum = 10, .maximum = 100 }, .{ .first_instance = 5, .instance_count = 2 }).?));
+    try std.testing.expect(!cached.contains(DrawFetchBounds.init(.{ .minimum = 10, .maximum = 50 }, .{ .first_instance = 6, .instance_count = 2 }).?));
 }
 
 test "compute resources retain temporal scalar load specializations" {

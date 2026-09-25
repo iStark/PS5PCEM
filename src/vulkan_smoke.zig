@@ -161,6 +161,53 @@ fn runCopyDataProbe(allocator: std.mem.Allocator) !void {
         .{},
     );
 }
+fn runExpandedBufferCacheProbe(allocator: std.mem.Allocator) !void {
+    const renderer = try allocator.create(vulkan.Renderer);
+    defer allocator.destroy(renderer);
+    renderer.* = try vulkan.Renderer.init(allocator, .{
+        .enable_timeline_scheduler = true,
+        .retain_clean_storage_buffers = true,
+        .storage_buffer_cache_entries = 600,
+        .cache_storage_buffer_contents = true,
+    });
+    defer renderer.deinit();
+    var guest = GuestMemory{};
+    var memory = guest.interface();
+    memory.fingerprint = GuestMemory.fingerprint;
+    _ = renderer.dcbBackend(memory);
+    renderer.storage_fingerprint_min_bytes = 16;
+    const base: usize = 0x4000;
+    var original: u64 = 0;
+    for (0..600) |index| {
+        guest.word(base + index * 64, @intCast(0x12340000 + index));
+        const staged = try renderer.stageGuestStorageBufferAt(0, base + index * 64, 64);
+        if (index == 0) original = staged.buffer;
+    }
+    try std.testing.expectEqual(@as(usize, 600), renderer.guest_buffers.items.len);
+    var rebound = try renderer.stageGuestStorageBufferAt(0, base, 64);
+    try std.testing.expect(rebound.allocation_cache_hit);
+    try std.testing.expectEqual(original, rebound.buffer);
+    var bytes: [64]u8 = undefined;
+    try renderer.readbackGuestStorageBuffer(base, &bytes);
+    try std.testing.expectEqualSlices(u8, guest.bytes[base..][0..64], &bytes);
+
+    // Native CPU replacement must invalidate contents even beyond the old
+    // 512-entry capacity. Slot pressure then preserves the recently used one.
+    guest.word(base, 0xaabbccdd);
+    rebound = try renderer.stageGuestStorageBufferAt(0, base, 64);
+    try std.testing.expect(rebound.allocation_cache_hit);
+    try renderer.readbackGuestStorageBuffer(base, &bytes);
+    try std.testing.expectEqual(@as(u32, 0xaabbccdd), std.mem.readInt(u32, bytes[0..4], .little));
+    const evictions = renderer.frame_profile.buffer_cache_evictions;
+    _ = try renderer.stageGuestStorageBufferAt(0, base + 600 * 64, 64);
+    try std.testing.expectEqual(evictions + 1, renderer.frame_profile.buffer_cache_evictions);
+    try std.testing.expectEqual(@as(usize, 600), renderer.guest_buffers.items.len);
+    rebound = try renderer.stageGuestStorageBufferAt(0, base, 64);
+    try std.testing.expect(rebound.allocation_cache_hit);
+    try std.testing.expectEqual(original, rebound.buffer);
+    std.debug.print("expanded buffer cache passed: 600 resident ranges, CPU replacement, indexed lookup and LRU eviction\n", .{});
+}
+
 fn command(opcode: u8, body_words: u14) u32 {
     return (@as(u32, 3) << 30) |
         (@as(u32, body_words - 1) << 16) |
@@ -5981,7 +6028,7 @@ fn runQueuedBufferReuseProbe(allocator: std.mem.Allocator, use_waits: bool, reta
     renderer.active_storage_buffers[2] = 0;
     renderer.draw_batch_active = true;
     _ = try renderer.dispatchSpirv(module.words, .{ 1, 1, 1 });
-    const pending_before = renderer.pending_command_buffers.items.len;
+    const pending_before = (renderer.pending_command_buffers.items.len + @as(usize, @intFromBool(renderer.open_batch_commands)));
     const submitted_before = renderer.submitted_tick;
     try std.testing.expect(pending_before != 0);
     // PM4 reads of CPU-authored memory must leave unrelated queued GPU work
@@ -5991,7 +6038,7 @@ fn runQueuedBufferReuseProbe(allocator: std.mem.Allocator, use_waits: bool, reta
     try std.testing.expect(command_backend.vtable.read(command_backend.context, 0x2000, &command_bytes));
     try std.testing.expectEqual(@as(u32, 0x1122_3344), std.mem.readInt(u32, &command_bytes, .little));
     try std.testing.expectEqual(submitted_before, renderer.submitted_tick);
-    try std.testing.expectEqual(pending_before, renderer.pending_command_buffers.items.len);
+    try std.testing.expectEqual(pending_before, (renderer.pending_command_buffers.items.len + @as(usize, @intFromBool(renderer.open_batch_commands))));
     // CP-owned labels and updates to a snapshotted input need no global GPU
     // completion. The queued copy must still consume its original input.
     try std.testing.expect(command_backend.vtable.write(command_backend.context, 0x3000, &.{ 1, 2, 3, 4 }));
@@ -6007,7 +6054,7 @@ fn runQueuedBufferReuseProbe(allocator: std.mem.Allocator, use_waits: bool, reta
     try std.testing.expectEqual(@as(u32, 0x9876_5432), std.mem.readInt(u32, guest.bytes[0x2100..][0..4], .little));
     try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4 }, guest.bytes[0x3000..][0..4]);
     try std.testing.expectEqual(submitted_before, renderer.submitted_tick);
-    try std.testing.expectEqual(pending_before, renderer.pending_command_buffers.items.len);
+    try std.testing.expectEqual(pending_before, (renderer.pending_command_buffers.items.len + @as(usize, @intFromBool(renderer.open_batch_commands))));
     if (device_budget == 0) {
         // A host-visible buffer with no queued users can be read without
         // submitting the unrelated source/destination copy. This also covers
@@ -6017,7 +6064,7 @@ fn runQueuedBufferReuseProbe(allocator: std.mem.Allocator, use_waits: bool, reta
         try std.testing.expectEqual(@as(u32, 0x1122_3344), std.mem.readInt(u32, ready_result[0..4], .little));
         if (use_waits) {
             try std.testing.expectEqual(submitted_before, renderer.submitted_tick);
-            try std.testing.expectEqual(pending_before, renderer.pending_command_buffers.items.len);
+            try std.testing.expectEqual(pending_before, (renderer.pending_command_buffers.items.len + @as(usize, @intFromBool(renderer.open_batch_commands))));
         }
     }
     renderer.current_descriptor_slot = 1;
@@ -6028,7 +6075,7 @@ fn runQueuedBufferReuseProbe(allocator: std.mem.Allocator, use_waits: bool, reta
     // host-visible path is configured to use the conservative global wait.
     if (use_waits or device_budget != 0) {
         try std.testing.expectEqual(submitted_before, renderer.submitted_tick);
-        try std.testing.expectEqual(pending_before + @as(usize, if (device_budget != 0) 1 else 0), renderer.pending_command_buffers.items.len);
+        try std.testing.expectEqual(pending_before, (renderer.pending_command_buffers.items.len + @as(usize, @intFromBool(renderer.open_batch_commands))));
     } else try std.testing.expect(renderer.submitted_tick > submitted_before);
     var independent_result: [16]u8 = undefined;
     try renderer.readbackGuestStorageBuffer(0x2200, &independent_result);
@@ -8322,7 +8369,9 @@ fn runFlatPointerProbe(allocator: std.mem.Allocator) !void {
 fn runCleanBufferRetentionProbe(allocator: std.mem.Allocator) !void {
     for ([_]bool{ false, true }) |use_waits| try runQueuedBufferReuseProbe(allocator, use_waits, true, 0, 0);
     for ([_]bool{ false, true }) |retain| {
-        var renderer = try vulkan.Renderer.init(allocator, .{
+        const renderer = try allocator.create(vulkan.Renderer);
+        defer allocator.destroy(renderer);
+        renderer.* = try vulkan.Renderer.init(allocator, .{
             .enable_timeline_scheduler = true,
             .retain_clean_storage_buffers = retain,
             .storage_buffer_cache_budget_bytes = 128 * 16,
@@ -10023,6 +10072,7 @@ fn runRetainedBufferCapacityProbe(allocator: std.mem.Allocator, device_budget: u
     var renderer = try vulkan.Renderer.init(allocator, .{
         .enable_timeline_scheduler = true,
         .retain_clean_storage_buffers = true,
+        .storage_buffer_cache_entries = 512,
         .device_storage_budget_bytes = device_budget,
     });
     defer renderer.deinit();
@@ -11205,6 +11255,10 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--buffer-content-cache")) {
         try runBufferContentCacheProbe(allocator, 0);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--expanded-buffer-cache")) {
+        try runExpandedBufferCacheProbe(allocator);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--compute-workgroup-shape")) {

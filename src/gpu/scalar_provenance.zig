@@ -41,6 +41,8 @@ pub const ScalarValue = struct {
     value: u32 = 0,
     sources: Sources = .{},
     producer_pc: u32 = 0,
+    /// Which USER_DATA words reached this register. Bit i is word i.
+    user_bits: u64 = 0,
 };
 
 pub const ScalarRegisters = [maximum_scalar_registers]ScalarValue;
@@ -101,7 +103,7 @@ const LaneSpills = struct {
                 const slot = self.slots[@ctz(remaining)];
                 remaining &= remaining - 1;
                 if (slot.vgpr == inst.src0.reg and slot.lane == index.?) {
-                    write(result, inst.dst, slot.value.value, slot.value.sources, inst.pc);
+                    write(result, inst.dst, slot.value.value, slot.value.sources, inst.pc, slot.value.user_bits);
                     return;
                 }
             }
@@ -153,6 +155,9 @@ pub const Evaluation = struct {
     /// A scalar load failed. The address list then omits bytes the next
     /// preparation might be able to read, so that walk must not be cached.
     memory_read_failed: bool = false,
+    /// USER_DATA words needed by resource discovery or scalar control flow.
+    /// Only values consumed purely by vector arithmetic may change on reuse.
+    address_user_data_mask: u64 = 0,
 
     /// Load storage is read only through load_count. Do not copy/clear all 512
     /// records merely to start a fresh draw-local scalar walk.
@@ -163,6 +168,7 @@ pub const Evaluation = struct {
         self.stop_pc = 0;
         self.stop_reason = .instruction_limit;
         self.memory_read_failed = false;
+        self.address_user_data_mask = 0;
     }
 
     pub fn copyFrom(self: *Evaluation, source_: *const Evaluation) void {
@@ -174,6 +180,7 @@ pub const Evaluation = struct {
         self.stop_pc = source_.stop_pc;
         self.stop_reason = source_.stop_reason;
         self.memory_read_failed = source_.memory_read_failed;
+        self.address_user_data_mask = source_.address_user_data_mask;
     }
 
     pub fn register(self: *const Evaluation, index: u8) ?ScalarValue {
@@ -629,6 +636,7 @@ fn evaluateInto(
             .known = true,
             .value = word,
             .sources = .{ .user_data = true },
+            .user_bits = if (index < 64) @as(u64, 1) << @intCast(index) else 0,
         };
     }
 
@@ -741,6 +749,8 @@ fn evaluateInto(
             }
         };
         result.instruction_count += 1;
+
+        recordResourceUserData(result, inst.*);
 
         if (inst.opcode != .v_writelane_b32) lane_spills.invalidateInstruction(inst.*);
 
@@ -1007,10 +1017,13 @@ fn executeSmem(
 
     const base_sources = Sources.merge(base_lo.sources, base_hi.sources);
     const loaded_sources = Sources.merge(Sources.merge(base_sources, offset.sources), .{ .memory = true });
+    const address_bits = base_lo.user_bits | base_hi.user_bits | offset.user_bits;
+    result.address_user_data_mask |= address_bits;
     for (loaded[0..inst.data_words], 0..) |word, index| {
         result.registers[destination + index] = .{
             .known = true,
             .value = word,
+            .user_bits = address_bits,
             .sources = loaded_sources,
             .producer_pc = inst.pc,
         };
@@ -1052,6 +1065,43 @@ fn setpcDestinationPc(result: *const Evaluation, program_address: u64, inst: rdn
     return @truncate(relative);
 }
 
+fn recordUserDataOperand(result: *Evaluation, operand: rdna2.Operand, count: usize) void {
+    const first = scalarRegisterIndex(operand) orelse return;
+    const end = @min(@as(usize, first) + count, maximum_scalar_registers);
+    for (result.registers[first..end]) |value| result.address_user_data_mask |= value.user_bits;
+}
+
+fn recordResourceUserData(result: *Evaluation, inst: rdna2.Instruction) void {
+    switch (inst.family) {
+        // Pin comparisons and carry producers as well as the eventual pointer.
+        // A selected pointer's value alone omits the condition that chose it.
+        .sop1, .sop2, .sopk, .sopc => {
+            recordUserDataOperand(result, inst.src0, 2);
+            if (inst.src_count >= 2) recordUserDataOperand(result, inst.src1, 2);
+        },
+        .smem => {
+            recordUserDataOperand(result, inst.src0, 4);
+            recordUserDataOperand(result, inst.src1, 1);
+        },
+        .mubuf, .mtbuf => {
+            recordUserDataOperand(result, inst.src1, 4);
+            recordUserDataOperand(result, inst.src2, 1);
+        },
+        .mimg => {
+            recordUserDataOperand(result, inst.src1, 8);
+            recordUserDataOperand(result, inst.src2, 4);
+        },
+        // Lane-dependent scalar/control values need a richer proof. Keep all
+        // entry words in the key instead of inferring their missing taint.
+        .vopc, .flat, .ds, .unknown => result.address_user_data_mask = std.math.maxInt(u64),
+        else => {},
+    }
+    if (inst.opcode == .unsupported or inst.opcode == .v_readlane_b32 or inst.opcode == .v_readfirstlane_b32 or
+        ((inst.family == .vop1 or inst.family == .vop2 or inst.family == .vop3 or inst.family == .vop3p) and
+            (scalarRegisterIndex(inst.dst) != null or scalarRegisterIndex(inst.dst2) != null)))
+        result.address_user_data_mask = std.math.maxInt(u64);
+}
+
 fn executeScalar(result: *Evaluation, program_address: u64, inst: rdna2.Instruction, scc: *?bool) void {
     if (inst.opcode == .s_wqm_b32 or inst.opcode == .s_not_b32) {
         const a = source(result, inst.src0) orelse {
@@ -1060,7 +1110,7 @@ fn executeScalar(result: *Evaluation, program_address: u64, inst: rdna2.Instruct
             return;
         };
         const value: u32 = if (inst.opcode == .s_not_b32) ~a.value else @truncate(wholeQuadMode64(a.value));
-        write(result, inst.dst, value, a.sources, inst.pc);
+        write(result, inst.dst, value, a.sources, inst.pc, a.user_bits);
         scc.* = value != 0;
         return;
     }
@@ -1073,7 +1123,7 @@ fn executeScalar(result: *Evaluation, program_address: u64, inst: rdna2.Instruct
             return;
         }
         const value = bitwise32(inst.opcode, a.?.value, b.?.value);
-        write(result, inst.dst, value, Sources.merge(a.?.sources, b.?.sources), inst.pc);
+        write(result, inst.dst, value, Sources.merge(a.?.sources, b.?.sources), inst.pc, a.?.user_bits | b.?.user_bits);
         scc.* = value != 0;
         return;
     }
@@ -1093,9 +1143,9 @@ fn executeScalar(result: *Evaluation, program_address: u64, inst: rdna2.Instruct
             };
             const destination = scalarRegisterIndex(inst.dst) orelse return;
             if (destination + 1 >= maximum_scalar_registers) return;
-            write(result, inst.dst, @truncate(wide.value), wide.sources, inst.pc);
-            result.registers[destination + 1] = .{ .known = true, .value = @truncate(wide.value >> 32), .sources = wide.sources, .producer_pc = inst.pc };
-        } else write(result, inst.dst, low.value, low.sources, inst.pc);
+            write(result, inst.dst, @truncate(wide.value), wide.sources, inst.pc, wide.user_bits);
+            result.registers[destination + 1] = .{ .known = true, .value = @truncate(wide.value >> 32), .sources = wide.sources, .producer_pc = inst.pc, .user_bits = wide.user_bits };
+        } else write(result, inst.dst, low.value, low.sources, inst.pc, low.user_bits);
         return;
     }
     if (inst.opcode == .s_getpc_b64 and inst.dst.kind == .sgpr and inst.dst.reg + 1 < maximum_scalar_registers) {
@@ -1140,7 +1190,7 @@ fn executeScalar(result: *Evaluation, program_address: u64, inst: rdna2.Instruct
             return;
         };
         const value: u32 = if (wide.value == 0) 0xffff_ffff else @truncate(@ctz(wide.value));
-        write(result, inst.dst, value, Sources.merge(combined_sources, wide.sources), inst.pc);
+        write(result, inst.dst, value, Sources.merge(combined_sources, wide.sources), inst.pc, wide.user_bits);
         return;
     }
 
@@ -1211,7 +1261,7 @@ fn executeScalar(result: *Evaluation, program_address: u64, inst: rdna2.Instruct
         .s_max_i32 => @bitCast(@max(@as(i32, @bitCast(a.value)), @as(i32, @bitCast(bv)))),
         else => null,
     };
-    if (value) |known| write(result, inst.dst, known, combined_sources, inst.pc) else invalidateDestination(result, inst.dst, 1);
+    if (value) |known| write(result, inst.dst, known, combined_sources, inst.pc, a.user_bits | if (b) |other| other.user_bits else 0) else invalidateDestination(result, inst.dst, 1);
 }
 
 /// The 64-bit reading of a source operand.
@@ -1228,7 +1278,7 @@ fn wideSource(
     result: *const Evaluation,
     operand: rdna2.Operand,
     low: ScalarValue,
-) ?struct { value: u64, sources: Sources } {
+) ?struct { value: u64, sources: Sources, user_bits: u64 } {
     switch (operand.kind) {
         .sgpr, .vcc_lo, .vcc_hi, .exec_lo, .exec_hi, .m0 => {
             const index = scalarRegisterIndex(operand) orelse return null;
@@ -1238,18 +1288,20 @@ fn wideSource(
             return .{
                 .value = @as(u64, low.value) | (@as(u64, high.value) << 32),
                 .sources = Sources.merge(low.sources, high.sources),
+                .user_bits = low.user_bits | high.user_bits,
             };
         },
         .integer_inline_constant => {
             const signed: i64 = @as(i32, @bitCast(operand.value));
-            return .{ .value = @bitCast(signed), .sources = low.sources };
+            return .{ .value = @bitCast(signed), .sources = low.sources, .user_bits = low.user_bits };
         },
-        .literal_constant => return .{ .value = operand.value, .sources = low.sources },
+        .literal_constant => return .{ .value = operand.value, .sources = low.sources, .user_bits = low.user_bits },
         .float_inline_constant => return .{
             .value = @bitCast(@as(f64, operand.float_val)),
             .sources = low.sources,
+            .user_bits = low.user_bits,
         },
-        .null => return .{ .value = 0, .sources = low.sources },
+        .null => return .{ .value = 0, .sources = low.sources, .user_bits = low.user_bits },
         else => return null,
     }
 }
@@ -1384,8 +1436,9 @@ fn executeScalar64(
     };
     if (value) |known| {
         if (isBitwise64(inst.opcode)) scc.* = known != 0;
-        write(result, inst.dst, @truncate(known), all_sources, inst.pc);
-        result.registers[destination + 1] = .{ .known = true, .value = @truncate(known >> 32), .sources = all_sources, .producer_pc = inst.pc };
+        const bits = a.user_bits | if (b) |other| other.user_bits else 0;
+        write(result, inst.dst, @truncate(known), all_sources, inst.pc, bits);
+        result.registers[destination + 1] = .{ .known = true, .value = @truncate(known >> 32), .sources = all_sources, .producer_pc = inst.pc, .user_bits = bits };
     } else invalidateDestination(result, inst.dst, 2);
 }
 
@@ -1460,9 +1513,9 @@ fn bitfieldMask32(width: u32, offset: u32) u32 {
     return mask << shift;
 }
 
-fn write(result: *Evaluation, destination: rdna2.Operand, value: u32, sources: Sources, pc: u32) void {
+fn write(result: *Evaluation, destination: rdna2.Operand, value: u32, sources: Sources, pc: u32, user_bits: u64) void {
     const index = scalarRegisterIndex(destination) orelse return;
-    result.registers[index] = .{ .known = true, .value = value, .sources = sources, .producer_pc = pc };
+    result.registers[index] = .{ .known = true, .value = value, .sources = sources, .producer_pc = pc, .user_bits = user_bits };
 }
 
 fn invalidateDestination(result: *Evaluation, destination: rdna2.Operand, count: u8) void {
@@ -2102,6 +2155,27 @@ test "reused scalar evaluation refreshes guest loads and clears failed or abando
     try std.testing.expectEqual(@as(u32, 0), result.stop_pc);
     try std.testing.expectEqual(@as(usize, 0), result.load_count);
     try std.testing.expect(result.register(8) == null);
+}
+
+test "resource reuse pins scalar conditions, direct descriptors and SMEM bounds" {
+    var evaluation: Evaluation = undefined;
+    evaluation.reset();
+    for (0..32) |index| evaluation.registers[index] = .{
+        .known = true,
+        .value = @intCast(index),
+        .user_bits = @as(u64, 1) << @intCast(index),
+    };
+    recordResourceUserData(&evaluation, .{ .family = .sopc, .opcode = .s_cmp_eq_u32, .src0 = .{ .kind = .sgpr, .reg = 20 }, .src1 = .{ .kind = .integer_inline_constant, .value = 0 }, .src_count = 2 });
+    try std.testing.expect(evaluation.address_user_data_mask & (@as(u64, 1) << 20) != 0);
+    recordResourceUserData(&evaluation, .{ .family = .smem, .opcode = .s_buffer_load_dword, .src0 = .{ .kind = .sgpr, .reg = 0 }, .src1 = .{ .kind = .sgpr, .reg = 8 }, .src_count = 2 });
+    try std.testing.expect(evaluation.address_user_data_mask & 0x10f == 0x10f);
+    recordResourceUserData(&evaluation, .{ .family = .mimg, .opcode = .image_sample, .src1 = .{ .kind = .sgpr, .reg = 8 }, .src2 = .{ .kind = .sgpr, .reg = 24 } });
+    try std.testing.expect(evaluation.address_user_data_mask & 0x0f00_ff00 == 0x0f00_ff00);
+    const protected = evaluation.address_user_data_mask;
+    recordResourceUserData(&evaluation, .{ .family = .vop2, .opcode = .v_mul_f32, .src0 = .{ .kind = .sgpr, .reg = 31 }, .src1 = .{ .kind = .vgpr, .reg = 0 }, .dst = .{ .kind = .vgpr, .reg = 1 }, .src_count = 2 });
+    try std.testing.expectEqual(protected, evaluation.address_user_data_mask);
+    recordResourceUserData(&evaluation, .{ .family = .vop1, .opcode = .v_readfirstlane_b32 });
+    try std.testing.expectEqual(std.math.maxInt(u64), evaluation.address_user_data_mask);
 }
 
 test "NGG scalar user data starts at s8" {

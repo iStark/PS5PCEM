@@ -681,6 +681,10 @@ fn run(init: std.process.Init) !bool {
         defer allocator.free(text);
         break :enabled text.len != 0 and !std.mem.eql(u8, text, "0");
     } else |_| use_quake_buffer_profile;
+    const reuse_graphics_resources = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_REUSE_GRAPHICS_RESOURCES")) |text| enabled: {
+        defer allocator.free(text);
+        break :enabled text.len != 0 and !std.mem.eql(u8, text, "0");
+    } else |_| enable_gpu_page_tracker;
     const enable_host_import = !enable_gpu_page_tracker and builtin.os.tag == .windows and
         (init.minimal.environ.containsUnempty(allocator, "PS5_GPU_HOST_IMPORT") catch false);
     // Yotei repeatedly binds multi-megabyte material buffers whose contents
@@ -756,11 +760,15 @@ fn run(init: std.process.Init) !bool {
     const retain_storage_buffers = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_RETAIN_STORAGE_BUFFERS")) |text| parse: {
         defer allocator.free(text);
         break :parse text.len != 0 and !std.mem.eql(u8, text, "0");
-    } else |_| use_quake_buffer_profile;
+    } else |_| enable_gpu_page_tracker or enable_gpu_buffer_content_cache;
     const storage_buffer_cache_mib = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_STORAGE_BUFFER_CACHE_MIB")) |text| parse: {
         defer allocator.free(text);
         break :parse std.math.clamp(std.fmt.parseInt(usize, text, 10) catch 4096, 128, 4096);
     } else |_| 4096;
+    const storage_buffer_cache_entries = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_STORAGE_BUFFER_CACHE_ENTRIES")) |text| parse: {
+        defer allocator.free(text);
+        break :parse std.math.clamp(std.fmt.parseInt(usize, text, 10) catch 2048, 64, 4096);
+    } else |_| 2048;
 
     // What the rendering preset actually selects. Both of these trade a
     // little fidelity margin for throughput once the sampled cache is over
@@ -854,7 +862,9 @@ fn run(init: std.process.Init) !bool {
             .retain_clean_storage_buffers = retain_storage_buffers,
             .cache_storage_buffer_contents = enable_gpu_buffer_content_cache,
             .bound_vertex_fetches = bound_vertex_fetches,
+            .reuse_graphics_resources = reuse_graphics_resources,
             .storage_buffer_cache_budget_bytes = storage_buffer_cache_mib * 1024 * 1024,
+            .storage_buffer_cache_entries = storage_buffer_cache_entries,
             .enable_host_import = enable_host_import,
             .native_window = .{
                 .instance = native.instance,

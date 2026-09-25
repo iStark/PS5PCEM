@@ -656,6 +656,9 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+    // Some coherence probes nest full renderer states to exercise retirement.
+    // Their diagnostic stack must accommodate those states plus driver calls.
+    vulkan_smoke.stack_size = 64 * 1024 * 1024;
     const install_vulkan_smoke = b.addInstallArtifact(vulkan_smoke, .{});
     b.getInstallStep().dependOn(&install_vulkan_smoke.step);
 

@@ -137,9 +137,15 @@ because avoiding a CPU wait adds a GPU buffer copy. The queued-upload probe
 checks both backing types with changed contents, descriptor snapshots, large
 and small ranges, and ring spills.
 
-`PS5_GPU_RETAIN_STORAGE_BUFFERS=1` retains up to 512 buffer ranges across
-descriptor-slot changes. `PS5_GPU_STORAGE_BUFFER_CACHE_MIB` bounds their
-backings (default 4096 MiB). In this opt-in mode, recycling a large backing for
+`PS5_GPU_RETAIN_STORAGE_BUFFERS=1` retains buffer ranges across descriptor-slot
+changes. The runner enables retention when page tracking or buffer-content
+caching is enabled. `PS5_GPU_STORAGE_BUFFER_CACHE_ENTRIES` bounds the number
+of ranges (default 2048, configurable from 64 to 4096), independently of the
+shader's descriptor count. `PS5_GPU_STORAGE_BUFFER_CACHE_MIB` bounds their
+backings (default 4096 MiB). Allocations grow with observed demand; these limits
+do not reserve their full capacity. The address index covers the maximum entry
+count. `[gpu buffer cache]` reports hits, misses and evictions per sampled frame.
+Recycling a large backing for
 a much smaller range creates a suitably sized replacement; old GPU readers
 keep their original backing until retirement. Otherwise a four-byte range can
 retain a multi-megabyte allocation and prematurely fill the cache budget.
@@ -148,9 +154,32 @@ the selected view's texels before uploading changes confined to padding or
 other mip levels.
 When the experimental device-storage budget is enabled,
 `PS5_GPU_DEVICE_STORAGE_MIN_KIB` (runner default 256) keeps small metadata and
-frequently read-back labels host-visible. The device-storage budget remains zero
-by default. Recycling a large device allocation for a smaller range observes
-the same threshold.
+frequently read-back labels host-visible. The device-storage budget defaults to
+512 MiB for Quake II and zero for other profiles. Recycling a large device
+allocation for a smaller range observes the same threshold.
+
+`PS5_GPU_REUSE_GRAPHICS_RESOURCES` enables consecutive read-only draw reuse
+when a guest page-tracking epoch is available. The runner defaults it to the
+page-tracker setting for any title. Pipeline state, shader bindings, input
+controls and the memory epoch must still match. Resource preparation records
+its actual shader-memory reads, including descriptor and AGC attribute metadata.
+Adjacent snapshot checks share checked memory reads. Small upload-ring sources
+are fingerprinted in ordinary CPU scratch memory before copying those exact
+bytes to Vulkan. Reuse fingerprints current guest bytes without reading the
+possibly write-combined upload mapping. Scratch storage grows to at most 256 KiB.
+This does not add write protection to hot
+CPU constant pages. Incomplete or inconsistent read transcripts, GPU writes,
+temporary image leases and shader fault checks use normal resource preparation.
+Already armed page watches are covered by the epoch check instead of another
+byte comparison. AGC metadata conservatively pins USER_DATA for scalar-only
+reuse, including optional direct pointers and inline descriptor mappings.
+Mesh and lookup indexing retain their extent-boundary decisions. Shortened
+vertex buffers may be reused only when the current vertex and instance bounds
+fit the captured limits; current index contents are checked again.
+Draw-dependent rectangle completion stays on normal preparation.
+Scalar-only reuse patches entry USER_DATA in a new descriptor slot and updates
+its resource descriptors in one Vulkan call. Guest completion labels and
+interrupts retain their existing synchronization requirements.
 
 Clean old storage images are collected before descriptor preparation. On a
 device-memory allocation failure, old unpinned storage images are published
