@@ -8131,6 +8131,7 @@ pub const Renderer = struct {
             instructions,
             &checkpoint_pcs,
             &checkpoint_registers,
+            null,
         );
         const scalar = gpu.ScalarEvaluation{ .registers = checkpoint_registers[0] };
         const descriptor = (try resolveComputeBufferDescriptor(

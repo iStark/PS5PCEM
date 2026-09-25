@@ -150,6 +150,9 @@ pub const Evaluation = struct {
     instruction_count: u32 = 0,
     stop_pc: u32 = 0,
     stop_reason: StopReason = .instruction_limit,
+    /// A scalar load failed. The address list then omits bytes the next
+    /// preparation might be able to read, so that walk must not be cached.
+    memory_read_failed: bool = false,
 
     pub fn register(self: *const Evaluation, index: u8) ?ScalarValue {
         const value = self.registers[index];
@@ -397,7 +400,7 @@ fn makeNop(inst: *rdna2.Instruction) void {
 }
 
 pub fn evaluatePrefix(reader: shaders.MemoryReader, bindings: *const shaders.StageBindings) Evaluation {
-    return evaluate(reader, bindings, null, false, null, null);
+    return evaluate(reader, bindings, null, false, null, null, null);
 }
 
 /// Evaluates scalar resource setup past lane-mask branches. EXEC/VCC branches
@@ -406,7 +409,7 @@ pub fn evaluatePrefix(reader: shaders.MemoryReader, bindings: *const shaders.Sta
 /// path. Following that path recovers late V#/T# loads without changing the
 /// strict prefix evaluator used for shader specialization.
 pub fn evaluateResourceState(reader: shaders.MemoryReader, bindings: *const shaders.StageBindings) Evaluation {
-    return evaluate(reader, bindings, null, true, null, null);
+    return evaluate(reader, bindings, null, true, null, null, null);
 }
 
 /// Evaluates resource state using a shader which the backend has already
@@ -417,7 +420,7 @@ pub fn evaluateDecodedResourceState(
     bindings: *const shaders.StageBindings,
     instructions: []const rdna2.Instruction,
 ) Evaluation {
-    return evaluate(reader, bindings, null, true, instructions, null);
+    return evaluate(reader, bindings, null, true, instructions, null, null);
 }
 
 const RegisterCheckpointCollector = struct {
@@ -473,13 +476,14 @@ pub fn evaluateDecodedResourceStateAtCheckpoints(
     instructions: []const rdna2.Instruction,
     checkpoint_pcs: []const u32,
     snapshots: []ScalarRegisters,
+    steps: ?[]const u32,
 ) Evaluation {
     std.debug.assert(checkpoint_pcs.len == snapshots.len);
     var collector = RegisterCheckpointCollector{
         .pcs = checkpoint_pcs,
         .snapshots = snapshots,
     };
-    const result = evaluate(reader, bindings, null, true, instructions, &collector);
+    const result = evaluate(reader, bindings, null, true, instructions, &collector, steps);
     collector.finish(&result);
     return result;
 }
@@ -492,7 +496,7 @@ pub fn evaluateResourceStateUntil(
     bindings: *const shaders.StageBindings,
     end_pc: u32,
 ) Evaluation {
-    return evaluate(reader, bindings, end_pc, true, null, null);
+    return evaluate(reader, bindings, end_pc, true, null, null, null);
 }
 
 /// Recovers descriptor state before one instruction, from a shader the backend
@@ -509,7 +513,7 @@ pub fn evaluateDecodedResourceStateUntil(
     instructions: []const rdna2.Instruction,
     end_pc: u32,
 ) Evaluation {
-    return evaluate(reader, bindings, end_pc, true, instructions, null);
+    return evaluate(reader, bindings, end_pc, true, instructions, null, null);
 }
 
 /// Evaluates only the straight scalar region ending before `end_pc`. This is
@@ -520,7 +524,30 @@ pub fn evaluatePrefixUntil(
     bindings: *const shaders.StageBindings,
     end_pc: u32,
 ) Evaluation {
-    return evaluate(reader, bindings, end_pc, false, null, null);
+    return evaluate(reader, bindings, end_pc, false, null, null, null);
+}
+
+/// Scalar ALU, scalar memory, lane spills, and any instruction that writes a
+/// scalar register. Pure vector instructions do not change the checkpoint
+/// walk; an index of these steps replaces visiting every opcode.
+pub fn scalarWalkVisits(inst: rdna2.Instruction) bool {
+    switch (inst.family) {
+        .sop1, .sop2, .sopk, .sopc, .sopp, .smem => return true,
+        else => {},
+    }
+    if (inst.opcode == .v_readlane_b32 or inst.opcode == .v_writelane_b32) return true;
+    if (scalarRegisterIndex(inst.dst) != null or scalarRegisterIndex(inst.dst2) != null) return true;
+    return false;
+}
+
+fn stepIndexAtOrAfter(instructions: []const rdna2.Instruction, steps: []const u32, pc: u32) usize {
+    var low: usize = 0;
+    var high = steps.len;
+    while (low < high) {
+        const middle = low + (high - low) / 2;
+        if (instructions[steps[middle]].pc < pc) low = middle + 1 else high = middle;
+    }
+    return low;
 }
 
 fn evaluate(
@@ -530,6 +557,7 @@ fn evaluate(
     follow_lane_mask_fallthrough: bool,
     decoded_instructions: ?[]const rdna2.Instruction,
     checkpoint_collector: ?*RegisterCheckpointCollector,
+    steps: ?[]const u32,
 ) Evaluation {
     var result = Evaluation{};
     const scalar_base: usize = bindings.scalar_user_data_base;
@@ -552,8 +580,31 @@ fn evaluate(
     var setpc_follows: u8 = 0;
     var unknown_scalar_exits: std.StaticBitSet(64 * 1024) = .initEmpty();
     var revisited_loop_edges: std.StaticBitSet(64 * 1024) = .initEmpty();
+    var dense_walk = steps == null;
+    var current_step: usize = 0;
     const instruction_limit: u32 = if (follow_lane_mask_fallthrough) bindings.resource_instruction_budget else maximum_instructions;
     while (result.instruction_count < instruction_limit) {
+        if (steps) |list| {
+            const instructions = decoded_instructions orelse {
+                result.stop_reason = .end_program;
+                return result;
+            };
+            // A writelane makes later vector destinations able to clobber a
+            // spill. Visit every instruction until that slot is gone, then
+            // resume the index. Backward branches binary-search it.
+            if (dense_walk and lane_spills.occupied == 0) dense_walk = false;
+            if (!dense_walk) {
+                const index = stepIndexAtOrAfter(instructions, list, pc);
+                if (index == list.len) {
+                    result.stop_reason = .end_program;
+                    return result;
+                }
+                current_step = index;
+                const step_pc = instructions[list[index]].pc;
+                if (step_pc != pc) pc = step_pc;
+                decoded_cursor = list[index];
+            }
+        }
         result.stop_pc = pc;
         if (checkpoint_collector) |collector| collector.captureBefore(&result, pc);
         if (end_pc) |end| {
@@ -639,6 +690,7 @@ fn evaluate(
         }
         if (inst.family == .smem) {
             if (!executeSmem(&result, reader, bindings, inst)) {
+                result.memory_read_failed = true;
                 if (!follow_lane_mask_fallthrough) {
                     if (result.stop_reason == .instruction_limit) result.stop_reason = .inaccessible_memory;
                     return result;
@@ -744,7 +796,23 @@ fn evaluate(
             .v_readlane_b32 => lane_spills.restore(&result, inst),
             else => executeScalar(&result, bindings.program_address, inst, &scc),
         }
-        pc +%= inst.word_count * 4;
+        if (steps != null and !dense_walk) {
+            if (lane_spills.occupied != 0) {
+                dense_walk = true;
+                pc +%= inst.word_count * 4;
+            } else {
+                const list = steps.?;
+                const instructions = decoded_instructions.?;
+                if (current_step + 1 >= list.len) {
+                    result.stop_pc = pc +% inst.word_count * 4;
+                    result.stop_reason = .end_program;
+                    return result;
+                }
+                pc = instructions[list[current_step + 1]].pc;
+            }
+        } else {
+            pc +%= inst.word_count * 4;
+        }
     }
 
     result.stop_pc = pc;
@@ -1792,7 +1860,7 @@ test "unknown 64-bit loop masks cannot reuse an earlier true SCC" {
         .{ .pc = 20, .opcode = .s_endpgm, .word_count = 1 },
     };
     var snapshots: [1]ScalarRegisters = undefined;
-    const result = evaluateDecodedResourceStateAtCheckpoints(memory.reader(), &bindings, &instructions, &.{20}, &snapshots);
+    const result = evaluateDecodedResourceStateAtCheckpoints(memory.reader(), &bindings, &instructions, &.{20}, &snapshots, null);
     try std.testing.expectEqual(StopReason.end_program, result.stop_reason);
     try std.testing.expectEqual(@as(usize, 1), result.loadSlice().len);
     try std.testing.expectEqual(@as(u32, 12), result.loadSlice()[0].pc);
@@ -1990,6 +2058,7 @@ test "one-pass resource checkpoints preserve instruction-local SGPR state" {
         &instructions,
         &checkpoint_pcs,
         &snapshots,
+        null,
     );
 
     try std.testing.expectEqual(@as(u32, 1), snapshots[0][2].value);
@@ -2065,7 +2134,7 @@ test "long resource walks retain post-loop loads and checkpoint state within an 
 
     bindings.resource_instruction_budget = 32 * 1024;
     var snapshots: [1]ScalarRegisters = undefined;
-    const complete = evaluateDecodedResourceStateAtCheckpoints(memory.reader(), &bindings, program.instructions.items, &.{36}, &snapshots);
+    const complete = evaluateDecodedResourceStateAtCheckpoints(memory.reader(), &bindings, program.instructions.items, &.{36}, &snapshots, null);
     try std.testing.expectEqual(StopReason.end_program, complete.stop_reason);
     try std.testing.expectEqual(@as(u32, 5000), complete.register(8).?.value);
     try std.testing.expectEqual(@as(usize, 2), complete.load_count);
@@ -2099,7 +2168,7 @@ test "resource checkpoints leave skipped blocks unknown and capture backward vis
     var program = try rdna2.decodeProgram(std.testing.allocator, &code);
     defer program.deinit(std.testing.allocator);
     var snapshots: [4]ScalarRegisters = undefined;
-    _ = evaluateDecodedResourceStateAtCheckpoints(memory.reader(), &bindings, program.instructions.items, &.{ 12, 20, 24, 32 }, &snapshots);
+    _ = evaluateDecodedResourceStateAtCheckpoints(memory.reader(), &bindings, program.instructions.items, &.{ 12, 20, 24, 32 }, &snapshots, null);
     try std.testing.expectEqual(@as(u32, 42), snapshots[0][8].value);
     try std.testing.expect(snapshots[0][8].known);
     try std.testing.expect(!snapshots[1][8].known);
@@ -2122,7 +2191,7 @@ test "resource checkpoints invalidate values that vary between loop iterations" 
     var program = try rdna2.decodeProgram(std.testing.allocator, &code);
     defer program.deinit(std.testing.allocator);
     var snapshots: [2]ScalarRegisters = undefined;
-    _ = evaluateDecodedResourceStateAtCheckpoints(memory.reader(), &bindings, program.instructions.items, &.{ 8, 20 }, &snapshots);
+    _ = evaluateDecodedResourceStateAtCheckpoints(memory.reader(), &bindings, program.instructions.items, &.{ 8, 20 }, &snapshots, null);
     try std.testing.expect(!snapshots[0][8].known);
     try std.testing.expect(snapshots[0][0].known);
     try std.testing.expectEqual(@as(u32, 2), snapshots[1][8].value);
@@ -2151,7 +2220,7 @@ test "masked loop checkpoints and load constants forget the first iteration" {
     var program = try rdna2.decodeProgram(std.testing.allocator, &code);
     defer program.deinit(std.testing.allocator);
     var snapshots: [3]ScalarRegisters = undefined;
-    const result = evaluateDecodedResourceStateAtCheckpoints(memory.reader(), &bindings, program.instructions.items, &.{ 32, 44, 56 }, &snapshots);
+    const result = evaluateDecodedResourceStateAtCheckpoints(memory.reader(), &bindings, program.instructions.items, &.{ 32, 44, 56 }, &snapshots, null);
     try std.testing.expectEqual(StopReason.end_program, result.stop_reason);
     try std.testing.expect(!snapshots[0][8].known);
     try std.testing.expect(!snapshots[0][12].known);
@@ -2178,14 +2247,14 @@ test "resource checkpoints recover after an unavailable scalar load" {
     const bindings = testBindings(0x3000, 0x4000);
     const pcs = [_]u32{ 8, 16, 28 };
     var snapshots: [pcs.len]ScalarRegisters = undefined;
-    const result = evaluateDecodedResourceStateAtCheckpoints(memory.reader(), &bindings, program.instructions.items, &pcs, &snapshots);
+    const result = evaluateDecodedResourceStateAtCheckpoints(memory.reader(), &bindings, program.instructions.items, &pcs, &snapshots, null);
     try std.testing.expectEqual(StopReason.end_program, result.stop_reason);
     for (0..8) |index| {
         try std.testing.expectEqual(@as(u32, @intCast(index + 1)), snapshots[0][8 + index].value);
         try std.testing.expect(!snapshots[1][8 + index].known);
         try std.testing.expectEqual(@as(u32, @intCast(index + 9)), snapshots[2][8 + index].value);
     }
-    const strict = evaluate(memory.reader(), &bindings, null, false, program.instructions.items, null);
+    const strict = evaluate(memory.reader(), &bindings, null, false, program.instructions.items, null, null);
     try std.testing.expectEqual(StopReason.invalid_address, strict.stop_reason);
     try std.testing.expectEqual(@as(u32, 8), strict.stop_pc);
 }
@@ -2209,7 +2278,7 @@ test "resource checkpoints reach late descriptors in large shaders" {
     var memory = TestMemory{ .base = 0x4000, .bytes = &storage };
     const bindings = testBindings(0x3000, 0x4000);
     var snapshots: [1]ScalarRegisters = undefined;
-    const result = evaluateDecodedResourceStateAtCheckpoints(memory.reader(), &bindings, instructions, &.{(count + 1) * 4}, &snapshots);
+    const result = evaluateDecodedResourceStateAtCheckpoints(memory.reader(), &bindings, instructions, &.{(count + 1) * 4}, &snapshots, null);
     try std.testing.expectEqual(StopReason.end_program, result.stop_reason);
     try std.testing.expectEqual(@as(u32, 42), snapshots[0][8].value);
 }
@@ -2229,7 +2298,7 @@ test "decoded resource cursor preserves gaps and prefix boundaries" {
     try std.testing.expectEqual(@as(u32, 11), prefix.registers[8].value);
     try std.testing.expect(!prefix.registers[9].known);
     var snapshots: [2]ScalarRegisters = undefined;
-    const complete = evaluateDecodedResourceStateAtCheckpoints(memory.reader(), &bindings, &instructions, &.{ 8, 12 }, &snapshots);
+    const complete = evaluateDecodedResourceStateAtCheckpoints(memory.reader(), &bindings, &instructions, &.{ 8, 12 }, &snapshots, null);
     try std.testing.expectEqual(StopReason.end_program, complete.stop_reason);
     try std.testing.expectEqual(@as(u32, 3), complete.instruction_count);
     try std.testing.expectEqual(@as(u32, 11), snapshots[0][8].value);
@@ -2276,7 +2345,7 @@ test "resource checkpoints recover descriptors after nested lane-dependent loops
     const bindings = testBindings(0x3000, 0x4000);
     const pcs = [_]u32{ 16, 28, 40 };
     var snapshots: [pcs.len]ScalarRegisters = undefined;
-    const result = evaluateDecodedResourceStateAtCheckpoints(memory.reader(), &bindings, program.instructions.items, &pcs, &snapshots);
+    const result = evaluateDecodedResourceStateAtCheckpoints(memory.reader(), &bindings, program.instructions.items, &pcs, &snapshots, null);
     try std.testing.expectEqual(StopReason.end_program, result.stop_reason);
     for (0..4) |index| {
         try std.testing.expectEqual(@as(u32, @intCast(index + 11)), snapshots[0][8 + index].value);
@@ -2313,7 +2382,7 @@ test "resource checkpoints escape an unresolved scalar loop and recover later te
     for (0..8) |index| memory.write(0x4000 + index * 4, @intCast(index + 11));
     const bindings = testBindings(0x3000, 0x4000);
     var snapshots: [3]ScalarRegisters = undefined;
-    const result = evaluateDecodedResourceStateAtCheckpoints(memory.reader(), &bindings, program.instructions.items, &.{ 16, 24, 36 }, &snapshots);
+    const result = evaluateDecodedResourceStateAtCheckpoints(memory.reader(), &bindings, program.instructions.items, &.{ 16, 24, 36 }, &snapshots, null);
     try std.testing.expectEqual(StopReason.end_program, result.stop_reason);
     for (0..4) |index| {
         try std.testing.expectEqual(@as(u32, @intCast(index + 11)), snapshots[0][8 + index].value);
