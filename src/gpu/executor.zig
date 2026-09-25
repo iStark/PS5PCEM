@@ -50,6 +50,9 @@ pub const Backend = struct {
         read_snapshot: ?*const fn (?*anyopaque, u64, []u8) bool = null,
         acquire: ?*const fn (?*anyopaque, gpu_state.AcquireMem) bool = null,
         release: ?*const fn (?*anyopaque, gpu_state.ReleaseMem) bool = null,
+        /// True when the release handler queued the label instead of writing it.
+        /// The caller must not signal the guest until the label is published.
+        release_queued: ?*const fn (?*anyopaque) bool = null,
         /// Publish deferred internal release labels before the submission owner
         /// exposes its completion to the guest. Called on the renderer owner.
         drain_releases: ?*const fn (?*anyopaque) bool = null,

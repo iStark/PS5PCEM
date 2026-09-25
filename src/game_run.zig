@@ -658,10 +658,15 @@ fn run(init: std.process.Init) !bool {
     // forces one submit/fence/readback for every dispatch.
     const defer_small_storage_writes = !force_eager_storage_writes;
     const enable_automatic_deferred_storage_writes = defer_small_storage_writes;
+    // End-of-pipe releases were a host wait per packet (about 80 waits and
+    // 90 ms on a Big Helmet Heroes gameplay frame). Queuing the label until
+    // the device reaches it removes those waits. PS5_GPU_DEFER_INTERNAL_RELEASES=0
+    // restores the synchronous publish.
     const defer_internal_releases = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_DEFER_INTERNAL_RELEASES")) |text| enabled: {
         defer allocator.free(text);
-        break :enabled std.mem.eql(u8, std.mem.trim(u8, text, " \t\r\n"), "1");
-    } else |_| false;
+        const request = std.mem.trim(u8, text, " \t\r\n");
+        break :enabled request.len != 0 and !std.mem.eql(u8, request, "0");
+    } else |_| true;
     const enable_gpu_page_tracker = enable_gpu_experimental or
         (init.minimal.environ.containsUnempty(allocator, "PS5_GPU_PAGE_TRACKER") catch false);
     const enable_host_import = !enable_gpu_page_tracker and builtin.os.tag == .windows and
@@ -873,10 +878,10 @@ fn run(init: std.process.Init) !bool {
             .context = if (enable_gpu_page_tracker) address_space else null,
             .read = runtime.firmware.libs.agc_submit.readGuestMemory,
             .write = runtime.firmware.libs.agc_submit.writeGuestMemory,
-            .fingerprint = if (enable_gpu_buffer_content_cache)
-                runtime.firmware.libs.agc_submit.fingerprintGuestMemory
-            else
-                null,
+            // In-place fingerprints let an unchanged GPU buffer stay bound.
+            // Without this, every graphics draw reads the guest bytes back
+            // into a new upload after a readback of the same device copy.
+            .fingerprint = runtime.firmware.libs.agc_submit.fingerprintGuestMemory,
             .shader_header = runtime.firmware.libs.agc_submit.findShaderHeader,
             .track_gpu_read = if (enable_gpu_page_tracker)
                 runtime.firmware.libs.agc_submit.trackGpuRead
@@ -892,6 +897,7 @@ fn run(init: std.process.Init) !bool {
                 null,
         };
         runtime.firmware.libs.agc_submit.setParallelCommandExecution(parallel_commands);
+        renderer.deferred_release_observer = runtime.firmware.libs.agc_submit.observeDeferredRelease;
         runtime.firmware.libs.agc_submit.attachBackend(renderer.dcbBackend(guest_memory));
         const video_sink = renderer.videoFrameSink();
         runtime.firmware.libs.videodec2.attachVideoFrameSink(.{

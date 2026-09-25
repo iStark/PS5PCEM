@@ -1328,6 +1328,38 @@ fn triggerAgcUserInterrupt() void {
     );
 }
 
+const DeferredReleaseNote = struct {
+    release: gpu.state.ReleaseMem,
+    event_id: u32,
+};
+var deferred_release_notes: [256]DeferredReleaseNote = undefined;
+var deferred_release_note_count: usize = 0;
+
+fn noteDeferredRelease(value: gpu.state.ReleaseMem, event_id: u32) void {
+    if (deferred_release_note_count == deferred_release_notes.len) return;
+    deferred_release_notes[deferred_release_note_count] = .{ .release = value, .event_id = event_id };
+    deferred_release_note_count += 1;
+}
+
+/// The renderer calls this after a queued label reaches guest memory.
+pub fn observeDeferredRelease(value: gpu.state.ReleaseMem) void {
+    var index: usize = 0;
+    while (index < deferred_release_note_count) : (index += 1) {
+        const note = deferred_release_notes[index];
+        if (note.release.address != value.address or note.release.data != value.data or
+            note.release.data_selection != value.data_selection) continue;
+        publishSynchronousRetirement(note.release);
+        triggerReleaseInterrupt(note.release, note.event_id);
+        deferred_release_note_count -= 1;
+        std.mem.copyForwards(
+            DeferredReleaseNote,
+            deferred_release_notes[index..deferred_release_note_count],
+            deferred_release_notes[index + 1 .. deferred_release_note_count + 1],
+        );
+        return;
+    }
+}
+
 fn triggerReleaseInterrupt(value: gpu.state.ReleaseMem, event_id: u32) void {
     if (value.interrupt != 1 and value.interrupt != 2 and value.interrupt != 4) return;
     if (completion_batch_active) {
@@ -1465,6 +1497,7 @@ fn backendRelease(context: ?*anyopaque, value: gpu.state.ReleaseMem) bool {
     if (installed_backend) |backend| {
         if (backend.vtable.release) |callback| {
             const accepted = callback(backend.context, value);
+            const queued = if (backend.vtable.release_queued) |query| query(backend.context) else false;
             if (reports_interrupt and interrupt_release_reports < 64) {
                 var new_label: [8]u8 = [_]u8{0} ** 8;
                 const new_label_valid = label_size != 0 and
@@ -1494,6 +1527,10 @@ fn backendRelease(context: ?*anyopaque, value: gpu.state.ReleaseMem) bool {
             // The EOP edge is observable only after its preceding Vulkan work
             // and release-label write. Waking before callback completion lets
             // the driver consume the event while the old fence is still set.
+            if (accepted and queued) {
+                noteDeferredRelease(value, event_id);
+                return true;
+            }
             if (accepted) {
                 publishSynchronousRetirement(value);
                 triggerReleaseInterrupt(value, event_id);

@@ -4165,6 +4165,9 @@ pub const Renderer = struct {
     acquire_callbacks: u64 = 0,
     release_callbacks: u64 = 0,
     defer_internal_releases: bool = false,
+    release_was_queued: bool = false,
+    /// HLE interrupt and retirement publication for a label that was queued.
+    deferred_release_observer: ?*const fn (gpu.state.ReleaseMem) void = null,
     deferred_internal_release_count: usize = 0,
     deferred_internal_releases: [256]DeferredRelease = undefined,
     publishing_internal_release: bool = false,
@@ -6314,7 +6317,10 @@ pub const Renderer = struct {
                     // Changed pages need a fresh snapshot while older timeline
                     // ticks may still read the persistent backing. Unchanged
                     // draws continue to bind that allocation directly.
-                    const upload: ?DrawUploadSlice = if (self.storageUploadUsesRing(entry))
+                    // A graphics draw must not wait out the previous reader to
+                    // overwrite the persistent buffer. The upload ring keeps
+                    // that reader intact. Compute, which has no ring, still waits.
+                    const upload: ?DrawUploadSlice = if (self.draw_uploads_enabled or self.storageUploadUsesRing(entry))
                         try self.allocateDrawUpload(size)
                     else
                         null;
@@ -20568,12 +20574,10 @@ pub const Renderer = struct {
             if (memory.gpu_generation) |generation| {
                 if (generation(memory.context, cached.descriptor.address, cached.allocation_bytes) == cached.guest_page_generation) return false;
             }
-        } else if (cached.guest_content_hash_valid and memory.fingerprint == null) {
-            // Nothing has cleared the hash since the image was uploaded or
-            // published, and this guest has no in-place fingerprint. Reading
-            // the allocation here only to hash it repeats a result we already
-            // stored. A command-processor write drops the flag; the page
-            // tracker, when enabled, takes the generation path above.
+        } else if (cached.guest_content_hash_valid) {
+            // A command-processor write clears this flag. The page tracker,
+            // when it is on, took the generation path above. Re-hashing a
+            // still-valid image only repeats a stored result.
             return false;
         }
         // Native memory can fingerprint the backing without copying or detiling
@@ -21236,10 +21240,12 @@ pub const Renderer = struct {
             // copying the complete allocation into a temporary host buffer.
             const unchanged = if (guest_page_generation != 0)
                 cached.guest_page_generation == guest_page_generation
-            else if (cached.guest_content_hash_valid and memory.fingerprint == null)
-                true
             else if (cached.guest_content_hash_valid)
-                if (memory.fingerprint) |fingerprint| fingerprint(memory.context, descriptor.address, allocation_bytes) == cached.guest_content_hash else false
+                // A command-processor write clears this flag. Hashing the
+                // allocation again would only rediscover that it is current.
+                true
+            else if (memory.fingerprint) |fingerprint|
+                cached.guest_backing_hash != 0 and fingerprint(memory.context, descriptor.address, allocation_bytes) == cached.guest_content_hash
             else
                 false;
             if (unchanged) {
@@ -24970,6 +24976,7 @@ pub const Renderer = struct {
         .write = dcbWrite,
         .acquire = dcbAcquire,
         .release = dcbRelease,
+        .release_queued = dcbReleaseWasQueued,
         .drain_releases = dcbDrainReleases,
         .wait = dcbWait,
         .write_data = dcbWriteData,
@@ -25189,13 +25196,24 @@ pub const Renderer = struct {
         return true;
     }
 
+    fn dcbReleaseWasQueued(context: ?*anyopaque) bool {
+        const self = fromContext(context);
+        const queued = self.release_was_queued;
+        self.release_was_queued = false;
+        return queued;
+    }
+
     fn dcbRelease(context: ?*anyopaque, release: gpu.state.ReleaseMem) bool {
         const self = fromContext(context);
         self.release_callbacks += 1;
+        self.release_was_queued = false;
         if (self.tryDeferInternalRelease(release) catch |err| {
             self.last_sync_error = err;
             return false;
-        }) return true;
+        }) {
+            self.release_was_queued = true;
+            return true;
+        }
         // RELEASE_MEM is the guest-visible completion boundary. Submit every
         // graphics command accumulated since the preceding boundary and wait
         // once before publishing its label/interrupt payload.
@@ -25263,14 +25281,13 @@ pub const Renderer = struct {
     }
 
     fn tryDeferInternalRelease(self: *Renderer, release: gpu.state.ReleaseMem) Error!bool {
-        // 64-bit retirement labels have an HLE publication hook; interrupting
-        // releases also wake guest threads. Keep both synchronous here. Cache
-        // flush and invalidate bits need nothing more: device writes reach
-        // guest memory only through writeback, which publication performs.
+        // Imported pages share CPU memory with queued readers, so they cannot
+        // be delayed. 64-bit immediate labels and end-of-pipe interrupts are
+        // queued too: the guest is told only when the label is published.
         if (!self.defer_internal_releases or !self.timeline_scheduler_enabled or
-            self.imported_allocations.items.len != 0 or release.interrupt != 0 or
+            self.imported_allocations.items.len != 0 or
             release.address == 0 or release.destination > 1 or
-            (release.data_selection != 1 and release.data_selection != 3 and release.data_selection != 4)) return false;
+            release.data_selection < 1 or release.data_selection > 4) return false;
         const size: usize = if (release.data_selection == 1) 4 else 8;
         // A label inside a cached buffer needs the ordinary writeback and
         // invalidation path. CPU-consumed compute output written before the
@@ -25370,12 +25387,13 @@ pub const Renderer = struct {
             var bytes: [8]u8 = undefined;
             if (pending.fixed) |fixed| {
                 bytes = fixed;
-            } else if (size == 4) {
-                std.mem.writeInt(u32, bytes[0..4], @truncate(release.data), .little);
-            } else {
-                std.mem.writeInt(u64, &bytes, releaseTimestampCounter(), .little);
+            } else switch (release.data_selection) {
+                1 => std.mem.writeInt(u32, bytes[0..4], @truncate(release.data), .little),
+                3, 4 => std.mem.writeInt(u64, &bytes, releaseTimestampCounter(), .little),
+                else => std.mem.writeInt(u64, &bytes, release.data, .little),
             }
             if (!dcbWrite(self, release.address, bytes[0..size])) return Error.GuestMemoryWriteFailed;
+            if (pending.fixed == null) if (self.deferred_release_observer) |observe| observe(release);
         }
     }
 
