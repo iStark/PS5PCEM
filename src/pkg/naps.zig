@@ -87,8 +87,12 @@ pub const Layout = struct {
         allocator.free(self.cblocks);
     }
 
+    /// The terminal entry. Earlier file boundaries can carry the same kind.
     pub fn mountSize(self: Layout) u64 {
-        for (self.file_offsets) |entry| {
+        var index = self.file_offsets.len;
+        while (index > 0) {
+            index -= 1;
+            const entry = self.file_offsets[index];
             if (entry.kind == 0x40) return entry.uncompressed_offset;
         }
         return 0;
@@ -161,11 +165,11 @@ pub fn parse(allocator: std.mem.Allocator, blob: []const u8) Error!Layout {
     const map_end = sectionEnd(counts, fidx_n);
     if (blob.len < map_end) return error.TruncatedNaps;
 
+    // Outer digests and shuffle entries are 8-byte records packed after the
+    // header; only the file-offset and u2c tables are padded to 16 bytes.
     var pos: usize = header_size;
     pos += @as(usize, counts.num_outer_blocks) * outer_stride;
-    pos = std.mem.alignForward(usize, pos, 16);
     pos += @as(usize, counts.num_shuffle) * shuffle_stride;
-    pos = std.mem.alignForward(usize, pos, 16);
 
     const file_offsets = allocator.alloc(FileOffset, fidx_n) catch return error.TruncatedNaps;
     errdefer allocator.free(file_offsets);
@@ -195,8 +199,8 @@ pub fn parse(allocator: std.mem.Allocator, blob: []const u8) Error!Layout {
 }
 
 fn sectionEnd(counts: Counts, fidx_n: usize) usize {
-    var pos = std.mem.alignForward(usize, header_size + @as(usize, counts.num_outer_blocks) * outer_stride, 16);
-    pos = std.mem.alignForward(usize, pos + @as(usize, counts.num_shuffle) * shuffle_stride, 16);
+    var pos = header_size + @as(usize, counts.num_outer_blocks) * outer_stride;
+    pos += @as(usize, counts.num_shuffle) * shuffle_stride;
     pos = std.mem.alignForward(usize, pos + fidx_n * file_offset_stride, 16);
     pos = std.mem.alignForward(usize, pos + @as(usize, counts.numU2c()) * u2c_stride, 16);
     return pos + @as(usize, counts.num_cblock_info) * cblock_stride;
@@ -241,10 +245,10 @@ test "NAPS padding does not become file offsets or shift CblockInfo" {
     // Two fidx entries, one outer block, one ublock and two CblockInfo records.
     std.mem.writeInt(u64, blob[0..8], 1 | (@as(u64, 1) << 32), .little);
     std.mem.writeInt(u64, blob[8..16], 1, .little);
-    // Outer digests end at 24; fidx starts at the next 16-byte boundary.
-    blob[40] = 4; // mount size 0x40000 in the second 40-bit offset
-    blob[43] = 0x40;
-    // fidx ends at 44, u2c occupies 48..58, cblocks start at 64.
+    // Outer digests end at 24 and fidx follows without padding.
+    blob[32] = 4; // mount size 0x40000 in the second 40-bit offset
+    blob[35] = 0x40;
+    // fidx ends at 36, u2c occupies 48..58, cblocks start at 64.
     blob[66] = 4; // run marker: bit 18, not bit 2
     var layout = try parse(std.testing.allocator, &blob);
     defer layout.deinit(std.testing.allocator);

@@ -139,6 +139,7 @@ fn walkBlocks(
 ) Error!void {
     var on_disk: u64 = 0;
     var uncomp: u64 = 0;
+    var sparse_cursor: usize = 0;
     var i: usize = 0;
     const recs = layout.cblocks;
     while (i < recs.len) : (i += 1) {
@@ -148,6 +149,8 @@ fn walkBlocks(
             on_disk = rec.runOnDisk(recs[i + 1]);
             continue;
         }
+        try appendSparseBlocks(allocator, layout, mount, &sparse_cursor, &uncomp, out);
+        if (uncomp >= mount) break;
         if (i + 1 >= recs.len) break;
         const file_end = layout.nextBoundary(uncomp, mount);
         const remain = if (file_end > uncomp) file_end - uncomp else 0;
@@ -172,7 +175,41 @@ fn walkBlocks(
         uncomp += uncomp_len;
         if (uncomp >= mount) break;
     }
+    try appendSparseBlocks(allocator, layout, mount, &sparse_cursor, &uncomp, out);
     if (uncomp != mount) return error.TruncatedPfs;
+}
+
+/// A 0x40 file offset below the mount size opens a region the map stores
+/// no records for (256 KiB in the packages seen so far). It reads as zeros
+/// and is represented by a block with no compressed bytes.
+fn appendSparseBlocks(
+    allocator: std.mem.Allocator,
+    layout: naps.Layout,
+    mount: u64,
+    cursor: *usize,
+    uncomp: *u64,
+    out: *std.ArrayList(UBlock),
+) Error!void {
+    const entries = layout.file_offsets;
+    while (uncomp.* < mount) {
+        while (cursor.* < entries.len and entries[cursor.*].uncompressed_offset < uncomp.*) cursor.* += 1;
+        if (cursor.* >= entries.len) return;
+        const entry = entries[cursor.*];
+        if (entry.kind != 0x40 or entry.uncompressed_offset != uncomp.*) return;
+        const end = layout.nextBoundary(uncomp.*, mount);
+        const len: u32 = @intCast(@min(naps.ublock_size, end - uncomp.*));
+        if (len == 0) return error.InvalidPfs;
+        out.append(allocator, .{
+            .logical = uncomp.*,
+            .on_disk = 0,
+            .comp = 0,
+            .uncomp = len,
+            .kraken = false,
+            .even_comp = 0,
+            .flags = 0,
+        }) catch return error.OutOfMemory;
+        uncomp.* += len;
+    }
 }
 
 fn decodeTail(
@@ -213,6 +250,10 @@ fn decodeUblock(
     dst: []u8,
 ) Error!void {
     if (dst.len != block.uncomp) return error.InvalidPfs;
+    if (block.comp == 0) {
+        @memset(dst, 0);
+        return;
+    }
     if (block.on_disk > image_size or block.comp > image_size - block.on_disk) return error.TruncatedPfs;
     var tmp: [naps.ublock_size]u8 = undefined;
     if (block.comp > tmp.len) return error.InvalidPfs;
