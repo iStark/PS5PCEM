@@ -493,6 +493,14 @@ its own position and reads positionally, so two descriptors on one file cannot
 disturb each other, and a descriptor closed during a read cannot have a reused
 slot's position corrupted afterwards.
 
+Guest descriptor identities increase for the lifetime of the mounted process,
+independently of the 256 reusable host table slots. Files, directories, devices,
+and offline sockets share that namespace. This keeps Unity's per-thread PS5
+read-ahead cache from matching a newly opened file against bytes cached under
+an earlier descriptor. Closed identities stay invalid, including when a read
+finishes after its host slot has been reused. The counter resets at detach and
+reports exhaustion instead of wrapping.
+
 The mount roots themselves (`/app0`, `/hostapp`, and `/host`) stat as existing
 directories. This matters independently of child lookup: managed runtimes often
 verify every parent before opening a known file, and must not see a missing

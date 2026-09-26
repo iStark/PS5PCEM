@@ -354,6 +354,7 @@ pub fn mountRelative(path: []const u8, storage: *[maximum_path]u8) ?[]const u8 {
 }
 
 const OpenFile = struct {
+    descriptor: i32 = -1,
     /// Null for a device node, which has no host file behind it.
     file: ?std.Io.File = null,
     /// Directory descriptors retain their iterator between getdents calls.
@@ -418,6 +419,10 @@ var savedata_root: ?std.Io.Dir = null;
 /// configuration, caches, and downloaded content here.
 var download_root: ?std.Io.Dir = null;
 var open_files: [maximum_open_files]?OpenFile = @splat(null);
+// Unity's PS5 read-ahead cache keys buffered bytes by the guest descriptor,
+// including across opens on different threads. Recycling a table slot must
+// not give a different file the same cache identity during this process.
+var next_descriptor: u32 = first_descriptor;
 var table_lock: Lock = .{};
 var virtual_socket_signal: std.atomic.Value(u8) = .init(0);
 
@@ -737,6 +742,7 @@ pub fn detach() void {
         for (&open_files) |*slot| slot.* = null;
     }
     active_io = null;
+    next_descriptor = first_descriptor;
     root = null;
     download_root = null;
     virtual_socket_signal.store(0, .release);
@@ -784,9 +790,27 @@ pub fn openCount() usize {
 
 fn slotOf(descriptor: i32) ?*?OpenFile {
     if (descriptor < first_descriptor) return null;
-    const index: usize = @intCast(descriptor - first_descriptor);
-    if (index >= open_files.len) return null;
-    return &open_files[index];
+    for (&open_files) |*slot| {
+        if (slot.*) |*entry| {
+            if (entry.descriptor == descriptor) return slot;
+        }
+    }
+    return null;
+}
+
+/// Reuses bounded host storage while retaining a distinct guest file identity.
+/// All descriptor kinds share this namespace; exhaustion never wraps an ID.
+fn insertFileLocked(value: OpenFile) Error!i32 {
+    if (next_descriptor > std.math.maxInt(i32)) return Error.TooManyOpenFiles;
+    for (&open_files) |*slot| {
+        if (slot.* != null) continue;
+        var entry = value;
+        entry.descriptor = @intCast(next_descriptor);
+        next_descriptor += 1;
+        slot.* = entry;
+        return entry.descriptor;
+    }
+    return Error.TooManyOpenFiles;
 }
 
 /// Opens a file the title named.
@@ -848,29 +872,19 @@ pub fn open(path: []const u8, flags: i32) Error!i32 {
     table_lock.lock();
     defer table_lock.unlock();
 
-    for (&open_files, 0..) |*slot, index| {
-        if (slot.* != null) continue;
-        var entry = OpenFile{ .file = file, .size = size };
-        entry.path_length = @min(path.len, maximum_path);
-        @memcpy(entry.path_buffer[0..entry.path_length], path[0..entry.path_length]);
-        slot.* = entry;
-        return first_descriptor + @as(i32, @intCast(index));
-    }
-    return Error.TooManyOpenFiles;
+    var entry = OpenFile{ .file = file, .size = size };
+    entry.path_length = @min(path.len, maximum_path);
+    @memcpy(entry.path_buffer[0..entry.path_length], path[0..entry.path_length]);
+    return insertFileLocked(entry);
 }
 
 fn openDevlogDirectory(path: []const u8) Error!i32 {
     table_lock.lock();
     defer table_lock.unlock();
-    for (&open_files, 0..) |*slot, index| {
-        if (slot.* != null) continue;
-        var entry = OpenFile{ .diagnostic_directory = true, .directory_index = 0 };
-        entry.path_length = @min(path.len, maximum_path);
-        @memcpy(entry.path_buffer[0..entry.path_length], path[0..entry.path_length]);
-        slot.* = entry;
-        return first_descriptor + @as(i32, @intCast(index));
-    }
-    return Error.TooManyOpenFiles;
+    var entry = OpenFile{ .diagnostic_directory = true, .directory_index = 0 };
+    entry.path_length = @min(path.len, maximum_path);
+    @memcpy(entry.path_buffer[0..entry.path_length], path[0..entry.path_length]);
+    return insertFileLocked(entry);
 }
 
 fn openDevlog(path: []const u8, flags: i32) Error!i32 {
@@ -888,20 +902,15 @@ fn openDevlog(path: []const u8, flags: i32) Error!i32 {
 
     table_lock.lock();
     defer table_lock.unlock();
-    for (&open_files, 0..) |*slot, index| {
-        if (slot.* != null) continue;
-        var entry = OpenFile{
-            .file = file,
-            .diagnostic_log = true,
-            .offset = if (flags & O.append != 0) size else 0,
-            .size = size,
-        };
-        entry.path_length = @min(path.len, maximum_path);
-        @memcpy(entry.path_buffer[0..entry.path_length], path[0..entry.path_length]);
-        slot.* = entry;
-        return first_descriptor + @as(i32, @intCast(index));
-    }
-    return Error.TooManyOpenFiles;
+    var entry = OpenFile{
+        .file = file,
+        .diagnostic_log = true,
+        .offset = if (flags & O.append != 0) size else 0,
+        .size = size,
+    };
+    entry.path_length = @min(path.len, maximum_path);
+    @memcpy(entry.path_buffer[0..entry.path_length], path[0..entry.path_length]);
+    return insertFileLocked(entry);
 }
 
 /// Opens a file inside a writable mount, creating it when asked.
@@ -940,18 +949,13 @@ fn openWritableFile(
 
     table_lock.lock();
     defer table_lock.unlock();
-    for (&open_files, 0..) |*slot, index| {
-        if (slot.* != null) continue;
-        var entry = OpenFile{ .file = file, .size = size, .writable = writing };
-        // Appending starts at the end; a title reopening its save to add to it
-        // must not overwrite what it wrote last time.
-        if (flags & O.append != 0) entry.offset = size;
-        entry.path_length = @min(path.len, maximum_path);
-        @memcpy(entry.path_buffer[0..entry.path_length], path[0..entry.path_length]);
-        slot.* = entry;
-        return first_descriptor + @as(i32, @intCast(index));
-    }
-    return Error.TooManyOpenFiles;
+    var entry = OpenFile{ .file = file, .size = size, .writable = writing };
+    // Appending starts at the end; a title reopening its save to add to it
+    // must not overwrite what it wrote last time.
+    if (flags & O.append != 0) entry.offset = size;
+    entry.path_length = @min(path.len, maximum_path);
+    @memcpy(entry.path_buffer[0..entry.path_length], path[0..entry.path_length]);
+    return insertFileLocked(entry);
 }
 
 /// Creates the directories leading to a file a title is about to write.
@@ -994,37 +998,28 @@ fn openDirectory(
 
     table_lock.lock();
     defer table_lock.unlock();
-    for (&open_files, 0..) |*slot, index| {
-        if (slot.* != null) continue;
-        var entry = OpenFile{
-            .directory = directory,
-            .directory_iterator = iterator,
-        };
-        entry.path_length = @min(path.len, maximum_path);
-        @memcpy(entry.path_buffer[0..entry.path_length], path[0..entry.path_length]);
-        slot.* = entry;
-        return first_descriptor + @as(i32, @intCast(index));
-    }
-    return Error.TooManyOpenFiles;
+    var entry = OpenFile{
+        .directory = directory,
+        .directory_iterator = iterator,
+    };
+    entry.path_length = @min(path.len, maximum_path);
+    @memcpy(entry.path_buffer[0..entry.path_length], path[0..entry.path_length]);
+    return insertFileLocked(entry);
 }
 
 fn openVirtualAudio(path: []const u8, relative: []const u8, io: std.Io, directory: std.Io.Dir) Error!i32 {
     const resolved = audio_fs.resolveVirtualWav(relative, directory, io, std.heap.page_allocator) catch {
         return Error.NotFound;
     };
+    errdefer std.heap.page_allocator.free(resolved.bytes);
 
     table_lock.lock();
     defer table_lock.unlock();
 
-    for (&open_files, 0..) |*slot, index| {
-        if (slot.* != null) continue;
-        var entry = OpenFile{ .memory = resolved.bytes, .size = resolved.size };
-        entry.path_length = @min(path.len, maximum_path);
-        @memcpy(entry.path_buffer[0..entry.path_length], path[0..entry.path_length]);
-        slot.* = entry;
-        return first_descriptor + @as(i32, @intCast(index));
-    }
-    return Error.TooManyOpenFiles;
+    var entry = OpenFile{ .memory = resolved.bytes, .size = resolved.size };
+    entry.path_length = @min(path.len, maximum_path);
+    @memcpy(entry.path_buffer[0..entry.path_length], path[0..entry.path_length]);
+    return insertFileLocked(entry);
 }
 
 /// Hands out a descriptor onto a device.
@@ -1039,27 +1034,18 @@ fn openDevice(device: Device, path: []const u8) Error!i32 {
     table_lock.lock();
     defer table_lock.unlock();
 
-    for (&open_files, 0..) |*slot, index| {
-        if (slot.* != null) continue;
-        var entry = OpenFile{ .device = device };
-        entry.path_length = @min(path.len, maximum_path);
-        @memcpy(entry.path_buffer[0..entry.path_length], path[0..entry.path_length]);
-        slot.* = entry;
-        return first_descriptor + @as(i32, @intCast(index));
-    }
-    return Error.TooManyOpenFiles;
+    var entry = OpenFile{ .device = device };
+    entry.path_length = @min(path.len, maximum_path);
+    @memcpy(entry.path_buffer[0..entry.path_length], path[0..entry.path_length]);
+    return insertFileLocked(entry);
 }
 
 /// Allocates a descriptor for a POSIX socket without opening host networking.
 pub fn openVirtualSocket() Error!i32 {
     table_lock.lock();
     defer table_lock.unlock();
-    for (&open_files, 0..) |*slot, index| {
-        if (slot.* != null) continue;
-        slot.* = OpenFile{ .virtual_socket = true };
-        return first_descriptor + @as(i32, @intCast(index));
-    }
-    return Error.TooManyOpenFiles;
+    const entry = OpenFile{ .virtual_socket = true };
+    return insertFileLocked(entry);
 }
 
 pub fn isVirtualSocket(descriptor: i32) bool {
@@ -1147,7 +1133,7 @@ pub fn read(descriptor: i32, buffer: []u8) Error!usize {
         table_lock.lock();
         defer table_lock.unlock();
         if (slot.*) |*entry| {
-            if (entry.memory != null) entry.offset = offset + count;
+            if (entry.descriptor == descriptor and entry.memory != null) entry.offset = offset + count;
         }
         return count;
     }
@@ -1172,7 +1158,7 @@ pub fn read(descriptor: i32, buffer: []u8) Error!usize {
     // reused slot would corrupt an unrelated file's position.
     if (slot.*) |*entry| {
         if (entry.file) |current| {
-            if (current.handle == file.handle) entry.offset = offset + count;
+            if (entry.descriptor == descriptor and current.handle == file.handle) entry.offset = offset + count;
         }
     }
     return count;
@@ -1715,6 +1701,68 @@ test "positional reads leave the descriptor position alone" {
     try testing.expectEqualStrings("345", &buffer);
 }
 
+test "reopened files cannot alias a previous descriptor read-ahead cache" {
+    var fixture = try Fixture.init("mesh");
+    defer fixture.deinit();
+    try fixture.tmp.dir.writeFile(testing.io, .{ .sub_path = "shader.bin", .data = "shader" });
+
+    const original = try open("/app0/data.bin", O.rdonly);
+    var cached: [4]u8 = undefined;
+    _ = try pread(original, &cached, 0);
+    try close(original);
+
+    // Reuse the bounded table repeatedly, as Unity does while loading bundles.
+    var previous = original;
+    for (0..maximum_open_files * 2) |_| {
+        const current = try open("/app0/shader.bin", O.rdonly);
+        try testing.expect(current > previous);
+        try testing.expectEqual(@as(usize, 1), openCount());
+        try testing.expectError(Error.BadDescriptor, pread(original, &cached, 0));
+        try testing.expectError(Error.BadDescriptor, close(previous));
+        var bytes: [6]u8 = undefined;
+        try testing.expectEqual(bytes.len, try pread(current, &bytes, 0));
+        try testing.expectEqualStrings("shader", &bytes);
+        try testing.expectEqualStrings("mesh", &cached);
+        try close(current);
+        previous = current;
+    }
+}
+
+test "descriptor identities share a namespace and preserve the live file limit" {
+    var fixture = try Fixture.init("data");
+    defer fixture.deinit();
+    const file = try open("/app0/data.bin", O.rdonly);
+    try close(file);
+    const directory = try open("/app0", O.directory);
+    try testing.expect(directory > file);
+    try close(directory);
+    const device = try open("/dev/gc", O.rdwr);
+    try testing.expect(device > directory);
+    try close(device);
+
+    var descriptors: [maximum_open_files]i32 = undefined;
+    for (&descriptors) |*fd| fd.* = try openVirtualSocket();
+    try testing.expect(descriptors[0] > device);
+    try testing.expectError(Error.TooManyOpenFiles, openVirtualSocket());
+    try close(descriptors[0]);
+    const replacement = try openVirtualSocket();
+    try testing.expect(replacement > descriptors[descriptors.len - 1]);
+    try testing.expect(!isVirtualSocket(descriptors[0]));
+    try testing.expect(isVirtualSocket(replacement));
+    try testing.expectEqual(maximum_open_files, openCount());
+}
+
+test "descriptor exhaustion does not wrap or publish a file" {
+    var fixture = try Fixture.init("data");
+    defer fixture.deinit();
+    next_descriptor = std.math.maxInt(i32);
+    const last = try openVirtualSocket();
+    try testing.expectEqual(std.math.maxInt(i32), last);
+    try close(last);
+    try testing.expectError(Error.TooManyOpenFiles, open("/app0/data.bin", O.rdonly));
+    try testing.expectEqual(@as(usize, 0), openCount());
+}
+
 test "seeking moves the position and rejects negative results" {
     var fixture = try Fixture.init("0123456789");
     defer fixture.deinit();
@@ -1872,7 +1920,7 @@ test "directory descriptors enumerate BSD dirent records" {
     try testing.expectEqual(@as(usize, 0), try getDents(fd, &buffer, null));
 }
 
-test "descriptors are released and reused" {
+test "descriptor storage is released without reusing guest identities" {
     var fixture = try Fixture.init("data");
     defer fixture.deinit();
 
@@ -1887,7 +1935,7 @@ test "descriptors are released and reused" {
 
     const second = try open("/app0/data.bin", O.rdonly);
     defer close(second) catch {};
-    try testing.expectEqual(first, second);
+    try testing.expect(second > first);
 }
 
 test "nested paths resolve" {

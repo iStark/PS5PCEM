@@ -17,6 +17,7 @@ supplied locally and is not included in this repository.
 
 | Title | Status | Notes |
 |---|---|---|
+| **Subnautica: Below Zero**<br><img src="images/subnautica-below-zero-title.png" width="240" alt="Subnautica Below Zero title scene with ocean, ice and pengwings rendered by PS5PCEM"> | **Animated title scene · menu interaction and gameplay unverified** | Verified on September 26, 2026 with PPSA02457 v1.022.125. Distinct guest file descriptor identities prevent Unity's read-ahead cache from confusing two resource files, resolving the startup write fault at `eboot.bin+0x51d36e`. The title logo, ocean, ice and pengwings render in two 120-second runs without the original fault. Menu options are not visible in the capture; gameplay, visual accuracy and longer-run stability remain unverified. [Title capture](images/subnautica-below-zero-title.png) · [Startup investigation](development/subnautica-startup-2026-09-26.md) |
 | **Terminator 2D: No Fate**<br><img src="images/live-gameplay.png" width="240" alt="Terminator 2D gameplay with the player character, HUD and desert scene"> | **Playable · Completable** | Completed without reported problems. Correct backgrounds, characters, HUD, textures and colors; warmed-up startup frames measure 22–65 ms on the current test host. [Gameplay capture](images/live-gameplay.png) |
 | **Pistol Whip** | Maps the native PS VR2 plugin and Burst module, then starts loading Unity asset archives | Headset, tracking, controller, and host OpenXR support are intentionally deferred |
 | **Propagation: Paradise Hotel** | Mounts the 8.8 GiB UE PAK, completes ICU/config bootstrap, opens the cooked Global shader archive, creates AGC shaders, and submits the first DCB | This milestone predates the new synchronization packet constructors and needs a fresh run; VR presentation still has no host headset bridge |
@@ -34,6 +35,12 @@ supplied locally and is not included in this repository.
 | **Ghost of Yōtei**<br><img src="images/yotei-difficulty.png" width="240" alt="Ghost of Yotei difficulty selection over a 3D scene"> | **Intro playback · bonus notices · brightness calibration · reaches in-game scenes · not playable** | Reaching the difficulty selection shown here takes several minutes of intro and scene loading, and the frame rate there is 0.6 FPS: sampled frames measure 1504-1554 ms for 321 draws and about 1330 compute dispatches. The title is not playable at that rate; what is claimed is that it renders its menus and 3D scenes correctly. Time to reach a scene varies widely between runs on the same build. Intro movies play at about their native 30 FPS in ReleaseFast. The verified reference run reached the animated loading indicator, Digital Deluxe Bonus, Gift of the Northern Star, Pre-order Bonus, and brightness calibration with the wolf image, instructions, slider and confirmation glyph. The maintainer also observed trees and parts of the 3D background, with menu music audible. Streamed scene loading, material tables and shader execution have advanced substantially. Gameplay itself -- moving the character through a loaded world -- remains unverified, and scene preparation frames are still very slow. The latest renderer was checked through the intro into scene loading; the complete bonus/brightness sequence was verified on reference build `796a484`, not repeated on the release candidate. [Detailed results and build-specific limits](architecture/yotei-startup.md) |
 
 ## Screenshots
+
+![Subnautica Below Zero title scene with ocean, ice and pengwings rendered by PS5PCEM](images/subnautica-below-zero-title.png)
+
+*Subnautica: Below Zero, PPSA02457 v1.022.125, September 26, 2026. Captured
+from the guest renderer after correcting file descriptor reuse. The animated
+title scene is visible; menu interaction and gameplay remain unverified.*
 
 ![Big Helmet Heroes opening movie playing in PS5PCEM](images/big-helmet-heroes-intro.png)
 
