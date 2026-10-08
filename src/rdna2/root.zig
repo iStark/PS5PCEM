@@ -21,6 +21,7 @@ pub const cache_key = @import("cache_key.zig");
 
 pub const Family = isa.Family;
 pub const Opcode = isa.Opcode;
+pub const scalar_calls = @import("scalar_calls.zig");
 pub const OperandKind = isa.OperandKind;
 pub const Operand = operand.Operand;
 pub const Instruction = instruction.Instruction;
@@ -70,6 +71,7 @@ test {
     _ = operand;
     _ = instruction;
     _ = scalar_alu;
+    _ = scalar_calls;
     _ = scalar_memory;
     _ = vector_alu;
     _ = vector_memory;

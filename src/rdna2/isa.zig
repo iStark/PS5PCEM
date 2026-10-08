@@ -131,6 +131,7 @@ pub const Opcode = enum {
     s_bitset1_b32,
     s_getpc_b64,
     s_setpc_b64,
+    s_swappc_b64,
     s_and_saveexec_b32,
     s_and_saveexec_b64,
     s_orn2_saveexec_b64,
@@ -206,6 +207,7 @@ pub const Opcode = enum {
     s_bitcmp0_b32,
     s_bitcmp1_b32,
     s_movk_i32,
+    s_call_b64,
     s_mulk_i32,
     s_setreg_b32,
     s_waitcnt,
@@ -712,6 +714,10 @@ pub const Opcode = enum {
     }
 
     /// Control-transfer instructions, used to collect branch targets.
+    pub fn isCall(self: Opcode) bool {
+        return self == .s_swappc_b64 or self == .s_call_b64;
+    }
+
     pub fn isBranch(self: Opcode) bool {
         return switch (self) {
             .s_branch,

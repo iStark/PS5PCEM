@@ -512,6 +512,8 @@ pub const Options = struct {
     /// UNORM word, blends in the shader, and packs the result back.
     packed_unorm_blend: [8]u32 = @splat(0),
     scalar_registers: []const ScalarRegister = &.{},
+    /// Guest allocation base for architectural scalar call return addresses.
+    program_address: u64 = 0,
     dynamic_scalar_binding: ?DynamicScalarBinding = null,
     compute_inputs: ?ComputeInputs = null,
     descriptor_array_length: u32 = 64,
@@ -1160,6 +1162,8 @@ const Builder = struct {
     local_vcc_pcs: []const u32 = &.{},
     uses_group_shuffle_relative: bool = false,
     scalar_specializations: []const ScalarRegister,
+    program_address: u64,
+    architectural_pc: bool = false,
     dynamic_scalar_binding: ?DynamicScalarBinding,
     zero_unmapped_flat_loads: bool,
     allow_float64: bool,
@@ -1237,6 +1241,7 @@ const Builder = struct {
             .fragment_per_vertex_mask = options.fragment_per_vertex_mask,
             .fragment_custom_interpolation_mask = options.fragment_custom_interpolation_mask,
             .scalar_specializations = options.scalar_registers,
+            .program_address = options.program_address,
             .dynamic_scalar_binding = options.dynamic_scalar_binding,
             .zero_unmapped_flat_loads = options.zero_unmapped_flat_loads,
             .allow_float64 = options.allow_float64,
@@ -4594,10 +4599,11 @@ const Builder = struct {
     }
 
     fn getPcFallback(self: *Builder, inst: instruction.Instruction) Error!void {
-        // Live shaders specialize GETPC-derived descriptor pointers before
-        // lowering. Keep a deterministic null pair for standalone translation.
-        const zero = try self.constant(.bits32, 0);
-        try self.destinationPair(inst.dst, .{ zero, zero });
+        const address = if (self.architectural_pc or inst.opcode.isCall()) self.program_address +% inst.pc +% (inst.word_count * 4) else 0;
+        try self.destinationPair(inst.dst, .{
+            try self.constant(.bits32, @truncate(address)),
+            try self.constant(.bits32, @truncate(address >> 32)),
+        });
     }
 
     fn cndmask(self: *Builder, inst: instruction.Instruction) Error!void {
@@ -11233,7 +11239,7 @@ const Builder = struct {
             .v_permlanex16_b32 => try self.permlane(inst, true),
             .v_movreld_b32, .v_movrels_b32 => try self.unary(inst, 83, .bits32),
             .s_mov_b64 => try self.mov64(inst),
-            .s_getpc_b64 => try self.getPcFallback(inst),
+            .s_getpc_b64, .s_call_b64, .s_swappc_b64 => try self.getPcFallback(inst),
             .s_not_b64 => try self.not64(inst),
             .s_and_b64,
             .s_or_b64,
@@ -12316,7 +12322,7 @@ fn translateStructuredLoops(builder: *Builder, instructions: []const instruction
 
         if (last.opcode.isProgramEnd()) {
             try builder.returnFromShader(); // OpReturn
-        } else if (last.opcode == .s_setpc_b64) {
+        } else if (last.opcode == .s_setpc_b64 or last.opcode.isCall()) {
             if (setpcSuccessor(graph, block.index)) |target| {
                 try builder.emit(&builder.body, 249, &.{labels[target]});
             } else {
@@ -12668,7 +12674,7 @@ fn translateDispatcher(builder: *Builder, instructions: []const instruction.Inst
         }
         if (last.opcode.isProgramEnd()) {
             try emitDispatchJump(builder, after, dispatch_sentinel);
-        } else if (last.opcode == .s_setpc_b64) {
+        } else if (last.opcode == .s_setpc_b64 or last.opcode.isCall()) {
             if (setpcSuccessor(graph, block.index)) |target| {
                 try emitDispatchJump(builder, after, target);
             } else {
@@ -12864,7 +12870,7 @@ fn translateStructured(builder: *Builder, instructions: []const instruction.Inst
 
         if (last.opcode.isProgramEnd()) {
             try builder.returnFromShader(); // OpReturn
-        } else if (last.opcode == .s_setpc_b64) {
+        } else if (last.opcode == .s_setpc_b64 or last.opcode.isCall()) {
             if (setpcSuccessor(graph, block.index)) |target| {
                 try builder.emit(&builder.body, 249, &.{structuredEdgeLabel(
                     graph,
@@ -13214,6 +13220,8 @@ fn translateInstructions(
     options: Options,
 ) Error!Module {
     var effective = options;
+    try @import("scalar_calls.zig").validate(instructions, false);
+    const has_calls = @import("scalar_calls.zig").present(instructions);
     var has_predicated_write = false;
     var cross_half_read = false;
     var uses_gds = false;
@@ -13339,6 +13347,7 @@ fn translateInstructions(
         effective.uses_execution_mask = true;
     }
     var builder = try Builder.init(allocator, effective);
+    builder.architectural_pc = has_calls;
     var builder_alive = true;
     defer if (builder_alive) builder.deinit();
     try builder.configureLaneSpills(instructions);
@@ -13363,7 +13372,7 @@ fn translateInstructions(
         try allocator.alloc(u32, 0);
     defer allocator.free(local_vcc_pcs);
     builder.local_vcc_pcs = local_vcc_pcs;
-    if (builder.converged_workgroup_dispatch) {
+    if (builder.converged_workgroup_dispatch or has_calls) {
         try translateDispatcher(&builder, instructions, &graph);
     } else if (graph.blocks.items.len == 1) {
         // A single guest wave executes LDS instructions in order. On a
@@ -15495,6 +15504,43 @@ test "MIMG multi-texel loads use typed fetches and checked full groups in every 
             }
         }
     }
+}
+
+test "scalar calls translate forward backward nested and trailing callees in every stage" {
+    const decoder = @import("decoder.zig");
+    for (@import("scalar_calls.zig").fixtures.cases) |case| {
+        var program = try decoder.decodeProgram(std.testing.allocator, case.words);
+        defer program.deinit(std.testing.allocator);
+        var typed = try @import("ir.zig").lowerWithOptions(std.testing.allocator, &program, .{ .enable_typed_ir = true, .enable_ssa_optimization = true });
+        defer typed.deinit(std.testing.allocator);
+        for ([_]Stage{ .compute, .vertex, .fragment }) |stage| {
+            const bindings = [_]StorageBufferBinding{
+                .{ .resource_sgpr = 0, .descriptor_index = 0, .extent_bytes = 2048 },
+                .{ .resource_sgpr = 4, .descriptor_index = 1, .extent_bytes = 2048 },
+            };
+            var module = try translate(std.testing.allocator, &program, .{ .stage = stage, .storage_buffers = &bindings, .program_address = 0x7fffffffc, .allow_control_flow_fallback = false });
+            defer module.deinit(std.testing.allocator);
+            try std.testing.expect(module.used_dispatcher);
+            try std.testing.expect(!module.used_control_flow_fallback);
+            var optimized = try translateIr(std.testing.allocator, &typed, .{ .stage = stage, .storage_buffers = &bindings, .program_address = 0x7fffffffc, .allow_control_flow_fallback = false });
+            defer optimized.deinit(std.testing.allocator);
+            try std.testing.expect(optimized.used_dispatcher);
+            try std.testing.expect(!optimized.used_control_flow_fallback);
+        }
+    }
+}
+
+test "scalar calls save the architectural 64-bit return without changing SCC or EXEC" {
+    var builder = try Builder.init(std.testing.allocator, .{ .stage = .compute, .program_address = 0x7fffffffc });
+    defer builder.deinit();
+    const initial = builder.snapshot();
+    try builder.lower(.{ .opcode = .s_call_b64, .dst = .{ .kind = .sgpr, .reg = 8 }, .data_words = 2 });
+    try std.testing.expectEqual(try builder.constant(.bits32, 0), try builder.source(.{ .kind = .sgpr, .reg = 8 }, .bits32));
+    try std.testing.expectEqual(try builder.constant(.bits32, 8), try builder.source(.{ .kind = .sgpr, .reg = 9 }, .bits32));
+    const final = builder.snapshot();
+    try std.testing.expectEqual(initial.scc, final.scc);
+    try std.testing.expectEqualDeep(initial.exec_mask, final.exec_mask);
+    try std.testing.expectEqual(initial.exec_mask_is_lane_predicate, final.exec_mask_is_lane_predicate);
 }
 
 test "MIMG horizontal gather uses native offsets or raw packed fetches in every stage" {

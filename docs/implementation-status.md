@@ -39,6 +39,11 @@ behind them.
   edge handling and register preservation. The measured direct 1D/2D subset
   is covered by 1,242 GPU dispatches; other descriptor/control modes remain
   explicit limitations. See the [horizontal gather report](development/gather4h-2026-10-09.md).
+- S_SWAPPC_B64 and S_CALL_B64 now save full return addresses and execute
+  bounded local shader subroutines, including nested and post-ENDPGM callees.
+  Verified AGC fetch pointers link to matching returns. A 42-dispatch GPU
+  probe checks 21,504 words; general dynamic calls remain unsupported. See
+  the [scalar call report](development/scalar-calls-2026-10-09.md).
 - Live VideoOut reaches a Vulkan swapchain, while host audio accepts decoded
   guest buffers at 48 kHz. SceAvPlayer uses FFmpeg for H.264/AAC media and
   returns synchronized NV12 video plus stereo PCM through the title's own

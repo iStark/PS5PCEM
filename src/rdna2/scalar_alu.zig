@@ -61,6 +61,7 @@ const sop1_table = buildTable(256, &.{
     .{ 0x1d, .s_bitset1_b32 },
     .{ 0x1f, .s_getpc_b64 },
     .{ 0x20, .s_setpc_b64 },
+    .{ 0x21, .s_swappc_b64 },
     .{ 0x24, .s_and_saveexec_b64 },
     .{ 0x28, .s_orn2_saveexec_b64 },
     .{ 0x34, .s_abs_i32 },
@@ -117,9 +118,11 @@ const sopk_table = buildTable(32, &.{
     .{ 0x0c, .s_cmp_ge_u32 }, .{ 0x0d, .s_cmp_lt_u32 },
     .{ 0x0e, .s_cmp_le_u32 }, .{ 0x0f, .s_add_i32 },
     .{ 0x10, .s_mulk_i32 },   .{ 0x13, .s_setreg_b32 },
+    .{ 0x16, .s_call_b64 },
     // The four s_waitcnt encodings differ only in which counter they wait on.
-    .{ 0x17, .s_waitcnt },    .{ 0x18, .s_waitcnt },
-    .{ 0x19, .s_waitcnt },    .{ 0x1a, .s_waitcnt },
+      .{ 0x17, .s_waitcnt },
+    .{ 0x18, .s_waitcnt },    .{ 0x19, .s_waitcnt },
+    .{ 0x1a, .s_waitcnt },
 });
 
 const sopp_table = buildTable(128, &.{
@@ -186,6 +189,7 @@ pub fn decodeSop1(pc: u32, code: []const u32, word_index: u32) Error!Instruction
         // s_getpc_b64 reads no source; it only writes the next instruction address.
         .s_getpc_b64 => {
             inst.src_count = 0;
+            inst.data_words = 2;
             inst.dst = try operand.decodeScalarDestination(sdst);
             return inst;
         },
@@ -203,6 +207,7 @@ pub fn decodeSop1(pc: u32, code: []const u32, word_index: u32) Error!Instruction
     inst.src0 = try operand.decodeScalarSource(ssrc0);
     inst.dst = try operand.decodeScalarDestination(sdst);
     inst.src_count = 1;
+    if (inst.opcode == .s_swappc_b64) inst.data_words = 2;
     try inst.readLiteralOperands(code, word_index);
     return inst;
 }
@@ -216,7 +221,8 @@ test "discarded SWAPPC return is a SETPC continuation" {
     try std.testing.expectEqual(@as(u32, 6), continuation.src0.reg);
     // Keeping a return address requires call/return handling, not this alias.
     const call = try decodeSop1(0, &.{0xbe802106}, 0);
-    try std.testing.expectEqual(Opcode.unsupported, call.opcode);
+    try std.testing.expectEqual(Opcode.s_swappc_b64, call.opcode);
+    try std.testing.expectEqual(@as(u8, 2), call.data_words);
 }
 
 pub fn decodeSop2(pc: u32, code: []const u32, word_index: u32) Error!Instruction {
@@ -272,6 +278,12 @@ pub fn decodeSopk(pc: u32, code: []const u32, word_index: u32) Error!Instruction
     }
 
     switch (inst.opcode) {
+        .s_call_b64 => {
+            inst.dst = try operand.decodeScalarDestination(sdst);
+            inst.data_words = 2;
+            inst.branch_target = pc +% 4 +% @as(u32, @bitCast(@as(i32, imm) * 4));
+            return inst;
+        },
         .s_movk_i32 => {
             inst.dst = try operand.decodeScalarDestination(sdst);
             return inst;

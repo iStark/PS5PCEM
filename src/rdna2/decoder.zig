@@ -10,6 +10,7 @@ const scalar_alu = @import("scalar_alu.zig");
 const scalar_memory = @import("scalar_memory.zig");
 const vector_alu = @import("vector_alu.zig");
 const vector_memory = @import("vector_memory.zig");
+const scalar_calls = @import("scalar_calls.zig");
 
 const Instruction = instruction.Instruction;
 const Program = instruction.Program;
@@ -75,10 +76,9 @@ pub fn decodeProgram(allocator: std.mem.Allocator, code: []const u32) ProgramErr
     var instructions: std.ArrayList(Instruction) = .empty;
     errdefer instructions.deinit(allocator);
 
-    var branch_targets: std.AutoHashMapUnmanaged(u32, void) = .empty;
-    defer branch_targets.deinit(allocator);
-
     var word_index: u32 = 0;
+    var furthest_target: u32 = 0;
+    var saw_end = false;
     while (word_index < code.len) {
         const pc = word_index * 4;
         const inst = try decodeInstruction(pc, code, word_index);
@@ -87,12 +87,15 @@ pub fn decodeProgram(allocator: std.mem.Allocator, code: []const u32) ProgramErr
         word_index += inst.word_count;
 
         if (inst.opcode.isBranch()) {
-            try branch_targets.put(allocator, inst.branch_target, {});
+            furthest_target = @max(furthest_target, inst.branch_target);
         }
+        if (inst.opcode.isCall()) if (scalar_calls.directTarget(instructions.items, instructions.items.len - 1)) |target| {
+            furthest_target = @max(furthest_target, target);
+        };
 
-        if (inst.opcode.isProgramEnd()) {
-            const at_end = word_index >= code.len;
-            if (at_end or !branch_targets.contains(word_index * 4)) {
+        saw_end = saw_end or inst.opcode.isProgramEnd();
+        if (inst.opcode.isProgramEnd() or (saw_end and scalar_calls.returnTarget(instructions.items, instructions.items.len - 1) != null)) {
+            if (furthest_target < word_index * 4 and !scalar_calls.needsMoreCode(instructions.items)) {
                 return .{ .code = code, .instructions = instructions };
             }
         }

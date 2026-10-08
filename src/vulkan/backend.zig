@@ -2880,6 +2880,7 @@ fn shaderProgramByteLimit(
 /// later lookup compares against guest memory, so no separate copy is kept.
 const AnalyzedProgram = struct {
     address: u64,
+    fetch_return: bool = false,
     analysis: gpu.ShaderAnalysis,
     last_used_sequence: u64 = 0,
 };
@@ -9212,6 +9213,7 @@ pub const Renderer = struct {
         // recognized query family its validated longer traversal budget.
         const module_lease = self.compute_translations.acquirePrepared(self.allocator, &analysis.program, .{
             .stage = .compute,
+            .program_address = if (rdna2.scalar_calls.present(analysis.program.instructions.items)) bindings.program_address else 0,
             .local_size = local_size,
             .physical_local_size = try @import("compute_shape.zig").fit(local_size, self.device_info.max_compute_work_group_size, self.device_info.max_compute_work_group_invocations),
             .maximum_dispatcher_iterations = if (scene_collision_query) 4096 else if (yotei_environment_lighting) 2048 else if (yotei_atmosphere_multiscatter) 1024 else if (yotei_atmosphere_precompute) 512 else 256,
@@ -13873,10 +13875,14 @@ pub const Renderer = struct {
         address: u64,
         header_address: ?u64,
     ) anyerror!*const gpu.ShaderAnalysis {
+        return self.analyzedProgramMode(reader, address, header_address, false);
+    }
+
+    fn analyzedProgramMode(self: *Renderer, reader: gpu.ShaderMemoryReader, address: u64, header_address: ?u64, fetch_return: bool) anyerror!*const gpu.ShaderAnalysis {
         self.analyzed_program_sequence +%= 1;
         var stale_index: ?usize = null;
         for (self.analyzed_programs.items, 0..) |*entry, index| {
-            if (entry.address != address) continue;
+            if (entry.address != address or entry.fetch_return != fetch_return) continue;
             const validation_started = self.resourceTimestampNs();
             const matches = programWordsMatch(reader, address, entry.analysis.code.items);
             self.frame_profile.shader_validation_ns +|= elapsedHostNanoseconds(validation_started);
@@ -13891,7 +13897,12 @@ pub const Renderer = struct {
 
         const started = self.resourceTimestampNs();
         const byte_limit = shaderProgramByteLimit(reader, header_address, address);
-        var analysis = if (byte_limit) |shader_bytes|
+        var analysis = if (fetch_return)
+            try gpu.shader_analysis.decodeFetchWithOptions(self.allocator, reader, address, headerless_shader_instruction_limit, .{
+                .enable_typed_ir = self.shader_ir_enabled,
+                .enable_ssa_optimization = self.shader_ssa_optimization_enabled,
+            })
+        else if (byte_limit) |shader_bytes|
             try gpu.shader_analysis.decodeBoundedWithOptions(
                 self.allocator,
                 reader,
@@ -13926,6 +13937,7 @@ pub const Renderer = struct {
         self.frame_profile.shader_analysis_misses += 1;
         const replacement = AnalyzedProgram{
             .address = address,
+            .fetch_return = fetch_return,
             .analysis = analysis,
             .last_used_sequence = self.analyzed_program_sequence,
         };
@@ -20969,11 +20981,21 @@ pub const Renderer = struct {
         var vertex_instructions = vertex_analysis.program.instructions.items;
         if (vertex_bindings.direct_pointers.fetch_shader) |fetch_address| {
             if (fetch_address != 0 and fetch_address != vertex_address) {
-                if (self.analyzedProgram(reader, fetch_address, null)) |fetch_analysis| {
+                var fetch_register: ?u32 = null;
+                for (vertex_instructions, 0..) |call, index| {
+                    if (call.opcode != .s_swappc_b64 or call.src0.kind != .sgpr or call.src0.reg < vertex_bindings.scalar_user_data_base or
+                        rdna2.scalar_calls.directTarget(vertex_instructions, index) != null) continue;
+                    const word = call.src0.reg - vertex_bindings.scalar_user_data_base;
+                    if (word + 1 >= vertex_bindings.user_data_count) continue;
+                    const pointer = @as(u64, vertex_bindings.user_data[word]) | (@as(u64, vertex_bindings.user_data[word + 1]) << 32);
+                    if (pointer == fetch_address) fetch_register = call.src0.reg;
+                }
+                if (self.analyzedProgramMode(reader, fetch_address, null, true)) |fetch_analysis| {
                     if (gpu.shader_analysis.inlineFetchShader(
                         self.allocator,
                         vertex_analysis.program.instructions.items,
                         fetch_analysis.program.instructions.items,
+                        fetch_register,
                         &vertex_instruction_storage,
                     ) catch false) {
                         vertex_instructions = vertex_instruction_storage.items;
@@ -21847,6 +21869,7 @@ pub const Renderer = struct {
         const fragment_translate_started = self.resourceTimestampNs();
         const fragment_lease = self.graphics_translations.acquirePrepared(self.allocator, &fragment_analysis.program, .{
             .stage = .fragment,
+            .program_address = if (rdna2.scalar_calls.present(fragment_analysis.program.instructions.items)) fragment_address else 0,
             .maximum_dispatcher_iterations = fragment_dispatcher_budget,
             .structure_branch_loops = @atomicLoad(bool, &fragment_branch_loops, .monotonic),
             .structure_short_fragment_loops = @atomicLoad(bool, &fragment_short_loops, .monotonic),
@@ -22207,6 +22230,7 @@ pub const Renderer = struct {
             else
                 self.graphics_translations.acquirePrepared(self.allocator, &vertex_program, .{
                     .stage = .vertex,
+                    .program_address = if (rdna2.scalar_calls.present(vertex_instructions)) vertex_address else 0,
                     // The PS5 NGG/export ABI supplies S_NGG_VERTEX_INDEX in v5;
                     // ordinary VS programs retain the legacy v0 convention.
                     // Prospero's merged graphics ABI supplies the vertex id in v5

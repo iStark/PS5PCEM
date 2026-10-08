@@ -87,6 +87,12 @@ pub fn formatInstruction(inst: Instruction, w: *Writer) Writer.Error!void {
     try w.print("0x{x:0>8}: {s}", .{ inst.pc, inst.opcode.mnemonic() });
 
     // Branches print their target rather than the raw immediate field.
+    if (inst.opcode == .s_call_b64) {
+        try w.writeAll(" ");
+        try formatOperand(inst.dst, w);
+        try w.print(", 0x{x:0>8}", .{inst.branch_target});
+        return;
+    }
     if (inst.opcode.isBranch()) {
         try w.print(" 0x{x:0>8}", .{inst.branch_target});
         return;

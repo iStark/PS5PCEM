@@ -683,6 +683,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "vulkan", .module = vulkan },
                 .{ .name = "gpu", .module = gpu },
+                .{ .name = "rdna2", .module = mod },
             },
         }),
     });
@@ -763,6 +764,8 @@ pub fn build(b: *std.Build) void {
     test_hle_step.dependOn(&run_hle_tests.step);
     const rdna_tests = b.addTest(.{ .root_module = mod, .filters = if (test_filter) |filter| &.{filter} else &.{} });
     b.step("test-rdna2", "Run decoder and shader translation tests").dependOn(&b.addRunArtifact(rdna_tests).step);
+    const gpu_tests = b.addTest(.{ .root_module = gpu, .filters = if (test_filter) |filter| &.{filter} else &.{} });
+    b.step("test-gpu", "Run GPU state and shader resource analysis tests").dependOn(&b.addRunArtifact(gpu_tests).step);
     const vulkan_tests = b.addTest(.{ .root_module = vulkan, .filters = if (test_filter) |filter| &.{filter} else &.{} });
     b.step("test-vulkan", "Run Vulkan backend tests").dependOn(&b.addRunArtifact(vulkan_tests).step);
 }

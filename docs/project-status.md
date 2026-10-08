@@ -18,6 +18,12 @@ widths and edge handling. A native GPU matrix passes 1,242 dispatches and
 635,904 checked words. This instruction-level check does not change game
 grades or FPS measurements. See the [gather report](development/gather4h-2026-10-09.md).
 
+**October 9, 2026 — scalar shader calls:** `S_SWAPPC_B64` and `S_CALL_B64`
+now execute bounded local subroutines and verified external fetch-shader calls.
+Native GPU checks pass 42 dispatches and 21,504 exact result words, including
+nested calls and inactive lanes. Game grades and FPS are unchanged by this
+instruction-level check. See the [scalar call report](development/scalar-calls-2026-10-09.md).
+
 ## Compatibility and progress
 
 

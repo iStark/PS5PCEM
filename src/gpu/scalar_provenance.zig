@@ -811,6 +811,7 @@ fn evaluateInto(
     var decoded_cursor: usize = 0;
     var lane_spills = LaneSpills{};
     var setpc_follows: u8 = 0;
+    const has_static_calls = if (decoded_instructions) |instructions| rdna2.scalar_calls.present(instructions) else false;
     var unknown_scalar_exits = BranchSites{};
     var revisited_loop_edges = BranchSites{};
     var dense_walk = steps == null;
@@ -949,10 +950,21 @@ fn evaluateInto(
                 result.stop_reason = .end_program;
                 return;
             },
+            .s_call_b64, .s_swappc_b64 => {
+                const target = if (inst.opcode == .s_call_b64) inst.branch_target else setpcDestinationPc(result, bindings.program_address, inst.*);
+                executeScalar(result, bindings.program_address, inst, &scc);
+                if (target) |dest_pc| {
+                    pc = dest_pc;
+                    dense_walk = true;
+                    continue;
+                }
+                // An AGC-linked external fetch body is attached before vertex
+                // translation; the initial resource walk keeps its continuation.
+            },
             .s_setpc_b64 => {
-                if (setpc_follows < 8) {
+                if (setpc_follows < 8 or has_static_calls) {
                     if (setpcDestinationPc(result, bindings.program_address, inst.*)) |dest_pc| {
-                        setpc_follows += 1;
+                        setpc_follows +|= 1;
                         pc = dest_pc;
                         continue;
                     }
@@ -1351,7 +1363,7 @@ fn executeScalar(result: *Evaluation, program_address: u64, inst: *const rdna2.I
         } else write(result, inst.dst, low.value, low.sources, inst.pc, low.user_bits);
         return;
     }
-    if (inst.opcode == .s_getpc_b64 and inst.dst.kind == .sgpr and inst.dst.reg + 1 < maximum_scalar_registers) {
+    if ((inst.opcode == .s_getpc_b64 or inst.opcode.isCall()) and inst.dst.kind == .sgpr and inst.dst.reg + 1 < maximum_scalar_registers) {
         const address = program_address + inst.pc + 4;
         const sources = Sources{ .program_counter = true };
         result.registers[inst.dst.reg] = .{ .known = true, .value = @truncate(address), .sources = sources, .producer_pc = inst.pc };
@@ -3175,6 +3187,20 @@ test "pack bitfield and 64-bit scan stay known through the scalar prefix" {
     }, &scc);
     try std.testing.expectEqual(@as(u32, 0x0000_0033), result.register(18).?.value);
     try std.testing.expectEqual(@as(u32, 0), result.register(19).?.value);
+}
+
+test "scalar calls preserve a full return pair and visit callee resources" {
+    var bytes: [128]u8 = @splat(0);
+    var memory = TestMemory{ .base = 0x7fffffffc, .bytes = &bytes };
+    const words = [_]u32{ 0xbb080002, 0xbe840320, 0xbf810000, 0xbea003ab, 0xbe802008 };
+    var program = try rdna2.decodeProgram(std.testing.allocator, &words);
+    defer program.deinit(std.testing.allocator);
+    const bindings = testBindings(memory.base, 0);
+    const result = evaluateDecodedResourceState(memory.reader(), &bindings, program.instructions.items);
+    try std.testing.expectEqual(StopReason.end_program, result.stop_reason);
+    try std.testing.expectEqual(@as(u32, 0), result.register(8).?.value);
+    try std.testing.expectEqual(@as(u32, 8), result.register(9).?.value);
+    try std.testing.expectEqual(@as(u32, 43), result.register(4).?.value);
 }
 
 test "scalar provenance follows a GETPC SETPC continuation" {

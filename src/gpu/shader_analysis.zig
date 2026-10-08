@@ -474,7 +474,11 @@ pub fn decodeWithOptions(
     instruction_limit: usize,
     pipeline_options: rdna2.ir.PipelineOptions,
 ) Error!Analysis {
-    return decodeImpl(allocator, reader, address, instruction_limit, null, pipeline_options);
+    return decodeImpl(allocator, reader, address, instruction_limit, null, pipeline_options, false);
+}
+
+pub fn decodeFetchWithOptions(allocator: std.mem.Allocator, reader: shaders.MemoryReader, address: u64, instruction_limit: usize, options: rdna2.ir.PipelineOptions) Error!Analysis {
+    return decodeImpl(allocator, reader, address, instruction_limit, null, options, true);
 }
 
 /// Decodes a program without ever reading beyond the AGC shader allocation.
@@ -513,6 +517,7 @@ pub fn decodeBoundedWithOptions(
         instruction_limit,
         shader_size_bytes / @sizeOf(u32),
         pipeline_options,
+        false,
     );
 }
 
@@ -523,12 +528,14 @@ fn decodeImpl(
     instruction_limit: usize,
     word_limit: ?usize,
     pipeline_options: rdna2.ir.PipelineOptions,
+    fetch_return: bool,
 ) Error!Analysis {
     var code: std.ArrayList(u32) = .empty;
     errdefer code.deinit(allocator);
     var instructions: std.ArrayList(rdna2.Instruction) = .empty;
     errdefer instructions.deinit(allocator);
     var furthest_branch_target: u32 = 0;
+    var saw_end = false;
 
     var word_index: u32 = 0;
     while (instructions.items.len < instruction_limit) {
@@ -552,9 +559,15 @@ fn decodeImpl(
         try instructions.append(allocator, inst);
         word_index += inst.word_count;
         if (inst.opcode.isBranch()) furthest_branch_target = @max(furthest_branch_target, inst.branch_target);
+        if (inst.opcode.isCall()) if (rdna2.scalar_calls.directTarget(instructions.items, instructions.items.len - 1)) |target| {
+            furthest_branch_target = @max(furthest_branch_target, target);
+        };
         // An earlier path can jump beyond this return and intervening padding.
         // Decode through every referenced forward target before ending the body.
-        if (isProgramTerminator(inst) and furthest_branch_target < word_index * 4) break;
+        const terminator = isProgramTerminator(inst) or (fetch_return and inst.opcode == .s_setpc_b64);
+        saw_end = saw_end or inst.opcode.isProgramEnd();
+        if ((terminator or (saw_end and rdna2.scalar_calls.returnTarget(instructions.items, instructions.items.len - 1) != null)) and
+            furthest_branch_target < word_index * 4 and !rdna2.scalar_calls.needsMoreCode(instructions.items)) break;
     } else {
         std.debug.print(
             "[gpu shader] instruction limit program=0x{x} instructions={d} words={d} pc=0x{x} first=0x{x:0>8} last=0x{x:0>8}\n",
@@ -604,12 +617,39 @@ pub fn inlineFetchShader(
     allocator: std.mem.Allocator,
     vertex: []const rdna2.Instruction,
     fetch: []const rdna2.Instruction,
+    fetch_register: ?u32,
     out: *std.ArrayList(rdna2.Instruction),
 ) Error!bool {
     if (fetch.len == 0) return false;
+    const original_len = out.items.len;
+    errdefer out.shrinkRetainingCapacity(original_len);
+    for (vertex, 0..) |call, call_index| {
+        if (call.opcode != .s_swappc_b64 or rdna2.scalar_calls.directTarget(vertex, call_index) != null) continue;
+        if (call.src0.kind != .sgpr or call.src0.reg != fetch_register) return error.InvalidScalarCall;
+        const ret = fetch[fetch.len - 1];
+        if (ret.opcode != .s_setpc_b64 or ret.src0.kind != .sgpr or ret.src0.reg != call.dst.reg) return error.InvalidScalarCall;
+        for (fetch[0 .. fetch.len - 1]) |inst| {
+            if (inst.opcode.isCall() or inst.opcode == .s_setpc_b64 or inst.opcode == .s_getpc_b64 or inst.opcode.isProgramEnd()) return error.InvalidScalarCall;
+        }
+        const fetch_base: u32 = 0x4000_0000;
+        try out.appendSlice(allocator, vertex);
+        out.items[call_index].opcode = .s_call_b64;
+        out.items[call_index].branch_target = fetch_base + fetch[0].pc;
+        out.items[call_index].src0 = .{};
+        out.items[call_index].src_count = 0;
+        for (fetch) |inst| {
+            var relocated = inst;
+            relocated.pc = fetch_base + inst.pc;
+            if (relocated.opcode.isBranch()) relocated.branch_target = fetch_base + inst.branch_target;
+            try out.append(allocator, relocated);
+        }
+        try rdna2.scalar_calls.validate(out.items, false);
+        return true;
+    }
     var setpc_index: ?usize = null;
     for (vertex, 0..) |inst, index| {
         if (inst.opcode != .s_setpc_b64 or isHardwareNggSetpc(inst)) continue;
+        if (rdna2.control_flow.resolveSetpcTargetInstructions(vertex, index) != null) continue;
         setpc_index = index;
     }
     const splice = setpc_index orelse return false;
@@ -1036,7 +1076,7 @@ test "fetch shader body replaces a non-s6 SETPC" {
     };
     var out: std.ArrayList(rdna2.Instruction) = .empty;
     defer out.deinit(std.testing.allocator);
-    try std.testing.expect(try inlineFetchShader(std.testing.allocator, &vs, &fetch, &out));
+    try std.testing.expect(try inlineFetchShader(std.testing.allocator, &vs, &fetch, null, &out));
     try std.testing.expectEqual(@as(usize, 3), out.items.len);
     try std.testing.expectEqual(rdna2.Opcode.s_nop, out.items[0].opcode);
     try std.testing.expectEqual(rdna2.Opcode.buffer_load_format_xyzw, out.items[1].opcode);
@@ -1061,7 +1101,35 @@ test "hardware NGG SETPC is not replaced by a fetch shader" {
     };
     var out: std.ArrayList(rdna2.Instruction) = .empty;
     defer out.deinit(std.testing.allocator);
-    try std.testing.expect(!(try inlineFetchShader(std.testing.allocator, &vs, &fetch, &out)));
+    try std.testing.expect(!(try inlineFetchShader(std.testing.allocator, &vs, &fetch, null, &out)));
+}
+
+test "scalar calls link a verified fetch pointer and preserve its matching return" {
+    const allocator = std.testing.allocator;
+    var vertex = try rdna2.decodeProgram(allocator, &.{ 0xbe882100, 0xbf810000 });
+    defer vertex.deinit(allocator);
+    var memory = TestMemory{};
+    memory.word(0, 0x7e020281); // v1 = 1
+    memory.word(4, 0xbe802008); // return through s8:s9; no ENDPGM follows
+    var fetch = try decodeFetchWithOptions(allocator, memory.reader(), 0, 16, .{});
+    defer fetch.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 2), fetch.program.instructions.items.len);
+    var linked: std.ArrayList(rdna2.Instruction) = .empty;
+    defer linked.deinit(allocator);
+    try std.testing.expectError(error.InvalidScalarCall, inlineFetchShader(allocator, vertex.instructions.items, fetch.program.instructions.items, 2, &linked));
+    try std.testing.expect(try inlineFetchShader(allocator, vertex.instructions.items, fetch.program.instructions.items, 0, &linked));
+    try std.testing.expectEqual(rdna2.Opcode.s_call_b64, linked.items[0].opcode);
+    try std.testing.expectEqual(@as(u32, 0x40000000), linked.items[0].branch_target);
+    var graph = try rdna2.control_flow.buildInstructions(allocator, linked.items);
+    defer graph.deinit(allocator);
+    var program = rdna2.Program{ .code = &.{}, .instructions = linked };
+    var module = try rdna2.translateSpirv(allocator, &program, .{ .stage = .vertex });
+    defer module.deinit(allocator);
+    try std.testing.expect(module.used_dispatcher);
+    var local = try rdna2.decodeProgram(allocator, &.{ 0xbb080001, 0xbf810000, 0xbe800381, 0xbe802008 });
+    defer local.deinit(allocator);
+    linked.clearRetainingCapacity();
+    try std.testing.expect(!(try inlineFetchShader(allocator, local.instructions.items, fetch.program.instructions.items, 0, &linked)));
 }
 
 test "bounded analysis stops before reading beyond AGC shader size" {

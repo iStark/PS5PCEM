@@ -7,8 +7,9 @@ const std = @import("std");
 const isa = @import("isa.zig");
 const operand = @import("operand.zig");
 const instruction = @import("instruction.zig");
+const scalar_calls = @import("scalar_calls.zig");
 
-pub const Error = std.mem.Allocator.Error || error{InvalidBranchTarget};
+pub const Error = std.mem.Allocator.Error || scalar_calls.Error || error{InvalidBranchTarget};
 
 pub const EdgeKind = enum { fallthrough, branch };
 pub const PredicateDomain = enum { none, scalar_uniform, wave_mask };
@@ -123,6 +124,8 @@ pub fn resolveSetpcTarget(program: *const instruction.Program, setpc_index: usiz
 
 pub fn resolveSetpcTargetInstructions(instructions: []const instruction.Instruction, setpc_index: usize) ?u32 {
     if (setpc_index >= instructions.len) return null;
+    if (instructions[setpc_index].opcode.isCall()) return scalar_calls.directTarget(instructions, setpc_index);
+    if (scalar_calls.returnTarget(instructions, setpc_index)) |target| return target;
     const setpc = instructions[setpc_index];
     if (setpc.opcode != .s_setpc_b64 or setpc.src0.kind != .sgpr) return null;
     const pc_reg = setpc.src0.reg;
@@ -315,6 +318,7 @@ pub fn buildInstructionsWithBarriers(allocator: std.mem.Allocator, instructions:
     var graph = Graph{};
     errdefer graph.deinit(allocator);
     if (count == 0) return graph;
+    try scalar_calls.validate(instructions, true);
 
     const leaders = try allocator.alloc(bool, count);
     defer allocator.free(leaders);
@@ -331,7 +335,7 @@ pub fn buildInstructionsWithBarriers(allocator: std.mem.Allocator, instructions:
                 return Error.InvalidBranchTarget;
             leaders[target] = true;
             if (index + 1 < count) leaders[index + 1] = true;
-        } else if (inst.opcode == .s_setpc_b64) {
+        } else if (inst.opcode == .s_setpc_b64 or inst.opcode.isCall()) {
             if (resolveSetpcTargetInstructions(instructions, index)) |target| {
                 if (instructionIndexAtPc(instructions, target)) |target_index| {
                     leaders[target_index] = true;
@@ -363,7 +367,7 @@ pub fn buildInstructionsWithBarriers(allocator: std.mem.Allocator, instructions:
         const last_index = block.first_instruction + block.instruction_count - 1;
         const last = instructions[last_index];
         if (last.opcode.isProgramEnd()) continue;
-        if (last.opcode == .s_setpc_b64) {
+        if (last.opcode == .s_setpc_b64 or last.opcode.isCall()) {
             if (resolveSetpcTargetInstructions(instructions, last_index)) |target| {
                 if (graph.blockForPc(target)) |dest| {
                     try graph.edges.append(allocator, .{
@@ -374,7 +378,7 @@ pub fn buildInstructionsWithBarriers(allocator: std.mem.Allocator, instructions:
                     if (dest <= block_index) graph.back_edge_count += 1;
                 }
             }
-            continue;
+            if (!last.opcode.isCall() or resolveSetpcTargetInstructions(instructions, last_index) != null) continue;
         }
 
         if (last.opcode.isBranch()) {
