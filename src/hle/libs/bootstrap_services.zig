@@ -941,6 +941,14 @@ fn amprMeasureCommandSizeNop(word_count: u32) callconv(abi.guest) u64 {
     return amprAlignUp4(@as(u64, word_count) * 4);
 }
 
+fn amprMeasureCommandSizeWriteAddressFromTimeCounterOnCompletion(_: ?*volatile u64) callconv(abi.guest) u64 {
+    return ampr_fixed_record_size;
+}
+
+fn amprMeasureCommandSizeWriteAddressFromCounterOnCompletion(_: ?*volatile u64, _: u8) callconv(abi.guest) u64 {
+    return ampr_fixed_record_size;
+}
+
 fn amprMeasureCommandSizeNopWithData(word_count: u32, _: ?*const u32) callconv(abi.guest) u64 {
     return amprAlignUp4((@as(u64, word_count) + 1) * 4);
 }
@@ -5060,6 +5068,9 @@ const ampr_exports = [_]symbols.Export{
     .{ .name = "sceAmprMeasureCommandSizeWaitOnCounter", .function = trace.wrap("sceAmprMeasureCommandSizeWaitOnCounter", &amprMeasureCommandSizeFixed32), .expect_id = "6jLL5BIZ88U" },
     .{ .name = "sceAmprMeasureCommandSizeWriteAddressOnCompletion", .function = trace.wrap("sceAmprMeasureCommandSizeWriteAddressOnCompletion", &amprMeasureCommandSizeFixed32), .expect_id = "C+IEj+BsAFM" },
     .{ .name = "sceAmprMeasureCommandSizeWriteCounterOnCompletion", .function = trace.wrap("sceAmprMeasureCommandSizeWriteCounterOnCompletion", &amprMeasureCommandSizeFixed32), .expect_id = "4muPEJ-x5N8" },
+    .{ .name = "sceAmprMeasureCommandSizeWriteAddressFromTimeCounterOnCompletion", .function = trace.wrap("sceAmprMeasureCommandSizeWriteAddressFromTimeCounterOnCompletion", &amprMeasureCommandSizeWriteAddressFromTimeCounterOnCompletion), .expect_id = "x7SQEXfeovg" },
+    .{ .name = "sceAmprMeasureCommandSizeWriteAddressFromCounterOnCompletion", .function = trace.wrap("sceAmprMeasureCommandSizeWriteAddressFromCounterOnCompletion", &amprMeasureCommandSizeWriteAddressFromCounterOnCompletion), .expect_id = "32AcaTaBPSY" },
+    .{ .name = "sceAmprMeasureCommandSizeWriteAddressFromCounterPairOnCompletion", .function = trace.wrap("sceAmprMeasureCommandSizeWriteAddressFromCounterPairOnCompletion", &amprMeasureCommandSizeWriteAddressFromCounterOnCompletion), .expect_id = "vxC58+DRk-U" },
     .{ .name = "sceAmprMeasureCommandSizeWriteKernelEventQueueOnCompletion", .function = trace.wrap("sceAmprMeasureCommandSizeWriteKernelEventQueueOnCompletion", &amprMeasureCommandSizeWriteKernelEventQueue), .expect_id = "Zi3dBUjgyXI" },
     .{ .name = "sceAmprCommandBufferConstructor", .function = trace.wrap("sceAmprCommandBufferConstructor", &amprCommandBufferConstructor), .expect_id = "8aI7R7WaOlc" },
     .{ .name = "sceAmprAprCommandBufferConstructor", .function = trace.wrap("sceAmprAprCommandBufferConstructor", &amprAprCommandBufferConstructor), .expect_id = "a8uLzYY--tM" },
@@ -6222,7 +6233,7 @@ test "AMPR completion ABI links and publishes writes before its event" {
         "V7GQTEeUfhw", "FrCNL9TQ8ms", "sJXyWHjP-F8", "3wn42MWTzTs",
         "o67gODLFpls", "FI2JD0jAHCs", "gSF5OsXdfIg", "ZLWtNUP6R5E",
         "jIlc4p5dSD0", "6jLL5BIZ88U", "C+IEj+BsAFM", "4muPEJ-x5N8",
-        "Zi3dBUjgyXI",
+        "Zi3dBUjgyXI", "x7SQEXfeovg", "32AcaTaBPSY", "vxC58+DRk-U",
     }) |id| {
         const symbol = db.findById(id, .function) orelse return error.TestExpectedSymbol;
         try std.testing.expectEqualStrings("libSceAmpr", symbol.key.library.name);
@@ -6269,6 +6280,34 @@ test "AMPR completion ABI links and publishes writes before its event" {
     try std.testing.expectEqual(@as(u64, 11), Sink.event.?.ident);
     try std.testing.expectEqual(data, Sink.event.?.completion_token);
     try std.testing.expectEqual(data, Sink.event.?.user_data);
+}
+
+test "AMPR completion counter measurement exports match their recorded packets" {
+    var db = symbols.Database{};
+    defer db.deinit(std.testing.allocator);
+    try register(&db, std.testing.allocator);
+    const MeasureTime = *const fn (?*volatile u64) callconv(abi.guest) u64;
+    const MeasureCounter = *const fn (?*volatile u64, u8) callconv(abi.guest) u64;
+    const measure_time: MeasureTime = @ptrFromInt(db.findById("x7SQEXfeovg", .function).?.address);
+    const measure_counter: MeasureCounter = @ptrFromInt(db.findById("32AcaTaBPSY", .function).?.address);
+    const measure_pair: MeasureCounter = @ptrFromInt(db.findById("vxC58+DRk-U", .function).?.address);
+    apr.reset();
+    defer apr.reset();
+    var header: [ampr_command_buffer_header_size]u8 align(8) = @splat(0);
+    var storage: [0x60]u8 align(8) = @splat(0);
+    var destination: u64 = 0x1234;
+    const address = @intFromPtr(&header);
+    try std.testing.expectEqual(errno.ok, amprCommandBufferConstructor(address));
+    try std.testing.expectEqual(errno.ok, amprCommandBufferSetBuffer(address, @intFromPtr(&storage), storage.len));
+    try std.testing.expectEqual(errno.ok, amprCommandBufferWriteAddressFromTimeCounterOnCompletion(address, &destination));
+    try std.testing.expectEqual(measure_time(&destination), amprCommandBufferGetCurrentOffset(address));
+    try std.testing.expectEqual(errno.ok, amprCommandBufferWriteAddressFromCounterOnCompletion(address, &destination, 7));
+    try std.testing.expectEqual(measure_time(&destination) + measure_counter(&destination, 7), amprCommandBufferGetCurrentOffset(address));
+    try std.testing.expectEqual(errno.ok, amprCommandBufferWriteAddressFromCounterPairOnCompletion(address, &destination, 254));
+    try std.testing.expectEqual(measure_time(&destination) + measure_counter(&destination, 7) + measure_pair(&destination, 254), amprCommandBufferGetCurrentOffset(address));
+    try std.testing.expectEqual(@as(u64, storage.len), amprCommandBufferGetCurrentOffset(address));
+    try std.testing.expectEqual(@as(u64, 0x1234), destination);
+    try std.testing.expectEqual(@as(u64, 32), measure_time(null));
 }
 
 test "AMPR gather and scatter continue a recorded file read" {

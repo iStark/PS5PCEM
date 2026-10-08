@@ -6,6 +6,13 @@ Guest binaries do not ship the firmware they call into. Every import is a numeri
 identifier, and the runtime is expected to supply an implementation. This module
 provides that machinery and the firmware libraries built on top of it.
 
+The HLE PNG encoder accepts pitched RGBA/BGRA pixels and produces standard
+RGB/RGBA PNGs with selectable filters and compression levels. RTC supplies
+calendar checks, FILETIME conversions and checked signed tick arithmetic.
+AMPR completion-size queries match the existing 32-byte records; hardware
+counter behavior remains incomplete. See the
+[PNG, RTC and AMPR validation report](../development/hle-png-rtc-ampr-2026-10-09.md).
+
 ## Symbol identifiers
 
 An import is an 11-character identifier derived from the export name: SHA-1 over

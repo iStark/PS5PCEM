@@ -4,6 +4,8 @@
 //! Bootstrap-level platform services imported by Unity support PRXs.
 
 const std = @import("std");
+const builtin = @import("builtin");
+const memory = @import("memory");
 const abi = @import("../abi.zig");
 const trace = @import("../trace.zig");
 const errno = @import("../errno.zig");
@@ -14,8 +16,16 @@ const video_out = @import("../video_out.zig");
 
 const rtc_unix_epoch_microseconds: i96 = 62_135_596_800 * std.time.us_per_s;
 const rtc_error_invalid_pointer: i32 = @bitCast(@as(u32, 0x80b5_0002));
-const rtc_error_invalid_value: i32 = @bitCast(@as(u32, 0x80b5_0004));
+const rtc_error_invalid_value: i32 = @bitCast(@as(u32, 0x80b5_0003));
 const rtc_error_invalid_year: i32 = @bitCast(@as(u32, 0x80b5_0008));
+const rtc_error_invalid_month: i32 = @bitCast(@as(u32, 0x80b5_0009));
+const rtc_error_invalid_day: i32 = @bitCast(@as(u32, 0x80b5_000a));
+const rtc_error_invalid_hour: i32 = @bitCast(@as(u32, 0x80b5_000b));
+const rtc_error_invalid_minute: i32 = @bitCast(@as(u32, 0x80b5_000c));
+const rtc_error_invalid_second: i32 = @bitCast(@as(u32, 0x80b5_000d));
+const rtc_error_invalid_microsecond: i32 = @bitCast(@as(u32, 0x80b5_000e));
+const rtc_filetime_epoch: u64 = 0xb36168b6a58000;
+const rtc_calendar_end: u64 = 3_652_059 * std.time.us_per_day;
 const gen2_error_memory_fault: i32 = @bitCast(@as(u32, 0x8002_0101));
 const net_ctl_error_invalid_address: i32 = @bitCast(@as(u32, 0x8041_2107));
 const net_ctl_error_not_connected: i32 = @bitCast(@as(u32, 0x8041_2108));
@@ -179,6 +189,8 @@ fn civilFromDays(days_since_unix_epoch: i64) RtcDateTime {
 }
 
 fn rtcDateTimeFromTick(tick: u64) ?RtcDateTime {
+    // Reject before narrowing the calculated year to u16.
+    if (tick >= rtc_calendar_end) return null;
     const unix_microseconds: i128 = @as(i128, tick) - rtc_unix_epoch_microseconds;
     const microseconds_per_day: i128 = std.time.us_per_day;
     const days = @divFloor(unix_microseconds, microseconds_per_day);
@@ -370,7 +382,8 @@ pub fn rtcParseRFC3339(tick_pointer: ?*u64, text_pointer: ?[*:0]const u8) callco
 
 fn checkedRtcOutput(output: ?*RtcDateTime) ?*RtcDateTime {
     const destination = output orelse return null;
-    if (!kernel_memory.isGuestRangeAccessible(@intFromPtr(destination), @sizeOf(RtcDateTime))) return null;
+    if (!rtcWritable(@intFromPtr(destination), @sizeOf(RtcDateTime))) return null;
+    rtcNotifyWrite(@intFromPtr(destination), @sizeOf(RtcDateTime));
     return destination;
 }
 
@@ -442,15 +455,20 @@ pub fn rtcGetTimeT(time_pointer: ?*const RtcDateTime, output: ?*i64) callconv(ab
 }
 
 pub fn rtcTickAddDays(output: ?*u64, source: ?*const u64, days: i32) callconv(abi.guest) i32 {
+    return rtcAddScaled(output, source, days, std.time.us_per_day);
+}
+
+fn rtcAddScaled(output: ?*u64, source: ?*const u64, count: i64, unit: u64) i32 {
     const destination = output orelse return rtc_error_invalid_pointer;
     const input = source orelse return rtc_error_invalid_pointer;
-    if (!kernel_memory.isGuestRangeAccessible(@intFromPtr(destination), @sizeOf(u64)) or
+    if (!rtcWritable(@intFromPtr(destination), @sizeOf(u64)) or
         !kernel_memory.isGuestRangeAccessible(@intFromPtr(input), @sizeOf(u64)))
     {
         return gen2_error_memory_fault;
     }
-    const adjusted = @as(i128, input.*) + @as(i128, days) * std.time.us_per_day;
+    const adjusted = @as(i128, input.*) + @as(i128, count) * unit;
     if (adjusted < 0 or adjusted > std.math.maxInt(u64)) return rtc_error_invalid_value;
+    rtcNotifyWrite(@intFromPtr(destination), @sizeOf(u64));
     destination.* = @intCast(adjusted);
     return errno.ok;
 }
@@ -485,6 +503,95 @@ pub fn rtcSetTimeT(output: ?*RtcDateTime, seconds: i64) callconv(abi.guest) i32 
     if (tick > std.math.maxInt(u64)) return rtc_error_invalid_value;
     destination.* = rtcDateTimeFromTick(@intCast(tick)) orelse return rtc_error_invalid_value;
     return errno.ok;
+}
+
+fn rtcWritable(address: u64, len: usize) bool {
+    if (address == 0) return false;
+    if (kernel_memory.attachedAddressSpace()) |space| {
+        if (space.isWritable(address, len)) return true;
+    } else if (builtin.os.tag != .windows) {
+        // Without a guest address space these are host-only library calls.
+        return true;
+    }
+    return memory.isHostRangeWritable(address, len);
+}
+
+fn rtcNotifyWrite(address: u64, len: usize) void {
+    if (kernel_memory.attachedAddressSpace()) |space| space.notifyGuestWrite(address, len);
+}
+
+fn rtcCheckValid(time: ?*const RtcDateTime) callconv(abi.guest) i32 {
+    const input = time orelse return rtc_error_invalid_pointer;
+    if (!kernel_memory.isGuestRangeAccessible(@intFromPtr(input), @sizeOf(RtcDateTime))) return gen2_error_memory_fault;
+    const value = input.*;
+    if (value.year < 1 or value.year > 9999) return rtc_error_invalid_year;
+    const days = rtcGetDaysInMonth(value.year, value.month);
+    if (days < 0) return days;
+    if (value.day < 1 or value.day > days) return rtc_error_invalid_day;
+    if (value.hour > 23) return rtc_error_invalid_hour;
+    if (value.minute > 59) return rtc_error_invalid_minute;
+    if (value.second > 59) return rtc_error_invalid_second;
+    if (value.microsecond >= std.time.us_per_s) return rtc_error_invalid_microsecond;
+    return errno.ok;
+}
+
+fn rtcGetDaysInMonth(year: i32, month: i32) callconv(abi.guest) i32 {
+    if (year < 1 or year > 9999) return rtc_error_invalid_year;
+    if (month < 1 or month > 12) return rtc_error_invalid_month;
+    return std.time.epoch.getDaysInMonth(@intCast(year), @enumFromInt(@as(u4, @intCast(month))));
+}
+
+fn rtcGetCurrentClock(output: ?*RtcDateTime, offset_minutes: i32) callconv(abi.guest) i32 {
+    const destination = output orelse return rtc_error_invalid_pointer;
+    if (!rtcWritable(@intFromPtr(destination), @sizeOf(RtcDateTime))) return gen2_error_memory_fault;
+    const now: i128 = rtc_unix_epoch_microseconds + @divTrunc(adjustedRealTimeNanoseconds(), std.time.ns_per_us);
+    const adjusted = now + @as(i128, offset_minutes) * std.time.us_per_min;
+    if (adjusted < 0 or adjusted >= rtc_calendar_end) return rtc_error_invalid_value;
+    const value = rtcDateTimeFromTick(@intCast(adjusted)) orelse return rtc_error_invalid_value;
+    rtcNotifyWrite(@intFromPtr(destination), @sizeOf(RtcDateTime));
+    destination.* = value;
+    return errno.ok;
+}
+
+fn rtcGetWin32FileTime(time: ?*const RtcDateTime, output: ?*u64) callconv(abi.guest) i32 {
+    const destination = output orelse return rtc_error_invalid_pointer;
+    const valid = rtcCheckValid(time);
+    if (valid != errno.ok) return valid;
+    if (!rtcWritable(@intFromPtr(destination), @sizeOf(u64))) return gen2_error_memory_fault;
+    const tick = tickFromRtcDateTime(time.?.*) orelse return rtc_error_invalid_value;
+    const value = (tick -| rtc_filetime_epoch) * 10;
+    rtcNotifyWrite(@intFromPtr(destination), @sizeOf(u64));
+    destination.* = value;
+    return errno.ok;
+}
+
+fn rtcSetWin32FileTime(output: ?*RtcDateTime, file_time: u64) callconv(abi.guest) i32 {
+    const destination = output orelse return rtc_error_invalid_pointer;
+    if (!rtcWritable(@intFromPtr(destination), @sizeOf(RtcDateTime))) return gen2_error_memory_fault;
+    const tick = file_time / 10 + rtc_filetime_epoch;
+    const value = rtcDateTimeFromTick(tick) orelse return rtc_error_invalid_value;
+    rtcNotifyWrite(@intFromPtr(destination), @sizeOf(RtcDateTime));
+    destination.* = value;
+    return errno.ok;
+}
+
+fn rtcTickAddTicks(output: ?*u64, input: ?*const u64, count: i64) callconv(abi.guest) i32 {
+    return rtcAddScaled(output, input, count, 1);
+}
+fn rtcTickAddMicroseconds(output: ?*u64, input: ?*const u64, count: i64) callconv(abi.guest) i32 {
+    return rtcAddScaled(output, input, count, 1);
+}
+fn rtcTickAddSeconds(output: ?*u64, input: ?*const u64, count: i64) callconv(abi.guest) i32 {
+    return rtcAddScaled(output, input, count, std.time.us_per_s);
+}
+fn rtcTickAddMinutes(output: ?*u64, input: ?*const u64, count: i64) callconv(abi.guest) i32 {
+    return rtcAddScaled(output, input, count, std.time.us_per_min);
+}
+fn rtcTickAddHours(output: ?*u64, input: ?*const u64, count: i32) callconv(abi.guest) i32 {
+    return rtcAddScaled(output, input, count, std.time.us_per_hour);
+}
+fn rtcTickAddWeeks(output: ?*u64, input: ?*const u64, count: i32) callconv(abi.guest) i32 {
+    return rtcAddScaled(output, input, count, 7 * std.time.us_per_day);
 }
 
 const VideoOutColorSettings = extern struct {
@@ -545,6 +652,17 @@ const net_ctl_exports = [_]symbols.Export{
 };
 
 const rtc_exports = [_]symbols.Export{
+    .{ .name = "sceRtcCheckValid", .function = trace.wrap("sceRtcCheckValid", &rtcCheckValid), .expect_id = "lPEBYdVX0XQ" },
+    .{ .name = "sceRtcGetCurrentClock", .function = trace.wrap("sceRtcGetCurrentClock", &rtcGetCurrentClock), .expect_id = "8lfvnRMqwEM" },
+    .{ .name = "sceRtcGetDaysInMonth", .function = trace.wrap("sceRtcGetDaysInMonth", &rtcGetDaysInMonth), .expect_id = "3O7Ln8AqJ1o" },
+    .{ .name = "sceRtcGetWin32FileTime", .function = trace.wrap("sceRtcGetWin32FileTime", &rtcGetWin32FileTime), .expect_id = "jfRO0uTjtzA" },
+    .{ .name = "sceRtcSetWin32FileTime", .function = trace.wrap("sceRtcSetWin32FileTime", &rtcSetWin32FileTime), .expect_id = "n5JiAJXsbcs" },
+    .{ .name = "sceRtcTickAddTicks", .function = trace.wrap("sceRtcTickAddTicks", &rtcTickAddTicks), .expect_id = "AqVMssr52Rc" },
+    .{ .name = "sceRtcTickAddMicroseconds", .function = trace.wrap("sceRtcTickAddMicroseconds", &rtcTickAddMicroseconds), .expect_id = "XPIiw58C+GM" },
+    .{ .name = "sceRtcTickAddSeconds", .function = trace.wrap("sceRtcTickAddSeconds", &rtcTickAddSeconds), .expect_id = "07O525HgICs" },
+    .{ .name = "sceRtcTickAddMinutes", .function = trace.wrap("sceRtcTickAddMinutes", &rtcTickAddMinutes), .expect_id = "mn-tf4QiFzk" },
+    .{ .name = "sceRtcTickAddHours", .function = trace.wrap("sceRtcTickAddHours", &rtcTickAddHours), .expect_id = "MDc5cd8HfCA" },
+    .{ .name = "sceRtcTickAddWeeks", .function = trace.wrap("sceRtcTickAddWeeks", &rtcTickAddWeeks), .expect_id = "gI4t194c2W8" },
     .{
         .name = "sceRtcGetCurrentTick",
         .function = trace.wrap("sceRtcGetCurrentTick", &rtcGetCurrentTick),
@@ -601,6 +719,109 @@ test "RTC calendar and tick conversions preserve subsecond time" {
     try std.testing.expectEqual(@as(i32, 4), rtcGetDayOfWeek(1970, 1, 1));
     try std.testing.expectEqual(@as(i32, 1), rtcIsLeapYear(2024));
     try std.testing.expectEqual(@as(i32, 0), rtcIsLeapYear(2023));
+}
+
+test "RTC validation reports the first invalid calendar field" {
+    const valid = RtcDateTime{ .year = 2000, .month = 2, .day = 29, .hour = 23, .minute = 59, .second = 59, .microsecond = 999999 };
+    try std.testing.expectEqual(errno.ok, rtcCheckValid(&valid));
+    try std.testing.expectEqual(@as(i32, 29), rtcGetDaysInMonth(2000, 2));
+    try std.testing.expectEqual(@as(i32, 28), rtcGetDaysInMonth(1900, 2));
+    try std.testing.expectEqual(@as(i32, 28), rtcGetDaysInMonth(2100, 2));
+    const cases = .{
+        .{ "year", 0, rtc_error_invalid_year },
+        .{ "year", 10000, rtc_error_invalid_year },
+        .{ "year", 1900, rtc_error_invalid_day },
+        .{ "month", 13, rtc_error_invalid_month },
+        .{ "day", 30, rtc_error_invalid_day },
+        .{ "hour", 24, rtc_error_invalid_hour },
+        .{ "minute", 60, rtc_error_invalid_minute },
+        .{ "second", 60, rtc_error_invalid_second },
+        .{ "microsecond", 1000000, rtc_error_invalid_microsecond },
+    };
+    inline for (cases) |case| {
+        var input = valid;
+        @field(input, case[0]) = case[1];
+        try std.testing.expectEqual(case[2], rtcCheckValid(&input));
+    }
+    try std.testing.expectEqual(rtc_error_invalid_pointer, rtcCheckValid(null));
+}
+
+test "RTC FILETIME epochs fractions and invalid wide ticks" {
+    var output: RtcDateTime = undefined;
+    try std.testing.expectEqual(errno.ok, rtcSetWin32FileTime(&output, 0));
+    try std.testing.expectEqual(@as(u16, 1601), output.year);
+    try std.testing.expectEqual(@as(u16, 1), output.month);
+    try std.testing.expectEqual(@as(u16, 1), output.day);
+    var file_time: u64 = 1;
+    try std.testing.expectEqual(errno.ok, rtcGetWin32FileTime(&output, &file_time));
+    try std.testing.expectEqual(@as(u64, 0), file_time);
+    const unix_filetime: u64 = 116444736000000000;
+    try std.testing.expectEqual(errno.ok, rtcSetWin32FileTime(&output, unix_filetime + 1234569));
+    try std.testing.expectEqual(@as(u16, 1970), output.year);
+    try std.testing.expectEqual(@as(u32, 123456), output.microsecond);
+    try std.testing.expectEqual(errno.ok, rtcGetWin32FileTime(&output, &file_time));
+    try std.testing.expectEqual(unix_filetime + 1234560, file_time);
+    const before = output;
+    try std.testing.expectEqual(rtc_error_invalid_value, rtcSetWin32FileTime(&output, std.math.maxInt(u64)));
+    const huge_tick: u64 = std.math.maxInt(u64);
+    try std.testing.expectEqual(rtc_error_invalid_value, rtcSetTick(&output, &huge_tick));
+    try std.testing.expectEqualDeep(before, output);
+    var first_tick: u64 = 0;
+    try std.testing.expectEqual(errno.ok, rtcSetTick(&output, &first_tick));
+    try std.testing.expectEqual(@as(u16, 1), output.year);
+    try std.testing.expectEqual(errno.ok, rtcGetWin32FileTime(&output, &file_time));
+    try std.testing.expectEqual(@as(u64, 0), file_time);
+    first_tick = rtc_calendar_end - 1;
+    try std.testing.expectEqual(errno.ok, rtcSetTick(&output, &first_tick));
+    try std.testing.expectEqual(@as(u16, 9999), output.year);
+}
+
+test "RTC tick arithmetic supports signed and aliased inputs without overflow" {
+    var value: u64 = 2 * std.time.us_per_day;
+    try std.testing.expectEqual(errno.ok, rtcTickAddSeconds(&value, &value, -1));
+    try std.testing.expectEqual(2 * std.time.us_per_day - std.time.us_per_s, value);
+    try std.testing.expectEqual(errno.ok, rtcTickAddMinutes(&value, &value, 1));
+    try std.testing.expectEqual(errno.ok, rtcTickAddHours(&value, &value, -1));
+    try std.testing.expectEqual(errno.ok, rtcTickAddWeeks(&value, &value, 1));
+    try std.testing.expectEqual(errno.ok, rtcTickAddMicroseconds(&value, &value, 9));
+    try std.testing.expectEqual(9 * std.time.us_per_day - std.time.us_per_hour + 59 * std.time.us_per_s + 9, value);
+    const before = value;
+    try std.testing.expectEqual(rtc_error_invalid_value, rtcTickAddMinutes(&value, &value, std.math.maxInt(i64)));
+    try std.testing.expectEqual(rtc_error_invalid_value, rtcTickAddSeconds(&value, &value, std.math.minInt(i64)));
+    try std.testing.expectEqual(before, value);
+    const zero: u64 = 0;
+    const maximum: u64 = std.math.maxInt(u64);
+    try std.testing.expectEqual(rtc_error_invalid_value, rtcTickAddTicks(&value, &zero, -1));
+    try std.testing.expectEqual(rtc_error_invalid_value, rtcTickAddTicks(&value, &maximum, 1));
+    try std.testing.expectEqual(before, value);
+}
+
+test "RTC current clock applies explicit minute offsets" {
+    var before: u64 = 0;
+    var after: u64 = 0;
+    var date: RtcDateTime = undefined;
+    for ([_]i32{ -90, 0, 180 }) |offset| {
+        try std.testing.expectEqual(errno.ok, rtcGetCurrentTick(&before));
+        try std.testing.expectEqual(errno.ok, rtcGetCurrentClock(&date, offset));
+        try std.testing.expectEqual(errno.ok, rtcGetCurrentTick(&after));
+        const actual = @as(i128, tickFromRtcDateTime(date).?) - @as(i128, offset) * std.time.us_per_min;
+        try std.testing.expect(actual >= before and actual <= after);
+    }
+}
+
+test "RTC refuses inaccessible pointers and read-only outputs" {
+    var space = try memory.AddressSpace.initWithDirectMemory(std.testing.allocator, memory.page_size);
+    defer space.deinit();
+    kernel_memory.init(std.testing.allocator);
+    defer kernel_memory.deinit();
+    kernel_memory.attachAddressSpace(&space);
+    const address = memory.user.start;
+    try space.mapFixed(address, memory.page_size, .read_only, .direct_memory, 0);
+    const tick: u64 = 0;
+    try std.testing.expectEqual(gen2_error_memory_fault, rtcCheckValid(@ptrFromInt(address + 2 * memory.page_size)));
+    try std.testing.expectEqual(gen2_error_memory_fault, rtcTickAddTicks(@ptrFromInt(address), &tick, 1));
+    try std.testing.expectEqual(gen2_error_memory_fault, rtcSetWin32FileTime(@ptrFromInt(address), 0));
+    try std.testing.expectEqual(gen2_error_memory_fault, rtcGetCurrentClock(@ptrFromInt(address), 0));
 }
 
 test "network control reports a coherent disconnected console" {

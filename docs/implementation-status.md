@@ -18,6 +18,12 @@ behind them.
   direct memory or released while committed. Batch commit, decommit, protect,
   and type/protect work; MOVE remains explicitly unsupported. See the
   [MemoryPool implementation and validation report](development/memory-pool-2026-10-08.md).
+- PNG encoding now produces 8-bit RGB/RGBA files from pitched RGBA/BGRA input,
+  with selectable filters, compression levels 0-9, and bounded output writes.
+  RTC adds calendar validation, FILETIME conversion, and checked tick arithmetic;
+  three AMPR completion-size queries close their missing export registrations.
+  Hardware AMPR counters remain incomplete. See the
+  [PNG, RTC and AMPR report](development/hle-png-rtc-ampr-2026-10-09.md).
 - Live VideoOut reaches a Vulkan swapchain, while host audio accepts decoded
   guest buffers at 48 kHz. SceAvPlayer uses FFmpeg for H.264/AAC media and
   returns synchronized NV12 video plus stereo PCM through the title's own
