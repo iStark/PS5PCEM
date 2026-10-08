@@ -331,7 +331,7 @@ fn mimgOpcode(id: u32) isa.Opcode {
         0x1a => .image_atomic_xor,
         0x1f => .image_atomic_fmax,
         0x20...0x3f, 0x68...0x6f, 0xa0...0xbe => .image_sample,
-        0x44, 0x47, 0x48, 0x4c, 0x4f, 0x54, 0x57, 0x58, 0x5c, 0x5f, 0x61 => .image_gather4,
+        0x44, 0x47, 0x48, 0x4c, 0x4f, 0x54, 0x57, 0x58, 0x5c, 0x5f, 0x61, 0x62 => .image_gather4,
         0x60 => .image_get_lod,
         0xe6 => .image_bvh_intersect_ray,
         0xe7 => .image_bvh64_intersect_ray,
@@ -393,7 +393,7 @@ pub fn decodeMimg(pc: u32, code: []const u32, word_index: u32) Error!Instruction
     };
     inst.setRawWords(code, word_index, word_count);
     inst.data_mask = @intCast((word0 >> 8) & 0xf);
-    inst.data_words = if (op == .image_gather4) 4 else @max(1, bitCount4(inst.data_mask));
+    inst.data_words = if (op == .image_gather4 and id != 0x62) 4 else @max(1, bitCount4(inst.data_mask));
     inst.globally_coherent = (word0 >> 13) & 1 != 0;
     inst.image_r128 = (word0 >> 15) & 1 != 0;
     switch (id) {
@@ -401,7 +401,7 @@ pub fn decodeMimg(pc: u32, code: []const u32, word_index: u32) Error!Instruction
         0x43, 0x4b, 0x71, 0x74 => inst.image_elements = 4,
         else => {},
     }
-    inst.image_packed = id == 0x70 or id == 0x71 or id == 0x73 or id == 0x74;
+    inst.image_packed = id == 0x62 or id == 0x70 or id == 0x71 or id == 0x73 or id == 0x74;
     inst.system_coherent = (word0 >> 25) & 1 != 0;
     inst.image_sample_flags.a16 = (word1 >> 30) & 1 != 0;
     // GFX10 MIMG bit 63 packs two returned/stored 16-bit components per VGPR.
@@ -470,7 +470,13 @@ pub fn decodeMimg(pc: u32, code: []const u32, word_index: u32) Error!Instruction
                 inst.image_sample_flags.level_zero = true;
                 inst.image_sample_flags.offset = true;
             },
-            0x61 => inst.image_sample_flags.gather_horizontal = true,
+            0x61, 0x62 => {
+                inst.image_sample_flags.gather_horizontal = true;
+                const dimension_valid = inst.image_dimension == .dim_2d or (id == 0x62 and inst.image_dimension == .dim_1d);
+                if (!dimension_valid or inst.data_mask == 0 or (id == 0x61 and @popCount(inst.data_mask) != 1) or
+                    inst.image_r128 or word1 & 0xc0000000 != 0)
+                    inst.setUnsupported(.mimg, id, "horizontal gather requires full 1D/2D descriptors, 32-bit addresses/data and a valid DMASK");
+            },
             else => {},
         }
     }
@@ -627,6 +633,33 @@ test "MIMG multi-texel loads preserve widths and consecutive or NSA addresses" {
             if (nsa != 0) try std.testing.expectEqual(@as(u8, 44), inst.image_nsa_address[1]);
         }
     }
+}
+
+test "MIMG horizontal gather DMASK describes a channel or packed output words" {
+    for ([_]u32{ 0x61, 0x62 }) |id| {
+        for (1..16) |mask| {
+            const code = [_]u32{ 0xf000000a | (id << 18) | (@as(u32, @intCast(mask)) << 8), 0x00610a1e, 0x00000028 };
+            const inst = try decodeMimg(0x10, &code, 0);
+            if (id == 0x61 and @popCount(mask) != 1) {
+                try std.testing.expectEqual(isa.Opcode.unsupported, inst.opcode);
+                continue;
+            }
+            try std.testing.expectEqual(isa.Opcode.image_gather4, inst.opcode);
+            try std.testing.expect(inst.image_sample_flags.gather_horizontal);
+            try std.testing.expectEqual(id == 0x62, inst.image_packed);
+            try std.testing.expectEqual(@as(u8, if (id == 0x61) 4 else @intCast(@popCount(mask))), inst.data_words);
+            try std.testing.expectEqual(@as(u32, 3), inst.word_count);
+            try std.testing.expectEqual(@as(u8, 40), inst.image_nsa_address[0]);
+        }
+        for ([_][2]u32{ .{ 0, 0 }, .{ 0x100, 1 << 30 }, .{ 0x100, 1 << 31 }, .{ 0x8100, 0 } }) |controls| {
+            const inst = try decodeMimg(0, &.{ 0xf0000008 | (id << 18) | controls[0], controls[1] }, 0);
+            try std.testing.expectEqual(isa.Opcode.unsupported, inst.opcode);
+        }
+    }
+    const one_d = try decodeMimg(0, &.{ 0xf1880500, 0 }, 0);
+    try std.testing.expectEqual(isa.Opcode.image_gather4, one_d.opcode);
+    try std.testing.expectEqual(@as(u8, 1), one_d.image_address_components);
+    try std.testing.expectEqual(@as(u8, 2), one_d.data_words);
 }
 
 test "MIMG multi-texel loads reject unsupported controls and stores explicitly" {

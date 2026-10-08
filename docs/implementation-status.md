@@ -34,6 +34,11 @@ behind them.
   registers. Integer sampled descriptors retain their numeric type. Stores
   and unmeasured format/descriptor combinations remain unsupported. See the
   [MIMG implementation and validation report](development/mimg-multi-texel-2026-10-09.md).
+- IMAGE_GATHER4H and IMAGE_GATHER4H_PCK now execute native horizontal
+  channel gathers and packed raw-texel streams with correct DMASK widths,
+  edge handling and register preservation. The measured direct 1D/2D subset
+  is covered by 1,242 GPU dispatches; other descriptor/control modes remain
+  explicit limitations. See the [horizontal gather report](development/gather4h-2026-10-09.md).
 - Live VideoOut reaches a Vulkan swapchain, while host audio accepts decoded
   guest buffers at 48 kHz. SceAvPlayer uses FFmpeg for H.264/AAC media and
   returns synchronized NV12 video plus stereo PCM through the title's own

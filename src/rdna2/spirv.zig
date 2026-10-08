@@ -731,6 +731,29 @@ fn storageImageValueType(format: StorageImageFormat) ValueType {
 
 pub const MultiTexelFormat = struct { component_bits: u5, components: u3, value_type: ValueType };
 
+pub const HorizontalGatherFormat = struct { component_bits: u6, components: u3, value_type: ValueType, unorm: bool = false };
+
+pub fn horizontalGatherFormat(inst: instruction.Instruction, format: StorageImageFormat) ?HorizontalGatherFormat {
+    var info: HorizontalGatherFormat = switch (format) {
+        .r8_unorm, .r8_snorm, .r8_uint, .r8_sint => .{ .component_bits = 8, .components = 1, .value_type = storageImageValueType(format) },
+        .rg8_unorm, .rg8_snorm, .rg8_uint, .rg8_sint => .{ .component_bits = 8, .components = 2, .value_type = storageImageValueType(format) },
+        .rgba8_unorm, .rgba8_snorm, .rgba8_uint, .rgba8_sint => .{ .component_bits = 8, .components = 4, .value_type = storageImageValueType(format) },
+        .r16_unorm, .r16_snorm, .r16_uint, .r16_sint, .r16_float => .{ .component_bits = 16, .components = 1, .value_type = storageImageValueType(format) },
+        .rg16_unorm, .rg16_snorm, .rg16_uint, .rg16_sint, .rg16_float => .{ .component_bits = 16, .components = 2, .value_type = storageImageValueType(format) },
+        .rgba16_unorm, .rgba16_snorm, .rgba16_uint, .rgba16_sint, .rgba16_float => .{ .component_bits = 16, .components = 4, .value_type = storageImageValueType(format) },
+        .r32_uint, .r32_sint, .r32_float => .{ .component_bits = 32, .components = 1, .value_type = storageImageValueType(format) },
+        .rg32_uint, .rg32_sint, .rg32_float => .{ .component_bits = 32, .components = 2, .value_type = storageImageValueType(format) },
+        .rgba32_uint, .rgba32_sint, .rgba32_float => .{ .component_bits = 32, .components = 4, .value_type = storageImageValueType(format) },
+        else => return null,
+    };
+    info.unorm = switch (format) {
+        .r8_unorm, .rg8_unorm, .rgba8_unorm, .r16_unorm, .rg16_unorm, .rgba16_unorm => true,
+        else => false,
+    };
+    if (inst.image_packed and info.value_type == .float32 and !info.unorm and info.component_bits != 32) return null;
+    return info;
+}
+
 /// The hardware-tested 2D subset. Packed SNORM/FLOAT and wider formats have
 /// different conversion rules and must not be guessed from ordinary loads.
 pub fn multiTexelFormat(inst: instruction.Instruction, format: StorageImageFormat) ?MultiTexelFormat {
@@ -7363,7 +7386,118 @@ const Builder = struct {
         return adjusted;
     }
 
+    fn horizontalGather(self: *Builder, inst: instruction.Instruction) Error!void {
+        const flags: u16 = @bitCast(inst.image_sample_flags);
+        if (flags != 1 << 9 or inst.image_r128 or inst.data_mask == 0 or
+            (inst.image_dimension != .dim_2d and !(inst.image_packed and inst.image_dimension == .dim_1d)) or
+            (!inst.image_packed and @popCount(inst.data_mask) != 1)) return Error.UnsupportedOpcode;
+        const binding = self.sampledImageBinding(inst.src1.reg, inst.src2.reg, inst.pc) orelse return Error.InvalidStorageBinding;
+        if (binding.dimension != .two_d or binding.comparison or binding.candidate_words != null or binding.lookup != null)
+            return Error.UnsupportedOpcode;
+        const format = binding.multi_texel_format orelse return Error.InvalidStorageBinding;
+        const info = horizontalGatherFormat(inst, format) orelse return Error.UnsupportedOpcode;
+        const vector_type = try self.ensureVec4(info.value_type);
+        const sampled = try self.loadSampledImage(binding, inst);
+        const x = try self.source(try imageAddressOperand(inst, 0), .float32);
+        const y = if (inst.image_dimension == .dim_2d) try self.source(try imageAddressOperand(inst, 1), .float32) else try self.constant(.float32, 0);
+        if (!inst.image_packed) {
+            // ConstOffsets gathers from the same lower-left footprint texel,
+            // unlike a normal 2x2 gather. Native sampling retains address modes.
+            self.uses_image_gather_extended = true;
+            const coords = self.id();
+            try self.emit(&self.body, 80, &.{ try self.ensureFloatVec2(), coords, x, y });
+            var offsets: [4]u32 = undefined;
+            for (&offsets, 0..) |*offset, index| {
+                offset.* = self.id();
+                try self.emit(&self.declarations, 44, &.{ try self.ensureSignedVec2(), offset.*, try self.constant(.sint32, @bitCast(@as(i32, @intCast(index)) - 1)), try self.constant(.sint32, 0) });
+            }
+            const array_type = self.id();
+            try self.emit(&self.declarations, 28, &.{ array_type, try self.ensureSignedVec2(), try self.constant(.bits32, 4) });
+            const offset_array = self.id();
+            try self.emit(&self.declarations, 44, &.{ array_type, offset_array, offsets[0], offsets[1], offsets[2], offsets[3] });
+            const gathered = self.id();
+            try self.emit(&self.body, 96, &.{ vector_type, gathered, sampled, coords, try self.constant(.bits32, @ctz(inst.data_mask)), 0x20, offset_array });
+            for (0..4) |index| {
+                const value = self.id();
+                try self.emit(&self.body, 81, &.{ self.typeId(info.value_type), value, gathered, @intCast(index) });
+                try self.destination(try consecutiveRegister(inst.dst, @intCast(index)), .{ .id = value, .value_type = info.value_type });
+            }
+            return;
+        }
+        const zero = try self.constant(.bits32, 0);
+        var stream: [4]u32 = @splat(zero);
+        const texel_bits: u32 = @as(u32, info.component_bits) * info.components;
+        // Measured packed gather returns zero words for texels wider than 32
+        // bits; it does not truncate each wide texel or read a larger stream.
+        if (texel_bits <= 32) {
+            self.uses_image_query = true;
+            const image = self.id();
+            try self.emit(&self.body, 100, &.{ sampledImageImageType(self, binding), image, sampled });
+            const size = self.id();
+            try self.emit(&self.body, 103, &.{ try self.ensureBitsVec2(), size, image, zero });
+            var extents: [2]u32 = undefined;
+            var floors: [2]u32 = undefined;
+            var limits: [2]u32 = undefined;
+            for ([_]u32{ x, y }, 0..) |coordinate, axis| {
+                const extent = self.id();
+                try self.emit(&self.body, 81, &.{ self.bits_type, extent, size, @intCast(axis) });
+                extents[axis] = self.id();
+                try self.emit(&self.body, 112, &.{ self.float_type, extents[axis], extent });
+                var scaled = try self.bvhBinary(133, self.float_type, coordinate, extents[axis]);
+                if (axis == 0) scaled = try self.bvhBinary(131, self.float_type, scaled, try self.constant(.float32, @bitCast(@as(f32, 0.5))));
+                floors[axis] = try self.glslFloatUnaryValue(8, scaled);
+                limits[axis] = try self.resinfoBinary(130, extent, try self.constant(.bits32, 1));
+            }
+            const row_inside = try self.bvhBinary(184, self.bool_type, floors[1], extents[1]);
+            // Clamp in float before integer conversion: finite coordinates far
+            // outside the image must not overflow OpConvertFToS.
+            var indices: [2]u32 = undefined;
+            for (floors, 0..) |floor, axis| {
+                const low = try self.constant(.float32, @bitCast(@as(f32, if (axis == 0) -2 else 0)));
+                const clamped = try self.glslBinaryValue(37, .float32, try self.glslBinaryValue(40, .float32, floor, low), extents[axis]);
+                indices[axis] = self.id();
+                try self.emit(&self.body, 110, &.{ self.signed_type, indices[axis], clamped });
+            }
+            const last_y = try self.convert(.{ .id = limits[1], .value_type = .bits32 }, .sint32);
+            const row = try self.glslBinaryValue(39, .sint32, indices[1], last_y); // SMin
+            const last_x = try self.convert(.{ .id = limits[0], .value_type = .bits32 }, .sint32);
+            for (0..4) |element| {
+                const column = try self.bvhBinary(128, self.signed_type, indices[0], try self.constant(.sint32, @bitCast(@as(i32, @intCast(element)) - 1)));
+                const clamped = try self.glslBinaryValue(39, .sint32, try self.glslBinaryValue(42, .sint32, column, try self.constant(.sint32, 0)), last_x);
+                const coords = self.id();
+                try self.emit(&self.body, 80, &.{ try self.ensureSignedVec2(), coords, clamped, row });
+                const texel = self.id();
+                try self.emit(&self.body, 95, &.{ vector_type, texel, image, coords, 2, zero });
+                for (0..info.components) |component| {
+                    const scalar = self.id();
+                    try self.emit(&self.body, 81, &.{ self.typeId(info.value_type), scalar, texel, @intCast(component) });
+                    var bits = scalar;
+                    if (info.unorm) {
+                        const maximum: f32 = @floatFromInt((@as(u32, 1) << @intCast(info.component_bits)) - 1);
+                        const scaled = try self.bvhBinary(133, self.float_type, scalar, try self.constant(.float32, @bitCast(maximum)));
+                        const rounded = try self.glslFloatUnaryValue(2, scaled);
+                        bits = self.id();
+                        try self.emit(&self.body, 109, &.{ self.bits_type, bits, rounded });
+                    } else bits = try self.convert(.{ .id = scalar, .value_type = info.value_type }, .bits32);
+                    if (info.component_bits < 32) bits = try self.andBits(bits, (@as(u32, 1) << @intCast(info.component_bits)) - 1);
+                    bits = try self.resinfoSelect(row_inside, bits, zero);
+                    const position = element * texel_bits + component * info.component_bits;
+                    const shift = position % 32;
+                    if (shift != 0) bits = try self.resinfoBinary(196, bits, try self.constant(.bits32, @intCast(shift)));
+                    stream[position / 32] = try self.resinfoBinary(197, stream[position / 32], bits);
+                }
+            }
+        }
+        var destination_index: u32 = 0;
+        for (stream, 0..) |word, bit| {
+            if (inst.data_mask & (@as(u4, 1) << @intCast(bit)) == 0) continue;
+            try self.destination(try consecutiveRegister(inst.dst, destination_index), .{ .id = word, .value_type = .bits32 });
+            destination_index += 1;
+        }
+    }
+
     fn gatherImage(self: *Builder, inst: instruction.Instruction) Error!void {
+        if (inst.image_sample_flags.gather_horizontal) return self.horizontalGather(inst);
         const arrayed = inst.image_dimension == .dim_2d_array_alt;
         const coordinate_count: u8 = if (arrayed) 3 else 2;
         const flags: u16 = @bitCast(inst.image_sample_flags);
@@ -10981,7 +11115,7 @@ const Builder = struct {
         }
         if (dimension_count < 2) return false;
         if (inst.dst.kind != .vgpr) return Error.InvalidStorageBinding;
-        const count: u32 = if (inst.opcode == .image_gather4) 4 else @popCount(inst.data_mask);
+        const count: u32 = if (inst.opcode == .image_gather4 and !inst.image_packed) 4 else @popCount(inst.data_mask);
         var original: [4]u32 = undefined;
         var combined: [4]u32 = @splat(try self.constant(.bits32, 0));
         for (0..count) |component|
@@ -11050,7 +11184,7 @@ const Builder = struct {
                         if (binding.unbound) {
                             if (binding.check_unmatched and binding.unbound_fault_descriptor == null) return Error.InvalidStorageBinding;
                             if (binding.unbound_fault_descriptor) |slot| try self.checkUnboundImage(inst, slot, null, binding.expected_sampler_words);
-                            const count: u32 = if (inst.opcode == .image_gather4) 4 else @popCount(inst.data_mask);
+                            const count: u32 = if (inst.opcode == .image_gather4 and !inst.image_packed) 4 else @popCount(inst.data_mask);
                             for (0..count) |component| try self.destination(
                                 try consecutiveRegister(inst.dst, @intCast(component)),
                                 .{ .id = try self.constant(.bits32, 0), .value_type = .bits32 },
@@ -15360,6 +15494,50 @@ test "MIMG multi-texel loads use typed fetches and checked full groups in every 
                 try std.testing.expectEqual(expected_binding, sampledDescriptorBinding(images[0]));
             }
         }
+    }
+}
+
+test "MIMG horizontal gather uses native offsets or raw packed fetches in every stage" {
+    const decoder = @import("decoder.zig");
+    for ([_]Stage{ .compute, .vertex, .fragment }) |stage| {
+        for ([_]StorageImageFormat{ .rgba8_unorm, .r16_uint, .r32_sint, .r32_float }) |format| {
+            for ([_]u32{ 0x61, 0x62 }) |id| {
+                var program = try decoder.decodeProgram(std.testing.allocator, &.{ 0xf0000108 | (id << 18), 0, 0xbf810000 });
+                defer program.deinit(std.testing.allocator);
+                var module = try translate(std.testing.allocator, &program, .{ .stage = stage, .sampled_images = &.{.{ .resource_sgpr = 0, .sampler_sgpr = 0, .descriptor_index = 0, .multi_texel_format = format }} });
+                defer module.deinit(std.testing.allocator);
+                try std.testing.expectEqual(@as(usize, if (id == 0x61) 1 else 0), countOpcode(module.words, 96));
+                try std.testing.expectEqual(@as(usize, if (id == 0x62) 4 else 0), countOpcode(module.words, 95));
+            }
+        }
+    }
+}
+
+test "MIMG packed horizontal gather null bindings preserve unselected destination registers" {
+    const decoder = @import("decoder.zig");
+    var program = try decoder.decodeProgram(std.testing.allocator, &.{ 0x7e0202ff, 0x12345678, 0xf1880108, 0x00000004, 0xbf810000 });
+    defer program.deinit(std.testing.allocator);
+    var builder = try Builder.init(std.testing.allocator, .{
+        .stage = .compute,
+        .sampled_images = &.{.{ .resource_sgpr = 0, .sampler_sgpr = 0, .descriptor_index = 0, .unbound = true }},
+    });
+    defer builder.deinit();
+    try builder.lower(program.instructions.items[0]);
+    const before = try builder.source(.{ .kind = .vgpr, .reg = 1 }, .bits32);
+    try builder.lower(program.instructions.items[1]);
+    const after = try builder.source(.{ .kind = .vgpr, .reg = 1 }, .bits32);
+    try std.testing.expectEqual(before, after);
+}
+
+test "MIMG packed horizontal gather rejects formats without recoverable raw bits" {
+    const decoder = @import("decoder.zig");
+    var program = try decoder.decodeProgram(std.testing.allocator, &.{ 0xf1880108, 0, 0xbf810000 });
+    defer program.deinit(std.testing.allocator);
+    for ([_]StorageImageFormat{ .r8_snorm, .rg16_snorm, .r16_float, .rgb10a2_unorm, .r11g11b10_float }) |format| {
+        try std.testing.expectError(Error.UnsupportedOpcode, translate(std.testing.allocator, &program, .{
+            .stage = .fragment,
+            .sampled_images = &.{.{ .resource_sgpr = 0, .sampler_sgpr = 0, .descriptor_index = 0, .multi_texel_format = format }},
+        }));
     }
 }
 

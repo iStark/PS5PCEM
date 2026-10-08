@@ -1090,15 +1090,38 @@ fn sampledImageDescriptorBinding(mapping: gpu.ShaderSpirvSampledImageBinding) u3
 }
 
 fn multiTexelBindingFormat(inst: gpu.ShaderInstruction, descriptor: gpu.ImageDescriptor) Error!?rdna2.spirv.StorageImageFormat {
-    if (inst.image_elements == 0) return null;
+    const horizontal = inst.image_sample_flags.gather_horizontal;
+    if (inst.image_elements == 0 and !horizontal) {
+        // These new integer views require the typed sampled bank. Keep them
+        // out of older sample/gather paths that still declare float operands.
+        switch (descriptor.unified_format) {
+            27, 28, 61, 63, 69, 70, 75, 76 => return Error.UnsupportedSampledImage,
+            else => return null,
+        }
+    }
     const format = std.enums.fromInt(rdna2.spirv.StorageImageFormat, descriptor.unified_format) orelse return Error.UnsupportedSampledImage;
-    if (descriptor.image_type != .color_2d or !std.mem.eql(u8, &descriptor.dst_select, &.{ 4, 5, 6, 7 }) or
-        rdna2.spirv.multiTexelFormat(inst, format) == null)
-    {
+    const valid_type = if (horizontal and inst.image_dimension == .dim_1d) descriptor.image_type == .color_1d else descriptor.image_type == .color_2d;
+    const valid_format = if (horizontal) rdna2.spirv.horizontalGatherFormat(inst, format) != null else rdna2.spirv.multiTexelFormat(inst, format) != null;
+    if (!valid_type or !std.mem.eql(u8, &descriptor.dst_select, &.{ 4, 5, 6, 7 }) or !valid_format) {
         std.debug.print("[vulkan dcb] unsupported multi-texel image pc=0x{x} opcode=0x{x} fmt={d} type={s} dst={any}\n", .{ inst.pc, inst.opcode_id, descriptor.unified_format, @tagName(descriptor.image_type), descriptor.dst_select });
         return Error.UnsupportedSampledImage;
     }
     return format;
+}
+
+test "horizontal gathers bind new integer views only through typed sampled banks" {
+    var inst = gpu.ShaderInstruction{ .opcode = .image_gather4, .data_mask = 1, .image_sample_flags = .{ .gather_horizontal = true } };
+    for ([_]u32{ 27, 28, 61, 63, 69, 70, 75, 76 }) |format| {
+        const descriptor = try gpu.resources.decodeImageDescriptor(&.{ 0x120, format << 20, 0, 0xfac | (9 << 28), 0, 0, 0, 0 });
+        const binding_format = (try multiTexelBindingFormat(inst, descriptor)).?;
+        try std.testing.expectEqual(format, @intFromEnum(binding_format));
+        const binding = gpu.ShaderSpirvSampledImageBinding{ .resource_sgpr = 0, .sampler_sgpr = 8, .descriptor_index = 0, .multi_texel_format = binding_format };
+        const expected = if (format == 27 or format == 69 or format == 75) rdna2.spirv.sampled_image_uint_2d_descriptor_binding else rdna2.spirv.sampled_image_sint_2d_descriptor_binding;
+        try std.testing.expectEqual(expected, sampledImageDescriptorBinding(binding));
+        inst.image_sample_flags.gather_horizontal = false;
+        try std.testing.expectError(Error.UnsupportedSampledImage, multiTexelBindingFormat(inst, descriptor));
+        inst.image_sample_flags.gather_horizontal = true;
+    }
 }
 
 test "graphics shader words share immutable storage and survive owner eviction" {
@@ -12444,7 +12467,7 @@ pub const Renderer = struct {
                     // sampled-image fallback.
                     continue;
                 }
-                if (inst.image_elements != 0 and candidate_table != null) return Error.UnsupportedSampledImage;
+                if ((inst.image_elements != 0 or inst.image_sample_flags.gather_horizontal) and candidate_table != null) return Error.UnsupportedSampledImage;
                 const multi_format = try multiTexelBindingFormat(inst, image_descriptor);
                 var sampler_descriptor: gpu.resources.SamplerDescriptor = resolved_sampler orelse if (image_fetch)
                     std.mem.zeroes(gpu.resources.SamplerDescriptor)
@@ -12468,6 +12491,7 @@ pub const Renderer = struct {
                         return Error.UnsupportedSampledImage;
                     };
                 resolved_sampler = sampler_descriptor;
+                if (inst.image_sample_flags.gather_horizontal and (sampler_descriptor.unnormalized_coordinates or sampler_descriptor.force_srgb)) return Error.UnsupportedSampledImage;
                 if (inst.opcode == .image_gather4) sampler_descriptor = pointGatherSampler(sampler_descriptor);
                 sampler_descriptor.compare_sample = comparesThroughSampler(inst);
                 const sampled_dimension = sampledImageDimensionForInstruction(
@@ -23308,6 +23332,7 @@ pub const Renderer = struct {
                     );
                     return Error.UnsupportedSampledImage;
                 };
+            if (inst.image_sample_flags.gather_horizontal and (sampler_descriptor.unnormalized_coordinates or sampler_descriptor.force_srgb)) return Error.UnsupportedSampledImage;
             if (inst.opcode == .image_gather4) sampler_descriptor = pointGatherSampler(sampler_descriptor);
             sampler_descriptor.compare_sample = comparesThroughSampler(inst);
             const sampled_dimension = sampledImageDimensionForInstruction(
@@ -23404,7 +23429,7 @@ pub const Renderer = struct {
         target: GuestColorTarget,
         extra_colors: []const GuestColorTarget,
     ) anyerror!bool {
-        if (inst.image_elements != 0) return false;
+        if (inst.image_elements != 0 or inst.image_sample_flags.gather_horizontal) return false;
         const uniform_null = try resolveUniformNullImage(bindings, reader, analysis, scalar, inst);
         if (!uniform_null and !self.sampled_image_nonuniform_indexing) return false;
         const candidate_scratch = if (uniform_null) null else (try self.borrowBufferImageCandidates(bindings, reader, analysis, scalar, inst)) orelse return false;
@@ -23437,6 +23462,7 @@ pub const Renderer = struct {
         sampler.compare_sample = comparesThroughSampler(inst);
         for (candidates.words[0..candidates.count]) |words| {
             const descriptor = try gpu.resources.decodeImageDescriptor(words[0..inst.imageResourceWords()]);
+            _ = try multiTexelBindingFormat(inst, descriptor);
             const dimension = sampledImageDimensionForInstruction(inst.image_dimension, descriptor.image_type) orelse return false;
             const image_key = SampledImageKey{ .image = descriptor, .sampler = sampler, .dimension = dimension };
             var slot = result.image_lookup.get(image_key);
@@ -34457,6 +34483,8 @@ fn sampledImageFormat(unified_format: u16, force_srgb: bool) ?u32 {
         22 => vk.format_r32_sfloat,
         23 => vk.format_r16g16_unorm,
         24 => vk.format_r16g16_snorm,
+        27 => vk.format_r16g16_uint,
+        28 => vk.format_r16g16_sint,
         29 => vk.format_r16g16_sfloat,
         64 => vk.format_r32g32_sfloat,
         36 => vk.format_b10g11r11_ufloat_pack32,
@@ -34464,9 +34492,16 @@ fn sampledImageFormat(unified_format: u16, force_srgb: bool) ?u32 {
         56 => if (force_srgb) vk.format_r8g8b8a8_srgb else vk.format_r8g8b8a8_unorm,
         57 => vk.format_r8g8b8a8_snorm,
         60 => vk.format_r8g8b8a8_uint,
+        61 => vk.format_r8g8b8a8_sint,
         62 => vk.format_r32g32_uint,
+        63 => vk.format_r32g32_sint,
         65 => vk.format_r16g16b16a16_unorm,
+        66 => vk.format_r16g16b16a16_snorm,
+        69 => vk.format_r16g16b16a16_uint,
+        70 => vk.format_r16g16b16a16_sint,
         71 => vk.format_r16g16b16a16_sfloat,
+        75 => vk.format_r32g32b32a32_uint,
+        76 => vk.format_r32g32b32a32_sint,
         77 => vk.format_r32g32b32a32_sfloat,
         // GFX10 FORMAT 128 is single-channel R8 sRGB. Vulkan has no R8 sRGB
         // format, so use its byte-identical UNORM representation.

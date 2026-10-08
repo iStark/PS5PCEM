@@ -12,6 +12,12 @@ formats. Native Vulkan checks cover packing, bounds and register preservation;
 game compatibility grades and FPS measurements are unchanged by this check.
 See the [implementation and validation report](development/mimg-multi-texel-2026-10-09.md).
 
+**October 9, 2026 — horizontal gathers:** `IMAGE_GATHER4H` and
+`IMAGE_GATHER4H_PCK` now execute with typed texture access, correct result
+widths and edge handling. A native GPU matrix passes 1,242 dispatches and
+635,904 checked words. This instruction-level check does not change game
+grades or FPS measurements. See the [gather report](development/gather4h-2026-10-09.md).
+
 ## Compatibility and progress
 
 
