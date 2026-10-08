@@ -12,6 +12,10 @@ const std = @import("std");
 const filesystem = @import("filesystem.zig");
 const memory = @import("libs/kernel_memory.zig");
 const errno = @import("errno.zig");
+const builtin = @import("builtin");
+const runtime = @import("libs/kernel_runtime.zig");
+const memory_module = @import("memory");
+pub const counters = @import("ampr_counters.zig");
 
 pub const maximum_path: usize = 1024;
 pub const maximum_command_buffers: usize = 32;
@@ -111,7 +115,18 @@ pub const AmmMapCommand = struct {
     protection: i32 = 0,
 };
 
-const OpKind = enum { read, write, completion, map };
+pub const CounterRead = struct {
+    destination: u64,
+    counter: u8 = 0,
+    source: enum { time, word, pair },
+};
+pub const CounterCommand = union(enum) {
+    write: counters.Write,
+    wait: counters.Wait,
+    read: CounterRead,
+};
+
+const OpKind = enum { read, write, completion, map, counter };
 
 const Op = struct {
     kind: OpKind,
@@ -141,6 +156,8 @@ const CommandBuffer = struct {
     write_count: usize = 0,
     maps: [maximum_maps_per_buffer]AmmMapCommand = undefined,
     map_count: usize = 0,
+    counter_commands: [maximum_ops_per_buffer]CounterCommand = undefined,
+    counter_count: usize = 0,
     ops: [maximum_ops_per_buffer]Op = undefined,
     op_count: usize = 0,
     cursor: ?GatherScatterCursor = null,
@@ -151,6 +168,8 @@ const Submission = struct {
     active: bool = false,
     identifier: u32 = 0,
     complete: bool = false,
+    failure: ?Error = null,
+    worker: ?std.Thread = null,
 };
 
 const Lock = struct {
@@ -179,6 +198,8 @@ var next_submission_identifier: u32 = 1;
 var completion_sink: ?CompletionSink = null;
 var auto_pool: [maximum_auto_pool]AutoPoolRange = [_]AutoPoolRange{.{}} ** maximum_auto_pool;
 var auto_pool_count: usize = 0;
+var counter_bank = counters.Bank{};
+var stopping = std.atomic.Value(bool).init(false);
 
 pub fn attachCompletionSink(sink: ?CompletionSink) void {
     lock.lock();
@@ -187,6 +208,12 @@ pub fn attachCompletionSink(sink: ?CompletionSink) void {
 }
 
 pub fn reset() void {
+    // Reset is called after guest submitters have stopped. Join before clearing
+    // counters, file handles or guest mappings referenced by a deferred buffer.
+    stopping.store(true, .release);
+    for (&submissions) |*submission| {
+        if (submission.worker) |worker| worker.join();
+    }
     var descriptors: [maximum_cached_files]i32 = undefined;
     var descriptor_count: usize = 0;
     lock.lock();
@@ -208,6 +235,8 @@ pub fn reset() void {
     next_submission_identifier = 1;
     auto_pool = [_]AutoPoolRange{.{}} ** maximum_auto_pool;
     auto_pool_count = 0;
+    counter_bank.reset();
+    stopping.store(false, .release);
     lock.unlock();
 
     for (descriptors[0..descriptor_count]) |descriptor| {
@@ -365,6 +394,7 @@ pub fn resetCommandBuffer(address: u64) Error!void {
     buffer.completion_count = 0;
     buffer.write_count = 0;
     buffer.map_count = 0;
+    buffer.counter_count = 0;
     buffer.op_count = 0;
     buffer.record_bytes = 0;
     buffer.command_count = 0;
@@ -474,6 +504,29 @@ pub fn appendWrite(address: u64, command: WriteCommand, record_bytes: usize) Err
     buffer.command_count += 1;
 }
 
+pub fn appendCounter(address: u64, command: CounterCommand, record_bytes: usize) Error!void {
+    if (record_bytes == 0) return error.InvalidCommandBuffer;
+    switch (command) {
+        .write => |c| if (!counters.valid(c.counter, c.access)) return error.InvalidCommandBuffer,
+        .wait => |c| if (!counters.valid(c.counter, c.access)) return error.InvalidCommandBuffer,
+        .read => |c| {
+            if (c.destination == 0 or c.destination & 7 != 0) return error.InvalidCommandBuffer;
+            if (c.source != .time and !counters.valid(c.counter, if (c.source == .pair) .pair else .word)) return error.InvalidCommandBuffer;
+        },
+    }
+    lock.lock();
+    defer lock.unlock();
+    const buffer = findCommandBufferLocked(address) orelse return error.InvalidCommandBuffer;
+    if (buffer.counter_count >= buffer.counter_commands.len) return error.TooManyCommands;
+    const next_bytes = std.math.add(usize, buffer.record_bytes, record_bytes) catch return error.InvalidCommandBuffer;
+    if (buffer.storage_size != 0 and next_bytes > buffer.storage_size) return error.InvalidCommandBuffer;
+    try pushOpLocked(buffer, .counter, buffer.counter_count);
+    buffer.counter_commands[buffer.counter_count] = command;
+    buffer.counter_count += 1;
+    buffer.record_bytes = next_bytes;
+    buffer.command_count += 1;
+}
+
 pub fn appendAmmMap(address: u64, command: AmmMapCommand, record_bytes: usize) Error!void {
     if (command.va == 0 or command.size == 0 or record_bytes == 0) return error.InvalidCommandBuffer;
     if (command.va & (amm_page_size - 1) != 0 or command.size & (amm_page_size - 1) != 0) {
@@ -521,67 +574,127 @@ pub fn mapActive(address: u64) Error!bool {
 }
 
 pub fn submitCommandBuffer(address: u64) Error!u32 {
-    var pending: [maximum_reads_per_buffer]ReadCommand = undefined;
-    var pending_writes: [maximum_writes_per_buffer]WriteCommand = undefined;
-    var pending_completions: [maximum_completions_per_buffer]CompletionCommand = undefined;
-    var pending_maps: [maximum_maps_per_buffer]AmmMapCommand = undefined;
-    var pending_ops: [maximum_ops_per_buffer]Op = undefined;
+    var pending: CommandBuffer = undefined;
     var sink: ?CompletionSink = null;
-    const counts = blk: {
+    const slot = blk: {
         lock.lock();
         defer lock.unlock();
+        if (stopping.load(.acquire)) return error.IoFailed;
         const buffer = findCommandBufferLocked(address) orelse return error.InvalidCommandBuffer;
-        @memcpy(pending[0..buffer.read_count], buffer.reads[0..buffer.read_count]);
-        @memcpy(pending_writes[0..buffer.write_count], buffer.writes[0..buffer.write_count]);
-        @memcpy(pending_completions[0..buffer.completion_count], buffer.completions[0..buffer.completion_count]);
-        @memcpy(pending_maps[0..buffer.map_count], buffer.maps[0..buffer.map_count]);
-        @memcpy(pending_ops[0..buffer.op_count], buffer.ops[0..buffer.op_count]);
-        for (pending_maps[0..buffer.map_count]) |*command| {
+        // Reserve before executing: a full submission table must not repeat
+        // counter updates or publish an event for an untrackable submission.
+        const index = for (&submissions, 0..) |*submission, i| {
+            if (!submission.active) break i;
+        } else return error.SubmissionTableFull;
+        pending = buffer.*;
+        for (pending.maps[0..pending.map_count]) |*command| {
             if (command.kind != .map_auto) continue;
-            command.dmem_offset = takeAutoLocked(command.size, command.memory_type) orelse
-                return error.OutOfDirectMemory;
+            command.dmem_offset = takeAutoLocked(command.size, command.memory_type) orelse return error.OutOfDirectMemory;
         }
-        sink = completion_sink;
-        break :blk .{
-            buffer.read_count,
-            buffer.write_count,
-            buffer.completion_count,
-            buffer.map_count,
-            buffer.op_count,
-        };
-    };
-    for (pending_ops[0..counts[4]]) |op| {
-        switch (op.kind) {
-            .read => try applyRead(pending[op.index]),
-            .write => try applyWrite(pending_writes[op.index]),
-            .completion => try applyCompletion(pending_completions[op.index], sink),
-            .map => try applyAmmMap(pending_maps[op.index]),
-        }
-    }
-
-    lock.lock();
-    defer lock.unlock();
-    for (&submissions) |*submission| {
-        if (submission.active) continue;
         const identifier = next_submission_identifier;
         next_submission_identifier +%= 1;
         if (next_submission_identifier == 0) next_submission_identifier = 1;
-        submission.* = .{ .active = true, .identifier = identifier, .complete = true };
-        return identifier;
+        submissions[index] = .{ .active = true, .identifier = identifier };
+        sink = completion_sink;
+        break :blk index;
+    };
+    errdefer {
+        lock.lock();
+        submissions[slot] = .{};
+        lock.unlock();
     }
-    return error.SubmissionTableFull;
+    var cursor: usize = 0;
+    const complete = try executePending(&pending, &cursor, sink);
+    lock.lock();
+    defer lock.unlock();
+    if (complete) {
+        submissions[slot].complete = true;
+    } else {
+        // Only blocked submissions allocate or launch a worker. Common APR
+        // reads retain the synchronous fast path. The snapshot outlives a
+        // guest resetting/reusing its command buffer immediately after submit.
+        const snapshot = std.heap.page_allocator.create(CommandBuffer) catch return error.IoFailed;
+        errdefer std.heap.page_allocator.destroy(snapshot);
+        snapshot.* = pending;
+        submissions[slot].worker = std.Thread.spawn(.{}, deferredMain, .{ slot, snapshot, cursor, sink }) catch return error.IoFailed;
+    }
+    return submissions[slot].identifier;
+}
+
+fn executePending(pending: *const CommandBuffer, cursor: *usize, sink: ?CompletionSink) Error!bool {
+    while (cursor.* < pending.op_count) : (cursor.* += 1) {
+        if (stopping.load(.acquire) or runtime.guestStopRequested()) return error.IoFailed;
+        const op = pending.ops[cursor.*];
+        switch (op.kind) {
+            .read => try applyRead(pending.reads[op.index]),
+            .write => try applyWrite(pending.writes[op.index]),
+            .completion => try applyCompletion(pending.completions[op.index], sink),
+            .map => try applyAmmMap(pending.maps[op.index]),
+            .counter => switch (pending.counter_commands[op.index]) {
+                .write => |command| counter_bank.write(command),
+                .wait => |command| if (!counter_bank.satisfied(command)) return false,
+                .read => |command| try applyWrite(.{
+                    .destination = command.destination,
+                    .value = switch (command.source) {
+                        .time => runtime.processTimeCounter(),
+                        .word => counter_bank.read(command.counter, .word),
+                        .pair => counter_bank.read(command.counter, .pair),
+                    },
+                }),
+            },
+        }
+    }
+    return true;
+}
+
+fn sleepWaiter() void {
+    if (comptime builtin.os.tag == .windows) {
+        var interval: i64 = -10_000;
+        _ = std.os.windows.ntdll.NtDelayExecution(.FALSE, &interval);
+    } else {
+        std.Thread.yield() catch {};
+    }
+}
+
+fn deferredMain(slot: usize, snapshot: *CommandBuffer, start: usize, sink: ?CompletionSink) void {
+    var cursor = start;
+    var failure: ?Error = null;
+    while (true) {
+        const complete = executePending(snapshot, &cursor, sink) catch |err| {
+            failure = err;
+            break;
+        };
+        if (complete) break;
+        sleepWaiter();
+    }
+    std.heap.page_allocator.destroy(snapshot);
+    lock.lock();
+    defer lock.unlock();
+    submissions[slot].failure = failure;
+    submissions[slot].complete = true;
 }
 
 pub fn waitCommandBuffer(identifier: u32) Error!void {
-    lock.lock();
-    defer lock.unlock();
-    for (&submissions) |*submission| {
-        if (!submission.active or submission.identifier != identifier) continue;
-        if (!submission.complete) return error.IoFailed;
-        submission.* = .{};
-        return;
+    while (true) {
+        lock.lock();
+        const submission = for (&submissions) |*entry| {
+            if (entry.active and entry.identifier == identifier) break entry;
+        } else {
+            lock.unlock();
+            return error.UnknownSubmission;
+        };
+        if (submission.complete) {
+            const worker = submission.worker;
+            const failure = submission.failure;
+            submission.* = .{};
+            lock.unlock();
+            if (worker) |thread| thread.join();
+            if (failure) |err| return err;
+            return;
+        }
+        lock.unlock();
+        sleepWaiter();
     }
-    return error.UnknownSubmission;
 }
 
 fn pushOpLocked(buffer: *CommandBuffer, kind: OpKind, index: usize) Error!void {
@@ -617,10 +730,22 @@ fn applyRead(command: ReadCommand) Error!void {
     }
 }
 
+pub fn writeDestinationValid(address: u64) bool {
+    if (address == 0 or address & 7 != 0) return false;
+    if (memory.attachedAddressSpace()) |space| {
+        if (space.isWritable(address, 8)) return true;
+        // A tracked read-only mapping must not fall back to its host page's
+        // possibly broader permissions.
+        if (space.query(address, false) != null) return false;
+    } else if (builtin.os.tag != .windows) return true;
+    return memory_module.isHostRangeWritable(address, 8);
+}
+
 fn applyWrite(command: WriteCommand) Error!void {
-    if (!memory.isGuestRangeAccessible(command.destination, 8)) return error.InvalidRead;
-    const destination: *[8]u8 = @ptrFromInt(command.destination);
-    std.mem.writeInt(u64, destination, command.value, .little);
+    if (!writeDestinationValid(command.destination)) return error.InvalidRead;
+    if (memory.attachedAddressSpace()) |space| space.notifyGuestWrite(command.destination, 8);
+    const destination: *u64 = @ptrFromInt(command.destination);
+    @atomicStore(u64, destination, command.value, .release);
 }
 
 fn applyCompletion(command: CompletionCommand, sink: ?CompletionSink) Error!void {
@@ -657,6 +782,123 @@ fn findCommandBufferLocked(address: u64) ?*CommandBuffer {
 fn findFileLocked(identifier: u32) ?*FileEntry {
     if (identifier == 0 or identifier > files.items.len) return null;
     return &files.items[identifier - 1];
+}
+
+fn expectSubmissionReady(identifier: u32) !void {
+    for (0..2000) |_| {
+        lock.lock();
+        const ready = for (submissions) |submission| {
+            if (submission.active and submission.identifier == identifier) break submission.complete;
+        } else false;
+        lock.unlock();
+        if (ready) return;
+        sleepWaiter();
+    }
+    return error.TestSubmissionTimedOut;
+}
+
+test "AMPR waits defer later writes and events and survive buffer reuse" {
+    reset();
+    defer reset();
+    const Sink = struct {
+        var value: u64 = 0;
+        var published = std.atomic.Value(u64).init(0);
+        fn publish(_: CompletionCommand) bool {
+            published.store(@atomicLoad(u64, &value, .acquire), .release);
+            return true;
+        }
+    };
+    Sink.value = 0;
+    Sink.published.store(0, .release);
+    attachCompletionSink(Sink.publish);
+    defer attachCompletionSink(null);
+    try constructCommandBuffer(0x1000);
+    try appendCounter(0x1000, .{ .wait = .{ .counter = 6, .access = .word, .reference = 7, .compare = .equal } }, 32);
+    try appendCounter(0x1000, .{ .read = .{ .destination = @intFromPtr(&Sink.value), .counter = 6, .source = .pair } }, 32);
+    try appendCompletion(0x1000, .{ .queue_handle = 1, .ident = 2, .completion_token = 3, .user_data = 4 });
+    const waiting = try submitCommandBuffer(0x1000);
+    try std.testing.expectEqual(@as(u64, 0), @atomicLoad(u64, &Sink.value, .acquire));
+    try std.testing.expectEqual(@as(u64, 0), Sink.published.load(.acquire));
+    try resetCommandBuffer(0x1000);
+    // A producer on the SAME host thread must be able to release the wait.
+    try appendCounter(0x1000, .{ .write = .{ .counter = 6, .access = .pair, .value = 0x900000007, .operation = .store } }, 32);
+    const producer = try submitCommandBuffer(0x1000);
+    try waitCommandBuffer(producer);
+    try expectSubmissionReady(waiting);
+    try waitCommandBuffer(waiting);
+    try std.testing.expectEqual(@as(u64, 0x900000007), Sink.published.load(.acquire));
+    try std.testing.expectError(error.UnknownSubmission, waitCommandBuffer(waiting));
+}
+
+test "AMPR pending reset cancels writes and clears process counters" {
+    reset();
+    defer reset();
+    var label: u64 = 0;
+    try constructCommandBuffer(0x1000);
+    try appendCounter(0x1000, .{ .write = .{ .counter = 4, .access = .word, .value = 55, .operation = .store } }, 32);
+    try appendCounter(0x1000, .{ .wait = .{ .counter = 4, .access = .word, .reference = 56, .compare = .equal } }, 32);
+    try appendWrite(0x1000, .{ .destination = @intFromPtr(&label), .value = 99 }, 32);
+    const identifier = try submitCommandBuffer(0x1000);
+    reset();
+    try std.testing.expectEqual(@as(u64, 0), label);
+    try std.testing.expectEqual(@as(u64, 0), counter_bank.read(4, .word));
+    try std.testing.expectError(error.UnknownSubmission, waitCommandBuffer(identifier));
+}
+
+test "AMPR table exhaustion has no counter side effects" {
+    reset();
+    defer reset();
+    try constructCommandBuffer(0x1000);
+    try appendCounter(0x1000, .{ .write = .{ .counter = 0, .access = .word, .value = 1, .operation = .add } }, 32);
+    var ids: [maximum_submissions]u32 = undefined;
+    for (&ids) |*id| id.* = try submitCommandBuffer(0x1000);
+    try std.testing.expectError(error.SubmissionTableFull, submitCommandBuffer(0x1000));
+    try std.testing.expectEqual(@as(u64, maximum_submissions), counter_bank.read(0, .word));
+    for (ids) |id| try waitCommandBuffer(id);
+}
+
+test "AMPR concurrent additions and paired snapshots are atomic" {
+    reset();
+    defer reset();
+    const Worker = struct {
+        fn run(address: u64) void {
+            for (0..1000) |_| {
+                const id = submitCommandBuffer(address) catch @panic("AMPR submit failed");
+                waitCommandBuffer(id) catch @panic("AMPR wait failed");
+            }
+        }
+    };
+    for (0..4) |i| {
+        try constructCommandBuffer(0x1000 + i);
+        try appendCounter(0x1000 + i, .{ .write = .{ .counter = 2, .access = .pair, .value = 0x100000001, .operation = .add } }, 32);
+    }
+    var threads: [4]std.Thread = undefined;
+    var started: usize = 0;
+    defer for (threads[0..started]) |thread| thread.join();
+    for (&threads, 0..) |*thread, i| {
+        thread.* = try std.Thread.spawn(.{}, Worker.run, .{0x1000 + i});
+        started += 1;
+    }
+    for (0..10000) |_| {
+        const pair = counter_bank.read(2, .pair);
+        try std.testing.expectEqual(@as(u32, @truncate(pair)), @as(u32, @truncate(pair >> 32)));
+    }
+    for (threads) |thread| thread.join();
+    started = 0;
+    try std.testing.expectEqual(@as(u64, 0xfa000000fa0), counter_bank.read(2, .pair));
+}
+
+test "AMPR deferred failure is reported without publishing completion" {
+    reset();
+    defer reset();
+    try constructCommandBuffer(0x1000);
+    try appendCounter(0x1000, .{ .wait = .{ .counter = 0, .access = .word, .reference = 1, .compare = .equal } }, 32);
+    // Validation occurs again at execution, after a preceding wait.
+    try appendWrite(0x1000, .{ .destination = 1, .value = 7 }, 32);
+    const id = try submitCommandBuffer(0x1000);
+    counter_bank.write(.{ .counter = 0, .access = .word, .value = 1, .operation = .store });
+    try expectSubmissionReady(id);
+    try std.testing.expectError(error.InvalidRead, waitCommandBuffer(id));
 }
 
 test "resolved files keep stable process-local identifiers" {

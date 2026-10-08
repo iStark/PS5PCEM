@@ -62,6 +62,10 @@ incomplete: their existing completion commands encode zero-valued writes,
 and counter wait/write operations retain their previous placeholder behavior.
 This update does not claim to implement the complete AMPR counter engine.
 
+The subsequent [AMPR counter implementation](ampr-counters-2026-10-09.md)
+replaces these counter placeholders and corrects the short counter ABIs;
+the test results below describe the earlier export-coverage change.
+
 ## Validation and references
 
 The full Windows x86-64 `ReleaseSafe` HLE suite passes **583/583** tests. Focused

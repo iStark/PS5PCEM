@@ -22,8 +22,13 @@ behind them.
   with selectable filters, compression levels 0-9, and bounded output writes.
   RTC adds calendar validation, FILETIME conversion, and checked tick arithmetic;
   three AMPR completion-size queries close their missing export registrations.
-  Hardware AMPR counters remain incomplete. See the
+  See the
   [PNG, RTC and AMPR report](development/hle-png-rtc-ampr-2026-10-09.md).
+- AMPR counters now execute stores, atomic field operations, single/pair reads,
+  timestamps and masked waits. Blocked waits retain submission snapshots and
+  resume before subsequent writes/events; ordinary and `_04_00` APIs have
+  separate argument lists. Hardware timing and WaitOnAddress remain incomplete.
+  See the [AMPR counter report](development/ampr-counters-2026-10-09.md).
 - Live VideoOut reaches a Vulkan swapchain, while host audio accepts decoded
   guest buffers at 48 kHz. SceAvPlayer uses FFmpeg for H.264/AAC media and
   returns synchronized NV12 video plus stereo PCM through the title's own

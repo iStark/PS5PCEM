@@ -9,8 +9,11 @@ provides that machinery and the firmware libraries built on top of it.
 The HLE PNG encoder accepts pitched RGBA/BGRA pixels and produces standard
 RGB/RGBA PNGs with selectable filters and compression levels. RTC supplies
 calendar checks, FILETIME conversions and checked signed tick arithmetic.
-AMPR completion-size queries match the existing 32-byte records; hardware
-counter behavior remains incomplete. See the
+AMPR now executes process-local counter updates, masked waits, single/pair
+reads and timestamps through its ordered APR command stream. Blocked counter
+waits resume asynchronously, including when a later submission on the same
+guest thread supplies the value. See the
+[AMPR counter report](../development/ampr-counters-2026-10-09.md) and the
 [PNG, RTC and AMPR validation report](../development/hle-png-rtc-ampr-2026-10-09.md).
 
 ## Symbol identifiers
@@ -364,7 +367,13 @@ wait-on-address/counter, write-address/counter, and marker/nop packets at their
 measured sizes, maps and unmaps AMM ranges into reserved guest VA on submit,
 publishes write-address values on submit, submits reads
 synchronously into checked guest memory, permits the short read expected at EOF,
-and delivers completion through the registered AMPR event queue. A failed path resolution writes the ABI-defined
+and delivers completion through the registered AMPR event queue. Counter writes
+support selected 8/16/32-bit fields and aligned 64-bit pairs, store/OR/AND-NOT/
+XOR/add operations, masked unsigned/signed/wrapping comparisons, and deferred
+reads into checked writable guest memory. A blocked counter wait retains a
+private command snapshot and resumes before subsequent writes/events; shutdown
+joins these workers before detaching memory. Wait-on-address remains a separate
+compatibility placeholder. A failed path resolution writes the ABI-defined
 sentinels (`id = 0xffffffff`, `size = 0`, and the failing index), allowing an
 engine to take its loose-file fallback without treating uninitialized memory as
 a multi-gigabyte allocation. Malformed headers, oversized transfers and invalid

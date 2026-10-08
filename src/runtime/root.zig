@@ -118,11 +118,13 @@ pub const Runtime = struct {
         self.sync_manager.deinit();
         hle.libs.kernel_threading.attachManager(null);
         self.thread_manager.deinit();
+        // Deferred AMPR waits own snapshots that can still write guest memory.
+        // Cancel and join them before detaching mappings and kernel objects.
+        hle.apr.reset();
         hle.libs.kernel_memory.attachAddressSpace(null);
         hle.libs.kernel_memory.deinit();
         hle.libs.audio.reset();
         hle.libs.font.reset();
-        hle.apr.reset();
         hle.libs.bootstrap_services.reset();
         hle.libs.dialogs.reset();
         hle.libs.fiber.reset();
