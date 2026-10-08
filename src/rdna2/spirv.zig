@@ -124,6 +124,8 @@ pub const SampledImageBinding = struct {
     comparison: bool = false,
     minimum_lod: f32 = 0,
     maximum_lod: f32 = 16,
+    /// Exact native texel format for the measured multi-texel load subset.
+    multi_texel_format: ?StorageImageFormat = null,
 };
 
 pub const SampledImageDimension = enum {
@@ -171,24 +173,50 @@ fn sampledImageDimensionIndex(dimension: SampledImageDimension) usize {
     };
 }
 
+pub const sampled_image_uint_2d_descriptor_binding: u32 = packed_unorm_feedback_descriptor_binding + 1;
+pub const sampled_image_sint_2d_descriptor_binding: u32 = packed_unorm_feedback_descriptor_binding + 2;
+pub const sampled_image_bank_count: u32 = 7;
+
+fn sampledImageBankIndex(binding: SampledImageBinding) usize {
+    if (binding.multi_texel_format) |format| switch (storageImageValueType(format)) {
+        .bits32 => return 4,
+        .sint32 => return 5,
+        else => {},
+    };
+    return sampledImageDimensionIndex(binding.dimension);
+}
+
+pub fn sampledDescriptorBinding(binding: SampledImageBinding) u32 {
+    if (binding.comparison and binding.dimension == .two_d) return sampled_image_comparison_2d_descriptor_binding;
+    return switch (sampledImageBankIndex(binding)) {
+        0 => sampled_image_2d_descriptor_binding,
+        1 => sampled_image_3d_descriptor_binding,
+        2 => sampled_image_cube_descriptor_binding,
+        3 => sampled_image_2d_array_descriptor_binding,
+        4 => sampled_image_uint_2d_descriptor_binding,
+        5 => sampled_image_sint_2d_descriptor_binding,
+        else => unreachable,
+    };
+}
+
 fn sampledImageArray(self: *const Builder, binding: SampledImageBinding) u32 {
     if (binding.comparison and binding.dimension == .two_d) return self.sampled_image_comparison_array;
-    return self.sampled_image_arrays[sampledImageDimensionIndex(binding.dimension)];
+    return self.sampled_image_arrays[sampledImageBankIndex(binding)];
 }
 
 fn sampledImageType(self: *const Builder, binding: SampledImageBinding) u32 {
     if (binding.comparison and binding.dimension == .two_d) return self.sampled_image_comparison_type;
-    return self.sampled_image_types[sampledImageDimensionIndex(binding.dimension)];
+    return self.sampled_image_types[sampledImageBankIndex(binding)];
 }
 
 fn sampledImageImageType(self: *const Builder, binding: SampledImageBinding) u32 {
     if (binding.comparison and binding.dimension == .two_d) return self.sampled_image_comparison_image_type;
-    return self.sampled_image_image_types[sampledImageDimensionIndex(binding.dimension)];
+    return self.sampled_image_image_types[sampledImageBankIndex(binding)];
 }
 
 fn sampledImagePointerType(self: *const Builder, binding: SampledImageBinding) u32 {
     if (binding.comparison and binding.dimension == .two_d) return self.sampled_image_comparison_pointer_type;
-    return self.sampled_image_pointer_types[sampledImageDimensionIndex(binding.dimension)];
+    return self.sampled_image_pointer_types[sampledImageBankIndex(binding)];
 }
 
 /// Static association between a GFX10 T# and an element in Vulkan's storage
@@ -701,6 +729,29 @@ fn storageImageValueType(format: StorageImageFormat) ValueType {
     };
 }
 
+pub const MultiTexelFormat = struct { component_bits: u5, components: u3, value_type: ValueType };
+
+/// The hardware-tested 2D subset. Packed SNORM/FLOAT and wider formats have
+/// different conversion rules and must not be guessed from ordinary loads.
+pub fn multiTexelFormat(inst: instruction.Instruction, format: StorageImageFormat) ?MultiTexelFormat {
+    if (inst.image_elements != 2 and inst.image_elements != 4) return null;
+    const info: MultiTexelFormat = switch (format) {
+        .r8_unorm, .r8_snorm, .r8_uint, .r8_sint => .{ .component_bits = 8, .components = 1, .value_type = storageImageValueType(format) },
+        .r16_unorm, .r16_snorm, .r16_uint, .r16_sint, .r16_float => .{ .component_bits = 16, .components = 1, .value_type = storageImageValueType(format) },
+        .rg8_unorm, .rg8_snorm, .rg8_uint, .rg8_sint => .{ .component_bits = 8, .components = 2, .value_type = storageImageValueType(format) },
+        else => return null,
+    };
+    if (@as(u32, info.component_bits) * info.components * inst.image_elements > 32) return null;
+    if (inst.image_packed) {
+        if (inst.data_mask != 1) return null;
+        switch (format) {
+            .r8_snorm, .r16_snorm, .rg8_snorm, .r16_float => return null,
+            else => {},
+        }
+    } else if (@as(u32, info.components) * inst.image_elements != @popCount(inst.data_mask)) return null;
+    return info;
+}
+
 fn storageImageSpirvFormat(format: StorageImageFormat) u32 {
     return switch (format) {
         .rgba32_float => 1, // Rgba32f
@@ -824,6 +875,8 @@ pub fn validateSampledImageBindings(allocator: std.mem.Allocator, bindings: []co
     var candidates: std.AutoHashMapUnmanaged(Candidate, void) = .empty;
     defer candidates.deinit(allocator);
     for (bindings, 0..) |binding, index| {
+        if (binding.multi_texel_format != null and (binding.dimension != .two_d or binding.comparison or binding.candidate_words != null or binding.lookup != null))
+            return Error.InvalidStorageBinding;
         if (binding.resource_sgpr >= 128 or binding.sampler_sgpr >= 128 or
             (binding.candidate_words != null and binding.resource_sgpr + 4 > 128) or
             binding.descriptor_index >= descriptor_count)
@@ -1035,10 +1088,10 @@ const Builder = struct {
     fragment_extent: [2]u32,
     vector2_type: u32 = 0,
     vector2_bits_type: u32 = 0,
-    sampled_image_image_types: [4]u32 = @splat(0),
-    sampled_image_types: [4]u32 = @splat(0),
-    sampled_image_arrays: [4]u32 = @splat(0),
-    sampled_image_pointer_types: [4]u32 = @splat(0),
+    sampled_image_image_types: [6]u32 = @splat(0),
+    sampled_image_types: [6]u32 = @splat(0),
+    sampled_image_arrays: [6]u32 = @splat(0),
+    sampled_image_pointer_types: [6]u32 = @splat(0),
     sampled_image_comparison_image_type: u32 = 0,
     sampled_image_comparison_type: u32 = 0,
     sampled_image_comparison_array: u32 = 0,
@@ -1557,11 +1610,11 @@ const Builder = struct {
                 return Error.InvalidStorageBinding;
             }
             try validateSampledImageBindings(allocator, options.sampled_images, sampled_array_length);
-            var sampled_dimensions: [4]bool = @splat(false);
+            var sampled_dimensions: [6]bool = @splat(false);
             var comparison_2d = false;
             for (options.sampled_images) |binding| {
                 if (binding.unbound) continue;
-                sampled_dimensions[sampledImageDimensionIndex(binding.dimension)] = true;
+                sampled_dimensions[sampledImageBankIndex(binding)] = true;
                 comparison_2d = comparison_2d or (binding.comparison and binding.dimension == .two_d);
             }
             if (self.vector4_type == 0) {
@@ -1571,7 +1624,7 @@ const Builder = struct {
             const descriptor_count = try self.constant(.bits32, sampled_array_length);
             for (sampled_dimensions, 0..) |present, dimension_index| {
                 if (!present) continue;
-                const dimensions: u32 = if (dimension_index == 0) 2 else 3;
+                const dimensions: u32 = if (dimension_index == 0 or dimension_index >= 4) 2 else 3;
                 // SPIR-V Dim values are 1=2D, 2=3D and 3=Cube. Keeping
                 // volume and cube descriptors distinct is required because
                 // Vulkan image-view compatibility follows the declared Dim.
@@ -1579,7 +1632,7 @@ const Builder = struct {
                     0 => 1,
                     1 => 2,
                     2 => 3,
-                    3 => 1,
+                    3, 4, 5 => 1,
                     else => unreachable,
                 };
                 const descriptor_binding = switch (dimension_index) {
@@ -1587,12 +1640,14 @@ const Builder = struct {
                     1 => sampled_image_3d_descriptor_binding,
                     2 => sampled_image_cube_descriptor_binding,
                     3 => sampled_image_2d_array_descriptor_binding,
+                    4 => sampled_image_uint_2d_descriptor_binding,
+                    5 => sampled_image_sint_2d_descriptor_binding,
                     else => unreachable,
                 };
-                if (dimension_index == 0 and self.vector2_type == 0) {
+                if (dimensions == 2 and self.vector2_type == 0) {
                     self.vector2_type = self.id();
                     try self.emit(&self.declarations, 23, &.{ self.vector2_type, self.float_type, dimensions }); // OpTypeVector
-                } else if (dimension_index != 0 and self.vector3_type == 0) {
+                } else if (dimensions == 3 and self.vector3_type == 0) {
                     self.vector3_type = self.id();
                     try self.emit(&self.declarations, 23, &.{ self.vector3_type, self.float_type, dimensions }); // OpTypeVector
                 }
@@ -1607,7 +1662,7 @@ const Builder = struct {
                 try self.emit(&self.annotations, 71, &.{ self.sampled_image_arrays[dimension_index], 33, descriptor_binding });
                 try self.emit(&self.declarations, 25, &.{
                     image_type,
-                    self.float_type,
+                    self.typeId(if (dimension_index == 4) .bits32 else if (dimension_index == 5) .sint32 else .float32),
                     spirv_dimension,
                     0,
                     @intFromBool(dimension_index == 2 or dimension_index == 3),
@@ -6437,7 +6492,87 @@ const Builder = struct {
         }
     }
 
+    fn imageMultiTexelLoad(self: *Builder, inst: instruction.Instruction) Error!void {
+        if (inst.image_dimension != .dim_2d or inst.image_r128 or inst.image_sample_flags.a16 or inst.image_sample_flags.d16)
+            return Error.UnsupportedOpcode;
+        const binding = self.sampledImageBinding(inst.src1.reg, inst.src2.reg, inst.pc) orelse return Error.InvalidStorageBinding;
+        if (binding.dimension != .two_d or binding.comparison or binding.candidate_words != null or binding.lookup != null)
+            return Error.UnsupportedOpcode;
+        const format = binding.multi_texel_format orelse return Error.InvalidStorageBinding;
+        const info = multiTexelFormat(inst, format) orelse return Error.UnsupportedOpcode;
+        self.uses_image_query = true;
+        // Capture every address before writing any destination: VDATA may
+        // overlap VADDR, including the explicit mip and NSA registers.
+        const x = try self.source(try imageIntegerAddressOperand(inst, 0), .bits32);
+        const y = try self.source(try imageIntegerAddressOperand(inst, 1), .bits32);
+        const zero = try self.constant(.bits32, 0);
+        const lod = if (inst.opcode == .image_load_mip) try self.source(try imageIntegerAddressOperand(inst, 2), .bits32) else zero;
+        const sampled = try self.loadSampledImage(binding, inst);
+        const image = self.id();
+        try self.emit(&self.body, 100, &.{ sampledImageImageType(self, binding), image, sampled });
+        const levels = self.id();
+        try self.emit(&self.body, 106, &.{ self.bits_type, levels, image });
+        const valid_lod = try self.bvhBinary(176, self.bool_type, lod, levels); // ULessThan
+        const query_lod = try self.resinfoSelect(valid_lod, lod, zero);
+        const size = self.id();
+        try self.emit(&self.body, 103, &.{ try self.ensureBitsVec2(), size, image, query_lod });
+        const width = self.id();
+        const height = self.id();
+        try self.emit(&self.body, 81, &.{ self.bits_type, width, size, 0 });
+        try self.emit(&self.body, 81, &.{ self.bits_type, height, size, 1 });
+        const valid_x = try self.bvhBinary(176, self.bool_type, x, width);
+        const valid_y = try self.bvhBinary(176, self.bool_type, y, height);
+        const remaining = try self.resinfoBinary(130, width, x); // ISub
+        const fits = try self.bvhBinary(174, self.bool_type, remaining, try self.constant(.bits32, inst.image_elements));
+        var inside = try self.bvhBinary(167, self.bool_type, valid_lod, valid_x);
+        inside = try self.bvhBinary(167, self.bool_type, inside, valid_y);
+        inside = try self.bvhBinary(167, self.bool_type, inside, fits);
+        // Bounds are tested against the ORIGINAL X, before rounding it down.
+        const first = try self.resinfoBinary(199, x, try self.constant(.bits32, ~(@as(u32, inst.image_elements) - 1)));
+        const row = try self.resinfoSelect(inside, y, zero);
+        var values: [4]u32 = @splat(zero);
+        var packed_word = zero;
+        const vector_type = try self.ensureVec4(info.value_type);
+        for (0..inst.image_elements) |element| {
+            const column = try self.resinfoSelect(inside, try self.resinfoBinary(128, first, try self.constant(.bits32, @intCast(element))), zero);
+            const coordinates = self.id();
+            try self.emit(&self.body, 80, &.{ try self.ensureBitsVec2(), coordinates, column, row });
+            const texel = self.id();
+            // Invalid groups still fetch only the valid texel (0,0,0), then
+            // publish zeros. No invalid LOD/coordinate reaches the Vulkan fetch.
+            try self.emit(&self.body, 95, &.{ vector_type, texel, image, coordinates, 2, query_lod });
+            for (0..info.components) |component| {
+                const value = self.id();
+                try self.emit(&self.body, 81, &.{ self.typeId(info.value_type), value, texel, @intCast(component) });
+                var bits = value;
+                if (inst.image_packed and info.value_type == .float32) {
+                    const scale: f32 = @floatFromInt((@as(u32, 1) << info.component_bits) - 1);
+                    const scaled = try self.bvhBinary(133, self.float_type, value, try self.constant(.float32, @bitCast(scale)));
+                    const rounded = try self.glslFloatUnaryValue(2, scaled); // RoundEven
+                    bits = self.id();
+                    try self.emit(&self.body, 109, &.{ self.bits_type, bits, rounded });
+                } else if (info.value_type != .bits32) {
+                    bits = self.id();
+                    try self.emit(&self.body, 124, &.{ self.bits_type, bits, value });
+                }
+                const index = element * info.components + component;
+                if (inst.image_packed) {
+                    const mask = try self.constant(.bits32, (@as(u32, 1) << info.component_bits) - 1);
+                    bits = try self.resinfoBinary(199, bits, mask);
+                    bits = try self.resinfoBinary(196, bits, try self.constant(.bits32, @intCast(index * info.component_bits)));
+                    packed_word = try self.resinfoBinary(197, packed_word, bits);
+                } else values[index] = try self.resinfoSelect(inside, bits, zero);
+            }
+        }
+        if (inst.image_packed) values[0] = try self.resinfoSelect(inside, packed_word, zero);
+        const count: usize = if (inst.image_packed) 1 else @as(usize, inst.image_elements) * info.components;
+        for (values[0..count], 0..) |value, index| {
+            try self.destination(try consecutiveRegister(inst.dst, @intCast(index)), .{ .id = value, .value_type = .bits32 });
+        }
+    }
+
     fn imageLoad(self: *Builder, inst: instruction.Instruction) Error!void {
+        if (inst.image_elements != 0) return self.imageMultiTexelLoad(inst);
         // CMPX changes EXEC's representation, not the descriptor binding.
         // Compute inputs remain storage images inside a divergent branch.
         if (self.stage != .compute) {
@@ -15197,6 +15332,47 @@ test "compute image load can fetch a compressed read-only sampled descriptor" {
     try std.testing.expect(containsOpcode(module.words, 100)); // OpImage
     try std.testing.expect(containsOpcode(module.words, 95)); // OpImageFetch
     try std.testing.expect(!containsOpcode(module.words, 98)); // no storage OpImageRead
+}
+
+test "MIMG multi-texel loads use typed fetches and checked full groups in every stage" {
+    const decoder = @import("decoder.zig");
+    for ([_]Stage{ .compute, .vertex, .fragment }) |stage| {
+        for ([_]StorageImageFormat{ .r8_uint, .r8_sint, .r8_unorm }) |format| {
+            for ([_]u32{ 0x42, 0x43, 0x4a, 0x4b, 0x70, 0x71, 0x73, 0x74 }) |id| {
+                const elements: u32 = if (id == 0x42 or id == 0x4a or id == 0x70 or id == 0x73) 2 else 4;
+                const mask: u32 = if (id >= 0x70) 1 else (@as(u32, 1) << @intCast(elements)) - 1;
+                // VDATA aliases the coordinate registers, including mip.
+                var program = try decoder.decodeProgram(std.testing.allocator, &.{ 0xf0000008 | (id << 18) | (mask << 8), 0, 0xbf810000 });
+                defer program.deinit(std.testing.allocator);
+                const images = [_]SampledImageBinding{.{ .resource_sgpr = 0, .sampler_sgpr = 0, .descriptor_index = 0, .multi_texel_format = format }};
+                var module = try translate(std.testing.allocator, &program, .{ .stage = stage, .sampled_images = &images });
+                defer module.deinit(std.testing.allocator);
+                try std.testing.expectEqual(@as(usize, elements), countOpcode(module.words, 95));
+                try std.testing.expect(containsOpcode(module.words, 106)); // query mip count
+                try std.testing.expect(containsOpcode(module.words, 103)); // query mip extent
+                try std.testing.expect(containsOpcode(module.words, 169)); // zero invalid groups
+                try std.testing.expect(!containsOpcode(module.words, 98)); // no storage fallback
+                const expected_binding: u32 = switch (format) {
+                    .r8_uint => sampled_image_uint_2d_descriptor_binding,
+                    .r8_sint => sampled_image_sint_2d_descriptor_binding,
+                    else => sampled_image_2d_descriptor_binding,
+                };
+                try std.testing.expectEqual(expected_binding, sampledDescriptorBinding(images[0]));
+            }
+        }
+    }
+}
+
+test "MIMG multi-texel formats reject unmeasured packing instead of zero fallback" {
+    const decoder = @import("decoder.zig");
+    var program = try decoder.decodeProgram(std.testing.allocator, &.{ 0xf0000108 | (0x70 << 18), 0, 0xbf810000 });
+    defer program.deinit(std.testing.allocator);
+    for ([_]StorageImageFormat{ .r8_snorm, .r16_float, .rgba8_uint, .r32_float }) |format| {
+        try std.testing.expectError(Error.UnsupportedOpcode, translate(std.testing.allocator, &program, .{
+            .stage = .fragment,
+            .sampled_images = &.{.{ .resource_sgpr = 0, .sampler_sgpr = 0, .descriptor_index = 0, .multi_texel_format = format }},
+        }));
+    }
 }
 
 test "compute array fetch and store reuse descriptor SGPRs at different instructions" {

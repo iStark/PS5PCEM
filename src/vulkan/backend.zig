@@ -1086,14 +1086,19 @@ fn sampledImageDescriptorBindings(mappings: []const gpu.ShaderSpirvSampledImageB
 }
 
 fn sampledImageDescriptorBinding(mapping: gpu.ShaderSpirvSampledImageBinding) u32 {
-    if (mapping.comparison and mapping.dimension == .two_d)
-        return sampled_image_comparison_2d_descriptor_binding;
-    return switch (mapping.dimension) {
-        .two_d => rdna2.spirv.sampled_image_2d_descriptor_binding,
-        .three_d => sampled_image_3d_descriptor_binding,
-        .cube => sampled_image_cube_descriptor_binding,
-        .two_d_array => sampled_image_2d_array_descriptor_binding,
-    };
+    return rdna2.spirv.sampledDescriptorBinding(mapping);
+}
+
+fn multiTexelBindingFormat(inst: gpu.ShaderInstruction, descriptor: gpu.ImageDescriptor) Error!?rdna2.spirv.StorageImageFormat {
+    if (inst.image_elements == 0) return null;
+    const format = std.enums.fromInt(rdna2.spirv.StorageImageFormat, descriptor.unified_format) orelse return Error.UnsupportedSampledImage;
+    if (descriptor.image_type != .color_2d or !std.mem.eql(u8, &descriptor.dst_select, &.{ 4, 5, 6, 7 }) or
+        rdna2.spirv.multiTexelFormat(inst, format) == null)
+    {
+        std.debug.print("[vulkan dcb] unsupported multi-texel image pc=0x{x} opcode=0x{x} fmt={d} type={s} dst={any}\n", .{ inst.pc, inst.opcode_id, descriptor.unified_format, @tagName(descriptor.image_type), descriptor.dst_select });
+        return Error.UnsupportedSampledImage;
+    }
+    return format;
 }
 
 test "graphics shader words share immutable storage and survive owner eviction" {
@@ -3833,6 +3838,7 @@ const SampledImageKey = struct {
     image: gpu.ImageDescriptor,
     sampler: gpu.resources.SamplerDescriptor,
     dimension: rdna2.spirv.SampledImageDimension,
+    multi_texel_format: ?rdna2.spirv.StorageImageFormat = null,
 
     const Context = struct {
         pub fn hash(_: @This(), key: SampledImageKey) u64 {
@@ -3844,6 +3850,7 @@ const SampledImageKey = struct {
             var hasher = std.hash.Wyhash.init(sampledImageStateHash(key.image, sampler));
             std.hash.autoHash(&hasher, key.image);
             std.hash.autoHash(&hasher, key.dimension);
+            std.hash.autoHash(&hasher, key.multi_texel_format);
             return hasher.final();
         }
 
@@ -4081,6 +4088,7 @@ const ComputeResources = struct {
     sampled_image_descriptors: [maximum_sampled_images]gpu.ImageDescriptor = undefined,
     sampled_image_samplers: [maximum_sampled_images]gpu.resources.SamplerDescriptor = undefined,
     sampled_image_dimensions: [maximum_sampled_images]rdna2.spirv.SampledImageDimension = undefined,
+    sampled_image_multi_formats: [maximum_sampled_images]?rdna2.spirv.StorageImageFormat = undefined,
     sampled_image_mappings: [maximum_compute_sampled_mappings]gpu.ShaderSpirvSampledImageBinding = undefined,
     sampled_image_mapping_count: usize = 0,
     lookup_plan: sampled_lookup_plan.Plan = .{},
@@ -5984,7 +5992,7 @@ pub const Renderer = struct {
             .descriptor_count = candidate.info.sampled_image_capacity,
             .stage_flags = vk.shader_stage_vertex_bit | vk.shader_stage_fragment_bit | vk.shader_stage_compute_bit,
         };
-        var descriptor_bindings: [9 + maximum_storage_images]vk.DescriptorSetLayoutBinding = undefined;
+        var descriptor_bindings: [11 + maximum_storage_images]vk.DescriptorSetLayoutBinding = undefined;
         descriptor_bindings[0] = storage_binding;
         descriptor_bindings[1] = sampled_image_binding;
         for (0..maximum_storage_images) |index| {
@@ -6039,6 +6047,14 @@ pub const Renderer = struct {
             .descriptor_count = 1,
             .stage_flags = vk.shader_stage_fragment_bit,
         };
+        for ([_]u32{ rdna2.spirv.sampled_image_uint_2d_descriptor_binding, rdna2.spirv.sampled_image_sint_2d_descriptor_binding }, 0..) |binding, index| {
+            descriptor_bindings[9 + maximum_storage_images + index] = .{
+                .binding = binding,
+                .descriptor_type = vk.descriptor_type_combined_image_sampler,
+                .descriptor_count = candidate.info.sampled_image_capacity,
+                .stage_flags = vk.shader_stage_vertex_bit | vk.shader_stage_fragment_bit | vk.shader_stage_compute_bit,
+            };
+        }
         var descriptor_binding_flags: [descriptor_bindings.len]vk.Flags = @splat(0);
         if (descriptor_partially_bound) {
             @memset(&descriptor_binding_flags, vk.descriptor_binding_partially_bound_bit);
@@ -6071,7 +6087,7 @@ pub const Renderer = struct {
         };
         const image_pool_size = vk.DescriptorPoolSize{
             .descriptor_type = vk.descriptor_type_combined_image_sampler,
-            .descriptor_count = candidate.info.sampled_image_capacity * 5 * maximum_frame_descriptor_sets,
+            .descriptor_count = candidate.info.sampled_image_capacity * rdna2.spirv.sampled_image_bank_count * maximum_frame_descriptor_sets,
         };
         const storage_image_pool_size = vk.DescriptorPoolSize{
             .descriptor_type = vk.descriptor_type_storage_image,
@@ -12124,6 +12140,7 @@ pub const Renderer = struct {
                 defer image_cursor += 1;
                 break :next instructions[image_cursor];
             };
+            if (inst.image_elements != 0) continue;
             const writable = switch (inst.opcode) {
                 .image_load => false,
                 .image_store,
@@ -12421,12 +12438,14 @@ pub const Renderer = struct {
             for (0..candidate_count) |candidate_index| {
                 const candidate_words: ?[8]u32 = if (candidate_table) |table| table.words[candidate_index] else null;
                 const image_descriptor = if (candidate_words) |words| try gpu.resources.decodeImageDescriptor(words[0..inst.imageResourceWords()]) else direct_image.?;
-                if (inst.opcode == .image_load and !isBlockCompressedUnifiedFormat(image_descriptor.unified_format)) {
+                if (inst.opcode == .image_load and inst.image_elements == 0 and !isBlockCompressedUnifiedFormat(image_descriptor.unified_format)) {
                     // Uncompressed fetches were bound through the storage-image
                     // pass above. Only compressed, read-only fetches need this
                     // sampled-image fallback.
                     continue;
                 }
+                if (inst.image_elements != 0 and candidate_table != null) return Error.UnsupportedSampledImage;
+                const multi_format = try multiTexelBindingFormat(inst, image_descriptor);
                 var sampler_descriptor: gpu.resources.SamplerDescriptor = resolved_sampler orelse if (image_fetch)
                     std.mem.zeroes(gpu.resources.SamplerDescriptor)
                 else if (if (candidate_table) |table| table.sampler else null) |sampler|
@@ -12470,7 +12489,7 @@ pub const Renderer = struct {
                 ) |existing_image, existing_sampler, existing_dimension, index| {
                     if (!std.meta.eql(existing_image, image_descriptor) or
                         !std.meta.eql(existing_sampler, sampler_descriptor) or
-                        existing_dimension != sampled_dimension)
+                        existing_dimension != sampled_dimension or result.sampled_image_multi_formats[index] != multi_format)
                     {
                         continue;
                     }
@@ -12509,6 +12528,7 @@ pub const Renderer = struct {
                     result.sampled_image_descriptors[result.sampled_image_count] = image_descriptor;
                     result.sampled_image_samplers[result.sampled_image_count] = sampler_descriptor;
                     result.sampled_image_dimensions[result.sampled_image_count] = sampled_dimension;
+                    result.sampled_image_multi_formats[result.sampled_image_count] = multi_format;
                     result.sampled_image_count += 1;
                     descriptor_index = physical_index;
                 }
@@ -12518,6 +12538,7 @@ pub const Renderer = struct {
                     .sampler_sgpr = sampler_sgpr,
                     .descriptor_index = descriptor_index.?,
                     .dimension = sampled_dimension,
+                    .multi_texel_format = multi_format,
                     .instruction_pc = inst.pc,
                     .candidate_words = candidate_words,
                     .check_unmatched = if (candidate_table) |table| table.requires_null_check else false,
@@ -23267,6 +23288,7 @@ pub const Renderer = struct {
                 );
                 return Error.UnsupportedSampledImage;
             };
+            const multi_format = try multiTexelBindingFormat(inst, image_descriptor);
             var sampler_descriptor: gpu.resources.SamplerDescriptor = if (image_fetch)
                 std.mem.zeroes(gpu.resources.SamplerDescriptor)
             else
@@ -23301,7 +23323,7 @@ pub const Renderer = struct {
             // SGPR pairs can name different images later in the same shader.
             // Resolve every instruction, sharing physical slots only when the
             // complete image, sampler and Vulkan view dimension still match.
-            const image_key = SampledImageKey{ .image = image_descriptor, .sampler = sampler_descriptor, .dimension = sampled_dimension };
+            const image_key = SampledImageKey{ .image = image_descriptor, .sampler = sampler_descriptor, .dimension = sampled_dimension, .multi_texel_format = multi_format };
             var descriptor_index = result.image_lookup.get(image_key);
             if (descriptor_index == null) {
                 if (result.image_count >= self.device_info.sampled_image_capacity) return Error.UnsupportedSampledImage;
@@ -23359,6 +23381,7 @@ pub const Renderer = struct {
                 .sampler_sgpr = inst.src2.reg,
                 .descriptor_index = descriptor_index.?,
                 .dimension = sampled_dimension,
+                .multi_texel_format = multi_format,
                 .instruction_pc = inst.pc,
                 .depth_compare = sampler_descriptor.depth_compare,
                 .comparison = sampler_descriptor.compare_sample,
@@ -23381,6 +23404,7 @@ pub const Renderer = struct {
         target: GuestColorTarget,
         extra_colors: []const GuestColorTarget,
     ) anyerror!bool {
+        if (inst.image_elements != 0) return false;
         const uniform_null = try resolveUniformNullImage(bindings, reader, analysis, scalar, inst);
         if (!uniform_null and !self.sampled_image_nonuniform_indexing) return false;
         const candidate_scratch = if (uniform_null) null else (try self.borrowBufferImageCandidates(bindings, reader, analysis, scalar, inst)) orelse return false;
@@ -34420,6 +34444,7 @@ fn sampledImageFormat(unified_format: u16, force_srgb: bool) ?u32 {
         5 => vk.format_r8_uint,
         6 => vk.format_r8_sint,
         7 => vk.format_r16_unorm,
+        8 => vk.format_r16_snorm,
         11 => vk.format_r16_uint,
         12 => vk.format_r16_sint,
         13 => vk.format_r16_sfloat,
@@ -37770,11 +37795,11 @@ fn choosePhysicalDevice(
         const other_descriptors = maximum_storage_descriptors + maximum_storage_images + 2;
         info.sampled_image_capacity = @min(
             maximum_sampled_images,
-            limits.max_per_stage_descriptor_samplers / 5,
-            limits.max_per_stage_descriptor_sampled_images / 5,
-            limits.max_descriptor_set_samplers / 5,
-            limits.max_descriptor_set_sampled_images / 5,
-            (limits.max_per_stage_resources -| other_descriptors) / 5,
+            limits.max_per_stage_descriptor_samplers / rdna2.spirv.sampled_image_bank_count,
+            limits.max_per_stage_descriptor_sampled_images / rdna2.spirv.sampled_image_bank_count,
+            limits.max_descriptor_set_samplers / rdna2.spirv.sampled_image_bank_count,
+            limits.max_descriptor_set_sampled_images / rdna2.spirv.sampled_image_bank_count,
+            (limits.max_per_stage_resources -| other_descriptors) / rdna2.spirv.sampled_image_bank_count,
         );
         if (info.sampled_image_capacity == 0) continue;
         @memcpy(info.name_bytes[0..name_length], name_source[0..name_length]);

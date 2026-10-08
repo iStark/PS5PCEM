@@ -318,8 +318,8 @@ pub fn decodeDs(pc: u32, code: []const u32, word_index: u32) Error!Instruction {
 
 fn mimgOpcode(id: u32) isa.Opcode {
     return switch (id) {
-        0x00 => .image_load,
-        0x01 => .image_load_mip,
+        0x00, 0x42, 0x43, 0x70, 0x71 => .image_load,
+        0x01, 0x4a, 0x4b, 0x73, 0x74 => .image_load_mip,
         0x08 => .image_store,
         0x09 => .image_store_mip,
         0x0e => .image_get_resinfo,
@@ -396,6 +396,12 @@ pub fn decodeMimg(pc: u32, code: []const u32, word_index: u32) Error!Instruction
     inst.data_words = if (op == .image_gather4) 4 else @max(1, bitCount4(inst.data_mask));
     inst.globally_coherent = (word0 >> 13) & 1 != 0;
     inst.image_r128 = (word0 >> 15) & 1 != 0;
+    switch (id) {
+        0x42, 0x4a, 0x70, 0x73 => inst.image_elements = 2,
+        0x43, 0x4b, 0x71, 0x74 => inst.image_elements = 4,
+        else => {},
+    }
+    inst.image_packed = id == 0x70 or id == 0x71 or id == 0x73 or id == 0x74;
     inst.system_coherent = (word0 >> 25) & 1 != 0;
     inst.image_sample_flags.a16 = (word1 >> 30) & 1 != 0;
     // GFX10 MIMG bit 63 packs two returned/stored 16-bit components per VGPR.
@@ -404,6 +410,16 @@ pub fn decodeMimg(pc: u32, code: []const u32, word_index: u32) Error!Instruction
         (op == .image_sample or op == .image_gather4 or
             (op == .image_load and id <= 1) or (op == .image_store and (id == 8 or id == 9)));
     if (inst.image_sample_flags.d16) inst.data_words = (inst.data_words + 1) / 2;
+    if (inst.image_elements != 0) {
+        const mask_valid = if (inst.image_packed) inst.data_mask == 1 else inst.data_mask == 15 or (inst.image_elements == 2 and inst.data_mask == 3);
+        if (!mask_valid or word1 & 0xc000_0000 != 0 or inst.image_r128 or inst.image_dimension != .dim_2d) {
+            inst.setUnsupported(.mimg, id, "multi-texel load requires measured DMASK, 32-bit addresses/data and a full 2D descriptor");
+        }
+    }
+    switch (id) {
+        0x52, 0x53, 0x5a, 0x5b, 0x76, 0x77, 0x79, 0x7a => inst.setUnsupported(.mimg, id, "BY/PCK multi-texel stores are not implemented"),
+        else => {},
+    }
     if (op == .image_sample) {
         if (id >= 0x20 and id <= 0x3f or (id >= 0xa0 and id <= 0xbe)) {
             const encoded = if (id >= 0xa0) id - 0x80 else id;
@@ -507,7 +523,7 @@ pub fn decodeMimg(pc: u32, code: []const u32, word_index: u32) Error!Instruction
         inst.src2 = .{};
         inst.src_count = 2;
     }
-    if (op == .unsupported) inst.unsupported_reason = "MIMG opcode is not implemented";
+    if (op == .unsupported and inst.unsupported_reason.len == 0) inst.unsupported_reason = "MIMG opcode is not implemented";
     return inst;
 }
 
@@ -588,6 +604,49 @@ test "MIMG explicit-mip operations include the mip address VGPR" {
     const inst = try decodeMimg(0x64, &code, 0);
     try std.testing.expectEqual(isa.Opcode.image_load_mip, inst.opcode);
     try std.testing.expectEqual(@as(u8, 3), inst.image_address_components);
+}
+
+test "MIMG multi-texel loads preserve widths and consecutive or NSA addresses" {
+    for ([_]u32{ 0x42, 0x43, 0x4a, 0x4b, 0x70, 0x71, 0x73, 0x74 }) |id| {
+        const packed_load = id >= 0x70;
+        const mip = id == 0x4a or id == 0x4b or id == 0x73 or id == 0x74;
+        const elements: u3 = if (id == 0x42 or id == 0x4a or id == 0x70 or id == 0x73) 2 else 4;
+        for ([_]u32{ 0, 1 }) |nsa| {
+            const mask: u32 = if (packed_load) 1 else 15;
+            const code = [_]u32{ 0xf0000008 | (id << 18) | (mask << 8) | (nsa << 1), 0x00010a1e, 0x00002c28 };
+            const inst = try decodeMimg(0x80, &code, 0);
+            try std.testing.expectEqual(if (mip) isa.Opcode.image_load_mip else .image_load, inst.opcode);
+            try std.testing.expectEqual(elements, inst.image_elements);
+            try std.testing.expectEqual(packed_load, inst.image_packed);
+            try std.testing.expectEqual(@as(u8, if (packed_load) 1 else 4), inst.data_words);
+            try std.testing.expectEqual(@as(u8, if (mip) 3 else 2), inst.image_address_components);
+            try std.testing.expectEqual(@as(u32, 10), inst.dst.reg);
+            try std.testing.expectEqual(@as(u32, 30), inst.src0.reg);
+            try std.testing.expectEqual(@as(u32, 4), inst.src1.reg);
+            try std.testing.expectEqual(2 + nsa, inst.word_count);
+            if (nsa != 0) try std.testing.expectEqual(@as(u8, 44), inst.image_nsa_address[1]);
+        }
+    }
+}
+
+test "MIMG multi-texel loads reject unsupported controls and stores explicitly" {
+    for ([_][2]u32{
+        .{ 0xf0000308 | (0x43 << 18), 0 }, // BY4 requires four results
+        .{ 0xf0000f08 | (0x70 << 18), 0 }, // PCK2 returns one word
+        .{ 0xf0008308 | (0x42 << 18), 0 }, // R128
+        .{ 0xf0000300 | (0x42 << 18), 0 }, // DIM 1D
+        .{ 0xf0000308 | (0x42 << 18), 1 << 30 }, // A16
+        .{ 0xf0000308 | (0x42 << 18), 1 << 31 }, // D16
+    }) |code| {
+        const inst = try decodeMimg(0, &code, 0);
+        try std.testing.expectEqual(isa.Opcode.unsupported, inst.opcode);
+        try std.testing.expect(inst.unsupported_reason.len != 0);
+    }
+    for ([_]u32{ 0x52, 0x53, 0x5a, 0x5b, 0x76, 0x77, 0x79, 0x7a }) |id| {
+        const inst = try decodeMimg(0, &.{ 0xf0000f08 | (id << 18), 0 }, 0);
+        try std.testing.expectEqual(isa.Opcode.unsupported, inst.opcode);
+        try std.testing.expectEqualStrings("BY/PCK multi-texel stores are not implemented", inst.unsupported_reason);
+    }
 }
 
 test "MIMG gather retains result width and offset address layout" {

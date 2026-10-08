@@ -523,6 +523,29 @@ test "dynamic buffer extents share translations while address and format rules r
 // canonical content; immutable lifetime IDs only reuse a checked prefix.
 const appendValue = rdna2.cache_key.appendValue;
 
+test "MIMG multi-texel translation cache separates native component formats" {
+    const allocator = std.testing.allocator;
+    var program = try rdna2.decodeProgram(allocator, &.{ 0xf0000308 | (0x42 << 18), 0, 0xbf810000 });
+    defer program.deinit(allocator);
+    var bindings = [_]rdna2.spirv.SampledImageBinding{.{ .resource_sgpr = 0, .sampler_sgpr = 0, .descriptor_index = 0, .multi_texel_format = .r8_uint }};
+    const options = rdna2.spirv.Options{ .stage = .compute, .sampled_images = &bindings };
+    var cache = Cache{};
+    defer cache.deinit(allocator);
+    const unsigned = try cache.acquire(allocator, &program, options, .{});
+    defer unsigned.release();
+    for ([_]rdna2.spirv.StorageImageFormat{ .r8_sint, .r8_unorm, .r16_uint }) |format| {
+        bindings[0].multi_texel_format = format;
+        const changed = try cache.acquire(allocator, &program, options, .{});
+        defer changed.release();
+        try std.testing.expect(!unsigned.sameModule(changed));
+    }
+    bindings[0].multi_texel_format = .r8_uint;
+    const reused = try cache.acquire(allocator, &program, options, .{});
+    defer reused.release();
+    try std.testing.expect(unsigned.sameModule(reused));
+    try std.testing.expectEqual(@as(u64, 4), cache.misses);
+}
+
 test "sampled lookup payloads reuse translations while code and validation stay exact" {
     const allocator = std.testing.allocator;
     var program = try rdna2.decodeProgram(allocator, &.{

@@ -91,7 +91,8 @@ The AnyPS5 update also includes hardware-checked MIMG BY2/BY4 and PCK2/PCK4
 loads, packed horizontal gather fixes, shader-call work and write-watch coverage
 tracking. These are useful candidates for a separate renderer comparison;
 none is claimed as a graphics fix or FPS improvement in this counter change.
-PS5PCEM's current MIMG opcode table does not handle these BY2/BY4 and PCK2/PCK4
-load encodings, making their decoder and execution tests a concrete follow-up.
+At this counter checkpoint PS5PCEM did not handle those load encodings. The
+subsequent [MIMG load implementation](mimg-multi-texel-2026-10-09.md) adds the
+measured 2D subset with decoder and native Vulkan execution checks.
 Its new AMPR completion-event filter correction already matches PS5PCEM's
 existing AMPR event filter.

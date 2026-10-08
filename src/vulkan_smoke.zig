@@ -72,7 +72,7 @@ fn SizedGuestMemory(comptime size: usize) type {
             return true;
         }
 
-        fn word(self: *Self, address: usize, value: u32) void {
+        pub fn word(self: *Self, address: usize, value: u32) void {
             self.changed();
             std.mem.writeInt(u32, self.bytes[address..][0..4], value, .little);
         }
@@ -90,7 +90,7 @@ fn SizedGuestMemory(comptime size: usize) type {
             return result;
         }
 
-        fn interface(self: *Self) vulkan.GuestMemory {
+        pub fn interface(self: *Self) vulkan.GuestMemory {
             return .{ .context = self, .read = read, .write = write };
         }
     };
@@ -12744,6 +12744,10 @@ fn runNativeLsHsProbe(allocator: std.mem.Allocator, triangles: bool) !void {
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
     const args = try init.minimal.args.toSlice(allocator);
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--mimg-multi-texel")) {
+        try @import("mimg_multi_probe.zig").run(allocator, GuestMemory);
+        return;
+    }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--indexed-tessellation")) {
         try runIndexedTessellationProbe(allocator);
         return;

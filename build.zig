@@ -761,4 +761,8 @@ pub fn build(b: *std.Build) void {
     const run_hle_tests = b.addRunArtifact(hle_tests);
     const test_hle_step = b.step("test-hle", "Run firmware library tests");
     test_hle_step.dependOn(&run_hle_tests.step);
+    const rdna_tests = b.addTest(.{ .root_module = mod, .filters = if (test_filter) |filter| &.{filter} else &.{} });
+    b.step("test-rdna2", "Run decoder and shader translation tests").dependOn(&b.addRunArtifact(rdna_tests).step);
+    const vulkan_tests = b.addTest(.{ .root_module = vulkan, .filters = if (test_filter) |filter| &.{filter} else &.{} });
+    b.step("test-vulkan", "Run Vulkan backend tests").dependOn(&b.addRunArtifact(vulkan_tests).step);
 }

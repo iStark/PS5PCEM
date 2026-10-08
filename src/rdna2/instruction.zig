@@ -76,6 +76,9 @@ pub const Instruction = struct {
     image_sample_flags: isa.ImageSampleFlags = .{},
     /// MIMG r128: the T# occupies four SGPRs instead of eight.
     image_r128: bool = false,
+    /// BY2/BY4 and PCK2/PCK4 load an aligned horizontal group of texels.
+    image_elements: u3 = 0,
+    image_packed: bool = false,
     memory_segment: u2 = 0,
     data_signed: bool = false,
     typed: bool = false,

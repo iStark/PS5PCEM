@@ -6,6 +6,12 @@ Development captures and the furthest repeatable point reached in each observed
 title. What the emulator can do subsystem by subsystem is listed separately in
 [Implementation status](implementation-status.md).
 
+**October 9, 2026 — shared shader support:** MIMG BY2/BY4 and PCK2/PCK4
+loads, including explicit mip levels, now execute for the measured native 2D
+formats. Native Vulkan checks cover packing, bounds and register preservation;
+game compatibility grades and FPS measurements are unchanged by this check.
+See the [implementation and validation report](development/mimg-multi-texel-2026-10-09.md).
+
 ## Compatibility and progress
 
 

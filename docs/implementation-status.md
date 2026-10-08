@@ -29,6 +29,11 @@ behind them.
   resume before subsequent writes/events; ordinary and `_04_00` APIs have
   separate argument lists. Hardware timing and WaitOnAddress remain incomplete.
   See the [AMPR counter report](development/ampr-counters-2026-10-09.md).
+- MIMG BY2/BY4 and PCK2/PCK4 loads now support the measured native 2D
+  formats, including explicit mips, packing, checked bounds and overlapping
+  registers. Integer sampled descriptors retain their numeric type. Stores
+  and unmeasured format/descriptor combinations remain unsupported. See the
+  [MIMG implementation and validation report](development/mimg-multi-texel-2026-10-09.md).
 - Live VideoOut reaches a Vulkan swapchain, while host audio accepts decoded
   guest buffers at 48 kHz. SceAvPlayer uses FFmpeg for H.264/AAC media and
   returns synchronized NV12 video plus stereo PCM through the title's own
