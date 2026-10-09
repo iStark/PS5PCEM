@@ -84,10 +84,9 @@ fn grownQueueDepth(current: usize, prepared: usize) usize {
 
 /// The largest buffer that can be played, as channels x bytes x frames.
 ///
-/// Fixed rather than allocated: this module is reached from firmware entry
-/// points that have no allocator of their own, and a title picks its buffer size
-/// once at startup. A title asking for more than this keeps the silent path
-/// rather than being refused outright.
+/// Each open stream allocates a bounded queue for its configured output shape.
+/// The limit also bounds conversion scratch space in the firmware entry points.
+/// A title asking for more keeps the paced silent path.
 pub const maximum_buffer_bytes = 8 * 4 * 4096;
 
 // ---------------------------------------------------------------------------
@@ -228,18 +227,8 @@ const time_period_ms: u32 = 1;
 const thread_priority_highest: i32 = 2;
 threadlocal var playback_thread_boosted = false;
 
-/// One open sound output.
-///
-/// A single instance, because a title opens one main output port and that is
-/// what reaches the speakers. Ports beyond it keep the silent path rather than
-/// competing for the device, which would interleave two unrelated streams.
-/// The sample buffers the device plays from.
-///
-/// Module scope rather than inside `Device`: they are a third of a megabyte,
-/// and there is one device, so carrying them in a value callers might place on
-/// a stack buys nothing and risks a great deal.
-var buffers: [maximum_queue_depth][maximum_buffer_bytes]u8 align(16) = undefined;
-
+/// One stable host stream. Separate guest ports must own separate PCM storage;
+/// Windows mixes their streams without closing one when another becomes audible.
 pub const Device = struct {
     handle: ?*anyopaque = null,
     /// Guest PCM shape and the shape accepted by the Windows endpoint. They
@@ -257,6 +246,8 @@ pub const Device = struct {
     primed: bool = false,
     fade_next_buffer: bool = false,
     precise_timer_active: bool = false,
+    buffers: []align(16) u8 = &.{},
+    diagnostic_id: i32 = 0,
 
     pub fn isOpen(self: *const Device) bool {
         return self.handle != null;
@@ -297,9 +288,15 @@ pub const Device = struct {
                 .{ config.channels, @tagName(config.format) },
             );
         }
-        errdefer _ = waveOutClose(handle);
+        const length: u32 = @intCast(output_config.bufferBytes());
+        const storage = std.heap.page_allocator.alignedAlloc(u8, .@"16", maximum_queue_depth * length) catch {
+            _ = waveOutClose(handle);
+            return Error.DeviceUnavailable;
+        };
 
         self.handle = handle;
+        self.buffers = storage;
+        errdefer self.close();
         self.config = config;
         self.output_config = output_config;
         self.prepared = 0;
@@ -315,14 +312,12 @@ pub const Device = struct {
         // three 256-frame buffers and create the underrun it is waiting to avoid.
         self.precise_timer_active = timeBeginPeriod(time_period_ms) == mmsyserr_noerror;
 
-        const length: u32 = @intCast(output_config.bufferBytes());
         // Prepare the bounded maximum once. Inactive headers remain completed,
         // so an underrun can grow the jitter reserve without reopening the
         // device or doing driver allocation on the title's mixer thread.
         for (&self.headers, 0..) |*header, index| {
-            header.* = .{ .lpData = &buffers[index], .dwBufferLength = length };
+            header.* = .{ .lpData = self.bufferAt(index).ptr, .dwBufferLength = length };
             if (waveOutPrepareHeader(handle, header, @sizeOf(WAVEHDR)) != mmsyserr_noerror) {
-                self.close();
                 return Error.DeviceUnavailable;
             }
             self.prepared = index + 1;
@@ -341,6 +336,7 @@ pub const Device = struct {
     pub fn play(self: *Device, samples: []const u8) Error!void {
         if (samples.len > maximum_buffer_bytes) return Error.BufferTooLarge;
         const handle = self.handle orelse return Error.DeviceUnavailable;
+        if (samples.len > self.config.bufferBytes()) return Error.BufferTooLarge;
         if (samples.len == 0) return;
         if (comptime !supported) return Error.Unsupported;
 
@@ -363,8 +359,8 @@ pub const Device = struct {
             self.active_depth = grownQueueDepth(self.active_depth, self.prepared);
             if (self.underruns <= 3 or std.math.isPowerOfTwo(self.underruns)) {
                 std.debug.print(
-                    "[audio] host underrun #{d} (pre-roll {d}/{d} buffers, {d} frames each)\n",
-                    .{ self.underruns, self.active_depth, self.prepared, self.config.frames },
+                    "[audio] host underrun #{d} stream={d} (pre-roll {d}/{d} buffers, {d} frames each)\n",
+                    .{ self.underruns, self.diagnostic_id, self.active_depth, self.prepared, self.config.frames },
                 );
             }
         }
@@ -382,11 +378,11 @@ pub const Device = struct {
         // it somewhere else afterwards is not something the device permits.
         const output_length = if (self.output_config.channels == self.config.channels and
             self.output_config.format == self.config.format)
-            passthroughSamples(self.config, samples, &buffers[slot])
+            passthroughSamples(self.config, samples, self.bufferAt(slot))
         else
-            convertToStereoSigned16(self.config, samples, &buffers[slot]);
+            convertToStereoSigned16(self.config, samples, self.bufferAt(slot));
         if (self.fade_next_buffer) {
-            self.fadeInAfterUnderrun(buffers[slot][0..output_length]);
+            self.fadeInAfterUnderrun(self.bufferAt(slot)[0..output_length]);
             self.fade_next_buffer = false;
         }
         header.dwBufferLength = @intCast(output_length);
@@ -396,9 +392,8 @@ pub const Device = struct {
             self.staged += 1;
             if (self.staged < self.active_depth) return;
 
-            const first = (self.next + self.active_depth - self.staged) % self.active_depth;
             for (0..self.staged) |offset| {
-                const staged_slot = (first + offset) % self.prepared;
+                const staged_slot = self.stagedSlot(offset);
                 try self.submitSlot(handle, staged_slot);
             }
             self.submitted +%= self.staged;
@@ -409,6 +404,18 @@ pub const Device = struct {
 
         try self.submitSlot(handle, slot);
         self.submitted +%= 1;
+    }
+
+    fn bufferAt(self: *Device, slot: usize) []u8 {
+        const length: usize = @intCast(self.output_config.bufferBytes());
+        return self.buffers[slot * length ..][0..length];
+    }
+
+    fn stagedSlot(self: *const Device, offset: usize) usize {
+        const first = (self.next + self.active_depth - self.staged) % self.active_depth;
+        // Recovery may begin at any cursor. Wrap inside the active ring, not
+        // the larger prepared reserve, or stale/unfilled buffers are submitted.
+        return (first + offset) % self.active_depth;
     }
 
     fn submitSlot(self: *Device, handle: ?*anyopaque, slot: usize) Error!void {
@@ -483,6 +490,8 @@ pub const Device = struct {
             if (self.precise_timer_active) _ = timeEndPeriod(time_period_ms);
         }
         self.handle = null;
+        std.heap.page_allocator.free(self.buffers);
+        self.buffers = &.{};
         self.prepared = 0;
         self.active_depth = 0;
         self.next = 0;
@@ -655,6 +664,50 @@ test "queued buffer accounting observes completed headers" {
     device.headers[1].dwFlags &= ~header_done;
     device.headers[3].dwFlags &= ~header_done;
     try testing.expectEqual(@as(usize, 2), device.queuedBufferCount());
+}
+
+test "recovery preserves PCM order when the active ring wraps inside its reserve" {
+    var device = Device{};
+    device.prepared = maximum_queue_depth;
+    // The driver drained the ring with its cursor away from zero; recovery
+    // has enlarged the active portion but has not activated all 32 headers.
+    for ([_]usize{ 8, 12, 16, 20, 24, 28, 32 }) |depth| {
+        for (0..depth) |cursor| {
+            device.active_depth = depth;
+            device.next = cursor;
+            device.staged = depth;
+            var pcm_ids: [maximum_queue_depth]usize = @splat(0xdead);
+            for (0..depth) |sequence| pcm_ids[(cursor + sequence) % depth] = sequence;
+            for (0..depth) |sequence| {
+                try testing.expectEqual(sequence, pcm_ids[device.stagedSlot(sequence)]);
+            }
+        }
+    }
+}
+
+test "simultaneous host streams retain private PCM when another stream closes" {
+    if (comptime !supported) return error.SkipZigTest;
+    var music = Device{};
+    var effects = Device{};
+    const config = Config{ .frequency = 48_000, .channels = 2, .format = .signed16, .frames = 256 };
+    music.open(config) catch return error.SkipZigTest;
+    defer music.close();
+    try effects.open(config);
+    defer effects.close();
+    try testing.expect(music.buffers.ptr != effects.buffers.ptr);
+    const music_pcm = [_]u8{0x12} ** 1024;
+    const effects_pcm = [_]u8{0x03} ** 1024;
+    try music.play(&music_pcm);
+    try effects.play(&effects_pcm);
+    try testing.expectEqualSlices(u8, &music_pcm, music.bufferAt(0));
+    try testing.expectEqualSlices(u8, &effects_pcm, effects.bufferAt(0));
+    music.close();
+    try testing.expect(effects.isOpen());
+    try testing.expectEqualSlices(u8, &effects_pcm, effects.bufferAt(0));
+    // Prime and run the surviving stream past the queue capacity.
+    for (0..20) |_| try effects.play(&effects_pcm);
+    try testing.expect(effects.submitted >= 20);
+    try testing.expectError(Error.BufferTooLarge, effects.play(&([_]u8{0} ** 1028)));
 }
 
 test "underrun recovery fades a resumed buffer in without changing its tail" {

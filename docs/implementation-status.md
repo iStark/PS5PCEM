@@ -44,6 +44,10 @@ behind them.
   Verified AGC fetch pointers link to matching returns. A 42-dispatch GPU
   probe checks 21,504 words; general dynamic calls remain unsupported. See
   the [scalar call report](development/scalar-calls-2026-10-09.md).
+- Legacy AudioOut ports own separate Windows streams and PCM queues, so music
+  and effects play concurrently. Batch output submits every active port;
+  underrun recovery preserves sample order within the active ring. See the
+  [Jets audio retest](development/jets-audio-streams-2026-10-09.md).
 - Live VideoOut reaches a Vulkan swapchain, while host audio accepts decoded
   guest buffers at 48 kHz. SceAvPlayer uses FFmpeg for H.264/AAC media and
   returns synchronized NV12 video plus stereo PCM through the title's own

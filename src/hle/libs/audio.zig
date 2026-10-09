@@ -3,8 +3,8 @@
 
 //! Guest audio services and the host AudioOut backend.
 //!
-//! AudioOut and AudioIn preserve port lifetimes, validate the common ABI, and
-//! pace producer/consumer calls without touching a host sound device. AudioOut2
+//! AudioOut preserves independent host streams for concurrent guest ports;
+//! AudioIn validates and paces silent capture. AudioOut2
 //! does the same for its context/port queue model and reports a connected
 //! primary port from `sceAudioOut2PortGetState`. AJM executes ATRAC9 and MP3
 //! decode jobs through stateful host codec instances.
@@ -120,15 +120,12 @@ const LegacyPort = struct {
     frequency: u32 = 0,
     channels: u8 = 0,
     samples: audio_device.SampleFormat = .signed16,
+    generation: u64 = 0,
 };
 
-/// The single sound output, and the port that holds it.
-///
-/// One port is audible because there is one pair of speakers. A title opens a
-/// main output port and, often, further ports for other purposes; letting each
-/// claim the device would interleave unrelated streams into one another. The
-/// rest keep the silent path, which is what they had before and costs a title
-/// nothing.
+/// AudioOut2 contexts retain their own mixed output path. Legacy ports use
+/// independent streams below so music and effects reach the Windows mixer
+/// concurrently instead of taking ownership away from one another.
 var device: audio_device.Device = .{};
 var device_owner = std.atomic.Value(i32).init(-1);
 var device_owner_last_signal_ms = std.atomic.Value(u64).init(0);
@@ -172,93 +169,24 @@ fn unlockDevice(io: std.Io) void {
     device_mutex.unlock(io);
 }
 
-/// Tries to make a port audible, and says whether it worked.
-///
-/// Failure is not reported to the title. A title must not stall or behave
-/// differently because the host has no sound card, denies access to it, or will
-/// not take the format it asked for — those are facts about this machine, not
-/// about the title.
-fn claimDevice(handle: i32, port: LegacyPort) bool {
-    const io = lockDevice() orelse return false;
-    defer unlockDevice(io);
-    if (device_owner.load(.acquire) != -1) return false;
-    if (audioDisabled()) {
-        std.debug.print("[audio] host output disabled by launcher\n", .{});
-        return false;
-    }
-    // Warm FSB index + host mix before the first audible Output so silent
-    // mixer buffers immediately carry real game PCM.
-    filesystem.ensureAudioIndexed();
-    device.open(.{
-        .frequency = port.frequency,
-        .channels = port.channels,
-        .format = port.samples,
-        .frames = port.frames,
-        .target_latency_ms = host_target_latency_ms.load(.acquire),
-    }) catch |err| {
-        std.debug.print(
-            "[audio] host device open failed handle={d} {d}Hz ch={d} fmt={s} frames={d}: {s}\n",
-            .{ handle, port.frequency, port.channels, @tagName(port.samples), port.frames, @errorName(err) },
-        );
-        return false;
-    };
-    device_owner.store(handle, .release);
-    device_owner_last_signal_ms.store(audioClockMilliseconds(), .release);
-    std.debug.print(
-        "[audio] host device open ok handle={d} {d}Hz ch={d} fmt={s} frames={d} queue={d}\n",
-        .{ handle, port.frequency, port.channels, @tagName(port.samples), port.frames, device.queueCapacity() },
-    );
-    return true;
-}
+const LegacyOutput = struct {
+    device: audio_device.Device = .{},
+    mutex: std.Io.Mutex = .init,
+    generation: std.atomic.Value(u64) = .init(0),
+};
 
-fn releaseDevice(handle: i32) void {
-    const io = lockDevice() orelse return;
-    defer unlockDevice(io);
-    if (device_owner.load(.acquire) != handle) return;
-    device.close();
-    device_owner.store(-1, .release);
-    device_owner_last_signal_ms.store(0, .release);
-}
+var legacy_outputs: [maximum_legacy_ports]LegacyOutput = @splat(.{});
+var next_legacy_generation: u64 = 0; // protected by port_mutex
+var fallback_output_owner = std.atomic.Value(i32).init(-1);
 
-/// Moves the one host device to the guest port that currently carries the
-/// title's real mix. Music/video helpers can leave their first-opened port
-/// alive after they stop submitting PCM; without reassignment every later NGS2
-/// buffer is valid but discarded as a "secondary" port.
-fn routeDevice(handle: i32, port: LegacyPort) bool {
-    const io = lockDevice() orelse return false;
-    defer unlockDevice(io);
-    const previous = device_owner.load(.acquire);
-    if (previous == handle) return true;
-    if (audioDisabled()) return false;
-    if (previous != -1) device.close();
-    device_owner.store(-1, .release);
-    device.open(.{
-        .frequency = port.frequency,
-        .channels = port.channels,
-        .format = port.samples,
-        .frames = port.frames,
-        .target_latency_ms = host_target_latency_ms.load(.acquire),
-    }) catch |err| {
-        std.debug.print(
-            "[audio] host route {d}->{d} failed {d}Hz ch={d} fmt={s}: {s}\n",
-            .{ previous, handle, port.frequency, port.channels, @tagName(port.samples), @errorName(err) },
-        );
-        return false;
-    };
-    device_owner.store(handle, .release);
-    const routed_now = audioClockMilliseconds();
-    device_owner_last_signal_ms.store(routed_now, .release);
-    device_routed_at_ms.store(routed_now, .release);
-    // Every one of these is a device teardown, and printing from the audio
-    // path costs a blocking write. Report the first few and then only
-    // occasionally: enough to see routing happen, not enough to become the
-    // problem being reported.
-    const route_count = device_route_count.fetchAdd(1, .monotonic) + 1;
-    if (route_count <= 8 or route_count % 64 == 0) std.debug.print(
-        "[audio] host route #{d} {d}->{d} {d}Hz ch={d} fmt={s}\n",
-        .{ route_count, previous, handle, port.frequency, port.channels, @tagName(port.samples) },
-    );
-    return true;
+fn releaseLegacyOutput(handle: i32) void {
+    const output = &legacy_outputs[@intCast(handle - 1)];
+    const io = filesystem.attachedIo();
+    if (io) |attached| output.mutex.lockUncancelable(attached);
+    defer if (io) |attached| output.mutex.unlock(attached);
+    output.generation.store(0, .release);
+    output.device.close();
+    _ = fallback_output_owner.cmpxchgStrong(handle, -1, .acq_rel, .acquire);
 }
 
 const maximum_legacy_ports = 64;
@@ -276,7 +204,10 @@ fn allocateLegacyPort(
     defer port_mutex.unlock();
     for (&legacy_ports, 0..) |*port, index| {
         if (port.kind != .none) continue;
+        next_legacy_generation +%= 1;
+        if (next_legacy_generation == 0) next_legacy_generation = 1;
         port.* = .{
+            .generation = next_legacy_generation,
             .kind = kind,
             .frames = frames,
             .frequency = frequency,
@@ -284,7 +215,7 @@ fn allocateLegacyPort(
             .samples = samples,
         };
         const handle: i32 = @intCast(index + 1);
-        if (kind == .output) _ = claimDevice(handle, port.*);
+        if (kind == .output) legacy_outputs[index].generation.store(port.generation, .release);
         return handle;
     }
     return null;
@@ -304,7 +235,7 @@ fn releaseLegacyPort(handle: i32, kind: PortKind) bool {
     defer port_mutex.unlock();
     const port = &legacy_ports[@intCast(handle - 1)];
     if (port.kind != kind) return false;
-    releaseDevice(handle);
+    if (kind == .output) releaseLegacyOutput(handle);
     port.* = .{};
     return true;
 }
@@ -351,10 +282,9 @@ fn audioOutSetMixLevelPadSpeaker(handle: i32, _: f32) callconv(abi.guest) i32 {
 /// device it is a sleep, exactly as before. A title cannot tell which, and must
 /// not be able to.
 var audio_out_play_ok: std.atomic.Value(u64) = .init(0);
-var audio_out_play_silent: std.atomic.Value(u64) = .init(0);
 var audio_out_play_fail: std.atomic.Value(u64) = .init(0);
 var audio_test_tone_phase: f32 = 0;
-/// Set once from `PS5_AUDIO_TEST_TONE=1` — inject a quiet 440 Hz tone when the
+/// Set once from `PS5_AUDIO_TEST_TONE=1` вЂ” inject a quiet 440 Hz tone when the
 /// title submits silent buffers so host speakers can be verified.
 var audio_test_tone_enabled: ?bool = null;
 var audio_disabled: ?bool = null;
@@ -449,131 +379,78 @@ fn fillTestTone(port: LegacyPort, dest: []u8) void {
     audio_test_tone_phase = phase;
 }
 
-/// How long an owner may go without signal before another port may claim the
-/// device.
-///
-/// This was 100 ms, which is inside one frame when a title runs slowly: Jets 'n'
-/// Guns 2 at 13 FPS submits every 70-92 ms, so a single long frame made the
-/// owner look abandoned. Two simultaneously active ports then took the device
-/// from each other several times per frame, and every exchange closes and
-/// reopens the host device -- the mix is not glitching, it is being torn down
-/// mid-playback, repeatedly.
-///
-/// A port that has genuinely stopped stays quiet far longer than this, so the
-/// reassignment this threshold exists for still happens.
-const audio_route_stale_ms: u64 = 500;
-
-/// Minimum time the device stays where it was just put.
-///
-/// The staleness rule alone cannot stop an exchange: both ports pass it at the
-/// same moment, and each hand-off makes the other side look stale in turn.
-/// Holding a fresh route briefly breaks that loop, and is short enough to be
-/// inaudible when a reassignment really is needed.
-const audio_route_hold_ms: u64 = 250;
-
-var device_routed_at_ms = std.atomic.Value(u64).init(0);
-var device_route_count = std.atomic.Value(u64).init(0);
-
-fn audioOutOutputImpl(handle: i32, data: ?*const anyopaque, fallback_pacing: bool, force_route: bool) i32 {
-    const port = legacyPort(handle, .output) orelse return audio_out_error_invalid_port;
-    // A null buffer is a legal drain/pacing request (and is used by JnG2 when
-    // stopping its BGM output thread), not an invalid guest pointer.
-    const samples = data orelse {
-        if (fallback_pacing) pace(port.frames, port.frequency);
-        return errno.ok;
-    };
+/// Submit one independent legacy stream. Each stream owns its PCM and wait
+/// lock; a music producer cannot reset or block a concurrently active SFX port.
+fn submitLegacyOutput(handle: i32, port: LegacyPort, samples: *const anyopaque) bool {
+    if (audioDisabled()) return false;
+    const io = filesystem.attachedIo() orelse return false;
+    const output = &legacy_outputs[@intCast(handle - 1)];
+    output.mutex.lockUncancelable(io);
+    defer output.mutex.unlock(io);
+    // Close/reopen may have reused this integer handle while the producer
+    // waited for its stream lock. Never feed an old call into a new port.
+    if (output.generation.load(.acquire) != port.generation) return false;
+    _ = fallback_output_owner.cmpxchgStrong(-1, handle, .acq_rel, .acquire);
+    const owns_fallback = fallback_output_owner.load(.acquire) == handle;
+    if (!output.device.isOpen()) {
+        if (owns_fallback) filesystem.ensureAudioIndexed();
+        output.device.diagnostic_id = handle;
+        output.device.open(.{
+            .frequency = port.frequency,
+            .channels = port.channels,
+            .format = port.samples,
+            .frames = port.frames,
+            .target_latency_ms = host_target_latency_ms.load(.acquire),
+        }) catch |err| {
+            const n = audio_out_play_fail.fetchAdd(1, .monotonic);
+            if (n < 5) std.debug.print("[audio] stream open failed handle={d}: {s}\n", .{ handle, @errorName(err) });
+            return false;
+        };
+        std.debug.print("[audio] stream open handle={d} {d}Hz ch={d} fmt={s} frames={d} queue={d}\n", .{
+            handle, port.frequency, port.channels, @tagName(port.samples), port.frames, output.device.queueCapacity(),
+        });
+    }
 
     const length = port.frames * @as(u32, port.channels) * port.samples.bytes();
-    if (kernel_memory.isGuestRangeAccessible(@intFromPtr(samples), length)) {
-        const bytes: [*]const u8 = @ptrCast(samples);
-        var play_slice = bytes[0..length];
-        const source_peak = bufferPeak(port, play_slice);
-        const now = audioClockMilliseconds();
-        const owner = device_owner.load(.acquire);
-        const last_signal = device_owner_last_signal_ms.load(.acquire);
-        const routed_at = device_routed_at_ms.load(.acquire);
-        const settled = now -| routed_at >= audio_route_hold_ms;
-        if (force_route or owner == -1 or
-            (owner != handle and settled and source_peak >= 8 and
-                now -| last_signal >= audio_route_stale_ms))
-        {
-            _ = routeDevice(handle, port);
-        }
-
-        if (device_owner.load(.acquire) == handle) {
-            // Optional host-side tone when the title is still feeding silence
-            // (codec/assets not ready). Real non-zero content is never replaced.
-            var tone_storage: [audio_device.maximum_buffer_bytes]u8 align(16) = undefined;
-            if (audioTestToneEnabled() and length <= tone_storage.len and source_peak < 8) {
-                @memcpy(tone_storage[0..length], play_slice);
-                fillTestTone(port, tone_storage[0..length]);
-                play_slice = tone_storage[0..length];
-            }
-            // A device that stopped working mid-run falls back to pacing rather
-            // than failing the call, because losing sound is not a reason to
-            // stop a title.
-            // When the title's mixer is still silent after first present, blend
-            // in FSB-backed attract clips (not the full load-time library).
-            var mixed_storage: [audio_device.maximum_buffer_bytes]u8 align(16) = undefined;
-            var peak = bufferPeak(port, play_slice);
-            if (peak < 8 and length <= mixed_storage.len) {
-                if (audio_fs.isMixLive()) {
-                    filesystem.ensureAudioMixAfterPresent();
-                }
-                if (audio_fs.isMixLive()) {
-                    @memcpy(mixed_storage[0..length], play_slice);
-                    const mixed = if (port.samples == .float32)
-                        audio_fs.mixIntoFloat32Buffer(mixed_storage[0..length], port.channels)
-                    else
-                        audio_fs.mixIntoInt16Buffer(mixed_storage[0..length], port.channels);
-                    if (mixed) {
-                        play_slice = mixed_storage[0..length];
-                        peak = bufferPeak(port, play_slice);
-                    }
-                }
-            }
-            const io = lockDevice() orelse {
-                if (fallback_pacing) pace(port.frames, port.frequency);
-                return errno.ok;
-            };
-            const play_result = if (device_owner.load(.acquire) == handle)
-                device.play(play_slice)
-            else
-                audio_device.Error.DeviceUnavailable;
-            unlockDevice(io);
-            if (play_result) |_| {
-                if (source_peak >= 8) device_owner_last_signal_ms.store(now, .release);
-                const n = audio_out_play_ok.fetchAdd(1, .monotonic);
-                if (n < 3 or n % 1000 == 0 or (peak > 8 and n < 20)) {
-                    if (log_verbose_audio) std.debug.print(
-                        "[audio] play ok #{d} handle={d} bytes={d} peak~{d}\n",
-                        .{ n + 1, handle, length, peak },
-                    );
-                }
-                return errno.ok;
-            } else |err| {
-                const n = audio_out_play_fail.fetchAdd(1, .monotonic);
-                if (n < 5) {
-                    std.debug.print("[audio] play failed #{d}: {s}\n", .{ n + 1, @errorName(err) });
-                }
-            }
-        } else {
-            const n = audio_out_play_silent.fetchAdd(1, .monotonic);
-            if (n < 3) {
-                std.debug.print(
-                    "[audio] inactive output route handle={d} owner={d} peak~{d}\n",
-                    .{ handle, device_owner.load(.acquire), source_peak },
-                );
+    const bytes: [*]const u8 = @ptrCast(samples);
+    var play_slice = bytes[0..length];
+    const source_peak = bufferPeak(port, play_slice);
+    var mixed_storage: [audio_device.maximum_buffer_bytes]u8 align(16) = undefined;
+    if (owns_fallback and source_peak < 8 and length <= mixed_storage.len) {
+        if (audioTestToneEnabled()) {
+            @memcpy(mixed_storage[0..length], play_slice);
+            fillTestTone(port, mixed_storage[0..length]);
+            play_slice = mixed_storage[0..length];
+        } else if (audio_fs.isMixLive()) {
+            filesystem.ensureAudioMixAfterPresent();
+            if (audio_fs.isMixLive()) {
+                @memcpy(mixed_storage[0..length], play_slice);
+                const mixed = if (port.samples == .float32)
+                    audio_fs.mixIntoFloat32Buffer(mixed_storage[0..length], port.channels)
+                else
+                    audio_fs.mixIntoInt16Buffer(mixed_storage[0..length], port.channels);
+                if (mixed) play_slice = mixed_storage[0..length];
             }
         }
     }
-
-    if (fallback_pacing) pace(port.frames, port.frequency);
-    return errno.ok;
+    output.device.play(play_slice) catch |err| {
+        const n = audio_out_play_fail.fetchAdd(1, .monotonic);
+        if (n < 5) std.debug.print("[audio] play failed #{d} handle={d}: {s}\n", .{ n + 1, handle, @errorName(err) });
+        return false;
+    };
+    _ = audio_out_play_ok.fetchAdd(1, .monotonic);
+    return true;
 }
 
 fn audioOutOutput(handle: i32, data: ?*const anyopaque) callconv(abi.guest) i32 {
-    return audioOutOutputImpl(handle, data, true, false);
+    const port = legacyPort(handle, .output) orelse return audio_out_error_invalid_port;
+    if (data) |samples| {
+        const length = @as(u64, port.frames) * port.channels * port.samples.bytes();
+        if (!kernel_memory.isGuestRangeAccessible(@intFromPtr(samples), length)) return audio_out_error_invalid_pointer;
+        if (submitLegacyOutput(handle, port, samples)) return errno.ok;
+    }
+    pace(port.frames, port.frequency);
+    return errno.ok;
 }
 
 const AudioOutOutputParam = extern struct {
@@ -594,14 +471,10 @@ fn audioOutOutputs(parameters: ?[*]const AudioOutOutputParam, count: u32) callco
     // later descriptor must not leave the host device with a partial batch.
     var frames: ?u32 = null;
     var frequency: u32 = 0;
-    const owner = device_owner.load(.acquire);
-    var owner_entry: ?AudioOutOutputParam = null;
-    var owner_peak: u32 = 0;
-    var first_data_entry: ?AudioOutOutputParam = null;
-    var strongest_entry: ?AudioOutOutputParam = null;
-    var strongest_peak: u32 = 0;
+    var ports: [25]LegacyPort = undefined;
     for (list[0..count], 0..) |entry, index| {
         const port = legacyPort(entry.handle, .output) orelse return audio_out_error_invalid_port;
+        ports[index] = port;
         if (frames) |expected| {
             if (port.frames != expected) return audio_out_error_invalid_size;
         } else {
@@ -612,44 +485,19 @@ fn audioOutOutputs(parameters: ?[*]const AudioOutOutputParam, count: u32) callco
             if (previous.handle == entry.handle) return audio_out_error_invalid_port;
         }
         if (entry.data != 0) {
-            const length = port.frames * @as(u32, port.channels) * port.samples.bytes();
+            const length = @as(u64, port.frames) * port.channels * port.samples.bytes();
             if (!kernel_memory.isGuestRangeAccessible(entry.data, length)) return audio_out_error_invalid_pointer;
-            const bytes: [*]const u8 = @ptrFromInt(entry.data);
-            const peak = bufferPeak(port, bytes[0..length]);
-            if (first_data_entry == null) first_data_entry = entry;
-            if (strongest_entry == null or peak > strongest_peak) {
-                strongest_entry = entry;
-                strongest_peak = peak;
-            }
-            if (entry.handle == owner) {
-                owner_entry = entry;
-                owner_peak = peak;
-            }
         }
     }
 
-    // All ports in one call describe the same audio quantum. Submitting or
-    // sleeping once is therefore the whole batch contract; pacing every silent
-    // auxiliary port in sequence multiplies 5.3 ms by the port count and drains
-    // the audible queue between otherwise timely mixer calls.
-    // Keep a live owner stable, but when its entry is null/silent route the
-    // strongest real buffer in this quantum. This is the MusicPlayer -> NGS2
-    // transition used by Jets 'n' Guns 2.
-    const selected = if (owner_entry != null and owner_peak >= 8)
-        owner_entry
-    else if (strongest_entry != null and strongest_peak >= 8)
-        strongest_entry
-    else
-        owner_entry orelse first_data_entry;
-    if (selected) |entry| {
-        return audioOutOutputImpl(
-            entry.handle,
-            @ptrFromInt(entry.data),
-            true,
-            entry.handle != owner,
-        );
+    // Submit every stream in this quantum. The independent host queues play
+    // concurrently; a silent/null auxiliary port must not add another sleep.
+    var played = false;
+    for (list[0..count], 0..) |entry, index| {
+        if (entry.data == 0) continue;
+        played = submitLegacyOutput(entry.handle, ports[index], @ptrFromInt(entry.data)) or played;
     }
-    pace(frames.?, frequency);
+    if (!played) pace(frames.?, frequency);
     return errno.ok;
 }
 
@@ -3494,6 +3342,7 @@ pub fn reset() void {
     device_owner_last_signal_ms.store(0, .release);
 
     port_mutex.lock();
+    for (0..maximum_legacy_ports) |index| releaseLegacyOutput(@intCast(index + 1));
     legacy_ports = [_]LegacyPort{.{}} ** maximum_legacy_ports;
     port_mutex.unlock();
 
@@ -3540,7 +3389,6 @@ pub fn reset() void {
     ngs2_command_logs.store(0, .monotonic);
     ajm_decode_jobs.store(0, .monotonic);
     audio_out_play_ok.store(0, .monotonic);
-    audio_out_play_silent.store(0, .monotonic);
     audio_out_play_fail.store(0, .monotonic);
     audio_test_tone_phase = 0;
     audio_test_tone_enabled = null;
