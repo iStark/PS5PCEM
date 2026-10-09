@@ -709,15 +709,39 @@ fn ensureAudioBuffer(player: *Player) bool {
     return true;
 }
 
+/// Host pipe reads must land in host-owned memory. The GPU tracker can make a
+/// previously returned guest frame read-only; a kernel I/O write cannot invoke
+/// our CPU write-fault handler to disarm that watch. Consume the reader's own
+/// bounded buffer, then publish through the tracked guest-memory write path.
+fn readDecodedGuestFrame(reader: *std.Io.Reader, address: u64, size: usize) !void {
+    const memory = @import("memory");
+    const space = kernel_memory.attachedAddressSpace();
+    const mapped = if (space) |attached| attached.isWritable(address, size) else false;
+    // Allocation callbacks may also return native CRT memory, just like the
+    // buffers accepted by allocateGuest. Preserve that path after checking its
+    // actual host permissions; it has no guest page watch to invalidate.
+    if (!mapped and !memory.isHostRangeWritable(address, size)) return error.ProtectionDenied;
+    if (reader.buffer.len == 0) return error.InvalidBuffer;
+    var written: usize = 0;
+    while (written < size) {
+        const bytes = try reader.take(@min(size - written, reader.buffer.len));
+        if (mapped) {
+            try space.?.write(address + written, bytes);
+        } else {
+            @memcpy(@as([*]u8, @ptrFromInt(address + written))[0..bytes.len], bytes);
+        }
+        written += bytes.len;
+    }
+}
+
 fn readVideoFrame(player: *Player) ?u64 {
     if (!ensureVideoBuffers(player)) return null;
     var attempt: u8 = 0;
     while (attempt < 2) : (attempt += 1) {
         if (player.video_reader == null) startVideoDecoder(player) catch return null;
         const allocation = player.video_buffers[player.next_video_buffer];
-        const frame: [*]u8 = @ptrFromInt(allocation.address);
         if (player.video_reader) |*reader| {
-            reader.interface.readSliceAll(frame[0..player.video_frame_bytes]) catch {
+            readDecodedGuestFrame(&reader.interface, allocation.address, player.video_frame_bytes) catch {
                 stopVideoDecoder(player);
                 if (!player.looping) {
                     finishStream(player, true);
@@ -742,9 +766,8 @@ fn readAudioFrame(player: *Player) ?u64 {
     while (attempt < 2) : (attempt += 1) {
         if (player.audio_reader == null) startAudioDecoder(player) catch return null;
         const address = player.audio_buffer.address + player.next_audio_buffer * audio_frame_bytes;
-        const frame: [*]u8 = @ptrFromInt(address);
         if (player.audio_reader) |*reader| {
-            reader.interface.readSliceAll(frame[0..audio_frame_bytes]) catch {
+            readDecodedGuestFrame(&reader.interface, address, audio_frame_bytes) catch {
                 stopAudioDecoder(player);
                 if (!player.looping) {
                     finishStream(player, false);
@@ -1390,6 +1413,54 @@ pub const exports = [_]symbols.Export{
     .{ .name = "sceAvPlayerClose", .function = trace.wrap("sceAvPlayerClose", &close), .expect_id = "NkJwDzKmIlw" },
     .{ .name = "sceAvPlayerSetLogCallback", .function = trace.wrap("sceAvPlayerSetLogCallback", &success), .expect_id = "eBTreZ84JFY" },
 };
+
+test "AvPlayer host reads refill GPU-watched frame buffers without kernel writes to guest pages" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const memory = @import("memory");
+    const testing = std.testing;
+    const frame_bytes = 3 * pipe_buffer_bytes + 37;
+    const mapped_bytes = 4 * pipe_buffer_bytes;
+    const frame_count = 4;
+    var space = try memory.AddressSpace.initWithDirectMemory(testing.allocator, mapped_bytes);
+    defer space.deinit();
+    const base = memory.user.start;
+    const address = base + 123;
+    try space.mapFixed(base, mapped_bytes, .read_write, .direct_memory, 0);
+    kernel_memory.attachAddressSpace(&space);
+    defer kernel_memory.attachAddressSpace(null);
+    space.enableGpuMemoryTracking();
+
+    const encoded = try testing.allocator.alloc(u8, frame_count * frame_bytes);
+    defer testing.allocator.free(encoded);
+    for (encoded, 0..) |*value, index| value.* = @truncate(index *% 17 +% (index / frame_bytes) *% 61);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "decoded.bin", .data = encoded });
+    const file = try tmp.dir.openFile(testing.io, "decoded.bin", .{});
+    defer file.close(testing.io);
+    var host_buffer: [pipe_buffer_bytes]u8 = undefined;
+    var reader = file.readerStreaming(testing.io, &host_buffer);
+    try space.write(address - 1, &.{0xa5});
+    try space.write(address + frame_bytes, &.{0x5a});
+    for (0..frame_count) |index| {
+        const generation = try space.trackGpuRead(address, frame_bytes);
+        try testing.expect(generation != 0);
+        try testing.expect(!memory.isHostRangeWritable(address, frame_bytes));
+        try readDecodedGuestFrame(&reader.interface, address, frame_bytes);
+        try testing.expect(space.gpuGeneration(address, frame_bytes) != generation);
+        try testing.expectEqualSlices(u8, encoded[index * frame_bytes ..][0..frame_bytes], @as([*]const u8, @ptrFromInt(address))[0..frame_bytes]);
+    }
+    try testing.expectEqual(@as(u8, 0xa5), @as(*const u8, @ptrFromInt(address - 1)).*);
+    try testing.expectEqual(@as(u8, 0x5a), @as(*const u8, @ptrFromInt(address + frame_bytes)).*);
+    try testing.expectError(error.EndOfStream, readDecodedGuestFrame(&reader.interface, address, 1));
+    try space.protect(base, mapped_bytes, .read_only);
+    var fixed = std.Io.Reader.fixed("x");
+    try testing.expectError(error.ProtectionDenied, readDecodedGuestFrame(&fixed, address, 1));
+    var native: [4]u8 = undefined;
+    var native_reader = std.Io.Reader.fixed("host");
+    try readDecodedGuestFrame(&native_reader, @intFromPtr(&native), native.len);
+    try testing.expectEqualStrings("host", &native);
+}
 
 test "a presentation ends when its clock passes the source duration" {
     // A title that takes only the pictures from a movie never drains the
