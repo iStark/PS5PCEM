@@ -22,6 +22,7 @@ const kernel_threading = @import("kernel_threading.zig");
 const kernel_memory = @import("kernel_memory.zig");
 const audio_device = @import("../audio_device.zig");
 const audio_fs = @import("../audio_fs.zig");
+const ngs2_pcm = @import("../ngs2_pcm.zig");
 const ajm_codec = @import("../ajm_codec.zig");
 const services = @import("services.zig");
 const filesystem = @import("../filesystem.zig");
@@ -878,12 +879,15 @@ fn updateAudioOut2Queue(context: *AudioObject, now: u64) void {
     const grain_ns = @max(1, @as(u64, context.grains) * std.time.ns_per_s / frequency);
     const completed = @min(context.queued_grains, (now -| context.queue_updated_ns) / grain_ns);
     context.queued_grains -= @intCast(completed);
-    // Preserve the partially played grain; an idle queue starts a new clock
-    // when the next grain is submitted.
-    context.queue_updated_ns = if (context.queued_grains == 0)
-        now
-    else
-        context.queue_updated_ns + completed * grain_ns;
+    // Carry the fractional hardware period across a just-drained queue too.
+    // Depth-one producers poll in whole milliseconds: resetting to `now` on
+    // each completion stretches a 256/48000 grain from 5.333 ms to 6 ms and
+    // eventually starves the host output. Rebase only after a full idle grain
+    // so an idle context cannot accumulate an unbounded catch-up allowance.
+    context.queue_updated_ns += completed * grain_ns;
+    if (context.queued_grains == 0 and now -| context.queue_updated_ns >= grain_ns) {
+        context.queue_updated_ns = now;
+    }
 }
 
 fn audioOut2Initialize() callconv(abi.guest) i32 {
@@ -1209,6 +1213,7 @@ var ngs2_control_logs = std.atomic.Value(u32).init(0);
 var ngs2_state_logs = std.atomic.Value(u32).init(0);
 var ngs2_waveform_logs = std.atomic.Value(u32).init(0);
 var ngs2_command_logs = std.atomic.Value(u32).init(0);
+var ngs2_sampler_detail_logs: [2]u32 = .{ 0, 0 }; // protected by ngs2_mutex
 
 const maximum_ngs2_systems = 8;
 const maximum_ngs2_racks = 64;
@@ -1234,6 +1239,8 @@ const Ngs2VoiceEvent = enum(u8) {
 const Ngs2System = struct {
     active: bool = false,
     handle: u64 = 0,
+    grain: u32 = 256,
+    sample_rate: u32 = 48_000,
 };
 
 const Ngs2Rack = struct {
@@ -1259,6 +1266,7 @@ const Ngs2Voice = struct {
     loop_start: ?usize = null,
     loop_end: usize = 0,
     gain: f32 = 1,
+    pcm: ?ngs2_pcm.Stream = null,
 };
 
 const Ngs2VoiceParamHeader = extern struct {
@@ -1314,7 +1322,17 @@ fn ngs2Handle() u64 {
     return next_ngs2_handle.fetchAdd(1, .monotonic);
 }
 
-fn ngs2SystemCreateWithAllocator(_: u64, _: u64, output: ?*u64) callconv(abi.guest) i32 {
+fn ngs2SystemCreateWithAllocator(options: u64, _: u64, output: ?*u64) callconv(abi.guest) i32 {
+    var grain: u32 = 256;
+    var rate: u32 = 48_000;
+    if (options != 0) {
+        if (!kernel_memory.isGuestRangeAccessible(options, 144)) return errno.KernelError.efault.raw();
+        const bytes = @as([*]const u8, @ptrFromInt(options))[0..144];
+        if (std.mem.readInt(u64, bytes[0..8], .little) < 144) return errno.KernelError.einval.raw();
+        grain = std.mem.readInt(u32, bytes[112..116], .little);
+        rate = std.mem.readInt(u32, bytes[116..120], .little);
+        if (grain == 0 or grain > 4096 or rate < 8000 or rate > 192000) return errno.KernelError.einval.raw();
+    }
     const destination = output orelse return ngs2_error_invalid_output;
     if (!kernel_memory.isGuestRangeAccessible(@intFromPtr(destination), @sizeOf(u64))) {
         return errno.KernelError.efault.raw();
@@ -1324,7 +1342,7 @@ fn ngs2SystemCreateWithAllocator(_: u64, _: u64, output: ?*u64) callconv(abi.gue
     for (&ngs2_systems) |*system| {
         if (system.active) continue;
         const handle = ngs2Handle();
-        system.* = .{ .active = true, .handle = handle };
+        system.* = .{ .active = true, .handle = handle, .grain = grain, .sample_rate = rate };
         destination.* = handle;
         return errno.ok;
     }
@@ -1497,6 +1515,7 @@ fn ngs2CacheWaveform(address: u64, decoded: Ngs2DecodedWaveform) ?usize {
 
 fn ngs2ResetVoice(voice: *Ngs2Voice) void {
     ngs2FreeVoiceWaveform(voice);
+    if (voice.pcm) |*pcm| pcm.deinit(std.heap.page_allocator);
     voice.* = .{};
 }
 
@@ -1772,6 +1791,18 @@ fn ngs2VoiceControl(handle: u64, params_address: u64) callconv(abi.guest) i32 {
 
         const rack_id = header.id >> 16;
         const command_id = header.id & 0x7fff;
+        if (trace.isLive() and rack_id == 0x1000 and command_id <= 1) {
+            const detail = &ngs2_sampler_detail_logs[command_id];
+            if (detail.* < 16) {
+                detail.* += 1;
+                std.debug.print("[audio] NGS2 sampler voice=0x{x} id=0x{x} bytes={x}\n", .{ handle, header.id, @as([*]const u8, @ptrFromInt(address))[0..@min(header.size, 40)] });
+                if (command_id == 1 and header.size >= 32) {
+                    const data = @as([*]const u8, @ptrFromInt(address))[0..32];
+                    const blocks = std.mem.readInt(u64, data[24..32], .little);
+                    if (kernel_memory.isGuestRangeAccessible(blocks, 40)) std.debug.print("[audio] NGS2 first block={x}\n", .{@as([*]const u8, @ptrFromInt(blocks))[0..40]});
+                }
+            }
+        }
         const log_index = ngs2_control_logs.fetchAdd(1, .monotonic);
         if (trace.isLive() and log_index < 128) std.debug.print(
             "[audio] NGS2 voice=0x{x} param id=0x{x} size={d} next={d}\n",
@@ -1785,10 +1816,47 @@ fn ngs2VoiceControl(handle: u64, params_address: u64) callconv(abi.guest) i32 {
                 "[audio] NGS2 voice=0x{x} event=0x{x}\n",
                 .{ handle, event.event_id },
             );
+        } else if (header.id == 0x1000_0000) {
+            if (header.size < 32) return errno.KernelError.einval.raw();
+            const format: *align(1) const Ngs2WaveformFormat = @ptrFromInt(address + 8);
+            ngs2FreeVoiceWaveform(voice);
+            if (voice.pcm) |*pcm| pcm.deinit(std.heap.page_allocator);
+            voice.pcm = null;
+            voice.state = .empty;
+            voice.event = .none;
+            if (format.waveform_type == 0x12 or format.waveform_type == 0x18) {
+                if (format.channels == 0 or format.channels > 8 or format.sample_rate < 8000 or format.sample_rate > 192000) return errno.KernelError.einval.raw();
+                voice.pcm = .{ .format = .{ .channels = @intCast(format.channels), .rate = format.sample_rate, .float32 = format.waveform_type == 0x18 } };
+            }
         } else if (header.id == 0x1000_0001) {
             if (header.size < @sizeOf(Ngs2VoiceWaveformParam)) return errno.KernelError.einval.raw();
             const waveform: *const Ngs2VoiceWaveformParam = @ptrFromInt(address);
-            ngs2ArmVoice(voice, waveform.data_address);
+            if (voice.pcm) |*pcm| {
+                if (header.size < 32) return errno.KernelError.einval.raw();
+                const bytes = @as([*]const u8, @ptrFromInt(address))[0..32];
+                const flags = std.mem.readInt(u32, bytes[16..20], .little);
+                const count = std.mem.readInt(u32, bytes[20..24], .little);
+                const blocks_address = std.mem.readInt(u64, bytes[24..32], .little);
+                if (count > ngs2_pcm.max_blocks or flags & ~@as(u32, 0x15) != 0) return errno.KernelError.einval.raw();
+                if (count != 0 and !kernel_memory.isGuestRangeAccessible(blocks_address, @as(u64, count) * @sizeOf(Ngs2WaveformBlock))) return errno.KernelError.efault.raw();
+                var queued: [ngs2_pcm.max_blocks]ngs2_pcm.Block = undefined;
+                const blocks: []align(1) const Ngs2WaveformBlock = if (count == 0) &.{} else @as([*]align(1) const Ngs2WaveformBlock, @ptrFromInt(blocks_address))[0..count];
+                var used: usize = 0;
+                for (blocks) |block| {
+                    if (block.samples == 0 and block.data_size == 0) continue;
+                    const data_address = std.math.add(u64, waveform.data_address, block.data_offset) catch return errno.KernelError.einval.raw();
+                    if (block.data_size > maximum_ngs2_waveform_bytes or !kernel_memory.isGuestRangeAccessible(data_address, block.data_size)) return errno.KernelError.efault.raw();
+                    queued[used] = .{ .data = @as([*]const u8, @ptrFromInt(data_address))[0..block.data_size], .skip = block.skip_samples, .frames = block.samples, .repeats = block.repeats, .user_data = block.user_data };
+                    used += 1;
+                }
+                pcm.append(std.heap.page_allocator, queued[0..used], flags & 4 != 0, flags & 1 != 0) catch return errno.KernelError.einval.raw();
+            } else {
+                ngs2ArmVoice(voice, waveform.data_address);
+            }
+        } else if (header.id == 0x1000_0005 and header.size >= 12) {
+            const pitch = @as(*align(1) const f32, @ptrFromInt(address + 8)).*;
+            if (!std.math.isFinite(pitch) or pitch < 0 or pitch > 4) return errno.KernelError.einval.raw();
+            if (voice.pcm) |*pcm| pcm.pitch = pitch;
         } else if (header.id == 0x0000_0002 and header.size >= 16) {
             const level_bits: *const u32 = @ptrFromInt(address + 12);
             const level: f32 = @bitCast(level_bits.*);
@@ -1814,6 +1882,34 @@ fn ngs2VoiceRunCommands(handle: u64, params_address: u64, command_count: u32, _:
             "[audio] NGS2 commands voice=0x{x} count={d} words={x:0>16} {x:0>16} {x:0>16} {x:0>16} {x:0>16} {x:0>16} {x:0>16} {x:0>16}\n",
             .{ handle, command_count, words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7] },
         );
+    }
+
+    if (command_count > 256 or !kernel_memory.isGuestRangeAccessible(params_address, @as(u64, command_count) * 16)) return errno.KernelError.efault.raw();
+    const commands = @as([*]const u8, @ptrFromInt(params_address))[0 .. command_count * 16];
+    // Compact commands have an ID, a typed scalar/array header and an 8-byte
+    // value. Their first word is not a VoiceParamHeader byte size.
+    if (commands[5] != 0) {
+        ngs2_mutex.lock();
+        defer ngs2_mutex.unlock();
+        const voice = ngs2FindVoice(handle) orelse return errno.KernelError.einval.raw();
+        for (0..command_count) |index| {
+            const command = commands[index * 16 ..][0..16];
+            const id = std.mem.readInt(u32, command[0..4], .little);
+            const value = std.mem.readInt(u32, command[8..12], .little);
+            switch (id & 0xffffff) {
+                2 => {
+                    if (command[5] != 4) return errno.KernelError.einval.raw();
+                    voice.event = ngs2Event(value) orelse return errno.KernelError.einval.raw();
+                },
+                6 => {
+                    const gain: f32 = @bitCast(value);
+                    if (command[5] != 1 or !std.math.isFinite(gain) or gain < 0 or gain > 8) return errno.KernelError.einval.raw();
+                    if (id >> 24 == 0) voice.gain = gain;
+                },
+                else => {}, // Existing graph/matrix controls remain accepted.
+            }
+        }
+        return errno.ok;
     }
 
     // Some SDK revisions pass the ordinary parameter-list representation to
@@ -1858,7 +1954,10 @@ fn ngs2ApplyEventsLocked(system_handle: u64) void {
                 .stop => if (voice.state == .playing or voice.state == .paused) {
                     voice.state = .stopped;
                 },
-                .stop_immediate, .kill => voice.state = .empty,
+                .stop_immediate, .kill => {
+                    voice.state = .empty;
+                    if (voice.pcm) |*pcm| pcm.clear();
+                },
             }
             voice.event = .none;
         }
@@ -1940,14 +2039,8 @@ fn ngs2CalcWaveformBlock(
     return errno.ok;
 }
 
-/// One NGS2 render produces one grain of interleaved float32 audio.  Titles
-/// normally hand that grain to AudioOut, whose blocking write provides the
-/// clock.  Some PS5 titles (JnG2 among them) drive NGS2 from a render worker
-/// without a blocking AudioOut call; returning immediately then turns the
-/// worker into a 100% CPU busy loop and can starve the game thread.
-///
-/// All output buses in a call describe the same grain.  Use the smallest valid
-/// frame count so malformed or auxiliary buffers cannot over-sleep the title.
+/// Bound the configured render grain by the smallest output capacity. Buffer
+/// capacity can exceed the system grain and must not set the playback clock.
 fn ngs2RenderFrameCount(buffers: []const Ngs2RenderBuffer) u32 {
     var result: u64 = 0;
     for (buffers) |buffer| {
@@ -1992,15 +2085,30 @@ fn ngs2MixBufferLocked(
     if (output_frames == 0) return;
     const destination: [*]f32 = @ptrFromInt(buffer.address);
     const output = destination[0 .. output_frames * output_channels];
+    const sample_rate = (ngs2FindSystem(system) orelse return).sample_rate;
 
     for (&ngs2_voices, 0..) |*voice, voice_index| {
-        if (!voice.active or !initial_playing[voice_index] or voice.samples.len == 0 or
+        if (!voice.active or !initial_playing[voice_index] or
             voice.source_channels == 0 or !ngs2VoiceBelongsToSystem(voice, system)) continue;
+        if (voice.pcm) |*pcm| {
+            var accessible = true;
+            for (pcm.blocks.items[pcm.cursor.block..]) |block| {
+                if (!kernel_memory.isGuestRangeAccessible(@intFromPtr(block.data.ptr), block.data.len)) {
+                    accessible = false;
+                    break;
+                }
+            }
+            if (!accessible) continue;
+            pcm.mix(output, output_channels, sample_rate, voice.gain, advance_voices);
+            if (advance_voices and pcm.finished()) voice.state = .empty;
+            continue;
+        }
+        if (voice.samples.len == 0) continue;
         const source_channels: usize = voice.source_channels;
         const source_frames = voice.samples.len / source_channels;
         const playback_end = @min(if (voice.loop_end != 0) voice.loop_end else source_frames, source_frames);
         if (playback_end == 0) continue;
-        const step = @as(f64, @floatFromInt(voice.source_rate)) / 48_000.0;
+        const step = @as(f64, @floatFromInt(voice.source_rate)) / @as(f64, @floatFromInt(sample_rate));
         var position = initial_positions[voice_index];
         var ended = false;
         for (0..output_frames) |output_frame| {
@@ -2042,6 +2150,7 @@ fn ngs2MixBufferLocked(
             if (ended) voice.state = .empty;
         }
     }
+    for (output) |*sample| sample.* = std.math.clamp(sample.*, -1, 1);
 }
 
 fn ngs2SystemRender(system: u64, buffers_address: u64, count: u32) callconv(abi.guest) i32 {
@@ -2058,33 +2167,36 @@ fn ngs2SystemRender(system: u64, buffers_address: u64, count: u32) callconv(abi.
     }
     const buffers: [*]const Ngs2RenderBuffer = @ptrFromInt(buffers_address);
     const render_buffers = buffers[0..count];
-    const frames = ngs2RenderFrameCount(render_buffers);
+    var last_bus: ?usize = null;
+    // Validate before taking the mixer lock or writing any bus.
+    for (render_buffers, 0..) |buffer, index| {
+        if (buffer.address == 0 or buffer.size == 0) continue;
+        if (buffer.size > 16 * 1024 * 1024 or !kernel_memory.isGuestRangeAccessible(buffer.address, buffer.size)) return errno.KernelError.efault.raw();
+        if (buffer.channels != 0 and buffer.channels <= 32 and buffer.waveform_type == 0x18 and buffer.size >= @as(u64, buffer.channels) * @sizeOf(f32)) last_bus = index;
+    }
     var initial_positions: [maximum_ngs2_voices]f64 = @splat(0);
     var initial_playing: [maximum_ngs2_voices]bool = @splat(false);
     ngs2_mutex.lock();
-    if (ngs2FindSystem(system) == null) {
+    const audio_system = ngs2FindSystem(system) orelse {
         ngs2_mutex.unlock();
         return errno.KernelError.einval.raw();
-    }
+    };
+    const frames = @min(audio_system.grain, ngs2RenderFrameCount(render_buffers));
     ngs2ApplyEventsLocked(system);
     for (&ngs2_voices, 0..) |*voice, index| {
         initial_positions[index] = voice.position;
         initial_playing[index] = voice.state == .playing;
     }
-    var advanced = false;
-    for (render_buffers) |buffer| {
+    for (render_buffers, 0..) |buffer, index| {
         if (buffer.address == 0 or buffer.size == 0) continue;
-        if (buffer.size > 16 * 1024 * 1024 or
-            !kernel_memory.isGuestRangeAccessible(buffer.address, buffer.size))
-        {
-            return errno.KernelError.efault.raw();
-        }
-        const destination: [*]u8 = @ptrFromInt(buffer.address);
-        @memset(destination[0..buffer.size], 0);
         const usable = buffer.channels != 0 and buffer.channels <= 32 and
-            buffer.size >= @as(u64, buffer.channels) * @sizeOf(f32);
-        ngs2MixBufferLocked(system, buffer, frames, &initial_positions, &initial_playing, usable and !advanced);
-        if (usable) advanced = true;
+            buffer.waveform_type == 0x18 and buffer.size >= @as(u64, buffer.channels) * @sizeOf(f32);
+        if (!usable) continue;
+        const bytes = @min(buffer.size, @as(u64, frames) * buffer.channels * @sizeOf(f32));
+        const destination: [*]u8 = @ptrFromInt(buffer.address);
+        @memset(destination[0..bytes], 0);
+        // Re-read the same stream cursor for each bus; consume it only once.
+        ngs2MixBufferLocked(system, buffer, frames, &initial_positions, &initial_playing, index == last_bus.?);
     }
     ngs2_mutex.unlock();
     const call_index = ngs2_render_calls.fetchAdd(1, .monotonic);
@@ -2092,9 +2204,8 @@ fn ngs2SystemRender(system: u64, buffers_address: u64, count: u32) callconv(abi.
         "[audio] NGS2 render buffers={d} grain={d} frames @48000Hz\n",
         .{ count, frames },
     );
-    // Treat the grain as a synchronous software-DSP quantum.  This preserves
-    // the real-time contract even while the voice mixer is still incomplete.
-    pace(frames, 48_000);
+    // This is a synchronous software mix. AudioOut owns the playback clock;
+    // sleeping here as well slows the producer and underfeeds the device.
     return errno.ok;
 }
 
@@ -2105,6 +2216,8 @@ fn ngs2VoiceGetState(handle: u64, state_address: u64, state_size: usize) callcon
         return errno.KernelError.einval.raw();
     };
     const state_flags = ngs2StateFlags(voice.state);
+    const pcm_cursor = if (voice.pcm) |*pcm| pcm.cursor else ngs2_pcm.Cursor{};
+    const read_address = if (voice.pcm) |*pcm| pcm.readAddress() else @as(u64, 0);
     ngs2_mutex.unlock();
     if (state_address != 0 and state_size != 0) {
         const bounded_size = @min(state_size, 0x400);
@@ -2114,6 +2227,12 @@ fn ngs2VoiceGetState(handle: u64, state_address: u64, state_size: usize) callcon
         if (bounded_size >= @sizeOf(u32)) {
             const flags: *align(1) u32 = @ptrFromInt(state_address);
             flags.* = state_flags;
+        }
+        if (bounded_size >= 56) {
+            std.mem.writeInt(u64, destination[24..32], pcm_cursor.decoded_frames, .little);
+            std.mem.writeInt(u64, destination[32..40], pcm_cursor.decoded_bytes, .little);
+            std.mem.writeInt(u64, destination[40..48], pcm_cursor.user_data, .little);
+            std.mem.writeInt(u64, destination[48..56], read_address, .little);
         }
     }
     return errno.ok;
@@ -3369,7 +3488,7 @@ pub fn reset() void {
     ajm_mutex.unlock();
     next_batch.store(1, .monotonic);
     ngs2_mutex.lock();
-    for (&ngs2_voices) |*voice| ngs2FreeVoiceWaveform(voice);
+    for (&ngs2_voices) |*voice| ngs2ResetVoice(voice);
     for (&ngs2_waveform_cache, 0..) |*cached, index| {
         cached.references = 0;
         ngs2EvictCachedWaveform(index);
@@ -3387,6 +3506,7 @@ pub fn reset() void {
     ngs2_state_logs.store(0, .monotonic);
     ngs2_waveform_logs.store(0, .monotonic);
     ngs2_command_logs.store(0, .monotonic);
+    ngs2_sampler_detail_logs = .{ 0, 0 };
     ajm_decode_jobs.store(0, .monotonic);
     audio_out_play_ok.store(0, .monotonic);
     audio_out_play_fail.store(0, .monotonic);
@@ -3448,6 +3568,32 @@ test "AudioOut2 queue drains whole grains while retaining fractional playback ti
     try std.testing.expectEqual(@as(u32, 0), context.queued_grains);
     context.queued_grains = 1;
     updateAudioOut2Queue(&context, 509 * std.time.ns_per_ms);
+    try std.testing.expectEqual(@as(u32, 1), context.queued_grains);
+}
+
+test "AudioOut2 depth-one polling retains the sample clock instead of rounding every grain" {
+    const start = 100 * std.time.ns_per_ms;
+    var context = AudioObject{ .kind = .context, .grains = 256, .frequency = 48_000, .queue_depth = 1, .queued_grains = 1, .queue_updated_ns = start };
+    var completed: u32 = 0;
+    // A guest polling at 1 ms still needs 48,000 samples/second. The old
+    // empty-queue rebase completed only 166 grains here instead of 187.
+    for (1..1001) |millisecond| {
+        updateAudioOut2Queue(&context, start + millisecond * std.time.ns_per_ms);
+        if (context.queued_grains == 0) {
+            completed += 1;
+            // Extra queue-level queries before Push must retain the phase.
+            const phase = context.queue_updated_ns;
+            updateAudioOut2Queue(&context, start + millisecond * std.time.ns_per_ms);
+            try std.testing.expectEqual(phase, context.queue_updated_ns);
+            context.queued_grains = 1;
+        }
+    }
+    try std.testing.expectEqual(@as(u32, 187), completed);
+    updateAudioOut2Queue(&context, start + 10 * std.time.ns_per_s);
+    try std.testing.expectEqual(@as(u32, 0), context.queued_grains);
+    try std.testing.expectEqual(start + 10 * std.time.ns_per_s, context.queue_updated_ns);
+    context.queued_grains = 1;
+    updateAudioOut2Queue(&context, start + 10 * std.time.ns_per_s + 5 * std.time.ns_per_ms);
     try std.testing.expectEqual(@as(u32, 1), context.queued_grains);
 }
 
@@ -3515,6 +3661,63 @@ test "NGS2 derives one bounded float32 render grain from all buses" {
     try std.testing.expectEqual(@as(u32, 0), ngs2RenderFrameCount(&.{
         .{ .address = 1, .size = 1024, .waveform_type = 0x18, .channels = 0 },
     }));
+}
+
+test "NGS2 raw PCM commands honor grain size multi-bus cursors pause and state readback" {
+    reset();
+    defer reset();
+    var system: u64 = 0;
+    var rack: u64 = 0;
+    var voice: u64 = 0;
+    try std.testing.expectEqual(errno.ok, ngs2SystemCreateWithAllocator(0, 0, &system));
+    try std.testing.expectEqual(errno.ok, ngs2RackCreateWithAllocator(system, 0x1000, 0, 0, &rack));
+    try std.testing.expectEqual(errno.ok, ngs2RackGetVoiceHandle(rack, 0, &voice));
+    const Setup = extern struct { header: Ngs2VoiceParamHeader, format: Ngs2WaveformFormat };
+    const setup = Setup{ .header = .{ .size = @sizeOf(Setup), .next = 0, .id = 0x10000000 }, .format = .{ .waveform_type = 0x12, .channels = 2, .sample_rate = 48000 } };
+    try std.testing.expectEqual(errno.ok, ngs2VoiceControl(voice, @intFromPtr(&setup)));
+    var samples: [512 * 2]i16 = undefined;
+    for (0..512) |frame| {
+        samples[frame * 2] = 8192;
+        samples[frame * 2 + 1] = -16384;
+    }
+    const block = Ngs2WaveformBlock{ .data_size = @sizeOf(@TypeOf(samples)), .samples = 512, .user_data = 77 };
+    const Queue = extern struct { header: Ngs2VoiceParamHeader, address: u64, flags: u32, count: u32, blocks: u64 };
+    var queue = Queue{ .header = .{ .size = @sizeOf(Queue), .next = 0, .id = 0x10000001 }, .address = @intFromPtr(&samples), .flags = 0, .count = 1, .blocks = @intFromPtr(&block) };
+    try std.testing.expectEqual(errno.ok, ngs2VoiceControl(voice, @intFromPtr(&queue)));
+    var command = [_]u64{ 0x0000040000000002, 1 };
+    try std.testing.expectEqual(errno.ok, ngs2VoiceRunCommands(voice, @intFromPtr(&command), 1, 0));
+    var first: [600 * 2]f32 = @splat(9);
+    var second: [600 * 2]f32 = @splat(9);
+    const buffers = [_]Ngs2RenderBuffer{
+        .{ .address = @intFromPtr(&first), .size = @sizeOf(@TypeOf(first)), .waveform_type = 0x18, .channels = 2 },
+        .{ .address = @intFromPtr(&second), .size = @sizeOf(@TypeOf(second)), .waveform_type = 0x18, .channels = 2 },
+    };
+    try std.testing.expectEqual(errno.ok, ngs2SystemRender(system, @intFromPtr(&buffers), 2));
+    try std.testing.expectEqualSlices(f32, &first, &second);
+    for (0..256) |frame| {
+        try std.testing.expectEqual(@as(f32, 0.25), first[frame * 2]);
+        try std.testing.expectEqual(@as(f32, -0.5), first[frame * 2 + 1]);
+    }
+    for (first[512..]) |sample| try std.testing.expectEqual(@as(f32, 9), sample);
+    var state: [56]u8 align(8) = undefined;
+    try std.testing.expectEqual(errno.ok, ngs2VoiceGetState(voice, @intFromPtr(&state), state.len));
+    try std.testing.expectEqual(@as(u64, 256), std.mem.readInt(u64, state[24..32], .little));
+    try std.testing.expectEqual(@as(u64, 1024), std.mem.readInt(u64, state[32..40], .little));
+    try std.testing.expectEqual(@intFromPtr(&samples) + 1024, std.mem.readInt(u64, state[48..56], .little));
+    command[1] = 16;
+    try std.testing.expectEqual(errno.ok, ngs2VoiceRunCommands(voice, @intFromPtr(&command), 1, 0));
+    try std.testing.expectEqual(errno.ok, ngs2SystemRender(system, @intFromPtr(&buffers), 2));
+    for (first[0..512]) |sample| try std.testing.expectEqual(@as(f32, 0), sample);
+    command[1] = 32;
+    try std.testing.expectEqual(errno.ok, ngs2VoiceRunCommands(voice, @intFromPtr(&command), 1, 0));
+    try std.testing.expectEqual(errno.ok, ngs2SystemRender(system, @intFromPtr(&buffers), 2));
+    try std.testing.expectEqual(errno.ok, ngs2VoiceGetState(voice, @intFromPtr(&state), state.len));
+    try std.testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, state[0..4], .little));
+    try std.testing.expectEqual(@as(u64, 512), std.mem.readInt(u64, state[24..32], .little));
+    queue.count = 0;
+    queue.blocks = 0;
+    queue.flags = 4;
+    try std.testing.expectEqual(errno.ok, ngs2VoiceControl(voice, @intFromPtr(&queue)));
 }
 
 test "NGS2 decodes and mixes PCM waveforms used by sampler voices" {

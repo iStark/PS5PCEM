@@ -12,6 +12,13 @@ font-atlas startup fix, firmware additions and shader work below. See the
 [release checks](development/release-0.3.4-validation.md). Existing game grades
 and dated FPS results are unchanged by the release preparation.
 
+**October 9, 2026 — Quake II and Subnautica audio:** raw PCM sampler blocks,
+compact playback commands and the configured NGS2 grain restore Quake II
+attract-sequence audio. Subnautica's AudioOut2 queue preserves fractional
+playback time; menu music works, but short dropouts remain. All 602 HLE tests
+pass. These development changes postdate 0.3.4. See the
+[audio report, FPS checks and captures](development/quake2-subnautica-audio-2026-10-09.md).
+
 **October 9, 2026 — Asterix & Obelix startup:** AvPlayer now stages decoded
 video and audio in host memory before publishing tracked guest writes. This
 fixes the opening movie freezing when a GPU-watched video buffer is reused.
