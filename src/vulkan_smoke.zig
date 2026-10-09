@@ -13038,6 +13038,17 @@ pub fn main(init: std.process.Init) !void {
         }
         return;
     }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--multisample-depth-pass")) {
+        for ([_]bool{ false, true }) |persistent| {
+            for ([_]u8{ 1, 2 }) |samples_log2| {
+                var renderer = try vulkan.Renderer.init(allocator, .{ .persistent_depth_passes = persistent, .enable_timeline_scheduler = true, .enable_validation = true });
+                defer renderer.deinit();
+                try renderer.probeMultisampleDepthPass(samples_log2);
+                std.debug.print("multisample depth pass passed: persistent={any}, samples={d}, retained depth/stencil, matching/rejected colour consumers and no diagnostic readback\n", .{ persistent, @as(u32, 1) << @intCast(samples_log2) });
+            }
+        }
+        return;
+    }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--feedback-snapshot")) {
         var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true });
         defer renderer.deinit();
