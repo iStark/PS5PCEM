@@ -24,6 +24,7 @@ const audio_device = @import("../audio_device.zig");
 const audio_fs = @import("../audio_fs.zig");
 const ngs2_pcm = @import("../ngs2_pcm.zig");
 const ajm_codec = @import("../ajm_codec.zig");
+const acm_convolution = @import("../acm_convolution.zig");
 const services = @import("services.zig");
 const filesystem = @import("../filesystem.zig");
 
@@ -2650,11 +2651,7 @@ const audiodec_exports = [_]symbols.Export{
 
 // libSceAcm ---------------------------------------------------------------
 
-const AcmBatchInfo = extern struct {
-    buffer: ?[*]u8 = null,
-    offset: usize = 0,
-    size: usize = 0,
-};
+const AcmBatchInfo = acm_convolution.BatchInfo;
 
 const AcmBatchError = extern struct {
     reserved: [8]u32 = [_]u32{0} ** 8,
@@ -2662,7 +2659,12 @@ const AcmBatchError = extern struct {
 
 const maximum_acm_contexts = 32;
 var acm_mutex: Lock = .{};
-var acm_contexts: [maximum_acm_contexts]bool = [_]bool{false} ** maximum_acm_contexts;
+const AcmContext = struct {
+    active: bool = false,
+    runtime: acm_convolution.Runtime = .{},
+    completed: [128]u32 = [_]u32{0} ** 128,
+};
+var acm_contexts: [maximum_acm_contexts]AcmContext = @splat(.{});
 var next_acm_batch = std.atomic.Value(u32).init(1);
 
 fn acmContextIndex(context: u32) ?usize {
@@ -2670,20 +2672,13 @@ fn acmContextIndex(context: u32) ?usize {
     return context - 1;
 }
 
-fn isAcmContext(context: u32) bool {
-    const index = acmContextIndex(context) orelse return false;
-    acm_mutex.lock();
-    defer acm_mutex.unlock();
-    return acm_contexts[index];
-}
-
 fn acmContextCreate(context: ?*u32) callconv(abi.guest) i32 {
     const output = context orelse return errno.KernelError.einval.raw();
     acm_mutex.lock();
     defer acm_mutex.unlock();
-    for (&acm_contexts, 0..) |*active, index| {
-        if (active.*) continue;
-        active.* = true;
+    for (&acm_contexts, 0..) |*entry, index| {
+        if (entry.active) continue;
+        entry.active = true;
         output.* = @intCast(index + 1);
         return errno.ok;
     }
@@ -2694,8 +2689,9 @@ fn acmContextDestroy(context: u32) callconv(abi.guest) i32 {
     const index = acmContextIndex(context) orelse return errno.KernelError.einval.raw();
     acm_mutex.lock();
     defer acm_mutex.unlock();
-    if (!acm_contexts[index]) return errno.KernelError.einval.raw();
-    acm_contexts[index] = false;
+    if (!acm_contexts[index].active) return errno.KernelError.einval.raw();
+    acm_contexts[index].runtime.deinit();
+    acm_contexts[index] = .{};
     return errno.ok;
 }
 
@@ -2706,10 +2702,22 @@ fn acmBatchStartBuffers(
     batch_error: ?*AcmBatchError,
     batch: ?*u32,
 ) callconv(abi.guest) i32 {
-    if (!isAcmContext(context) or (info_count != 0 and infos == null)) return errno.KernelError.einval.raw();
-    const output = batch orelse return errno.KernelError.einval.raw();
+    const index = acmContextIndex(context) orelse return errno.KernelError.einval.raw();
+    if (info_count > 256 or (info_count != 0 and infos == null)) return errno.KernelError.einval.raw();
+    if (info_count != 0 and !acmCheck(@intFromPtr(infos.?), @as(usize, info_count) * @sizeOf(usize))) return errno.KernelError.efault.raw();
+    if (batch == null or !acmCheck(@intFromPtr(batch.?), @sizeOf(u32))) return errno.KernelError.efault.raw();
+    if (batch_error != null and !acmCheck(@intFromPtr(batch_error.?), @sizeOf(AcmBatchError))) return errno.KernelError.efault.raw();
+    acm_mutex.lock();
+    defer acm_mutex.unlock();
+    const entry = &acm_contexts[index];
+    if (!entry.active) return errno.KernelError.einval.raw();
     if (batch_error) |failure| failure.* = .{};
-    output.* = next_acm_batch.fetchAdd(1, .monotonic);
+    for (0..info_count) |i| {
+        const info = infos.?[i] orelse return errno.KernelError.einval.raw();
+        if (!acmCheck(@intFromPtr(info), @sizeOf(AcmBatchInfo)) or info.offset > info.size) return errno.KernelError.einval.raw();
+        entry.runtime.execute(@intFromPtr(info.buffer), info.offset, acmCheck) catch |err| return acmBatchFailure(batch_error, err);
+    }
+    acmComplete(entry, batch.?);
     return errno.ok;
 }
 
@@ -2720,12 +2728,16 @@ fn acmBatchStartBuffer(
     batch_error: ?*AcmBatchError,
     batch: ?*u32,
 ) callconv(abi.guest) i32 {
-    _ = commands_address;
-    _ = commands_size;
-    if (!isAcmContext(context)) return errno.KernelError.einval.raw();
-    const output = batch orelse return errno.KernelError.einval.raw();
+    const index = acmContextIndex(context) orelse return errno.KernelError.einval.raw();
+    if (batch == null or !acmCheck(@intFromPtr(batch.?), @sizeOf(u32))) return errno.KernelError.efault.raw();
+    if (batch_error != null and !acmCheck(@intFromPtr(batch_error.?), @sizeOf(AcmBatchError))) return errno.KernelError.efault.raw();
+    acm_mutex.lock();
+    defer acm_mutex.unlock();
+    const entry = &acm_contexts[index];
+    if (!entry.active) return errno.KernelError.einval.raw();
     if (batch_error) |failure| failure.* = .{};
-    output.* = next_acm_batch.fetchAdd(1, .monotonic);
+    entry.runtime.execute(commands_address, commands_size, acmCheck) catch |err| return acmBatchFailure(batch_error, err);
+    acmComplete(entry, batch.?);
     return errno.ok;
 }
 
@@ -2749,40 +2761,67 @@ fn acmBatchProcess(_: ?*anyopaque) callconv(abi.guest) i32 {
     return errno.ok;
 }
 
-fn acmBatchWait(context: u32, _: u32, _: u32) callconv(abi.guest) i32 {
-    return if (isAcmContext(context)) errno.ok else errno.KernelError.einval.raw();
+fn acmBatchWait(context: u32, batch: u32, _: u32) callconv(abi.guest) i32 {
+    const index = acmContextIndex(context) orelse return errno.KernelError.einval.raw();
+    acm_mutex.lock();
+    defer acm_mutex.unlock();
+    const entry = &acm_contexts[index];
+    // FMOD deliberately waits on -1 before submitting its first job. Reporting
+    // success makes it mix a not-yet-written wet buffer into the entire graph.
+    return if (entry.active and batch != 0 and entry.completed[batch % entry.completed.len] == batch) errno.ok else errno.KernelError.einval.raw();
 }
 
-fn acmAdvanceBatch(info: ?*AcmBatchInfo, amount: usize) i32 {
-    const batch = info orelse return errno.ok;
-    if (batch.buffer != null and batch.size != 0) {
-        batch.offset = @min(batch.size, std.math.add(usize, batch.offset, amount) catch std.math.maxInt(usize));
-    }
-    return errno.ok;
+fn acmCheck(address: usize, bytes: usize) bool {
+    return kernel_memory.isGuestRangeAccessible(address, bytes);
+}
+
+fn acmStatus(err: acm_convolution.Error) i32 {
+    return switch (err) {
+        error.OutOfMemory => errno.KernelError.enomem.raw(),
+        error.Unsupported => errno.KernelError.enosys.raw(),
+        error.InvalidParameter => errno.KernelError.einval.raw(),
+    };
+}
+
+fn acmBatchFailure(output: ?*AcmBatchError, err: acm_convolution.Error) i32 {
+    const status = acmStatus(err);
+    if (output) |failure| failure.reserved[0] = @bitCast(status);
+    std.debug.print("[audio acm] batch failed: {s}\n", .{@errorName(err)});
+    return status;
+}
+
+fn acmComplete(entry: *AcmContext, output: *u32) void {
+    const id = next_acm_batch.fetchAdd(1, .monotonic);
+    entry.completed[id % entry.completed.len] = id;
+    output.* = id;
+    if (id <= 4) std.debug.print("[audio acm] completed convolution batch #{d}\n", .{id});
 }
 
 fn acmBatchJobNotification(info: ?*AcmBatchInfo, _: u64, _: u64) callconv(abi.guest) i32 {
-    return acmAdvanceBatch(info, 32);
+    acm_convolution.notification(@intFromPtr(info), acmCheck) catch |err| return acmStatus(err);
+    return errno.ok;
 }
 
-fn acmConvReverbSharedInput(info: ?*AcmBatchInfo, _: u64, _: u64, _: u64, _: u64, _: u64) callconv(abi.guest) i32 {
-    return acmAdvanceBatch(info, 1024);
+fn acmConvReverbSharedInput(info: ?*AcmBatchInfo, blocks: u32, input: usize, count: u32, irs: usize, gains: usize, outputs: usize) callconv(abi.guest) i32 {
+    acm_convolution.append(@intFromPtr(info), blocks, input, count, irs, gains, outputs, false, acmCheck) catch |err| return acmStatus(err);
+    return errno.ok;
 }
 
-fn acmConvReverbSharedIr(info: ?*AcmBatchInfo, _: u64, _: u64, _: u64, _: u64, _: u64) callconv(abi.guest) i32 {
-    return acmAdvanceBatch(info, 1024);
+fn acmConvReverbSharedIr(info: ?*AcmBatchInfo, blocks: u32, ir: usize, count: u32, inputs: usize, gains: usize, outputs: usize) callconv(abi.guest) i32 {
+    acm_convolution.append(@intFromPtr(info), blocks, ir, count, inputs, gains, outputs, true, acmCheck) catch |err| return acmStatus(err);
+    return errno.ok;
 }
 
-fn acmFft(info: ?*AcmBatchInfo, _: u64, _: u64, _: u64, _: u64, _: u64) callconv(abi.guest) i32 {
-    return acmAdvanceBatch(info, 256);
+fn acmFft(_: ?*AcmBatchInfo, _: u64, _: u64, _: u64, _: u64, _: u64) callconv(abi.guest) i32 {
+    return errno.KernelError.enosys.raw();
 }
 
-fn acmIfft(info: ?*AcmBatchInfo, _: u64, _: u64, _: u64, _: u64, _: u64) callconv(abi.guest) i32 {
-    return acmAdvanceBatch(info, 256);
+fn acmIfft(_: ?*AcmBatchInfo, _: u64, _: u64, _: u64, _: u64, _: u64) callconv(abi.guest) i32 {
+    return errno.KernelError.enosys.raw();
 }
 
-fn acmPanner(info: ?*AcmBatchInfo, _: u64, _: u64, _: u64, _: u64, _: u64) callconv(abi.guest) i32 {
-    return acmAdvanceBatch(info, 512);
+fn acmPanner(_: ?*AcmBatchInfo, _: u64, _: u64, _: u64, _: u64, _: u64) callconv(abi.guest) i32 {
+    return errno.KernelError.enosys.raw();
 }
 
 const acm_exports = [_]symbols.Export{
@@ -3476,7 +3515,10 @@ pub fn reset() void {
     audiodec_mutex.unlock();
 
     acm_mutex.lock();
-    acm_contexts = [_]bool{false} ** maximum_acm_contexts;
+    for (&acm_contexts) |*entry| {
+        entry.runtime.deinit();
+        entry.* = .{};
+    }
     acm_mutex.unlock();
     next_acm_batch.store(1, .monotonic);
 
@@ -3540,6 +3582,23 @@ test "legacy AudioOut formats distinguish standard 8-channel integer and float P
     try std.testing.expectEqual(audio_device.SampleFormat.signed16, formatSamples(6).?);
     try std.testing.expectEqual(@as(?u8, 8), formatChannels(7));
     try std.testing.expectEqual(audio_device.SampleFormat.float32, formatSamples(7).?);
+}
+
+test "ACM waits reject nonexistent jobs and respect context lifetime" {
+    reset();
+    defer reset();
+    var context: u32 = 0;
+    try std.testing.expectEqual(errno.ok, acmContextCreate(&context));
+    try std.testing.expect(acmBatchWait(context, 0xffffffff, 0xffffffff) != errno.ok);
+    try std.testing.expect(acmBatchWait(context, 0, 0) != errno.ok);
+    var batch: u32 = 0;
+    try std.testing.expectEqual(errno.ok, acmBatchStartBuffer(context, 0, 0, null, &batch));
+    try std.testing.expectEqual(errno.ok, acmBatchWait(context, batch, 0));
+    try std.testing.expect(acmBatchWait(context, batch + 1, 0) != errno.ok);
+    try std.testing.expectEqual(errno.ok, acmContextDestroy(context));
+    try std.testing.expect(acmBatchWait(context, batch, 0) != errno.ok);
+    try std.testing.expectEqual(errno.ok, acmContextCreate(&context));
+    try std.testing.expect(acmBatchWait(context, batch, 0) != errno.ok);
 }
 
 test "headless AudioOut preserves port lifecycle" {

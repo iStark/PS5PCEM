@@ -1,5 +1,12 @@
 # Quake II and Subnautica audio investigation — October 9, 2026
 
+**October 10 correction:** subsequent launches reproduced delayed silence
+independently of Options or title-screen confirmation. The root cause was
+uncomputed ACM convolution output and a successful wait on an invalid initial
+batch. The observations below remain historical samples, not evidence that
+pressing Options restores sound. See the
+[ACM investigation](subnautica-acm-audio-2026-10-10.md).
+
 The reported silence predates the October 9 Jets/Asterix fixes. The installed
 runner and the preserved pre-Jets 0.3.4 runner both produce a completely silent
 10-second Windows loopback recording in the Quake II attract sequence.
