@@ -755,6 +755,12 @@ fn run(init: std.process.Init) !bool {
     // fetch stays inside the original descriptor; unknown indexing keeps it.
     const use_quake_buffer_profile = std.ascii.eqlIgnoreCase(title_identifier, quake_ii_title_id);
     const use_gta_iii_buffer_profile = std.ascii.eqlIgnoreCase(title_identifier, gta_iii_title_id);
+    // Bounded live constant-buffer guards remove inactive resource branches
+    // from both staging and SPIR-V. Enable the shared read-only graphics path
+    // for the title with a validated live comparison; other profiles retain
+    // their existing policy until their graphics/performance are checked.
+    vulkan.backend.vertex_uniform_specialization = use_gta_iii_buffer_profile;
+    vulkan.backend.graphics_uniform_specialization = use_gta_iii_buffer_profile;
     const enable_gpu_page_tracker = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_PAGE_TRACKER")) |text| enabled: {
         defer allocator.free(text);
         const request = std.mem.trim(u8, text, " \t\r\n");

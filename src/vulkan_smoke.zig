@@ -8901,19 +8901,23 @@ fn runColorCubePublicationProbe(allocator: std.mem.Allocator) !void {
     const Memory = SizedGuestMemory(4 * 1024 * 1024);
     const guest = try allocator.create(Memory);
     defer allocator.destroy(guest);
-    for ([_]gpu.resources.TileMode{ .standard_4kb, .render_target }) |mode| {
-        guest.* = .{};
-        var renderer = try vulkan.Renderer.init(allocator, .{ .render_target_cache_limit = 64, .enable_timeline_scheduler = true });
-        defer renderer.deinit();
-        var memory = guest.interface();
-        guest.watch_generation = 1;
-        memory.fingerprint = Memory.fingerprint;
-        memory.track_gpu_read = Memory.track;
-        memory.gpu_generation = Memory.generation;
-        _ = renderer.dcbBackend(memory);
-        try renderer.probeColorCubePublication(0x10000, mode);
+    for ([_]usize{ 8, 64 }) |target_limit| {
+        for ([_]bool{ true, false }) |sampled| {
+            for ([_]gpu.resources.TileMode{ .standard_4kb, .render_target }) |mode| {
+                guest.* = .{};
+                var renderer = try vulkan.Renderer.init(allocator, .{ .render_target_cache_limit = target_limit, .enable_timeline_scheduler = true });
+                defer renderer.deinit();
+                var memory = guest.interface();
+                guest.watch_generation = 1;
+                memory.fingerprint = Memory.fingerprint;
+                memory.track_gpu_read = Memory.track;
+                memory.gpu_generation = Memory.generation;
+                _ = renderer.dcbBackend(memory);
+                try renderer.probeColorCubePublication(0x10000, mode, sampled);
+            }
+        }
     }
-    std.debug.print("colour cube publication passed: GPU producers and UINT consumers, six faces, eight mips, two revisions, 4/64 KiB tiles and watched backing\n", .{});
+    std.debug.print("colour cube publication passed: GPU producers, sampled cubes and UINT consumers, six faces, eight mips, two revisions, 4/64 KiB tiles and watched backing\n", .{});
 }
 
 fn runMippedColorCase(allocator: std.mem.Allocator, tracked: bool, tiled: bool) !void {

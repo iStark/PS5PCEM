@@ -306,37 +306,124 @@ pub fn pruneUniformBranches(
     instructions: []const rdna2.Instruction,
     graph: *const rdna2.control_flow.Graph,
 ) !?std.ArrayList(rdna2.Instruction) {
+    return pruneUniformBranchesWithPlan(allocator, reader, bindings, instructions, graph, null, null);
+}
+
+pub fn canPruneUniformBranches(
+    instructions: []const rdna2.Instruction,
+    graph: *const rdna2.control_flow.Graph,
+) bool {
     var has_guard = false;
-    var invariant = Evaluation{};
-    const scalar_base: usize = bindings.scalar_user_data_base;
-    const available = @min(@as(usize, bindings.user_data_count), maximum_scalar_registers - scalar_base);
-    for (bindings.user_data[0..available], 0..) |word, index| {
-        invariant.registers[scalar_base + index] = .{ .known = true, .value = word, .sources = .{ .user_data = true } };
-    }
     for (instructions, 0..) |inst, index| {
-        if (inst.opcode == .unknown or inst.opcode == .unsupported) return null;
+        if (inst.opcode == .unknown or inst.opcode == .unsupported) return false;
         if (inst.opcode == .s_setpc_b64) {
-            const target = rdna2.control_flow.resolveSetpcTargetInstructions(instructions, index) orelse return null;
-            if (graph.blockForPc(target) == null) return null;
+            const target = rdna2.control_flow.resolveSetpcTargetInstructions(instructions, index) orelse return false;
+            if (graph.blockForPc(target) == null) return false;
         }
         switch (inst.opcode) {
-            .s_cbranch_cdbgsys, .s_cbranch_cdbguser, .s_cbranch_cdbgsys_or_user, .s_cbranch_cdbgsys_and_user, .s_setreg_b32 => return null,
+            .s_cbranch_cdbgsys, .s_cbranch_cdbguser, .s_cbranch_cdbgsys_or_user, .s_cbranch_cdbgsys_and_user, .s_setreg_b32 => return false,
             else => {},
         }
-        if (std.mem.startsWith(u8, @tagName(inst.opcode), "s_movrel")) return null;
+        if (std.mem.startsWith(u8, @tagName(inst.opcode), "s_movrel")) return false;
         has_guard = has_guard or switch (inst.opcode) {
             .s_cbranch_scc0, .s_cbranch_scc1, .s_cbranch_execz, .s_cbranch_execnz, .s_cbranch_vccz, .s_cbranch_vccnz => true,
             else => false,
         };
     }
-    if (!has_guard or graph.blocks.items.len == 0) return null;
+    return has_guard and graph.blocks.items.len != 0;
+}
+
+pub fn pruneUniformBranchesWithPlan(
+    allocator: std.mem.Allocator,
+    reader: shaders.MemoryReader,
+    bindings: *const shaders.StageBindings,
+    instructions: []const rdna2.Instruction,
+    graph: *const rdna2.control_flow.Graph,
+    plan: ?*const @import("resource_checkpoints.zig").Plan,
+    eligible: ?bool,
+) !?std.ArrayList(rdna2.Instruction) {
+    var proof = (try proveUniformBranchesWithPlan(allocator, reader, bindings, instructions, graph, plan, eligible)) orelse return null;
+    defer proof.deinit(allocator);
+    return try proof.materialize(allocator, instructions, graph);
+}
+
+pub const UniformBlockAction = enum(u8) { keep, remove, branch, fallthrough };
+
+/// A variant is identified by its block rewrites under one immutable parent
+/// program. Cache hits need only this small key, not a copied instruction array.
+pub const UniformBranchProof = struct {
+    actions: []UniformBlockAction,
+
+    pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+        allocator.free(self.actions);
+        self.* = undefined;
+    }
+
+    pub fn materialize(self: @This(), allocator: std.mem.Allocator, instructions: []const rdna2.Instruction, graph: *const rdna2.control_flow.Graph) !std.ArrayList(rdna2.Instruction) {
+        var result: std.ArrayList(rdna2.Instruction) = .empty;
+        errdefer result.deinit(allocator);
+        try result.appendSlice(allocator, instructions);
+        for (graph.blocks.items) |block| {
+            const end = block.first_instruction + block.instruction_count;
+            switch (self.actions[block.index]) {
+                .keep => {},
+                .remove => for (result.items[block.first_instruction..end]) |*inst| {
+                    if (!inst.opcode.isProgramEnd()) makeNop(inst);
+                },
+                .branch => result.items[end - 1].opcode = .s_branch,
+                .fallthrough => makeNop(&result.items[end - 1]),
+            }
+        }
+        return result;
+    }
+};
+
+pub fn proveUniformBranchesWithPlan(
+    allocator: std.mem.Allocator,
+    reader: shaders.MemoryReader,
+    bindings: *const shaders.StageBindings,
+    instructions: []const rdna2.Instruction,
+    graph: *const rdna2.control_flow.Graph,
+    plan: ?*const @import("resource_checkpoints.zig").Plan,
+    eligible: ?bool,
+) !?UniformBranchProof {
+    if (!(eligible orelse canPruneUniformBranches(instructions, graph))) return null;
+    var invariant: Evaluation = undefined;
+    invariant.reset();
+    const scalar_base: usize = bindings.scalar_user_data_base;
+    const available = @min(@as(usize, bindings.user_data_count), maximum_scalar_registers - scalar_base);
+    for (bindings.user_data[0..available], 0..) |word, index| {
+        invariant.registers[scalar_base + index] = .{ .known = true, .value = word, .sources = .{ .user_data = true } };
+    }
+    const buffer_constants = if (plan != null and plan.?.matches(instructions))
+        plan.?.reads_only_resources
+    else
+        @import("resource_checkpoints.zig").readsOnlyResources(instructions);
     for (invariant.registers[106..]) |*value| value.* = .{};
 
-    const State = struct { registers: ScalarRegisters, scc: ?bool = null, seen: bool = false };
+    // The CFG proof needs values and knownness, not resource provenance.
+    // Keep that smaller lattice between blocks; execute through the shared
+    // scalar evaluator without copying its full provenance register file.
+    const State = struct {
+        values: [maximum_scalar_registers]u32 = undefined,
+        known: u128 = 0,
+        scc: ?bool = null,
+        seen: bool = false,
+
+        fn capture(self: *@This(), registers: *const ScalarRegisters, scc: ?bool) void {
+            self.known = 0;
+            for (registers, 0..) |value, index| if (value.known) {
+                self.known |= @as(u128, 1) << @intCast(index);
+                self.values[index] = value.value;
+            };
+            self.scc = scc;
+            self.seen = true;
+        }
+    };
     const states = try allocator.alloc(State, graph.blocks.items.len);
     defer allocator.free(states);
-    for (states) |*state| state.* = .{ .registers = [_]ScalarValue{.{}} ** maximum_scalar_registers };
-    states[0] = .{ .registers = invariant.registers, .seen = true };
+    for (states) |*state| state.* = .{};
+    states[0].capture(&invariant.registers, null);
     const dirty = try allocator.alloc(bool, states.len);
     defer allocator.free(dirty);
     @memset(dirty, false);
@@ -344,6 +431,7 @@ pub fn pruneUniformBranches(
     const decisions = try allocator.alloc(?bool, graph.blocks.items.len);
     defer allocator.free(decisions);
     @memset(decisions, null);
+    const steps: ?[]const u32 = if (plan != null and plan.?.matches(instructions)) plan.?.scalar_steps else null;
     var pending = true;
     var budget: usize = maximum_resource_instructions * 256;
     while (pending) {
@@ -351,19 +439,53 @@ pub fn pruneUniformBranches(
         for (graph.blocks.items) |block| {
             if (!dirty[block.index]) continue;
             dirty[block.index] = false;
-            var local = Evaluation{ .registers = states[block.index].registers };
+            // A struct literal materializes the entire load-history array
+            // even though this proof never records loads. Reset only the
+            // live register file and counters instead of copying ~48 KiB
+            // of defaults for every visited block.
+            var local: Evaluation = undefined;
+            local.reset();
+            var known = states[block.index].known;
+            while (known != 0) {
+                const index = @ctz(known);
+                known &= known - 1;
+                local.registers[index] = .{ .known = true, .value = states[block.index].values[index] };
+            }
             var scc = states[block.index].scc;
             decisions[block.index] = null;
             const end = block.first_instruction + block.instruction_count;
-            for (instructions[block.first_instruction..end]) |inst| {
-                if (budget == 0) return null;
-                budget -= 1;
-                const clobbers = uniformClobbers(inst);
+            // Keep the original whole-block budget, but visit only operations
+            // that can change scalar state. Pure vector arithmetic cannot
+            // contribute to a uniform reachability proof.
+            if (block.instruction_count > budget) return null;
+            budget -= block.instruction_count;
+            var cursor: usize = block.first_instruction;
+            if (steps) |indices| {
+                var low: usize = 0;
+                var high = indices.len;
+                while (low < high) {
+                    const middle = low + (high - low) / 2;
+                    if (indices[middle] < block.first_instruction) low = middle + 1 else high = middle;
+                }
+                cursor = low;
+            }
+            while (true) : (cursor += 1) {
+                const position = if (steps) |indices| if (cursor < indices.len) indices[cursor] else break else cursor;
+                if (position >= end) break;
+                const inst = &instructions[position];
                 switch (inst.opcode) {
                     .s_load_dword, .s_load_dwordx2, .s_load_dwordx4, .s_load_dwordx8, .s_load_dwordx16 => {
-                        _ = executeSmem(&local, reader, bindings, &inst, true);
+                        _ = executeSmem(&local, reader, bindings, inst, false);
                     },
-                    .s_mov_b32, .s_mov_b64, .s_movk_i32, .s_cselect_b32, .s_cselect_b64 => executeScalar(&local, bindings.program_address, &inst, &scc),
+                    .s_buffer_load_dword, .s_buffer_load_dwordx2, .s_buffer_load_dwordx4, .s_buffer_load_dwordx8, .s_buffer_load_dwordx16 => {
+                        // A read-only shader can use a bounded constant-buffer
+                        // flag just like a pointer-based scalar load. Preserve
+                        // both successors if a shader may write an alias.
+                        if (buffer_constants) {
+                            _ = executeSmem(&local, reader, bindings, inst, false);
+                        } else invalidateDestination(&local, inst.dst, inst.data_words);
+                    },
+                    .s_mov_b32, .s_mov_b64, .s_movk_i32, .s_cselect_b32, .s_cselect_b64 => executeScalar(&local, bindings.program_address, inst, &scc),
                     .s_cmp_eq_i32,
                     .s_cmp_lg_i32,
                     .s_cmp_gt_i32,
@@ -388,7 +510,7 @@ pub fn pruneUniformBranches(
                     .s_xnor_b32,
                     .s_not_b32,
                     .s_wqm_b32,
-                    => executeScalar(&local, bindings.program_address, &inst, &scc),
+                    => executeScalar(&local, bindings.program_address, inst, &scc),
                     .s_nop, .s_waitcnt, .s_inst_prefetch, .s_branch, .s_endpgm, .s_code_end => {},
                     .s_cbranch_scc0, .s_cbranch_scc1 => if (scc) |value| {
                         decisions[block.index] = value == (inst.opcode == .s_cbranch_scc1);
@@ -405,7 +527,7 @@ pub fn pruneUniformBranches(
                         // Vector instructions usually leave all SGPRs intact.
                         // Visit only written registers instead of scanning the
                         // entire scalar register file for every instruction.
-                        var remaining = clobbers;
+                        var remaining = uniformClobbers(inst);
                         while (remaining != 0) {
                             const index = @ctz(remaining);
                             local.registers[index] = .{};
@@ -445,12 +567,16 @@ pub fn pruneUniformBranches(
                 const target = &states[edge.to];
                 var updated = false;
                 if (!target.seen) {
-                    target.* = .{ .registers = local.registers, .scc = scc, .seen = true };
+                    target.capture(&local.registers, scc);
                     updated = true;
                 } else {
-                    for (&target.registers, local.registers) |*old, incoming| {
-                        if (old.known and (!incoming.known or old.value != incoming.value)) {
-                            old.* = .{};
+                    var remaining = target.known;
+                    while (remaining != 0) {
+                        const index = @ctz(remaining);
+                        remaining &= remaining - 1;
+                        const incoming = local.registers[index];
+                        if (!incoming.known or target.values[index] != incoming.value) {
+                            target.known &= ~(@as(u128, 1) << @intCast(index));
                             updated = true;
                         }
                     }
@@ -497,24 +623,14 @@ pub fn pruneUniformBranches(
             changed = true;
         }
     }
-    var result: std.ArrayList(rdna2.Instruction) = .empty;
-    errdefer result.deinit(allocator);
-    try result.appendSlice(allocator, instructions);
+    const actions = try allocator.alloc(UniformBlockAction, graph.blocks.items.len);
     for (graph.blocks.items) |block| {
-        const end = block.first_instruction + block.instruction_count;
-        if (!reachable[block.index]) {
-            for (result.items[block.first_instruction..end]) |*inst| {
-                if (!inst.opcode.isProgramEnd()) makeNop(inst);
-            }
-        } else if (decisions[block.index]) |taken| {
-            const branch = &result.items[end - 1];
-            if (taken) branch.opcode = .s_branch else makeNop(branch);
-        }
+        actions[block.index] = if (!reachable[block.index]) .remove else if (decisions[block.index]) |taken| if (taken) .branch else .fallthrough else .keep;
     }
-    return result;
+    return .{ .actions = actions };
 }
 
-fn uniformClobbers(inst: rdna2.Instruction) u128 {
+fn uniformClobbers(inst: *const rdna2.Instruction) u128 {
     var mask: u128 = 0;
     // Over-approximate explicit multi-register definitions, including wide
     // VALU masks. Implicit EXEC updates are invalidated by the transfer above.
@@ -748,9 +864,10 @@ pub fn evaluatePrefixUntil(
 /// walk; an index of these steps replaces visiting every opcode.
 pub fn scalarWalkVisits(inst: rdna2.Instruction) bool {
     switch (inst.family) {
-        .sop1, .sop2, .sopk, .sopc, .sopp, .smem => return true,
-        else => {},
+        .vop1, .vop2, .vop3, .vop3p, .vopc, .vintrp, .mubuf, .mtbuf, .flat, .ds, .mimg, .exp => {},
+        else => return true,
     }
+    if (std.mem.startsWith(u8, @tagName(inst.opcode), "v_cmpx_")) return true;
     if (inst.opcode == .v_readlane_b32 or inst.opcode == .v_writelane_b32) return true;
     if (scalarRegisterIndex(inst.dst) != null or scalarRegisterIndex(inst.dst2) != null) return true;
     return false;
@@ -2190,6 +2307,39 @@ test "uniform resource guard is specialized independently for each dispatch" {
     try std.testing.expect((try pruneUniformBranches(std.testing.allocator, memory.reader(), &bindings, program.instructions.items, &graph)) == null);
 }
 
+test "uniform buffer guards follow live bounded read-only constants" {
+    var storage = [_]u8{0} ** 16;
+    var memory = TestMemory{ .base = 0x1000, .bytes = &storage };
+    var bindings = testBindings(0x2000, 0x1000);
+    bindings.user_data_count = 4;
+    bindings.user_data[2] = 4;
+    var instructions = [_]rdna2.Instruction{
+        .{ .pc = 0, .family = .smem, .opcode = .s_buffer_load_dword, .dst = .{ .kind = .sgpr, .reg = 106 }, .src0 = .{ .kind = .sgpr }, .src1 = .{ .kind = .null }, .data_words = 1, .word_count = 2 },
+        .{ .pc = 8, .family = .sopc, .opcode = .s_cmp_lg_u32, .src0 = .{ .kind = .integer_inline_constant }, .src1 = .{ .kind = .sgpr, .reg = 106 }, .src_count = 2 },
+        .{ .pc = 12, .opcode = .s_cbranch_scc0, .branch_target = 20 },
+        .{ .pc = 16, .family = .mubuf, .opcode = .buffer_load_dword, .dst = .{ .kind = .vgpr }, .data_words = 1 },
+        .{ .pc = 20, .opcode = .s_endpgm },
+    };
+    var graph = try rdna2.control_flow.buildInstructions(std.testing.allocator, &instructions);
+    defer graph.deinit(std.testing.allocator);
+    for ([_]u32{ 0, 1, 0 }) |flag| {
+        memory.write(0x1000, flag);
+        var result = (try pruneUniformBranches(std.testing.allocator, memory.reader(), &bindings, &instructions, &graph)).?;
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expectEqual(if (flag == 0) rdna2.Opcode.s_nop else .buffer_load_dword, result.items[3].opcode);
+    }
+    memory.base = 0x3000;
+    try std.testing.expect((try pruneUniformBranches(std.testing.allocator, memory.reader(), &bindings, &instructions, &graph)) == null);
+    bindings.user_data[2] = 0; // An empty descriptor has defined zero reads.
+    var empty = (try pruneUniformBranches(std.testing.allocator, memory.reader(), &bindings, &instructions, &graph)).?;
+    defer empty.deinit(std.testing.allocator);
+    try std.testing.expectEqual(rdna2.Opcode.s_nop, empty.items[3].opcode);
+    memory.base = 0x1000;
+    bindings.user_data[2] = 4;
+    instructions[3].opcode = .buffer_store_dword;
+    try std.testing.expect((try pruneUniformBranches(std.testing.allocator, memory.reader(), &bindings, &instructions, &graph)) == null);
+}
+
 test "uniform bit guards prune only the selected dispatch branch" {
     var storage = [_]u8{0} ** 16;
     var memory = TestMemory{ .base = 0x1000, .bytes = &storage };
@@ -2343,6 +2493,24 @@ test "unknown 64-bit loop masks cannot reuse an earlier true SCC" {
     try std.testing.expectEqual(@as(u32, 0x3f800000), snapshots[0][106].value);
 }
 
+fn expectUniformPlanMatchesFullWalk(reader: shaders.MemoryReader, bindings: *const shaders.StageBindings, instructions: []const rdna2.Instruction, graph: *const rdna2.control_flow.Graph) !void {
+    const allocator = std.testing.allocator;
+    var plan = try @import("resource_checkpoints.zig").Plan.init(allocator, instructions);
+    defer plan.deinit(allocator);
+    var full = try pruneUniformBranches(allocator, reader, bindings, instructions, graph);
+    defer if (full) |*value| value.deinit(allocator);
+    var sparse = try pruneUniformBranchesWithPlan(allocator, reader, bindings, instructions, graph, &plan, null);
+    defer if (sparse) |*value| value.deinit(allocator);
+    try std.testing.expectEqual(full == null, sparse == null);
+    if (full) |value| {
+        try std.testing.expectEqual(value.items.len, sparse.?.items.len);
+        for (value.items, sparse.?.items) |expected, actual| {
+            try std.testing.expectEqual(expected.pc, actual.pc);
+            try std.testing.expectEqual(expected.opcode, actual.opcode);
+        }
+    }
+}
+
 test "uniform guards survive unrelated vector masks without reusing overwritten masks" {
     var storage = [_]u8{0} ** 16;
     var memory = TestMemory{ .base = 0x1000, .bytes = &storage };
@@ -2360,11 +2528,13 @@ test "uniform guards survive unrelated vector masks without reusing overwritten 
     defer graph.deinit(std.testing.allocator);
     for ([_]u32{ 0, 1 }) |enabled| {
         memory.write(0x1000, enabled);
+        try expectUniformPlanMatchesFullWalk(memory.reader(), &bindings, &instructions, &graph);
         var specialized = (try pruneUniformBranches(std.testing.allocator, memory.reader(), &bindings, &instructions, &graph)).?;
         defer specialized.deinit(std.testing.allocator);
         try std.testing.expectEqual(if (enabled == 0) rdna2.Opcode.s_nop else .image_store, specialized.items[5].opcode);
     }
     instructions[1].dst = .{ .kind = .vcc_lo };
+    try expectUniformPlanMatchesFullWalk(memory.reader(), &bindings, &instructions, &graph);
     try std.testing.expect((try pruneUniformBranches(std.testing.allocator, memory.reader(), &bindings, &instructions, &graph)) == null);
 }
 
@@ -2393,6 +2563,7 @@ test "uniform zero-count loop skips its texture and retains later outputs" {
     defer graph.deinit(std.testing.allocator);
     for ([_]u32{ 0, 1, 0 }) |count| {
         memory.write(0x1000, count);
+        try expectUniformPlanMatchesFullWalk(memory.reader(), &bindings, program.instructions.items, &graph);
         var specialized = try pruneUniformBranches(std.testing.allocator, memory.reader(), &bindings, program.instructions.items, &graph);
         defer if (specialized) |*value| value.deinit(std.testing.allocator);
         const actual = if (specialized) |value| value.items else program.instructions.items;
@@ -2400,6 +2571,7 @@ test "uniform zero-count loop skips its texture and retains later outputs" {
         try std.testing.expectEqual(rdna2.Opcode.image_store, actual[11].opcode);
     }
     memory.base = 0x3000;
+    try expectUniformPlanMatchesFullWalk(memory.reader(), &bindings, program.instructions.items, &graph);
     var unknown = try pruneUniformBranches(std.testing.allocator, memory.reader(), &bindings, program.instructions.items, &graph);
     defer if (unknown) |*value| value.deinit(std.testing.allocator);
     const retained = if (unknown) |value| value.items else program.instructions.items;

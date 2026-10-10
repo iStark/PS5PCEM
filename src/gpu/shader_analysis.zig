@@ -169,29 +169,54 @@ pub const Analysis = struct {
         use_cache: bool,
     ) !?UniformSpecializations.Lease {
         const active_cache = if (use_cache) self.uniform_specializations else null;
-        var instructions = (try @import("scalar_provenance.zig").pruneUniformBranches(
-            allocator,
+        const scalar = @import("scalar_provenance.zig");
+        const eligible = if (active_cache) |cache| cache.eligible orelse blk: {
+            const value = scalar.canPruneUniformBranches(self.program.instructions.items, &self.graph);
+            cache.eligible = value;
+            break :blk value;
+        } else scalar.canPruneUniformBranches(self.program.instructions.items, &self.graph);
+        if (!eligible) return null;
+        // CFG states can exceed the host allocator's large-allocation cutoff.
+        // Reuse their scratch storage, while re-reading every live input and
+        // keeping retained analyses independent of this temporary arena.
+        const scratch_cache = if (active_cache) |cache| if (!cache.scratch_busy) cache else null else null;
+        var scratch = if (scratch_cache) |cache| cache.scratch.promote(allocator) else std.heap.ArenaAllocator.init(allocator);
+        if (scratch_cache) |cache| cache.scratch_busy = true;
+        defer if (scratch_cache) |cache| {
+            _ = scratch.reset(.{ .retain_with_limit = 2 * 1024 * 1024 });
+            cache.scratch = scratch.state;
+            cache.scratch_busy = false;
+        } else scratch.deinit();
+        var proof = (try scalar.proveUniformBranchesWithPlan(
+            scratch.allocator(),
             reader,
             bindings,
             self.program.instructions.items,
             &self.graph,
+            if (self.resource_checkpoints) |*plan| plan else null,
+            eligible,
         )) orelse return null;
-        var instructions_owned = true;
-        defer if (instructions_owned) instructions.deinit(allocator);
+        defer proof.deinit(scratch.allocator());
         if (active_cache) |cache| {
             cache.sequence +%= 1;
             for (&cache.entries) |*entry| {
                 const value = entry.analysis orelse continue;
-                if (!UniformSpecializations.samePrunedInstructions(value.program.instructions.items, instructions.items)) continue;
+                if (!std.mem.eql(scalar.UniformBlockAction, entry.actions, proof.actions)) continue;
                 entry.pins += 1;
                 entry.sequence = cache.sequence;
                 return .{ .analysis = value, .entry = entry, .allocator = allocator, .reused = true };
             }
         }
+        const actions = if (active_cache != null) try allocator.dupe(scalar.UniformBlockAction, proof.actions) else &.{};
+        var actions_owned = true;
+        defer if (actions_owned) allocator.free(actions);
         const value = try allocator.create(Analysis);
         errdefer allocator.destroy(value);
-        value.* = try self.buildUniformSpecialization(allocator, instructions);
-        instructions_owned = false;
+        var retained = try proof.materialize(allocator, self.program.instructions.items, &self.graph);
+        var retained_owned = true;
+        defer if (retained_owned) retained.deinit(allocator);
+        value.* = try self.buildUniformSpecialization(allocator, retained);
+        retained_owned = false;
         if (active_cache != null) {
             value.enableScalarDefinitionCache(allocator) catch {};
             value.enableResourceCheckpoints(allocator) catch {};
@@ -209,7 +234,9 @@ pub const Analysis = struct {
                     old.deinit(allocator);
                     allocator.destroy(old);
                 }
-                entry.* = .{ .analysis = value, .pins = 1, .sequence = cache.sequence };
+                allocator.free(entry.actions);
+                entry.* = .{ .analysis = value, .pins = 1, .sequence = cache.sequence, .actions = actions };
+                actions_owned = false;
                 return .{ .analysis = value, .entry = entry, .allocator = allocator };
             }
         }
@@ -395,11 +422,15 @@ pub const Analysis = struct {
 pub const UniformSpecializations = struct {
     const Entry = struct {
         analysis: ?*Analysis = null,
+        actions: []const @import("scalar_provenance.zig").UniformBlockAction = &.{},
         pins: usize = 0,
         sequence: u64 = 0,
     };
     entries: [4]Entry = @splat(.{}),
     sequence: u64 = 0,
+    scratch: std.heap.ArenaAllocator.State = .{},
+    scratch_busy: bool = false,
+    eligible: ?bool = null,
 
     pub const Lease = struct {
         analysis: *Analysis,
@@ -430,8 +461,11 @@ pub const UniformSpecializations = struct {
     }
 
     fn deinit(self: *UniformSpecializations, allocator: std.mem.Allocator) void {
+        std.debug.assert(!self.scratch_busy);
+        self.scratch.promote(allocator).deinit();
         for (&self.entries) |*entry| {
             std.debug.assert(entry.pins == 0);
+            allocator.free(entry.actions);
             if (entry.analysis) |value| {
                 value.deinit(allocator);
                 allocator.destroy(value);
@@ -944,6 +978,7 @@ test "uniform specialization reuse rechecks guest values and owns separate stati
     var analysis = try decode(allocator, memory.reader(), 0, 16);
     defer analysis.deinit(allocator);
     try analysis.enableUniformSpecializations(allocator);
+    try analysis.enableResourceCheckpoints(allocator);
     var bindings = std.mem.zeroes(shaders.StageBindings);
     bindings.resource_instruction_budget = 4096;
     bindings.user_data_count = 2;
@@ -952,6 +987,9 @@ test "uniform specialization reuse rechecks guest values and owns separate stati
         memory.word(48, flag);
         var lease = (try analysis.acquireUniformSpecialization(allocator, memory.reader(), &bindings, true)).?;
         defer lease.release();
+        var unplanned = (try analysis.specializeUniformBranches(allocator, memory.reader(), &bindings)).?;
+        defer unplanned.deinit(allocator);
+        try std.testing.expect(UniformSpecializations.samePrunedInstructions(unplanned.program.instructions.items, lease.analysis.program.instructions.items));
         try std.testing.expectEqual(iteration >= 2, lease.reused);
         try std.testing.expectEqual(if (flag == 0) rdna2.Opcode.s_nop else .image_store, lease.analysis.program.instructions.items[5].opcode);
         try std.testing.expect(lease.analysis.resource_checkpoints.?.matches(lease.analysis.program.instructions.items));

@@ -98,6 +98,7 @@ const Player = struct {
     looping: bool = false,
     auto_start: bool = false,
     end_of_stream: bool = true,
+    end_event_pending: bool = false,
     video_end_of_stream: bool = true,
     audio_end_of_stream: bool = true,
     seek_video_frame_pending: bool = false,
@@ -407,8 +408,9 @@ fn finishStream(player: *Player, video: bool) void {
     }
     if (!player.video_end_of_stream or !player.audio_end_of_stream) return;
     player.end_of_stream = true;
+    player.seek_time_ms = if (player.duration_ms != 0) player.duration_ms else playbackPositionMs(player);
     player.started = false;
-    emitEvent(player, event_state_stop);
+    player.end_event_pending = true;
 }
 
 /// End a presentation whose clock has passed the duration of its source.
@@ -433,8 +435,9 @@ fn expirePlayback(player: *Player) void {
     player.video_end_of_stream = true;
     player.audio_end_of_stream = true;
     player.end_of_stream = true;
+    player.seek_time_ms = player.duration_ms;
     player.started = false;
-    emitEvent(player, event_state_stop);
+    player.end_event_pending = true;
 }
 
 fn sourcePath(player: *Player) []const u8 {
@@ -460,12 +463,13 @@ fn callbackResult(raw: u64) i32 {
 /// file callbacks even though every URI names the same `.resource` file. Feed
 /// FFmpeg an exact host-side snapshot of that virtual file; opening the URI on
 /// the host directly would always decode the first embedded movie instead.
+fn hasCompleteFileCallbacks(player: *const Player) bool {
+    return player.file_open != 0 and player.file_close != 0 and
+        player.file_read_offset != 0 and player.file_size != 0;
+}
+
 fn materializeCallbackSource(player: *Player, guest_path: []const u8) !void {
-    if (player.file_open == 0 or player.file_close == 0 or
-        player.file_read_offset == 0 or player.file_size == 0)
-    {
-        return error.MissingFileCallbacks;
-    }
+    if (!hasCompleteFileCallbacks(player)) return error.MissingFileCallbacks;
     const io = filesystem.attachedIo() orelse return error.NotAttached;
     const path_allocation = allocateGuest(player, guest_path.len + 1, false) orelse return error.OutOfMemory;
     defer deallocateGuest(player, path_allocation);
@@ -601,8 +605,8 @@ fn startVideoDecoder(player: *Player) !void {
     var filter_buffer: [128]u8 = undefined;
     const filter = try std.fmt.bufPrint(
         &filter_buffer,
-        "pad={d}:{d}:0:0:black",
-        .{ player.video_pitch, player.video_height },
+        "fps={d},pad={d}:{d}:0:0:black",
+        .{ video_fps, player.video_pitch, player.video_height },
     );
     var seek_buffer: [32]u8 = undefined;
     const seek_seconds = try std.fmt.bufPrint(
@@ -882,8 +886,8 @@ fn addSourceEx(
     if (!kernel_memory.isGuestRangeAccessible(details_address, 16)) return av_error_invalid_params;
     const path_address = readGuestU64(details_address);
     const path_length = readGuestU32(details_address + 8);
-    if (path_address == 0 or path_length == 0 or path_length > filesystem.maximum_path or
-        !kernel_memory.isGuestRangeAccessible(path_address, path_length))
+    if (path_address == 0 or (path_length == 0 and !hasCompleteFileCallbacks(player)) or path_length > filesystem.maximum_path or
+        !kernel_memory.isGuestRangeAccessible(path_address, @max(path_length, 1)))
     {
         return av_error_invalid_params;
     }
@@ -903,7 +907,7 @@ pub fn addSource(handle: ?*anyopaque, filename: ?*const u8) callconv(abi.guest) 
         if (!kernel_memory.isGuestRangeAccessible(address, 1)) return av_error_invalid_params;
         if (@as(*const u8, @ptrFromInt(address)).* == 0) break;
     }
-    if (path_length == 0 or path_length == filesystem.maximum_path) return av_error_invalid_params;
+    if ((path_length == 0 and !hasCompleteFileCallbacks(player)) or path_length == filesystem.maximum_path) return av_error_invalid_params;
 
     const guest_path: [*]const u8 = @ptrFromInt(path_address);
     return addSourcePath(player, guest_path[0..path_length]);
@@ -916,24 +920,31 @@ fn addSourcePath(player: *Player, guest_path: []const u8) i32 {
         if (!player.initialized) return av_error_invalid_params;
 
         var normalized: [filesystem.maximum_path]u8 = undefined;
-        const relative = filesystem.mountRelative(guest_path, &normalized) orelse {
-            return av_error_invalid_params;
-        };
+        // Custom file callbacks own the URI namespace. UE can pass an empty
+        // name because its callback object already holds the opened archive.
+        // Only a host-file fallback needs a mount-relative pathname.
+        const relative = if (guest_path.len != 0) filesystem.mountRelative(guest_path, &normalized) else null;
+        if (relative == null and !hasCompleteFileCallbacks(player)) return av_error_invalid_params;
         stopDecoders(player);
         releaseGuestBuffers(player);
         releaseTemporarySource(player);
-        @memcpy(player.source_path[0..relative.len], relative);
-        player.source_path_length = relative.len;
+        player.source_path_length = 0;
+        if (relative) |path| {
+            @memcpy(player.source_path[0..path.len], path);
+            player.source_path_length = path.len;
+        }
         if (player.file_open != 0 or player.file_read_offset != 0 or player.file_size != 0) {
             materializeCallbackSource(player, guest_path) catch |err| {
                 std.debug.print(
-                    "[avplayer] custom file source '{s}' failed: {s}; using host path\n",
-                    .{ relative, @errorName(err) },
+                    "[avplayer] custom file source '{s}' failed: {s}; host fallback={any}\n",
+                    .{ guest_path, @errorName(err), relative != null },
                 );
+                if (relative == null) return av_error_operation_failed;
             };
         }
         player.source_ready = true;
         player.end_of_stream = false;
+        player.end_event_pending = false;
         player.video_end_of_stream = false;
         player.audio_end_of_stream = false;
         player.seek_video_frame_pending = false;
@@ -950,7 +961,7 @@ fn addSourcePath(player: *Player, guest_path: []const u8) i32 {
         std.debug.print(
             "[avplayer] source '{s}' duration={d}ms video={d}x{d} pitch={d} bytes={d} (FFmpeg NV12 + PCM16)\n",
             .{
-                relative,
+                guest_path,
                 player.duration_ms,
                 player.video_width,
                 player.video_height,
@@ -1055,6 +1066,7 @@ fn startLocked(player: *Player) i32 {
     player.started = true;
     player.paused = false;
     player.end_of_stream = false;
+    player.end_event_pending = false;
     player.video_end_of_stream = false;
     player.audio_end_of_stream = false;
     player.seek_video_frame_pending = false;
@@ -1096,9 +1108,11 @@ fn stop(handle: ?*anyopaque) callconv(abi.guest) i32 {
         .{ player.video_frame_index, player.audio_frame_index, player.duration_ms },
     );
     stopDecoders(player);
+    player.seek_time_ms = playbackPositionMs(player);
     player.started = false;
     player.paused = false;
     player.end_of_stream = true;
+    player.end_event_pending = false;
     player.video_end_of_stream = true;
     player.audio_end_of_stream = true;
     player.playback_ceiling_ms.store(unbounded_playback_ms, .release);
@@ -1160,6 +1174,7 @@ fn jumpToTime(handle: ?*anyopaque, time_ms: u64) callconv(abi.guest) i32 {
     player.paused_clock_ns = 0;
     player.playback_ceiling_ms.store(time_ms +| playback_frame_ms, .release);
     player.end_of_stream = false;
+    player.end_event_pending = false;
     player.video_end_of_stream = false;
     player.audio_end_of_stream = false;
     player.seek_video_frame_pending = player.paused;
@@ -1172,6 +1187,10 @@ fn simpleAction(handle: ?*anyopaque, _: u64, _: u64) callconv(abi.guest) i32 {
 }
 
 fn playbackPositionMs(player: *const Player) u64 {
+    // Keep the final media timestamp after EOF. Middleware can drain its
+    // presentation queue after IsActive becomes false; resetting to zero
+    // strands every queued frame with a positive timestamp.
+    if (!player.started) return player.seek_time_ms;
     const now = if (player.paused) player.pause_clock_started_ns else playbackClockNs();
     if (now == 0 or player.play_clock_started_ns == 0 or now < player.play_clock_started_ns) {
         return player.seek_time_ms;
@@ -1184,7 +1203,7 @@ fn playbackPositionMs(player: *const Player) u64 {
 
 pub fn currentTime(handle: ?*anyopaque) callconv(abi.guest) u64 {
     const player = playerForHandle(handle) orelse return 0;
-    if (!player.source_ready or !player.started) return 0;
+    if (!player.source_ready) return 0;
     const io = lockStreams(player) orelse return 0;
     defer unlockStreams(player, io);
     return playbackPositionMs(player);
@@ -1309,7 +1328,16 @@ fn isActive(handle: ?*anyopaque) callconv(abi.guest) u8 {
     defer unlockStreams(player, io);
     if (!player.initialized) return 0;
     expirePlayback(player);
-    return if (player.started and !player.end_of_stream) 1 else 0;
+    const active: u8 = if (player.started and !player.end_of_stream) 1 else 0;
+    // A decoder worker must not suspend the guest's media state before the
+    // presentation thread can observe EOF. Unreal otherwise stops polling
+    // IsActive and waits forever on its final movie frame. Publish the stop
+    // notification together with the first terminal status observation.
+    if (player.end_event_pending) {
+        player.end_event_pending = false;
+        emitEvent(player, event_state_stop);
+    }
+    return active;
 }
 
 fn close(handle: ?*anyopaque) callconv(abi.guest) i32 {
@@ -1489,6 +1517,27 @@ test "a presentation ends when its clock passes the source duration" {
     try std.testing.expect(!player.started);
     try std.testing.expect(player.end_of_stream);
     try std.testing.expect(player.audio_end_of_stream);
+    try std.testing.expectEqual(@as(u64, 3_170), playbackPositionMs(&player));
+}
+
+test "AvPlayer retains the final timestamp after both streams drain" {
+    var player = Player{
+        .started = true,
+        .duration_ms = 15_700,
+        .seek_time_ms = 15_680,
+        .end_of_stream = false,
+        .video_end_of_stream = false,
+        .audio_end_of_stream = false,
+    };
+    finishStream(&player, true);
+    try std.testing.expect(player.started);
+    finishStream(&player, false);
+    try std.testing.expect(!player.started);
+    try std.testing.expect(player.end_of_stream);
+    try std.testing.expectEqual(@as(u64, 15_700), playbackPositionMs(&player));
+    // A real host clock must not advance an already completed presentation.
+    player.play_clock_started_ns = 1;
+    try std.testing.expectEqual(@as(u64, 15_700), playbackPositionMs(&player));
 }
 
 test "a looping presentation and one of unknown length never expire" {
