@@ -631,12 +631,20 @@ fn run(init: std.process.Init) !bool {
     const sparse_graphics_draws = init.minimal.environ.containsUnempty(allocator, "PS5_SPARSE_GRAPHICS") catch false;
     const translate_compute_only = init.minimal.environ.containsUnempty(allocator, "PS5_COMPUTE_TRANSLATE_ONLY") catch false;
     const prefer_integrated_gpu = init.minimal.environ.containsUnempty(allocator, "PS5_VULKAN_PREFER_INTEGRATED") catch false;
+    const use_big_helmet_gpu_profile = std.ascii.eqlIgnoreCase(title_identifier, "PPSA19943");
     // Big Helmet Heroes' packed menu scanout has been checked against the
     // CPU conversion. Avoid reading its 4K attachment back every flip.
     vulkan.backend.gpu_packed_scanout = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_PACKED_SCANOUT")) |text| enabled: {
         defer allocator.free(text);
         break :enabled !std.mem.eql(u8, std.mem.trim(u8, text, " \t\r\n"), "0");
-    } else |_| std.ascii.eqlIgnoreCase(title_identifier, "PPSA19943");
+    } else |_| use_big_helmet_gpu_profile;
+    // Keep the GPU fed while the CPU prepares the next resources. This only
+    // submits recorded work asynchronously; guest ordering remains intact.
+    const default_batch_age_us: u64 = if (use_big_helmet_gpu_profile) 1000 else 0;
+    vulkan.backend.command_batch_max_ns = (if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_COMMAND_BATCH_US")) |text| parse: {
+        defer allocator.free(text);
+        break :parse @min(std.fmt.parseInt(u64, std.mem.trim(u8, text, " \t\r\n"), 10) catch default_batch_age_us, 1000000);
+    } else |_| default_batch_age_us) * std.time.ns_per_us;
     const dump_compute_spirv = init.minimal.environ.containsUnempty(allocator, "PS5_DUMP_COMPUTE_SPIRV") catch false;
     const dump_graphics_spirv = init.minimal.environ.containsUnempty(allocator, "PS5_DUMP_GRAPHICS_SPIRV") catch false;
     const trace_resource_failures = init.minimal.environ.containsUnempty(allocator, "PS5_TRACE_RESOURCE_FAILURES") catch false;
@@ -675,12 +683,13 @@ fn run(init: std.process.Init) !bool {
         adaptive_compiler_workers = false;
         break :workers std.math.clamp(std.fmt.parseInt(usize, std.mem.trim(u8, text, " \t\r\n"), 10) catch 2, 1, 4);
     } else |_| if (adaptive_cpu_workers) cpu_worker_limits.compilers else 2;
-    // GTA III's frequent ordering callbacks outweigh command lookahead.
+    // GTA III and Big Helmet Heroes spend more on ordering callbacks than
+    // they gain from command lookahead in the measured scenes.
     // Retain the environment override for comparisons and other titles.
     const parallel_commands = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_PARALLEL_COMMANDS")) |text| enabled: {
         defer allocator.free(text);
         break :enabled !std.mem.eql(u8, std.mem.trim(u8, text, " \t\r\n"), "0");
-    } else |_| !std.ascii.eqlIgnoreCase(title_identifier, gta_iii_title_id);
+    } else |_| !std.ascii.eqlIgnoreCase(title_identifier, gta_iii_title_id) and !use_big_helmet_gpu_profile;
     var adaptive_resource_workers = adaptive_cpu_workers;
     const resource_preparation_workers = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_RESOURCE_WORKERS")) |text| workers: {
         defer allocator.free(text);
@@ -705,7 +714,7 @@ fn run(init: std.process.Init) !bool {
         (init.minimal.environ.containsUnempty(allocator, "PS5_GPU_CANONICAL_ALIASES") catch false);
     const enable_depth_transfer = enable_gpu_experimental or
         (init.minimal.environ.containsUnempty(allocator, "PS5_GPU_DEPTH_TRANSFER") catch false);
-    const enable_image_state_optimization = enable_gpu_experimental or
+    const enable_image_state_optimization = use_big_helmet_gpu_profile or enable_gpu_experimental or
         (init.minimal.environ.containsUnempty(allocator, "PS5_GPU_IMAGE_STATE_OPT") catch false);
     const use_terminator_gpu_profile = titleUsesTerminatorGpuProfile(title_identifier);
     runtime.firmware.libs.audio.setHostTargetLatencyMilliseconds(if (use_terminator_gpu_profile)
@@ -768,7 +777,7 @@ fn run(init: std.process.Init) !bool {
         defer allocator.free(text);
         break :enabled text.len != 0 and !std.mem.eql(u8, text, "0");
     } else |_| std.ascii.eqlIgnoreCase(title_identifier, yotei_title_id) or use_gta_iii_buffer_profile;
-    const default_copy_workers: u8 = if (use_gta_iii_buffer_profile or
+    const default_copy_workers: u8 = if (use_big_helmet_gpu_profile or use_gta_iii_buffer_profile or
         std.ascii.eqlIgnoreCase(title_identifier, yotei_title_id) or
         std.ascii.eqlIgnoreCase(title_identifier, little_nightmares_enhanced_title_id)) 4 else 1;
     const gpu_copy_workers: u8 = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_COPY_WORKERS")) |text| parse: {

@@ -845,13 +845,14 @@ test "compute cache matches fresh translation across runtime values wave modes a
         .storage_buffers = &storage,
         .dynamic_scalar_binding = .{ .binding = 10 },
     };
-    for (0..6) |step| {
+    for (0..7) |step| {
         switch (step) {
             1 => scalars[0].value = 1,
             2 => options.wave32 = true,
             3 => options.local_size = .{ 32, 1, 1 },
             4 => storage[0].extent_bytes = 16,
             5 => storage[0].descriptor_index = 1,
+            6 => storage[0].write_extent_descriptor = 2,
             else => {},
         }
         var cached = try cache.translate(a, &program, options, .{});
@@ -861,5 +862,5 @@ test "compute cache matches fresh translation across runtime values wave modes a
         try std.testing.expectEqualSlices(u32, fresh.words, cached.words);
     }
     try std.testing.expectEqual(@as(u64, 2), cache.hits);
-    try std.testing.expectEqual(@as(u64, 4), cache.misses);
+    try std.testing.expectEqual(@as(u64, 5), cache.misses);
 }

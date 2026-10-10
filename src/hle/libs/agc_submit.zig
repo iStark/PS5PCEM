@@ -1220,6 +1220,7 @@ pub fn publishDirectMemory(context: ?*anyopaque, address: u64, size: usize) bool
 pub export var trace_guest_write_min_bytes: u64 = 0;
 pub export var trace_guest_write_reports: u32 = 0;
 pub export var skip_unchanged_guest_writes: bool = true;
+pub export var parallel_guest_publications: bool = true;
 pub export var guest_write_compared_bytes: u64 = 0;
 pub export var guest_write_unchanged_bytes: u64 = 0;
 
@@ -1227,6 +1228,35 @@ pub export var guest_write_unchanged_bytes: u64 = 0;
 /// and command-snapshot notifications still run once for the entire write.
 /// Narrow label writes retain their existing path and wake-up semantics.
 fn copyChangedGuestBytes(space: ?*guest_address_space.AddressSpace, destination: []u8, source: []const u8) usize {
+    if (source.len < gpu.parallel_copy.Pool.minimum_bytes or
+        !@atomicLoad(bool, &parallel_guest_publications, .monotonic))
+        return copyChangedGuestBytesSerial(space, destination, source);
+    const Work = struct {
+        space: ?*guest_address_space.AddressSpace,
+        destination: []u8,
+        source: []const u8,
+        unchanged: [gpu.parallel_copy.Pool.maximum_participants]usize = @splat(0),
+
+        fn run(raw: *anyopaque, first: usize, end: usize, participant: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            // Align partitions to native allocation granularity. Tracker
+            // protection batches never straddle two publication workers.
+            const granularity = 64 * 1024;
+            const adjustment = @intFromPtr(self.destination.ptr) % granularity;
+            const start = if (first == 0) 0 else first * granularity - adjustment;
+            const limit = @min(self.source.len, end * granularity - adjustment);
+            self.unchanged[participant] = copyChangedGuestBytesSerial(self.space, self.destination[start..limit], self.source[start..limit]);
+        }
+    };
+    var work = Work{ .space = space, .destination = destination, .source = source };
+    const chunks = (source.len + @intFromPtr(destination.ptr) % (64 * 1024) + 64 * 1024 - 1) / (64 * 1024);
+    gpu.parallel_copy.guest_copy_pool.forRanges(chunks, &work, Work.run);
+    var unchanged: usize = 0;
+    for (work.unchanged) |count| unchanged += count;
+    return unchanged;
+}
+
+fn copyChangedGuestBytesSerial(space: ?*guest_address_space.AddressSpace, destination: []u8, source: []const u8) usize {
     std.debug.assert(destination.len == source.len);
     const address = @intFromPtr(destination.ptr);
     var unchanged: usize = 0;
@@ -1260,6 +1290,55 @@ fn copyChangedGuestBytes(space: ?*guest_address_space.AddressSpace, destination:
 test "equal GPU publications preserve page watches and changed pages advance" {
     try exerciseEqualGpuPublications(.private);
     try exerciseEqualGpuPublications(.direct_memory);
+}
+
+test "parallel GPU publications preserve unchanged pages and join before completion" {
+    const page = guest_address_space.page_size;
+    const size = gpu.parallel_copy.Pool.minimum_bytes + 3 * page;
+    const base = guest_address_space.user.start;
+    var space = try guest_address_space.AddressSpace.initWithDirectMemory(testing.allocator, size);
+    defer space.deinit();
+    try space.mapFixed(base, size, .read_write, .direct_memory, 0);
+    space.enableGpuMemoryTracking();
+    const source = try testing.allocator.alloc(u8, size - 246);
+    defer testing.allocator.free(source);
+    @memset(source, 0x39);
+    const destination = @as([*]u8, @ptrFromInt(base + 123))[0..source.len];
+    const pool = &gpu.parallel_copy.guest_copy_pool;
+    const previous = pool.participants.swap(4, .acq_rel);
+    defer pool.participants.store(previous, .release);
+    defer pool.deinit();
+    _ = copyChangedGuestBytes(&space, destination, source);
+    const generations = try testing.allocator.alloc(u64, size / page);
+    defer testing.allocator.free(generations);
+    for (generations, 0..) |*generation, index| generation.* = try space.trackGpuRead(base + index * page, page);
+    try testing.expectEqual(source.len, copyChangedGuestBytes(&space, destination, source));
+    // Writes cross worker boundaries and touch both unaligned endpoints.
+    for (source, 0..) |*byte, index| if ((index + 123) / page % 7 == 0) {
+        byte.* = 0x73;
+    };
+    source[source.len - 1] = 0x94;
+    var expected_unchanged: usize = 0;
+    for (source, destination) |new, old| if (new == old) {
+        expected_unchanged += 1;
+    };
+    // The return value counts whole unchanged page fragments, not equal
+    // bytes within the changed final page.
+    expected_unchanged -= (page - 123) - 1;
+    try testing.expectEqual(expected_unchanged, copyChangedGuestBytes(&space, destination, source));
+    try testing.expectEqualSlices(u8, source, destination);
+    for (generations, 0..) |generation, index| {
+        if (index % 7 == 0 or index + 1 == generations.len)
+            try testing.expectEqual(@as(u64, 0), space.gpuGeneration(base + index * page, page))
+        else
+            try testing.expectEqual(generation, space.gpuGeneration(base + index * page, page));
+    }
+    try testing.expectEqual(@as(u8, 0), @as(*const u8, @ptrFromInt(base + 122)).*);
+    try testing.expectEqual(@as(u8, 0), @as(*const u8, @ptrFromInt(base + size - 123)).*);
+    // A nested/busy pool preserves the serial publication path.
+    try testing.expect(pool.lock.tryLock());
+    defer pool.lock.unlock();
+    try testing.expectEqual(source.len, copyChangedGuestBytes(&space, destination, source));
 }
 
 fn exerciseEqualGpuPublications(kind: guest_address_space.MappingKind) !void {
@@ -1930,12 +2009,16 @@ fn backendRelease(context: ?*anyopaque, value: gpu.state.ReleaseMem) bool {
     const event_id: u32 = @intCast(@intFromPtr(context));
     if (sdk11_dcb_release_capture) captureSdk11DcbRelease(value);
     if (compact_release_reports < 64) {
-        if (resolveSubmissionAlias(value.address, switch (value.data_selection) {
+        // Native labels normally resolve to themselves. This diagnostic only
+        // logs compact aliases; querying Windows page permissions for an
+        // unchanged address at every release adds no information.
+        const size: usize = switch (value.data_selection) {
             1 => 4,
             2, 3, 4 => 8,
             else => 0,
-        })) |cpu_address| {
-            if (cpu_address != value.address) {
+        };
+        if (findSubmissionAlias(value.address, size)) |cpu_address| {
+            if (cpu_address != value.address and memory.isGuestRangeAccessible(cpu_address, size)) {
                 std.debug.print(
                     "[agc release alias] gpu=0x{x} cpu=0x{x} data=0x{x} selection={d} interrupt={d} context={d}\n",
                     .{

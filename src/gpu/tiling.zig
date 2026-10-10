@@ -1660,7 +1660,7 @@ pub const SubresourceLayout = struct {
     /// and cached swizzle offsets instead of evaluating the general volume /
     /// MSAA address function millions of times for each full-resolution image.
     fn blockCopyLayout(self: SubresourceLayout) Error!?Layout {
-        if (self.kind != .array_2d or self.in_tail or self.block.samples_log2 != 0) return null;
+        if (self.in_tail or self.block.samples_log2 != 0 or self.block.depth != 1) return null;
         const mode: resources.TileMode = switch (self.block.family) {
             .linear => .linear,
             .standard_256b => .standard_256b,
@@ -1676,11 +1676,14 @@ pub const SubresourceLayout = struct {
             .width = self.width,
             .height = self.height,
             .layers = self.depth_or_layers,
-            .first_slice = self.first_slice,
+            .first_slice = if (self.kind == .array_2d) self.first_slice else 0,
             .row_pitch_elements = self.padded_width,
         }, self.block.bytes_per_element);
         layout.source_base_offset = self.level_offset;
-        layout.source_slice_bytes = self.source_layer_bytes;
+        // Thin 3D surfaces use the same per-slice swizzle as 2D arrays,
+        // including the Z-dependent RB+ XOR. Thick tiles and packed tails
+        // still need the subresource path below.
+        layout.source_slice_bytes = if (self.kind == .array_2d) self.source_layer_bytes else self.block_slice_bytes;
         layout.required_source_bytes = self.required_source_bytes;
         return layout;
     }
@@ -1721,6 +1724,17 @@ pub const SubresourceLayout = struct {
         source: []const u8,
         destination: []u8,
     ) Error!void {
+        return self.copySubresourceUsingPool(to_tiled, element_bytes, source, destination, &parallel_copy.guest_copy_pool);
+    }
+
+    fn copySubresourceUsingPool(
+        self: SubresourceLayout,
+        comptime to_tiled: bool,
+        comptime element_bytes: usize,
+        source: []const u8,
+        destination: []u8,
+        pool: *parallel_copy.Pool,
+    ) Error!void {
         const sample_count: usize = self.samples();
         const row_bytes: usize = @intCast(try multiply3(self.width, sample_count, element_bytes));
         const slice_bytes: usize = @intCast(try multiply(row_bytes, self.height));
@@ -1747,9 +1761,47 @@ pub const SubresourceLayout = struct {
         for (0..self.block.width) |x| {
             x_offsets[x] = try self.block.byteOffset(@intCast(x), 0, 0, 0);
         }
+        const Work = struct {
+            layout: SubresourceLayout,
+            source: []const u8,
+            destination: []u8,
+            x_offsets: *const [256]u32,
+            errors: [parallel_copy.Pool.maximum_participants]?Error = @splat(null),
+
+            fn run(raw: *anyopaque, first: usize, end: usize, participant: usize) void {
+                const work: *@This() = @ptrCast(@alignCast(raw));
+                work.layout.copySubresourceSlices(to_tiled, element_bytes, work.source, work.destination, work.x_offsets, first, end) catch |err| {
+                    work.errors[participant] = err;
+                };
+            }
+        };
+        var work = Work{ .layout = self, .source = source, .destination = destination, .x_offsets = &x_offsets };
+        // Each Z slice has disjoint texel addresses even inside a thick tile.
+        // Preserve padding and mip-tail neighbours exactly as in the scalar
+        // path; only the ownership of the loop iterations changes.
+        if (try self.stagingBytes() >= 1024 * 1024)
+            pool.forRanges(self.depth_or_layers, &work, Work.run)
+        else
+            Work.run(&work, 0, self.depth_or_layers, 0);
+        for (work.errors) |failure| if (failure) |err| return err;
+    }
+
+    fn copySubresourceSlices(
+        self: SubresourceLayout,
+        comptime to_tiled: bool,
+        comptime element_bytes: usize,
+        source: []const u8,
+        destination: []u8,
+        x_offsets: *const [256]u32,
+        first: usize,
+        end: usize,
+    ) Error!void {
+        const sample_count: usize = self.samples();
+        const row_bytes: usize = @intCast(try multiply3(self.width, sample_count, element_bytes));
+        const slice_bytes: usize = @intCast(try multiply(row_bytes, self.height));
         const rb_plus = self.block.family == .depth_64kb or self.block.family == .render_target_64kb;
         const blocks_per_row = self.padded_width / self.block.width;
-        for (0..self.depth_or_layers) |slice_index| {
+        for (first..end) |slice_index| {
             const slice: u32 = @intCast(slice_index);
             const physical_slice = if (self.kind == .array_2d) try addU32(self.first_slice, slice) else 0;
             const allocation: usize = @intCast(try add(self.level_offset, if (self.kind == .array_2d)
@@ -3383,6 +3435,40 @@ fn testSubresourceCopies(description: Texture, element_bytes: u8) !void {
         try testing.expectError(Error.DestinationTooSmall, view.detile(allocation, actual[0 .. actual.len - 1]));
         try testing.expectError(Error.SourceTooSmall, view.tile(expected[0 .. expected.len - 1], tiled));
         try testing.expectError(Error.DestinationTooSmall, view.tile(expected, tiled[0 .. @as(usize, @intCast(view.required_source_bytes)) - 1]));
+    }
+}
+
+test "parallel thick volume copies preserve every texel and padding byte" {
+    var pool = parallel_copy.Pool{};
+    defer pool.deinit();
+    pool.participants.store(4, .release);
+    for ([_]resources.TileMode{ .standard_4kb, .standard_64kb, .partially_resident, .render_target }) |mode| {
+        const texture = try TextureLayout.init(.{
+            .tile_mode = mode,
+            .kind = .volume_3d,
+            .width = 67,
+            .height = 65,
+            .depth_or_layers = 37,
+            .mip_levels = 5,
+        }, 8);
+        const allocation = try testing.allocator.alloc(u8, @intCast(texture.required_source_bytes));
+        defer testing.allocator.free(allocation);
+        for (allocation, 0..) |*byte, index| byte.* = @truncate(index ^ (index >> 8) ^ (index >> 16));
+        for (0..texture.mip_levels) |level| {
+            const view = try texture.subresource(@intCast(level), 0, texture.layers);
+            const expected = try testing.allocator.alloc(u8, @intCast(try view.stagingBytes()));
+            defer testing.allocator.free(expected);
+            const actual = try testing.allocator.alloc(u8, expected.len);
+            defer testing.allocator.free(actual);
+            const memory = TestMemory{ .base = 0x4000_0000, .bytes = allocation };
+            try view.stage(memory.reader(), memory.base, expected);
+            try view.copySubresourceUsingPool(false, 8, allocation, actual, &pool);
+            try testing.expectEqualSlices(u8, expected, actual);
+            const tiled = try testing.allocator.dupe(u8, allocation);
+            defer testing.allocator.free(tiled);
+            try view.copySubresourceUsingPool(true, 8, expected, tiled, &pool);
+            try testing.expectEqualSlices(u8, allocation, tiled);
+        }
     }
 }
 

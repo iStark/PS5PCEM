@@ -58,6 +58,24 @@ pub const Ranges = struct {
         }
         return output[0..count];
     }
+
+    /// Retire only bytes already published (or protected by a newer writer).
+    /// Further GPU writes are merged back through include/merge as usual.
+    pub fn consumePrefix(self: *Ranges, size: usize, total: usize) void {
+        if (size == 0) return;
+        if (self.whole) {
+            self.* = .{};
+            if (size < total) self.include(.{ .first = size, .end = total });
+            return;
+        }
+        var remaining: usize = 0;
+        for (self.spans[0..self.count]) |span| {
+            if (span.end <= size) continue;
+            self.spans[remaining] = .{ .first = @max(span.first, size), .end = span.end };
+            remaining += 1;
+        }
+        self.count = remaining;
+    }
 };
 
 test "write spans merge overlap and adjacency without publishing the gaps" {
@@ -88,4 +106,41 @@ test "write span overflow and unknown writes retain every GPU result" {
     try std.testing.expect(known.whole);
     known.include(.{ .first = 0, .end = 4 });
     try std.testing.expect(known.whole);
+}
+
+test "published prefixes stay retired until another GPU write" {
+    var ranges = Ranges{ .whole = true };
+    var clipped: [capacity]Span = undefined;
+    ranges.consumePrefix(0, 64);
+    try std.testing.expect(ranges.whole);
+    ranges.consumePrefix(3, 64);
+    try std.testing.expectEqual(@as(usize, 0), ranges.prefix(3, &clipped).len);
+    ranges.consumePrefix(3, 64);
+    try std.testing.expectEqual(Span{ .first = 3, .end = 9 }, ranges.prefix(9, &clipped)[0]);
+    ranges.consumePrefix(9, 64);
+    ranges.include(.{ .first = 1, .end = 5 });
+    try std.testing.expectEqual(Span{ .first = 1, .end = 5 }, ranges.prefix(9, &clipped)[0]);
+    ranges.consumePrefix(9, 64);
+    try std.testing.expectEqual(Span{ .first = 9, .end = 64 }, ranges.prefix(64, &clipped)[0]);
+    ranges.consumePrefix(64, 64);
+    try std.testing.expectEqual(@as(usize, 0), ranges.count);
+    try std.testing.expect(!ranges.whole);
+    ranges.merge(&.{ .whole = true });
+    try std.testing.expectEqual(Span{ .first = 0, .end = 64 }, ranges.prefix(64, &clipped)[0]);
+    ranges.consumePrefix(128, 64);
+    try std.testing.expectEqual(@as(usize, 0), ranges.count);
+    try std.testing.expect(!ranges.whole);
+}
+
+test "prefix publication retires sparse writes without adding their gaps" {
+    var ranges = Ranges{};
+    ranges.include(.{ .first = 4, .end = 8 });
+    ranges.include(.{ .first = 16, .end = 24 });
+    ranges.consumePrefix(12, 64);
+    try std.testing.expectEqual(@as(usize, 1), ranges.count);
+    try std.testing.expectEqual(Span{ .first = 16, .end = 24 }, ranges.spans[0]);
+    ranges.consumePrefix(20, 64);
+    try std.testing.expectEqual(Span{ .first = 20, .end = 24 }, ranges.spans[0]);
+    ranges.consumePrefix(24, 64);
+    try std.testing.expectEqual(@as(usize, 0), ranges.count);
 }

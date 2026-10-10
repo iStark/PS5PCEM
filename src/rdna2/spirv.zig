@@ -52,6 +52,10 @@ pub const StorageBufferBinding = struct {
     /// Null leaves the access unchecked, which is what a caller that has not
     /// recovered the descriptor should say rather than guessing a size.
     extent_bytes: ?u32 = null,
+    /// Optional private SSBO word recording the largest exclusive byte end
+    /// of executed stores. Bounds and EXEC guards cover this atomic as
+    /// well as the guest store; the counter never occupies guest storage.
+    write_extent_descriptor: ?u32 = null,
     /// A bounded table may supply several V#s to the same instruction. Match
     /// all four live words before selecting its staged host descriptor.
     candidate_words: ?[4]u32 = null,
@@ -869,6 +873,10 @@ pub fn validateStorageBufferBindings(bindings: []const StorageBufferBinding, des
     for (bindings, 0..) |binding, index| {
         if (binding.resource_sgpr >= 128 or binding.descriptor_index >= descriptor_count or binding.index_stride > 3)
             return Error.InvalidStorageBinding;
+        if (binding.write_extent_descriptor) |descriptor| {
+            if (descriptor >= descriptor_count or descriptor == binding.descriptor_index or
+                binding.lookup != null or binding.candidate_words != null) return Error.InvalidStorageBinding;
+        }
         if (binding.lookup) |lookup| {
             if (binding.candidate_words == null or binding.resource_sgpr > 124 or
                 lookup.descriptor_index >= descriptor_count or lookup.mask == std.math.maxInt(u32) or
@@ -9444,6 +9452,26 @@ const Builder = struct {
     /// behind a branch, which is the only way SPIR-V has of not doing one.
     fn storeBufferWord(self: *Builder, address: BufferAddress, delta: u32, value: u32) Error!void {
         const access = try self.bufferWordAccess(address, delta);
+        if (address.binding.write_extent_descriptor) |descriptor| {
+            const predicate = try self.writePredicate(access.in_range);
+            const taken = if (predicate != null) self.id() else 0;
+            const merge = if (predicate != null) self.id() else 0;
+            if (predicate) |enabled| {
+                try self.emit(&self.body, 247, &.{ merge, 0 });
+                try self.emit(&self.body, 250, &.{ enabled, taken, merge });
+                try self.emit(&self.body, 248, &.{taken});
+            }
+            try self.emit(&self.body, 62, &.{ access.pointer, value });
+            const pointer = self.id();
+            try self.emit(&self.body, 65, &.{ self.storage_word_pointer_type, pointer, self.storage_array, try self.constant(.bits32, descriptor), try self.constant(.bits32, 0), try self.constant(.bits32, 0) });
+            const end = try self.addBits(try self.andBits(address.byte_offset, 0xffff_fffc), try self.constant(.bits32, (delta + 1) * 4));
+            try self.emit(&self.body, 239, &.{ self.bits_type, self.id(), pointer, try self.constant(.bits32, 1), try self.constant(.bits32, 0), end }); // OpAtomicUMax
+            if (predicate != null) {
+                try self.emit(&self.body, 249, &.{merge});
+                try self.emit(&self.body, 248, &.{merge});
+            }
+            return;
+        }
         const predicate = try self.writePredicate(access.in_range) orelse {
             try self.emit(&self.body, 62, &.{ access.pointer, value }); // OpStore
             return;
@@ -10864,6 +10892,14 @@ const Builder = struct {
         const semantics = try self.constant(.bits32, 0);
         try self.emit(&self.body, 240, &.{ self.bits_type, self.id(), pointer, scope, semantics, inverse_mask });
         try self.emit(&self.body, 241, &.{ self.bits_type, self.id(), pointer, scope, semantics, inserted });
+        if (address.binding.write_extent_descriptor) |descriptor| {
+            const counter = self.id();
+            try self.emit(&self.body, 65, &.{ self.storage_word_pointer_type, counter, self.storage_array, try self.constant(.bits32, descriptor), try self.constant(.bits32, 0), try self.constant(.bits32, 0) });
+            // Count the byte actually written, inside the same bounds/EXEC
+            // guard as the atomic update. Neighbouring bytes remain CPU-owned.
+            const end = try self.addBits(address.byte_offset, try self.constant(.bits32, 1));
+            try self.emit(&self.body, 239, &.{ self.bits_type, self.id(), counter, scope, semantics, end });
+        }
         if (predicate != null) {
             try self.emit(&self.body, 249, &.{merge});
             try self.emit(&self.body, 248, &.{merge});
