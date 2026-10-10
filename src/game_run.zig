@@ -742,7 +742,8 @@ fn run(init: std.process.Init) !bool {
     } else |_| true;
     // Native Windows writes are observed by the page-fault tracker. Retain
     // unchanged buffers for every title; explicit zero values remain useful
-    // for comparisons. Vertex-fetch bounds still use the verified profile.
+    // for comparisons. Vertex ranges are shortened only after proving every
+    // fetch stays inside the original descriptor; unknown indexing keeps it.
     const use_quake_buffer_profile = std.ascii.eqlIgnoreCase(title_identifier, quake_ii_title_id);
     const use_gta_iii_buffer_profile = std.ascii.eqlIgnoreCase(title_identifier, gta_iii_title_id);
     const enable_gpu_page_tracker = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_PAGE_TRACKER")) |text| enabled: {
@@ -753,7 +754,7 @@ fn run(init: std.process.Init) !bool {
     const bound_vertex_fetches = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_BOUND_VERTEX_FETCHES")) |text| enabled: {
         defer allocator.free(text);
         break :enabled text.len != 0 and !std.mem.eql(u8, text, "0");
-    } else |_| use_quake_buffer_profile or use_gta_iii_buffer_profile;
+    } else |_| true;
     const reuse_graphics_resources = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_REUSE_GRAPHICS_RESOURCES")) |text| enabled: {
         defer allocator.free(text);
         break :enabled text.len != 0 and !std.mem.eql(u8, text, "0");

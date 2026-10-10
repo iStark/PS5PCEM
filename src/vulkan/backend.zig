@@ -4682,6 +4682,14 @@ const DrawFetchBounds = struct {
         }
         return true;
     }
+
+    fn fetchLimit(self: DrawFetchBounds, origins: gpu.index_bounds.VectorEntryOrigins, vertex_attribute: bool) ?u32 {
+        const limit = origins.upperBound(&self.entries) orelse return null;
+        // Attribute bindings can replace the guest VGPR index with Vulkan's
+        // VertexIndex. Cover both choices so shortening cannot change the
+        // later validation decision or truncate an otherwise valid attribute.
+        return if (vertex_attribute) @max(limit, self.entries[0].limit) else limit;
+    }
 };
 
 fn vertexFetchesAreReadOnly(instructions: []const gpu.ShaderInstruction) bool {
@@ -4732,7 +4740,10 @@ fn vertexStagingPrefix(descriptor_bytes: u64, required_bytes: u64) u64 {
     // buckets. Small/interleaved world ranges keep their shared full backing.
     if (required_bytes > descriptor_bytes / 16) return descriptor_bytes;
     const bucket = std.mem.alignForward(u64, required_bytes, 64 * 1024);
-    return if (bucket != 0 and bucket <= descriptor_bytes / 16) bucket else descriptor_bytes;
+    // Rounding the proven prefix must not reject near-power-of-two arenas:
+    // 0xffff0 bytes for a few vertices still saves almost 16x with a 64 KiB
+    // snapshot. Require an 8x saving after rounding, 16x before rounding.
+    return if (bucket != 0 and bucket <= descriptor_bytes / 8) bucket else descriptor_bytes;
 }
 
 test "vertex staging buckets preserve static arena reuse and cover the proven prefix" {
@@ -4743,6 +4754,30 @@ test "vertex staging buckets preserve static arena reuse and cover the proven pr
     try std.testing.expectEqual(@as(u64, arena), vertexStagingPrefix(arena, 600000));
     try std.testing.expectEqual(@as(u64, 512), vertexStagingPrefix(512, 16));
     try std.testing.expectEqual(@as(u64, arena), vertexStagingPrefix(arena, 0));
+}
+
+test "vertex staging shortens padded arenas without expanding proven ranges" {
+    try std.testing.expectEqual(@as(u64, 64 * 1024), vertexStagingPrefix(0xffff0, 96));
+    try std.testing.expectEqual(@as(u64, 64 * 1024), vertexStagingPrefix(1024 * 1024, 96));
+    try std.testing.expectEqual(@as(u64, 128 * 1024), vertexStagingPrefix(2 * 1024 * 1024 - 24, 65537));
+    // Keep full snapshots when bucket rounding would erase most of the saving
+    // or the proven fetches already occupy a substantial part of the arena.
+    try std.testing.expectEqual(@as(u64, 512 * 1024 - 8), vertexStagingPrefix(512 * 1024 - 8, 96));
+    try std.testing.expectEqual(@as(u64, 0xffff0), vertexStagingPrefix(0xffff0, 65536));
+    try std.testing.expectEqual(@as(u64, 0xffff0), vertexStagingPrefix(0xffff0, 0xffff0));
+}
+
+test "vertex staging covers attribute remapping as well as proven guest indices" {
+    const bounds = DrawFetchBounds.init(.{ .minimum = 0, .maximum = 8191 }, .{ .instance_count = 2 }).?;
+    const instance = gpu.index_bounds.VectorEntryOrigins{ .registers = @as(u256, 1) << 8 };
+    try std.testing.expectEqual(@as(?u32, 2), bounds.fetchLimit(instance, false));
+    try std.testing.expectEqual(@as(?u32, 8192), bounds.fetchLimit(instance, true));
+    const unknown = gpu.index_bounds.VectorEntryOrigins{ .registers = @as(u256, 1) << 19 };
+    try std.testing.expectEqual(@as(?u32, null), bounds.fetchLimit(unknown, true));
+    // The host index is not a replacement for an unknown guest-origin proof.
+    // A larger guest bound must also survive the attribute union.
+    const literal = gpu.index_bounds.VectorEntryOrigins{ .constant_max = 16383 };
+    try std.testing.expectEqual(@as(?u32, 16384), bounds.fetchLimit(literal, true));
 }
 
 test "bounded vertex fetch staging keeps offsets, instancing and full-range fallbacks" {
@@ -12070,7 +12105,7 @@ pub const Renderer = struct {
                         break :origins gpu.index_bounds.vectorOrigins(instructions, &analysis.graph, instruction_index, inst.src0.reg, 0);
                     };
                     if (origins) |proven| {
-                        staged_extent = vertexStagingPrefix(descriptor.size_bytes, vertexBufferFetchExtent(descriptor, inst, if (vertex_attribute) |attribute| attribute.offset_bytes else vertexFetchScalarOffset(inst.src2, instruction_scalar), proven.upperBound(&bounds.entries)));
+                        staged_extent = vertexStagingPrefix(descriptor.size_bytes, vertexBufferFetchExtent(descriptor, inst, if (vertex_attribute) |attribute| attribute.offset_bytes else vertexFetchScalarOffset(inst.src2, instruction_scalar), bounds.fetchLimit(proven, vertex_attribute != null)));
                     }
                 }
             }
