@@ -78,8 +78,8 @@ found, and can invoke the package extractor on a debug package directly.
       <sub>Ghost of Yotei &mdash; difficulty selection over a loaded 3D scene (0.6 FPS; not playable yet)</sub>
     </td>
     <td width="50%" align="center">
-      <img src="docs/images/dreaming-sarah-gameplay.png" alt="Dreaming Sarah forest scene with an NPC rendered by PS5PCEM"><br>
-      <sub>Dreaming Sarah &mdash; world scene with an NPC</sub>
+      <img src="docs/images/gta3-startup-reflections-2026-10-10.png" alt="GTA III: The Definitive Edition opening gameplay with the player, car and HUD rendered by PS5PCEM"><br>
+      <sub>GTA III: The Definitive Edition &mdash; opening gameplay at Callahan Bridge (shadow defects remain)</sub>
     </td>
   </tr>
   <tr>
