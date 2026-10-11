@@ -312,6 +312,15 @@ exposing the host network. Peer traffic still reports the offline state, and
 room for 1,024 entries because Unity Baselib can create more than 64 before its
 first frame.
 
+The kernel-status `scePthreadSemInit`, `Wait`, `Trywait`, `Post`, and `Destroy`
+exports use the same counted objects and scheduler wait queues. They preserve
+the optional name, consume one token per successful wait, return `EAGAIN` for
+an empty nonblocking wait and `EOVERFLOW` at the maximum count, and reject
+destruction while a waiter is still attached. Posting reserves a token before
+waking its recipient so another thread cannot steal that grant. Only private
+semaphores are supported; nonzero creation flags are rejected. These exports
+are registered in `libkernel`, without patching individual titles.
+
 **Title bootstrap services** ([src/hle/libs/system_service.zig](../../src/hle/libs/system_service.zig),
 [src/hle/libs/user_service.zig](../../src/hle/libs/user_service.zig),
 [src/hle/libs/pad.zig](../../src/hle/libs/pad.zig))

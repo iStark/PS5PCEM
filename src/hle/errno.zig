@@ -98,6 +98,7 @@ pub const KernelError = enum(i32) {
     erange = @bitCast(kernel_error_base | 34),
     etimedout = @bitCast(kernel_error_base | 60),
     enametoolong = @bitCast(kernel_error_base | 63),
+    eoverflow = @bitCast(kernel_error_base | 84),
     enosys = @bitCast(kernel_error_base | 78),
     ecanceled = @bitCast(kernel_error_base | 85),
 

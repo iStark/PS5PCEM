@@ -1395,6 +1395,10 @@ fn signalSemaphore(
     _: u64,
     _: u64,
 ) callconv(abi.guest) i32 {
+    return signalSemaphoreImpl(handle, signal_count, KernelError.einval.raw());
+}
+
+fn signalSemaphoreImpl(handle: u32, signal_count: i32, overflow_status: i32) i32 {
     const signaller = threading.currentThreadId();
     const signaller_host = std.Thread.getCurrentId();
     const signaller_name = threading.currentThreadName();
@@ -1403,11 +1407,13 @@ fn signalSemaphore(
         kernel_object_lock.unlock();
         return KernelError.enoent.raw();
     };
-    if (object.deleted or signal_count <= 0 or signal_count > object.maximum_count or
-        object.count > object.maximum_count - signal_count)
-    {
+    if (object.deleted or signal_count <= 0 or signal_count > object.maximum_count) {
         kernel_object_lock.unlock();
         return KernelError.einval.raw();
+    }
+    if (object.count > object.maximum_count - signal_count) {
+        kernel_object_lock.unlock();
+        return overflow_status;
     }
     object.count += signal_count;
     grantSemaphoreWaitersLocked(object);
@@ -1480,6 +1486,7 @@ fn deleteSemaphore(
 
 fn posixSemaphoreHandle(address: ?*const u32) ?u32 {
     const semaphore = address orelse return null;
+    if (@intFromPtr(semaphore) % @alignOf(u32) != 0) return null;
     if (!memory_api.isGuestRangeAccessible(@intFromPtr(semaphore), @sizeOf(u32))) return null;
     const handle = semaphore.*;
     return if (handle == 0) null else handle;
@@ -1513,6 +1520,67 @@ fn posixSemaphoreDestroy(address: ?*u32) callconv(abi.guest) i32 {
     const result = deleteSemaphore(handle, 0, 0, 0, 0, 0);
     if (result == 0) semaphore.* = 0;
     return result;
+}
+
+// These exports use kernel status codes, unlike the C sem_* errno ABI. Keep
+// their opaque handles backed by the same counted, scheduler-aware objects:
+// a post reserves a token for an existing waiter before waking that thread.
+fn pthreadSemaphoreStatus(status: i32) i32 {
+    return if (status == KernelError.enoent.raw()) KernelError.einval.raw() else status;
+}
+
+fn semaphoreSlotWritable(address: *u32) bool {
+    const base = @intFromPtr(address);
+    if (base % @alignOf(u32) != 0) return false;
+    if (memory_api.attachedAddressSpace()) |space| {
+        return space.isWritable(base, @sizeOf(u32)) or host_memory.isHostRangeWritable(base, @sizeOf(u32));
+    }
+    return true;
+}
+
+fn notifySemaphoreSlotWrite(address: *u32) void {
+    if (memory_api.attachedAddressSpace()) |space| space.notifyGuestWrite(@intFromPtr(address), @sizeOf(u32));
+}
+
+fn pthreadSemaphoreInit(destination: ?*u32, flags: i32, value: u32, name: ?[*:0]const u8) callconv(abi.guest) i32 {
+    const slot = destination orelse return KernelError.einval.raw();
+    if (flags != 0 or value > std.math.maxInt(i32)) return KernelError.einval.raw();
+    if (!semaphoreSlotWritable(slot)) return KernelError.efault.raw();
+    notifySemaphoreSlotWrite(slot);
+    return createSemaphore(slot, name orelse "pthread", 1, @intCast(value), std.math.maxInt(i32), 0);
+}
+
+fn pthreadSemaphoreWait(address: ?*const u32) callconv(abi.guest) i32 {
+    const handle = posixSemaphoreHandle(address) orelse return KernelError.einval.raw();
+    return pthreadSemaphoreStatus(waitSemaphore(handle, 1, null, 0, 0, 0));
+}
+
+fn pthreadSemaphoreTrywait(address: ?*const u32) callconv(abi.guest) i32 {
+    const handle = posixSemaphoreHandle(address) orelse return KernelError.einval.raw();
+    const status = pollSemaphore(handle, 1, 0, 0, 0, 0);
+    return if (status == KernelError.ebusy.raw()) KernelError.eagain.raw() else pthreadSemaphoreStatus(status);
+}
+
+fn pthreadSemaphorePost(address: ?*const u32) callconv(abi.guest) i32 {
+    const handle = posixSemaphoreHandle(address) orelse return KernelError.einval.raw();
+    return pthreadSemaphoreStatus(signalSemaphoreImpl(handle, 1, KernelError.eoverflow.raw()));
+}
+
+fn pthreadSemaphoreDestroy(address: ?*u32) callconv(abi.guest) i32 {
+    const slot = address orelse return KernelError.einval.raw();
+    if (!semaphoreSlotWritable(slot)) return KernelError.efault.raw();
+    const handle = posixSemaphoreHandle(slot) orelse return KernelError.einval.raw();
+    kernel_object_lock.lock();
+    defer kernel_object_lock.unlock();
+    const object = findSemaphore(handle) orelse return KernelError.einval.raw();
+    if (object.deleted) return KernelError.einval.raw();
+    // Destroying a semaphore with a blocked waiter is not a successful wake.
+    // Keep both the object and its handle alive so the producer can post it.
+    if (object.waiters != 0) return KernelError.ebusy.raw();
+    object.* = .{};
+    notifySemaphoreSlotWrite(slot);
+    slot.* = 0;
+    return 0;
 }
 
 fn getArgc() callconv(abi.guest) i32 {
@@ -2256,6 +2324,11 @@ fn getOpenPsId(output: ?*[16]u8) callconv(abi.guest) i32 {
 }
 
 pub const exports = [_]symbols.Export{
+    .{ .name = "scePthreadSemInit", .function = trace.wrap("scePthreadSemInit", &pthreadSemaphoreInit), .expect_id = "GEnUkDZoUwY" },
+    .{ .name = "scePthreadSemWait", .function = trace.wrap("scePthreadSemWait", &pthreadSemaphoreWait), .expect_id = "C36iRE0F5sE" },
+    .{ .name = "scePthreadSemTrywait", .function = trace.wrap("scePthreadSemTrywait", &pthreadSemaphoreTrywait), .expect_id = "H2a+IN9TP0E" },
+    .{ .name = "scePthreadSemPost", .function = trace.wrap("scePthreadSemPost", &pthreadSemaphorePost), .expect_id = "aishVAiFaYM" },
+    .{ .name = "scePthreadSemDestroy", .function = trace.wrap("scePthreadSemDestroy", &pthreadSemaphoreDestroy), .expect_id = "Vwc+L05e6oE" },
     .{ .name = "_sceKernelSetThreadDtors", .function = trace.wrap("_sceKernelSetThreadDtors", &setThreadDtors), .expect_id = "rNhWz+lvOMU" },
     .{ .name = "_sceKernelSetThreadAtexitCount", .function = trace.wrap("_sceKernelSetThreadAtexitCount", &setThreadAtexitCount), .expect_id = "pB-yGZ2nQ9o" },
     .{ .name = "_sceKernelSetThreadAtexitReport", .function = trace.wrap("_sceKernelSetThreadAtexitReport", &setThreadAtexitReport), .expect_id = "WhCc1w3EhSI" },
@@ -2483,6 +2556,10 @@ test "runtime compatibility exports include libc bootstrap data and private NIDs
     try std.testing.expect(db.findByName("sceKernelSyncOnAddressWait64", .function) != null);
     try std.testing.expect(db.findByName("sceKernelSyncOnAddressWait", .function) != null);
     try std.testing.expect(db.findByName("sceKernelSyncOnAddressWake", .function) != null);
+    for ([_][]const u8{ "GEnUkDZoUwY", "C36iRE0F5sE", "H2a+IN9TP0E", "aishVAiFaYM", "Vwc+L05e6oE" }) |id| {
+        const symbol = db.findById(id, .function) orelse return error.TestExpectedEqual;
+        try std.testing.expectEqualStrings("libkernel", symbol.key.library.name);
+    }
 }
 
 test "sanitizer replacement queries return sized empty hook tables" {
@@ -2841,4 +2918,77 @@ test "semaphore cancel and delete complete blocked waiters explicitly" {
         KernelError.enoent.raw(),
         pollSemaphore(backend.handle, 1, 0, 0, 0, 0),
     );
+}
+
+test "pthread semaphores consume tokens and validate lifetime and count bounds" {
+    const testing = std.testing;
+    resetKernelObjects();
+    defer resetKernelObjects();
+    var guarded = extern struct { handle: u32 = 0, guard: u32 = 0xfeedbeef }{};
+    const sem = &guarded.handle;
+    try testing.expectEqual(KernelError.einval.raw(), pthreadSemaphoreInit(null, 0, 0, null));
+    try testing.expectEqual(KernelError.einval.raw(), pthreadSemaphoreInit(sem, 1, 0, null));
+    try testing.expectEqual(KernelError.einval.raw(), pthreadSemaphoreInit(sem, 0, 0x80000000, null));
+    try testing.expectEqual(@as(i32, 0), pthreadSemaphoreInit(sem, 0, 2, "python-lock"));
+    try testing.expectEqualStrings("python-lock", std.mem.sliceTo(&findSemaphore(sem.*).?.name, 0));
+    try testing.expectEqual(@as(i32, 0), pthreadSemaphoreWait(sem));
+    try testing.expectEqual(@as(i32, 0), pthreadSemaphoreTrywait(sem));
+    try testing.expectEqual(KernelError.eagain.raw(), pthreadSemaphoreTrywait(sem));
+    try testing.expectEqual(@as(i32, 0), pthreadSemaphorePost(sem));
+    try testing.expectEqual(@as(i32, 0), pthreadSemaphoreTrywait(sem));
+    var stale = sem.*;
+    try testing.expectEqual(@as(i32, 0), pthreadSemaphoreDestroy(sem));
+    try testing.expectEqual(@as(u32, 0), sem.*);
+    try testing.expectEqual(KernelError.einval.raw(), pthreadSemaphoreDestroy(sem));
+    try testing.expectEqual(KernelError.einval.raw(), pthreadSemaphoreWait(&stale));
+    try testing.expectEqual(KernelError.einval.raw(), pthreadSemaphoreTrywait(&stale));
+    try testing.expectEqual(KernelError.einval.raw(), pthreadSemaphorePost(&stale));
+    try testing.expectEqual(KernelError.einval.raw(), pthreadSemaphorePost(null));
+    try testing.expectEqual(@as(i32, 0), pthreadSemaphoreInit(sem, 0, std.math.maxInt(i32), null));
+    try testing.expectEqual(KernelError.eoverflow.raw(), pthreadSemaphorePost(sem));
+    try testing.expectEqual(@as(i32, 0), pthreadSemaphoreTrywait(sem));
+    try testing.expectEqual(@as(i32, 0), pthreadSemaphorePost(sem));
+    try testing.expectEqual(@as(i32, 0), pthreadSemaphoreDestroy(sem));
+    try testing.expectEqual(@as(u32, 0xfeedbeef), guarded.guard);
+}
+
+test "pthread semaphore post wakes a blocked waiter without losing its token" {
+    const testing = std.testing;
+    resetKernelObjects();
+    defer resetKernelObjects();
+    const Probe = struct {
+        sem: u32 = 0,
+        request: ?threading.WaitRequest = null,
+        wake_key: u64 = 0,
+        wake_count: usize = 0,
+        fn start(_: ?*anyopaque, _: threading.StartRequest) threading.BackendError!void {
+            return error.Unsupported;
+        }
+        fn wait(raw: ?*anyopaque, request: threading.WaitRequest) threading.BackendError!threading.WaitResult {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.request = request;
+            if (pthreadSemaphoreDestroy(&self.sem) != KernelError.ebusy.raw()) return error.WaitFailed;
+            if (pthreadSemaphorePost(&self.sem) != 0) return error.WaitFailed;
+            // Even a poll before the waiter resumes must not steal its grant.
+            if (pthreadSemaphoreTrywait(&self.sem) != KernelError.eagain.raw()) return error.WaitFailed;
+            return .awoken;
+        }
+        fn wake(raw: ?*anyopaque, key: u64, _: u64, maximum: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.wake_key = key;
+            self.wake_count += maximum;
+        }
+    };
+    var probe = Probe{};
+    var thread_manager = threading.Manager{};
+    thread_manager.setBackend(.{ .context = &probe, .start_fn = &Probe.start, .wait_fn = &Probe.wait, .wake_fn = &Probe.wake });
+    threading.attachManager(&thread_manager);
+    defer threading.attachManager(null);
+    try testing.expectEqual(@as(i32, 0), pthreadSemaphoreInit(&probe.sem, 0, 0, null));
+    try testing.expectEqual(@as(i32, 0), pthreadSemaphoreWait(&probe.sem));
+    try testing.expect(probe.request != null);
+    try testing.expect(probe.request.?.timeout_microseconds == null);
+    try testing.expectEqual(probe.request.?.key, probe.wake_key);
+    try testing.expectEqual(@as(usize, 1), probe.wake_count);
+    try testing.expectEqual(@as(i32, 0), pthreadSemaphoreDestroy(&probe.sem));
 }
