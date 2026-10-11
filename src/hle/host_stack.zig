@@ -51,6 +51,32 @@ pub const SuspendedStack = extern struct {
 };
 threadlocal var suspended_stack: ?*const SuspendedStack = null;
 
+/// A cooperative fiber may suspend inside a firmware call. Its host stack and
+/// nesting flag must travel together: reusing another fiber's allocation would
+/// overwrite that suspended call, while retaining `active` runs HLE on a small
+/// guest stack. Windows switches the NT_TIB bounds with the native fiber.
+pub const FiberState = struct {
+    allocation: ?[]align(16) u8 = null,
+    was_active: bool = false,
+    suspended: ?*const SuspendedStack = null,
+
+    pub fn deinit(self: *FiberState) void {
+        if (self.allocation) |value| std.heap.page_allocator.free(value);
+        self.* = .{};
+    }
+};
+
+/// Move ownership of the current TLS stack into the suspended fiber, then take
+/// the destination's stack. The caller must immediately perform SwitchToFiber.
+pub fn switchFiberState(outgoing: *FiberState, incoming: *FiberState) void {
+    std.debug.assert(outgoing != incoming and outgoing.allocation == null);
+    outgoing.* = .{ .allocation = stack, .was_active = active, .suspended = suspended_stack };
+    stack = incoming.allocation;
+    active = incoming.was_active;
+    suspended_stack = incoming.suspended;
+    incoming.* = .{};
+}
+
 pub fn suspendedStack() ?*const SuspendedStack {
     return suspended_stack;
 }
@@ -177,6 +203,13 @@ comptime {
     );
 }
 
+noinline fn finishCall() void {
+    // A firmware call may yield a fiber and resume on a different OS thread.
+    // Resolve TLS after the switch, never through an address cached on entry.
+    active = false;
+    suspended_stack = null;
+}
+
 /// Calls `func` with `args` on this thread's firmware stack.
 ///
 /// `args` is a tuple matching the function's parameters. The result travels
@@ -213,8 +246,7 @@ pub fn call(comptime Result: type, comptime func: anytype, args: anytype) Result
     var frame: Frame = .{ .arguments = args, .result = undefined };
 
     active = true;
-    defer active = false;
-    defer suspended_stack = null;
+    defer finishCall();
     ps5HleCallOnStack(&frame, &Invoker.invoke, stack_top, &suspended_stack);
 
     if (Result == void) return;

@@ -57,6 +57,7 @@ pub const Posix = struct {
     pub const emfile: i32 = 24;
     pub const enospc: i32 = 28;
     pub const erange: i32 = 34;
+    pub const enotsup: i32 = 45;
     pub const enosys: i32 = 78;
     pub const eagain: i32 = 35;
     pub const etimedout: i32 = 60;

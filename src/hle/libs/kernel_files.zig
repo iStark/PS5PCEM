@@ -114,6 +114,16 @@ fn kernelClose(descriptor: i32) callconv(abi.guest) i32 {
     return errno.ok;
 }
 
+fn kernelFsync(descriptor: i32) callconv(abi.guest) i32 {
+    filesystem.fsync(descriptor) catch |err| return kernelStatus(err);
+    return errno.ok;
+}
+
+fn posixFsync(descriptor: i32) callconv(abi.guest) i64 {
+    filesystem.fsync(descriptor) catch |err| return posixFail(err);
+    return 0;
+}
+
 fn kernelRead(descriptor: i32, buffer: ?[*]u8, length: usize) callconv(abi.guest) i64 {
     const bytes = writableSlice(buffer, length) orelse return KernelError.efault.raw();
     if (length == 0) return 0;
@@ -331,7 +341,7 @@ pub const exports = [_]symbols.Export{
     .{ .name = "sceKernelFstat", .function = trace.wrap("sceKernelFstat", &kernelFstat), .expect_id = "kBwCPsYX-m4" },
     .{ .name = "sceKernelGetdents", .function = trace.wrap("sceKernelGetdents", &kernelGetdents), .expect_id = "j2AIqSqJP0w" },
     .{ .name = "sceKernelGetdirentries", .function = trace.wrap("sceKernelGetdirentries", &kernelGetdirentries), .expect_id = "taRWhTJFTgE" },
-    .{ .name = "sceKernelFsync", .function = trace.wrap("sceKernelFsync", &readOnlyStatus), .expect_id = "fTx66l5iWIA" },
+    .{ .name = "sceKernelFsync", .function = trace.wrap("sceKernelFsync", &kernelFsync), .expect_id = "fTx66l5iWIA" },
     .{ .name = "sceKernelFchmod", .function = trace.wrap("sceKernelFchmod", &readOnlyStatus), .expect_id = "UtszJWHrDcA" },
     .{ .name = "sceKernelFtruncate", .function = trace.wrap("sceKernelFtruncate", &kernelFtruncate), .expect_id = "VW3TVZiM4-E" },
     .{ .name = "sceKernelRmdir", .function = trace.wrap("sceKernelRmdir", &readOnlyStatus), .expect_id = "naInUjYt3so" },
@@ -352,6 +362,7 @@ pub const exports = [_]symbols.Export{
 };
 
 const posix_exports = [_]symbols.Export{
+    .{ .name = "fsync", .function = trace.wrap("fsync", &posixFsync), .expect_id = "juWbTNM+8hw" },
     .{ .name = "ftruncate", .function = trace.wrap("ftruncate", &posixFtruncate), .expect_id = "ih4CD9-gghM" },
 };
 
@@ -440,6 +451,41 @@ test "positional save writes and truncation persist without moving the cursor" {
     var info = filesystem.Stat{};
     try testing.expectEqual(errno.ok, kernelFstat(truncated, &info));
     try testing.expectEqual(@as(i64, 0), info.size);
+}
+
+test "fsync commits writable files and reports host flush failures" {
+    var fixture = try Fixture.init();
+    defer fixture.deinit();
+    filesystem.attachTemporaryData(fixture.tmp.dir);
+    defer filesystem.detachTemporaryData();
+    const fd = kernelOpen("/temp0/sync.sav", filesystem.O.rdwr | filesystem.O.creat | filesystem.O.trunc, 0);
+    try testing.expect(fd >= filesystem.first_descriptor);
+    try testing.expectEqual(@as(i64, 4), kernelWrite(fd, "save", 4));
+    try testing.expectEqual(errno.ok, kernelFsync(fd));
+    try testing.expectEqual(@as(i64, 0), posixFsync(fd));
+    try testing.expectEqual(@as(i64, 4), kernelLseek(fd, 0, filesystem.Seek.cur));
+    const Fail = struct {
+        fn sync(_: ?*anyopaque, _: std.Io.File) std.Io.File.SyncError!void {
+            return error.InputOutput;
+        }
+    };
+    // A backend failure must not turn into a successful no-op at either ABI.
+    var failing_vtable = testing.io.vtable.*;
+    failing_vtable.fileSync = &Fail.sync;
+    var failing_io = testing.io;
+    failing_io.vtable = &failing_vtable;
+    filesystem.attach(failing_io, fixture.tmp.dir);
+    try testing.expectEqual(KernelError.eio.raw(), kernelFsync(fd));
+    try testing.expectEqual(@as(i64, -1), posixFsync(fd));
+    filesystem.attach(testing.io, fixture.tmp.dir);
+    try testing.expectEqual(errno.ok, kernelClose(fd));
+    try testing.expectEqual(KernelError.ebadf.raw(), kernelFsync(fd));
+    try testing.expectEqual(@as(i64, -1), posixFsync(fd));
+    const reopened = kernelOpen("/temp0/sync.sav", filesystem.O.rdonly, 0);
+    defer _ = kernelClose(reopened);
+    var bytes: [4]u8 = undefined;
+    try testing.expectEqual(@as(i64, 4), kernelRead(reopened, &bytes, bytes.len));
+    try testing.expectEqualStrings("save", &bytes);
 }
 
 test "the POSIX entry points report failure the POSIX way" {

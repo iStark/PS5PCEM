@@ -1394,6 +1394,18 @@ pub fn ftruncate(descriptor: i32, length: u64) Error!void {
     entry.size = length;
 }
 
+/// Wait for the host filesystem to commit the file's contents and metadata.
+/// Retaining the table lock prevents close/reuse of the handle during the flush.
+pub fn fsync(descriptor: i32) Error!void {
+    const io = active_io orelse return Error.NotAttached;
+    table_lock.lock();
+    defer table_lock.unlock();
+    const slot = slotOf(descriptor) orelse return Error.BadDescriptor;
+    const entry = slot.* orelse return Error.BadDescriptor;
+    const file = entry.file orelse return Error.InvalidArgument;
+    file.sync(io) catch return Error.IoFailed;
+}
+
 pub fn seek(descriptor: i32, offset: i64, whence: i32) Error!i64 {
     table_lock.lock();
     defer table_lock.unlock();

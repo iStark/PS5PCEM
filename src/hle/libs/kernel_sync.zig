@@ -87,6 +87,7 @@ const MutexAttr = struct {
     magic: u64 = mutex_attr_magic,
     kind: i32 = 1,
     protocol: i32 = 0,
+    process_shared: i32 = 0,
 };
 
 const Cond = struct {
@@ -1026,6 +1027,20 @@ pub fn pthread_mutexattr_setprotocol(attr: ?*MutexAttrHandle, protocol: i32) cal
     return posixStatus(scePthreadMutexattrSetprotocol(attr, protocol));
 }
 
+pub fn pthread_mutexattr_setpshared(raw: ?*MutexAttrHandle, shared: i32) callconv(abi.guest) i32 {
+    const outer = raw orelse return Posix.einval;
+    if (shared != 0 and shared != 1) return Posix.einval;
+    const manager = activeManager() orelse return Posix.enosys;
+    manager.lock.lock();
+    defer manager.lock.unlock();
+    const attr = findPointer(MutexAttr, manager.mutex_attrs.items, outer.*) orelse return Posix.einval;
+    // The host-owned mutex handles synchronize every thread of this guest
+    // process. They cannot be placed in another process's shared mapping.
+    if (shared == 1) return Posix.enotsup;
+    attr.process_shared = shared;
+    return errno.ok;
+}
+
 fn readCondAttr(raw: ?*const CondAttrHandle) ?CondAttr {
     const outer = raw orelse return null;
     const manager = activeManager() orelse return null;
@@ -1713,6 +1728,7 @@ pub const exports = [_]symbols.Export{
     .{ .name = "pthread_mutexattr_settype", .function = trace.wrap("pthread_mutexattr_settype", &pthread_mutexattr_settype), .expect_id = "mDmgMOGVUqg" },
     .{ .name = "scePthreadMutexattrSetprotocol", .function = trace.wrap("scePthreadMutexattrSetprotocol", &scePthreadMutexattrSetprotocol), .expect_id = "1FGvU0i9saQ" },
     .{ .name = "pthread_mutexattr_setprotocol", .function = trace.wrap("pthread_mutexattr_setprotocol", &pthread_mutexattr_setprotocol), .expect_id = "5txKfcMUAok" },
+    .{ .name = "pthread_mutexattr_setpshared", .function = trace.wrap("pthread_mutexattr_setpshared", &pthread_mutexattr_setpshared), .expect_id = "EXv3ztGqtDM" },
 
     .{ .name = "scePthreadCondInit", .function = trace.wrap("scePthreadCondInit", &scePthreadCondInit), .expect_id = "2Tb92quprl0" },
     .{ .name = "pthread_cond_init", .function = trace.wrap("pthread_cond_init", &pthread_cond_init), .expect_id = "0TyVk4MSLt0" },
@@ -1836,6 +1852,12 @@ test "recursive mutexes preserve ownership and reject busy destruction" {
 
     var attr: MutexAttrHandle = null;
     try testing.expectEqual(errno.ok, pthread_mutexattr_init(&attr));
+    try testing.expectEqual(errno.ok, pthread_mutexattr_setpshared(&attr, 0));
+    try testing.expectEqual(Posix.einval, pthread_mutexattr_setpshared(null, 0));
+    try testing.expectEqual(Posix.einval, pthread_mutexattr_setpshared(&attr, -1));
+    try testing.expectEqual(Posix.einval, pthread_mutexattr_setpshared(&attr, 2));
+    try testing.expectEqual(Posix.enotsup, pthread_mutexattr_setpshared(&attr, 1));
+    try testing.expectEqual(@as(i32, 0), readMutexAttr(&attr).?.process_shared);
     try testing.expectEqual(errno.ok, pthread_mutexattr_settype(&attr, 2));
     var mutex: MutexHandle = null;
     try testing.expectEqual(errno.ok, pthread_mutex_init(&mutex, &attr));
@@ -1846,6 +1868,7 @@ test "recursive mutexes preserve ownership and reject busy destruction" {
     try testing.expectEqual(errno.ok, pthread_mutex_unlock(&mutex));
     try testing.expectEqual(errno.ok, pthread_mutex_destroy(&mutex));
     try testing.expectEqual(errno.ok, pthread_mutexattr_destroy(&attr));
+    try testing.expectEqual(Posix.einval, pthread_mutexattr_setpshared(&attr, 0));
 }
 
 test "default mutexes keep nested Gen5 CRT guard locks balanced" {

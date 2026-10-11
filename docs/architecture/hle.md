@@ -337,9 +337,14 @@ preserve the suspended guest registers, mixed guest/HLE call frames, stack, and
 resume point instead of treating a switch as a successful no-op. The public
 128-byte `SceFiber` record retains its ABI signatures, state, entry argument,
 name, and caller-provided context range, while Windows owns the guarded host
-stack required for safe native switching. `sceFiberGetSelf`, finalization,
-cross-thread ownership checks, and runtime reset are implemented; this backend
-is intentionally limited to the Windows native-execution target.
+stack required for safe native switching. Each fiber also retains its own
+4 MiB firmware stack and HLE nesting state. Suspended fibers can migrate between
+OS threads; a synchronized handoff publishes the saved context only after the
+native switch finishes, and returning targets the current thread's root fiber.
+`sceFiberGetInfo` fills the 128-byte ABI record, and `sceFiberRename` updates the
+bounded name. GetSelf, finalization and runtime reset are implemented. Context
+usage checking is not enabled, so the information record reports the ABI's
+unavailable-margin sentinel. This backend is limited to Windows native execution.
 
 **`libSceUlt` — user-level threads** ([src/hle/libs/ult.zig](../../src/hle/libs/ult.zig))
 

@@ -1062,6 +1062,14 @@ const maximum_staged_buffer_bytes = 128 * 1024 * 1024;
 // the dominant transfer despite already having exact-address readback paths.
 const deferred_storage_write_min_bytes = 256 * 1024;
 const maximum_frame_bytes = 128 * 1024 * 1024;
+// Sampled atlases can exceed a framebuffer's size: a 16K BC7 atlas with
+// its mip chain needs about 341 MiB. Keep a separate bounded upload budget.
+const maximum_sampled_image_bytes = 512 * 1024 * 1024;
+
+fn sampledImageByteSizesValid(staging: u64, source: u64) bool {
+    return staging > 0 and staging <= maximum_sampled_image_bytes and
+        source > 0 and source <= maximum_sampled_image_bytes;
+}
 const maximum_completed_frames = 16;
 // Unreal's post-processing graph keeps dozens of transient color attachments
 // live in one frame (Tetris Effect reaches 42 before its second flip). Keeping
@@ -28520,9 +28528,8 @@ pub const Renderer = struct {
             .two_d_array => available_layers >= 1,
         };
         if (!valid_layers or
-            bytes_per_element != bytes_per_texel or staging_bytes_u64 == 0 or
-            staging_bytes_u64 > maximum_frame_bytes or source_bytes == 0 or
-            source_bytes > maximum_frame_bytes)
+            bytes_per_element != bytes_per_texel or
+            !sampledImageByteSizesValid(staging_bytes_u64, source_bytes))
         {
             std.debug.print(
                 "[vulkan dcb] sampled image layout rejected depth/layers={d} bpp={d} expected_bpp={d} stage=0x{x} source=0x{x} mips={d}\n",
@@ -43110,6 +43117,57 @@ test "first-use sampled views cover the T# mip range" {
     try std.testing.expectEqual(@as(u32, 16), extent1[0]);
     try std.testing.expectEqual(@as(u32, 16), extent1[1]);
     try std.testing.expect((try plan.stagingBytes()) >= try mip0.stagingBytes());
+}
+
+test "large compressed sampled atlases do not inherit the framebuffer byte limit" {
+    var descriptor = gpu.resources.ImageDescriptor{
+        .address = 0x2000_0000,
+        .width = 64,
+        .height = 64,
+        .depth_or_layers = 1,
+        .pitch = 64,
+        .unified_format = 56,
+        .tile_mode = .linear,
+        .image_type = .color_2d,
+        .dst_select = .{ 4, 5, 6, 7 },
+        .base_level = 0,
+        .last_level = 0,
+        .base_array = 0,
+        .array_pitch = 0,
+        .max_mip = 0,
+        .min_lod = 0,
+        .min_lod_warning = 0,
+        .bc_swizzle = 0,
+        .metadata_address = 0,
+        .dcc_enabled = false,
+        .cmask_fast_clear = false,
+        .fmask_compression = false,
+        .cmask_address = 0,
+        .fmask_address = 0,
+        .dcc_address = 0,
+        .descriptor_flags = 0,
+        .extended = true,
+    };
+    descriptor.width = 16384;
+    descriptor.pitch = 16384;
+    descriptor.unified_format = 181; // BC7, 16 bytes per 4x4 block.
+    descriptor.tile_mode = .standard_4kb;
+    descriptor.max_mip = 13;
+    descriptor.last_level = 13;
+    for ([_]u32{ 8192, 16384 }) |height| {
+        descriptor.height = height;
+        const plan = SampledViewPlan.fromDescriptor(descriptor, .two_d) orelse return error.TestFailed;
+        const staging = try plan.stagingBytes();
+        const source = try plan.requiredSourceBytes();
+        try std.testing.expect(staging > maximum_frame_bytes);
+        try std.testing.expect(source >= staging);
+        try std.testing.expect(sampledImageByteSizesValid(staging, source));
+        try std.testing.expectEqual(@as(u8, 14), plan.level_count);
+    }
+    try std.testing.expect(!sampledImageByteSizesValid(0, 4096));
+    try std.testing.expect(!sampledImageByteSizesValid(4096, 0));
+    try std.testing.expect(!sampledImageByteSizesValid(maximum_sampled_image_bytes + 1, 4096));
+    try std.testing.expect(!sampledImageByteSizesValid(4096, maximum_sampled_image_bytes + 1));
 }
 
 test "streamed sampled views read only resident mips across array gaps" {
