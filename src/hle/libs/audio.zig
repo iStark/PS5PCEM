@@ -1215,6 +1215,7 @@ var ngs2_control_logs = std.atomic.Value(u32).init(0);
 var ngs2_state_logs = std.atomic.Value(u32).init(0);
 var ngs2_waveform_logs = std.atomic.Value(u32).init(0);
 var ngs2_command_logs = std.atomic.Value(u32).init(0);
+var ngs2_format_logs = std.atomic.Value(u32).init(0);
 var ngs2_sampler_detail_logs: [2]u32 = .{ 0, 0 }; // protected by ngs2_mutex
 
 const maximum_ngs2_systems = 8;
@@ -1897,7 +1898,13 @@ fn ngs2VoiceControl(handle: u64, params_address: u64) callconv(abi.guest) i32 {
 
         const rack_id = header.id >> 16;
         const command_id = header.id & 0x7fff;
-        if (trace.isLive() and rack_id == 0x1000 and command_id <= 1) {
+        // The custom sampler rack (0x4001) takes the sampler's own voice
+        // parameters: waveform format, blocks and pitch.
+        const sampler_command: ?u32 = if ((rack_id == 0x1000 or rack_id == 0x4001) and header.id & 0x8000 == 0)
+            header.id & 0xffff
+        else
+            null;
+        if (trace.isLive() and sampler_command != null and command_id <= 1) {
             const detail = &ngs2_sampler_detail_logs[command_id];
             if (detail.* < 16) {
                 detail.* += 1;
@@ -1922,9 +1929,13 @@ fn ngs2VoiceControl(handle: u64, params_address: u64) callconv(abi.guest) i32 {
                 "[audio] NGS2 voice=0x{x} event=0x{x}\n",
                 .{ handle, event.event_id },
             );
-        } else if (header.id == 0x1000_0000) {
+        } else if (sampler_command == 0) {
             if (header.size < 32) return errno.KernelError.einval.raw();
             const format: *align(1) const Ngs2WaveformFormat = @ptrFromInt(address + 8);
+            if (ngs2_format_logs.fetchAdd(1, .monotonic) < 8) std.debug.print(
+                "[audio] NGS2 voice=0x{x} rack=0x{x} format type=0x{x} channels={d} rate={d} config=0x{x}\n",
+                .{ handle, rack_id, format.waveform_type, format.channels, format.sample_rate, format.config_data },
+            );
             ngs2FreeVoiceWaveform(voice);
             if (voice.pcm) |*pcm| pcm.deinit(std.heap.page_allocator);
             voice.pcm = null;
@@ -1934,7 +1945,7 @@ fn ngs2VoiceControl(handle: u64, params_address: u64) callconv(abi.guest) i32 {
                 if (format.channels == 0 or format.channels > 8 or format.sample_rate < 8000 or format.sample_rate > 192000) return errno.KernelError.einval.raw();
                 voice.pcm = .{ .format = .{ .channels = @intCast(format.channels), .rate = format.sample_rate, .float32 = format.waveform_type == 0x18 } };
             }
-        } else if (header.id == 0x1000_0001) {
+        } else if (sampler_command == 1) {
             if (header.size < @sizeOf(Ngs2VoiceWaveformParam)) return errno.KernelError.einval.raw();
             const waveform: *const Ngs2VoiceWaveformParam = @ptrFromInt(address);
             if (voice.pcm) |*pcm| {
@@ -1959,7 +1970,7 @@ fn ngs2VoiceControl(handle: u64, params_address: u64) callconv(abi.guest) i32 {
             } else {
                 ngs2ArmVoice(voice, waveform.data_address);
             }
-        } else if (header.id == 0x1000_0005 and header.size >= 12) {
+        } else if (sampler_command == 5 and header.size >= 12) {
             const pitch = @as(*align(1) const f32, @ptrFromInt(address + 8)).*;
             if (!std.math.isFinite(pitch) or pitch < 0 or pitch > 4) return errno.KernelError.einval.raw();
             if (voice.pcm) |*pcm| pcm.pitch = pitch;
@@ -3883,6 +3894,40 @@ test "NGS2 derives one bounded float32 render grain from all buses" {
     try std.testing.expectEqual(@as(u32, 0), ngs2RenderFrameCount(&.{
         .{ .address = 1, .size = 1024, .waveform_type = 0x18, .channels = 0 },
     }));
+}
+
+test "NGS2 custom sampler rack voices take the sampler format and block parameters" {
+    reset();
+    defer reset();
+    var system: u64 = 0;
+    var rack: u64 = 0;
+    var voice: u64 = 0;
+    try std.testing.expectEqual(errno.ok, ngs2SystemCreateWithAllocator(0, 0, &system));
+    try std.testing.expectEqual(errno.ok, ngs2RackCreateWithAllocator(system, 0x4001, 0, 0, &rack));
+    try std.testing.expectEqual(errno.ok, ngs2RackGetVoiceHandle(rack, 0, &voice));
+    const Setup = extern struct { header: Ngs2VoiceParamHeader, format: Ngs2WaveformFormat };
+    const setup = Setup{ .header = .{ .size = @sizeOf(Setup), .next = 0, .id = 0x40010000 }, .format = .{ .waveform_type = 0x12, .channels = 2, .sample_rate = 48000 } };
+    try std.testing.expectEqual(errno.ok, ngs2VoiceControl(voice, @intFromPtr(&setup)));
+    var samples: [256 * 2]i16 = undefined;
+    for (0..256) |frame| {
+        samples[frame * 2] = 8192;
+        samples[frame * 2 + 1] = -16384;
+    }
+    const block = Ngs2WaveformBlock{ .data_size = @sizeOf(@TypeOf(samples)), .samples = 256 };
+    const Queue = extern struct { header: Ngs2VoiceParamHeader, address: u64, flags: u32, count: u32, blocks: u64 };
+    var queue = Queue{ .header = .{ .size = @sizeOf(Queue), .next = 0, .id = 0x40010001 }, .address = @intFromPtr(&samples), .flags = 0, .count = 1, .blocks = @intFromPtr(&block) };
+    try std.testing.expectEqual(errno.ok, ngs2VoiceControl(voice, @intFromPtr(&queue)));
+    var command = [_]u64{ 0x0000040000000002, 1 };
+    try std.testing.expectEqual(errno.ok, ngs2VoiceRunCommands(voice, @intFromPtr(&command), 1, 0));
+    var output: [256 * 2]f32 = @splat(9);
+    const buffers = [_]Ngs2RenderBuffer{
+        .{ .address = @intFromPtr(&output), .size = @sizeOf(@TypeOf(output)), .waveform_type = 0x18, .channels = 2 },
+    };
+    try std.testing.expectEqual(errno.ok, ngs2SystemRender(system, @intFromPtr(&buffers), 1));
+    for (0..256) |frame| {
+        try std.testing.expectEqual(@as(f32, 0.25), output[frame * 2]);
+        try std.testing.expectEqual(@as(f32, -0.5), output[frame * 2 + 1]);
+    }
 }
 
 test "NGS2 raw PCM commands honor grain size multi-bus cursors pause and state readback" {

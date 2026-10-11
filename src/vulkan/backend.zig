@@ -22879,6 +22879,7 @@ pub const Renderer = struct {
         // pixel shader and texture. It must not copy that texture over the
         // completed scene. Partial channel masks also require a real draw.
         const full_color_write = pipeline_state.color_write_masks[target.descriptor.slot] == vk.color_component_rgba_bits;
+        const copy_replaces_target = full_color_write and blendReplacesTarget(pipeline_state, target.descriptor.slot);
         if (self.traceCurrentGraphicsFrame() and fragment_image_count == 1 and
             graphics_resources.descriptors[0].unified_format == 50 and
             target.format.vulkan == vk.format_a2b10g10r10_unorm_pack32 and
@@ -22928,7 +22929,7 @@ pub const Renderer = struct {
         // it with a copy of descriptor zero discards the UI and post-processing
         // inputs, so only take the copy fast path for the single-image cases
         // below.
-        if (full_color_write and fragment_image_count == 1 and fullscreen_corner and
+        if (copy_replaces_target and fragment_image_count == 1 and fullscreen_corner and
             target.descriptor.width == 3840 and target.descriptor.height == 2160 and
             try self.emulateFullscreenSampleBlit(
                 memory,
@@ -22942,7 +22943,7 @@ pub const Renderer = struct {
         // Procedural triangles can transform UVs independently of positions,
         // including a runtime Y scale/bias. Their viewport sign alone cannot
         // determine copy orientation; preserve the translated vertex shader.
-        if (full_color_write and fragment_image_count == 1 and draw.index_count != null and
+        if (copy_replaces_target and fragment_image_count == 1 and draw.index_count != null and
             hasFullscreenSampleBlitGeometry(draw) and
             matchesFullscreenSampleBlit(fragment_analysis.program.instructions.items))
         {
@@ -34506,6 +34507,36 @@ fn hasFullscreenSampleBlitGeometry(draw: GuestDraw) bool {
     if (draw.instance_count != 1) return false;
     if (draw.index_count) |count| return count == 6;
     return draw.vertex_count == 3;
+}
+
+/// A copy stands in for a pass-through draw only when blending writes the
+/// source unchanged. Dead Cells adds its blurred emissive buffer onto the lit
+/// scene with SRC_ALPHA/ONE through the same one-sample shader; copying it
+/// replaced the whole level with the black emissive image.
+fn blendReplacesTarget(state: GraphicsPipelineState, slot: usize) bool {
+    if (state.blend_enables[slot] == 0) return true;
+    // VK_BLEND_FACTOR_ONE = 1, VK_BLEND_FACTOR_ZERO = 0, VK_BLEND_OP_ADD = 0.
+    return state.source_color_blend_factors[slot] == 1 and
+        state.destination_color_blend_factors[slot] == 0 and
+        state.color_blend_operations[slot] == 0 and
+        state.source_alpha_blend_factors[slot] == 1 and
+        state.destination_alpha_blend_factors[slot] == 0 and
+        state.alpha_blend_operations[slot] == 0;
+}
+
+test "fullscreen copy fast path keeps blended pass-through draws" {
+    var state = GraphicsPipelineState.default(642, 362);
+    try std.testing.expect(blendReplacesTarget(state, 0));
+    // Dead Cells' emissive glow: color SRC_ALPHA/ONE, alpha ONE/ZERO.
+    state.blend_enables[0] = 1;
+    state.source_color_blend_factors[0] = 6;
+    state.destination_color_blend_factors[0] = 1;
+    state.source_alpha_blend_factors[0] = 1;
+    state.destination_alpha_blend_factors[0] = 0;
+    try std.testing.expect(!blendReplacesTarget(state, 0));
+    state.source_color_blend_factors[0] = 1;
+    state.destination_color_blend_factors[0] = 0;
+    try std.testing.expect(blendReplacesTarget(state, 0));
 }
 
 fn matchesWholeImageCopy(inst: anytype) bool {

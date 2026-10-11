@@ -119,8 +119,9 @@ dark gameplay scene, so its output is verified by tests only.
 
 ## Limits
 
-- The level and character render dark in gameplay; this is the next fix.
-- The main menu is silent.
+- The level and character render dark in gameplay, and the main menu is
+  silent. Both are fixed in the
+  [follow-up report](dead-cells-level-and-menu-audio-2026-10-11.md).
 - The NGS2 mixer still accepts voice matrix levels without applying them, so
   `sceNgs2GeomApply` results do not yet change what is heard.
 - `sceNgs2PanGetVolumeMatrix` still routes every input to the first output
