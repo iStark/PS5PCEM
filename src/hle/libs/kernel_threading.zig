@@ -268,8 +268,20 @@ const ThreadRecord = struct {
     external: bool,
     joining: bool = false,
     specific_values: [maximum_keys]u64 = [_]u64{0} ** maximum_keys,
+    cleanup_head: u64 = 0,
     state: std.atomic.Value(u8) = std.atomic.Value(u8).init(@intFromEnum(ThreadState.prepared)),
     result: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+};
+
+// The caller supplies an eight-word _pthread_cleanup_info on its guest stack.
+// Only the FreeBSD-compatible linked-list prefix is used; the reserved tail
+// stays untouched. The record belongs to the guest and must never be freed.
+const CleanupRecord = extern struct {
+    previous: u64,
+    routine: u64,
+    argument: u64,
+    on_heap: i32 = 0,
+    padding: u32 = 0,
 };
 
 pub const PreparedThread = struct {
@@ -591,6 +603,7 @@ pub const Manager = struct {
             self.lock.unlock();
             return error.ThreadNotFound;
         };
+        record.cleanup_head = 0;
         record.result.store(result, .release);
         record.state.store(@intFromEnum(ThreadState.finished), .release);
         const reap = record.attributes.detached and !record.external;
@@ -759,6 +772,42 @@ pub const Manager = struct {
 
     pub fn callGuest(self: *Manager, entry_point: u64, arguments: []const u64) Error!void {
         _ = try self.callGuestResult(entry_point, arguments);
+    }
+
+    pub fn pushCleanup(self: *Manager, routine: u64, argument: u64, storage: u64) Error!void {
+        if (routine == 0 or storage == 0 or storage % @alignOf(CleanupRecord) != 0)
+            return error.InvalidArgument;
+        self.lock.lock();
+        defer self.lock.unlock();
+        const record = self.findRecordLocked(current_guest_thread) orelse return error.ThreadNotFound;
+        const cleanup = CleanupRecord{
+            .previous = record.cleanup_head,
+            .routine = routine,
+            .argument = argument,
+        };
+        try self.address_space.write(storage, std.mem.asBytes(&cleanup));
+        record.cleanup_head = storage;
+    }
+
+    pub fn popCleanup(self: *Manager, execute: bool) Error!bool {
+        const cleanup = blk: {
+            self.lock.lock();
+            defer self.lock.unlock();
+            const record = self.findRecordLocked(current_guest_thread) orelse return error.ThreadNotFound;
+            if (record.cleanup_head == 0) return false;
+            var value: CleanupRecord = undefined;
+            try self.address_space.read(record.cleanup_head, std.mem.asBytes(&value));
+            // Unlink before entering guest code. Callbacks may push or pop
+            // handlers, use other pthread services, or call pthread_exit.
+            record.cleanup_head = value.previous;
+            break :blk value;
+        };
+        if (execute) try self.callGuest(cleanup.routine, &.{cleanup.argument});
+        return true;
+    }
+
+    pub fn runCleanupHandlers(self: *Manager) Error!void {
+        while (try self.popCleanup(true)) {}
     }
 
     /// Schedules a process exception callback on the target guest pthread.
@@ -1278,12 +1327,30 @@ pub fn pthread_equal(first: ThreadHandle, second: ThreadHandle) callconv(abi.gue
 
 pub fn scePthreadExit(result: ThreadHandle) callconv(abi.guest) void {
     const active_manager = activeManager() orelse return;
+    active_manager.runCleanupHandlers() catch |err| {
+        std.debug.print("[pthread] exit cleanup failed: {s}\n", .{@errorName(err)});
+    };
     active_manager.runSpecificDestructors() catch {};
     active_manager.requestExit(handleAddress(result) orelse 0);
 }
 
 pub fn pthread_exit(result: ThreadHandle) callconv(abi.guest) void {
     scePthreadExit(result);
+}
+
+pub fn pthreadCleanupPush(routine: u64, argument: u64, storage: u64) callconv(abi.guest) void {
+    const active_manager = activeManager() orelse return;
+    active_manager.pushCleanup(routine, argument, storage) catch |err| {
+        std.debug.print("[pthread] cleanup push failed: {s}\n", .{@errorName(err)});
+    };
+}
+
+pub fn pthreadCleanupPop(execute: i32) callconv(abi.guest) void {
+    const active_manager = activeManager() orelse return;
+    _ = active_manager.popCleanup(execute != 0) catch |err| {
+        std.debug.print("[pthread] cleanup pop failed: {s}\n", .{@errorName(err)});
+        return;
+    };
 }
 
 pub fn scePthreadYield() callconv(abi.guest) void {
@@ -1783,6 +1850,8 @@ pub const exports = [_]symbols.Export{
     .{ .name = "scePthreadEqual", .function = trace.wrap("scePthreadEqual", &scePthreadEqual), .expect_id = "3PtV6p3QNX4" },
     .{ .name = "pthread_equal", .function = trace.wrap("pthread_equal", &pthread_equal), .expect_id = "7Xl257M4VNI" },
     .{ .name = "scePthreadExit", .function = trace.wrap("scePthreadExit", &scePthreadExit), .expect_id = "3kg7rT0NQIs" },
+    .{ .name = "__pthread_cleanup_push_imp", .function = trace.wrap("__pthread_cleanup_push_imp", &pthreadCleanupPush), .expect_id = "1xvtUVx1-Sg" },
+    .{ .name = "__pthread_cleanup_pop_imp", .function = trace.wrap("__pthread_cleanup_pop_imp", &pthreadCleanupPop), .expect_id = "iWsFlYMf3Kw" },
     .{ .name = "pthread_exit", .function = trace.wrap("pthread_exit", &pthread_exit), .expect_id = "FJrT5LuUBAU" },
     .{ .name = "scePthreadYield", .function = trace.wrap("scePthreadYield", &scePthreadYield), .expect_id = "T72hz6ffq08" },
     .{ .name = "pthread_yield", .function = trace.wrap("pthread_yield", &pthread_yield), .expect_id = "B5GmVDKwpn0" },
@@ -2082,4 +2151,113 @@ test "threading library registers the sample executable imports" {
     try testing.expectEqual(exports.len, db.count());
     try testing.expect(db.findById("6UgtwV+0zb4", .function) != null);
     try testing.expect(db.findById("1jfXLRVzisc", .function) != null);
+    for ([_][]const u8{ "1xvtUVx1-Sg", "iWsFlYMf3Kw" }) |id| {
+        const symbol = db.findById(id, .function) orelse return error.TestExpectedEqual;
+        try testing.expectEqualStrings("libkernel", symbol.key.library.name);
+    }
+}
+
+test "pthread cleanup records preserve guest storage and isolate thread stacks" {
+    var address_space = try memory.AddressSpace.init(testing.allocator);
+    defer address_space.deinit();
+    var registry = loader.TlsRegistry{};
+    defer registry.deinit(testing.allocator);
+    var manager = testManager(&address_space, &registry);
+    defer manager.deinit();
+    var backend = TestBackend{ .manager = &manager };
+    manager.setBackend(backend.value());
+    attachManager(&manager);
+    defer attachManager(null);
+    const first = try manager.prepareInitialThread("first");
+    const second = try manager.prepareInitialThread("second");
+    defer manager.leave();
+    try manager.enter(first.handle);
+    const storage = first.stack_address + 0x100;
+    try address_space.write(storage - 8, &(@as([80]u8, @splat(0xa5))));
+    pthreadCleanupPush(0x1110, 0x11, storage);
+    try testing.expectEqual(@as(u64, 0), try readGuestU64(&address_space, storage));
+    try testing.expectEqual(@as(u64, 0x1110), try readGuestU64(&address_space, storage + 8));
+    try testing.expectEqual(@as(u64, 0x11), try readGuestU64(&address_space, storage + 16));
+    try testing.expectEqual(@as(u64, 0), try readGuestU64(&address_space, storage + 24));
+    try testing.expectEqual(@as(u64, 0xa5a5a5a5a5a5a5a5), try readGuestU64(&address_space, storage - 8));
+    var tail: [40]u8 = undefined;
+    try address_space.read(storage + 32, &tail);
+    try testing.expectEqualSlices(u8, &(@as([40]u8, @splat(0xa5))), &tail);
+    try testing.expectError(error.InvalidArgument, manager.pushCleanup(0x2220, 0x22, storage + 1));
+    pthreadCleanupPush(0x2220, 0x22, storage + 0x80);
+    try testing.expectEqual(storage, try readGuestU64(&address_space, storage + 0x80));
+    try manager.enter(second.handle);
+    try testing.expect(!try manager.popCleanup(true));
+    pthreadCleanupPush(0x3330, 0x33, second.stack_address + 0x100);
+    try manager.enter(first.handle);
+    pthreadCleanupPop(0);
+    try testing.expectEqual(@as(usize, 0), backend.once_calls);
+    pthreadCleanupPop(-1);
+    try testing.expectEqual(@as(u64, 0x1110), backend.last_call.?.entry_point);
+    try testing.expectEqual(@as(u64, 0x11), backend.last_call.?.arguments[0]);
+    try testing.expectEqual(@intFromPtr(first.handle.?), backend.last_call.?.thread_handle);
+    try testing.expect(!try manager.popCleanup(true));
+    try manager.enter(second.handle);
+    pthreadCleanupPop(1);
+    try testing.expectEqual(@as(u64, 0x3330), backend.last_call.?.entry_point);
+    try testing.expectEqual(@intFromPtr(second.handle.?), backend.last_call.?.thread_handle);
+    try testing.expectEqual(@as(usize, 2), backend.once_calls);
+}
+
+test "pthread exit runs reentrant cleanup handlers before TLS destructors and exit" {
+    var address_space = try memory.AddressSpace.init(testing.allocator);
+    defer address_space.deinit();
+    var registry = loader.TlsRegistry{};
+    defer registry.deinit(testing.allocator);
+    var manager = testManager(&address_space, &registry);
+    defer manager.deinit();
+    attachManager(&manager);
+    defer attachManager(null);
+    const prepared = try manager.prepareInitialThread("cleanup");
+    try manager.enter(prepared.handle);
+    defer manager.leave();
+    const Probe = struct {
+        manager: *Manager,
+        storage: u64,
+        entries: [5]u64 = @splat(0),
+        args: [5]u64 = @splat(0),
+        count: usize = 0,
+        fn start(_: ?*anyopaque, _: StartRequest) BackendError!void {
+            return error.Unsupported;
+        }
+        fn call(raw: ?*anyopaque, request: GuestCall) BackendError!u64 {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.count >= self.entries.len or request.argument_count != 1) return error.CallFailed;
+            self.entries[self.count] = request.entry_point;
+            self.args[self.count] = request.arguments[0];
+            self.count += 1;
+            if (request.entry_point == 2) {
+                // Handler 2 is already unlinked. A nested pop runs handler 1;
+                // a newly registered handler must run before TLS destruction.
+                if (!(self.manager.popCleanup(true) catch return error.CallFailed)) return error.CallFailed;
+                self.manager.pushCleanup(3, 30, self.storage) catch return error.CallFailed;
+            }
+            return 0;
+        }
+        fn exit(raw: ?*anyopaque, _: u64, result: u64) void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.count >= self.entries.len) return;
+            self.entries[self.count] = 0xff;
+            self.args[self.count] = result;
+            self.count += 1;
+        }
+    };
+    var probe = Probe{ .manager = &manager, .storage = prepared.stack_address + 0x100 };
+    manager.setBackend(.{ .context = &probe, .start_fn = &Probe.start, .call_fn = &Probe.call, .request_exit_fn = &Probe.exit });
+    pthreadCleanupPush(1, 10, prepared.stack_address);
+    pthreadCleanupPush(2, 20, prepared.stack_address + 0x80);
+    var key: u32 = undefined;
+    try manager.keyCreate(&key, 4);
+    try manager.setSpecific(key, 40);
+    scePthreadExit(@ptrFromInt(50));
+    try testing.expectEqual(@as(usize, 5), probe.count);
+    try testing.expectEqualSlices(u64, &.{ 2, 1, 3, 4, 0xff }, &probe.entries);
+    try testing.expectEqualSlices(u64, &.{ 20, 10, 30, 40, 50 }, &probe.args);
+    try testing.expect(!try manager.popCleanup(true));
+    try testing.expectEqual(@as(u64, 0), manager.getSpecific(key));
 }

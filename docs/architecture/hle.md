@@ -238,6 +238,13 @@ keys store values per guest thread and run guest destructors for up to the four
 standard passes. POSIX wrappers return plain positive errno values; sce entry
 points return kernel statuses.
 
+`__pthread_cleanup_push_imp` and `__pthread_cleanup_pop_imp` maintain a LIFO
+list per guest pthread in caller-supplied cleanup records. Pop unlinks the
+record before optionally calling the guest handler, so callbacks can safely
+register or remove other handlers. `pthread_exit` drains this list before TLS
+key destructors. Caller storage is never freed; its reserved tail is preserved.
+Asynchronous thread cancellation still reports unsupported.
+
 Thread execution is connected through an explicit backend adapter. Every start
 request contains the entry point, argument, pthread identity, scheduling hints,
 a mapped guest stack with a no-access guard, and a ready `ThreadContext`
@@ -245,8 +252,8 @@ containing the guest `fs_base`. HLE code never replaces a host segment register.
 The `cpu` dispatcher consumes this contract and calls its machine bridge only
 across guest instruction execution. Until a dispatcher is attached, creation,
 positive-duration sleep, and guest callbacks from `once` report `ENOSYS`.
-`scePthreadExit` runs key destructors itself and, because its ABI returns `void`,
-continues thread exit if a destructor callback fails.
+`scePthreadExit` runs cleanup handlers and key destructors itself and, because
+its ABI returns `void`, continues thread exit if a callback fails.
 
 **`libkernel` — pthread synchronization** ([src/hle/libs/kernel_sync.zig](../../src/hle/libs/kernel_sync.zig))
 
