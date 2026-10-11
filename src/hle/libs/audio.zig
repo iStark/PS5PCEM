@@ -23,6 +23,7 @@ const kernel_memory = @import("kernel_memory.zig");
 const audio_device = @import("../audio_device.zig");
 const audio_fs = @import("../audio_fs.zig");
 const ngs2_pcm = @import("../ngs2_pcm.zig");
+const ngs2_geom = @import("../ngs2_geom.zig");
 const ajm_codec = @import("../ajm_codec.zig");
 const acm_convolution = @import("../acm_convolution.zig");
 const services = @import("services.zig");
@@ -1237,11 +1238,25 @@ const Ngs2VoiceEvent = enum(u8) {
     resume_playback,
 };
 
+/// SceNgs2ContextBufferInfo. Systems and racks created from a caller's
+/// buffer return it from their destroy call so the caller can free it.
+const Ngs2BufferInfo = extern struct {
+    host_buffer: u64 = 0,
+    host_buffer_size: u64 = 0,
+    reserved: [5]u64 = @splat(0),
+    user_data: u64 = 0,
+};
+
+comptime {
+    std.debug.assert(@sizeOf(Ngs2BufferInfo) == 64);
+}
+
 const Ngs2System = struct {
     active: bool = false,
     handle: u64 = 0,
     grain: u32 = 256,
     sample_rate: u32 = 48_000,
+    buffer: Ngs2BufferInfo = .{},
 };
 
 const Ngs2Rack = struct {
@@ -1249,6 +1264,7 @@ const Ngs2Rack = struct {
     handle: u64 = 0,
     system: u64 = 0,
     rack_id: u32 = 0,
+    buffer: Ngs2BufferInfo = .{},
 };
 
 const Ngs2Voice = struct {
@@ -1323,17 +1339,29 @@ fn ngs2Handle() u64 {
     return next_ngs2_handle.fetchAdd(1, .monotonic);
 }
 
-fn ngs2SystemCreateWithAllocator(options: u64, _: u64, output: ?*u64) callconv(abi.guest) i32 {
-    var grain: u32 = 256;
-    var rate: u32 = 48_000;
-    if (options != 0) {
-        if (!kernel_memory.isGuestRangeAccessible(options, 144)) return errno.KernelError.efault.raw();
-        const bytes = @as([*]const u8, @ptrFromInt(options))[0..144];
-        if (std.mem.readInt(u64, bytes[0..8], .little) < 144) return errno.KernelError.einval.raw();
-        grain = std.mem.readInt(u32, bytes[112..116], .little);
-        rate = std.mem.readInt(u32, bytes[116..120], .little);
-        if (grain == 0 or grain > 4096 or rate < 8000 or rate > 192000) return errno.KernelError.einval.raw();
+const Ngs2SystemOptions = struct { grain: u32 = 256, sample_rate: u32 = 48_000 };
+const Ngs2OptionError = error{ Fault, Invalid };
+
+fn ngs2ReadSystemOptions(options: u64) Ngs2OptionError!Ngs2SystemOptions {
+    var result = Ngs2SystemOptions{};
+    if (options == 0) return result;
+    if (!kernel_memory.isGuestRangeAccessible(options, 144)) return error.Fault;
+    const bytes = @as([*]const u8, @ptrFromInt(options))[0..144];
+    if (std.mem.readInt(u64, bytes[0..8], .little) < 144) return error.Invalid;
+    result.grain = std.mem.readInt(u32, bytes[112..116], .little);
+    result.sample_rate = std.mem.readInt(u32, bytes[116..120], .little);
+    if (result.grain == 0 or result.grain > 4096 or result.sample_rate < 8000 or result.sample_rate > 192000) {
+        return error.Invalid;
     }
+    return result;
+}
+
+fn ngs2OptionError(err: Ngs2OptionError) i32 {
+    return if (err == error.Fault) errno.KernelError.efault.raw() else errno.KernelError.einval.raw();
+}
+
+fn ngs2CreateSystem(options: u64, buffer: Ngs2BufferInfo, output: ?*u64) i32 {
+    const parsed = ngs2ReadSystemOptions(options) catch |err| return ngs2OptionError(err);
     const destination = output orelse return ngs2_error_invalid_output;
     if (!kernel_memory.isGuestRangeAccessible(@intFromPtr(destination), @sizeOf(u64))) {
         return errno.KernelError.efault.raw();
@@ -1343,11 +1371,82 @@ fn ngs2SystemCreateWithAllocator(options: u64, _: u64, output: ?*u64) callconv(a
     for (&ngs2_systems) |*system| {
         if (system.active) continue;
         const handle = ngs2Handle();
-        system.* = .{ .active = true, .handle = handle, .grain = grain, .sample_rate = rate };
+        system.* = .{ .active = true, .handle = handle, .grain = parsed.grain, .sample_rate = parsed.sample_rate, .buffer = buffer };
         destination.* = handle;
         return errno.ok;
     }
     return errno.KernelError.enomem.raw();
+}
+
+fn ngs2SystemCreateWithAllocator(options: u64, _: u64, output: ?*u64) callconv(abi.guest) i32 {
+    return ngs2CreateSystem(options, .{}, output);
+}
+
+/// State lives on the host, so the caller's buffer only has to exist. The
+/// sizes keep the SDK's shape — a fixed system, a rack growing with its
+/// voice count — so titles that budget audio memory get familiar numbers.
+const ngs2_system_buffer_bytes: u64 = 64 * 1024;
+
+fn ngs2RackBufferBytes(options: u64) Ngs2OptionError!u64 {
+    var voices: u64 = 64;
+    if (options != 0) {
+        if (!kernel_memory.isGuestRangeAccessible(options, 36)) return error.Fault;
+        const bytes = @as([*]const u8, @ptrFromInt(options))[0..36];
+        if (std.mem.readInt(u64, bytes[0..8], .little) < 36) return error.Invalid;
+        // SceNgs2RackOption: size, name[16], flags, maxGrainSamples, maxVoices.
+        const requested = std.mem.readInt(u32, bytes[32..36], .little);
+        if (requested != 0) voices = @min(requested, 4096);
+    }
+    return 16 * 1024 + voices * 1024;
+}
+
+fn ngs2WriteBufferSize(info_address: u64, size: u64) i32 {
+    if (info_address == 0) return ngs2_error_invalid_output;
+    if (!kernel_memory.isGuestRangeAccessible(info_address, @sizeOf(Ngs2BufferInfo))) return errno.KernelError.efault.raw();
+    const info: *align(1) Ngs2BufferInfo = @ptrFromInt(info_address);
+    info.* = .{ .host_buffer_size = size };
+    return errno.ok;
+}
+
+/// Reads the caller's buffer description and checks it covers `required`.
+fn ngs2ReadBuffer(info_address: u64, required: u64) Ngs2OptionError!Ngs2BufferInfo {
+    if (info_address == 0) return error.Invalid;
+    if (!kernel_memory.isGuestRangeAccessible(info_address, @sizeOf(Ngs2BufferInfo))) return error.Fault;
+    const info = @as(*align(1) const Ngs2BufferInfo, @ptrFromInt(info_address)).*;
+    if (info.host_buffer == 0 or info.host_buffer_size < required) return error.Invalid;
+    if (!kernel_memory.isGuestRangeAccessible(info.host_buffer, required)) return error.Fault;
+    return info;
+}
+
+fn ngs2SystemQueryBufferSize(options: u64, info_address: u64) callconv(abi.guest) i32 {
+    _ = ngs2ReadSystemOptions(options) catch |err| return ngs2OptionError(err);
+    return ngs2WriteBufferSize(info_address, ngs2_system_buffer_bytes);
+}
+
+fn ngs2SystemCreate(options: u64, info_address: u64, output: ?*u64) callconv(abi.guest) i32 {
+    const buffer = ngs2ReadBuffer(info_address, ngs2_system_buffer_bytes) catch |err| return ngs2OptionError(err);
+    return ngs2CreateSystem(options, buffer, output);
+}
+
+fn ngs2RackQueryBufferSize(_: u32, options: u64, info_address: u64) callconv(abi.guest) i32 {
+    const size = ngs2RackBufferBytes(options) catch |err| return ngs2OptionError(err);
+    return ngs2WriteBufferSize(info_address, size);
+}
+
+fn ngs2RackCreate(system: u64, rack_id: u32, options: u64, info_address: u64, output: ?*u64) callconv(abi.guest) i32 {
+    const size = ngs2RackBufferBytes(options) catch |err| return ngs2OptionError(err);
+    const buffer = ngs2ReadBuffer(info_address, size) catch |err| return ngs2OptionError(err);
+    return ngs2CreateRack(system, rack_id, buffer, output);
+}
+
+/// Hands back the buffer a system or rack was created from; allocator-backed
+/// objects report an empty one.
+fn ngs2ReturnBuffer(info_address: u64, buffer: Ngs2BufferInfo) i32 {
+    if (info_address == 0) return errno.ok;
+    if (!kernel_memory.isGuestRangeAccessible(info_address, @sizeOf(Ngs2BufferInfo))) return errno.KernelError.efault.raw();
+    const info: *align(1) Ngs2BufferInfo = @ptrFromInt(info_address);
+    info.* = buffer;
+    return errno.ok;
 }
 
 fn ngs2RackCreateWithAllocator(
@@ -1357,6 +1456,10 @@ fn ngs2RackCreateWithAllocator(
     _: u64,
     output: ?*u64,
 ) callconv(abi.guest) i32 {
+    return ngs2CreateRack(system, rack_id, .{}, output);
+}
+
+fn ngs2CreateRack(system: u64, rack_id: u32, buffer: Ngs2BufferInfo, output: ?*u64) i32 {
     if (system == 0) return errno.KernelError.einval.raw();
     const destination = output orelse return ngs2_error_invalid_output;
     if (!kernel_memory.isGuestRangeAccessible(@intFromPtr(destination), @sizeOf(u64))) {
@@ -1368,7 +1471,7 @@ fn ngs2RackCreateWithAllocator(
     for (&ngs2_racks) |*rack| {
         if (rack.active) continue;
         const handle = ngs2Handle();
-        rack.* = .{ .active = true, .handle = handle, .system = system, .rack_id = rack_id };
+        rack.* = .{ .active = true, .handle = handle, .system = system, .rack_id = rack_id, .buffer = buffer };
         destination.* = handle;
         return errno.ok;
     }
@@ -1520,21 +1623,23 @@ fn ngs2ResetVoice(voice: *Ngs2Voice) void {
     voice.* = .{};
 }
 
-fn ngs2RackDestroy(handle: u64, _: u64) callconv(abi.guest) i32 {
+fn ngs2RackDestroy(handle: u64, info_address: u64) callconv(abi.guest) i32 {
     ngs2_mutex.lock();
     defer ngs2_mutex.unlock();
     const rack = ngs2FindRack(handle) orelse return errno.KernelError.einval.raw();
+    const buffer = rack.buffer;
     for (&ngs2_voices) |*voice| {
         if (voice.active and voice.rack == handle) ngs2ResetVoice(voice);
     }
     rack.* = .{};
-    return errno.ok;
+    return ngs2ReturnBuffer(info_address, buffer);
 }
 
-fn ngs2SystemDestroy(handle: u64, _: u64) callconv(abi.guest) i32 {
+fn ngs2SystemDestroy(handle: u64, info_address: u64) callconv(abi.guest) i32 {
     ngs2_mutex.lock();
     defer ngs2_mutex.unlock();
     const system = ngs2FindSystem(handle) orelse return errno.KernelError.einval.raw();
+    const buffer = system.buffer;
     for (&ngs2_racks) |*rack| {
         if (!rack.active or rack.system != handle) continue;
         for (&ngs2_voices) |*voice| {
@@ -1543,7 +1648,7 @@ fn ngs2SystemDestroy(handle: u64, _: u64) callconv(abi.guest) i32 {
         rack.* = .{};
     }
     system.* = .{};
-    return errno.ok;
+    return ngs2ReturnBuffer(info_address, buffer);
 }
 
 fn ngs2Event(event_id: u32) ?Ngs2VoiceEvent {
@@ -2273,6 +2378,56 @@ fn ngs2PanGetVolumeMatrix(_: u64, _: u64, count: u32, format: u32, output_addres
     return errno.ok;
 }
 
+fn ngs2GeomResetListenerParam(param_address: u64) callconv(abi.guest) i32 {
+    if (param_address == 0) return ngs2_error_invalid_output;
+    if (!kernel_memory.isGuestRangeAccessible(param_address, @sizeOf(ngs2_geom.ListenerParam))) return errno.KernelError.efault.raw();
+    var param: ngs2_geom.ListenerParam = undefined;
+    ngs2_geom.resetListener(&param);
+    @as(*align(1) ngs2_geom.ListenerParam, @ptrFromInt(param_address)).* = param;
+    return errno.ok;
+}
+
+fn ngs2GeomResetSourceParam(param_address: u64) callconv(abi.guest) i32 {
+    if (param_address == 0) return ngs2_error_invalid_output;
+    if (!kernel_memory.isGuestRangeAccessible(param_address, @sizeOf(ngs2_geom.SourceParam))) return errno.KernelError.efault.raw();
+    var param: ngs2_geom.SourceParam = undefined;
+    ngs2_geom.resetSource(&param);
+    @as(*align(1) ngs2_geom.SourceParam, @ptrFromInt(param_address)).* = param;
+    return errno.ok;
+}
+
+fn ngs2GeomCalcListener(param_address: u64, work_address: u64, flags: u32) callconv(abi.guest) i32 {
+    if (param_address == 0) return errno.KernelError.einval.raw();
+    if (work_address == 0) return ngs2_error_invalid_output;
+    if (!kernel_memory.isGuestRangeAccessible(param_address, @sizeOf(ngs2_geom.ListenerParam)) or
+        !kernel_memory.isGuestRangeAccessible(work_address, @sizeOf(ngs2_geom.ListenerWork)))
+    {
+        return errno.KernelError.efault.raw();
+    }
+    const param = @as(*align(1) const ngs2_geom.ListenerParam, @ptrFromInt(param_address)).*;
+    var work: ngs2_geom.ListenerWork = undefined;
+    ngs2_geom.calcListener(param, flags, &work) catch return errno.KernelError.einval.raw();
+    @as(*align(1) ngs2_geom.ListenerWork, @ptrFromInt(work_address)).* = work;
+    return errno.ok;
+}
+
+fn ngs2GeomApply(work_address: u64, source_address: u64, attribute_address: u64, _: u32) callconv(abi.guest) i32 {
+    if (work_address == 0 or source_address == 0) return errno.KernelError.einval.raw();
+    if (attribute_address == 0) return ngs2_error_invalid_output;
+    if (!kernel_memory.isGuestRangeAccessible(work_address, @sizeOf(ngs2_geom.ListenerWork)) or
+        !kernel_memory.isGuestRangeAccessible(source_address, @sizeOf(ngs2_geom.SourceParam)) or
+        !kernel_memory.isGuestRangeAccessible(attribute_address, @sizeOf(ngs2_geom.Attribute)))
+    {
+        return errno.KernelError.efault.raw();
+    }
+    const work = @as(*align(1) const ngs2_geom.ListenerWork, @ptrFromInt(work_address)).*;
+    const source = @as(*align(1) const ngs2_geom.SourceParam, @ptrFromInt(source_address)).*;
+    var attribute: ngs2_geom.Attribute = undefined;
+    ngs2_geom.apply(work, source, &attribute);
+    @as(*align(1) ngs2_geom.Attribute, @ptrFromInt(attribute_address)).* = attribute;
+    return errno.ok;
+}
+
 const ngs2_exports = [_]symbols.Export{
     .{ .name = "sceNgs2CalcWaveformBlock", .function = trace.wrap("sceNgs2CalcWaveformBlock", &ngs2CalcWaveformBlock), .expect_id = "3pCNbVM11UA" },
     .{ .name = "sceNgs2ParseWaveformData", .function = trace.wrap("sceNgs2ParseWaveformData", &ngs2ParseWaveformData), .expect_id = "hyVLT2VlOYk" },
@@ -2293,6 +2448,14 @@ const ngs2_exports = [_]symbols.Export{
     .{ .name = "sceNgs2PanGetVolumeMatrix", .function = trace.wrap("sceNgs2PanGetVolumeMatrix", &ngs2PanGetVolumeMatrix), .expect_id = "gbMKV+8Enuo" },
     .{ .name = "sceNgs2VoiceGetState", .function = trace.wrap("sceNgs2VoiceGetState", &ngs2VoiceGetState), .expect_id = "-TOuuAQ-buE" },
     .{ .name = "sceNgs2VoiceGetStateFlags", .function = trace.wrap("sceNgs2VoiceGetStateFlags", &ngs2VoiceGetStateFlags), .expect_id = "rEh728kXk3w" },
+    .{ .name = "sceNgs2SystemQueryBufferSize", .function = trace.wrap("sceNgs2SystemQueryBufferSize", &ngs2SystemQueryBufferSize), .expect_id = "pgFAiLR5qT4" },
+    .{ .name = "sceNgs2SystemCreate", .function = trace.wrap("sceNgs2SystemCreate", &ngs2SystemCreate), .expect_id = "koBbCMvOKWw" },
+    .{ .name = "sceNgs2RackQueryBufferSize", .function = trace.wrap("sceNgs2RackQueryBufferSize", &ngs2RackQueryBufferSize), .expect_id = "0eFLVCfWVds" },
+    .{ .name = "sceNgs2RackCreate", .function = trace.wrap("sceNgs2RackCreate", &ngs2RackCreate), .expect_id = "cLV4aiT9JpA" },
+    .{ .name = "sceNgs2GeomResetListenerParam", .function = trace.wrap("sceNgs2GeomResetListenerParam", &ngs2GeomResetListenerParam), .expect_id = "7Lcfo8SmpsU" },
+    .{ .name = "sceNgs2GeomResetSourceParam", .function = trace.wrap("sceNgs2GeomResetSourceParam", &ngs2GeomResetSourceParam), .expect_id = "0lbbayqDNoE" },
+    .{ .name = "sceNgs2GeomCalcListener", .function = trace.wrap("sceNgs2GeomCalcListener", &ngs2GeomCalcListener), .expect_id = "1WsleK-MTkE" },
+    .{ .name = "sceNgs2GeomApply", .function = trace.wrap("sceNgs2GeomApply", &ngs2GeomApply), .expect_id = "eF8yRCC6W64" },
 };
 
 // libSceAudiodec ---------------------------------------------------------

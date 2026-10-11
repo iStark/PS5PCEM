@@ -105,6 +105,7 @@ test {
     _ = @import("font_kerning.zig");
     _ = libs.audio;
     _ = @import("audio_fs.zig");
+    _ = @import("ngs2_geom.zig");
     _ = libs.bootstrap_services;
     _ = libs.cxx_abi;
     _ = libs.dialogs;
