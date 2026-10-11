@@ -33,11 +33,13 @@
 
 <p align="center"><em>A native Windows library with local cover art, per-title saves, input profiles, and direct game launching.</em></p>
 
-The launcher remembers up to 32 recent titles across pages of eight, reads artwork
+The launcher remembers up to 48 recent titles across pages of eight, shown as cover
+tiles or as a table and searchable by title, title ID or folder name. It reads artwork
 from each title's local `sce_sys/icon0.png`, detects DualSense and DualShock controllers,
 and keeps portable settings and savedata beside the application. It reports
 whether the host can run Vulkan before a title is started, naming the device it
-found, and can invoke the package extractor on a debug package directly.
+found, can invoke the package extractor on a debug package directly, and asks
+GitHub Releases whether a newer version is available.
 
 ## See it running
 
