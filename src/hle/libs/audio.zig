@@ -161,6 +161,7 @@ fn hostTimestampNs() u64 {
 /// latency on every other game.
 pub fn setHostTargetLatencyMilliseconds(milliseconds: u16) void {
     host_target_latency_ms.store(@max(milliseconds, 1), .release);
+    @import("audio3d.zig").setHostTargetLatencyMilliseconds(@max(milliseconds, 1));
 }
 
 fn lockDevice() ?std.Io {
@@ -314,7 +315,7 @@ fn audioTestToneEnabled() bool {
     return on;
 }
 
-fn audioDisabled() bool {
+pub fn audioDisabled() bool {
     if (audio_disabled) |value| return value;
     var disabled = false;
     if (comptime builtin.os.tag == .windows) {
@@ -3772,6 +3773,7 @@ const ajm_exports = [_]symbols.Export{
 };
 
 pub fn reset() void {
+    @import("audio3d.zig").reset();
     // Runtime teardown can happen without the title closing its port. Release
     // WinMM before forgetting port ownership so a later runtime in this process
     // can claim the device cleanly.
@@ -3839,6 +3841,7 @@ pub fn reset() void {
 }
 
 pub fn register(db: *symbols.Database, gpa: std.mem.Allocator) symbols.Error!void {
+    try @import("audio3d.zig").register(db, gpa);
     const modules_to_register = [_]struct { lib: []const u8, mod: []const u8, exports: []const symbols.Export }{
         .{ .lib = "libSceAudioOut", .mod = "libSceAudioOut", .exports = &audio_out_exports },
         .{ .lib = "libSceAudioIn", .mod = "libSceAudioIn", .exports = &audio_in_exports },

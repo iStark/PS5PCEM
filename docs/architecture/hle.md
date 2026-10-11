@@ -245,6 +245,15 @@ register or remove other handlers. `pthread_exit` drains this list before TLS
 key destructors. Caller storage is never freed; its reserved tail is preserved.
 Asynchronous thread cancellation still reports unsupported.
 
+`pthread_setcancelstate` is exported by both `libkernel` and `libScePosix`;
+`scePthreadSetcancelstate` shares its implementation with kernel-status errors.
+Each guest pthread starts with cancellation enabled, independently of its
+parent, and can disable or restore it while retrieving the previous state.
+Invalid state values and unwritable output storage leave the state unchanged.
+This implements the state API, not cancellation delivery: `pthread_cancel`
+and `scePthreadCancel` still report unsupported rather than accepting requests
+that the execution backend cannot deliver.
+
 Thread execution is connected through an explicit backend adapter. Every start
 request contains the entry point, argument, pthread identity, scheduling hints,
 a mapped guest stack with a no-access guard, and a ready `ThreadContext`
@@ -463,6 +472,20 @@ previews are resampled to the 48 kHz host mix, use short de-click envelopes,
 and drain once. Direct fallback mixing is disabled by default because replaying
 a clip beside the title's real AudioOut/AJM mix is heard as echo; it remains
 available explicitly with `PS5_AUDIO_FALLBACK_MIX=1`.
+
+`libSceAudio3d` implements initialization/termination, checked port lifetimes,
+object reservation, batched object attributes and flush-to-host playback.
+The observed PS5 attribute IDs are PCM 1, position 3 and gain 5, rather than
+the PS4 position/gain IDs. Mono S16/float PCM is copied into bounded per-object
+queues before returning to the guest. Flush mixes the objects simultaneously
+with a stereo azimuth/gain approximation and submits through the shared WinMM
+device implementation. Invalid attribute batches leave the object unchanged;
+NaN/Inf samples become silence and final sums saturate. Playback waits happen
+outside the global metadata lock, with per-port flush ordering and generation
+checks around close/reopen. Only the 0x20/0x28 open layouts, buffer mode 2 and
+two-bed configuration are accepted. HRTF, reverberation, bed submission, other
+attributes and explicit advance/push APIs remain unimplemented; unsupported
+parameters return errors instead of accepting and discarding their work.
 
 [src/hle/libs/av_player.zig](../../src/hle/libs/av_player.zig) implements the
 SceAvPlayer lifecycle, callback-based file input and title-owned allocations.

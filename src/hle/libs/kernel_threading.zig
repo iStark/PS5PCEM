@@ -269,6 +269,7 @@ const ThreadRecord = struct {
     joining: bool = false,
     specific_values: [maximum_keys]u64 = [_]u64{0} ** maximum_keys,
     cleanup_head: u64 = 0,
+    cancellation_disabled: bool = false,
     state: std.atomic.Value(u8) = std.atomic.Value(u8).init(@intFromEnum(ThreadState.prepared)),
     result: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 };
@@ -808,6 +809,22 @@ pub const Manager = struct {
 
     pub fn runCleanupHandlers(self: *Manager) Error!void {
         while (try self.popCleanup(true)) {}
+    }
+
+    /// POSIX state belongs to the guest pthread, not its host worker or its
+    /// parent. No cancellation request can be pending while cancel itself is
+    /// unsupported; disabling/restoring the state must still round-trip.
+    pub fn setCancelState(self: *Manager, state: i32, previous: ?*i32) Error!void {
+        if (state != 0 and state != 1) return error.InvalidArgument;
+        self.lock.lock();
+        defer self.lock.unlock();
+        const record = self.findRecordLocked(current_guest_thread) orelse return error.ThreadNotFound;
+        if (previous) |output| {
+            const old_state: i32 = @intFromBool(record.cancellation_disabled);
+            // Validate and notify the guest write before committing the change.
+            try self.address_space.write(@intFromPtr(output), std.mem.asBytes(&old_state));
+        }
+        record.cancellation_disabled = state == 1;
     }
 
     /// Schedules a process exception callback on the target guest pthread.
@@ -1464,6 +1481,20 @@ pub fn pthread_attr_setsolosched_np(attr: ?*AttrHandle, solo_sched: i32) callcon
     return posixStatus(scePthreadAttrSetsolosched(attr, solo_sched));
 }
 
+pub fn scePthreadSetcancelstate(state: i32, previous: ?*i32) callconv(abi.guest) i32 {
+    if (state != 0 and state != 1) return KernelError.einval.raw();
+    const manager = activeManager() orelse return KernelError.enosys.raw();
+    manager.setCancelState(state, previous) catch |err| return switch (err) {
+        error.ProtectionDenied => KernelError.efault.raw(),
+        else => kernelStatus(err),
+    };
+    return errno.ok;
+}
+
+pub fn pthread_setcancelstate(state: i32, previous: ?*i32) callconv(abi.guest) i32 {
+    return posixStatus(scePthreadSetcancelstate(state, previous));
+}
+
 /// Cancellation, refused rather than answered.
 ///
 /// Cancelling a thread means unwinding it at a point it did not choose, and
@@ -1869,6 +1900,8 @@ pub const exports = [_]symbols.Export{
     .{ .name = "pthread_attr_setsolosched_np", .function = trace.wrap("pthread_attr_setsolosched_np", &pthread_attr_setsolosched_np), .expect_id = "2+pVfgiEd7A" },
     .{ .name = "pthread_cancel", .function = trace.wrap("pthread_cancel", &pthread_cancel), .expect_id = "0D4-FVvEikw" },
     .{ .name = "scePthreadCancel", .function = trace.wrap("scePthreadCancel", &scePthreadCancel), .expect_id = "qBDmpCyGssE" },
+    .{ .name = "scePthreadSetcancelstate", .function = trace.wrap("scePthreadSetcancelstate", &scePthreadSetcancelstate), .expect_id = "OAmWq+OHSjw" },
+    .{ .name = "pthread_setcancelstate", .function = trace.wrap("pthread_setcancelstate", &pthread_setcancelstate), .expect_id = "lZzFeSxPl08" },
     .{ .name = "sched_get_priority_max", .function = trace.wrap("sched_get_priority_max", &sched_get_priority_max), .expect_id = "CBNtXOoef-E" },
     .{ .name = "sched_get_priority_min", .function = trace.wrap("sched_get_priority_min", &sched_get_priority_min), .expect_id = "m0iS6jNsXds" },
     .{ .name = "sceKernelUsleep", .function = trace.wrap("sceKernelUsleep", &sceKernelUsleep), .expect_id = "1jfXLRVzisc" },
@@ -1921,11 +1954,17 @@ pub const exports = [_]symbols.Export{
     .{ .name = "pthread_once", .function = trace.wrap("pthread_once", &pthread_once), .expect_id = "Z4QosVuAsA0" },
 };
 
+pub const posix_exports = [_]symbols.Export{
+    .{ .name = "pthread_setcancelstate", .function = trace.wrap("pthread_setcancelstate", &pthread_setcancelstate), .expect_id = "lZzFeSxPl08" },
+};
+
 pub const library = symbols.Library{ .name = "libkernel", .version = 1 };
+pub const posix_library = symbols.Library{ .name = "libScePosix", .version = 1 };
 pub const module = symbols.Module{ .name = "libkernel", .version_major = 1, .version_minor = 1 };
 
 pub fn register(db: *symbols.Database, gpa: std.mem.Allocator) symbols.Error!void {
     try db.addLibrary(gpa, library, module, &exports);
+    try db.addLibrary(gpa, posix_library, module, &posix_exports);
 }
 
 // ---------------------------------------------------------------------------
@@ -2148,13 +2187,83 @@ test "threading library registers the sample executable imports" {
     var db = symbols.Database{};
     defer db.deinit(testing.allocator);
     try register(&db, testing.allocator);
-    try testing.expectEqual(exports.len, db.count());
+    try testing.expectEqual(exports.len + posix_exports.len, db.count());
     try testing.expect(db.findById("6UgtwV+0zb4", .function) != null);
     try testing.expect(db.findById("1jfXLRVzisc", .function) != null);
     for ([_][]const u8{ "1xvtUVx1-Sg", "iWsFlYMf3Kw" }) |id| {
         const symbol = db.findById(id, .function) orelse return error.TestExpectedEqual;
         try testing.expectEqualStrings("libkernel", symbol.key.library.name);
     }
+    for ([_]symbols.Library{ library, posix_library }) |export_library| {
+        try testing.expect(db.find(.{
+            .id = "lZzFeSxPl08".*,
+            .library = export_library,
+            .module = module,
+            .type = .function,
+        }) != null);
+    }
+}
+
+test "pthread cancellation state round trips independently for each guest thread" {
+    var address_space = try memory.AddressSpace.init(testing.allocator);
+    defer address_space.deinit();
+    var registry = loader.TlsRegistry{};
+    defer registry.deinit(testing.allocator);
+    var manager = testManager(&address_space, &registry);
+    defer manager.deinit();
+    attachManager(&manager);
+    defer attachManager(null);
+    const first = try manager.prepareInitialThread("first");
+    try manager.enter(first.handle);
+    defer manager.leave();
+    const previous: *i32 = @ptrFromInt(first.stack_address);
+    previous.* = -99;
+    try testing.expectEqual(errno.ok, pthread_setcancelstate(1, previous));
+    try testing.expectEqual(@as(i32, 0), previous.*);
+    try testing.expectEqual(errno.ok, pthread_setcancelstate(1, previous));
+    try testing.expectEqual(@as(i32, 1), previous.*);
+
+    // A thread prepared while its parent has cancellation disabled starts
+    // enabled, and changing it must not affect the parent's saved state.
+    const second = try manager.prepareInitialThread("second");
+    try manager.enter(second.handle);
+    try testing.expectEqual(errno.ok, scePthreadSetcancelstate(1, previous));
+    try testing.expectEqual(@as(i32, 0), previous.*);
+    try testing.expectEqual(errno.ok, pthread_setcancelstate(0, null));
+    try testing.expectEqual(errno.ok, pthread_setcancelstate(0, previous));
+    try testing.expectEqual(@as(i32, 0), previous.*);
+    try manager.enter(first.handle);
+    try testing.expectEqual(errno.ok, scePthreadSetcancelstate(0, previous));
+    try testing.expectEqual(@as(i32, 1), previous.*);
+}
+
+test "invalid pthread cancellation state or output preserves the previous state" {
+    var address_space = try memory.AddressSpace.init(testing.allocator);
+    defer address_space.deinit();
+    var registry = loader.TlsRegistry{};
+    defer registry.deinit(testing.allocator);
+    var manager = testManager(&address_space, &registry);
+    defer manager.deinit();
+    attachManager(&manager);
+    defer attachManager(null);
+    const prepared = try manager.prepareInitialThread("cancel-state");
+    try manager.enter(prepared.handle);
+    defer manager.leave();
+    const previous: *i32 = @ptrFromInt(prepared.stack_address);
+    previous.* = 42;
+    try testing.expectEqual(errno.ok, pthread_setcancelstate(1, null));
+    try testing.expectEqual(Posix.einval, pthread_setcancelstate(-1, previous));
+    try testing.expectEqual(KernelError.einval.raw(), scePthreadSetcancelstate(2, previous));
+    try testing.expectEqual(@as(i32, 42), previous.*);
+    // The stack's guard is mapped but not writable. Failure must be an errno
+    // result, not a host access violation or a successful state transition.
+    const guard: *i32 = @ptrFromInt(prepared.stack_address - 4);
+    try testing.expectEqual(Posix.efault, pthread_setcancelstate(0, guard));
+    try testing.expectEqual(KernelError.efault.raw(), scePthreadSetcancelstate(0, guard));
+    try testing.expectEqual(errno.ok, pthread_setcancelstate(0, previous));
+    try testing.expectEqual(@as(i32, 1), previous.*);
+    manager.leave();
+    try testing.expectEqual(Posix.esrch, pthread_setcancelstate(0, null));
 }
 
 test "pthread cleanup records preserve guest storage and isolate thread stacks" {

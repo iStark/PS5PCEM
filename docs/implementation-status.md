@@ -48,6 +48,10 @@ behind them.
   and effects play concurrently. Batch output submits every active port;
   underrun recovery preserves sample order within the active ring. See the
   [Jets audio retest](development/jets-audio-streams-2026-10-09.md).
+- Audio3d object PCM has bounded owned queues and simultaneous stereo mixing
+  with PS5 position/gain attributes and host playback. This is a stereo
+  approximation, not full HRTF/room rendering; bed and advance/push APIs remain
+  unsupported. See the [KeyWe startup report](development/keywe-pthread-cancel-state-2026-10-11.md).
 - Live VideoOut reaches a Vulkan swapchain, while host audio accepts decoded
   guest buffers at 48 kHz. SceAvPlayer uses FFmpeg for H.264/AAC media and
   returns synchronized NV12 video plus stereo PCM through the title's own
