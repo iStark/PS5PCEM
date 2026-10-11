@@ -1409,6 +1409,15 @@ pub fn pthread_cancel(_: ThreadHandle) callconv(abi.guest) i32 {
     return errno.Posix.enosys;
 }
 
+/// Kernel-status spelling of the existing POSIX cancellation boundary. Do not
+/// claim a thread stopped when the dispatcher cannot safely unwind it yet.
+pub fn scePthreadCancel(handle: ThreadHandle) callconv(abi.guest) i32 {
+    if (handle == null) return KernelError.einval.raw();
+    const manager = activeManager() orelse return KernelError.enosys.raw();
+    if (manager.readAffinity(handle) == null) return KernelError.esrch.raw();
+    return KernelError.enosys.raw();
+}
+
 /// The console's thread priority range, in which a smaller number is higher.
 ///
 /// Reported so that a title asking the range and then choosing inside it picks
@@ -1790,6 +1799,7 @@ pub const exports = [_]symbols.Export{
     .{ .name = "pthread_rename_np", .function = trace.wrap("pthread_rename_np", &pthread_rename_np), .expect_id = "9vyP6Z7bqzc" },
     .{ .name = "pthread_attr_setsolosched_np", .function = trace.wrap("pthread_attr_setsolosched_np", &pthread_attr_setsolosched_np), .expect_id = "2+pVfgiEd7A" },
     .{ .name = "pthread_cancel", .function = trace.wrap("pthread_cancel", &pthread_cancel), .expect_id = "0D4-FVvEikw" },
+    .{ .name = "scePthreadCancel", .function = trace.wrap("scePthreadCancel", &scePthreadCancel), .expect_id = "qBDmpCyGssE" },
     .{ .name = "sched_get_priority_max", .function = trace.wrap("sched_get_priority_max", &sched_get_priority_max), .expect_id = "CBNtXOoef-E" },
     .{ .name = "sched_get_priority_min", .function = trace.wrap("sched_get_priority_min", &sched_get_priority_min), .expect_id = "m0iS6jNsXds" },
     .{ .name = "sceKernelUsleep", .function = trace.wrap("sceKernelUsleep", &sceKernelUsleep), .expect_id = "1jfXLRVzisc" },

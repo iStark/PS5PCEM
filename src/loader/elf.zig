@@ -93,8 +93,9 @@ pub const SegmentType = enum(u32) {
     gnu_eh_frame = 0x6474_e550,
     /// Build provenance stored by newer PS5 toolchains.
     sce_comment_ps5 = 0x6fff_ff00,
-    /// Dynamic linking data stored by newer PS5 toolchains.
-    sce_dynlibdata_ps5 = 0x6fff_ff01,
+    /// Library-version metadata, not dynamic linking tables. This non-loadable
+    /// segment may be omitted from stripped ELF and decrypted SELF images.
+    sce_libversion_ps5 = 0x6fff_ff01,
     _,
 };
 
@@ -191,24 +192,8 @@ pub const Image = struct {
 
     /// Contents of the segment holding the dynamic linking tables.
     pub fn dynlibData(self: Image) Error!?[]const u8 {
-        for (self.program_headers) |ph| {
-            const segment_type = ph.segmentType();
-            if (segment_type == .sce_dynlibdata or segment_type == .sce_dynlibdata_ps5) {
-                // A module can carry this header with nothing behind it.
-                // libc.prx in Dreaming Sarah places the segment at its own
-                // last byte and claims 26 more, in the untouched file as
-                // much as in the patched one, so there is provably nothing
-                // stored and an empty view is the honest answer. Only a bare
-                // ELF can say this: its p_offset and the image length are the
-                // same measure. A SELF keeps the error, and so does any
-                // segment that starts inside the image and runs off the end,
-                // which is a truncated file rather than an absent table.
-                if (self.self_layout == null and ph.offset >= self.bytes.len)
-                    return self.bytes[0..0];
-                return try self.fileRange(ph);
-            }
-        }
-        return null;
+        const ph = self.findSegment(.sce_dynlibdata) orelse return null;
+        return try self.fileRange(ph);
     }
 
     /// Contents of the `PT_DYNAMIC` segment: the array of dynamic entries.
@@ -271,13 +256,13 @@ pub const Image = struct {
             return self.physicalRange(physical, size);
         }
 
-        // Some decrypted PS5 images append PT_SCE_DYNLIBDATA directly after
+        // Some decrypted images append PT_SCE_DYNLIBDATA directly after
         // the last blocked payload without giving it a SELF entry. Logical
         // NOTE segments and alignment gaps between them are not stored, so the
         // ELF offset delta must deliberately not be carried into this mapping.
         var is_unlisted_dynlib = false;
         for (self.program_headers) |ph| {
-            if (ph.segmentType() == .sce_dynlibdata_ps5 and
+            if (ph.segmentType() == .sce_dynlibdata and
                 ph.offset == offset and ph.filesz == size)
             {
                 is_unlisted_dynlib = true;
@@ -668,7 +653,7 @@ test "SELF resolves an unlisted dynlib-data tail after logical padding" {
             .@"align" = 1,
         },
         .{
-            .type = @intFromEnum(SegmentType.sce_dynlibdata_ps5),
+            .type = @intFromEnum(SegmentType.sce_dynlibdata),
             .flags = 0,
             .offset = logical_offset + comment.len + padding,
             .vaddr = 0,
@@ -717,4 +702,49 @@ test "SELF resolves an unlisted dynlib-data tail after logical padding" {
 
     const image = try parse(bytes.items);
     try testing.expectEqualStrings(dynlib, (try image.dynlibData()).?);
+
+    // A real dynamic-table tail is required, even when entirely missing.
+    const partial = try parse(bytes.items[0 .. bytes.items.len - 1]);
+    try testing.expectError(Error.TruncatedSelf, partial.dynlibData());
+    const missing = try parse(bytes.items[0 .. bytes.items.len - dynlib.len]);
+    try testing.expectError(Error.TruncatedSelf, missing.dynlibData());
+}
+
+test "library-version metadata never shadows required ELF dynamic tables" {
+    const offset = TestImage.payloadOffset(2);
+    const payload = "linking tables";
+    var segments = [_]ProgramHeader{
+        .{
+            .type = @intFromEnum(SegmentType.sce_libversion_ps5),
+            .flags = 0,
+            .offset = offset + payload.len,
+            .vaddr = 0,
+            .paddr = 0,
+            .filesz = 39,
+            .memsz = 32,
+            .@"align" = 16,
+        },
+        .{
+            .type = @intFromEnum(SegmentType.sce_dynlibdata),
+            .flags = 0,
+            .offset = offset,
+            .vaddr = 0,
+            .paddr = 0,
+            .filesz = payload.len,
+            .memsz = payload.len,
+            .@"align" = 1,
+        },
+    };
+    var fixture = try TestImage.build(testing.allocator, .sce_dynamic, &segments, payload);
+    defer fixture.deinit(testing.allocator);
+    const image = try parse(fixture.bytes());
+    try testing.expectEqualStrings(payload, (try image.dynlibData()).?);
+    const partial = try parse(fixture.bytes()[0 .. fixture.bytes().len - 1]);
+    try testing.expectError(Error.MalformedHeader, partial.dynlibData());
+
+    segments[1].offset += payload.len;
+    var missing = try TestImage.build(testing.allocator, .sce_dynamic, &segments, payload);
+    defer missing.deinit(testing.allocator);
+    const missing_image = try parse(missing.bytes());
+    try testing.expectError(Error.MalformedHeader, missing_image.dynlibData());
 }

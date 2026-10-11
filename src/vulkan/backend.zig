@@ -2767,6 +2767,40 @@ const GuestDepthTarget = struct {
     }
 };
 
+/// Exact raw float-depth fills only. Compressed, multisample and subresource
+/// layouts require their own metadata/plane decoding and are not guessed here.
+fn rawDepthFillBytes(target: GuestDepthTarget) ?usize {
+    if (target.guest_format != 3 or target.descriptor.htile_enabled or
+        target.samples_log2 != 0 or target.base_array_slice != 0 or target.mip_level != 0 or
+        (target.descriptor.read_address != 0 and target.descriptor.read_address != target.address) or
+        target.allocation_bytes == 0 or target.allocation_bytes % 4 != 0 or
+        target.allocation_bytes > maximum_frame_bytes) return null;
+    return std.math.cast(usize, target.allocation_bytes);
+}
+
+fn uniformRawDepthValue(bytes: []const u8) ?f32 {
+    if (bytes.len == 0 or bytes.len % 4 != 0) return null;
+    const words = std.mem.bytesAsSlice(u32, bytes);
+    const word = std.mem.littleToNative(u32, words[0]);
+    const value: f32 = @bitCast(word);
+    if (!std.math.isFinite(value) or value < 0 or value > 1) return null;
+    for (words[1..]) |other| if (other != words[0]) return null;
+    return value;
+}
+
+test "raw depth clears require complete finite uniform float planes" {
+    var words = [_]u32{ 0x3f800000, 0x3f800000, 0x3f800000, 0x3f800000 };
+    try std.testing.expectEqual(@as(?f32, 1), uniformRawDepthValue(std.mem.sliceAsBytes(&words)));
+    words[3] = 0;
+    try std.testing.expectEqual(null, uniformRawDepthValue(std.mem.sliceAsBytes(&words)));
+    for ([_]u32{ 0x7fc00000, 0x7f800000, 0xbf800000, 0x40000000 }) |invalid| {
+        @memset(&words, invalid);
+        try std.testing.expectEqual(null, uniformRawDepthValue(std.mem.sliceAsBytes(&words)));
+    }
+    try std.testing.expectEqual(null, uniformRawDepthValue(&.{}));
+    try std.testing.expectEqual(null, uniformRawDepthValue(&.{ 0, 0, 0 }));
+}
+
 /// One guest depth allocation kept resident as a Vulkan attachment.
 ///
 const CachedDepthTarget = struct {
@@ -10549,6 +10583,7 @@ pub const Renderer = struct {
         // This kernel also fills attachment metadata. Updating guest bytes
         // alone leaves resident colour/depth images with the previous frame,
         // unlike the translated and packed-fill paths.
+        try self.applyUniformDepthWrite(address, bytes);
         try self.applyUniformHtileWrite(address, bytes);
         try self.applyUniformDccWrite(address, bytes);
         self.emulated_buffer_clear_dispatches += 1;
@@ -10880,6 +10915,7 @@ pub const Renderer = struct {
             self.prepareHtileWrite(descriptor.address, byte_count);
             if (!memory.write(memory.context, descriptor.address, bytes)) return Error.GuestMemoryWriteFailed;
             self.invalidateDmaDestination(descriptor.address, byte_count);
+            try self.applyUniformDepthWrite(descriptor.address, bytes);
             try self.applyUniformHtileWrite(descriptor.address, bytes);
             try self.applyUniformDccWrite(descriptor.address, bytes);
             self.emulated_buffer_clear_dispatches += 1;
@@ -13165,6 +13201,10 @@ pub const Renderer = struct {
         const entry = self.guest_buffers.items[buffer_index];
         var needed: usize = 0;
         for (self.depth_targets.items) |cached| {
+            if (rawDepthFillBytes(cached.target)) |raw_size| {
+                if (entry.guest_address == cached.target.address and raw_size <= entry.size)
+                    needed = @max(needed, raw_size);
+            }
             const size = uniformHtileBytes(cached.target) orelse continue;
             const address = cached.target.descriptor.htile_address;
             // As in flushGuestStorageRange, an oversized V# spanning unrelated
@@ -13188,6 +13228,7 @@ pub const Renderer = struct {
         defer self.allocator.free(bytes);
         if (!memory.read(memory.context, entry.guest_address, bytes)) return Error.GuestMemoryReadFailed;
         self.prepareHtileWrite(entry.guest_address, needed);
+        try self.applyUniformDepthWrite(entry.guest_address, bytes);
         try self.applyUniformHtileWrite(entry.guest_address, bytes);
         try self.applyUniformDccWrite(entry.guest_address, bytes);
     }
@@ -15768,7 +15809,7 @@ pub const Renderer = struct {
             if (chain.signature != signature) break;
             return .{
                 .image = chain.image,
-                .view = try self.residentImageViewLevels(chain.image.handle, vk.image_view_type_2d, image_format, try sampledImageComponents(descriptor.dst_select), vk.image_aspect_color_bit, 1, levels),
+                .view = try self.residentImageViewLevels(chain.image.handle, vk.image_view_type_2d, image_format, try sampledImageComponents(descriptor.dst_select, descriptor.unified_format), vk.image_aspect_color_bit, 1, levels),
                 .sampler = try self.residentSampler(sampler_descriptor),
             };
         }
@@ -15887,7 +15928,7 @@ pub const Renderer = struct {
         snapshot.source_generation = source.content_generation;
         return .{
             .image = snapshot.image,
-            .view = try self.residentImageView(snapshot.image.handle, vk.image_view_type_3d, image_format, try sampledImageComponents(descriptor.dst_select), vk.image_aspect_color_bit, 1),
+            .view = try self.residentImageView(snapshot.image.handle, vk.image_view_type_3d, image_format, try sampledImageComponents(descriptor.dst_select, descriptor.unified_format), vk.image_aspect_color_bit, 1),
             .sampler = try self.residentSampler(sampler_descriptor),
         };
     }
@@ -15912,7 +15953,7 @@ pub const Renderer = struct {
             .image = snapshot.handle,
             .view_type = vk.image_view_type_3d,
             .format = image_format,
-            .components = if (storage) .{} else try sampledImageComponents(descriptor.dst_select),
+            .components = if (storage) .{} else try sampledImageComponents(descriptor.dst_select, descriptor.unified_format),
             .subresource_range = .{ .aspect_mask = vk.image_aspect_color_bit },
         };
         var view: vk.ImageView = 0;
@@ -16007,7 +16048,7 @@ pub const Renderer = struct {
         };
         const cached = self.render_targets.items[index];
         try self.transitionRenderTargetToShaderRead(index);
-        const components = try sampledImageComponents(descriptor.dst_select);
+        const components = try sampledImageComponents(descriptor.dst_select, descriptor.unified_format);
         const view = try self.residentImageView(
             cached.image.handle,
             if (dimension == .two_d_array) vk.image_view_type_2d_array else vk.image_view_type_2d,
@@ -16107,7 +16148,7 @@ pub const Renderer = struct {
                 self.resident_depth_sample_reports +|= 1;
             }
             try self.transitionDepthTargetToShaderRead(index);
-            const components = try sampledImageComponents(descriptor.dst_select);
+            const components = try sampledImageComponents(descriptor.dst_select, descriptor.unified_format);
             const view = try self.residentImageView(
                 cached.image.handle,
                 vk.image_view_type_2d,
@@ -16587,7 +16628,7 @@ pub const Renderer = struct {
         if (self.depth_targets.items.len < maximum_depth_targets) {
             try self.depth_targets.append(self.allocator, cached);
             const index = self.depth_targets.items.len - 1;
-            if (!try self.inheritDepthPlanes(index) and !try self.initializeDepthFromUniformHtile(index) and self.depth_transfer_enabled)
+            if (!try self.inheritDepthPlanes(index) and !try self.initializeDepthFromUniformHtile(index) and !try self.initializeDepthFromUniformBytes(index) and self.depth_transfer_enabled)
                 _ = try self.importDepthTarget(index);
             self.depth_target_sequence +%= 1;
             self.depth_targets.items[index].last_used_sequence = self.depth_target_sequence;
@@ -16615,7 +16656,7 @@ pub const Renderer = struct {
         self.invalidateDepthPasses(victim.view);
         self.destroyCachedDepthTarget(victim.*);
         victim.* = cached;
-        if (!try self.inheritDepthPlanes(oldest_index) and !try self.initializeDepthFromUniformHtile(oldest_index) and self.depth_transfer_enabled)
+        if (!try self.inheritDepthPlanes(oldest_index) and !try self.initializeDepthFromUniformHtile(oldest_index) and !try self.initializeDepthFromUniformBytes(oldest_index) and self.depth_transfer_enabled)
             _ = try self.importDepthTarget(oldest_index);
         self.depth_target_sequence +%= 1;
         self.depth_targets.items[oldest_index].last_used_sequence = self.depth_target_sequence;
@@ -16648,12 +16689,12 @@ pub const Renderer = struct {
         return depth;
     }
 
-    fn clearDepthFromHtile(self: *Renderer, index: usize, depth: f32) anyerror!void {
+    fn clearResidentDepth(self: *Renderer, index: usize, depth: f32) anyerror!void {
         const snapshot = self.depth_targets.items[index];
         const command_buffer = try self.beginOneShot();
         defer self.releaseOneShot(command_buffer);
         // Layouts remain coupled for a packed depth/stencil image, even when
-        // depth-only HTILE changes just its depth aspect. Initialize stencil
+        // a raw plane or depth-only HTILE fill changes just its depth aspect. Initialize stencil
         // on first use as prepareDepthAttachment does, then preserve it.
         const layout_range = vk.ImageSubresourceRange{ .aspect_mask = snapshot.target.aspectMask() };
         const range = vk.ImageSubresourceRange{ .aspect_mask = if (snapshot.initialized) vk.image_aspect_depth_bit else snapshot.target.aspectMask() };
@@ -16677,7 +16718,7 @@ pub const Renderer = struct {
         cached.last_used_sequence = self.depth_target_sequence;
         if (self.reported_htile_resolves < 4 or self.traceCurrentGraphicsFrame()) {
             self.reported_htile_resolves +|= 1;
-            std.debug.print("[vulkan dcb] resident HTILE clear depth@0x{x} {d}x{d} meta@0x{x} value={d}\n", .{
+            std.debug.print("[vulkan dcb] resident depth clear depth@0x{x} {d}x{d} meta@0x{x} value={d}\n", .{
                 cached.target.address,                  cached.target.width, cached.target.height,
                 cached.target.descriptor.htile_address, depth,
             });
@@ -16692,8 +16733,33 @@ pub const Renderer = struct {
         defer self.allocator.free(bytes);
         if (!memory.read(memory.context, target.descriptor.htile_address, bytes)) return false;
         const depth = uniformHtileClear(bytes) orelse return false;
-        try self.clearDepthFromHtile(index, depth);
+        try self.clearResidentDepth(index, depth);
         return true;
+    }
+
+    /// A raw full-plane clear is independent of DB_DEPTH_CLEAR and HTILE.
+    /// Keep the resident attachment coherent even when general depth transfer
+    /// is disabled. Never infer a full clear from a sparse pixel probe.
+    fn initializeDepthFromUniformBytes(self: *Renderer, index: usize) anyerror!bool {
+        const target = self.depth_targets.items[index].target;
+        const size = rawDepthFillBytes(target) orelse return false;
+        const memory = self.guest_memory orelse return false;
+        var scratch = try self.image_scratch.acquire(self.allocator, size);
+        defer scratch.release();
+        if (!memory.read(memory.context, target.address, scratch.bytes)) return false;
+        const depth = uniformRawDepthValue(scratch.bytes) orelse return false;
+        try self.clearResidentDepth(index, depth);
+        return true;
+    }
+
+    fn applyUniformDepthWrite(self: *Renderer, address: u64, bytes: []const u8) anyerror!void {
+        for (self.depth_targets.items, 0..) |cached, index| {
+            const size = rawDepthFillBytes(cached.target) orelse continue;
+            if (!byteRangeContains(address, bytes.len, cached.target.address, size)) continue;
+            const offset: usize = @intCast(cached.target.address - address);
+            const depth = uniformRawDepthValue(bytes[offset..][0..size]) orelse continue;
+            try self.clearResidentDepth(index, depth);
+        }
     }
 
     /// Mirror a complete metadata fill into resident depth immediately, so
@@ -16706,7 +16772,7 @@ pub const Renderer = struct {
             const offset = std.math.cast(usize, metadata - address) orelse continue;
             if (offset > bytes.len or size > bytes.len - offset) continue;
             const depth = uniformHtileClear(bytes[offset..][0..size]) orelse continue;
-            try self.clearDepthFromHtile(index, depth);
+            try self.clearResidentDepth(index, depth);
         }
     }
 
@@ -20700,7 +20766,7 @@ pub const Renderer = struct {
         // A fast clear is a new producer even when the smaller attachment
         // was not the most recently bound view of this allocation.
         _ = try self.acquireDepthTarget(larger);
-        try self.clearDepthFromHtile(restored, 0);
+        try self.clearResidentDepth(restored, 0);
         _ = try self.acquireDepthTarget(original);
         try std.testing.expectEqual([2]f32{ 0, 0 }, try self.readDepthProbeValues(restored, false));
         try self.transitionDepthTargetToShaderRead(expanded);
@@ -20745,6 +20811,72 @@ pub const Renderer = struct {
         defer self.allocator.free(values);
         try self.readMapped(readback, std.mem.sliceAsBytes(values));
         return .{ values[0], values[(height / 2) * width + width / 2] };
+    }
+
+    pub fn probeRawDepthClears(self: *Renderer) anyerror!void {
+        var descriptor = std.mem.zeroes(gpu.resources.DepthTarget);
+        descriptor.read_address = 0x60000;
+        descriptor.write_address = descriptor.read_address;
+        descriptor.stencil_format = 1;
+        descriptor.stencil_read_address = 0x80000;
+        descriptor.stencil_write_address = descriptor.stencil_read_address;
+        descriptor.clear_stencil = 0x5a;
+        descriptor.width = 32;
+        descriptor.height = 32;
+        descriptor.format = 3;
+        descriptor.tile_mode = .depth;
+        const target = guestDepthTarget(descriptor) orelse return error.TestFailed;
+        const size = rawDepthFillBytes(target) orelse return error.TestFailed;
+        const bytes = try self.allocator.alloc(u8, size);
+        defer self.allocator.free(bytes);
+        fillRepeatedPattern(bytes, &.{ 0, 0, 0x80, 0x3f });
+        try std.testing.expect(dcbWrite(self, target.address, bytes));
+        const index = try self.acquireDepthTarget(target);
+        try std.testing.expectEqual([2]f32{ 1, 1 }, try self.readDepthProbeValues(index, false));
+        try std.testing.expectEqual([2]u8{ 0x5a, 0x5a }, try self.readDepthProbeValues(index, true));
+        self.depth_targets.items[index].target.clear_stencil = 0xa5;
+        var state = GraphicsPipelineState.default(32, 32);
+        state.color_write_masks = @splat(0);
+        state.depth_attachment_format = target.format;
+        state.depth_test_enable = 1;
+        state.depth_write_enable = 1;
+        state.depth_compare_operation = 1;
+        state.viewport_min_depth_bits = @bitCast(@as(f32, 0.5));
+        state.viewport_max_depth_bits = @bitCast(@as(f32, 0.5));
+        for ([_]u32{ 3, 0 }) |vertices| {
+            try self.beginFrameDraw();
+            try self.drawGraphicsShaders(&graphics_probe_vertex_spirv, &graphics_probe_fragment_spirv, &.{}, &.{}, state, null, &.{}, target, false, false, false, .{ .vertex_count = vertices });
+        }
+        try std.testing.expectEqual([2]f32{ 1, 0.5 }, try self.readDepthProbeValues(index, false));
+        try std.testing.expect(dcbWrite(self, target.address, &.{ 0, 0, 0, 0 }));
+        try std.testing.expectEqual([2]f32{ 1, 0.5 }, try self.readDepthProbeValues(index, false));
+        @memset(bytes, 0);
+        try std.testing.expect(dcbWrite(self, target.address, bytes));
+        try std.testing.expectEqual([2]f32{ 0, 0 }, try self.readDepthProbeValues(index, false));
+        try std.testing.expectEqual([2]u8{ 0x5a, 0x5a }, try self.readDepthProbeValues(index, true));
+        fillRepeatedPattern(bytes, &.{ 0, 0, 0x80, 0x3f });
+        try std.testing.expect(dcbWrite(self, target.address, bytes));
+        try std.testing.expectEqual([2]f32{ 1, 1 }, try self.readDepthProbeValues(index, false));
+        const code = [_]u32{ 0xd7460004, 8 | (134 << 9) | (256 << 18), 0x7e000204, 0x7e020205, 0x7e040206, 0x7e060207, 0xe01c2000, 0x80000004, 0xbf810000 };
+        const memory = self.guest_memory.?;
+        if (!memory.write(memory.context, 0x100, std.mem.sliceAsBytes(&code))) return error.TestFailed;
+        var compute = gpu.State{};
+        try compute.writeRegister(.shader, 0x20c, 1);
+        try compute.writeRegister(.shader, 0x20d, 0);
+        try compute.writeRegister(.shader, 0x213, (8 << 1) | (1 << 7));
+        const user_data = [_]u32{ @intCast(target.address), 16 << 16, @intCast(size / 16), (75 << 12) | 0xfac, 0, 0, 0, 0 };
+        for (user_data, 0..) |word, i| try compute.writeRegister(.shader, 0x240 + @as(u32, @intCast(i)), word);
+        _ = try self.dispatchRdna2State(&compute, .{ 64, 1, 1 }, .{ @intCast(size / (16 * 64)), 1, 1 });
+        try std.testing.expectEqual([2]f32{ 0, 0 }, try self.readDepthProbeValues(index, false));
+        try std.testing.expectEqual([2]u8{ 0x5a, 0x5a }, try self.readDepthProbeValues(index, true));
+        // Exercise a real translated buffer writer as well as the recognized fill.
+        const native = code[0 .. code.len - 1].* ++ [_]u32{ 0xbf800000, 0xbf810000 };
+        if (!memory.write(memory.context, 0x200, std.mem.sliceAsBytes(&native))) return error.TestFailed;
+        try compute.writeRegister(.shader, 0x20c, 2);
+        for (0..4) |i| try compute.writeRegister(.shader, 0x244 + @as(u32, @intCast(i)), 0x3f800000);
+        _ = try self.dispatchRdna2State(&compute, .{ 64, 1, 1 }, .{ @intCast(size / (16 * 64)), 1, 1 });
+        try std.testing.expectEqual([2]f32{ 1, 1 }, try self.readDepthProbeValues(index, false));
+        try std.testing.expectEqual([2]u8{ 0x5a, 0x5a }, try self.readDepthProbeValues(index, true));
     }
 
     pub fn probeHtileDepthClears(self: *Renderer) anyerror!void {
@@ -27749,7 +27881,7 @@ pub const Renderer = struct {
             if (chain.signature != signature) break;
             return .{
                 .image = chain.image,
-                .view = try self.residentImageViewLevels(chain.image.handle, vk.image_view_type_2d, image_format, try sampledImageComponents(descriptor.dst_select), vk.image_aspect_color_bit, 1, levels),
+                .view = try self.residentImageViewLevels(chain.image.handle, vk.image_view_type_2d, image_format, try sampledImageComponents(descriptor.dst_select, descriptor.unified_format), vk.image_aspect_color_bit, 1, levels),
                 .sampler = try self.residentSampler(sampler_descriptor),
             };
         }
@@ -27872,7 +28004,7 @@ pub const Renderer = struct {
         // with that fixed the wait bought nothing and cost a full pipeline
         // drain per pyramid per frame.
 
-        const components = try sampledImageComponents(descriptor.dst_select);
+        const components = try sampledImageComponents(descriptor.dst_select, descriptor.unified_format);
         const view = try self.residentImageViewLevels(
             destination.handle,
             vk.image_view_type_2d,
@@ -27993,7 +28125,7 @@ pub const Renderer = struct {
                 .layer_count = if (cached.descriptor.image_type == .color_2d_array) cached.subresource.depth_or_layers else 1,
             }, image_state.storage_read_usage);
             try self.submitOneShot(access_commands);
-            const components = try sampledImageComponents(descriptor.dst_select);
+            const components = try sampledImageComponents(descriptor.dst_select, descriptor.unified_format);
             const view = try self.residentImageView(
                 cached.image.handle,
                 switch (dimension) {
@@ -28079,7 +28211,7 @@ pub const Renderer = struct {
         const view_info = vk.ImageViewCreateInfo{
             .image = snapshot.handle,
             .format = image_format,
-            .components = try sampledImageComponents(descriptor.dst_select),
+            .components = try sampledImageComponents(descriptor.dst_select, descriptor.unified_format),
             .subresource_range = .{ .aspect_mask = vk.image_aspect_color_bit },
         };
         var view: vk.ImageView = 0;
@@ -28540,7 +28672,7 @@ pub const Renderer = struct {
                         .two_d_array => vk.image_view_type_2d_array,
                     },
                     image_format,
-                    try sampledImageComponents(descriptor.dst_select),
+                    try sampledImageComponents(descriptor.dst_select, descriptor.unified_format),
                     vk.image_aspect_color_bit,
                     if (is_cube or is_2d_array) available_layers else 1,
                     item.mip_levels,
@@ -28918,7 +29050,7 @@ pub const Renderer = struct {
             );
             @memset(linear, 0);
         }
-        const components = try sampledImageComponents(descriptor.dst_select);
+        const components = try sampledImageComponents(descriptor.dst_select, descriptor.unified_format);
         // A cube-compatible 2D image stores one face per array layer. Some
         // Unreal fallback descriptors are typed as cube while a DIM=2D
         // instruction samples only the first 1x1 face; keep that legal by
@@ -31234,6 +31366,7 @@ pub const Renderer = struct {
             cached.depth_snapshot = null;
             cached.content_generation = 0;
         };
+        self.applyUniformDepthWrite(address, bytes) catch return false;
         self.applyUniformHtileWrite(address, bytes) catch return false;
         self.applyUniformDccWrite(address, bytes) catch return false;
         return true;
@@ -31946,6 +32079,7 @@ pub const Renderer = struct {
                 self.prepareHtileWrite(dma.destination_address, byte_count);
                 self.writeGuestCommandBytes(dma.destination_address, bytes) catch return false;
                 self.invalidateDmaDestination(dma.destination_address, byte_count);
+                self.applyUniformDepthWrite(dma.destination_address, bytes) catch return false;
                 self.applyUniformHtileWrite(dma.destination_address, bytes) catch return false;
                 self.applyUniformDccWrite(dma.destination_address, bytes) catch return false;
             },
@@ -36475,6 +36609,12 @@ fn sampledImageFormat(unified_format: u16, force_srgb: bool) ?u32 {
         // format, so use its byte-identical UNORM representation.
         128 => vk.format_r8_unorm,
         130 => vk.format_r8g8b8a8_srgb,
+        // Guest packed components start at the least significant bits. The
+        // view swizzle below composes this layout with the T# selectors.
+        133 => vk.format_b5g6r5_unorm_pack16,
+        134 => vk.format_a1r5g5b5_unorm_pack16,
+        135 => vk.format_r5g5b5a1_unorm_pack16,
+        136 => vk.format_r4g4b4a4_unorm_pack16,
         169 => if (force_srgb) vk.format_bc1_rgba_srgb_block else vk.format_bc1_rgba_unorm_block,
         170 => vk.format_bc1_rgba_srgb_block,
         171 => if (force_srgb) vk.format_bc2_srgb_block else vk.format_bc2_unorm_block,
@@ -36778,7 +36918,7 @@ fn sameStorageImageDescriptor(a: gpu.ImageDescriptor, b: gpu.ImageDescriptor) bo
 fn storageImageBytesPerTexel(unified_format: u16) u8 {
     return switch (unified_format) {
         1...6, 128 => 1,
-        7...19, 129 => 2,
+        7...19, 129, 133...136 => 2,
         20...30, 36, 50, 56...61, 130 => 4,
         62...71 => 8,
         75...77 => 16,
@@ -36871,18 +37011,25 @@ fn vulkanComponentSwizzle(selector: u8) Error!u32 {
     };
 }
 
-fn sampledImageComponents(selectors: [4]u8) Error!vk.ComponentMapping {
-    for (selectors) |selector| {
-        if (selector != 0 and selector != 1 and (selector < 4 or selector > 7)) {
+fn sampledImageComponents(selectors: [4]u8, unified_format: u16) Error!vk.ComponentMapping {
+    const guest_to_host: [4]u8 = switch (unified_format) {
+        134 => .{ 6, 5, 4, 7 }, // A1R5G5B5: guest R occupies host B.
+        135, 136 => .{ 7, 6, 5, 4 }, // Vulkan names packed channels MSB first.
+        else => .{ 4, 5, 6, 7 },
+    };
+    var mapped = selectors;
+    for (&mapped) |*selector| {
+        if (selector.* != 0 and selector.* != 1 and (selector.* < 4 or selector.* > 7)) {
             std.debug.print("[vulkan dcb] unsupported sampled component selectors {any}\n", .{selectors});
             return Error.UnsupportedSampledImage;
         }
+        if (selector.* >= 4) selector.* = guest_to_host[selector.* - 4];
     }
     return .{
-        .r = try vulkanComponentSwizzle(selectors[0]),
-        .g = try vulkanComponentSwizzle(selectors[1]),
-        .b = try vulkanComponentSwizzle(selectors[2]),
-        .a = try vulkanComponentSwizzle(selectors[3]),
+        .r = try vulkanComponentSwizzle(mapped[0]),
+        .g = try vulkanComponentSwizzle(mapped[1]),
+        .b = try vulkanComponentSwizzle(mapped[2]),
+        .a = try vulkanComponentSwizzle(mapped[3]),
     };
 }
 
@@ -42880,18 +43027,37 @@ test "sampled image views honor sRGB and destination selectors" {
     try std.testing.expectEqual(@as(u32, 1), vulkanMinMagFilter(3));
     try std.testing.expect(sampledImageFormat(0, false) == null);
 
-    const identity = try sampledImageComponents(.{ 4, 5, 6, 7 });
+    const identity = try sampledImageComponents(.{ 4, 5, 6, 7 }, 56);
     try std.testing.expectEqual(vk.component_swizzle_r, identity.r);
     try std.testing.expectEqual(vk.component_swizzle_g, identity.g);
     try std.testing.expectEqual(vk.component_swizzle_b, identity.b);
     try std.testing.expectEqual(vk.component_swizzle_a, identity.a);
 
-    const blue_one_red_zero = try sampledImageComponents(.{ 6, 1, 4, 0 });
+    const blue_one_red_zero = try sampledImageComponents(.{ 6, 1, 4, 0 }, 56);
     try std.testing.expectEqual(vk.component_swizzle_b, blue_one_red_zero.r);
     try std.testing.expectEqual(vk.component_swizzle_one, blue_one_red_zero.g);
     try std.testing.expectEqual(vk.component_swizzle_r, blue_one_red_zero.b);
     try std.testing.expectEqual(vk.component_swizzle_zero, blue_one_red_zero.a);
-    try std.testing.expectError(Error.UnsupportedSampledImage, sampledImageComponents(.{ 2, 5, 6, 7 }));
+    try std.testing.expectError(Error.UnsupportedSampledImage, sampledImageComponents(.{ 2, 5, 6, 7 }, 56));
+}
+
+test "packed sampled formats preserve component bits and descriptor constants" {
+    const formats = [_]u32{ vk.format_b5g6r5_unorm_pack16, vk.format_a1r5g5b5_unorm_pack16, vk.format_r5g5b5a1_unorm_pack16, vk.format_r4g4b4a4_unorm_pack16 };
+    for (formats, 133..) |format, guest| {
+        const unified: u16 = @intCast(guest);
+        try std.testing.expectEqual(format, sampledImageFormat(unified, false).?);
+        try std.testing.expectEqual(@as(u8, 2), storageImageBytesPerTexel(unified));
+        try std.testing.expectEqual(@as(u8, 2), gpu.elementLayoutForUnifiedFormat(unified).?.bytes);
+    }
+    // 0x8421 has guest RGBA nibbles 1,2,4,8 but Vulkan RGBA 8,4,2,1.
+    const packed_components = try sampledImageComponents(.{ 4, 5, 6, 7 }, 136);
+    try std.testing.expectEqual(vk.ComponentMapping{ .r = vk.component_swizzle_a, .g = vk.component_swizzle_b, .b = vk.component_swizzle_g, .a = vk.component_swizzle_r }, packed_components);
+    // Raiden's actual BGRA T# must compose with that reversal, not replace it.
+    const raiden = try sampledImageComponents(.{ 6, 5, 4, 7 }, 136);
+    try std.testing.expectEqual(vk.ComponentMapping{ .r = vk.component_swizzle_g, .g = vk.component_swizzle_b, .b = vk.component_swizzle_a, .a = vk.component_swizzle_r }, raiden);
+    const constant = try sampledImageComponents(.{ 6, 1, 4, 0 }, 134);
+    try std.testing.expectEqual(vk.ComponentMapping{ .r = vk.component_swizzle_r, .g = vk.component_swizzle_one, .b = vk.component_swizzle_b, .a = vk.component_swizzle_zero }, constant);
+    try std.testing.expectError(Error.UnsupportedSampledImage, sampledImageComponents(.{ 3, 5, 6, 7 }, 136));
 }
 
 test "first-use sampled views cover the T# mip range" {

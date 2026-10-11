@@ -2079,7 +2079,7 @@ pub const BufferLayout = struct {
 pub fn elementLayoutForUnifiedFormat(format: u16) ?ElementLayout {
     return switch (format) {
         1...6, 128, 161 => .{ .bytes = 1 },
-        7...19, 129, 133, 134, 136 => .{ .bytes = 2 },
+        7...19, 129, 133...136 => .{ .bytes = 2 },
         20...61, 130, 132 => .{ .bytes = 4 },
         62...71 => .{ .bytes = 8 },
         72...74 => .{ .bytes = 12 },

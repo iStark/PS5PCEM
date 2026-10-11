@@ -170,6 +170,14 @@ fn padInit() callconv(abi.guest) i32 {
     return errno.ok;
 }
 
+/// Private PS5 initialization entry. The SDK wrapper calls it without setting
+/// arguments immediately after successful scePadInit. Share the controller
+/// initialization state, without guessing that stale argument registers point
+/// to an output buffer. Its public firmware name is still unknown.
+fn padInitPrivate() callconv(abi.guest) i32 {
+    return padInit();
+}
+
 fn padOpen(user_id: i32, port_type: i32, index: i32, parameter: ?*const anyopaque) callconv(abi.guest) i32 {
     if (initialized.load(.acquire) == 0) return error_not_initialized;
     // PS5 titles use port type 2 for the login user's special controller port
@@ -365,6 +373,7 @@ fn isRemoteController(_: i32) callconv(abi.guest) i32 {
 
 pub const exports = [_]symbols.Export{
     .{ .name = "scePadInit", .function = trace.wrap("scePadInit", &padInit), .expect_id = "hv1luiJrqQM" },
+    .{ .name = "scePadPrivateInit", .function = trace.wrap("scePadPrivateInit", &padInitPrivate), .id_override = "n3kSX62fgNo" },
     .{ .name = "scePadOpen", .function = trace.wrap("scePadOpen", &padOpen), .expect_id = "xk0AcarP3V4" },
     .{ .name = "scePadClose", .function = trace.wrap("scePadClose", &padClose), .expect_id = "6ncge5+l5Qs" },
     .{ .name = "scePadGetHandle", .function = trace.wrap("scePadGetHandle", &padGetHandle), .expect_id = "u1GRHp+oWoY" },

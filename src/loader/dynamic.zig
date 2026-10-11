@@ -626,7 +626,7 @@ test "standard dependency filenames and module filenames are retained" {
     try testing.expectEqualStrings("original.prx", info.original_filename.?);
 }
 
-test "standard PS5 dynamic addresses resolve through a mapped load segment" {
+test "standard PS5 dynamic addresses resolve with omitted library-version metadata" {
     const strings = "\x00app\x00libkernel\x00";
     const image_vaddr: u64 = 0x20_0000;
     const entries = [_]Entry{
@@ -651,7 +651,7 @@ test "standard PS5 dynamic addresses resolve through a mapped load segment" {
         try payload.appendSlice(testing.allocator, std.mem.asBytes(&entry));
     }
 
-    const file_offset = elf.TestImage.payloadOffset(2);
+    const file_offset = elf.TestImage.payloadOffset(3);
     const segments = [_]elf.ProgramHeader{
         .{
             .type = @intFromEnum(elf.SegmentType.load),
@@ -673,24 +673,59 @@ test "standard PS5 dynamic addresses resolve through a mapped load segment" {
             .memsz = payload.items.len - dynamic_offset,
             .@"align" = 8,
         },
+        // PT_SCE_LIBVERSION can be declared but absent from a stripped image.
+        // It is not the backing store for DT_STRTAB/DT_SYMTAB/DT_RELA.
+        .{
+            .type = 0x6fff_ff01,
+            .flags = 0,
+            .offset = file_offset + payload.items.len,
+            .vaddr = 0,
+            .paddr = 0,
+            .filesz = 39,
+            .memsz = 32,
+            .@"align" = 16,
+        },
     };
 
     var fixture = try elf.TestImage.build(testing.allocator, .sce_dynexec, &segments, payload.items);
     defer fixture.deinit(testing.allocator);
-    const image = try elf.parse(fixture.bytes());
-    var info = try parse(testing.allocator, image);
-    defer info.deinit(testing.allocator);
+    // Wrap the same ELF in a decrypted SELF. Only its PT_LOAD is stored;
+    // PT_DYNAMIC is a view into that payload, with no trailing version bytes.
+    const self_container = @import("self.zig");
+    var self_header = std.mem.zeroes(self_container.Header);
+    @memcpy(self_header.ident[0..4], &self_container.magic);
+    self_header.ident[5] = 1;
+    self_header.ident[6] = 1;
+    self_header.ident[7] = 0x12;
+    self_header.segment_count = 1;
+    const self_segment = self_container.Segment{
+        .type = 0x800,
+        .offset = @sizeOf(self_container.Header) + @sizeOf(self_container.Segment) + file_offset,
+        .compressed_size = payload.items.len,
+        .decompressed_size = payload.items.len,
+    };
+    var self_bytes: std.ArrayList(u8) = .empty;
+    defer self_bytes.deinit(testing.allocator);
+    try self_bytes.appendSlice(testing.allocator, std.mem.asBytes(&self_header));
+    try self_bytes.appendSlice(testing.allocator, std.mem.asBytes(&self_segment));
+    try self_bytes.appendSlice(testing.allocator, fixture.bytes());
 
-    try testing.expectEqual(TableAddressing.virtual_address, info.table_addressing);
-    try testing.expectEqual(@as(?u64, image_vaddr), info.symtab_offset);
-    try testing.expectEqual(@as(?u64, image_vaddr), info.rela_offset);
-    try testing.expectEqual(@as(?u64, image_vaddr), info.jmprel_offset);
-    try testing.expectEqualStrings("app", info.module_info.?.name);
-    try testing.expectEqualStrings("libkernel", info.import_libraries.items[0].name);
-    try testing.expectEqualStrings(
-        strings,
-        try info.tableData(image, info.strtab_offset, info.strtab_size),
-    );
+    for ([_][]const u8{ fixture.bytes(), self_bytes.items }) |bytes| {
+        const image = try elf.parse(bytes);
+        var info = try parse(testing.allocator, image);
+        defer info.deinit(testing.allocator);
+
+        try testing.expectEqual(TableAddressing.virtual_address, info.table_addressing);
+        try testing.expectEqual(@as(?u64, image_vaddr), info.symtab_offset);
+        try testing.expectEqual(@as(?u64, image_vaddr), info.rela_offset);
+        try testing.expectEqual(@as(?u64, image_vaddr), info.jmprel_offset);
+        try testing.expectEqualStrings("app", info.module_info.?.name);
+        try testing.expectEqualStrings("libkernel", info.import_libraries.items[0].name);
+        try testing.expectEqualStrings(
+            strings,
+            try info.tableData(image, info.strtab_offset, info.strtab_size),
+        );
+    }
 }
 
 test "an import resolves to a named library through its code" {

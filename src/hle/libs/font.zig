@@ -108,6 +108,17 @@ const Font = struct {
 };
 var lock: memory.HostMutex = .{};
 var libraries: [32]usize = @splat(0);
+const DeviceCache = struct {
+    bytes: []u8 = &.{},
+    owned: bool = false,
+    cursor: usize = 0,
+
+    fn clear(self: *DeviceCache) void {
+        if (self.owned) allocator.free(self.bytes);
+        self.* = .{};
+    }
+};
+var device_caches: [32]DeviceCache = @splat(.{});
 var renderers: [64]usize = @splat(0);
 var fonts: [128]Font = @splat(.{});
 var next_handle: usize = 0x464f0000;
@@ -118,6 +129,7 @@ pub fn reset() void {
     lock.lock();
     defer lock.unlock();
     for (&fonts) |*font| font.close();
+    for (&device_caches) |*cache| cache.clear();
     @memset(&libraries, 0);
     @memset(&renderers, 0);
     // Do not recycle stale handles when another title starts in this process.
@@ -219,7 +231,8 @@ fn destroyLibrary(output: ?*usize) callconv(abi.guest) i32 {
     for (&fonts) |*font| if (font.library == handle) {
         font.close();
     };
-    for (&libraries) |*slot| if (slot.* == handle) {
+    for (&libraries, 0..) |*slot, index| if (slot.* == handle) {
+        device_caches[index].clear();
         slot.* = 0;
     };
     writeOutput(usize, output.?, 0);
@@ -292,6 +305,45 @@ fn supportSystemFonts(library: usize) callconv(abi.guest) i32 {
 }
 fn supportExternalFonts(library: usize, _: u32, _: u32) callconv(abi.guest) i32 {
     return supportSystemFonts(library);
+}
+
+/// Null storage asks the library to own the cache allocation. Caller storage
+/// remains borrowed. Glyph transfer images use this buffer, with wraparound;
+/// the outline cache stays in FreeType's host-side representation.
+fn attachDeviceCacheBuffer(library: usize, address: usize, size: u32) callconv(abi.guest) i32 {
+    if (size > 64 * 1024 * 1024 or (address != 0 and size == 0)) return invalid_parameter;
+    lock.lock();
+    defer lock.unlock();
+    if (library == 0) return invalid_parameter;
+    const index = std.mem.indexOfScalar(usize, &libraries, library) orelse return invalid_parameter;
+    var replacement = DeviceCache{};
+    if (size != 0) {
+        if (address == 0) {
+            replacement.bytes = allocator.alloc(u8, size) catch return errno.KernelError.enomem.raw();
+            replacement.owned = true;
+        } else {
+            if (!writable(address, size)) return errno.KernelError.efault.raw();
+            replacement.bytes = @as([*]u8, @ptrFromInt(address))[0..size];
+        }
+    }
+    device_caches[index].clear();
+    device_caches[index] = replacement;
+    for (&fonts) |*font| if (font.library == library) {
+        font.trans_image = .{};
+    };
+    return errno.ok;
+}
+
+fn cacheTransferImage(library: usize, pixels: []const u8) []const u8 {
+    const index = std.mem.indexOfScalar(usize, &libraries, library) orelse return pixels;
+    const cache = &device_caches[index];
+    if (pixels.len == 0 or pixels.len > cache.bytes.len) return pixels;
+    if (pixels.len > cache.bytes.len - cache.cursor) cache.cursor = 0;
+    const destination = cache.bytes[cache.cursor..][0..pixels.len];
+    if (!cache.owned) notifyWrite(@intFromPtr(destination.ptr), destination.len);
+    @memcpy(destination, pixels);
+    cache.cursor += pixels.len;
+    return destination;
 }
 fn bindRenderer(handle: usize, renderer: usize) callconv(abi.guest) i32 {
     lock.lock();
@@ -454,7 +506,8 @@ fn renderGlyph(handle: usize, codepoint: u32, surface: ?*RenderSurface, x: f32, 
         if (status != errno.ok) return status;
         result.surface_image = .{ .address = s.buffer, .width_bytes = @intCast(s.width_bytes), .pixel_size_bytes = @intCast(s.pixel_size_bytes) };
     }
-    font.trans_image = .{ .address = if (glyph.pixels.len != 0) @intFromPtr(glyph.pixels.ptr) else 0, .width_bytes = glyph.width, .width = glyph.width, .height = glyph.height };
+    const transfer_pixels = cacheTransferImage(font.library, glyph.pixels);
+    font.trans_image = .{ .address = if (transfer_pixels.len != 0) @intFromPtr(transfer_pixels.ptr) else 0, .width_bytes = glyph.width, .width = glyph.width, .height = glyph.height };
     result.trans_image = @intFromPtr(&font.trans_image);
     result.image_metrics = .{
         .bearing_x = @floatFromInt(glyph.left),
@@ -489,6 +542,7 @@ pub const exports = [_]symbols.Export{
     .{ .name = "sceFontCreateLibraryWithEdition", .function = trace.wrap("sceFontCreateLibraryWithEdition", &createLibrary), .expect_id = "n590hj5Oe-k" },
     .{ .name = "sceFontSupportSystemFonts", .function = trace.wrap("sceFontSupportSystemFonts", &supportSystemFonts), .expect_id = "SsRbbCiWoGw" },
     .{ .name = "sceFontSupportExternalFonts", .function = trace.wrap("sceFontSupportExternalFonts", &supportExternalFonts), .expect_id = "mz2iTY0MK4A" },
+    .{ .name = "sceFontAttachDeviceCacheBuffer", .function = trace.wrap("sceFontAttachDeviceCacheBuffer", &attachDeviceCacheBuffer), .expect_id = "CUKn5pX-NVY" },
     .{ .name = "sceFontCreateRendererWithEdition", .function = trace.wrap("sceFontCreateRendererWithEdition", &createRenderer), .expect_id = "WaSFJoRWXaI" },
     .{ .name = "sceFontRenderSurfaceInit", .function = trace.wrap("sceFontRenderSurfaceInit", &renderSurfaceInit), .expect_id = "gdUCnU0gHdI" },
     .{ .name = "sceFontRenderSurfaceSetScissor", .function = trace.wrap("sceFontRenderSurfaceSetScissor", &renderSurfaceSetScissor), .expect_id = "vRxf4d0ulPs" },
@@ -539,6 +593,33 @@ test "font writes invalidate GPU watches and reject read-only guest surfaces" {
     surface.buffer = 1;
     try std.testing.expectEqual(errno.KernelError.efault.raw(), renderGlyph(font, 'W', &surface, 8, 24, null, null));
     try std.testing.expectEqual(errno.KernelError.efault.raw(), openFontMemory(library, 1, 1024, 0, &font));
+}
+
+test "font device cache owns or borrows storage and backs rendered transfer images" {
+    reset();
+    defer reset();
+    var library: usize = 0;
+    var font: usize = 0;
+    try std.testing.expectEqual(errno.ok, createLibrary(null, 0, 0, &library));
+    try std.testing.expectEqual(errno.ok, openFontSet(library, 0, 0, 0, &font));
+    var buffer: [4096]u8 = @splat(0xaa);
+    try std.testing.expectEqual(invalid_parameter, attachDeviceCacheBuffer(0, @intFromPtr(&buffer), buffer.len));
+    try std.testing.expectEqual(errno.ok, attachDeviceCacheBuffer(library, @intFromPtr(&buffer), buffer.len));
+    var result = RenderOutput{};
+    try std.testing.expectEqual(errno.ok, renderGlyph(font, 'W', null, 0, 0, null, &result));
+    const transfer: *const TransImage = @ptrFromInt(result.trans_image);
+    try std.testing.expectEqual(@intFromPtr(&buffer), transfer.address);
+    try std.testing.expect(transfer.width != 0 and transfer.height != 0);
+    const bytes = transfer.width * transfer.height;
+    try std.testing.expect(std.mem.indexOfNone(u8, buffer[0..bytes], &.{0}) != null);
+    try std.testing.expectEqual(@as(u8, 0xaa), buffer[bytes]);
+    try std.testing.expectEqual(errno.ok, attachDeviceCacheBuffer(library, 0, 1024 * 1024));
+    const index = std.mem.indexOfScalar(usize, &libraries, library).?;
+    try std.testing.expect(device_caches[index].owned);
+    try std.testing.expectEqual(errno.ok, renderGlyph(font, 'A', null, 0, 0, null, &result));
+    try std.testing.expectEqual(@intFromPtr(device_caches[index].bytes.ptr), transfer.address);
+    try std.testing.expectEqual(errno.ok, destroyLibrary(&library));
+    try std.testing.expectEqual(@as(usize, 0), device_caches[index].bytes.len);
 }
 
 test "font ABI structures retain firmware sizes and offsets" {

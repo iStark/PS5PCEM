@@ -295,6 +295,10 @@ pub const descriptor_type_input_attachment: u32 = 10;
 pub const subpass_description_rasterization_order_attachment_color_access_bit: Flags = 0x0000_0010;
 pub const pipeline_color_blend_rasterization_order_attachment_access_bit: Flags = 0x0000_0001;
 
+pub const format_r4g4b4a4_unorm_pack16: u32 = 2;
+pub const format_b5g6r5_unorm_pack16: u32 = 5;
+pub const format_r5g5b5a1_unorm_pack16: u32 = 6;
+pub const format_a1r5g5b5_unorm_pack16: u32 = 8;
 pub const format_r8_unorm: u32 = 9;
 pub const format_r8_snorm: u32 = 10;
 pub const format_r8_uint: u32 = 13;

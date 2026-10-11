@@ -13298,6 +13298,15 @@ pub fn main(init: std.process.Init) !void {
         try runCubeArrayProbe(allocator);
         return;
     }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--raw-depth-clears")) {
+        var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true });
+        defer renderer.deinit();
+        var guest = SizedGuestMemory(0xa0000){};
+        _ = renderer.dcbBackend(guest.interface());
+        try renderer.probeRawDepthClears();
+        std.debug.print("Raw depth clears passed: initial bytes, raster depth, partial guards, emulated/native compute and stencil preservation\n", .{});
+        return;
+    }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--htile-clears")) {
         var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true });
         defer renderer.deinit();
