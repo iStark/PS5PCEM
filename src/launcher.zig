@@ -21,6 +21,11 @@ comptime {
 }
 
 const site_url = "https://ps5pcem.com";
+/// Where a newer release is downloaded. `latest` redirects to the newest
+/// published release; the API below reports the same one.
+const releases_url = "https://github.com/iStark/PS5PCEM/releases/latest";
+const latest_release_host = "api.github.com";
+const latest_release_path = "/repos/iStark/PS5PCEM/releases/latest";
 const github_url = "https://github.com/iStark/PS5PCEM";
 const boosty_url = "https://boosty.to/ps5pcem";
 const window_width = 1180;
@@ -140,6 +145,14 @@ const Phrase = enum {
     column_title,
     column_identifier,
     column_folder,
+    update_check,
+    update_checking,
+    update_latest,
+    update_available,
+    update_failed,
+    status_update_latest,
+    status_update_available,
+    status_update_failed,
 };
 
 const Rect = struct {
@@ -238,6 +251,16 @@ var extract_output: [1024]u16 = @splat(0);
 var extract_output_length: usize = 0;
 const extract_timer_id: usize = 3;
 const wm_extract_finished: u32 = Win32.wm_app + 1;
+/// Posted by the update check with 1 when `update_remote_tag` holds the latest
+/// release tag and 0 when GitHub could not be asked.
+const wm_update_checked: u32 = Win32.wm_app + 2;
+const UpdateState = enum { idle, checking, latest, available, failed };
+var update_state: UpdateState = .idle;
+var hovered_update = false;
+/// Written by the checking thread before it posts its message, read by the
+/// window thread after it arrives.
+var update_remote_tag: [32]u8 = undefined;
+var update_remote_tag_length: usize = 0;
 const extract_log_capacity = 8;
 const extract_log_bytes = 200;
 /// Shared with the reader thread, under `extract_lock`.
@@ -380,6 +403,14 @@ fn tr(phrase: Phrase) []const u8 {
             .column_title => "TITLE",
             .column_identifier => "TITLE ID",
             .column_folder => "FOLDER",
+            .update_check => "Check for updates",
+            .update_checking => "Checking…",
+            .update_latest => "Latest version",
+            .update_available => "Update available",
+            .update_failed => "Check failed",
+            .status_update_latest => "You have the latest version, v{v}",
+            .status_update_available => "Version v{v} is available · click the button to download",
+            .status_update_failed => "Could not reach GitHub to check for updates",
         },
         .chinese_simplified => switch (phrase) {
             .nav_library => "游戏库",
@@ -488,6 +519,14 @@ fn tr(phrase: Phrase) []const u8 {
             .column_title => "名称",
             .column_identifier => "游戏 ID",
             .column_folder => "文件夹",
+            .update_check => "检查更新",
+            .update_checking => "正在检查…",
+            .update_latest => "已是最新版本",
+            .update_available => "有可用更新",
+            .update_failed => "检查失败",
+            .status_update_latest => "当前已是最新版本：v{v}",
+            .status_update_available => "v{v} 版本已发布 · 点击按钮下载",
+            .status_update_failed => "无法连接 GitHub 检查更新",
         },
         .spanish => switch (phrase) {
             .nav_library => "Biblioteca",
@@ -596,6 +635,14 @@ fn tr(phrase: Phrase) []const u8 {
             .column_title => "TÍTULO",
             .column_identifier => "ID DEL TÍTULO",
             .column_folder => "CARPETA",
+            .update_check => "Comprobar versión",
+            .update_checking => "Comprobando…",
+            .update_latest => "Última versión",
+            .update_available => "Nueva versión",
+            .update_failed => "Error al comprobar",
+            .status_update_latest => "Tienes la última versión: v{v}",
+            .status_update_available => "La versión v{v} está disponible · haz clic para descargarla",
+            .status_update_failed => "No se pudo contactar con GitHub para buscar actualizaciones",
         },
         .arabic => switch (phrase) {
             .nav_library => "المكتبة",
@@ -704,6 +751,14 @@ fn tr(phrase: Phrase) []const u8 {
             .column_title => "العنوان",
             .column_identifier => "معرّف اللعبة",
             .column_folder => "المجلد",
+            .update_check => "البحث عن تحديث",
+            .update_checking => "جارٍ التحقق…",
+            .update_latest => "أحدث إصدار",
+            .update_available => "يتوفر تحديث",
+            .update_failed => "فشل التحقق",
+            .status_update_latest => "لديك أحدث إصدار: v{v}",
+            .status_update_available => "الإصدار v{v} متاح · انقر على الزر للتنزيل",
+            .status_update_failed => "تعذّر الاتصال بـ GitHub للتحقق من التحديثات",
         },
         .portuguese => switch (phrase) {
             .nav_library => "Biblioteca",
@@ -812,6 +867,14 @@ fn tr(phrase: Phrase) []const u8 {
             .column_title => "TÍTULO",
             .column_identifier => "ID DO TÍTULO",
             .column_folder => "PASTA",
+            .update_check => "Verificar versão",
+            .update_checking => "Verificando…",
+            .update_latest => "Versão mais recente",
+            .update_available => "Nova versão",
+            .update_failed => "Falha na verificação",
+            .status_update_latest => "Você tem a versão mais recente: v{v}",
+            .status_update_available => "A versão v{v} está disponível · clique para baixar",
+            .status_update_failed => "Não foi possível acessar o GitHub para verificar atualizações",
         },
         .russian => switch (phrase) {
             .nav_library => "Библиотека",
@@ -920,6 +983,14 @@ fn tr(phrase: Phrase) []const u8 {
             .column_title => "НАЗВАНИЕ",
             .column_identifier => "ID ИГРЫ",
             .column_folder => "ПАПКА",
+            .update_check => "Проверить версию",
+            .update_checking => "Проверка…",
+            .update_latest => "Последняя версия",
+            .update_available => "Есть обновление",
+            .update_failed => "Ошибка проверки",
+            .status_update_latest => "У вас последняя версия: v{v}",
+            .status_update_available => "Доступна версия v{v} · нажмите кнопку, чтобы скачать",
+            .status_update_failed => "Не удалось связаться с GitHub для проверки обновлений",
         },
         .german => switch (phrase) {
             .nav_library => "Bibliothek",
@@ -1028,6 +1099,14 @@ fn tr(phrase: Phrase) []const u8 {
             .column_title => "TITEL",
             .column_identifier => "TITEL-ID",
             .column_folder => "ORDNER",
+            .update_check => "Nach Updates suchen",
+            .update_checking => "Wird geprüft…",
+            .update_latest => "Aktuelle Version",
+            .update_available => "Update verfügbar",
+            .update_failed => "Prüfung misslungen",
+            .status_update_latest => "Du hast die aktuelle Version: v{v}",
+            .status_update_available => "Version v{v} ist verfügbar · zum Herunterladen klicken",
+            .status_update_failed => "GitHub war für die Update-Prüfung nicht erreichbar",
         },
         .french => switch (phrase) {
             .nav_library => "Bibliothèque",
@@ -1136,6 +1215,14 @@ fn tr(phrase: Phrase) []const u8 {
             .column_title => "TITRE",
             .column_identifier => "ID DU TITRE",
             .column_folder => "DOSSIER",
+            .update_check => "Vérifier la version",
+            .update_checking => "Vérification…",
+            .update_latest => "Dernière version",
+            .update_available => "Nouvelle version",
+            .update_failed => "Vérification échouée",
+            .status_update_latest => "Vous avez la dernière version : v{v}",
+            .status_update_available => "La version v{v} est disponible · cliquez pour la télécharger",
+            .status_update_failed => "Impossible de joindre GitHub pour vérifier les mises à jour",
         },
     };
 }
@@ -1273,13 +1360,16 @@ fn windowProcedure(
                 break :blk recentRemoveRect(slot).contains(x, y);
             } else false;
             const next_arrow = if (current_page == .library) libraryArrowAt(x, y) else null;
+            const next_update = update_rect.contains(x, y);
             if (next_game != hovered_recent_game or
                 next_remove != hovered_recent_remove or
-                next_arrow != hovered_library_arrow)
+                next_arrow != hovered_library_arrow or
+                next_update != hovered_update)
             {
                 hovered_recent_game = next_game;
                 hovered_recent_remove = next_remove;
                 hovered_library_arrow = next_arrow;
+                hovered_update = next_update;
                 _ = Win32.InvalidateRect(window, null, 0);
             }
             if (!tracking_mouse_leave) {
@@ -1308,10 +1398,11 @@ fn windowProcedure(
         },
         Win32.wm_mouse_leave => {
             tracking_mouse_leave = false;
-            if (hovered_recent_game != null or hovered_recent_remove or hovered_library_arrow != null) {
+            if (hovered_recent_game != null or hovered_recent_remove or hovered_library_arrow != null or hovered_update) {
                 hovered_recent_game = null;
                 hovered_recent_remove = false;
                 hovered_library_arrow = null;
+                hovered_update = false;
                 _ = Win32.InvalidateRect(window, null, 0);
             }
             return 0;
@@ -1403,6 +1494,11 @@ fn windowProcedure(
             syncSearchBox(window);
             return 0;
         },
+        wm_update_checked => {
+            finishUpdateCheck(word_parameter != 0);
+            _ = Win32.InvalidateRect(window, null, 0);
+            return 0;
+        },
         Win32.wm_destroy => {
             // Closing the launcher abandons the extraction; the extractor has
             // no window of its own to be stopped from.
@@ -1442,15 +1538,18 @@ const library_launch_rect = Rect{ .left = 776, .top = 646, .right = 1086, .botto
 const library_prev_rect = Rect{ .left = 236, .top = 298, .right = 270, .bottom = 354 };
 const library_next_rect = Rect{ .left = 1085, .top = 298, .right = 1119, .bottom = 354 };
 
+/// The update button every page carries at the end of its heading row.
+const update_rect = Rect{ .left = 936, .top = 44, .right = 1086, .bottom = 72 };
+
 // The search box and the view switch share the heading row with the title,
-// left of the build pill every page carries.
-const library_search_rect = Rect{ .left = 604, .top = 44, .right = 880, .bottom = 72 };
+// left of the update button.
+const library_search_rect = Rect{ .left = 580, .top = 44, .right = 840, .bottom = 72 };
 const library_view_rects = [_]Rect{
-    .{ .left = 892, .top = 44, .right = 928, .bottom = 72 },
-    .{ .left = 934, .top = 44, .right = 970, .bottom = 72 },
+    .{ .left = 852, .top = 44, .right = 886, .bottom = 72 },
+    .{ .left = 892, .top = 44, .right = 926, .bottom = 72 },
 };
 /// Where the edit control sits inside the drawn box, right of the magnifier.
-const search_edit_rect = Rect{ .left = 638, .top = 48, .right = 870, .bottom = 69 };
+const search_edit_rect = Rect{ .left = 614, .top = 48, .right = 830, .bottom = 69 };
 const search_box_colour: u32 = 0x00251f1b;
 
 /// Pages the library needs. Always at least one, so an empty library or an
@@ -1783,6 +1882,7 @@ fn indexOfRect(rects: []const Rect, x: i32, y: i32) ?usize {
 /// Whether the pointer is over something that responds to a click.
 fn clickableAt(x: i32, y: i32) bool {
     if (indexOfRect(&nav_rects, x, y) != null) return true;
+    if (update_rect.contains(x, y)) return update_state != .checking;
     return switch (current_page) {
         .library => recentGameAt(x, y) != null or
             libraryViewAt(x, y) != null or
@@ -1827,6 +1927,8 @@ fn handleClick(window: Win32.Window, x: i32, y: i32) void {
             hovered_recent_game = null;
             hovered_recent_remove = false;
         }
+    } else if (update_rect.contains(x, y)) {
+        handleUpdateClick(window);
     } else switch (current_page) {
         .library => handleLibraryClick(window, x, y),
         .input => handleInputClick(x, y),
@@ -2253,7 +2355,7 @@ fn drawLibraryToolbar(dc: Win32.DeviceContext) void {
         const selected = view == library_view;
         roundFill(dc, rectangle, 10, if (selected) 0x003d3029 else search_box_colour);
         const colour: u32 = if (selected) 0x00ffac64 else 0x008b817a;
-        const x = rectangle.left + 10;
+        const x = rectangle.left + @divTrunc(rectangle.right - rectangle.left - 16, 2);
         const y = rectangle.top + 6;
         switch (view) {
             // Four tiles.
@@ -3014,7 +3116,7 @@ fn drawSettings(dc: Win32.DeviceContext) void {
 }
 
 fn pageHeading(dc: Win32.DeviceContext, heading: Phrase, subtitle: Phrase) void {
-    pageHeadingBefore(dc, heading, subtitle, 966);
+    pageHeadingBefore(dc, heading, subtitle, update_rect.left - 16);
 }
 
 /// The library shares the heading row with its search box, so its title stops
@@ -3022,11 +3124,38 @@ fn pageHeading(dc: Win32.DeviceContext, heading: Phrase, subtitle: Phrase) void 
 fn pageHeadingBefore(dc: Win32.DeviceContext, heading: Phrase, subtitle: Phrase, heading_right: i32) void {
     localizedText(dc, heading, .{ .left = 282, .top = 42, .right = heading_right, .bottom = 82 }, 0x00f4f0ea, title_font, Win32.dt_left | Win32.dt_end_ellipsis);
     localizedText(dc, subtitle, .{ .left = 282, .top = 91, .right = 1086, .bottom = 118 }, 0x009b9088, regular_font, Win32.dt_left);
-    roundFill(dc, .{ .left = 984, .top = 44, .right = 1086, .bottom = 72 }, 14, 0x00342a25);
+    drawUpdateButton(dc);
+}
+
+/// The pill that used to read EARLY BUILD, now a button that asks GitHub for
+/// the latest release and then says what it found. An available update fills
+/// it with the accent colour; clicking it then opens the release page.
+fn drawUpdateButton(dc: Win32.DeviceContext) void {
+    const background: u32 = if (update_state == .available)
+        (if (hovered_update) 0x00ffb366 else 0x00ff9c3d)
+    else if (hovered_update and update_state != .checking)
+        0x004a3a2e
+    else
+        0x00342a25;
+    roundFill(dc, update_rect, 14, background);
+    const label: Phrase = switch (update_state) {
+        .idle => .update_check,
+        .checking => .update_checking,
+        .latest => .update_latest,
+        .available => .update_available,
+        .failed => .update_failed,
+    };
+    const colour: u32 = switch (update_state) {
+        .idle => 0x00ffac64,
+        .checking => 0x009b9088,
+        .latest => 0x0068d391,
+        .available => 0x00181510,
+        .failed => 0x006b77ff,
+    };
     // The label needs the pill's whole inner width. A narrower rectangle
     // centred the text and then clipped both of its ends, which read as a
     // misspelling rather than as truncation.
-    text(dc, w("EARLY BUILD"), -1, .{ .left = 988, .top = 52, .right = 1082, .bottom = 68 }, 0x00ffac64, small_font, Win32.dt_center | Win32.dt_end_ellipsis);
+    localizedText(dc, label, .{ .left = update_rect.left + 6, .top = update_rect.top + 7, .right = update_rect.right - 6, .bottom = update_rect.bottom - 4 }, colour, small_font, Win32.dt_center | Win32.dt_end_ellipsis);
 }
 
 fn drawFooter(dc: Win32.DeviceContext) void {
@@ -3574,6 +3703,127 @@ fn findGameExecutable(output: *[1024]u16) bool {
 
 fn openGithub(owner: Win32.Window) void {
     _ = Win32.ShellExecuteW(owner, w("open"), w(github_url), null, null, Win32.show_normal);
+}
+
+fn handleUpdateClick(window: Win32.Window) void {
+    switch (update_state) {
+        .checking => {},
+        .available => _ = Win32.ShellExecuteW(window, w("open"), w(releases_url), null, null, Win32.show_normal),
+        .idle, .latest, .failed => {
+            update_state = .checking;
+            const checker = std.Thread.spawn(.{}, checkLatestRelease, .{window}) catch {
+                finishUpdateCheck(false);
+                return;
+            };
+            checker.detach();
+        },
+    }
+}
+
+/// Runs on its own thread: a slow or unreachable network must not freeze the
+/// window. GitHub requires a User-Agent, which WinHttpOpen supplies.
+fn checkLatestRelease(window: Win32.Window) void {
+    const found = fetchLatestReleaseTag();
+    _ = Win32.PostMessageW(window, wm_update_checked, @intFromBool(found), 0);
+}
+
+fn fetchLatestReleaseTag() bool {
+    const session = Win32.WinHttpOpen(w("PS5PCEM-Launcher/" ++ build_options.release_version), Win32.winhttp_automatic_proxy, null, null, 0) orelse return false;
+    defer _ = Win32.WinHttpCloseHandle(session);
+    _ = Win32.WinHttpSetTimeouts(session, 10_000, 10_000, 10_000, 10_000);
+    const connection = Win32.WinHttpConnect(session, w(latest_release_host), 443, 0) orelse return false;
+    defer _ = Win32.WinHttpCloseHandle(connection);
+    const request = Win32.WinHttpOpenRequest(connection, w("GET"), w(latest_release_path), null, null, null, Win32.winhttp_flag_secure) orelse return false;
+    defer _ = Win32.WinHttpCloseHandle(request);
+    const accept = w("Accept: application/vnd.github+json\r\n");
+    _ = Win32.WinHttpAddRequestHeaders(request, accept, @intCast(wideLength(accept)), Win32.winhttp_add_header);
+    if (Win32.WinHttpSendRequest(request, null, 0, null, 0, 0, 0) == 0) return false;
+    if (Win32.WinHttpReceiveResponse(request, null) == 0) return false;
+    var status: u32 = 0;
+    var status_size: u32 = @sizeOf(u32);
+    if (Win32.WinHttpQueryHeaders(request, Win32.winhttp_query_status_code | Win32.winhttp_query_flag_number, null, &status, &status_size, null) == 0 or status != 200) return false;
+
+    // The tag comes near the start of the document, ahead of the release
+    // notes and asset list, so the first part of a long response is enough.
+    var document: [16 * 1024]u8 = undefined;
+    var length: usize = 0;
+    while (length < document.len) {
+        var read: u32 = 0;
+        if (Win32.WinHttpReadData(request, document[length..].ptr, @intCast(document.len - length), &read) == 0) return false;
+        if (read == 0) break;
+        length += read;
+    }
+    const tag = jsonStringValue(document[0..length], "\"tag_name\"") orelse return false;
+    if (tag.len == 0 or tag.len > update_remote_tag.len or parseReleaseVersion(tag) == null) return false;
+    @memcpy(update_remote_tag[0..tag.len], tag);
+    update_remote_tag_length = tag.len;
+    return true;
+}
+
+fn finishUpdateCheck(found: bool) void {
+    const remote = if (found) parseReleaseVersion(update_remote_tag[0..update_remote_tag_length]) else null;
+    const local = parseReleaseVersion(build_options.release_version);
+    if (remote == null or local == null) {
+        update_state = .failed;
+        setStatusPhrase(.status_update_failed, true);
+        return;
+    }
+    if (isNewerRelease(remote.?, local.?)) {
+        update_state = .available;
+        setStatusWithVersion(.status_update_available, versionDigits(update_remote_tag[0..update_remote_tag_length]));
+    } else {
+        update_state = .latest;
+        // A development build can be ahead of the latest release; it names
+        // the release it was built from, not the older one GitHub reported.
+        setStatusWithVersion(.status_update_latest, build_options.release_version);
+    }
+}
+
+/// Major, minor and patch of a tag such as "v0.3.4" or "0.3.1-beta.1". Missing
+/// components read as zero, and a pre-release suffix is ignored.
+fn parseReleaseVersion(tag: []const u8) ?[3]u32 {
+    const digits = versionDigits(tag);
+    var parts: [3]u32 = .{ 0, 0, 0 };
+    var cursor: usize = 0;
+    for (&parts, 0..) |*part, index| {
+        const start = cursor;
+        while (cursor < digits.len and std.ascii.isDigit(digits[cursor])) : (cursor += 1) {}
+        if (cursor == start) return if (index == 0) null else parts;
+        part.* = std.fmt.parseInt(u32, digits[start..cursor], 10) catch return null;
+        if (cursor >= digits.len or digits[cursor] != '.') break;
+        cursor += 1;
+    }
+    return parts;
+}
+
+fn versionDigits(tag: []const u8) []const u8 {
+    return if (tag.len != 0 and (tag[0] == 'v' or tag[0] == 'V')) tag[1..] else tag;
+}
+
+fn isNewerRelease(remote: [3]u32, local: [3]u32) bool {
+    return std.mem.order(u32, &remote, &local) == .gt;
+}
+
+/// Fills the `{v}` in a status phrase with a version number.
+fn setStatusWithVersion(phrase: Phrase, version: []const u8) void {
+    const template = tr(phrase);
+    var line: [256]u8 = undefined;
+    const marker = std.mem.indexOf(u8, template, "{v}") orelse return setStatus(template, false);
+    const composed = std.fmt.bufPrint(&line, "{s}{s}{s}", .{ template[0..marker], version, template[marker + 3 ..] }) catch return setStatus(template, false);
+    setStatus(composed, false);
+}
+
+test "release tags compare by major, minor and patch" {
+    try std.testing.expectEqual([3]u32{ 0, 3, 4 }, parseReleaseVersion("v0.3.4").?);
+    try std.testing.expectEqual([3]u32{ 0, 3, 1 }, parseReleaseVersion("0.3.1-beta.1").?);
+    try std.testing.expectEqual([3]u32{ 1, 0, 0 }, parseReleaseVersion("v1").?);
+    try std.testing.expectEqual([3]u32{ 0, 10, 0 }, parseReleaseVersion("0.10").?);
+    try std.testing.expectEqual(@as(?[3]u32, null), parseReleaseVersion("latest"));
+    try std.testing.expectEqual(@as(?[3]u32, null), parseReleaseVersion(""));
+    try std.testing.expect(isNewerRelease(.{ 0, 3, 5 }, .{ 0, 3, 4 }));
+    try std.testing.expect(isNewerRelease(.{ 0, 10, 0 }, .{ 0, 9, 9 }));
+    try std.testing.expect(!isNewerRelease(.{ 0, 3, 4 }, .{ 0, 3, 4 }));
+    try std.testing.expect(!isNewerRelease(.{ 0, 3, 3 }, .{ 0, 3, 4 }));
 }
 
 fn openSite(owner: Win32.Window) void {
@@ -4241,4 +4491,20 @@ const Win32 = if (builtin.os.tag == .windows) struct {
     extern "ole32" fn CoUninitialize() callconv(.winapi) void;
     extern "ole32" fn CoTaskMemFree(?*anyopaque) callconv(.winapi) void;
     extern "dwmapi" fn DwmSetWindowAttribute(Window, u32, *const anyopaque, u32) callconv(.winapi) i32;
+
+    const winhttp_automatic_proxy: u32 = 4;
+    const winhttp_flag_secure: u32 = 0x0080_0000;
+    const winhttp_add_header: u32 = 0x2000_0000;
+    const winhttp_query_status_code: u32 = 19;
+    const winhttp_query_flag_number: u32 = 0x2000_0000;
+    extern "winhttp" fn WinHttpOpen([*:0]const u16, u32, ?[*:0]const u16, ?[*:0]const u16, u32) callconv(.winapi) Handle;
+    extern "winhttp" fn WinHttpSetTimeouts(Handle, i32, i32, i32, i32) callconv(.winapi) i32;
+    extern "winhttp" fn WinHttpConnect(Handle, [*:0]const u16, u16, u32) callconv(.winapi) Handle;
+    extern "winhttp" fn WinHttpOpenRequest(Handle, [*:0]const u16, [*:0]const u16, ?[*:0]const u16, ?[*:0]const u16, ?*const ?[*:0]const u16, u32) callconv(.winapi) Handle;
+    extern "winhttp" fn WinHttpAddRequestHeaders(Handle, [*]const u16, u32, u32) callconv(.winapi) i32;
+    extern "winhttp" fn WinHttpSendRequest(Handle, ?[*]const u16, u32, ?*anyopaque, u32, u32, usize) callconv(.winapi) i32;
+    extern "winhttp" fn WinHttpReceiveResponse(Handle, ?*anyopaque) callconv(.winapi) i32;
+    extern "winhttp" fn WinHttpQueryHeaders(Handle, u32, ?[*:0]const u16, ?*anyopaque, *u32, ?*u32) callconv(.winapi) i32;
+    extern "winhttp" fn WinHttpReadData(Handle, [*]u8, u32, *u32) callconv(.winapi) i32;
+    extern "winhttp" fn WinHttpCloseHandle(Handle) callconv(.winapi) i32;
 } else struct {};

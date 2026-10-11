@@ -61,8 +61,9 @@ behind them.
   next run; the launcher groups every local slot by title ID.
 - A native Windows launcher maintains a recent-game library of up to 48 titles
   with installed cover art, shown as a cover grid or a table and searchable by
-  title, title ID or folder name. It persists sound and input profiles and
-  starts `game-run` with controller, keyboard, or hybrid controls.
+  title, title ID or folder name. It persists sound and input profiles,
+  starts `game-run` with controller, keyboard, or hybrid controls, and checks
+  GitHub Releases for a newer version from a button in its heading row.
   Sony's own pads are read directly over HID, so a DualSense or DualShock 4
   works without a translation layer; the launcher reports which one it found and
   can drive its motors and light bar as a check.
