@@ -612,7 +612,9 @@ const InstanceFunctions = struct {
 };
 
 const SurfaceFunctions = struct {
-    create_win32_surface: vk.PfnCreateWin32SurfaceKHR,
+    create_win32_surface: if (builtin.os.tag == .windows) vk.PfnCreateWin32SurfaceKHR else void,
+    /// Linux presents to an X11 window (see the window module).
+    create_xlib_surface: if (builtin.os.tag == .linux) vk.PfnCreateXlibSurfaceKHR else void,
     destroy_surface: vk.PfnDestroySurfaceKHR,
     get_surface_support: vk.PfnGetPhysicalDeviceSurfaceSupportKHR,
     get_surface_capabilities: vk.PfnGetPhysicalDeviceSurfaceCapabilitiesKHR,
@@ -620,9 +622,14 @@ const SurfaceFunctions = struct {
     get_surface_formats: vk.PfnGetPhysicalDeviceSurfaceFormatsKHR,
 
     fn load(loader: *const Loader, instance_handle: vk.Instance) Error!SurfaceFunctions {
-        if (builtin.os.tag != .windows) return Error.UnsupportedPresentationPlatform;
+        if (builtin.os.tag != .windows and builtin.os.tag != .linux) return Error.UnsupportedPresentationPlatform;
         return .{
-            .create_win32_surface = try loader.instance(instance_handle, vk.PfnCreateWin32SurfaceKHR, "vkCreateWin32SurfaceKHR"),
+            .create_win32_surface = if (builtin.os.tag == .windows)
+                try loader.instance(instance_handle, vk.PfnCreateWin32SurfaceKHR, "vkCreateWin32SurfaceKHR")
+            else {},
+            .create_xlib_surface = if (builtin.os.tag == .linux)
+                try loader.instance(instance_handle, vk.PfnCreateXlibSurfaceKHR, "vkCreateXlibSurfaceKHR")
+            else {},
             .destroy_surface = try loader.instance(instance_handle, vk.PfnDestroySurfaceKHR, "vkDestroySurfaceKHR"),
             .get_surface_support = try loader.instance(instance_handle, vk.PfnGetPhysicalDeviceSurfaceSupportKHR, "vkGetPhysicalDeviceSurfaceSupportKHR"),
             .get_surface_capabilities = try loader.instance(instance_handle, vk.PfnGetPhysicalDeviceSurfaceCapabilitiesKHR, "vkGetPhysicalDeviceSurfaceCapabilitiesKHR"),
@@ -5950,7 +5957,7 @@ pub const Renderer = struct {
 
     pub fn init(allocator: std.mem.Allocator, options: Options) (Error || std.mem.Allocator.Error)!Renderer {
         const wants_presentation = options.native_window != null;
-        if (wants_presentation and builtin.os.tag != .windows) return Error.UnsupportedPresentationPlatform;
+        if (wants_presentation and builtin.os.tag != .windows and builtin.os.tag != .linux) return Error.UnsupportedPresentationPlatform;
         var loader = try Loader.init();
         errdefer loader.deinit();
 
@@ -5973,7 +5980,7 @@ pub const Renderer = struct {
         const layer_names = [_][*:0]const u8{validation_name};
         const instance_extension_names = [_][*:0]const u8{
             "VK_KHR_surface",
-            "VK_KHR_win32_surface",
+            if (builtin.os.tag == .linux) "VK_KHR_xlib_surface" else "VK_KHR_win32_surface",
         };
 
         const application_info = vk.ApplicationInfo{
@@ -6003,12 +6010,23 @@ pub const Renderer = struct {
             null;
         var surface: vk.Surface = 0;
         if (options.native_window) |window| {
-            const surface_info = vk.Win32SurfaceCreateInfoKHR{
-                .instance = window.instance,
-                .window = window.window,
-            };
-            if (surface_functions.?.create_win32_surface(instance_handle, &surface_info, null, &surface) != vk.success) {
-                return Error.SurfaceCreationFailed;
+            if (builtin.os.tag == .linux) {
+                // The window module hands over the Xlib Display and the XID.
+                const surface_info = vk.XlibSurfaceCreateInfoKHR{
+                    .display = window.instance,
+                    .window = @intFromPtr(window.window),
+                };
+                if (surface_functions.?.create_xlib_surface(instance_handle, &surface_info, null, &surface) != vk.success) {
+                    return Error.SurfaceCreationFailed;
+                }
+            } else {
+                const surface_info = vk.Win32SurfaceCreateInfoKHR{
+                    .instance = window.instance,
+                    .window = window.window,
+                };
+                if (surface_functions.?.create_win32_surface(instance_handle, &surface_info, null, &surface) != vk.success) {
+                    return Error.SurfaceCreationFailed;
+                }
             }
         }
         errdefer if (surface != 0) surface_functions.?.destroy_surface(instance_handle, surface, null);

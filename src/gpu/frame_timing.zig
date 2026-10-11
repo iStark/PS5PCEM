@@ -25,10 +25,12 @@ pub const Split = struct {
 /// Monotonic host nanoseconds, or zero where no counter is available. A zero
 /// return disables the split rather than reporting a nonsensical interval.
 pub fn timestampNs() u64 {
-    if (comptime builtin.os.tag != .windows) {
-        var timer = std.time.Timer.start() catch return 0;
-        return timer.read();
+    if (comptime builtin.os.tag == .linux) {
+        var now: std.os.linux.timespec = undefined;
+        if (std.os.linux.clock_gettime(.MONOTONIC, &now) != 0 or now.sec < 0) return 0;
+        return @as(u64, @intCast(now.sec)) * std.time.ns_per_s + @as(u64, @intCast(now.nsec));
     }
+    if (comptime builtin.os.tag != .windows) return 0;
     var counter: std.os.windows.LARGE_INTEGER = 0;
     if (!std.os.windows.ntdll.RtlQueryPerformanceCounter(&counter).toBool() or counter < 0) return 0;
     var frequency = counter_frequency.load(.monotonic);

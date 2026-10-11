@@ -296,11 +296,11 @@ pub const Bridge = struct {
     }
 };
 
-/// Whether this build can contain the direct Windows x86-64 execution path.
-/// Runtime availability additionally depends on the operating system exposing
-/// user-mode RDFSBASE/WRFSBASE support.
+/// Whether this build can contain the direct x86-64 execution path, on Windows
+/// or Linux. Runtime availability additionally depends on the operating system
+/// exposing user-mode RDFSBASE/WRFSBASE support.
 pub const can_use_native_bridge = builtin.cpu.arch == .x86_64 and
-    builtin.os.tag == .windows;
+    (builtin.os.tag == .windows or builtin.os.tag == .linux);
 
 const NativeCallFrame = extern struct {
     // The first 272 bytes are shared with the hand-written assembly below.
@@ -797,7 +797,12 @@ fn resolveStackPointer(request: ExecuteRequest) ?u64 {
         null;
 }
 
-const NativeMachine = if (can_use_native_bridge) WindowsX64Machine else UnsupportedMachine;
+const NativeMachine = if (!can_use_native_bridge)
+    UnsupportedMachine
+else if (builtin.os.tag == .linux)
+    LinuxX64Machine
+else
+    WindowsX64Machine;
 
 const UnsupportedMachine = struct {
     fn isSupported() bool {
@@ -825,6 +830,286 @@ const UnsupportedMachine = struct {
     }
 };
 
+/// Direct System V AMD64 execution on a Linux x86-64 host.
+///
+/// The bridge assembly is shared with Windows: it is called with the Microsoft
+/// convention on either host and saves a superset of the System V callee-saved
+/// registers. Two things differ. Linux keeps host thread-local storage in FS,
+/// so every firmware thunk switches FS back to the host value through the
+/// per-thread block described in `hle.guest_fs`. And faults arrive as signals;
+/// they are rewritten into the Windows exception record and context and handed
+/// to the same handler, so every recovery it implements applies unchanged.
+const LinuxX64Machine = struct {
+    const linux = std.os.linux;
+    const windows = std.os.windows;
+    const ThreadBlock = hle.guest_fs.ThreadBlock;
+
+    /// HWCAP2_FSGSBASE: the kernel permits RDFSBASE/WRFSBASE (Linux 5.9+).
+    const hwcap2_fsgsbase: usize = 1 << 1;
+    /// A guest thread that has exhausted its own stack must still be able to
+    /// run the handler, and the handler formats reports with sizeable frames.
+    const signal_stack_size: usize = 256 * 1024;
+    const handled_signals = [_]std.posix.SIG{ .SEGV, .BUS, .ILL };
+    /// si_code of a fault the kernel raised without a page address: a general
+    /// protection fault, for example a non-canonical access.
+    const si_kernel: i32 = 0x80;
+    const trap_page_fault: u64 = 14;
+    /// Page-fault error code bits.
+    const page_fault_write: u64 = 1 << 1;
+    const page_fault_fetch: u64 = 1 << 4;
+
+    /// The kernel's x86-64 sigcontext, which follows the stack description in
+    /// ucontext. Zig's standard library does not describe it for this target.
+    const SignalRegisters = extern struct {
+        r8: u64,
+        r9: u64,
+        r10: u64,
+        r11: u64,
+        r12: u64,
+        r13: u64,
+        r14: u64,
+        r15: u64,
+        rdi: u64,
+        rsi: u64,
+        rbp: u64,
+        rbx: u64,
+        rdx: u64,
+        rax: u64,
+        rcx: u64,
+        rsp: u64,
+        rip: u64,
+        eflags: u64,
+        segments: u64,
+        err: u64,
+        trapno: u64,
+        oldmask: u64,
+        cr2: u64,
+        /// FXSAVE layout; XMM0-15 start at byte 160.
+        fpstate: ?[*]u8,
+        reserved: [8]u64,
+    };
+
+    const SignalContext = extern struct {
+        flags: u64,
+        link: u64,
+        stack: linux.stack_t,
+        registers: SignalRegisters,
+    };
+
+    comptime {
+        std.debug.assert(@offsetOf(SignalContext, "registers") == 40);
+        std.debug.assert(@offsetOf(SignalRegisters, "rip") == 128);
+        std.debug.assert(@offsetOf(SignalRegisters, "err") == 152);
+        std.debug.assert(@offsetOf(SignalRegisters, "fpstate") == 184);
+    }
+
+    threadlocal var thread_block: ?*ThreadBlock = null;
+    var previous_actions: [handled_signals.len]std.posix.Sigaction = undefined;
+
+    fn isSupported() bool {
+        // With libc, glibc's startup code runs instead of Zig's and only libc
+        // has seen the auxiliary vector.
+        const hwcap2: usize = if (builtin.link_libc)
+            std.c.getauxval(std.elf.AT_HWCAP2)
+        else
+            linux.getauxval(std.elf.AT_HWCAP2);
+        return hwcap2 & hwcap2_fsgsbase != 0;
+    }
+
+    fn installFaultHandler() ?*anyopaque {
+        var action = std.posix.Sigaction{
+            .handler = .{ .sigaction = handleSignal },
+            .mask = std.posix.sigemptyset(),
+            // NODEFER lets a fault inside the handler reach it again, where
+            // the reentrancy guard declines it instead of the kernel killing
+            // the process without a report.
+            .flags = std.posix.SA.SIGINFO | std.posix.SA.ONSTACK | std.posix.SA.NODEFER,
+        };
+        for (handled_signals, 0..) |signal, index| {
+            std.posix.sigaction(signal, &action, &previous_actions[index]);
+        }
+        return @ptrCast(&previous_actions);
+    }
+
+    fn removeFaultHandler(_: *anyopaque) void {
+        for (handled_signals, 0..) |signal, index| {
+            std.posix.sigaction(signal, &previous_actions[index], null);
+        }
+    }
+
+    /// Gives the calling OS thread its GS block and alternate signal stack.
+    /// Both outlive the thread's guest executions; they are a few hundred
+    /// kilobytes per host worker and are kept for its lifetime.
+    fn ensureThreadBlock() *ThreadBlock {
+        if (thread_block) |block| return block;
+        const block = std.heap.page_allocator.create(ThreadBlock) catch
+            @panic("cannot allocate the guest thread block");
+        block.* = .{ .host_fs = readFsBase(), .guest_fs = 0 };
+        if (std.heap.page_allocator.alloc(u8, signal_stack_size)) |stack| {
+            const description = linux.stack_t{ .sp = stack.ptr, .flags = 0, .size = stack.len };
+            _ = linux.sigaltstack(&description, null);
+        } else |_| {}
+        hle.guest_fs.install(block);
+        thread_block = block;
+        return block;
+    }
+
+    fn call(
+        frame: *NativeCallFrame,
+        entry_point: u64,
+        stack_pointer: u64,
+    ) u64 {
+        const block = ensureThreadBlock();
+        // Nested callbacks belong to the same guest thread and carry the
+        // same base, so restoring the previous value is only for clarity.
+        const previous_guest_fs = block.guest_fs;
+        block.guest_fs = frame.guest_fs_base;
+        defer block.guest_fs = previous_guest_fs;
+        const firmware_state = hle.host_stack.CallState.capture();
+        defer firmware_state.restore();
+        return ps5NativeCallWindowsX64(frame, entry_point, stack_pointer);
+    }
+
+    fn escape(frame: *NativeCallFrame) noreturn {
+        ps5NativeEscapeWindowsX64(frame);
+    }
+
+    fn readFsBase() u64 {
+        return asm volatile ("rdfsbase %[base]"
+            : [base] "=r" (-> u64),
+        );
+    }
+
+    fn writeFsBase(value: u64) void {
+        asm volatile ("wrfsbase %[base]"
+            :
+            : [base] "r" (value),
+        );
+    }
+
+    fn handleSignal(
+        signal: std.posix.SIG,
+        info: *const std.posix.siginfo_t,
+        raw_context: ?*anyopaque,
+    ) callconv(.c) void {
+        // Before anything that could touch host thread-local storage.
+        const replaced_fs = hle.guest_fs.enterHost();
+        defer hle.guest_fs.leaveHost(replaced_fs);
+        const context: *SignalContext = @ptrCast(@alignCast(raw_context orelse return));
+        if (!dispatch(signal, info, &context.registers)) decline(signal);
+    }
+
+    /// Runs the Windows handler on an equivalent record and context, and
+    /// copies its edits back. Returns whether execution should resume.
+    fn dispatch(
+        signal: std.posix.SIG,
+        info: *const std.posix.siginfo_t,
+        registers: *SignalRegisters,
+    ) bool {
+        var record = std.mem.zeroes(windows.EXCEPTION_RECORD);
+        record.ExceptionAddress = @ptrFromInt(registers.rip);
+        switch (signal) {
+            .SEGV, .BUS => {
+                record.ExceptionCode = windows.EXCEPTION_ACCESS_VIOLATION;
+                record.NumberParameters = 2;
+                const page_fault = registers.trapno == trap_page_fault and info.code != si_kernel;
+                record.ExceptionInformation[0] = if (!page_fault)
+                    0
+                else if (registers.err & page_fault_fetch != 0)
+                    8
+                else if (registers.err & page_fault_write != 0)
+                    1
+                else
+                    0;
+                // Windows reports a general protection fault, which has no
+                // page address, as an access to all ones. Zero would look like
+                // a null dereference and invite the null-pointer recoveries.
+                record.ExceptionInformation[1] = if (page_fault)
+                    @intFromPtr(info.fields.sigfault.addr)
+                else
+                    std.math.maxInt(u64);
+            },
+            .ILL => record.ExceptionCode = windows.EXCEPTION_ILLEGAL_INSTRUCTION,
+            else => return false,
+        }
+
+        var context = std.mem.zeroes(windows.CONTEXT);
+        loadContext(&context, registers);
+        var pointers = windows.EXCEPTION_POINTERS{
+            .ExceptionRecord = &record,
+            .ContextRecord = &context,
+        };
+        if (WindowsX64Machine.handleGuestException(&pointers) != WindowsX64Machine.exception_continue_execution) {
+            return false;
+        }
+        storeContext(registers, &context);
+        return true;
+    }
+
+    fn loadContext(context: *windows.CONTEXT, registers: *const SignalRegisters) void {
+        context.Rax = registers.rax;
+        context.Rbx = registers.rbx;
+        context.Rcx = registers.rcx;
+        context.Rdx = registers.rdx;
+        context.Rsi = registers.rsi;
+        context.Rdi = registers.rdi;
+        context.Rbp = registers.rbp;
+        context.Rsp = registers.rsp;
+        context.R8 = registers.r8;
+        context.R9 = registers.r9;
+        context.R10 = registers.r10;
+        context.R11 = registers.r11;
+        context.R12 = registers.r12;
+        context.R13 = registers.r13;
+        context.R14 = registers.r14;
+        context.R15 = registers.r15;
+        context.Rip = registers.rip;
+        context.EFlags = @truncate(registers.eflags);
+        if (registers.fpstate) |state| {
+            const xmm: [*]const windows.M128A = @ptrCast(@alignCast(state + 160));
+            const first = &context.DUMMYUNIONNAME.DUMMYSTRUCTNAME.Xmm0;
+            const destination: [*]windows.M128A = @ptrCast(first);
+            @memcpy(destination[0..16], xmm[0..16]);
+        }
+    }
+
+    fn storeContext(registers: *SignalRegisters, context: *const windows.CONTEXT) void {
+        registers.rax = context.Rax;
+        registers.rbx = context.Rbx;
+        registers.rcx = context.Rcx;
+        registers.rdx = context.Rdx;
+        registers.rsi = context.Rsi;
+        registers.rdi = context.Rdi;
+        registers.rbp = context.Rbp;
+        registers.rsp = context.Rsp;
+        registers.r8 = context.R8;
+        registers.r9 = context.R9;
+        registers.r10 = context.R10;
+        registers.r11 = context.R11;
+        registers.r12 = context.R12;
+        registers.r13 = context.R13;
+        registers.r14 = context.R14;
+        registers.r15 = context.R15;
+        registers.rip = context.Rip;
+        registers.eflags = (registers.eflags & ~@as(u64, 0xffff_ffff)) | context.EFlags;
+        if (registers.fpstate) |state| {
+            const xmm: [*]windows.M128A = @ptrCast(@alignCast(state + 160));
+            const first = &context.DUMMYUNIONNAME.DUMMYSTRUCTNAME.Xmm0;
+            const source: [*]const windows.M128A = @ptrCast(first);
+            @memcpy(xmm[0..16], source[0..16]);
+        }
+    }
+
+    /// Leaves the fault to whatever handled it before: normally the default
+    /// action, which terminates with a core dump once the instruction
+    /// faults again on return.
+    fn decline(signal: std.posix.SIG) void {
+        for (handled_signals, 0..) |candidate, index| {
+            if (candidate == signal) std.posix.sigaction(signal, &previous_actions[index], null);
+        }
+    }
+};
+
 const WindowsX64Machine = struct {
     const exception_continue_execution: c_long = -1;
     const exception_noncontinuable: u32 = 0x1;
@@ -848,6 +1133,9 @@ const WindowsX64Machine = struct {
     ) callconv(.winapi) usize;
 
     fn hostAllocationBase(address: u64) u64 {
+        // Only names the module in a host-fault report. Linux reuses the
+        // handler below and has no VirtualQuery to answer it.
+        if (comptime builtin.os.tag != .windows) return 0;
         var info: WindowsMemoryInfo = undefined;
         if (VirtualQuery(@ptrFromInt(address), &info, @sizeOf(WindowsMemoryInfo)) == 0) return 0;
         return if (info.allocation_base) |base| @intFromPtr(base) else 0;

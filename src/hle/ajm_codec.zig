@@ -742,7 +742,7 @@ pub const Decoder = struct {
         var sample_rate: c_ulong = 0;
         var channels: u8 = 0;
         const consumed = c.NeAACDecInit(handle, @ptrCast(@constCast(input.ptr)), @intCast(input.len), &sample_rate, &channels);
-        if (consumed < 0) return .{ .result = result_codec_fatal, .internal_result = consumed };
+        if (consumed < 0) return .{ .result = result_codec_fatal, .internal_result = std.math.cast(i32, consumed) orelse -1 };
         self.aac_opened = true;
         if (channels != 0) self.aac_channels = channels;
         if (sample_rate != 0) self.aac_sample_rate = @intCast(sample_rate);
@@ -785,7 +785,7 @@ pub const Decoder = struct {
             const channels: u32 = frame_info.channels;
             const frame_samples: u32 = @intCast(frame_info.samples / channels);
             self.aac_channels = channels;
-            if (frame_info.samplerate != 0) self.aac_sample_rate = frame_info.samplerate;
+            if (frame_info.samplerate != 0) self.aac_sample_rate = @intCast(frame_info.samplerate);
             self.aac_frame_samples = frame_samples;
             self.aac_heaac = if (frame_info.sbr != 0 or frame_info.ps != 0) 1 else 0;
             if (frame_info.samplerate != 0 and frame_samples != 0) {

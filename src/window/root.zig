@@ -52,9 +52,11 @@ pub const HostWindow = struct {
     window: std.atomic.Value(usize) = .init(0),
     width: u32 = 1280,
     height: u32 = 720,
+    /// Set by `requestClose` on Linux; the X11 event thread polls it.
+    close_requested: std.atomic.Value(bool) = .init(false),
 
     pub fn init(self: *HostWindow, width: u32, height: u32) Error!void {
-        if (builtin.os.tag != .windows) return error.UnsupportedPlatform;
+        if (builtin.os.tag != .windows and builtin.os.tag != .linux) return error.UnsupportedPlatform;
         if (width == 0 or height == 0) return error.WindowCreationFailed;
         self.* = .{
             .status = .init(status_starting),
@@ -100,6 +102,10 @@ pub const HostWindow = struct {
     }
 
     pub fn requestClose(self: *HostWindow) void {
+        if (builtin.os.tag == .linux) {
+            self.close_requested.store(true, .release);
+            return;
+        }
         if (builtin.os.tag != .windows) return;
         const value = self.window.load(.acquire);
         if (value != 0) _ = Win32.PostMessageA(@ptrFromInt(value), Win32.wm_close, 0, 0);
@@ -109,7 +115,7 @@ pub const HostWindow = struct {
     /// SetWindowText is safe across threads within the same process and avoids
     /// touching the Vulkan client area or adding work to every presented frame.
     pub fn updateFps(self: *HostWindow, fps_tenths: u32) void {
-        if (builtin.os.tag != .windows) return;
+        if (builtin.os.tag != .windows and builtin.os.tag != .linux) return;
         const value = self.window.load(.acquire);
         if (value == 0) return;
         var title: [96]u8 = undefined;
@@ -118,10 +124,20 @@ pub const HostWindow = struct {
             "PS5PCEM - Vulkan guest output - {d}.{d} FPS",
             .{ fps_tenths / 10, fps_tenths % 10 },
         ) catch return;
+        if (builtin.os.tag == .linux) {
+            // Xlib was initialised for threads, so the title can be set from
+            // the renderer's thread like SetWindowText on Windows.
+            const display = self.instance.load(.acquire);
+            if (display == 0) return;
+            _ = X11.functions.store_name(@ptrFromInt(display), value, title_z.ptr);
+            _ = X11.functions.flush(@ptrFromInt(display));
+            return;
+        }
         _ = Win32.SetWindowTextA(@ptrFromInt(value), title_z.ptr);
     }
 
     fn threadMain(self: *HostWindow) void {
+        if (builtin.os.tag == .linux) return X11.threadMain(self);
         if (builtin.os.tag != .windows) {
             self.status.store(status_failed, .release);
             return;
@@ -226,6 +242,232 @@ pub const HostWindow = struct {
             else => {},
         }
         return Win32.DefWindowProcA(window, message, word_parameter, long_parameter);
+    }
+};
+
+/// The Linux window: X11 through Xlib, loaded at run time.
+///
+/// X11 rather than Wayland because it is present on every Linux desktop,
+/// Wayland ones included through XWayland, and every Vulkan driver offers
+/// VK_KHR_xlib_surface. Loading libX11 dynamically keeps the runner free of a
+/// link-time dependency: without it the runner still starts, headless.
+///
+/// The native handle carries the Display pointer as `instance` and the window
+/// XID as `window`, the two values vkCreateXlibSurfaceKHR needs.
+const X11 = struct {
+    const Display = opaque {};
+    const XWindow = u64;
+    const Atom = u64;
+
+    /// XEvent is a union of at most 24 longs.
+    const Event = extern union {
+        type: i32,
+        key: extern struct {
+            type: i32,
+            serial: u64,
+            send_event: i32,
+            display: ?*Display,
+            window: XWindow,
+            root: XWindow,
+            subwindow: XWindow,
+            time: u64,
+            x: i32,
+            y: i32,
+            x_root: i32,
+            y_root: i32,
+            state: u32,
+            keycode: u32,
+            same_screen: i32,
+        },
+        client: extern struct {
+            type: i32,
+            serial: u64,
+            send_event: i32,
+            display: ?*Display,
+            window: XWindow,
+            message_type: Atom,
+            format: i32,
+            data: [5]u64,
+        },
+        padding: [24]u64,
+    };
+
+    const key_press: i32 = 2;
+    const key_release: i32 = 3;
+    const focus_in: i32 = 9;
+    const focus_out: i32 = 10;
+    const client_message: i32 = 33;
+    const key_press_mask: i64 = 1 << 0;
+    const key_release_mask: i64 = 1 << 1;
+    const structure_notify_mask: i64 = 1 << 17;
+    const focus_change_mask: i64 = 1 << 21;
+
+    const Functions = struct {
+        init_threads: *const fn () callconv(.c) i32,
+        open_display: *const fn (?[*:0]const u8) callconv(.c) ?*Display,
+        close_display: *const fn (*Display) callconv(.c) i32,
+        default_screen: *const fn (*Display) callconv(.c) i32,
+        root_window: *const fn (*Display, i32) callconv(.c) XWindow,
+        black_pixel: *const fn (*Display, i32) callconv(.c) u64,
+        display_width: *const fn (*Display, i32) callconv(.c) i32,
+        display_height: *const fn (*Display, i32) callconv(.c) i32,
+        create_simple_window: *const fn (*Display, XWindow, i32, i32, u32, u32, u32, u64, u64) callconv(.c) XWindow,
+        destroy_window: *const fn (*Display, XWindow) callconv(.c) i32,
+        store_name: *const fn (*Display, XWindow, [*:0]const u8) callconv(.c) i32,
+        select_input: *const fn (*Display, XWindow, i64) callconv(.c) i32,
+        intern_atom: *const fn (*Display, [*:0]const u8, i32) callconv(.c) Atom,
+        set_wm_protocols: *const fn (*Display, XWindow, [*]Atom, i32) callconv(.c) i32,
+        map_window: *const fn (*Display, XWindow) callconv(.c) i32,
+        flush: *const fn (*Display) callconv(.c) i32,
+        pending: *const fn (*Display) callconv(.c) i32,
+        next_event: *const fn (*Display, *Event) callconv(.c) i32,
+        lookup_keysym: *const fn (*Event, i32) callconv(.c) u64,
+        detectable_auto_repeat: *const fn (*Display, i32, ?*i32) callconv(.c) i32,
+    };
+
+    var library: ?std.DynLib = null;
+    var functions: Functions = undefined;
+
+    fn load() bool {
+        if (library != null) return true;
+        var opened = std.DynLib.open("libX11.so.6") catch return false;
+        inline for (.{
+            .{ "init_threads", "XInitThreads" },
+            .{ "open_display", "XOpenDisplay" },
+            .{ "close_display", "XCloseDisplay" },
+            .{ "default_screen", "XDefaultScreen" },
+            .{ "root_window", "XRootWindow" },
+            .{ "black_pixel", "XBlackPixel" },
+            .{ "display_width", "XDisplayWidth" },
+            .{ "display_height", "XDisplayHeight" },
+            .{ "create_simple_window", "XCreateSimpleWindow" },
+            .{ "destroy_window", "XDestroyWindow" },
+            .{ "store_name", "XStoreName" },
+            .{ "select_input", "XSelectInput" },
+            .{ "intern_atom", "XInternAtom" },
+            .{ "set_wm_protocols", "XSetWMProtocols" },
+            .{ "map_window", "XMapWindow" },
+            .{ "flush", "XFlush" },
+            .{ "pending", "XPending" },
+            .{ "next_event", "XNextEvent" },
+            .{ "lookup_keysym", "XLookupKeysym" },
+            .{ "detectable_auto_repeat", "XkbSetDetectableAutoRepeat" },
+        }) |entry| {
+            @field(functions, entry[0]) = opened.lookup(@FieldType(Functions, entry[0]), entry[1]) orelse {
+                opened.close();
+                return false;
+            };
+        }
+        // Vulkan presents from the renderer's thread through the same Display.
+        // XInitThreads must precede every other Xlib call to make that safe.
+        if (functions.init_threads() == 0) {
+            opened.close();
+            return false;
+        }
+        library = opened;
+        return true;
+    }
+
+    fn threadMain(window: *HostWindow) void {
+        if (!load()) return window.status.store(status_failed, .release);
+        const display = functions.open_display(null) orelse
+            return window.status.store(status_failed, .release);
+        const screen = functions.default_screen(display);
+        const fitted = fitClientExtent(
+            window.width,
+            window.height,
+            @intCast(@max(1, functions.display_width(display, screen))),
+            @intCast(@max(1, functions.display_height(display, screen))),
+        );
+        window.width = fitted.width;
+        window.height = fitted.height;
+        const black = functions.black_pixel(display, screen);
+        const native = functions.create_simple_window(
+            display,
+            functions.root_window(display, screen),
+            0,
+            0,
+            window.width,
+            window.height,
+            0,
+            black,
+            black,
+        );
+        if (native == 0) {
+            _ = functions.close_display(display);
+            return window.status.store(status_failed, .release);
+        }
+        _ = functions.store_name(display, native, "PS5PCEM - Vulkan guest output");
+        _ = functions.select_input(display, native, key_press_mask | key_release_mask | structure_notify_mask | focus_change_mask);
+        // Holding a key otherwise arrives as alternating release/press pairs.
+        _ = functions.detectable_auto_repeat(display, 1, null);
+        var delete_window = functions.intern_atom(display, "WM_DELETE_WINDOW", 0);
+        _ = functions.set_wm_protocols(display, native, @ptrCast(&delete_window), 1);
+        _ = functions.map_window(display, native);
+        _ = functions.flush(display);
+
+        window.instance.store(@intFromPtr(display), .release);
+        window.window.store(native, .release);
+        window.status.store(status_open, .release);
+
+        var event: Event = undefined;
+        while (!window.close_requested.load(.acquire)) {
+            if (functions.pending(display) == 0) {
+                // Polling keeps a close request from another thread visible
+                // without a wake-up event; 8 ms is well below input latency a
+                // player would notice and costs nothing measurable.
+                sleepMilliseconds(8);
+                continue;
+            }
+            _ = functions.next_event(display, &event);
+            switch (event.type) {
+                key_press, key_release => {
+                    const virtual_key = virtualKey(functions.lookup_keysym(&event, 0)) orelse continue;
+                    const down = event.type == key_press;
+                    input.noteKeyState(virtual_key, down);
+                    if (down) input.noteKeyPress(virtual_key);
+                },
+                focus_in => input.noteKeyboardFocus(true),
+                focus_out => input.noteKeyboardFocus(false),
+                client_message => if (event.client.data[0] == delete_window) break,
+                else => {},
+            }
+        }
+        input.noteKeyboardFocus(false);
+        window.window.store(0, .release);
+        window.status.store(status_closed, .release);
+        // The Display stays open: the renderer's surface and swapchain refer
+        // to it until the process ends, and closing it under them would make
+        // their next present fail rather than merely stop.
+        _ = functions.destroy_window(display, native);
+        _ = functions.flush(display);
+    }
+
+    fn sleepMilliseconds(milliseconds: u64) void {
+        var request = std.os.linux.timespec{ .sec = 0, .nsec = @intCast(milliseconds * std.time.ns_per_ms) };
+        _ = std.os.linux.nanosleep(&request, null);
+    }
+
+    /// Translates an X11 keysym to the Windows virtual-key code the key
+    /// mapping is written in. Keys without a use in the mapping are ignored.
+    fn virtualKey(keysym: u64) ?usize {
+        return switch (keysym) {
+            'a'...'z' => @intCast(keysym - 'a' + 'A'),
+            'A'...'Z', '0'...'9', ' ' => @intCast(keysym),
+            0xff08 => 0x08, // BackSpace
+            0xff09 => 0x09, // Tab
+            0xff0d, 0xff8d => 0x0d, // Return, KP_Enter
+            0xff1b => 0x1b, // Escape
+            0xff51 => 0x25, // Left
+            0xff52 => 0x26, // Up
+            0xff53 => 0x27, // Right
+            0xff54 => 0x28, // Down
+            0xffe1, 0xffe2 => 0x10, // Shift
+            0xffe3, 0xffe4 => 0x11, // Control
+            0xffe9, 0xffea => 0x12, // Alt
+            0xffbe...0xffc9 => @intCast(keysym - 0xffbe + 0x70), // F1-F12
+            else => null,
+        };
     }
 };
 

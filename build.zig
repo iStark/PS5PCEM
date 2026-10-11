@@ -93,7 +93,6 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-
     window.addImport("input", input);
 
     // Guest module images: ELF64 parsing and the dynamic linking tables.
@@ -591,6 +590,12 @@ pub fn build(b: *std.Build) void {
             .file = b.path("assets/windows/ps5pcem-runner.rc"),
             .include_paths = &.{b.path("assets/windows")},
         });
+    }
+    if (target.result.os.tag == .linux) {
+        // The same layout constraint as Windows: a default executable base
+        // and the brk heap after it would land in the guest's system-managed
+        // window, which starts at 256 KiB. 2 TiB is outside every aperture.
+        game_run.image_base = 0x0200_0000_0000;
     }
     const install_game_run = b.addInstallArtifact(game_run, .{});
     b.getInstallStep().dependOn(&install_game_run.step);

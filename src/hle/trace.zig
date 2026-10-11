@@ -23,6 +23,8 @@ const gpu = @import("gpu");
 const builtin = @import("builtin");
 const abi = @import("abi.zig");
 const host_stack = @import("host_stack.zig");
+// Must run before anything in a thunk touches host thread-local storage.
+const guest_fs = @import("guest_fs.zig");
 
 /// How many calls are retained. Two hundred and fifty six covers the run-up to
 /// a failure comfortably while keeping the buffer small enough to stay resident.
@@ -589,6 +591,8 @@ pub fn wrap(comptime name: []const u8, comptime func: anytype) abi.RawEntryPoint
     const Thunk = switch (info.params.len) {
         0 => struct {
             fn call() callconv(abi.guest) Result {
+                const replaced_fs = guest_fs.enterHost();
+                defer guest_fs.leaveHost(replaced_fs);
                 const args = [_]u64{};
                 enter(name, &args, @returnAddress());
                 return finish(name, host_stack.call(Result, func, .{}), &args);
@@ -596,6 +600,8 @@ pub fn wrap(comptime name: []const u8, comptime func: anytype) abi.RawEntryPoint
         },
         1 => struct {
             fn call(a0: P.t(0)) callconv(abi.guest) Result {
+                const replaced_fs = guest_fs.enterHost();
+                defer guest_fs.leaveHost(replaced_fs);
                 captureGuestCalleeSaved();
                 const args = [_]u64{word(a0)};
                 enter(name, &args, @returnAddress());
@@ -604,6 +610,8 @@ pub fn wrap(comptime name: []const u8, comptime func: anytype) abi.RawEntryPoint
         },
         2 => struct {
             fn call(a0: P.t(0), a1: P.t(1)) callconv(abi.guest) Result {
+                const replaced_fs = guest_fs.enterHost();
+                defer guest_fs.leaveHost(replaced_fs);
                 captureGuestCalleeSaved();
                 const args = [_]u64{ word(a0), word(a1) };
                 enter(name, &args, @returnAddress());
@@ -612,6 +620,8 @@ pub fn wrap(comptime name: []const u8, comptime func: anytype) abi.RawEntryPoint
         },
         3 => struct {
             fn call(a0: P.t(0), a1: P.t(1), a2: P.t(2)) callconv(abi.guest) Result {
+                const replaced_fs = guest_fs.enterHost();
+                defer guest_fs.leaveHost(replaced_fs);
                 const args = [_]u64{ word(a0), word(a1), word(a2) };
                 enter(name, &args, @returnAddress());
                 return finish(name, host_stack.call(Result, func, .{ a0, a1, a2 }), &args);
@@ -619,6 +629,8 @@ pub fn wrap(comptime name: []const u8, comptime func: anytype) abi.RawEntryPoint
         },
         4 => struct {
             fn call(a0: P.t(0), a1: P.t(1), a2: P.t(2), a3: P.t(3)) callconv(abi.guest) Result {
+                const replaced_fs = guest_fs.enterHost();
+                defer guest_fs.leaveHost(replaced_fs);
                 const args = [_]u64{ word(a0), word(a1), word(a2), word(a3) };
                 enter(name, &args, @returnAddress());
                 return finish(name, host_stack.call(Result, func, .{ a0, a1, a2, a3 }), &args);
@@ -632,6 +644,8 @@ pub fn wrap(comptime name: []const u8, comptime func: anytype) abi.RawEntryPoint
                 a3: P.t(3),
                 a4: P.t(4),
             ) callconv(abi.guest) Result {
+                const replaced_fs = guest_fs.enterHost();
+                defer guest_fs.leaveHost(replaced_fs);
                 const args = [_]u64{ word(a0), word(a1), word(a2), word(a3), word(a4) };
                 enter(name, &args, @returnAddress());
                 return finish(name, host_stack.call(Result, func, .{ a0, a1, a2, a3, a4 }), &args);
@@ -646,6 +660,8 @@ pub fn wrap(comptime name: []const u8, comptime func: anytype) abi.RawEntryPoint
                 a4: P.t(4),
                 a5: P.t(5),
             ) callconv(abi.guest) Result {
+                const replaced_fs = guest_fs.enterHost();
+                defer guest_fs.leaveHost(replaced_fs);
                 const args = [_]u64{ word(a0), word(a1), word(a2), word(a3), word(a4), word(a5) };
                 enter(name, &args, @returnAddress());
                 return finish(
@@ -665,6 +681,8 @@ pub fn wrap(comptime name: []const u8, comptime func: anytype) abi.RawEntryPoint
                 a5: P.t(5),
                 a6: P.t(6),
             ) callconv(abi.guest) Result {
+                const replaced_fs = guest_fs.enterHost();
+                defer guest_fs.leaveHost(replaced_fs);
                 const args = [_]u64{ word(a0), word(a1), word(a2), word(a3), word(a4), word(a5), word(a6) };
                 enter(name, &args, @returnAddress());
                 return finish(
@@ -685,6 +703,8 @@ pub fn wrap(comptime name: []const u8, comptime func: anytype) abi.RawEntryPoint
                 a6: P.t(6),
                 a7: P.t(7),
             ) callconv(abi.guest) Result {
+                const replaced_fs = guest_fs.enterHost();
+                defer guest_fs.leaveHost(replaced_fs);
                 const args = [_]u64{ word(a0), word(a1), word(a2), word(a3), word(a4), word(a5), word(a6), word(a7) };
                 enter(name, &args, @returnAddress());
                 return finish(
@@ -706,6 +726,8 @@ pub fn wrap(comptime name: []const u8, comptime func: anytype) abi.RawEntryPoint
                 a7: P.t(7),
                 a8: P.t(8),
             ) callconv(abi.guest) Result {
+                const replaced_fs = guest_fs.enterHost();
+                defer guest_fs.leaveHost(replaced_fs);
                 const args = [_]u64{ word(a0), word(a1), word(a2), word(a3), word(a4), word(a5), word(a6), word(a7), word(a8) };
                 enter(name, &args, @returnAddress());
                 return finish(
@@ -728,6 +750,8 @@ pub fn wrap(comptime name: []const u8, comptime func: anytype) abi.RawEntryPoint
                 a8: P.t(8),
                 a9: P.t(9),
             ) callconv(abi.guest) Result {
+                const replaced_fs = guest_fs.enterHost();
+                defer guest_fs.leaveHost(replaced_fs);
                 const args = [_]u64{
                     word(a0), word(a1), word(a2), word(a3), word(a4),
                     word(a5), word(a6), word(a7), word(a8), word(a9),
@@ -754,6 +778,8 @@ pub fn wrap(comptime name: []const u8, comptime func: anytype) abi.RawEntryPoint
                 a9: P.t(9),
                 a10: P.t(10),
             ) callconv(abi.guest) Result {
+                const replaced_fs = guest_fs.enterHost();
+                defer guest_fs.leaveHost(replaced_fs);
                 const args = [_]u64{
                     word(a0), word(a1), word(a2), word(a3), word(a4),  word(a5),
                     word(a6), word(a7), word(a8), word(a9), word(a10),
@@ -781,6 +807,8 @@ pub fn wrap(comptime name: []const u8, comptime func: anytype) abi.RawEntryPoint
                 a10: P.t(10),
                 a11: P.t(11),
             ) callconv(abi.guest) Result {
+                const replaced_fs = guest_fs.enterHost();
+                defer guest_fs.leaveHost(replaced_fs);
                 const args = [_]u64{
                     word(a0), word(a1), word(a2), word(a3), word(a4),  word(a5),
                     word(a6), word(a7), word(a8), word(a9), word(a10), word(a11),

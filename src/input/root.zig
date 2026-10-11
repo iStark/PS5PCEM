@@ -94,8 +94,48 @@ const KeyPressLatch = struct {
 
 var key_press_latch: KeyPressLatch = .{};
 
+/// Keys held in the emulator's own window, by Windows virtual-key code.
+///
+/// Windows answers held-key queries directly with GetAsyncKeyState. X11 has no
+/// such query for a single window, so on Linux the window thread records every
+/// press and release here, translated to the same codes the key mapping uses.
+var held_keys: KeyPressLatch = .{};
+/// Whether the emulator window has keyboard focus. Only kept on Linux, where
+/// the window thread reports focus changes; Windows asks for the foreground
+/// window instead.
+var keyboard_focused = std.atomic.Value(bool).init(false);
+
 pub fn noteKeyPress(key: usize) void {
     key_press_latch.press(key);
+}
+
+/// Records a key going down or up in the emulator window (Linux).
+pub fn noteKeyState(key: usize, down: bool) void {
+    if (key >= 256) return;
+    const bit = @as(u64, 1) << @as(u6, @intCast(key % 64));
+    if (down) {
+        _ = held_keys.words[key / 64].fetchOr(bit, .release);
+    } else {
+        _ = held_keys.words[key / 64].fetchAnd(~bit, .release);
+    }
+}
+
+/// Records the emulator window gaining or losing keyboard focus (Linux). Keys
+/// released while another window has focus never report their release here,
+/// so losing focus releases everything.
+pub fn noteKeyboardFocus(focused: bool) void {
+    keyboard_focused.store(focused, .release);
+    if (!focused) {
+        for (&held_keys.words) |*word| word.store(0, .release);
+        clearKeyboardPresses();
+    }
+}
+
+/// An environment variable on Linux, read through libc.
+fn posixEnvironment(comptime name: [:0]const u8) ?[]const u8 {
+    if (comptime builtin.os.tag != .linux or !builtin.link_libc) return null;
+    const value = std.c.getenv(name) orelse return null;
+    return std.mem.span(value);
 }
 
 pub fn clearKeyboardPresses() void {
@@ -122,6 +162,11 @@ pub fn mode() Mode {
             if (eqlIgnoreCase(text, "hybrid")) value = .hybrid;
             if (eqlIgnoreCase(text, "scripted")) value = .scripted;
         }
+    } else if (posixEnvironment("PS5_INPUT_MODE")) |text| {
+        if (eqlIgnoreCase(text, "controller")) value = .controller;
+        if (eqlIgnoreCase(text, "keyboard")) value = .keyboard;
+        if (eqlIgnoreCase(text, "hybrid")) value = .hybrid;
+        if (eqlIgnoreCase(text, "scripted")) value = .scripted;
     }
     cached_mode = value;
     return value;
@@ -141,15 +186,19 @@ pub fn read() State {
 }
 
 fn mergeKeyboard(state: *State, keys: Mapping) void {
-    if (comptime builtin.os.tag != .windows) return;
-    // GetAsyncKeyState observes the whole desktop. Typing in another program
-    // must not move the guest or press Options/Cross in a background game.
-    // A fresh poll releases keyboard state on focus loss; controller state
-    // already merged by hybrid mode is left intact.
-    const foreground = Win32.GetForegroundWindow() orelse return;
-    var owner: u32 = 0;
-    _ = Win32.GetWindowThreadProcessId(foreground, &owner);
-    if (owner != Win32.GetCurrentProcessId()) return;
+    if (comptime builtin.os.tag == .linux) {
+        if (!keyboard_focused.load(.acquire)) return;
+    } else {
+        if (comptime builtin.os.tag != .windows) return;
+        // GetAsyncKeyState observes the whole desktop. Typing in another program
+        // must not move the guest or press Options/Cross in a background game.
+        // A fresh poll releases keyboard state on focus loss; controller state
+        // already merged by hybrid mode is left intact.
+        const foreground = Win32.GetForegroundWindow() orelse return;
+        var owner: u32 = 0;
+        _ = Win32.GetWindowThreadProcessId(foreground, &owner);
+        if (owner != Win32.GetCurrentProcessId()) return;
+    }
     const presses = key_press_latch.take();
     const bindings = [_]struct { key: u8, mask: u32 }{
         .{ .key = keys.cross, .mask = Button.cross },
@@ -262,6 +311,9 @@ fn controllerIndex() u32 {
             const parsed = std.fmt.parseInt(u32, buffer[0..length], 10) catch 0;
             if (parsed < 4) value = parsed;
         }
+    } else if (posixEnvironment("PS5_CONTROLLER_INDEX")) |text| {
+        const parsed = std.fmt.parseInt(u32, text, 10) catch 0;
+        if (parsed < 4) value = parsed;
     }
     cached_controller_index = value;
     return value;
@@ -274,6 +326,8 @@ fn mapping() Mapping {
         var buffer: [512]u8 = undefined;
         const length = Win32.GetEnvironmentVariableA("PS5_KEYMAP", &buffer, buffer.len);
         if (length > 0 and length < buffer.len) parseMapping(buffer[0..length], &value);
+    } else if (posixEnvironment("PS5_KEYMAP")) |text| {
+        parseMapping(text, &value);
     }
     cached_mapping = value;
     return value;
@@ -308,6 +362,10 @@ fn latchedKey(key: u8, presses: [4]u64) bool {
 }
 
 fn keyDown(key: u8, presses: [4]u64) bool {
+    if (comptime builtin.os.tag == .linux) {
+        const held = held_keys.words[key / 64].load(.acquire);
+        return latchedKey(key, presses) or held & (@as(u64, 1) << @as(u6, @intCast(key % 64))) != 0;
+    }
     if (comptime builtin.os.tag != .windows) return false;
     return latchedKey(key, presses) or Win32.GetAsyncKeyState(key) < 0;
 }

@@ -17,6 +17,7 @@ pub const modules = @import("modules.zig");
 pub const filesystem = @import("filesystem.zig");
 pub const savedata = @import("savedata.zig");
 pub const host_stack = @import("host_stack.zig");
+pub const guest_fs = @import("guest_fs.zig");
 pub const video_out = @import("video_out.zig");
 pub const graphics_device = @import("graphics_device.zig");
 pub const apr = @import("apr.zig");

@@ -207,6 +207,7 @@ pub const structure_type_image_memory_barrier: u32 = 45;
 pub const structure_type_swapchain_create_info_khr: u32 = 1_000_001_000;
 pub const structure_type_present_info_khr: u32 = 1_000_001_001;
 pub const structure_type_win32_surface_create_info_khr: u32 = 1_000_009_000;
+pub const structure_type_xlib_surface_create_info_khr: u32 = 1_000_004_000;
 pub const structure_type_physical_device_features_2: u32 = 1_000_059_000;
 pub const structure_type_descriptor_set_layout_binding_flags_create_info: u32 = 1_000_161_000;
 pub const structure_type_physical_device_descriptor_indexing_features: u32 = 1_000_161_001;
@@ -943,6 +944,15 @@ pub const Win32SurfaceCreateInfoKHR = extern struct {
     window: *anyopaque,
 };
 
+/// VK_KHR_xlib_surface: an Xlib Display and a window XID.
+pub const XlibSurfaceCreateInfoKHR = extern struct {
+    s_type: u32 = structure_type_xlib_surface_create_info_khr,
+    p_next: ?*const anyopaque = null,
+    flags: Flags = 0,
+    display: *anyopaque,
+    window: u64,
+};
+
 pub const SwapchainCreateInfoKHR = extern struct {
     s_type: u32 = structure_type_swapchain_create_info_khr,
     p_next: ?*const anyopaque = null,
@@ -1270,6 +1280,7 @@ pub const PfnGetPhysicalDeviceQueueFamilyProperties = *const fn (PhysicalDevice,
 pub const PfnGetPhysicalDeviceMemoryProperties = *const fn (PhysicalDevice, *PhysicalDeviceMemoryProperties) callconv(call) void;
 pub const PfnCreateDevice = *const fn (PhysicalDevice, *const DeviceCreateInfo, ?*const anyopaque, *?Device) callconv(call) Result;
 pub const PfnCreateWin32SurfaceKHR = *const fn (Instance, *const Win32SurfaceCreateInfoKHR, ?*const anyopaque, *Surface) callconv(call) Result;
+pub const PfnCreateXlibSurfaceKHR = *const fn (Instance, *const XlibSurfaceCreateInfoKHR, ?*const anyopaque, *Surface) callconv(call) Result;
 pub const PfnDestroySurfaceKHR = *const fn (Instance, Surface, ?*const anyopaque) callconv(call) void;
 pub const PfnGetPhysicalDeviceSurfaceSupportKHR = *const fn (PhysicalDevice, u32, Surface, *Bool32) callconv(call) Result;
 pub const PfnGetPhysicalDeviceSurfaceCapabilitiesKHR = *const fn (PhysicalDevice, Surface, *SurfaceCapabilitiesKHR) callconv(call) Result;

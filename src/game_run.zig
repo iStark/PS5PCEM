@@ -906,7 +906,8 @@ fn run(init: std.process.Init) !bool {
         defer allocator.free(text);
         break :parse @min(std.fmt.parseInt(u64, text, 10) catch default_retirement_slack_mib, 1024);
     } else |_| default_retirement_slack_mib) * 1024 * 1024;
-    if (builtin.os.tag == .windows and !force_headless) live_gpu: {
+    // Linux presents to an X11 window through VK_KHR_xlib_surface.
+    if ((builtin.os.tag == .windows or builtin.os.tag == .linux) and !force_headless) live_gpu: {
         host_window.init(output_mode.width(), output_mode.height()) catch |err| {
             try stderr.print("live Vulkan window unavailable: {s}; continuing headless\n", .{@errorName(err)});
             try stderr.flush();
