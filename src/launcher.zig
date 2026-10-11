@@ -135,6 +135,11 @@ const Phrase = enum {
     launch_windows_error,
     status_launched,
     status_game_removed,
+    search_placeholder,
+    search_empty,
+    column_title,
+    column_identifier,
+    column_folder,
 };
 
 const Rect = struct {
@@ -176,11 +181,30 @@ var mapping = mapping_defaults;
 var capture_mapping: ?usize = null;
 var game_folder: [1024]u16 = [_]u16{0} ** 1024;
 var game_folder_length: usize = 0;
-/// Four pages of eight. The grid shows one page at a time, so the ceiling is
+/// Six pages of eight. The grid shows one page at a time, so the ceiling is
 /// about how many titles are worth keeping, not about how many fit on screen.
-const maximum_recent_games = 32;
-/// One page of the library grid: four columns by two rows.
+const maximum_recent_games = 48;
+/// One page of the library: four columns by two rows in the grid, or eight
+/// rows in the table. Both views page alike, so switching keeps the count.
 const library_page_size = 8;
+// Saved as a number in the settings file; keep the existing values.
+const LibraryView = enum(u8) { grid = 0, table = 1 };
+var library_view: LibraryView = .grid;
+/// Positions in `recent_games` that pass the search, in library order. With no
+/// search text every game passes, so paging always works on this list.
+var library_matches: [maximum_recent_games]u8 = undefined;
+var library_match_count: usize = 0;
+var search_text: [128]u16 = @splat(0);
+var search_length: usize = 0;
+/// A native edit control, so typing gets the caret, selection, clipboard and
+/// IME composition Windows already provides. It is hidden behind a drawn
+/// placeholder until the search is used, and while it holds no text.
+var search_edit: Win32.Window = null;
+var search_edit_original: isize = 0;
+/// Whether the edit control is on screen; the placeholder is drawn otherwise.
+var search_shown = false;
+var search_brush: Win32.Brush = null;
+const search_edit_id: usize = 100;
 const RecentGame = struct {
     folder: [1024]u16 = @splat(0),
     folder_length: usize = 0,
@@ -351,6 +375,11 @@ fn tr(phrase: Phrase) []const u8 {
             .launch_windows_error => "Windows error",
             .status_launched => "Game launched in a separate process",
             .status_game_removed => "Game removed from the library",
+            .search_placeholder => "Search games",
+            .search_empty => "No games match the search",
+            .column_title => "TITLE",
+            .column_identifier => "TITLE ID",
+            .column_folder => "FOLDER",
         },
         .chinese_simplified => switch (phrase) {
             .nav_library => "游戏库",
@@ -454,6 +483,11 @@ fn tr(phrase: Phrase) []const u8 {
             .launch_windows_error => "Windows 错误",
             .status_launched => "游戏已在独立进程中启动",
             .status_game_removed => "游戏已从游戏库移除",
+            .search_placeholder => "搜索游戏",
+            .search_empty => "没有符合搜索条件的游戏",
+            .column_title => "名称",
+            .column_identifier => "游戏 ID",
+            .column_folder => "文件夹",
         },
         .spanish => switch (phrase) {
             .nav_library => "Biblioteca",
@@ -557,6 +591,11 @@ fn tr(phrase: Phrase) []const u8 {
             .launch_windows_error => "Error de Windows",
             .status_launched => "Juego iniciado en un proceso independiente",
             .status_game_removed => "Juego eliminado de la biblioteca",
+            .search_placeholder => "Buscar juegos",
+            .search_empty => "Ningún juego coincide con la búsqueda",
+            .column_title => "TÍTULO",
+            .column_identifier => "ID DEL TÍTULO",
+            .column_folder => "CARPETA",
         },
         .arabic => switch (phrase) {
             .nav_library => "المكتبة",
@@ -660,6 +699,11 @@ fn tr(phrase: Phrase) []const u8 {
             .launch_windows_error => "خطأ Windows",
             .status_launched => "تم تشغيل اللعبة في عملية منفصلة",
             .status_game_removed => "تمت إزالة اللعبة من المكتبة",
+            .search_placeholder => "ابحث عن الألعاب",
+            .search_empty => "لا توجد ألعاب مطابقة للبحث",
+            .column_title => "العنوان",
+            .column_identifier => "معرّف اللعبة",
+            .column_folder => "المجلد",
         },
         .portuguese => switch (phrase) {
             .nav_library => "Biblioteca",
@@ -763,6 +807,11 @@ fn tr(phrase: Phrase) []const u8 {
             .launch_windows_error => "Erro do Windows",
             .status_launched => "Jogo iniciado em um processo separado",
             .status_game_removed => "Jogo removido da biblioteca",
+            .search_placeholder => "Pesquisar jogos",
+            .search_empty => "Nenhum jogo corresponde à pesquisa",
+            .column_title => "TÍTULO",
+            .column_identifier => "ID DO TÍTULO",
+            .column_folder => "PASTA",
         },
         .russian => switch (phrase) {
             .nav_library => "Библиотека",
@@ -866,6 +915,11 @@ fn tr(phrase: Phrase) []const u8 {
             .launch_windows_error => "Ошибка Windows",
             .status_launched => "Игра запущена в отдельном процессе",
             .status_game_removed => "Игра удалена из библиотеки",
+            .search_placeholder => "Поиск игр",
+            .search_empty => "Нет игр, подходящих под запрос",
+            .column_title => "НАЗВАНИЕ",
+            .column_identifier => "ID ИГРЫ",
+            .column_folder => "ПАПКА",
         },
         .german => switch (phrase) {
             .nav_library => "Bibliothek",
@@ -969,6 +1023,11 @@ fn tr(phrase: Phrase) []const u8 {
             .launch_windows_error => "Windows-Fehler",
             .status_launched => "Spiel in einem separaten Prozess gestartet",
             .status_game_removed => "Spiel aus der Bibliothek entfernt",
+            .search_placeholder => "Spiele suchen",
+            .search_empty => "Keine Spiele passen zur Suche",
+            .column_title => "TITEL",
+            .column_identifier => "TITEL-ID",
+            .column_folder => "ORDNER",
         },
         .french => switch (phrase) {
             .nav_library => "Bibliothèque",
@@ -1072,6 +1131,11 @@ fn tr(phrase: Phrase) []const u8 {
             .launch_windows_error => "Erreur Windows",
             .status_launched => "Jeu lancé dans un processus séparé",
             .status_game_removed => "Jeu retiré de la bibliothèque",
+            .search_placeholder => "Rechercher des jeux",
+            .search_empty => "Aucun jeu ne correspond à la recherche",
+            .column_title => "TITRE",
+            .column_identifier => "ID DU TITRE",
+            .column_folder => "DOSSIER",
         },
     };
 }
@@ -1139,6 +1203,10 @@ pub fn main(_: std.process.Init) !void {
         instance,
         null,
     ) orelse return error.WindowCreationFailed;
+    createSearchEdit(window, instance);
+    defer if (search_brush != null) {
+        _ = Win32.DeleteObject(search_brush);
+    };
     var dark: i32 = 1;
     _ = Win32.DwmSetWindowAttribute(window, 20, &dark, @sizeOf(i32));
     _ = Win32.ShowWindow(window, Win32.show_normal);
@@ -1254,19 +1322,65 @@ fn windowProcedure(
             if (@as(u16, @truncate(@as(usize, @bitCast(long_parameter)))) == Win32.hit_test_client) {
                 var point = Win32.NativePoint{};
                 if (Win32.GetCursorPos(&point) != 0 and Win32.ScreenToClient(window, &point) != 0) {
+                    if (searchPlaceholderAt(point.x, point.y)) {
+                        _ = Win32.SetCursor(Win32.LoadCursorW(null, Win32.ibeam_cursor));
+                        return 1;
+                    }
                     const over = clickableAt(point.x, point.y);
                     _ = Win32.SetCursor(Win32.LoadCursorW(null, if (over) Win32.hand_cursor else Win32.arrow_cursor));
                     return 1;
                 }
             }
         },
+        Win32.wm_left_button_down => {
+            // A click anywhere outside the search box ends typing there. Clicks
+            // inside the edit control go to the control and never reach here.
+            if (search_edit != null and Win32.GetFocus() == search_edit) _ = Win32.SetFocus(window);
+            return 0;
+        },
         Win32.wm_left_button_up => {
             const x: i32 = @as(i16, @bitCast(@as(u16, @truncate(@as(usize, @bitCast(long_parameter))))));
             const y: i32 = @as(i16, @bitCast(@as(u16, @truncate(@as(usize, @bitCast(long_parameter)) >> 16))));
             handleClick(window, x, y);
+            syncSearchBox(window);
             return 0;
         },
+        Win32.wm_command => {
+            const notification: u16 = @truncate(word_parameter >> 16);
+            if ((word_parameter & 0xffff) == search_edit_id) {
+                if (notification == Win32.en_change) readSearchText();
+                if (notification == Win32.en_change or notification == Win32.en_kill_focus) {
+                    syncSearchBox(window);
+                    _ = Win32.InvalidateRect(window, null, 0);
+                }
+                return 0;
+            }
+        },
+        Win32.wm_control_color_edit => {
+            const dc: Win32.DeviceContext = @ptrFromInt(word_parameter);
+            _ = Win32.SetTextColor(dc, 0x00f4f0ea);
+            _ = Win32.SetBkColor(dc, search_box_colour);
+            return @bitCast(@intFromPtr(search_brush));
+        },
+        Win32.wm_char => {
+            // Typing on the library starts a search with that character, so a
+            // long library is filtered without reaching for the mouse first.
+            // A space does not: on its own it would match nearly every title.
+            if (capture_mapping == null and libraryToolbarVisible() and
+                word_parameter > 0x20 and word_parameter != 0x7f)
+            {
+                activateSearch(window);
+                _ = Win32.SendMessageW(search_edit, Win32.wm_char, word_parameter, long_parameter);
+                return 0;
+            }
+        },
         Win32.wm_key_down => {
+            if (capture_mapping == null and word_parameter == 'F' and
+                Win32.GetKeyState(Win32.vk_control) < 0 and libraryToolbarVisible())
+            {
+                activateSearch(window);
+                return 0;
+            }
             if (capture_mapping) |index| {
                 if (word_parameter == 0x1b) {
                     capture_mapping = null;
@@ -1286,6 +1400,7 @@ fn windowProcedure(
         },
         wm_extract_finished => {
             finishExtraction(window, @truncate(word_parameter));
+            syncSearchBox(window);
             return 0;
         },
         Win32.wm_destroy => {
@@ -1327,18 +1442,38 @@ const library_launch_rect = Rect{ .left = 776, .top = 646, .right = 1086, .botto
 const library_prev_rect = Rect{ .left = 236, .top = 298, .right = 270, .bottom = 354 };
 const library_next_rect = Rect{ .left = 1085, .top = 298, .right = 1119, .bottom = 354 };
 
-/// Pages the library needs. Always at least one, so an empty library still
-/// has a page to be on.
+// The search box and the view switch share the heading row with the title,
+// left of the build pill every page carries.
+const library_search_rect = Rect{ .left = 604, .top = 44, .right = 880, .bottom = 72 };
+const library_view_rects = [_]Rect{
+    .{ .left = 892, .top = 44, .right = 928, .bottom = 72 },
+    .{ .left = 934, .top = 44, .right = 970, .bottom = 72 },
+};
+/// Where the edit control sits inside the drawn box, right of the magnifier.
+const search_edit_rect = Rect{ .left = 638, .top = 48, .right = 870, .bottom = 69 };
+const search_box_colour: u32 = 0x00251f1b;
+
+/// Pages the library needs. Always at least one, so an empty library or an
+/// empty search still has a page to be on.
 fn libraryPageCount() usize {
-    if (recent_game_count == 0) return 1;
-    return (recent_game_count + library_page_size - 1) / library_page_size;
+    if (library_match_count == 0) return 1;
+    return (library_match_count + library_page_size - 1) / library_page_size;
 }
 
-/// Where a game sits on the page being shown, or null when it is on another.
+/// The game shown in a slot of the current page, or null for an empty slot.
+fn libraryGameAtSlot(slot: usize) ?usize {
+    const position = library_page * library_page_size + slot;
+    if (slot >= library_page_size or position >= library_match_count) return null;
+    return library_matches[position];
+}
+
+/// Where a game sits on the page being shown, or null when it is on another
+/// page or hidden by the search.
 fn librarySlotOf(index: usize) ?usize {
-    const first = library_page * library_page_size;
-    if (index < first or index - first >= library_page_size) return null;
-    return index - first;
+    for (0..library_page_size) |slot| {
+        if (libraryGameAtSlot(slot) == index) return slot;
+    }
+    return null;
 }
 
 /// Keeps the shown page inside the list after games are added or removed.
@@ -1349,8 +1484,12 @@ fn clampLibraryPage() void {
 }
 
 /// Rectangles are addressed by slot on the page, not by position in the list:
-/// the grid has eight places and the list can be longer than that.
+/// the page has eight places and the list can be longer than that.
 fn libraryGameRect(slot: usize) Rect {
+    if (library_view == .table) {
+        const top: i32 = 170 + @as(i32, @intCast(slot)) * 42;
+        return .{ .left = 282, .top = top, .right = 1074, .bottom = top + 38 };
+    }
     const column: i32 = @intCast(slot % 4);
     const row: i32 = @intCast(slot / 4);
     const left = 282 + column * 201;
@@ -1360,6 +1499,9 @@ fn libraryGameRect(slot: usize) Rect {
 
 fn recentRemoveRect(slot: usize) Rect {
     const game = libraryGameRect(slot);
+    if (library_view == .table) {
+        return .{ .left = game.right - 36, .top = game.top + 6, .right = game.right - 10, .bottom = game.bottom - 6 };
+    }
     return .{
         .left = game.right - 34,
         .top = game.top + 8,
@@ -1415,10 +1557,8 @@ fn showLibraryPage(page: usize) void {
 
 fn recentGameAt(x: i32, y: i32) ?usize {
     if (extract_state != .idle) return null;
-    const first = library_page * library_page_size;
     for (0..library_page_size) |slot| {
-        const index = first + slot;
-        if (index >= recent_game_count) break;
+        const index = libraryGameAtSlot(slot) orelse break;
         if (libraryGameRect(slot).contains(x, y)) return index;
     }
     return null;
@@ -1426,13 +1566,153 @@ fn recentGameAt(x: i32, y: i32) ?usize {
 
 fn recentRemoveAt(x: i32, y: i32) ?usize {
     if (extract_state != .idle) return null;
-    const first = library_page * library_page_size;
     for (0..library_page_size) |slot| {
-        const index = first + slot;
-        if (index >= recent_game_count) break;
+        const index = libraryGameAtSlot(slot) orelse break;
         if (recentRemoveRect(slot).contains(x, y)) return index;
     }
     return null;
+}
+
+/// Search and the view switch only mean something once there is a library to
+/// look through, and they make way for the extraction panel.
+fn libraryToolbarVisible() bool {
+    return current_page == .library and extract_state == .idle and recent_game_count != 0;
+}
+
+fn libraryViewAt(x: i32, y: i32) ?LibraryView {
+    if (!libraryToolbarVisible()) return null;
+    const index = indexOfRect(&library_view_rects, x, y) orelse return null;
+    return @enumFromInt(index);
+}
+
+/// The drawn placeholder, which turns into the edit control when clicked.
+fn searchPlaceholderAt(x: i32, y: i32) bool {
+    return libraryToolbarVisible() and !search_shown and library_search_rect.contains(x, y);
+}
+
+/// Case-insensitive substring test. Both sides go through the system's own
+/// lowercase mapping, so Cyrillic, Greek and accented Latin titles match too.
+fn containsIgnoringCase(haystack: []const u16, lowered_needle: []const u16) bool {
+    if (lowered_needle.len == 0) return true;
+    if (lowered_needle.len > haystack.len or haystack.len > 1024) return false;
+    var lowered: [1024]u16 = undefined;
+    @memcpy(lowered[0..haystack.len], haystack);
+    _ = Win32.CharLowerBuffW(&lowered, @intCast(haystack.len));
+    return std.mem.indexOf(u16, lowered[0..haystack.len], lowered_needle) != null;
+}
+
+/// Recomputes which games pass the search. Called whenever the library or the
+/// search text changes, so drawing and hit testing read a settled list.
+fn refreshLibraryMatches() void {
+    var needle: [128]u16 = undefined;
+    @memcpy(needle[0..search_length], search_text[0..search_length]);
+    if (search_length != 0) _ = Win32.CharLowerBuffW(&needle, @intCast(search_length));
+    const query = needle[0..search_length];
+    library_match_count = 0;
+    for (recent_games[0..recent_game_count], 0..) |game, index| {
+        const folder = game.folder[0..game.folder_length];
+        var name_start = folder.len;
+        while (name_start > 0 and folder[name_start - 1] != '\\' and folder[name_start - 1] != '/') : (name_start -= 1) {}
+        if (containsIgnoringCase(game.title[0..game.title_length], query) or
+            containsIgnoringCase(game.identifier[0..game.identifier_length], query) or
+            containsIgnoringCase(folder[name_start..], query))
+        {
+            library_matches[library_match_count] = @intCast(index);
+            library_match_count += 1;
+        }
+    }
+    clampLibraryPage();
+}
+
+fn readSearchText() void {
+    const edit = search_edit orelse return;
+    const length = Win32.GetWindowTextW(edit, &search_text, search_text.len);
+    search_length = if (length > 0) @intCast(length) else 0;
+    search_text[search_length] = 0;
+    refreshLibraryMatches();
+    // A new query starts from its first result.
+    showLibraryPage(0);
+}
+
+fn createSearchEdit(window: Win32.Window, instance: Win32.Instance) void {
+    search_brush = Win32.CreateSolidBrush(search_box_colour);
+    const edit = Win32.CreateWindowExW(
+        0,
+        w("EDIT"),
+        w(""),
+        Win32.ws_child | Win32.es_auto_horizontal_scroll,
+        search_edit_rect.left,
+        search_edit_rect.top,
+        search_edit_rect.right - search_edit_rect.left,
+        search_edit_rect.bottom - search_edit_rect.top,
+        window,
+        @ptrFromInt(search_edit_id),
+        instance,
+        null,
+    ) orelse return;
+    search_edit = edit;
+    _ = Win32.SendMessageW(edit, Win32.wm_set_font, @intFromPtr(regular_font), 0);
+    _ = Win32.SendMessageW(edit, Win32.em_limit_text, search_text.len - 1, 0);
+    search_edit_original = Win32.SetWindowLongPtrW(edit, Win32.gwlp_window_procedure, @bitCast(@intFromPtr(&searchEditProcedure)));
+}
+
+/// Escape clears the search and leaves the box; Enter picks the first result.
+/// A single-line edit would otherwise beep at both, and Ctrl+Backspace would
+/// insert a box character instead of deleting.
+fn searchEditProcedure(window: Win32.Window, message: u32, word_parameter: usize, long_parameter: isize) callconv(.winapi) isize {
+    switch (message) {
+        Win32.wm_key_down => {
+            if (word_parameter == 0x1b) {
+                _ = Win32.SetWindowTextW(window, w(""));
+                _ = Win32.SetFocus(current_window);
+                return 0;
+            }
+            if (word_parameter == 0x0d) {
+                if (library_match_count != 0) {
+                    selectRecentGame(library_matches[0]);
+                    _ = Win32.InvalidateRect(current_window, null, 0);
+                }
+                return 0;
+            }
+        },
+        Win32.wm_char => if (word_parameter == 0x0d or word_parameter == 0x1b or word_parameter == 0x7f) return 0,
+        else => {},
+    }
+    const original: Win32.WindowProcedure = @ptrFromInt(@as(usize, @bitCast(search_edit_original)));
+    return Win32.CallWindowProcW(original, window, message, word_parameter, long_parameter);
+}
+
+fn activateSearch(window: Win32.Window) void {
+    const edit = search_edit orelse return;
+    if (!libraryToolbarVisible()) return;
+    search_shown = true;
+    _ = Win32.ShowWindow(edit, Win32.show_normal);
+    _ = Win32.SetFocus(edit);
+    _ = Win32.InvalidateRect(window, null, 0);
+}
+
+/// Empties the search without moving focus into it. A newly chosen or
+/// extracted game must not be hidden by a filter typed for something else.
+fn clearSearch() void {
+    if (search_edit) |edit| {
+        if (search_length != 0) _ = Win32.SetWindowTextW(edit, w(""));
+    }
+    search_length = 0;
+    refreshLibraryMatches();
+}
+
+/// Shows the edit control only on the library, and only while it holds text
+/// or has the focus. It is a child window, so it would otherwise stay on top
+/// of other pages. Deriving this from the state rather than tracking it means
+/// a focus change Windows makes on its own, such as switching applications,
+/// cannot leave an empty box open.
+fn syncSearchBox(window: Win32.Window) void {
+    const edit = search_edit orelse return;
+    if (recent_game_count == 0 and search_length != 0) clearSearch();
+    const shown = libraryToolbarVisible() and (search_length != 0 or Win32.GetFocus() == edit);
+    if (!shown and Win32.GetFocus() == edit) _ = Win32.SetFocus(window);
+    search_shown = shown;
+    _ = Win32.ShowWindow(edit, if (shown) Win32.show_normal else Win32.show_hide);
 }
 
 /// Sits beside the presence indicator on the input page.
@@ -1505,6 +1785,7 @@ fn clickableAt(x: i32, y: i32) bool {
     if (indexOfRect(&nav_rects, x, y) != null) return true;
     return switch (current_page) {
         .library => recentGameAt(x, y) != null or
+            libraryViewAt(x, y) != null or
             libraryArrowAt(x, y) != null or
             libraryDotAt(x, y) != null or
             library_browse_rect.contains(x, y) or
@@ -1562,6 +1843,20 @@ fn handleLibraryClick(window: Win32.Window, x: i32, y: i32) void {
     }
     if (extractFinished() and extract_panel_rect.contains(x, y)) {
         extract_state = .idle;
+        return;
+    }
+    if (searchPlaceholderAt(x, y)) {
+        activateSearch(window);
+        return;
+    }
+    if (libraryViewAt(x, y)) |view| {
+        if (view != library_view) {
+            library_view = view;
+            // The same page holds the same eight games in either view.
+            hovered_recent_game = null;
+            hovered_recent_remove = false;
+            saveSettings();
+        }
         return;
     }
     if (libraryArrowAt(x, y)) |arrow| {
@@ -1751,20 +2046,31 @@ fn drawNavItem(dc: Win32.DeviceContext, page: Page, top: i32, label: Phrase, com
 }
 
 fn drawLibrary(dc: Win32.DeviceContext) void {
-    pageHeading(dc, .library_heading, .library_subtitle);
+    if (libraryToolbarVisible()) {
+        pageHeadingBefore(dc, .library_heading, .library_subtitle, library_search_rect.left - 16);
+        drawLibraryToolbar(dc);
+    } else {
+        pageHeading(dc, .library_heading, .library_subtitle);
+    }
 
     if (extract_state != .idle) {
         drawExtractPanel(dc);
     } else if (recent_game_count == 0) {
         card(dc, .{ .left = 282, .top = 158, .right = 1086, .bottom = 510 });
-        localizedText(dc, .folder_prompt, .{ .left = 330, .top = 300, .right = 1038, .bottom = 332 }, 0x00f4f0ea, title_font, Win32.dt_center | Win32.dt_end_ellipsis);
+        localizedText(dc, .folder_prompt, .{ .left = 330, .top = 298, .right = 1038, .bottom = 338 }, 0x00f4f0ea, title_font, Win32.dt_center | Win32.dt_end_ellipsis);
         localizedText(dc, .folder_empty, .{ .left = 330, .top = 350, .right = 1038, .bottom = 376 }, 0x008b817a, regular_font, Win32.dt_center | Win32.dt_end_ellipsis);
+    } else if (library_match_count == 0) {
+        card(dc, .{ .left = 282, .top = 158, .right = 1086, .bottom = 510 });
+        localizedText(dc, .search_empty, .{ .left = 330, .top = 298, .right = 1038, .bottom = 338 }, 0x00f4f0ea, title_font, Win32.dt_center | Win32.dt_end_ellipsis);
+        text(dc, &search_text, @intCast(search_length), .{ .left = 330, .top = 350, .right = 1038, .bottom = 376 }, 0x008b817a, regular_font, Win32.dt_center | Win32.dt_end_ellipsis);
     } else {
-        const first = library_page * library_page_size;
+        if (library_view == .table) drawLibraryTableHeader(dc);
         for (0..library_page_size) |slot| {
-            const index = first + slot;
-            if (index >= recent_game_count) break;
-            drawLibraryGame(dc, recent_games[index], index, slot);
+            const index = libraryGameAtSlot(slot) orelse break;
+            switch (library_view) {
+                .grid => drawLibraryGame(dc, recent_games[index], index, slot),
+                .table => drawLibraryRow(dc, recent_games[index], index, slot),
+            }
         }
         drawLibraryPager(dc);
     }
@@ -1927,6 +2233,118 @@ fn drawLibraryGame(dc: Win32.DeviceContext, game: RecentGame, index: usize, slot
         roundFill(dc, remove, 13, if (hovered_recent_remove) 0x004848d8 else 0x00403934);
         text(dc, w("×"), -1, .{ .left = remove.left, .top = remove.top + 2, .right = remove.right, .bottom = remove.bottom }, 0x00f4f0ea, medium_font, Win32.dt_center);
     }
+}
+
+/// The search box, drawn around the edit control or as a placeholder when the
+/// control is hidden, and the two view buttons beside it.
+fn drawLibraryToolbar(dc: Win32.DeviceContext) void {
+    const box = library_search_rect;
+    const focused = search_edit != null and Win32.GetFocus() == search_edit;
+    // A one-pixel ring: the outline colour underneath, the box colour inset.
+    roundFill(dc, box, 12, if (focused) 0x00ffac64 else 0x00403934);
+    roundFill(dc, .{ .left = box.left + 1, .top = box.top + 1, .right = box.right - 1, .bottom = box.bottom - 1 }, 11, search_box_colour);
+    drawMagnifier(dc, box.left + 12, box.top + 8, if (focused) 0x00ffac64 else 0x008b817a);
+    if (!search_shown) {
+        localizedText(dc, .search_placeholder, .{ .left = search_edit_rect.left, .top = box.top, .right = search_edit_rect.right, .bottom = box.bottom }, 0x007e746d, regular_font, Win32.dt_left | Win32.dt_vertical_center | Win32.dt_single_line | Win32.dt_end_ellipsis);
+    }
+
+    for (library_view_rects, 0..) |rectangle, index| {
+        const view: LibraryView = @enumFromInt(index);
+        const selected = view == library_view;
+        roundFill(dc, rectangle, 10, if (selected) 0x003d3029 else search_box_colour);
+        const colour: u32 = if (selected) 0x00ffac64 else 0x008b817a;
+        const x = rectangle.left + 10;
+        const y = rectangle.top + 6;
+        switch (view) {
+            // Four tiles.
+            .grid => for (0..4) |tile| {
+                const tile_x = x + @as(i32, @intCast(tile % 2)) * 9;
+                const tile_y = y + @as(i32, @intCast(tile / 2)) * 9;
+                fill(dc, .{ .left = tile_x, .top = tile_y, .right = tile_x + 7, .bottom = tile_y + 7 }, colour);
+            },
+            // Three rows, each a marker and a line.
+            .table => for (0..3) |row| {
+                const row_y = y + 1 + @as(i32, @intCast(row)) * 6;
+                fill(dc, .{ .left = x, .top = row_y, .right = x + 3, .bottom = row_y + 3 }, colour);
+                fill(dc, .{ .left = x + 5, .top = row_y, .right = x + 16, .bottom = row_y + 3 }, colour);
+            },
+        }
+    }
+}
+
+/// A lens and a handle. Drawn with GDI rather than a glyph, because the
+/// interface font has no magnifier and GDI does not fall back to one.
+fn drawMagnifier(dc: Win32.DeviceContext, x: i32, y: i32, colour: u32) void {
+    const pen = Win32.CreatePen(0, 2, colour) orelse return;
+    defer _ = Win32.DeleteObject(pen);
+    const old_pen = Win32.SelectObject(dc, pen);
+    const old_brush = Win32.SelectObject(dc, Win32.GetStockObject(Win32.null_brush));
+    _ = Win32.Ellipse(dc, x, y, x + 10, y + 10);
+    _ = Win32.MoveToEx(dc, x + 9, y + 9, null);
+    _ = Win32.LineTo(dc, x + 13, y + 13);
+    _ = Win32.SelectObject(dc, old_brush);
+    _ = Win32.SelectObject(dc, old_pen);
+}
+
+/// Column positions shared by the header and every row.
+const table_title_left = 340;
+const table_identifier_left = 700;
+const table_folder_left = 812;
+const table_folder_right = 1030;
+
+fn drawLibraryTableHeader(dc: Win32.DeviceContext) void {
+    // The rows keep their left-to-right layout in every language, so each
+    // heading starts where its column does. Arabic keeps its reading order but
+    // not the right alignment localizedText would give it.
+    const flags = Win32.dt_left | Win32.dt_end_ellipsis | (if (language == .arabic) Win32.dt_rtl_reading else 0);
+    const colour: u32 = 0x007c716a;
+    textUtf8(dc, tr(.column_title), .{ .left = table_title_left, .top = 146, .right = table_identifier_left - 12, .bottom = 164 }, colour, small_font, flags);
+    textUtf8(dc, tr(.column_identifier), .{ .left = table_identifier_left, .top = 146, .right = table_folder_left - 12, .bottom = 164 }, colour, small_font, flags);
+    textUtf8(dc, tr(.column_folder), .{ .left = table_folder_left, .top = 146, .right = table_folder_right, .bottom = 164 }, colour, small_font, flags);
+}
+
+fn drawLibraryRow(dc: Win32.DeviceContext, game: RecentGame, index: usize, slot: usize) void {
+    const row = libraryGameRect(slot);
+    const selected = sameFolder(game.folder[0..game.folder_length], game_folder[0..game_folder_length]);
+    const hovered = hovered_recent_game == index;
+    roundFill(dc, row, 10, if (selected) 0x0049362b else if (hovered) 0x002e2621 else 0x00251f1b);
+    const icon = Rect{ .left = row.left + 10, .top = row.top + 3, .right = row.left + 42, .bottom = row.top + 35 };
+    if (game.icon) |bitmap| {
+        drawBitmap(dc, bitmap, icon);
+    } else {
+        roundFill(dc, icon, 6, 0x00352c27);
+    }
+    const line = Win32.dt_left | Win32.dt_vertical_center | Win32.dt_single_line;
+    const title_area = Rect{ .left = table_title_left, .top = row.top, .right = table_identifier_left - 12, .bottom = row.bottom };
+    text(dc, &game.title, @intCast(game.title_length), title_area, 0x00f4f0ea, regular_font, line | Win32.dt_end_ellipsis);
+    text(dc, &game.identifier, @intCast(game.identifier_length), .{ .left = table_identifier_left, .top = row.top, .right = table_folder_left - 12, .bottom = row.bottom }, 0x00a39890, small_font, line | Win32.dt_end_ellipsis);
+    const folder_area = Rect{ .left = table_folder_left, .top = row.top, .right = table_folder_right, .bottom = row.bottom };
+    text(dc, &game.folder, @intCast(game.folder_length), folder_area, 0x007e746d, small_font, line | folderEllipsis(dc, game.folder[0..game.folder_length], folder_area));
+    if (hovered) {
+        const remove = recentRemoveRect(slot);
+        roundFill(dc, remove, 13, if (hovered_recent_remove) 0x004848d8 else 0x00403934);
+        text(dc, w("×"), -1, .{ .left = remove.left, .top = remove.top + 1, .right = remove.right, .bottom = remove.bottom }, 0x00f4f0ea, medium_font, Win32.dt_center);
+    }
+}
+
+/// The end of a path names the game's own folder, so the path ellipsis
+/// shortens the middle and keeps it. That ellipsis clips a final folder name
+/// too long to fit by itself, so such a path ends in an ellipsis instead. The
+/// two flags cannot be combined: DrawTextW stops drawing partway through.
+fn folderEllipsis(dc: Win32.DeviceContext, folder: []const u16, area: Rect) u32 {
+    var name_start = folder.len;
+    while (name_start > 0 and folder[name_start - 1] != '\\' and folder[name_start - 1] != '/') : (name_start -= 1) {}
+    const previous = Win32.SelectObject(dc, small_font);
+    defer _ = Win32.SelectObject(dc, previous);
+    var name_size = Win32.NativePoint{};
+    var prefix_size = Win32.NativePoint{};
+    const prefix = w("D:\\...\\");
+    if (Win32.GetTextExtentPoint32W(dc, folder[name_start..].ptr, @intCast(folder.len - name_start), &name_size) == 0 or
+        Win32.GetTextExtentPoint32W(dc, prefix, @intCast(wideLength(prefix)), &prefix_size) == 0)
+    {
+        return Win32.dt_end_ellipsis;
+    }
+    return if (name_size.x + prefix_size.x <= area.right - area.left) Win32.dt_path_ellipsis else Win32.dt_end_ellipsis;
 }
 
 fn drawInput(dc: Win32.DeviceContext) void {
@@ -2396,6 +2814,7 @@ fn rememberGameFolder(folder: []const u16, persist: bool) void {
         while (cursor > 0) : (cursor -= 1) recent_games[cursor] = recent_games[cursor - 1];
     }
     recent_games[0] = candidate;
+    refreshLibraryMatches();
     showLibraryPage(0);
     if (persist) saveRecentGames();
 }
@@ -2413,6 +2832,7 @@ fn loadRecentGames() void {
         recent_games[recent_game_count] = game;
         recent_game_count += 1;
     }
+    refreshLibraryMatches();
 }
 
 fn destroyRecentGames() void {
@@ -2421,6 +2841,7 @@ fn destroyRecentGames() void {
         if (game.icon != null) _ = Win32.DeleteObject(game.icon);
     }
     recent_game_count = 0;
+    library_match_count = 0;
 }
 
 /// Removes only the launcher's reference. The installed game and every save
@@ -2441,8 +2862,9 @@ fn removeRecentGame(index: usize) void {
     recent_games[recent_game_count] = .{};
     hovered_recent_game = null;
     hovered_recent_remove = false;
-    // Emptying the last page leaves the view on one that no longer exists.
-    clampLibraryPage();
+    // Emptying the last page leaves the view on one that no longer exists;
+    // refreshing the matches clamps it back.
+    refreshLibraryMatches();
     saveRecentGames();
 
     if (removed_selected) {
@@ -2592,7 +3014,13 @@ fn drawSettings(dc: Win32.DeviceContext) void {
 }
 
 fn pageHeading(dc: Win32.DeviceContext, heading: Phrase, subtitle: Phrase) void {
-    localizedText(dc, heading, .{ .left = 282, .top = 42, .right = 966, .bottom = 82 }, 0x00f4f0ea, title_font, Win32.dt_left);
+    pageHeadingBefore(dc, heading, subtitle, 966);
+}
+
+/// The library shares the heading row with its search box, so its title stops
+/// short of it and is shortened with an ellipsis rather than drawn under it.
+fn pageHeadingBefore(dc: Win32.DeviceContext, heading: Phrase, subtitle: Phrase, heading_right: i32) void {
+    localizedText(dc, heading, .{ .left = 282, .top = 42, .right = heading_right, .bottom = 82 }, 0x00f4f0ea, title_font, Win32.dt_left | Win32.dt_end_ellipsis);
     localizedText(dc, subtitle, .{ .left = 282, .top = 91, .right = 1086, .bottom = 118 }, 0x009b9088, regular_font, Win32.dt_left);
     roundFill(dc, .{ .left = 984, .top = 44, .right = 1086, .bottom = 72 }, 14, 0x00342a25);
     // The label needs the pill's whole inner width. A narrower rectangle
@@ -2733,6 +3161,7 @@ fn chooseGameFolder(owner: Win32.Window) void {
     if (Win32.SHGetPathFromIDListW(item, &game_folder) == 0) return;
     game_folder_length = wideLength(@ptrCast(&game_folder));
     refreshTitleIdentifier();
+    clearSearch();
     rememberGameFolder(game_folder[0..game_folder_length], true);
     saveSettings();
     setStatusPhrase(.status_folder_selected, false);
@@ -2982,6 +3411,7 @@ fn finishExtraction(window: Win32.Window, exit_code: u32) void {
     game_folder[out_len] = 0;
     game_folder_length = out_len;
     refreshTitleIdentifier();
+    clearSearch();
     rememberGameFolder(game_folder[0..game_folder_length], true);
     saveSettings();
     var eboot: [1024]u16 = [_]u16{0} ** 1024;
@@ -3251,6 +3681,8 @@ fn loadSettings() void {
     if (language_value < @typeInfo(Language).@"enum".fields.len) language = @enumFromInt(language_value);
     const controller_value = Win32.GetPrivateProfileIntW(w("launcher"), w("controller_index"), 0, @ptrCast(&ini_path));
     if (controller_value <= 3) controller_index = @intCast(controller_value);
+    const view_value = Win32.GetPrivateProfileIntW(w("launcher"), w("library_view"), 0, @ptrCast(&ini_path));
+    if (view_value < @typeInfo(LibraryView).@"enum".fields.len) library_view = @enumFromInt(view_value);
     for (0..mapping.len) |index| {
         var key_name: [32]u16 = [_]u16{0} ** 32;
         keyName(index, &key_name);
@@ -3270,6 +3702,7 @@ fn saveSettings() void {
     writeIniInt(w("launcher"), w("input_mode"), @intFromEnum(input_mode));
     writeIniInt(w("launcher"), w("language"), @intFromEnum(language));
     writeIniInt(w("launcher"), w("controller_index"), controller_index);
+    writeIniInt(w("launcher"), w("library_view"), @intFromEnum(library_view));
     for (0..mapping.len) |index| {
         var name: [32]u16 = [_]u16{0} ** 32;
         keyName(index, &name);
@@ -3599,7 +4032,9 @@ const Win32 = if (builtin.os.tag == .windows) struct {
     };
 
     const class_redraw: u32 = 0x0001 | 0x0002;
-    const window_style: u32 = 0x00c0_0000 | 0x0008_0000 | 0x0002_0000 | 0x0001_0000;
+    // WS_CLIPCHILDREN keeps the full-window repaint from drawing over the
+    // search box and making it flicker.
+    const window_style: u32 = 0x00c0_0000 | 0x0008_0000 | 0x0002_0000 | 0x0001_0000 | 0x0200_0000;
     const centered: i32 = @bitCast(@as(u32, 0x8000_0000));
     const show_normal: i32 = 5;
     const show_minimized: i32 = 2;
@@ -3619,7 +4054,25 @@ const Win32 = if (builtin.os.tag == .windows) struct {
     const hand_cursor: [*:0]align(1) const u16 = @ptrFromInt(32649);
     const app_icon_resource: [*:0]align(1) const u16 = @ptrFromInt(1);
     const wm_key_down: u32 = 0x0100;
+    const wm_char: u32 = 0x0102;
+    const wm_command: u32 = 0x0111;
+    const wm_control_color_edit: u32 = 0x0133;
+    const wm_set_font: u32 = 0x0030;
+    const wm_left_button_down: u32 = 0x0201;
     const wm_left_button_up: u32 = 0x0202;
+    const en_kill_focus: u16 = 0x0200;
+    const en_change: u16 = 0x0300;
+    const em_limit_text: u32 = 0x00c5;
+    const ws_child: u32 = 0x4000_0000;
+    const es_auto_horizontal_scroll: u32 = 0x0080;
+    const gwlp_window_procedure: i32 = -4;
+    const show_hide: i32 = 0;
+    const vk_control: i32 = 0x11;
+    const ibeam_cursor: [*:0]align(1) const u16 = @ptrFromInt(32513);
+    const dt_vertical_center: u32 = 0x0004;
+    const dt_single_line: u32 = 0x0020;
+    const dt_path_ellipsis: u32 = 0x4000;
+    const null_brush: i32 = 5;
     const tme_leave: u32 = 0x0000_0002;
     const transparent: i32 = 1;
     const dt_left: u32 = 0x0000;
@@ -3743,6 +4196,15 @@ const Win32 = if (builtin.os.tag == .windows) struct {
     extern "user32" fn InvalidateRect(Window, ?*const NativeRect, i32) callconv(.winapi) i32;
     extern "user32" fn SetProcessDpiAwarenessContext(?*anyopaque) callconv(.winapi) i32;
     extern "user32" fn MapVirtualKeyW(code: u32, map_type: u32) callconv(.winapi) u32;
+    extern "user32" fn GetFocus() callconv(.winapi) Window;
+    extern "user32" fn SetFocus(Window) callconv(.winapi) Window;
+    extern "user32" fn GetKeyState(i32) callconv(.winapi) i16;
+    extern "user32" fn SendMessageW(Window, u32, usize, isize) callconv(.winapi) isize;
+    extern "user32" fn SetWindowLongPtrW(Window, i32, isize) callconv(.winapi) isize;
+    extern "user32" fn CallWindowProcW(WindowProcedure, Window, u32, usize, isize) callconv(.winapi) isize;
+    extern "user32" fn GetWindowTextW(Window, [*]u16, i32) callconv(.winapi) i32;
+    extern "user32" fn SetWindowTextW(Window, [*:0]const u16) callconv(.winapi) i32;
+    extern "user32" fn CharLowerBuffW([*]u16, u32) callconv(.winapi) u32;
     extern "user32" fn GetKeyNameTextW(long_parameter: i32, output: [*]u16, size: i32) callconv(.winapi) i32;
 
     extern "gdi32" fn CreateSolidBrush(color: u32) callconv(.winapi) Brush;
@@ -3756,6 +4218,13 @@ const Win32 = if (builtin.os.tag == .windows) struct {
     extern "gdi32" fn RoundRect(DeviceContext, i32, i32, i32, i32, i32, i32) callconv(.winapi) i32;
     extern "gdi32" fn SetBkMode(DeviceContext, i32) callconv(.winapi) i32;
     extern "gdi32" fn SetTextColor(DeviceContext, u32) callconv(.winapi) u32;
+    extern "gdi32" fn SetBkColor(DeviceContext, u32) callconv(.winapi) u32;
+    // SIZE has the same layout as POINT: two LONGs.
+    extern "gdi32" fn GetTextExtentPoint32W(DeviceContext, [*]const u16, i32, *NativePoint) callconv(.winapi) i32;
+    extern "gdi32" fn CreatePen(i32, i32, u32) callconv(.winapi) Object;
+    extern "gdi32" fn Ellipse(DeviceContext, i32, i32, i32, i32) callconv(.winapi) i32;
+    extern "gdi32" fn MoveToEx(DeviceContext, i32, i32, ?*NativePoint) callconv(.winapi) i32;
+    extern "gdi32" fn LineTo(DeviceContext, i32, i32) callconv(.winapi) i32;
     extern "gdi32" fn CreateFontW(i32, i32, i32, i32, i32, u32, u32, u32, u32, u32, u32, u32, u32, [*:0]const u16) callconv(.winapi) Font;
 
     extern "gdiplus" fn GdiplusStartup(*usize, *const GdiplusStartupInput, ?*anyopaque) callconv(.winapi) i32;
