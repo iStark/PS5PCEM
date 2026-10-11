@@ -3,9 +3,9 @@
 
 //! Headless common, message, browser, and input-dialog services.
 //!
-//! Dialogs complete immediately because there is no console shell to render
-//! them. Their state still follows the guest lifecycle so polling code cannot
-//! hang and result buffers never expose uninitialized memory.
+//! Interactive dialogs complete headlessly because there is no console shell.
+//! Save progress dialogs remain running until the title closes them: finishing
+//! before the application starts its I/O can strand its state machine.
 
 const std = @import("std");
 const abi = @import("../abi.zig");
@@ -417,13 +417,27 @@ fn saveDialogInitialize() callconv(abi.guest) i32 {
 }
 
 fn saveDialogOpen(parameter: ?[*]const u8) callconv(abi.guest) i32 {
-    if (parameter) |bytes| {
-        // Common-dialog base (0x30), then size/mode/dispType/padding and eight
-        // pointers. Mode and userData are reflected by GetResult.
-        save_dialog_mode.store(std.mem.readInt(i32, bytes[0x34..0x38], .little), .release);
-        save_dialog_user_data.store(std.mem.readInt(u64, bytes[0x70..0x78], .little), .release);
+    const bytes = parameter orelse return msg_error_argument_null;
+    if (!kernel_memory.isGuestRangeAccessible(@intFromPtr(bytes), 0x78))
+        return msg_error_argument_null;
+    const current = save_dialog_status.load(.acquire);
+    if (current != status_initialized and current != status_finished)
+        return @bitCast(@as(u32, 0x80b8_0006)); // INVALID_STATE
+    // Common-dialog base (0x30), then size/mode/dispType/padding and pointers.
+    const mode = std.mem.readInt(i32, bytes[0x34..0x38], .little);
+    var application_closes = mode == 5; // PROGRESS_BAR
+    if (mode == 3 or mode == 2) {
+        const offset: usize = if (mode == 3) 0x58 else 0x50;
+        const message = std.mem.readInt(u64, bytes[offset..][0..8], .little);
+        if (message == 0 or !kernel_memory.isGuestRangeAccessible(message, 4))
+            return msg_error_argument_null;
+        const kind = @as(*align(1) const u32, @ptrFromInt(message)).*;
+        // SYSTEM_MSG/PROGRESS and USER_MSG/NONE have no completion button.
+        application_closes = if (mode == 3) kind == 5 else kind == 2;
     }
-    save_dialog_status.store(status_finished, .release);
+    save_dialog_mode.store(mode, .release);
+    save_dialog_user_data.store(std.mem.readInt(u64, bytes[0x70..0x78], .little), .release);
+    save_dialog_status.store(if (application_closes) status_running else status_finished, .release);
     return errno.ok;
 }
 
@@ -433,6 +447,7 @@ fn saveDialogStatus() callconv(abi.guest) i32 {
 
 fn saveDialogGetResult(result: ?*[72]u8) callconv(abi.guest) i32 {
     const output = result orelse return msg_error_argument_null;
+    if (save_dialog_status.load(.acquire) != status_finished) return msg_error_not_finished;
     @memset(output, 0);
     std.mem.writeInt(i32, output[0..4], save_dialog_mode.load(.acquire), .little);
     std.mem.writeInt(i32, output[4..8], 0, .little); // OK
@@ -676,6 +691,45 @@ pub fn register(db: *symbols.Database, gpa: std.mem.Allocator) symbols.Error!voi
     try db.addLibrary(gpa, .{ .name = "libSceSaveDataDialog.native" }, .{ .name = "libSceSaveDataDialog" }, &save_dialog_exports);
     try db.addLibrary(gpa, .{ .name = "libSceImeDialog" }, .{ .name = "libSceImeDialog" }, &ime_dialog_exports);
     try db.addLibrary(gpa, .{ .name = "libSceIme" }, .{ .name = "libSceIme" }, &ime_exports);
+}
+
+test "save progress waits for application close before reporting a result" {
+    reset();
+    defer reset();
+    try std.testing.expectEqual(errno.ok, saveDialogInitialize());
+    var parameter: [0x98]u8 = @splat(0);
+    var message: u32 = 5; // SYSTEM_MSG/PROGRESS, as used before save I/O.
+    std.mem.writeInt(i32, parameter[0x34..0x38], 3, .little);
+    std.mem.writeInt(u64, parameter[0x58..0x60], @intFromPtr(&message), .little);
+    std.mem.writeInt(u64, parameter[0x70..0x78], 0x1234, .little);
+    try std.testing.expectEqual(errno.ok, saveDialogOpen(&parameter));
+    var result: [72]u8 = @splat(0xa5);
+    for (0..8) |_| try std.testing.expectEqual(status_running, saveDialogStatus());
+    try std.testing.expectEqual(msg_error_not_finished, saveDialogGetResult(&result));
+    for (result) |byte| try std.testing.expectEqual(@as(u8, 0xa5), byte);
+    try std.testing.expectEqual(@as(i32, @bitCast(@as(u32, 0x80b8_0006))), saveDialogOpen(&parameter));
+    try std.testing.expectEqual(errno.ok, saveDialogClose(null));
+    try std.testing.expectEqual(status_finished, saveDialogStatus());
+    try std.testing.expectEqual(errno.ok, saveDialogGetResult(&result));
+    try std.testing.expectEqual(@as(i32, 3), std.mem.readInt(i32, result[0..4], .little));
+    try std.testing.expectEqual(@as(u64, 0x1234), std.mem.readInt(u64, result[32..40], .little));
+
+    std.mem.writeInt(i32, parameter[0x34..0x38], 5, .little);
+    try std.testing.expectEqual(errno.ok, saveDialogOpen(&parameter));
+    for (0..8) |_| try std.testing.expectEqual(status_running, saveDialogStatus());
+    try std.testing.expectEqual(errno.ok, saveDialogTerminate());
+    try std.testing.expectEqual(status_none, saveDialogStatus());
+    try std.testing.expectEqual(errno.ok, saveDialogInitialize());
+    std.mem.writeInt(i32, parameter[0x34..0x38], 2, .little);
+    message = 2; // USER_MSG/NONE.
+    std.mem.writeInt(u64, parameter[0x50..0x58], @intFromPtr(&message), .little);
+    try std.testing.expectEqual(errno.ok, saveDialogOpen(&parameter));
+    try std.testing.expectEqual(status_running, saveDialogStatus());
+    try std.testing.expectEqual(errno.ok, saveDialogClose(null));
+    message = 0; // An OK button keeps the existing headless completion policy.
+    try std.testing.expectEqual(errno.ok, saveDialogOpen(&parameter));
+    try std.testing.expectEqual(status_finished, saveDialogStatus());
+    try std.testing.expectEqual(msg_error_argument_null, saveDialogOpen(null));
 }
 
 test "headless message dialog finishes immediately with an affirmative result" {

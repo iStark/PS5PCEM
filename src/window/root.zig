@@ -10,6 +10,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const input = @import("input");
 
 pub const Error = error{
     UnsupportedPlatform,
@@ -207,16 +208,24 @@ pub const HostWindow = struct {
         long_parameter: isize,
     ) callconv(.winapi) isize {
         switch (message) {
+            Win32.wm_keydown, Win32.wm_syskeydown => {
+                // Preserve a tap even if key-up arrives before the guest's
+                // next controller poll. Auto-repeat is not a new press.
+                if (long_parameter & (1 << 30) == 0) input.noteKeyPress(word_parameter);
+            },
+            Win32.wm_killfocus => input.clearKeyboardPresses(),
             Win32.wm_close => {
                 _ = Win32.DestroyWindow(window);
                 return 0;
             },
             Win32.wm_destroy => {
+                input.clearKeyboardPresses();
                 Win32.PostQuitMessage(0);
                 return 0;
             },
-            else => return Win32.DefWindowProcA(window, message, word_parameter, long_parameter),
+            else => {},
         }
+        return Win32.DefWindowProcA(window, message, word_parameter, long_parameter);
     }
 };
 
@@ -261,7 +270,10 @@ const Win32 = if (builtin.os.tag == .windows) struct {
     const use_default: i32 = @bitCast(@as(u32, 0x8000_0000));
     const show_normal: i32 = 5;
     const wm_destroy: u32 = 0x0002;
+    const wm_killfocus: u32 = 0x0008;
     const wm_close: u32 = 0x0010;
+    const wm_keydown: u32 = 0x0100;
+    const wm_syskeydown: u32 = 0x0104;
     const arrow_cursor: [*:0]const u8 = @ptrFromInt(32512);
     const error_class_already_exists: u32 = 1410;
 

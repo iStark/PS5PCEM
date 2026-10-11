@@ -777,6 +777,17 @@ pub fn readSaveDataParameters(slot: []const u8, storage: []u8) ?[]const u8 {
 
 /// Stores the descriptive parameters of a slot.
 pub fn writeSaveDataParameters(slot: []const u8, contents: []const u8) Error!void {
+    return writeSaveDataMetadata(slot, savedata.parameter_file, contents);
+}
+
+/// Icons are slot metadata, not game payload. Keep them under sce_sys so an
+/// interrupted save containing only its icon is not advertised as complete.
+pub fn writeSaveDataIcon(contents: []const u8) Error!void {
+    if (savedata_root == null or mountedSaveDataSlot().len == 0) return Error.NotAttached;
+    return writeSaveDataMetadata(mountedSaveDataSlot(), "icon0.png", contents);
+}
+
+fn writeSaveDataMetadata(slot: []const u8, filename: []const u8, contents: []const u8) Error!void {
     const io = active_io orelse return Error.NotAttached;
     const home = savedata_home orelse return Error.NotAttached;
     var identifier_storage: [savedata.maximum_slot_name]u8 = undefined;
@@ -793,7 +804,7 @@ pub fn writeSaveDataParameters(slot: []const u8, contents: []const u8) Error!voi
     home.createDirPath(io, directory) catch return Error.IoFailed;
 
     var path_storage: [maximum_path]u8 = undefined;
-    const relative = savedata.joinPath(&path_storage, &.{ directory, savedata.parameter_file }) orelse
+    const relative = savedata.joinPath(&path_storage, &.{ directory, filename }) orelse
         return Error.InvalidArgument;
     const file = home.createFile(io, relative, .{ .truncate = true }) catch return Error.IoFailed;
     defer file.close(io);

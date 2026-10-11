@@ -75,7 +75,35 @@ var cached_mode: ?Mode = null;
 var cached_mapping: ?Mapping = null;
 var cached_controller_index: ?u32 = null;
 
+/// The window thread records presses; the guest input thread consumes each
+/// batch once. Physical held-key polling remains responsible for long holds.
+const KeyPressLatch = struct {
+    words: [4]std.atomic.Value(u64) = @splat(std.atomic.Value(u64).init(0)),
+
+    fn press(self: *KeyPressLatch, key: usize) void {
+        if (key >= 256) return;
+        _ = self.words[key / 64].fetchOr(@as(u64, 1) << @as(u6, @intCast(key % 64)), .release);
+    }
+
+    fn take(self: *KeyPressLatch) [4]u64 {
+        var result: [4]u64 = undefined;
+        for (&self.words, &result) |*word, *value| value.* = word.swap(0, .acq_rel);
+        return result;
+    }
+};
+
+var key_press_latch: KeyPressLatch = .{};
+
+pub fn noteKeyPress(key: usize) void {
+    key_press_latch.press(key);
+}
+
+pub fn clearKeyboardPresses() void {
+    _ = key_press_latch.take();
+}
+
 pub fn reset() void {
+    clearKeyboardPresses();
     cached_mode = null;
     cached_mapping = null;
     cached_controller_index = null;
@@ -122,6 +150,7 @@ fn mergeKeyboard(state: *State, keys: Mapping) void {
     var owner: u32 = 0;
     _ = Win32.GetWindowThreadProcessId(foreground, &owner);
     if (owner != Win32.GetCurrentProcessId()) return;
+    const presses = key_press_latch.take();
     const bindings = [_]struct { key: u8, mask: u32 }{
         .{ .key = keys.cross, .mask = Button.cross },
         .{ .key = keys.circle, .mask = Button.circle },
@@ -139,7 +168,7 @@ fn mergeKeyboard(state: *State, keys: Mapping) void {
         .{ .key = keys.left, .mask = Button.left },
     };
     for (bindings) |binding| {
-        if (keyDown(binding.key)) state.buttons |= binding.mask;
+        if (keyDown(binding.key, presses)) state.buttons |= binding.mask;
     }
 
     // WASD is the left stick. Only write an axis when a key is actually
@@ -147,14 +176,14 @@ fn mergeKeyboard(state: *State, keys: Mapping) void {
     // unconditionally centering WASD here wiped the physical left stick
     // (Quake II could look with the right stick but could not walk).
     // Arrow keys remain the d-pad and, with Alt held, the right stick.
-    state.left_stick_x = mergeDigitalAxis(state.left_stick_x, keyDown('A'), keyDown('D'));
-    state.left_stick_y = mergeDigitalAxis(state.left_stick_y, keyDown('W'), keyDown('S'));
-    if (keyDown(0x12)) { // Alt
-        state.right_stick_x = mergeDigitalAxis(state.right_stick_x, keyDown(0x25), keyDown(0x27));
-        state.right_stick_y = mergeDigitalAxis(state.right_stick_y, keyDown(0x26), keyDown(0x28));
+    state.left_stick_x = mergeDigitalAxis(state.left_stick_x, keyDown('A', presses), keyDown('D', presses));
+    state.left_stick_y = mergeDigitalAxis(state.left_stick_y, keyDown('W', presses), keyDown('S', presses));
+    if (keyDown(0x12, presses)) { // Alt
+        state.right_stick_x = mergeDigitalAxis(state.right_stick_x, keyDown(0x25, presses), keyDown(0x27, presses));
+        state.right_stick_y = mergeDigitalAxis(state.right_stick_y, keyDown(0x26, presses), keyDown(0x28, presses));
     }
-    if (keyDown(keys.l2)) state.analog_l2 = 255;
-    if (keyDown(keys.r2)) state.analog_r2 = 255;
+    if (keyDown(keys.l2, presses)) state.analog_l2 = 255;
+    if (keyDown(keys.r2, presses)) state.analog_r2 = 255;
 }
 
 fn mergeController(state: *State) void {
@@ -274,9 +303,13 @@ fn parseMapping(text: []const u8, output: *Mapping) void {
     }
 }
 
-fn keyDown(key: u8) bool {
+fn latchedKey(key: u8, presses: [4]u64) bool {
+    return presses[key / 64] & (@as(u64, 1) << @as(u6, @intCast(key % 64))) != 0;
+}
+
+fn keyDown(key: u8, presses: [4]u64) bool {
     if (comptime builtin.os.tag != .windows) return false;
-    return Win32.GetAsyncKeyState(key) < 0;
+    return latchedKey(key, presses) or Win32.GetAsyncKeyState(key) < 0;
 }
 
 fn axis(negative: bool, positive: bool) u8 {
@@ -358,6 +391,31 @@ test "keyboard mapping parser changes only named keys" {
     try std.testing.expectEqual(@as(u8, 'X'), value.cross);
     try std.testing.expectEqual(@as(u8, 'C'), value.circle);
     try std.testing.expectEqual(@as(u8, 'F'), value.square);
+}
+
+test "keyboard tap survives release before polling and is consumed once" {
+    var latch = KeyPressLatch{};
+    latch.press(0x20);
+    latch.press(0xa0);
+    latch.press(256); // invalid virtual-key codes cannot address the latch
+    const first = latch.take();
+    try std.testing.expect(latchedKey(0x20, first));
+    try std.testing.expect(latchedKey(0xa0, first));
+    try std.testing.expect(!latchedKey(0x21, first));
+    try std.testing.expectEqual([_]u64{ 0, 0, 0, 0 }, latch.take());
+    // A new press after a poll is retained for the next poll.
+    latch.press('D');
+    const next = latch.take();
+    try std.testing.expect(latchedKey('D', next));
+    try std.testing.expect(!latchedKey(0x20, next));
+}
+
+test "keyboard focus loss clears pending presses" {
+    clearKeyboardPresses();
+    defer clearKeyboardPresses();
+    noteKeyPress(0x20);
+    clearKeyboardPresses();
+    try std.testing.expectEqual([_]u64{ 0, 0, 0, 0 }, key_press_latch.take());
 }
 
 test {

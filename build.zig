@@ -94,6 +94,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    window.addImport("input", input);
+
     // Guest module images: ELF64 parsing and the dynamic linking tables.
     const loader = b.addModule("loader", .{
         .root_source_file = b.path("src/loader/root.zig"),

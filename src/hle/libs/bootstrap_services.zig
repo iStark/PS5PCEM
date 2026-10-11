@@ -2227,6 +2227,61 @@ const SaveDataParam = extern struct {
     reserved: [32]u8 = @splat(0),
 };
 
+const SaveDataIcon = extern struct {
+    buffer: u64,
+    buffer_size: u64,
+    data_size: u64,
+    reserved: [32]u8 = @splat(0),
+};
+
+fn saveDataSaveIcon(mount_point: u64, icon_address: u64) callconv(abi.guest) i32 {
+    const parameter_error: i32 = @bitCast(@as(u32, 0x809f0000));
+    const not_mounted: i32 = @bitCast(@as(u32, 0x809f0004));
+    if (mount_point == 0 or icon_address == 0 or
+        !kernel_memory.isGuestRangeAccessible(mount_point, 16) or
+        !kernel_memory.isGuestRangeAccessible(icon_address, @sizeOf(SaveDataIcon))) return parameter_error;
+    const mount: *align(1) const [16]u8 = @ptrFromInt(mount_point);
+    if (!std.mem.eql(u8, savedata.boundedName(mount), "/savedata0") or
+        filesystem.attachedSaveDataRoot() == null) return not_mounted;
+    const icon: *align(1) const SaveDataIcon = @ptrFromInt(icon_address);
+    if (icon.buffer == 0 or icon.data_size == 0 or icon.data_size > icon.buffer_size or
+        !kernel_memory.isGuestRangeAccessible(icon.buffer, icon.data_size)) return parameter_error;
+    const data: [*]const u8 = @ptrFromInt(icon.buffer);
+    filesystem.writeSaveDataIcon(data[0..@intCast(icon.data_size)]) catch return @bitCast(@as(u32, 0x809f000b));
+    return errno.ok;
+}
+
+test "save icon persists only its data bytes in the selected mounted slot" {
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    filesystem.attach(testing.io, tmp.dir);
+    defer filesystem.detach();
+    filesystem.attachSaveDataHome(tmp.dir, "PPSA00001");
+    defer filesystem.unmountSaveData();
+    _ = try filesystem.mountSaveDataSlot("slot0000", true);
+    var mount: [16]u8 = @splat(0);
+    @memcpy(mount[0..10], "/savedata0");
+    const pixels = "\x89PNG\r\n\x1a\nencoded-icon-unused-capacity";
+    var icon = SaveDataIcon{ .buffer = @intFromPtr(pixels.ptr), .buffer_size = pixels.len, .data_size = 20 };
+    try testing.expectEqual(errno.ok, saveDataSaveIcon(@intFromPtr(&mount), @intFromPtr(&icon)));
+    var storage: [64]u8 = undefined;
+    const stored = try tmp.dir.readFile(testing.io, "PPSA00001/slot0000/sce_sys/icon0.png", &storage);
+    try testing.expectEqualSlices(u8, pixels[0..20], stored);
+    icon.data_size = icon.buffer_size + 1;
+    try testing.expectEqual(@as(i32, @bitCast(@as(u32, 0x809f0000))), saveDataSaveIcon(@intFromPtr(&mount), @intFromPtr(&icon)));
+    // A rejected write must preserve the existing icon.
+    try testing.expectEqualSlices(u8, pixels[0..20], try tmp.dir.readFile(testing.io, "PPSA00001/slot0000/sce_sys/icon0.png", &storage));
+    icon.data_size = 20;
+    filesystem.unmountSaveData();
+    try testing.expectEqual(@as(i32, @bitCast(@as(u32, 0x809f0004))), saveDataSaveIcon(@intFromPtr(&mount), @intFromPtr(&icon)));
+    _ = try filesystem.mountSaveDataSlot("slot0001", true);
+    try testing.expectEqual(errno.ok, saveDataSaveIcon(@intFromPtr(&mount), @intFromPtr(&icon)));
+    try testing.expectEqualSlices(u8, pixels[0..20], try tmp.dir.readFile(testing.io, "PPSA00001/slot0001/sce_sys/icon0.png", &storage));
+    var names: [4][savedata.maximum_slot_name]u8 = undefined;
+    try testing.expectEqual(@as(usize, 0), filesystem.listSaveDataSlots(&names));
+}
+
 fn writeParameterString(destination: []u8, value: []const u8) void {
     @memset(destination, 0);
     const count = @min(value.len, destination.len - 1);
@@ -2418,6 +2473,7 @@ const mouse_exports = [_]symbols.Export{
 // title's `/savedata0`; its files are then written through the ordinary file
 // API, which is how a title stores its progress.
 const save_data_exports = [_]symbols.Export{
+    .{ .name = "sceSaveDataSaveIcon", .function = trace.wrap("sceSaveDataSaveIcon", &saveDataSaveIcon), .expect_id = "c88Yy54Mx0w" },
     .{ .name = "sceSaveDataDelete", .function = trace.wrap("sceSaveDataDelete", &saveDataDelete), .expect_id = "S1GkePI17zQ" },
     .{ .name = "sceSaveDataInitialize3", .function = trace.wrap("sceSaveDataInitialize3", &success), .expect_id = "TywrFKCoLGY" },
     .{ .name = "sceSaveDataSetupSaveDataMemory2", .function = trace.wrap("sceSaveDataSetupSaveDataMemory2", &saveDataSetupMemory), .expect_id = "oQySEUfgXRA" },

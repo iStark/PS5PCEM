@@ -1191,6 +1191,12 @@ var ngs2_sampler_detail_logs: [2]u32 = .{ 0, 0 }; // protected by ngs2_mutex
 const maximum_ngs2_systems = 8;
 const maximum_ngs2_racks = 64;
 const maximum_ngs2_voices = 1024;
+const maximum_ngs2_ports = 256;
+
+const ngs2_error_invalid_voice: i32 = @bitCast(@as(u32, 0x804a0300));
+const ngs2_error_invalid_port: i32 = @bitCast(@as(u32, 0x804a0304));
+const ngs2_error_invalid_patch: i32 = @bitCast(@as(u32, 0x804a0305));
+const ngs2_error_invalid_matrix: i32 = @bitCast(@as(u32, 0x804a0700));
 
 const Ngs2VoiceState = enum(u8) {
     empty,
@@ -1244,8 +1250,8 @@ const Ngs2RackOptions = struct {
     name: [64]u8 = @splat(0),
     max_grain: u32 = 256,
     max_voices: u32 = 64,
-    max_matrices: u32 = 0,
-    max_ports: u32 = 0,
+    max_matrices: u32 = 1,
+    max_ports: u32 = 8,
 };
 
 // The 216-byte common prefix is also used by the 232-byte PS5 query.
@@ -1294,7 +1300,24 @@ const Ngs2Voice = struct {
     loop_end: usize = 0,
     gain: f32 = 1,
     pcm: ?ngs2_pcm.Stream = null,
+    ports: []Ngs2VoicePortInfo = &.{},
 };
+
+/// Query ABI shared by the port controls. Keep every port independent; the
+/// current direct PCM mixer consumes port zero's volume, while graph routing,
+/// matrix mixing and delay processing remain separate renderer work.
+const Ngs2VoicePortInfo = extern struct {
+    matrix_id: i32 = -1,
+    volume: f32 = 1,
+    num_delay_samples: u32 = 0,
+    dest_input_id: u32 = 0,
+    dest_handle: u64 = 0,
+};
+
+comptime {
+    std.debug.assert(@sizeOf(Ngs2VoicePortInfo) == 24);
+    std.debug.assert(@offsetOf(Ngs2VoicePortInfo, "dest_handle") == 16);
+}
 
 const Ngs2VoiceParamHeader = extern struct {
     size: u16,
@@ -1418,6 +1441,7 @@ fn ngs2ReadRackOptions(options: u64) Ngs2OptionError!Ngs2RackOptions {
         if (size >= 176) {
             result.max_matrices = std.mem.readInt(u32, ptr[88..92], .little);
             result.max_ports = std.mem.readInt(u32, ptr[92..96], .little);
+            if (result.max_ports > maximum_ngs2_ports) return error.Invalid;
         }
     }
     return result;
@@ -1487,7 +1511,11 @@ fn ngs2RackCreateWithAllocator(
 }
 
 fn ngs2CreateRack(system: u64, rack_id: u32, options: u64, buffer: Ngs2BufferInfo, output: ?*u64) i32 {
-    const parsed = ngs2ReadRackOptions(options) catch |err| return ngs2OptionError(err);
+    var parsed = ngs2ReadRackOptions(options) catch |err| return ngs2OptionError(err);
+    if (options == 0 and rack_id == 0x3000) {
+        parsed.max_ports = 0;
+        parsed.max_matrices = 0;
+    }
     if (system == 0) return errno.KernelError.einval.raw();
     const destination = output orelse return ngs2_error_invalid_output;
     if (!kernel_memory.isGuestRangeAccessible(@intFromPtr(destination), @sizeOf(u64))) {
@@ -1559,8 +1587,10 @@ fn ngs2RackGetVoiceHandle(rack: u64, voice_id: u32, output: ?*u64) callconv(abi.
     }
     for (&ngs2_voices) |*voice| {
         if (voice.active) continue;
+        const ports = std.heap.page_allocator.alloc(Ngs2VoicePortInfo, owner.options.max_ports) catch return errno.KernelError.enomem.raw();
+        @memset(ports, .{});
         const handle = ngs2Handle();
-        voice.* = .{ .active = true, .handle = handle, .rack = rack, .voice_id = voice_id };
+        voice.* = .{ .active = true, .handle = handle, .rack = rack, .voice_id = voice_id, .ports = ports };
         destination.* = handle;
         return errno.ok;
     }
@@ -1682,8 +1712,19 @@ fn ngs2CacheWaveform(address: u64, decoded: Ngs2DecodedWaveform) ?usize {
 }
 
 fn ngs2ResetVoice(voice: *Ngs2Voice) void {
+    if (voice.active) {
+        for (&ngs2_voices) |*source| {
+            if (!source.active) continue;
+            for (source.ports) |*port| {
+                if (port.dest_handle != voice.handle) continue;
+                port.dest_handle = 0;
+                port.dest_input_id = 0;
+            }
+        }
+    }
     ngs2FreeVoiceWaveform(voice);
     if (voice.pcm) |*pcm| pcm.deinit(std.heap.page_allocator);
+    std.heap.page_allocator.free(voice.ports);
     voice.* = .{};
 }
 
@@ -1944,6 +1985,39 @@ fn ngs2ArmVoice(voice: *Ngs2Voice, address: u64) void {
     );
 }
 
+fn ngs2SetPortVolume(voice: *Ngs2Voice, index: u32, volume: f32) i32 {
+    if (index >= voice.ports.len) return ngs2_error_invalid_port;
+    if (!std.math.isFinite(volume) or volume < 0 or volume > 8) return errno.KernelError.einval.raw();
+    voice.ports[index].volume = volume;
+    if (index == 0) voice.gain = volume;
+    return errno.ok;
+}
+
+fn ngs2SetPortMatrix(voice: *Ngs2Voice, index: u32, matrix: i32) i32 {
+    if (index >= voice.ports.len) return ngs2_error_invalid_port;
+    const rack = ngs2FindRack(voice.rack) orelse return ngs2_error_invalid_voice;
+    if (matrix < -1 or (matrix >= 0 and @as(u32, @intCast(matrix)) >= rack.options.max_matrices)) return ngs2_error_invalid_matrix;
+    voice.ports[index].matrix_id = matrix;
+    return errno.ok;
+}
+
+fn ngs2VoiceGetPortInfo(handle: u64, index: u32, output: u64, size: usize) callconv(abi.guest) i32 {
+    if (output == 0) return ngs2_error_invalid_output;
+    if (size != @sizeOf(Ngs2VoicePortInfo)) return @bitCast(@as(u32, 0x804a8011));
+    // Readable is insufficient here: a query must not write into read-only
+    // guest pages. Host-backed CRT/stack allocations need the same check.
+    const memory = @import("memory");
+    const space = kernel_memory.attachedAddressSpace();
+    if (!(if (space) |s| s.isWritable(output, size) else false) and !memory.isHostRangeWritable(output, size)) return errno.KernelError.efault.raw();
+    ngs2_mutex.lock();
+    defer ngs2_mutex.unlock();
+    const voice = ngs2FindVoice(handle) orelse return ngs2_error_invalid_voice;
+    if (index >= voice.ports.len) return ngs2_error_invalid_port;
+    if (space) |s| s.notifyGuestWrite(output, size);
+    @as(*align(1) Ngs2VoicePortInfo, @ptrFromInt(output)).* = voice.ports[index];
+    return errno.ok;
+}
+
 fn ngs2VoiceControl(handle: u64, params_address: u64) callconv(abi.guest) i32 {
     if (params_address == 0) return errno.KernelError.einval.raw();
     ngs2_mutex.lock();
@@ -2004,6 +2078,8 @@ fn ngs2VoiceControl(handle: u64, params_address: u64) callconv(abi.guest) i32 {
             voice.pcm = null;
             voice.state = .empty;
             voice.event = .none;
+            @memset(voice.ports, .{});
+            voice.gain = 1;
             if (format.waveform_type == 0x12 or format.waveform_type == 0x18) {
                 if (format.channels == 0 or format.channels > 8 or format.sample_rate < 8000 or format.sample_rate > 192000) return errno.KernelError.einval.raw();
                 voice.pcm = .{ .format = .{ .channels = @intCast(format.channels), .rate = format.sample_rate, .float32 = format.waveform_type == 0x18 } };
@@ -2037,10 +2113,33 @@ fn ngs2VoiceControl(handle: u64, params_address: u64) callconv(abi.guest) i32 {
             const pitch = @as(*align(1) const f32, @ptrFromInt(address + 8)).*;
             if (!std.math.isFinite(pitch) or pitch < 0 or pitch > 4) return errno.KernelError.einval.raw();
             if (voice.pcm) |*pcm| pcm.pitch = pitch;
-        } else if (header.id == 0x0000_0002 and header.size >= 16) {
-            const level_bits: *const u32 = @ptrFromInt(address + 12);
-            const level: f32 = @bitCast(level_bits.*);
-            if (std.math.isFinite(level) and level >= 0 and level <= 8) voice.gain = level;
+        } else if (header.id >= 2 and header.id <= 5) {
+            if (header.size < (if (header.id == 5) @as(u16, 24) else @as(u16, 16))) return errno.KernelError.einval.raw();
+            const index = @as(*align(1) const u32, @ptrFromInt(address + 8)).*;
+            if (index >= voice.ports.len) return ngs2_error_invalid_port;
+            const value = @as(*align(1) const u32, @ptrFromInt(address + 12)).*;
+            const result = switch (header.id) {
+                2 => ngs2SetPortVolume(voice, index, @bitCast(value)),
+                3 => ngs2SetPortMatrix(voice, index, @bitCast(value)),
+                4 => blk: {
+                    voice.ports[index].num_delay_samples = value;
+                    break :blk errno.ok;
+                },
+                5 => blk: {
+                    const destination = @as(*align(1) const u64, @ptrFromInt(address + 16)).*;
+                    if (destination != 0) {
+                        const target = ngs2FindVoice(destination) orelse return ngs2_error_invalid_patch;
+                        const source_rack = ngs2FindRack(voice.rack) orelse return ngs2_error_invalid_voice;
+                        const target_rack = ngs2FindRack(target.rack) orelse return ngs2_error_invalid_patch;
+                        if (source_rack.system != target_rack.system or destination == handle or target_rack.rack_id == 0x1000) return ngs2_error_invalid_patch;
+                    }
+                    voice.ports[index].dest_handle = destination;
+                    voice.ports[index].dest_input_id = if (destination == 0) 0 else value;
+                    break :blk errno.ok;
+                },
+                else => unreachable,
+            };
+            if (result != errno.ok) return result;
         }
         if (header.next == 0) return errno.ok;
         address = ngs2NextParam(address, header.next) orelse return errno.KernelError.einval.raw();
@@ -2082,9 +2181,14 @@ fn ngs2VoiceRunCommands(handle: u64, params_address: u64, command_count: u32, _:
                     voice.event = ngs2Event(value) orelse return errno.KernelError.einval.raw();
                 },
                 6 => {
-                    const gain: f32 = @bitCast(value);
-                    if (command[5] != 1 or !std.math.isFinite(gain) or gain < 0 or gain > 8) return errno.KernelError.einval.raw();
-                    if (id >> 24 == 0) voice.gain = gain;
+                    if (command[5] != 1) return errno.KernelError.einval.raw();
+                    const result = ngs2SetPortVolume(voice, id >> 24, @bitCast(value));
+                    if (result != errno.ok) return result;
+                },
+                7 => {
+                    if (command[5] != 3) return errno.KernelError.einval.raw();
+                    const result = ngs2SetPortMatrix(voice, id >> 24, @bitCast(value));
+                    if (result != errno.ok) return result;
                 },
                 else => {}, // Existing graph/matrix controls remain accepted.
             }
@@ -2566,6 +2670,7 @@ const ngs2_exports = [_]symbols.Export{
     .{ .name = "sceNgs2PanGetVolumeMatrix", .function = trace.wrap("sceNgs2PanGetVolumeMatrix", &ngs2PanGetVolumeMatrix), .expect_id = "gbMKV+8Enuo" },
     .{ .name = "sceNgs2VoiceGetState", .function = trace.wrap("sceNgs2VoiceGetState", &ngs2VoiceGetState), .expect_id = "-TOuuAQ-buE" },
     .{ .name = "sceNgs2VoiceGetStateFlags", .function = trace.wrap("sceNgs2VoiceGetStateFlags", &ngs2VoiceGetStateFlags), .expect_id = "rEh728kXk3w" },
+    .{ .name = "sceNgs2VoiceGetPortInfo", .function = trace.wrap("sceNgs2VoiceGetPortInfo", &ngs2VoiceGetPortInfo), .expect_id = "WCayTgob7-o" },
     .{ .name = "sceNgs2SystemQueryBufferSize", .function = trace.wrap("sceNgs2SystemQueryBufferSize", &ngs2SystemQueryBufferSize), .expect_id = "pgFAiLR5qT4" },
     .{ .name = "sceNgs2SystemCreate", .function = trace.wrap("sceNgs2SystemCreate", &ngs2SystemCreate), .expect_id = "koBbCMvOKWw" },
     .{ .name = "sceNgs2RackQueryBufferSize", .function = trace.wrap("sceNgs2RackQueryBufferSize", &ngs2RackQueryBufferSize), .expect_id = "0eFLVCfWVds" },
@@ -4032,6 +4137,136 @@ test "NGS2 rack info preserves full SDK options and bounds both output ABIs" {
         try std.testing.expectEqual(@as(u8, 0xa5), output[size]);
         if (size == 232) try std.testing.expectEqualSlices(u8, &(@as([16]u8, @splat(0))), output[216..232]);
     }
+}
+
+test "NGS2 port query tracks controls and compact commands independently" {
+    reset();
+    defer reset();
+    var system: u64 = 0;
+    var rack: u64 = 0;
+    var master_rack: u64 = 0;
+    var voice: u64 = 0;
+    var master: u64 = 0;
+    try std.testing.expectEqual(errno.ok, ngs2SystemCreateWithAllocator(0, 0, &system));
+    try std.testing.expectEqual(errno.ok, ngs2RackCreateWithAllocator(system, 0x1000, 0, 0, &rack));
+    try std.testing.expectEqual(errno.ok, ngs2RackCreateWithAllocator(system, 0x3000, 0, 0, &master_rack));
+    try std.testing.expectEqual(errno.ok, ngs2RackGetVoiceHandle(rack, 0, &voice));
+    try std.testing.expectEqual(errno.ok, ngs2RackGetVoiceHandle(master_rack, 0, &master));
+    var output = extern struct { info: Ngs2VoicePortInfo = .{}, canary: u64 = 0xdeadbeef }{};
+    const ptr = @intFromPtr(&output.info);
+    try std.testing.expectEqual(errno.ok, ngs2VoiceGetPortInfo(voice, 1, ptr, 24));
+    try std.testing.expectEqualDeep(Ngs2VoicePortInfo{}, output.info);
+
+    // One linked list sets all query fields on port 1, leaving port 0 alone.
+    var controls: [72]u8 align(8) = @splat(0);
+    for ([_]u32{ 2, 3, 4, 5 }, 0..) |id, index| {
+        const bytes = controls[index * 16 ..];
+        std.mem.writeInt(u16, bytes[0..2], if (id == 5) 24 else 16, .little);
+        std.mem.writeInt(i16, bytes[2..4], if (id == 5) 0 else 16, .little);
+        std.mem.writeInt(u32, bytes[4..8], id, .little);
+        std.mem.writeInt(u32, bytes[8..12], 1, .little);
+    }
+    std.mem.writeInt(u32, controls[12..16], @bitCast(@as(f32, 0.25)), .little);
+    std.mem.writeInt(u32, controls[44..48], 128, .little);
+    std.mem.writeInt(u32, controls[60..64], 2, .little);
+    std.mem.writeInt(u64, controls[64..72], master, .little);
+    try std.testing.expectEqual(errno.ok, ngs2VoiceControl(voice, @intFromPtr(&controls)));
+    try std.testing.expectEqual(errno.ok, ngs2VoiceGetPortInfo(voice, 1, ptr, 24));
+    try std.testing.expectEqualDeep(Ngs2VoicePortInfo{ .matrix_id = 0, .volume = 0.25, .num_delay_samples = 128, .dest_input_id = 2, .dest_handle = master }, output.info);
+    try std.testing.expectEqual(@as(u64, 0xdeadbeef), output.canary);
+    try std.testing.expectEqual(errno.ok, ngs2VoiceGetPortInfo(voice, 0, ptr, 24));
+    try std.testing.expectEqualDeep(Ngs2VoicePortInfo{}, output.info);
+
+    var commands: [32]u8 = @splat(0);
+    std.mem.writeInt(u32, commands[0..4], 0x01000006, .little);
+    commands[5] = 1;
+    std.mem.writeInt(u32, commands[8..12], @bitCast(@as(f32, 0.5)), .little);
+    std.mem.writeInt(u32, commands[16..20], 0x01000007, .little);
+    commands[21] = 3;
+    std.mem.writeInt(i32, commands[24..28], -1, .little);
+    try std.testing.expectEqual(errno.ok, ngs2VoiceRunCommands(voice, @intFromPtr(&commands), 2, 0));
+    try std.testing.expectEqual(errno.ok, ngs2VoiceGetPortInfo(voice, 1, ptr, 24));
+    try std.testing.expectEqual(@as(f32, 0.5), output.info.volume);
+    try std.testing.expectEqual(@as(i32, -1), output.info.matrix_id);
+    try std.testing.expectEqual(@as(f32, 1), ngs2FindVoice(voice).?.gain);
+
+    // Destroying a destination disconnects it without clearing other settings.
+    try std.testing.expectEqual(errno.ok, ngs2RackDestroy(master_rack, 0));
+    try std.testing.expectEqual(errno.ok, ngs2VoiceGetPortInfo(voice, 1, ptr, 24));
+    try std.testing.expectEqual(@as(u64, 0), output.info.dest_handle);
+    try std.testing.expectEqual(@as(u32, 0), output.info.dest_input_id);
+    try std.testing.expectEqual(@as(u32, 128), output.info.num_delay_samples);
+    try std.testing.expectEqual(@as(f32, 0.5), output.info.volume);
+
+    // Invalid controls must leave the last accepted values intact.
+    std.mem.writeInt(u32, commands[0..4], 0x08000006, .little);
+    try std.testing.expectEqual(ngs2_error_invalid_port, ngs2VoiceRunCommands(voice, @intFromPtr(&commands), 1, 0));
+    std.mem.writeInt(u32, commands[0..4], 0x01000006, .little);
+    std.mem.writeInt(u32, commands[8..12], @bitCast(std.math.nan(f32)), .little);
+    try std.testing.expectEqual(errno.KernelError.einval.raw(), ngs2VoiceRunCommands(voice, @intFromPtr(&commands), 1, 0));
+    std.mem.writeInt(i32, commands[24..28], 1, .little);
+    try std.testing.expectEqual(ngs2_error_invalid_matrix, ngs2VoiceRunCommands(voice, @intFromPtr(&commands) + 16, 1, 0));
+    try std.testing.expectEqual(errno.ok, ngs2VoiceGetPortInfo(voice, 1, ptr, 24));
+    try std.testing.expectEqual(@as(f32, 0.5), output.info.volume);
+    try std.testing.expectEqual(@as(i32, -1), output.info.matrix_id);
+
+    try std.testing.expectEqual(errno.ok, ngs2RackDestroy(rack, 0));
+    try std.testing.expectEqual(errno.ok, ngs2RackCreateWithAllocator(system, 0x1000, 0, 0, &rack));
+    try std.testing.expectEqual(errno.ok, ngs2RackGetVoiceHandle(rack, 0, &voice));
+    try std.testing.expectEqual(errno.ok, ngs2VoiceGetPortInfo(voice, 1, ptr, 24));
+    try std.testing.expectEqualDeep(Ngs2VoicePortInfo{}, output.info);
+}
+
+test "NGS2 port query rejects invalid ranges and handles without touching output" {
+    reset();
+    defer reset();
+    var system: u64 = 0;
+    var rack: u64 = 0;
+    var voice: u64 = 0;
+    var options: [176]u8 = @splat(0);
+    std.mem.writeInt(u64, options[0..8], options.len, .little);
+    std.mem.writeInt(u32, options[92..96], 2, .little);
+    try std.testing.expectEqual(errno.ok, ngs2SystemCreateWithAllocator(0, 0, &system));
+    try std.testing.expectEqual(errno.ok, ngs2RackCreateWithAllocator(system, 0x1000, @intFromPtr(&options), 0, &rack));
+    try std.testing.expectEqual(errno.ok, ngs2RackGetVoiceHandle(rack, 0, &voice));
+    var output: [25]u8 = @splat(0xa5);
+    const ptr = @intFromPtr(&output);
+    try std.testing.expectEqual(ngs2_error_invalid_output, ngs2VoiceGetPortInfo(voice, 0, 0, 24));
+    try std.testing.expectEqual(@as(i32, @bitCast(@as(u32, 0x804a8011))), ngs2VoiceGetPortInfo(voice, 0, ptr, 23));
+    try std.testing.expectEqual(@as(i32, @bitCast(@as(u32, 0x804a8011))), ngs2VoiceGetPortInfo(voice, 0, ptr, 25));
+    try std.testing.expectEqual(errno.KernelError.efault.raw(), ngs2VoiceGetPortInfo(voice, 0, 1, 24));
+    try std.testing.expectEqual(ngs2_error_invalid_voice, ngs2VoiceGetPortInfo(0, 0, ptr, 24));
+    try std.testing.expectEqual(ngs2_error_invalid_port, ngs2VoiceGetPortInfo(voice, 2, ptr, 24));
+    try std.testing.expectEqualSlices(u8, &(@as([25]u8, @splat(0xa5))), &output);
+    try std.testing.expectEqual(errno.ok, ngs2VoiceGetPortInfo(voice, 1, ptr, 24));
+    try std.testing.expectEqual(@as(u8, 0xa5), output[24]);
+    try std.testing.expectEqual(errno.ok, ngs2RackDestroy(rack, 0));
+    try std.testing.expectEqual(ngs2_error_invalid_voice, ngs2VoiceGetPortInfo(voice, 0, ptr, 24));
+}
+
+test "NGS2 port query checks guest output protection and page boundaries" {
+    const memory = @import("memory");
+    reset();
+    defer reset();
+    var system: u64 = 0;
+    var rack: u64 = 0;
+    var voice: u64 = 0;
+    try std.testing.expectEqual(errno.ok, ngs2SystemCreateWithAllocator(0, 0, &system));
+    try std.testing.expectEqual(errno.ok, ngs2RackCreateWithAllocator(system, 0x1000, 0, 0, &rack));
+    try std.testing.expectEqual(errno.ok, ngs2RackGetVoiceHandle(rack, 0, &voice));
+    var space = try memory.AddressSpace.initWithDirectMemory(std.testing.allocator, memory.page_size * 2);
+    defer space.deinit();
+    kernel_memory.init(std.testing.allocator);
+    defer kernel_memory.deinit();
+    kernel_memory.attachAddressSpace(&space);
+    const address = memory.user.start;
+    try space.mapFixed(address, memory.page_size, .read_write, .direct_memory, 0);
+    try space.mapFixed(address + memory.page_size, memory.page_size, .read_only, .direct_memory, memory.page_size);
+    try std.testing.expectEqual(errno.KernelError.efault.raw(), ngs2VoiceGetPortInfo(voice, 0, address + memory.page_size, 24));
+    try std.testing.expectEqual(errno.KernelError.efault.raw(), ngs2VoiceGetPortInfo(voice, 0, address + memory.page_size - 16, 24));
+    try std.testing.expectEqual(errno.ok, ngs2VoiceGetPortInfo(voice, 0, address + memory.page_size - 24, 24));
+    const output: *const Ngs2VoicePortInfo = @ptrFromInt(address + memory.page_size - 24);
+    try std.testing.expectEqualDeep(Ngs2VoicePortInfo{}, output.*);
 }
 
 test "NGS2 waveform file parses a mounted file at an offset and closes descriptors" {
