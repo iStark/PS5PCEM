@@ -457,10 +457,13 @@ pub const voiceqos_exports = [_]symbols.Export{
     .{ .name = "sceVoiceQoSGetLocalEndpointAttribute", .function = trace.wrap("sceVoiceQoSGetLocalEndpointAttribute", &services.offline), .expect_id = "eZu2RP0Ma3w" },
     .{ .name = "sceVoiceQoSReadPacket", .function = trace.wrap("sceVoiceQoSReadPacket", &services.offline), .expect_id = "PWokFqab5q4" },
     .{ .name = "sceVoiceQoSSetLocalEndpointAttribute", .function = trace.wrap("sceVoiceQoSSetLocalEndpointAttribute", &services.offline), .expect_id = "F7wS7FbfumQ" },
+    // Connection configuration belongs to the same unavailable voice transport
+    // as Init/Connect. Resolve the import, but never report a configured peer.
+    .{ .name = "sceVoiceQoSSetConnectionAttribute", .function = trace.wrap("sceVoiceQoSSetConnectionAttribute", &services.offline), .expect_id = "KCGOxg8iX7s" },
     .{ .name = "sceVoiceQoSDisconnect", .function = trace.wrap("sceVoiceQoSDisconnect", &services.offline), .expect_id = "j9Xt85krooc" },
     .{ .name = "sceVoiceQoSInit", .function = trace.wrap("sceVoiceQoSInit", &services.offline), .expect_id = "U8IfNl6-Css" },
     .{ .name = "sceVoiceQoSEnd", .function = trace.wrap("sceVoiceQoSEnd", &services.offline), .expect_id = "ATRGkmbolVM" },
-    .{ .name = "libSceVoiceQoS:cpC-zyHoMik", .function = trace.wrap("libSceVoiceQoS:cpC-zyHoMik", &services.offline), .id_override = "cpC-zyHoMik" },
+    .{ .name = "sceVoiceQoSSetRemoteEndpointAttribute", .function = trace.wrap("sceVoiceQoSSetRemoteEndpointAttribute", &services.offline), .expect_id = "cpC-zyHoMik" },
 };
 
 /// Touchpad gesture recognition.

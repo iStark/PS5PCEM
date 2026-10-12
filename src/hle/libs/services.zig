@@ -568,6 +568,25 @@ test "an absent service reports absence rather than success" {
     try testing.expectEqual(errno.ok, accept(0, 0, 0, 0, 0, 0));
 }
 
+test "VoiceQoS connection attributes link and preserve caller memory while offline" {
+    var db = symbols.Database{};
+    defer db.deinit(testing.allocator);
+    try register(&db, testing.allocator);
+    const entry = db.findById("KCGOxg8iX7s", .function) orelse return error.MissingVoiceQoSAttribute;
+    try testing.expectEqualStrings("libSceVoiceQoS", entry.key.library.name);
+    try testing.expectEqualStrings("libSceVoiceQoS", entry.key.module.name);
+    const configure: *const @TypeOf(offline) = @ptrFromInt(entry.address);
+    var attribute: [16]u8 = @splat(0xa5);
+    try testing.expectEqual(unavailable, configure(1, 0, @intFromPtr(&attribute), attribute.len, 0, 0));
+    try testing.expectEqualSlices(u8, &([_]u8{0xa5} ** 16), &attribute);
+    // Failed initialization cannot leave a usable connection, even if a caller
+    // keeps configuring it. No parameter is dereferenced on this error path.
+    const initialize = db.findById("U8IfNl6-Css", .function) orelse return error.MissingVoiceQoSInit;
+    const init: *const @TypeOf(offline) = @ptrFromInt(initialize.address);
+    try testing.expectEqual(unavailable, init(0, 0, 0, 0, 0, 0));
+    try testing.expectEqual(unavailable, configure(0, 0, 0, 0, 0, 0));
+}
+
 test "IPMI imports resolve and refuse client creation without fabricating an object" {
     var db = symbols.Database{};
     defer db.deinit(testing.allocator);
