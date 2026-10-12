@@ -21,7 +21,10 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-pub const supported = builtin.os.tag == .windows;
+pub const supported = builtin.os.tag == .windows or builtin.os.tag == .linux;
+/// waveOut on Windows; PulseAudio's simple API on Linux (see `Pulse`).
+const windows_output = builtin.os.tag == .windows;
+const pulse_output = builtin.os.tag == .linux;
 
 pub const Error = error{
     /// No sound output exists on this host build.
@@ -223,6 +226,15 @@ extern "kernel32" fn GetTickCount64() callconv(.winapi) u64;
 extern "kernel32" fn GetCurrentThread() callconv(.winapi) ?*anyopaque;
 extern "kernel32" fn SetThreadPriority(thread: ?*anyopaque, priority: i32) callconv(.winapi) i32;
 
+/// Milliseconds on a monotonic clock, for measuring playback pacing.
+fn monotonicMilliseconds() u64 {
+    if (comptime builtin.os.tag == .windows) return GetTickCount64();
+    if (comptime builtin.os.tag != .linux) return 0;
+    var now: std.os.linux.timespec = undefined;
+    if (std.os.linux.clock_gettime(.MONOTONIC, &now) != 0) return 0;
+    return @as(u64, @intCast(now.sec)) * std.time.ms_per_s + @as(u64, @intCast(now.nsec)) / std.time.ns_per_ms;
+}
+
 const time_period_ms: u32 = 1;
 const thread_priority_highest: i32 = 2;
 threadlocal var playback_thread_boosted = false;
@@ -266,6 +278,7 @@ pub const Device = struct {
         if (config.frequency == 0 or config.channels == 0 or config.frames == 0) {
             return Error.DeviceUnavailable;
         }
+        if (comptime pulse_output) return Pulse.open(self, config);
 
         var output_config = config;
         var wave_format = makeWaveFormat(output_config);
@@ -339,6 +352,7 @@ pub const Device = struct {
         if (samples.len > self.config.bufferBytes()) return Error.BufferTooLarge;
         if (samples.len == 0) return;
         if (comptime !supported) return Error.Unsupported;
+        if (comptime pulse_output) return Pulse.play(self, handle, samples);
 
         // AudioOut is called by the title's dedicated mixer thread. Keep that
         // thread runnable when a driver compiler or a burst of Unity workers is
@@ -479,7 +493,8 @@ pub const Device = struct {
 
     pub fn close(self: *Device) void {
         const handle = self.handle orelse return;
-        if (comptime supported) {
+        if (comptime pulse_output) Pulse.functions.free(handle);
+        if (comptime windows_output) {
             // Reset first: a header cannot be unprepared while the device still
             // holds it, and stopping playback is what releases them.
             _ = waveOutReset(handle);
@@ -500,6 +515,143 @@ pub const Device = struct {
         self.primed = false;
         self.fade_next_buffer = false;
         self.precise_timer_active = false;
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Linux output: PulseAudio's simple API, loaded at run time.
+//
+// pa_simple_write blocks while the server's buffer is full, which is the same
+// back-pressure the waveOut queue gives the title on Windows. PipeWire desktops
+// serve the same API through pipewire-pulse, and WSLg runs a PulseAudio server.
+// Loading the library dynamically keeps the runner free of a link-time
+// dependency; without it the title keeps its paced silent path.
+
+const Pulse = struct {
+    const SampleSpec = extern struct {
+        format: u32,
+        rate: u32,
+        channels: u8,
+    };
+
+    const BufferAttributes = extern struct {
+        maxlength: u32,
+        tlength: u32,
+        prebuf: u32,
+        minreq: u32,
+        fragsize: u32,
+    };
+
+    const stream_playback: u32 = 1;
+    const sample_s16le: u32 = 3;
+    const sample_float32le: u32 = 5;
+    const server_default: u32 = std.math.maxInt(u32);
+
+    const Functions = struct {
+        new: *const fn (
+            server: ?[*:0]const u8,
+            name: [*:0]const u8,
+            direction: u32,
+            device: ?[*:0]const u8,
+            stream_name: [*:0]const u8,
+            spec: *const SampleSpec,
+            map: ?*const anyopaque,
+            attributes: ?*const BufferAttributes,
+            failure: ?*i32,
+        ) callconv(.c) ?*anyopaque,
+        write: *const fn (*anyopaque, *const anyopaque, usize, ?*i32) callconv(.c) i32,
+        free: *const fn (*anyopaque) callconv(.c) void,
+    };
+
+    var functions: Functions = undefined;
+    var load_lock: std.atomic.Mutex = .unlocked;
+    var load_state: enum { untried, loaded, failed } = .untried;
+
+    fn load() bool {
+        while (!load_lock.tryLock()) std.atomic.spinLoopHint();
+        defer load_lock.unlock();
+        switch (load_state) {
+            .loaded => return true,
+            .failed => return false,
+            .untried => {},
+        }
+        load_state = .failed;
+        var library = std.DynLib.open("libpulse-simple.so.0") catch return false;
+        functions = .{
+            .new = library.lookup(@FieldType(Functions, "new"), "pa_simple_new") orelse return false,
+            .write = library.lookup(@FieldType(Functions, "write"), "pa_simple_write") orelse return false,
+            .free = library.lookup(@FieldType(Functions, "free"), "pa_simple_free") orelse return false,
+        };
+        // The library stays loaded for the process: open streams call into it.
+        load_state = .loaded;
+        return true;
+    }
+
+    fn open(device: *Device, config: Config) Error!void {
+        if (!load()) return Error.DeviceUnavailable;
+        // Surround mixes are folded to stereo here rather than passed with a
+        // channel map: the console's 7.1 order and the server's default map
+        // disagree, and stereo is what nearly every host plays anyway.
+        var output_config = config;
+        if (config.channels > 2) {
+            output_config.channels = 2;
+            output_config.format = .signed16;
+        }
+        const spec = SampleSpec{
+            .format = switch (output_config.format) {
+                .signed16 => sample_s16le,
+                .float32 => sample_float32le,
+            },
+            .rate = output_config.frequency,
+            .channels = output_config.channels,
+        };
+        // Pre-roll and target the same real latency the Windows queue holds.
+        const buffer_bytes: u32 = @intCast(output_config.bufferBytes());
+        const latency_bytes: u32 = @intCast(@max(
+            @as(u64, buffer_bytes) * 2,
+            @as(u64, output_config.frequency) * output_config.bytesPerFrame() *
+                @max(config.target_latency_ms, 1) / std.time.ms_per_s,
+        ));
+        const attributes = BufferAttributes{
+            .maxlength = server_default,
+            .tlength = latency_bytes,
+            .prebuf = latency_bytes,
+            .minreq = buffer_bytes,
+            .fragsize = server_default,
+        };
+        const storage = std.heap.page_allocator.alignedAlloc(u8, .@"16", buffer_bytes) catch
+            return Error.DeviceUnavailable;
+        var failure: i32 = 0;
+        const handle = functions.new(null, "PS5PCEM", stream_playback, null, "Guest audio", &spec, null, &attributes, &failure) orelse {
+            std.heap.page_allocator.free(storage);
+            return Error.DeviceUnavailable;
+        };
+        if (output_config.channels != config.channels) std.debug.print(
+            "[audio] host converts {d}ch {s} to stereo signed16\n",
+            .{ config.channels, @tagName(config.format) },
+        );
+        device.handle = handle;
+        device.buffers = storage;
+        device.config = config;
+        device.output_config = output_config;
+        device.active_depth = queueDepth(config);
+        device.next = 0;
+        device.submitted = 0;
+        device.underruns = 0;
+        device.staged = 0;
+        device.primed = true;
+        device.fade_next_buffer = false;
+    }
+
+    fn play(device: *Device, handle: *anyopaque, samples: []const u8) Error!void {
+        const output: []const u8 = if (device.output_config.channels == device.config.channels and
+            device.output_config.format == device.config.format)
+            samples
+        else
+            device.buffers[0..convertToStereoSigned16(device.config, samples, device.buffers)];
+        var failure: i32 = 0;
+        if (functions.write(handle, output.ptr, output.len, &failure) != 0) return Error.DeviceUnavailable;
+        device.submitted +%= 1;
     }
 };
 
@@ -631,9 +783,9 @@ test "a real device takes as long to play as the sound lasts" {
     const pcm = std.mem.sliceAsBytes(tone[0..]);
 
     const buffer_count = 20; // 200 ms
-    const started = GetTickCount64();
+    const started = monotonicMilliseconds();
     for (0..buffer_count) |_| try device.play(pcm);
-    const elapsed_ms = GetTickCount64() - started;
+    const elapsed_ms = monotonicMilliseconds() - started;
 
     // Wide bounds on purpose. What is being distinguished is "the device paced
     // this" from "the calls returned at once", not one clock from another.
@@ -699,11 +851,15 @@ test "simultaneous host streams retain private PCM when another stream closes" {
     const effects_pcm = [_]u8{0x03} ** 1024;
     try music.play(&music_pcm);
     try effects.play(&effects_pcm);
-    try testing.expectEqualSlices(u8, &music_pcm, music.bufferAt(0));
-    try testing.expectEqualSlices(u8, &effects_pcm, effects.bufferAt(0));
+    // Only the waveOut queue keeps submitted PCM in the device's own ring;
+    // PulseAudio copies it into the server's buffer on write.
+    if (comptime windows_output) {
+        try testing.expectEqualSlices(u8, &music_pcm, music.bufferAt(0));
+        try testing.expectEqualSlices(u8, &effects_pcm, effects.bufferAt(0));
+    }
     music.close();
     try testing.expect(effects.isOpen());
-    try testing.expectEqualSlices(u8, &effects_pcm, effects.bufferAt(0));
+    if (comptime windows_output) try testing.expectEqualSlices(u8, &effects_pcm, effects.bufferAt(0));
     // Prime and run the surviving stream past the queue capacity.
     for (0..20) |_| try effects.play(&effects_pcm);
     try testing.expect(effects.submitted >= 20);

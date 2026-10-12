@@ -737,7 +737,7 @@ pub fn writeDestinationValid(address: u64) bool {
         // A tracked read-only mapping must not fall back to its host page's
         // possibly broader permissions.
         if (space.query(address, false) != null) return false;
-    } else if (builtin.os.tag != .windows) return true;
+    } else if (builtin.os.tag != .windows and builtin.os.tag != .linux) return true;
     return memory_module.isHostRangeWritable(address, 8);
 }
 

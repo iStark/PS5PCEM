@@ -111,6 +111,15 @@ fn windowsAllocationRange(address: u64) Error!Range {
 
 const HostPermission = enum { read, write, execute };
 
+test "maps lines answer coverage and permission" {
+    const line = "7f0000001000-7f0000003000 rw-p 00000000 00:00 0";
+    try std.testing.expectEqual(@as(?MapsCoverage, null), mapsLineCovers(line, 0x7f0000003000, .read));
+    try std.testing.expectEqual(MapsCoverage{ .end = 0x7f0000003000, .allowed = true }, mapsLineCovers(line, 0x7f0000002000, .write).?);
+    try std.testing.expectEqual(MapsCoverage{ .end = 0x7f0000003000, .allowed = false }, mapsLineCovers(line, 0x7f0000002000, .execute).?);
+    // A mapping that begins after the cursor leaves a gap.
+    try std.testing.expectEqual(false, mapsLineCovers(line, 0x7f0000000000, .read).?.allowed);
+}
+
 fn windowsRangeAccessible(address: u64, size: u64, required: HostPermission) bool {
     if (builtin.os.tag != .windows or address == 0 or size == 0) return false;
     const end = std.math.add(u64, address, size) catch return false;
@@ -138,15 +147,121 @@ fn windowsRangeAccessible(address: u64, size: u64, required: HostPermission) boo
     return true;
 }
 
+/// Linux has no VirtualQuery. Readability is answered by copying one byte of
+/// every page out of this process with process_vm_readv, which fails with
+/// EFAULT on the first unmapped or unreadable page: exact, and free of signals
+/// and locks. Write and execute permission are read from /proc/self/maps.
+/// Both paths use only system calls and stack buffers, because the native
+/// fault handler asks these questions from inside a signal handler.
+fn linuxRangeAccessible(address: u64, size: u64, required: HostPermission) bool {
+    if (builtin.os.tag != .linux or address == 0 or size == 0) return false;
+    const end = std.math.add(u64, address, size) catch return false;
+    if (required == .read) {
+        if (linuxProbeReadable(address, end)) |readable| return readable;
+    }
+    return linuxMapsAllow(address, end, required);
+}
+
+/// Null when the probe is unavailable, for instance where a seccomp profile
+/// forbids process_vm_readv; the caller then reads the mappings instead.
+fn linuxProbeReadable(address: u64, end: u64) ?bool {
+    const linux = std.os.linux;
+    const batch = 64;
+    var scratch: [batch]u8 = undefined;
+    var local: [batch]std.posix.iovec = undefined;
+    var remote: [batch]std.posix.iovec_const = undefined;
+    const pid = linux.getpid();
+    var cursor = address;
+    while (cursor < end) {
+        var count: usize = 0;
+        while (count < batch and cursor < end) : (count += 1) {
+            local[count] = .{ .base = @ptrCast(&scratch[count]), .len = 1 };
+            remote[count] = .{ .base = @ptrFromInt(cursor), .len = 1 };
+            cursor = std.mem.alignForward(u64, cursor + 1, std.heap.page_size_min);
+        }
+        const result = linux.process_vm_readv(pid, local[0..count], remote[0..count], 0);
+        switch (linux.errno(result)) {
+            .SUCCESS => if (result != count) return false,
+            .FAULT => return false,
+            else => return null,
+        }
+    }
+    return true;
+}
+
+/// Walks /proc/self/maps, whose lines are sorted, and requires the range to be
+/// covered without a gap by mappings carrying the permission.
+fn linuxMapsAllow(address: u64, end: u64, required: HostPermission) bool {
+    const linux = std.os.linux;
+    const opened = linux.open("/proc/self/maps", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(opened) != .SUCCESS) return false;
+    const fd: i32 = @intCast(opened);
+    defer _ = linux.close(fd);
+
+    var buffer: [4096]u8 = undefined;
+    var filled: usize = 0;
+    var cursor = address;
+    while (true) {
+        const result = linux.read(fd, buffer[filled..].ptr, buffer.len - filled);
+        if (linux.errno(result) != .SUCCESS) return false;
+        filled += result;
+        const at_end = result == 0;
+        var consumed: usize = 0;
+        while (std.mem.indexOfScalarPos(u8, buffer[0..filled], consumed, '\n')) |newline| {
+            const line = buffer[consumed..newline];
+            consumed = newline + 1;
+            const covered = mapsLineCovers(line, cursor, required) orelse continue;
+            if (!covered.allowed) return false;
+            cursor = @min(end, covered.end);
+            if (cursor >= end) return true;
+        }
+        if (at_end) return false;
+        // Keep the partial last line for the next read.
+        std.mem.copyForwards(u8, buffer[0 .. filled - consumed], buffer[consumed..filled]);
+        filled -= consumed;
+        if (filled == buffer.len) return false;
+    }
+}
+
+const MapsCoverage = struct { end: u64, allowed: bool };
+
+/// For a line of /proc/self/maps: null if it ends at or before `cursor` (keep
+/// looking), otherwise whether it permits the access from `cursor` and where
+/// it ends. A line starting after `cursor` leaves a gap, which denies.
+fn mapsLineCovers(line: []const u8, cursor: u64, required: HostPermission) ?MapsCoverage {
+    const dash = std.mem.indexOfScalar(u8, line, '-') orelse return null;
+    const space = std.mem.indexOfScalarPos(u8, line, dash, ' ') orelse return null;
+    if (space + 4 > line.len) return null;
+    const start = std.fmt.parseInt(u64, line[0..dash], 16) catch return null;
+    const stop = std.fmt.parseInt(u64, line[dash + 1 .. space], 16) catch return null;
+    if (stop <= cursor) return null;
+    if (start > cursor) return .{ .end = stop, .allowed = false };
+    const permissions = line[space + 1 ..][0..3];
+    const allowed = switch (required) {
+        .read => permissions[0] == 'r',
+        .write => permissions[1] == 'w',
+        .execute => permissions[2] == 'x',
+    };
+    return .{ .end = stop, .allowed = allowed };
+}
+
+fn hostRangeAccessible(address: u64, size: u64, required: HostPermission) bool {
+    return switch (builtin.os.tag) {
+        .windows => windowsRangeAccessible(address, size, required),
+        .linux => linuxRangeAccessible(address, size, required),
+        else => false,
+    };
+}
+
 /// Checks native allocations returned to guest code by the host CRT. These
 /// pages are outside AddressSpace's console windows but remain valid pointers
 /// for native guest execution and for HLE output parameters.
 pub fn isHostRangeReadable(address: u64, size: u64) bool {
-    return windowsRangeAccessible(address, size, .read);
+    return hostRangeAccessible(address, size, .read);
 }
 
 pub fn isHostRangeWritable(address: u64, size: u64) bool {
-    return windowsRangeAccessible(address, size, .write);
+    return hostRangeAccessible(address, size, .write);
 }
 
 /// Checks that a native return address belongs to committed executable code.
@@ -154,7 +269,7 @@ pub fn isHostRangeWritable(address: u64, size: u64) bool {
 /// encounter host bridge frames, but must not mistake an arbitrary host heap
 /// pointer for one of those frames.
 pub fn isHostRangeExecutable(address: u64, size: u64) bool {
-    return windowsRangeAccessible(address, size, .execute);
+    return hostRangeAccessible(address, size, .execute);
 }
 
 /// Guest mappings are aligned to the hardware's 16 KiB page size.
@@ -212,6 +327,87 @@ pub const user = Range{
 };
 
 pub const guest_ranges = [_]Range{ system_managed, system_reserved, device, user };
+
+/// Host memory that guest code addresses directly, placed below 1 TiB.
+///
+/// Console user addresses fit in 40 bits, and engines rely on it: Arkanoid's
+/// job system packs fiber stack addresses into 40-bit fields. Windows hands
+/// out such memory bottom-up, so after the guest windows are reserved its
+/// allocations land in the free 16 GiB between the user window and 1 TiB and
+/// the packing holds. Linux maps top-down, near 128 TiB, and the same pointer
+/// is truncated. Stacks that guest code runs on, or whose locals it receives,
+/// are therefore taken from that gap on Linux; other hosts use the page
+/// allocator as before.
+pub const low_host = struct {
+    pub const start: u64 = user.end;
+    pub const end: u64 = 0x100_0000_0000;
+
+    var cursor = std.atomic.Value(u64).init(start);
+
+    pub fn alloc(size: usize) ?[]align(std.heap.page_size_min) u8 {
+        const length = std.mem.alignForward(usize, size, std.heap.page_size_min);
+        if (builtin.os.tag != .linux) {
+            return std.heap.page_allocator.alignedAlloc(u8, .fromByteUnits(std.heap.page_size_min), length) catch null;
+        }
+        const linux = std.os.linux;
+        // A bump cursor that wraps once: freed ranges are found again by
+        // MAP_FIXED_NOREPLACE succeeding where it failed before.
+        var address = cursor.load(.monotonic);
+        var wrapped = false;
+        while (true) {
+            if (address + length > end) {
+                if (wrapped) break;
+                wrapped = true;
+                address = start;
+                continue;
+            }
+            const result = linux.mmap(
+                @ptrFromInt(address),
+                length,
+                .{ .READ = true, .WRITE = true },
+                .{ .TYPE = .PRIVATE, .ANONYMOUS = true, .FIXED_NOREPLACE = true },
+                -1,
+                0,
+            );
+            switch (linux.errno(result)) {
+                .SUCCESS => {
+                    if (result != address) {
+                        // Kernels before 4.17 treat the flag as a hint only.
+                        _ = linux.munmap(@ptrFromInt(result), length);
+                        break;
+                    }
+                    cursor.store(address + length, .monotonic);
+                    const bytes: [*]align(std.heap.page_size_min) u8 = @ptrFromInt(address);
+                    return bytes[0..length];
+                },
+                .EXIST => address += length,
+                else => break,
+            }
+        }
+        return std.heap.page_allocator.alignedAlloc(u8, .fromByteUnits(std.heap.page_size_min), length) catch null;
+    }
+
+    pub fn free(bytes: []align(std.heap.page_size_min) u8) void {
+        if (bytes.len == 0) return;
+        const address = @intFromPtr(bytes.ptr);
+        if (builtin.os.tag == .linux and address >= start and address < end) {
+            _ = std.os.linux.munmap(bytes.ptr, bytes.len);
+            return;
+        }
+        std.heap.page_allocator.free(bytes);
+    }
+};
+
+test "low host memory stays below the 40-bit guest pointer limit" {
+    const bytes = low_host.alloc(64 * 1024) orelse return error.SkipZigTest;
+    defer low_host.free(bytes);
+    bytes[0] = 1;
+    bytes[bytes.len - 1] = 2;
+    if (builtin.os.tag == .linux) {
+        try std.testing.expect(@intFromPtr(bytes.ptr) >= low_host.start);
+        try std.testing.expect(@intFromPtr(bytes.ptr) + bytes.len <= low_host.end);
+    }
+}
 
 /// The window searched by an address chosen by the emulator.
 pub const Area = enum {

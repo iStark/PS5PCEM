@@ -422,7 +422,7 @@ const X11 = struct {
             _ = functions.next_event(display, &event);
             switch (event.type) {
                 key_press, key_release => {
-                    const virtual_key = virtualKey(functions.lookup_keysym(&event, 0)) orelse continue;
+                    const virtual_key: usize = input.virtualKeyFromKey(functions.lookup_keysym(&event, 0), event.key.keycode) orelse continue;
                     const down = event.type == key_press;
                     input.noteKeyState(virtual_key, down);
                     if (down) input.noteKeyPress(virtual_key);
@@ -446,28 +446,6 @@ const X11 = struct {
     fn sleepMilliseconds(milliseconds: u64) void {
         var request = std.os.linux.timespec{ .sec = 0, .nsec = @intCast(milliseconds * std.time.ns_per_ms) };
         _ = std.os.linux.nanosleep(&request, null);
-    }
-
-    /// Translates an X11 keysym to the Windows virtual-key code the key
-    /// mapping is written in. Keys without a use in the mapping are ignored.
-    fn virtualKey(keysym: u64) ?usize {
-        return switch (keysym) {
-            'a'...'z' => @intCast(keysym - 'a' + 'A'),
-            'A'...'Z', '0'...'9', ' ' => @intCast(keysym),
-            0xff08 => 0x08, // BackSpace
-            0xff09 => 0x09, // Tab
-            0xff0d, 0xff8d => 0x0d, // Return, KP_Enter
-            0xff1b => 0x1b, // Escape
-            0xff51 => 0x25, // Left
-            0xff52 => 0x26, // Up
-            0xff53 => 0x27, // Right
-            0xff54 => 0x28, // Down
-            0xffe1, 0xffe2 => 0x10, // Shift
-            0xffe3, 0xffe4 => 0x11, // Control
-            0xffe9, 0xffea => 0x12, // Alt
-            0xffbe...0xffc9 => @intCast(keysym - 0xffbe + 0x70), // F1-F12
-            else => null,
-        };
     }
 };
 

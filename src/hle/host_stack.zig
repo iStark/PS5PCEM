@@ -21,6 +21,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const memory = @import("memory");
 
 /// Size of each thread's firmware stack.
 ///
@@ -31,7 +32,12 @@ pub const stack_size: usize = 4 * 1024 * 1024;
 
 /// Switching is only meaningful where guest and host share a stack in the first
 /// place. Elsewhere the call runs directly and this whole layer is inert.
-pub const supported = builtin.cpu.arch == .x86_64 and builtin.os.tag == .windows;
+pub const supported = builtin.cpu.arch == .x86_64 and
+    (builtin.os.tag == .windows or builtin.os.tag == .linux);
+/// Windows validates frames against the stack bounds in its thread block (GS:8
+/// and GS:16), so switching must move them too. Linux has no such bounds, and
+/// GS there points at the guest FS block (see guest_fs.zig).
+const windows_stack_bounds = supported and builtin.os.tag == .windows;
 
 threadlocal var stack: ?[]align(16) u8 = null;
 /// Guards against switching twice. Firmware calling firmware is common, and the
@@ -61,7 +67,7 @@ pub const FiberState = struct {
     suspended: ?*const SuspendedStack = null,
 
     pub fn deinit(self: *FiberState) void {
-        if (self.allocation) |value| std.heap.page_allocator.free(value);
+        if (self.allocation) |value| freeStack(value);
         self.* = .{};
     }
 };
@@ -91,22 +97,33 @@ pub const CallState = struct {
     stack_limit: u64,
 
     pub fn capture() CallState {
+        if (!windows_stack_bounds) {
+            // Nothing on Linux tracks the bounds, so report the firmware
+            // stack's own while a call runs on it, as the TEB would.
+            const switched = if (active) stack else null;
+            return .{
+                .was_active = active,
+                .suspended = suspended_stack,
+                .stack_base = if (switched) |value| @intFromPtr(value.ptr) + value.len else 0,
+                .stack_limit = if (switched) |value| @intFromPtr(value.ptr) else 0,
+            };
+        }
         return .{
             .was_active = active,
             .suspended = suspended_stack,
-            .stack_base = if (supported) asm volatile ("movq %%gs:8, %[value]"
+            .stack_base = asm volatile ("movq %%gs:8, %[value]"
                 : [value] "=r" (-> u64),
-            ) else 0,
-            .stack_limit = if (supported) asm volatile ("movq %%gs:16, %[value]"
+            ),
+            .stack_limit = asm volatile ("movq %%gs:16, %[value]"
                 : [value] "=r" (-> u64),
-            ) else 0,
+            ),
         };
     }
 
     pub fn restore(self: CallState) void {
         active = self.was_active;
         suspended_stack = self.suspended;
-        if (supported) asm volatile (
+        if (windows_stack_bounds) asm volatile (
             \\movq %[base], %%gs:8
             \\movq %[limit], %%gs:16
             :
@@ -125,8 +142,7 @@ pub const CallState = struct {
 fn top() u64 {
     if (stack) |value| return @intFromPtr(value.ptr) + value.len;
 
-    const allocated = std.heap.page_allocator.alignedAlloc(u8, .@"16", stack_size) catch
-        return 0;
+    const allocated = allocateStack() orelse return 0;
     stack = allocated;
     return @intFromPtr(allocated.ptr) + allocated.len;
 }
@@ -136,10 +152,23 @@ fn top() u64 {
 /// Worth calling when a guest thread ends; leaking one stack per thread would
 /// otherwise accumulate over a title's lifetime.
 pub fn release() void {
-    if (stack) |value| std.heap.page_allocator.free(value);
+    if (stack) |value| freeStack(value);
     stack = null;
     active = false;
     suspended_stack = null;
+}
+
+/// Guest callbacks receive pointers to locals on this stack. On Linux it is
+/// taken from below 1 TiB, where Windows places it too, because guest code
+/// may pack such pointers into 40 bits (see memory.low_host).
+fn allocateStack() ?[]align(16) u8 {
+    if (builtin.os.tag == .linux) return memory.low_host.alloc(stack_size);
+    return std.heap.page_allocator.alignedAlloc(u8, .@"16", stack_size) catch null;
+}
+
+fn freeStack(value: []align(16) u8) void {
+    if (builtin.os.tag == .linux) return memory.low_host.free(@alignCast(value));
+    std.heap.page_allocator.free(value);
 }
 
 extern fn ps5HleCallOnStack(
@@ -150,7 +179,7 @@ extern fn ps5HleCallOnStack(
 ) callconv(.c) void;
 
 comptime {
-    if (supported) asm (
+    if (windows_stack_bounds) asm (
     // Switches to `stack_top`, calls `target(context)`, and restores.
     //
     // The Microsoft x64 convention places context in rcx, target in rdx and the
@@ -191,6 +220,42 @@ comptime {
         \\  movq %r11, %gs:16
         \\  popq %rax
         \\  movq %rax, %gs:8
+        \\  popq %r10
+        \\  movq %r10, %rsp
+        \\  popq %r15
+        \\  popq %r14
+        \\  popq %r13
+        \\  popq %r12
+        \\  popq %rbp
+        \\  popq %rbx
+        \\  retq
+    );
+}
+
+comptime {
+    if (supported and builtin.os.tag == .linux) asm (
+    // The System V form of the switch above: context in rdi, target in rsi,
+    // the new top in rdx and saved_stack in rcx. Linux keeps no stack bounds
+    // to update, and the callee needs no shadow space. The six pushes leave
+    // the same SuspendedStack layout on the original stack.
+        \\.text
+        \\.p2align 4
+        \\.globl ps5HleCallOnStack
+        \\ps5HleCallOnStack:
+        \\  pushq %rbx
+        \\  pushq %rbp
+        \\  pushq %r12
+        \\  pushq %r13
+        \\  pushq %r14
+        \\  pushq %r15
+        \\  movq %rsp, %r10
+        \\  movq %r10, (%rcx)
+        \\  movq %rdx, %rsp
+        \\  pushq %r10
+        // One pushed word leaves rsp 8 past the 16-byte alignment of the top.
+        \\  subq $8, %rsp
+        \\  callq *%rsi
+        \\  addq $8, %rsp
         \\  popq %r10
         \\  movq %r10, %rsp
         \\  popq %r15
@@ -263,7 +328,7 @@ const DebugOutput = struct {
 };
 
 test "Windows debug output returns on firmware stacks and restores native bounds" {
-    if (!supported) return error.SkipZigTest;
+    if (!windows_stack_bounds) return error.SkipZigTest;
     defer release();
     const original = CallState.capture();
     const Probe = struct {
@@ -291,7 +356,7 @@ test "Windows debug output returns on firmware stacks and restores native bounds
 comptime {
     std.debug.assert(@sizeOf(SuspendedStack) == 7 * @sizeOf(u64));
     std.debug.assert(stack_size == 4194304); // Shared with the switch assembly.
-    if (supported and builtin.is_test) asm (
+    if (windows_stack_bounds and builtin.is_test) asm (
         \\.text
         \\.p2align 4
         \\.globl ps5HleTestRegisterRoot
@@ -315,7 +380,8 @@ extern fn ps5HleTestRegisterRoot(
 ) callconv(.c) u64;
 
 test "register-only roots are spilled before switching firmware stacks" {
-    if (!supported) return error.SkipZigTest;
+    // The probe below is written for the Microsoft convention.
+    if (!windows_stack_bounds) return error.SkipZigTest;
     defer release();
     const Probe = struct {
         fn invoke(raw: *anyopaque) callconv(.c) void {

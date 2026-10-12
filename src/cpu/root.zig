@@ -849,7 +849,14 @@ const LinuxX64Machine = struct {
     /// A guest thread that has exhausted its own stack must still be able to
     /// run the handler, and the handler formats reports with sizeable frames.
     const signal_stack_size: usize = 256 * 1024;
-    const handled_signals = [_]std.posix.SIG{ .SEGV, .BUS, .ILL };
+    const handled_signals = [_]std.posix.SIG{ .SEGV, .BUS, .ILL, .SYS };
+    /// PR_SET_SYSCALL_USER_DISPATCH and PR_SYS_DISPATCH_ON (Linux 5.11+).
+    const pr_set_syscall_user_dispatch: i32 = 59;
+    const pr_sys_dispatch_on: usize = 1;
+    /// FreeBSD's ENOSYS. A blocked guest system call returns it the FreeBSD
+    /// way: the error number in RAX with the carry flag set.
+    const freebsd_enosys: u64 = 78;
+    var blocked_syscalls = std.atomic.Value(u32).init(0);
     /// si_code of a fault the kernel raised without a page address: a general
     /// protection fault, for example a non-canonical access.
     const si_kernel: i32 = 0x80;
@@ -904,7 +911,38 @@ const LinuxX64Machine = struct {
     }
 
     threadlocal var thread_block: ?*ThreadBlock = null;
-    var previous_actions: [handled_signals.len]std.posix.Sigaction = undefined;
+    /// Kept in the kernel's own form so that restoring one reinstalls its
+    /// restorer exactly as it was, whoever installed it.
+    var previous_actions: [handled_signals.len]linux.k_sigaction = undefined;
+
+    /// The restorer of the handlers below, and the one region Syscall User
+    /// Dispatch always lets through. A handler that resumes guest code leaves
+    /// the selector at block, so the `rt_sigreturn` that ends it would itself
+    /// be dispatched as a guest call, again and again, without the exemption.
+    /// The kernel checks the address following `syscall`, which the trailing
+    /// `ud2` keeps inside the range.
+    extern fn ps5LinuxSignalReturn() callconv(.c) void;
+    extern const ps5LinuxSignalReturnEnd: u8;
+
+    comptime {
+        if (builtin.os.tag == .linux) asm (
+            \\.text
+            \\.p2align 4
+            \\.globl ps5LinuxSignalReturn
+            \\.globl ps5LinuxSignalReturnEnd
+            \\ps5LinuxSignalReturn:
+            \\  movl $15, %eax
+            \\  syscall
+            \\  ud2
+            \\ps5LinuxSignalReturnEnd:
+        );
+    }
+
+    /// The `syscall` instruction's length, to re-execute a blocked one.
+    const syscall_instruction_size: u64 = 2;
+
+    /// What `dispatch` decided.
+    const Outcome = enum { decline, resume_guest, retry_host_syscall };
 
     fn isSupported() bool {
         // With libc, glibc's startup code runs instead of Zig's and only libc
@@ -917,24 +955,37 @@ const LinuxX64Machine = struct {
     }
 
     fn installFaultHandler() ?*anyopaque {
-        var action = std.posix.Sigaction{
-            .handler = .{ .sigaction = handleSignal },
-            .mask = std.posix.sigemptyset(),
+        // Installed with the system call itself: both Zig's and glibc's
+        // wrappers substitute their own restorer for ours.
+        const action = linux.k_sigaction{
+            .handler = @ptrCast(&handleSignal),
             // NODEFER lets a fault inside the handler reach it again, where
             // the reentrancy guard declines it instead of the kernel killing
             // the process without a report.
-            .flags = std.posix.SA.SIGINFO | std.posix.SA.ONSTACK | std.posix.SA.NODEFER,
+            .flags = linux.SA.SIGINFO | linux.SA.ONSTACK | linux.SA.NODEFER | linux.SA.RESTORER,
+            .restorer = &ps5LinuxSignalReturn,
+            .mask = linux.sigemptyset(),
         };
         for (handled_signals, 0..) |signal, index| {
-            std.posix.sigaction(signal, &action, &previous_actions[index]);
+            setAction(signal, &action, &previous_actions[index]);
         }
         return @ptrCast(&previous_actions);
     }
 
     fn removeFaultHandler(_: *anyopaque) void {
         for (handled_signals, 0..) |signal, index| {
-            std.posix.sigaction(signal, &previous_actions[index], null);
+            setAction(signal, &previous_actions[index], null);
         }
+    }
+
+    fn setAction(signal: std.posix.SIG, action: *const linux.k_sigaction, previous: ?*linux.k_sigaction) void {
+        _ = linux.syscall4(
+            .rt_sigaction,
+            @intFromEnum(signal),
+            @intFromPtr(action),
+            if (previous) |value| @intFromPtr(value) else 0,
+            @sizeOf(linux.sigset_t),
+        );
     }
 
     /// Gives the calling OS thread its GS block and alternate signal stack.
@@ -945,6 +996,17 @@ const LinuxX64Machine = struct {
         const block = std.heap.page_allocator.create(ThreadBlock) catch
             @panic("cannot allocate the guest thread block");
         block.* = .{ .host_fs = readFsBase(), .guest_fs = 0 };
+        // Every system call on this thread now consults the selector in the
+        // block; host code keeps it at allow, guest code at block. A kernel
+        // without the feature leaves guest system calls unguarded, as before.
+        const exempt_start = @intFromPtr(&ps5LinuxSignalReturn);
+        _ = linux.prctl(
+            pr_set_syscall_user_dispatch,
+            pr_sys_dispatch_on,
+            exempt_start,
+            @intFromPtr(&ps5LinuxSignalReturnEnd) - exempt_start,
+            @intFromPtr(&block.syscall_selector),
+        );
         if (std.heap.page_allocator.alloc(u8, signal_stack_size)) |stack| {
             const description = linux.stack_t{ .sp = stack.ptr, .flags = 0, .size = stack.len };
             _ = linux.sigaltstack(&description, null);
@@ -967,6 +1029,10 @@ const LinuxX64Machine = struct {
         defer block.guest_fs = previous_guest_fs;
         const firmware_state = hle.host_stack.CallState.capture();
         defer firmware_state.restore();
+        // Declared last so it runs first: nothing after the guest returns or
+        // escapes may make a system call while the selector still blocks.
+        hle.guest_fs.setSyscallSelector(block, hle.guest_fs.syscall_block);
+        defer hle.guest_fs.setSyscallSelector(block, hle.guest_fs.syscall_allow);
         return ps5NativeCallWindowsX64(frame, entry_point, stack_pointer);
     }
 
@@ -994,20 +1060,50 @@ const LinuxX64Machine = struct {
     ) callconv(.c) void {
         // Before anything that could touch host thread-local storage.
         const replaced_fs = hle.guest_fs.enterHost();
-        defer hle.guest_fs.leaveHost(replaced_fs);
-        const context: *SignalContext = @ptrCast(@alignCast(raw_context orelse return));
-        if (!dispatch(signal, info, &context.registers)) decline(signal);
+        const outcome: Outcome = if (raw_context) |raw| outcome: {
+            const context: *SignalContext = @ptrCast(@alignCast(raw));
+            break :outcome dispatch(signal, info, &context.registers);
+        } else .decline;
+        if (outcome == .decline) decline(signal);
+        hle.guest_fs.leaveHost(replaced_fs);
+        // After leaveHost, which blocks again whenever guest FS was in place:
+        // the host code being resumed must find its system call allowed.
+        if (outcome == .retry_host_syscall) {
+            if (hle.guest_fs.currentBlock()) |block| hle.guest_fs.setSyscallSelector(block, hle.guest_fs.syscall_allow);
+        }
     }
 
     /// Runs the Windows handler on an equivalent record and context, and
-    /// copies its edits back. Returns whether execution should resume.
+    /// copies its edits back.
     fn dispatch(
         signal: std.posix.SIG,
         info: *const std.posix.siginfo_t,
         registers: *SignalRegisters,
-    ) bool {
+    ) Outcome {
+        if (signal == .SYS) {
+            const call_address = @intFromPtr(info.fields.sigsys.call_addr);
+            if (call_address >> hle.guest_fs.guest_address_limit_shift != 0) {
+                // Host code interrupted guest code with the selector still at
+                // block: a handler someone else installed, ending in its own
+                // restorer. Let it make the call it meant to.
+                registers.rip -= syscall_instruction_size;
+                return .retry_host_syscall;
+            }
+            // Syscall User Dispatch: a `syscall` instruction in guest code.
+            // The console's numbers are FreeBSD's; the kernel never ran it.
+            registers.rax = freebsd_enosys;
+            registers.eflags |= 1;
+            if (blocked_syscalls.fetchAdd(1, .monotonic) < 16) std.debug.print(
+                "[cpu] blocked guest system call {d} at rip=0x{x}\n",
+                .{ info.fields.sigsys.syscall, call_address },
+            );
+            return .resume_guest;
+        }
         var record = std.mem.zeroes(windows.EXCEPTION_RECORD);
-        record.ExceptionAddress = @ptrFromInt(registers.rip);
+        // A call through a null pointer faults with RIP zero, which the
+        // record's non-optional pointer type cannot hold; Windows stores it
+        // anyway, so write the raw word.
+        @as(*usize, @ptrCast(&record.ExceptionAddress)).* = registers.rip;
         switch (signal) {
             .SEGV, .BUS => {
                 record.ExceptionCode = windows.EXCEPTION_ACCESS_VIOLATION;
@@ -1030,7 +1126,7 @@ const LinuxX64Machine = struct {
                     std.math.maxInt(u64);
             },
             .ILL => record.ExceptionCode = windows.EXCEPTION_ILLEGAL_INSTRUCTION,
-            else => return false,
+            else => return .decline,
         }
 
         var context = std.mem.zeroes(windows.CONTEXT);
@@ -1040,10 +1136,10 @@ const LinuxX64Machine = struct {
             .ContextRecord = &context,
         };
         if (WindowsX64Machine.handleGuestException(&pointers) != WindowsX64Machine.exception_continue_execution) {
-            return false;
+            return .decline;
         }
         storeContext(registers, &context);
-        return true;
+        return .resume_guest;
     }
 
     fn loadContext(context: *windows.CONTEXT, registers: *const SignalRegisters) void {
@@ -1105,7 +1201,7 @@ const LinuxX64Machine = struct {
     /// faults again on return.
     fn decline(signal: std.posix.SIG) void {
         for (handled_signals, 0..) |candidate, index| {
-            if (candidate == signal) std.posix.sigaction(signal, &previous_actions[index], null);
+            if (candidate == signal) setAction(signal, &previous_actions[index], null);
         }
     }
 };
@@ -5440,6 +5536,9 @@ test "native bridge restores firmware state after escapes and nested callbacks" 
             NativeMachine.escape(frame);
         }
         fn entry(frame: *NativeCallFrame) callconv(.{ .x86_64_sysv = .{} }) u64 {
+            // Stands in for a firmware thunk, which enters the host FS before
+            // anything else; the escape reinstalls the caller's.
+            _ = hle.guest_fs.enterHost();
             hle.host_stack.call(void, escape, .{frame});
             unreachable;
         }
@@ -5650,10 +5749,12 @@ test "native bridge unwinds scePthreadExit to the dispatcher" {
         0xff, 0xd0, 0x0f, 0x0b,
     };
     std.mem.writeInt(u64, program[2..10], 0x55, .little);
+    // Through the export's thunk, as a title reaches it: on Linux the thunk
+    // is what replaces the guest FS with the host's.
     std.mem.writeInt(
         u64,
         program[12..20],
-        @intFromPtr(&threading.scePthreadExit),
+        @intFromPtr(hle.trace.wrap("scePthreadExit", &threading.scePthreadExit)),
         .little,
     );
     try address_space.write(code_address, &program);

@@ -309,6 +309,8 @@ fn audioTestToneEnabled() bool {
         if (n > 0 and n < buf.len) {
             on = buf[0] != '0' and buf[0] != 'n' and buf[0] != 'N';
         }
+    } else if (posixFlag("PS5_AUDIO_TEST_TONE")) |value| {
+        on = value;
     }
     audio_test_tone_enabled = on;
     if (on) std.debug.print("[audio] PS5_AUDIO_TEST_TONE: inject 440 Hz on silent buffers\n", .{});
@@ -322,9 +324,19 @@ pub fn audioDisabled() bool {
         var buf: [8]u8 = undefined;
         const n = GetEnvironmentVariableA("PS5_AUDIO_DISABLED", &buf, buf.len);
         if (n > 0 and n < buf.len) disabled = buf[0] != '0' and buf[0] != 'n' and buf[0] != 'N';
+    } else if (posixFlag("PS5_AUDIO_DISABLED")) |value| {
+        disabled = value;
     }
     audio_disabled = disabled;
     return disabled;
+}
+
+/// A yes/no environment switch on Linux, read through libc.
+fn posixFlag(comptime name: [:0]const u8) ?bool {
+    if (comptime builtin.os.tag != .linux or !builtin.link_libc) return null;
+    const value = std.mem.span(std.c.getenv(name) orelse return null);
+    if (value.len == 0) return null;
+    return value[0] != '0' and value[0] != 'n' and value[0] != 'N';
 }
 
 fn readF32Le(bytes: *const [4]u8) f32 {

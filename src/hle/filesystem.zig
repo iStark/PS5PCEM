@@ -12,6 +12,7 @@
 //! emulator's `out` directory. None can alter installed game data.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const audio_fs = @import("audio_fs.zig");
 const savedata = @import("savedata.zig");
 const boot_config = @import("boot_config.zig");
@@ -349,11 +350,56 @@ fn normalizedMountRelative(path: []const u8, storage: *[maximum_path]u8) ?[]cons
     return storage[0..written];
 }
 
+/// Rewrites `relative`, in place, to the case the host directory uses.
+///
+/// Console storage ignores case, as NTFS does, so titles routinely open
+/// `Data/Maps.pak` for a file shipped as `data/maps.pak`. Linux file systems do
+/// not ignore it. When the path does not exist as written, each segment is
+/// looked up in its parent and replaced by the one entry naming it in another
+/// case; ASCII case folding keeps the length. The walk stops at the first
+/// segment with no match, so a path being created keeps its new leaf as given
+/// beneath parents spelled the host's way.
+fn matchHostCase(relative: []u8, io: std.Io, base: std.Io.Dir) void {
+    if (comptime builtin.os.tag != .linux) return;
+    if (std.mem.eql(u8, relative, ".")) return;
+    if (base.statFile(io, relative, .{})) |_| return else |_| {}
+
+    var begin: usize = 0;
+    while (begin < relative.len) {
+        const end = std.mem.indexOfScalarPos(u8, relative, begin, '/') orelse relative.len;
+        const prefix = relative[0..end];
+        if (base.statFile(io, prefix, .{})) |_| {} else |_| {
+            const parent_path = if (begin == 0) "." else relative[0 .. begin - 1];
+            var parent = base.openDir(io, parent_path, .{ .iterate = true }) catch return;
+            defer parent.close(io);
+            const segment = relative[begin..end];
+            var iterator = parent.iterate();
+            const found = while (iterator.next(io) catch null) |entry| {
+                if (std.ascii.eqlIgnoreCase(entry.name, segment)) {
+                    @memcpy(segment, entry.name);
+                    break true;
+                }
+            } else false;
+            if (!found) return;
+        }
+        begin = end + 1;
+    }
+}
+
+/// Normalizes a guest path below `base` and matches it to the host's case.
+fn hostRelative(path: []const u8, storage: *[maximum_path]u8, io: std.Io, base: std.Io.Dir) ?[]const u8 {
+    const relative = normalizedMountRelative(path, storage) orelse return null;
+    matchHostCase(storage[0..relative.len], io, base);
+    return relative;
+}
+
 /// Returns a normalized path below the attached title root for host helpers
 /// which need to consume the same file through an external decoder. Parent
 /// segments remain clamped at the mount and drive-qualified paths are rejected.
 pub fn mountRelative(path: []const u8, storage: *[maximum_path]u8) ?[]const u8 {
-    return normalizedMountRelative(path, storage);
+    const io = active_io orelse return normalizedMountRelative(path, storage);
+    const base = rootFor(mountOf(path)) orelse return normalizedMountRelative(path, storage);
+    return hostRelative(path, storage, io, base);
 }
 
 const OpenFile = struct {
@@ -943,7 +989,7 @@ pub fn open(path: []const u8, flags: i32) Error!i32 {
     }
 
     var relative_storage: [maximum_path]u8 = undefined;
-    const relative = normalizedMountRelative(path, &relative_storage) orelse return Error.NotFound;
+    const relative = hostRelative(path, &relative_storage, io, directory) orelse return Error.NotFound;
 
     if (flags & O.directory != 0) return openDirectory(path, relative, io, directory);
 
@@ -1094,7 +1140,7 @@ pub fn makeDirectory(path: []const u8) Error!void {
     const io = active_io orelse return Error.NotAttached;
     const directory = rootFor(mount) orelse return Error.NotAttached;
     var relative_storage: [maximum_path]u8 = undefined;
-    const relative = normalizedMountRelative(path, &relative_storage) orelse return Error.NotFound;
+    const relative = hostRelative(path, &relative_storage, io, directory) orelse return Error.NotFound;
     if (std.mem.eql(u8, relative, ".")) return;
     directory.createDirPath(io, relative) catch return Error.IoFailed;
 }
@@ -1498,7 +1544,7 @@ pub fn stat(path: []const u8, out: *Stat) Error!void {
     const directory = rootFor(mountOf(path)) orelse return Error.NotAttached;
 
     var relative_storage: [maximum_path]u8 = undefined;
-    const relative = normalizedMountRelative(path, &relative_storage) orelse return Error.NotFound;
+    const relative = hostRelative(path, &relative_storage, io, directory) orelse return Error.NotFound;
 
     if (mountOf(path) == .title and std.ascii.eqlIgnoreCase(relative, boot_config.path)) {
         table_lock.lock();

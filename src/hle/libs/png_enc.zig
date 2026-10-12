@@ -56,7 +56,7 @@ fn readable(address: u64, len: usize) bool {
     if (address == 0) return false;
     _ = std.math.add(u64, address, len) catch return false;
     if (kernel_memory.attachedAddressSpace()) |_| return kernel_memory.isGuestRangeAccessible(address, len);
-    if (builtin.os.tag != .windows) return true;
+    if (builtin.os.tag != .windows and builtin.os.tag != .linux) return true;
     return memory.isHostRangeReadable(address, len);
 }
 fn writable(address: u64, len: usize) bool {
@@ -64,7 +64,7 @@ fn writable(address: u64, len: usize) bool {
     _ = std.math.add(u64, address, len) catch return false;
     if (kernel_memory.attachedAddressSpace()) |space| {
         if (space.isWritable(address, len)) return true;
-    } else if (builtin.os.tag != .windows) {
+    } else if (builtin.os.tag != .windows and builtin.os.tag != .linux) {
         return true;
     }
     return memory.isHostRangeWritable(address, len);

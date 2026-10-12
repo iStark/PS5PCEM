@@ -22,8 +22,14 @@ const symbols = @import("../symbols.zig");
 const kernel_memory = @import("kernel_memory.zig");
 const memory = @import("memory");
 const host_stack = @import("../host_stack.zig");
+const guest_fs = @import("../guest_fs.zig");
 
-const supported = builtin.cpu.arch == .x86_64 and builtin.os.tag == .windows;
+const supported = builtin.cpu.arch == .x86_64 and
+    (builtin.os.tag == .windows or builtin.os.tag == .linux);
+
+/// The host fiber's start routine is called by Windows with WINAPI, and by
+/// the Linux switch trampoline with the C convention.
+const entry_convention: std.builtin.CallingConvention = if (builtin.os.tag == .windows) .winapi else .c;
 
 const error_null: i32 = @bitCast(@as(u32, 0x8059_0001));
 const error_alignment: i32 = @bitCast(@as(u32, 0x8059_0002));
@@ -77,7 +83,7 @@ comptime {
     if (@offsetOf(Fiber, "end_signature") != 104) @compileError("SceFiber end signature offset mismatch");
 }
 
-const Host = struct {
+const Host = if (builtin.os.tag == .linux) LinuxHost else struct {
     const StartRoutine = *const fn (?*anyopaque) callconv(.winapi) void;
 
     extern "kernel32" fn ConvertThreadToFiberEx(
@@ -93,6 +99,113 @@ const Host = struct {
     ) callconv(.winapi) ?*anyopaque;
     extern "kernel32" fn SwitchToFiber(fiber: *anyopaque) callconv(.winapi) void;
     extern "kernel32" fn DeleteFiber(fiber: *anyopaque) callconv(.winapi) void;
+};
+
+/// The four Windows fiber calls this file relies on, for Linux.
+///
+/// A fiber is a saved stack pointer. Switching pushes the System V callee-saved
+/// registers onto the current stack, stores the stack pointer, loads the
+/// target's and pops the same frame. Like a Windows fiber created without
+/// FIBER_FLAG_FLOAT_SWITCH, it leaves MXCSR and the x87 control word alone, so
+/// every fiber sees the thread's floating-point mode, FTZ/DAZ included. A new
+/// fiber's stack is prepared so that the first switch to it pops into a
+/// trampoline that calls the start routine. As with Windows fibers, a fiber
+/// suspended on one thread can be resumed on another.
+const LinuxHost = struct {
+    const StartRoutine = *const fn (?*anyopaque) callconv(.c) void;
+    /// What Windows reserves for a fiber whose reserve size is zero.
+    const default_stack_size: usize = 1024 * 1024;
+
+    const Context = struct {
+        /// Saved stack pointer while the fiber is suspended.
+        stack_pointer: u64 = 0,
+        /// Owned stack of a created fiber; a converted thread keeps its own.
+        stack: []align(std.heap.page_size_min) u8 = &.{},
+    };
+
+    threadlocal var current: ?*Context = null;
+
+    fn ConvertThreadToFiberEx(_: ?*anyopaque, _: u32) ?*anyopaque {
+        const context = std.heap.page_allocator.create(Context) catch return null;
+        context.* = .{};
+        current = context;
+        return context;
+    }
+
+    fn CreateFiberEx(_: usize, reserve_size: usize, _: u32, start: StartRoutine, parameter: ?*anyopaque) ?*anyopaque {
+        const size = std.mem.alignForward(usize, @max(if (reserve_size == 0) default_stack_size else reserve_size, 64 * 1024), std.heap.page_size_min);
+        // Below 1 TiB like a Windows fiber stack: guest code packs these
+        // addresses into 40-bit fields (see memory.low_host).
+        const stack = memory.low_host.alloc(size) orelse return null;
+        const context = std.heap.page_allocator.create(Context) catch {
+            memory.low_host.free(stack);
+            return null;
+        };
+        // The first switch pops this frame: an unused word, r15, r14, r13 (the
+        // parameter), r12 (the start routine), rbx, rbp, then returns into the
+        // trampoline with the stack aligned as at a function entry.
+        const top = std.mem.alignBackward(u64, @intFromPtr(stack.ptr) + stack.len, 16);
+        const frame: [*]u64 = @ptrFromInt(top - 72);
+        frame[0] = 0; // keeps the frame the same size as a suspended fiber's
+        frame[1] = 0; // r15
+        frame[2] = 0; // r14
+        frame[3] = @intFromPtr(parameter); // r13
+        frame[4] = @intFromPtr(start); // r12
+        frame[5] = 0; // rbx
+        frame[6] = 0; // rbp
+        frame[7] = @intFromPtr(&ps5LinuxFiberStart);
+        context.* = .{ .stack_pointer = top - 72, .stack = stack };
+        return context;
+    }
+
+    fn SwitchToFiber(raw_target: *anyopaque) void {
+        const target: *Context = @ptrCast(@alignCast(raw_target));
+        const source = current orelse return;
+        current = target;
+        ps5LinuxFiberSwitch(&source.stack_pointer, target.stack_pointer);
+    }
+
+    fn DeleteFiber(raw_fiber: *anyopaque) void {
+        const context: *Context = @ptrCast(@alignCast(raw_fiber));
+        if (context.stack.len != 0) memory.low_host.free(context.stack);
+        std.heap.page_allocator.destroy(context);
+    }
+
+    extern fn ps5LinuxFiberSwitch(save: *u64, load: u64) callconv(.c) void;
+    extern fn ps5LinuxFiberStart() callconv(.c) void;
+
+    comptime {
+        if (builtin.cpu.arch == .x86_64 and builtin.os.tag == .linux) asm (
+            \\.text
+            \\.p2align 4
+            \\.globl ps5LinuxFiberSwitch
+            \\ps5LinuxFiberSwitch:
+            \\  pushq %rbp
+            \\  pushq %rbx
+            \\  pushq %r12
+            \\  pushq %r13
+            \\  pushq %r14
+            \\  pushq %r15
+            \\  subq $8, %rsp
+            \\  movq %rsp, (%rdi)
+            \\  movq %rsi, %rsp
+            \\  addq $8, %rsp
+            \\  popq %r15
+            \\  popq %r14
+            \\  popq %r13
+            \\  popq %r12
+            \\  popq %rbx
+            \\  popq %rbp
+            \\  retq
+            \\.p2align 4
+            \\.globl ps5LinuxFiberStart
+            \\ps5LinuxFiberStart:
+            \\  subq $8, %rsp
+            \\  movq %r13, %rdi
+            \\  callq *%r12
+            \\  ud2
+        );
+    }
 };
 
 const RuntimeFiber = struct {
@@ -170,11 +283,17 @@ fn ensureHostFiber(runtime_fiber: *RuntimeFiber) bool {
 
 /// Host-fiber entry trampoline.  The entry function itself uses the guest
 /// System V convention even though the Windows trampoline uses WINAPI.
-fn fiberEntry(parameter: ?*anyopaque) callconv(.winapi) void {
+fn fiberEntry(parameter: ?*anyopaque) callconv(entry_convention) void {
     const runtime_fiber: *RuntimeFiber = @ptrCast(@alignCast(parameter.?));
     completeSwitch(runtime_fiber);
     const entry: *const fn (u64, u64) callconv(abi.guest) void = @ptrFromInt(runtime_fiber.entry);
-    entry(runtime_fiber.argument_on_initialize, runtime_fiber.incoming_argument);
+    const argument_on_initialize = runtime_fiber.argument_on_initialize;
+    const incoming_argument = runtime_fiber.incoming_argument;
+    // Called directly rather than through the bridge, so on Linux the guest
+    // thread pointer has to be installed here; Windows leaves FS to the guest.
+    const host_fs = guest_fs.enterGuest();
+    entry(argument_on_initialize, incoming_argument);
+    guest_fs.leaveGuest(host_fs);
 
     // Returning from an entry function terminates it and hands control back to
     // the root thread.  A finalized fiber is never resumed at this point.

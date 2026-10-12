@@ -109,6 +109,69 @@ pub fn noteKeyPress(key: usize) void {
     key_press_latch.press(key);
 }
 
+/// Translates an X11 keysym (a GDK keyval is the same number) to the Windows
+/// virtual-key code the key mapping is written in. Keys without a use in the
+/// mapping are ignored. The Linux window and the Linux launcher both use it,
+/// so a binding captured in one is the key the other reports.
+pub fn virtualKeyFromKeysym(keysym: u64) ?u8 {
+    return switch (keysym) {
+        'a'...'z' => @intCast(keysym - 'a' + 'A'),
+        'A'...'Z', '0'...'9', ' ' => @intCast(keysym),
+        0xff08 => 0x08, // BackSpace
+        0xff09 => 0x09, // Tab
+        0xff0d, 0xff8d => 0x0d, // Return, KP_Enter
+        0xff1b => 0x1b, // Escape
+        0xff51 => 0x25, // Left
+        0xff52 => 0x26, // Up
+        0xff53 => 0x27, // Right
+        0xff54 => 0x28, // Down
+        0xffe1, 0xffe2 => 0x10, // Shift
+        0xffe3, 0xffe4 => 0x11, // Control
+        0xffe9, 0xffea => 0x12, // Alt
+        0xffbe...0xffc9 => @intCast(keysym - 0xffbe + 0x70), // F1-F12
+        else => null,
+    };
+}
+
+/// Translates the physical key of an X11 keycode (the evdev code plus eight,
+/// which GDK reports as the hardware keycode too) to the virtual-key code of a
+/// US layout. Only letters and digits are listed: their keysyms are what a
+/// non-Latin layout changes, while Return, Space or the arrows keep theirs.
+pub fn virtualKeyFromKeycode(keycode: u32) ?u8 {
+    const letter_rows = [_]struct { first: u32, keys: []const u8 }{
+        .{ .first = 10, .keys = "1234567890" },
+        .{ .first = 24, .keys = "QWERTYUIOP" },
+        .{ .first = 38, .keys = "ASDFGHJKL" },
+        .{ .first = 52, .keys = "ZXCVBNM" },
+    };
+    for (letter_rows) |row| {
+        if (keycode >= row.first and keycode - row.first < row.keys.len) return row.keys[keycode - row.first];
+    }
+    return null;
+}
+
+/// The virtual key of a key event, as Windows would report it. A Latin
+/// keysym is taken as the layout says, so AZERTY keeps its letters; a key
+/// whose keysym is not one, such as a Cyrillic letter, falls back to its
+/// physical position. Windows does the same for Cyrillic layouts, where the
+/// key under the Russian Ц is still VK 'W', so WASD works without switching
+/// layouts.
+pub fn virtualKeyFromKey(keysym: u64, keycode: u32) ?u8 {
+    return virtualKeyFromKeysym(keysym) orelse virtualKeyFromKeycode(keycode);
+}
+
+test "a Cyrillic layout keeps WASD on its physical keys" {
+    // Ц, Ф, Ы and В: the keys under W, A, S and D on a Russian layout.
+    try std.testing.expectEqual(@as(?u8, 'W'), virtualKeyFromKey(0x6c3, 25));
+    try std.testing.expectEqual(@as(?u8, 'A'), virtualKeyFromKey(0x6c6, 38));
+    try std.testing.expectEqual(@as(?u8, 'S'), virtualKeyFromKey(0x6d9, 39));
+    try std.testing.expectEqual(@as(?u8, 'D'), virtualKeyFromKey(0x6d7, 40));
+    // A Latin keysym wins over the position: AZERTY's A sits where Q is.
+    try std.testing.expectEqual(@as(?u8, 'A'), virtualKeyFromKey('a', 24));
+    try std.testing.expectEqual(@as(?u8, 0x0d), virtualKeyFromKey(0xff0d, 36));
+    try std.testing.expectEqual(@as(?u8, null), virtualKeyFromKey(0xffff, 9));
+}
+
 /// Records a key going down or up in the emulator window (Linux).
 pub fn noteKeyState(key: usize, down: bool) void {
     if (key >= 256) return;

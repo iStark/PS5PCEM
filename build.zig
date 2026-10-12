@@ -632,16 +632,16 @@ pub fn build(b: *std.Build) void {
     // Zero-dependency native launcher. It selects the title directory, stores
     // user preferences and starts game-run with the corresponding environment.
     var launcher: ?*std.Build.Step.Compile = null;
+    // The launcher prints the release it belongs to. It reads the same file
+    // the packaging and publishing scripts read, so a build cannot claim a
+    // version the archive around it disagrees with.
+    const launcher_options = b.addOptions();
+    launcher_options.addOption(
+        []const u8,
+        "release_version",
+        std.mem.trim(u8, @embedFile("VERSION"), " \t\r\n"),
+    );
     if (target.result.os.tag == .windows) {
-        // The launcher prints the release it belongs to. It reads the same
-        // file the packaging and publishing scripts read, so a build cannot
-        // claim a version the archive around it disagrees with.
-        const launcher_options = b.addOptions();
-        launcher_options.addOption(
-            []const u8,
-            "release_version",
-            std.mem.trim(u8, @embedFile("VERSION"), " \t\r\n"),
-        );
         const native_launcher = b.addExecutable(.{
             .name = "ps5pcem",
             .root_module = b.createModule(.{
@@ -677,6 +677,39 @@ pub fn build(b: *std.Build) void {
         const launcher_step = b.step("launcher", "Open the PS5PCEM launcher");
         launcher_step.dependOn(&launcher_cmd.step);
         launcher = native_launcher;
+    }
+    if (target.result.os.tag == .linux) {
+        // The Linux launcher draws the same pages through GTK 3, cairo and
+        // Pango, which it opens at run time as game-run opens X11 and
+        // PulseAudio, so the build needs no GTK development files.
+        const linux_launcher = b.addExecutable(.{
+            .name = "ps5pcem",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/launcher_linux.zig"),
+                .target = target,
+                .optimize = optimize,
+                .link_libc = true,
+                .imports = &.{
+                    .{ .name = "input", .module = input },
+                    .{ .name = "build_options", .module = launcher_options.createModule() },
+                },
+            }),
+        });
+        linux_launcher.root_module.addAnonymousImport("app_icon", .{
+            .root_source_file = b.path("assets/branding/ps5pcem-icon-256.png"),
+        });
+        const install_linux_launcher = b.addInstallArtifact(linux_launcher, .{});
+        b.getInstallStep().dependOn(&install_linux_launcher.step);
+
+        const build_launcher_step = b.step("build-launcher", "Build only the native PS5PCEM launcher");
+        build_launcher_step.dependOn(&install_linux_launcher.step);
+
+        const launcher_cmd = b.addSystemCommand(&.{b.getInstallPath(.bin, "ps5pcem")});
+        launcher_cmd.step.dependOn(&install_linux_launcher.step);
+        launcher_cmd.step.dependOn(&install_game_run.step);
+        const launcher_step = b.step("launcher", "Open the PS5PCEM launcher");
+        launcher_step.dependOn(&launcher_cmd.step);
+        launcher = linux_launcher;
     }
 
     // Verifies device/queue creation, a compute pipeline and synchronized
@@ -735,7 +768,7 @@ pub fn build(b: *std.Build) void {
     check_step.dependOn(&vulkan_smoke.step);
     if (launcher) |native_launcher| check_step.dependOn(&native_launcher.step);
     // The launcher's own tests cover its pure helpers, such as release-tag
-    // comparison; they link the same Windows libraries as the executable.
+    // comparison; they link the same libraries as the executable.
     if (launcher) |native_launcher| test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = native_launcher.root_module })).step);
     check_step.dependOn(&pkgextractor.step);
     for ([_]*std.Build.Module{
@@ -760,6 +793,10 @@ pub fn build(b: *std.Build) void {
         vulkan_window_smoke.root_module,
     }) |m| {
         const tests = b.addTest(.{ .root_module = m });
+        // Linux reserves the guest windows whole, so a test runner at the
+        // default base would sit inside system_managed, as game-run would.
+        // A static PIE is mapped where mmap places it, far above them.
+        if (target.result.os.tag == .linux) tests.pie = true;
         check_step.dependOn(&tests.step);
         test_step.dependOn(&b.addRunArtifact(tests).step);
     }
@@ -769,6 +806,7 @@ pub fn build(b: *std.Build) void {
         .root_module = hle,
         .filters = if (test_filter) |filter| &.{filter} else &.{},
     });
+    if (target.result.os.tag == .linux) hle_tests.pie = true;
     const run_hle_tests = b.addRunArtifact(hle_tests);
     const test_hle_step = b.step("test-hle", "Run firmware library tests");
     test_hle_step.dependOn(&run_hle_tests.step);

@@ -38027,6 +38027,7 @@ const WindowsFileDump = if (builtin.os.tag == .windows) struct {
 
 /// Writes a binary PPM (P6) of an RGBA8 linear frame for offline inspection.
 fn dumpFramePpm(path: [*:0]const u8, width: u32, height: u32, rgba: []const u8) void {
+    if (builtin.os.tag == .linux) return dumpFramePpmLinux(path, width, height, rgba);
     if (builtin.os.tag != .windows) return;
     const needed = @as(usize, width) * @as(usize, height) * 4;
     if (rgba.len < needed or width == 0 or height == 0) return;
@@ -38079,6 +38080,58 @@ fn dumpFramePpm(path: [*:0]const u8, width: u32, height: u32, rgba: []const u8) 
         }
     }
     std.debug.print("[vulkan dcb] dumped {s} ({d}x{d})\n", .{ path, width, height });
+}
+
+/// The Linux form of `dumpFramePpm`. Diagnostic paths are written with
+/// Windows separators throughout this file, so they are translated here and
+/// the `out` directory they name is created when missing.
+fn dumpFramePpmLinux(path: [*:0]const u8, width: u32, height: u32, rgba: []const u8) void {
+    const linux = std.os.linux;
+    const needed = @as(usize, width) * @as(usize, height) * 4;
+    if (rgba.len < needed or width == 0 or height == 0) return;
+    var translated: [256]u8 = undefined;
+    const source = std.mem.span(path);
+    if (source.len >= translated.len) return;
+    for (source, 0..) |byte, index| translated[index] = if (byte == '\\') '/' else byte;
+    translated[source.len] = 0;
+    if (std.mem.indexOfScalar(u8, translated[0..source.len], '/')) |separator| {
+        translated[separator] = 0;
+        _ = linux.mkdir(@ptrCast(&translated), 0o755);
+        translated[separator] = '/';
+    }
+    const opened = linux.open(@ptrCast(&translated), .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .CLOEXEC = true }, 0o644);
+    if (linux.errno(opened) != .SUCCESS) {
+        std.debug.print("[vulkan dcb] frame dump open failed: {s}\n", .{translated[0..source.len]});
+        return;
+    }
+    const fd: i32 = @intCast(opened);
+    defer _ = linux.close(fd);
+    var header_buffer: [64]u8 = undefined;
+    const header = std.fmt.bufPrint(&header_buffer, "P6\n{d} {d}\n255\n", .{ width, height }) catch return;
+    if (!writeAllLinux(fd, header)) return;
+    // PPM is RGB without alpha; strip A while streaming rows.
+    const row = std.heap.page_allocator.alloc(u8, @as(usize, width) * 3) catch return;
+    defer std.heap.page_allocator.free(row);
+    for (0..height) |y| {
+        const source_row = rgba[y * @as(usize, width) * 4 ..];
+        for (0..width) |x| {
+            row[x * 3] = source_row[x * 4];
+            row[x * 3 + 1] = source_row[x * 4 + 1];
+            row[x * 3 + 2] = source_row[x * 4 + 2];
+        }
+        if (!writeAllLinux(fd, row)) return;
+    }
+    std.debug.print("[vulkan dcb] dumped {s} ({d}x{d})\n", .{ translated[0..source.len], width, height });
+}
+
+fn writeAllLinux(fd: i32, bytes: []const u8) bool {
+    var offset: usize = 0;
+    while (offset < bytes.len) {
+        const result = std.os.linux.write(fd, bytes[offset..].ptr, bytes.len - offset);
+        if (std.os.linux.errno(result) != .SUCCESS or result == 0) return false;
+        offset += result;
+    }
+    return true;
 }
 
 fn dumpA2B10G10R10FramePpm(
