@@ -8575,6 +8575,22 @@ pub const Renderer = struct {
         }
     }
 
+    fn flushGuestIndexRange(self: *Renderer, address: u64, size: usize) anyerror!void {
+        try self.flushPendingGuestWrite(address, size);
+        // An indexed draw is an explicit buffer consumer, unlike a CP label
+        // read which may merely fall inside an oversized V#. Games suballocate
+        // index lists within compute-written arenas (Minecraft's UI uses +0x74).
+        // Publish the producing view before bounds analysis or CPU index upload.
+        const end = std.math.add(u64, address, size) catch return Error.GuestBufferTooLarge;
+        var candidates = self.bufferAliasCandidates(address, size);
+        while (candidates.next()) |index| {
+            const entry = &self.guest_buffers.items[index];
+            if (!bufferPendingWriteOverlaps(entry, address, size)) continue;
+            const prefix = @min(entry.size, end - entry.guest_address);
+            try self.flushGuestStoragePrefix(index, @intCast(prefix));
+        }
+    }
+
     /// An attachment can be a face or mip of a larger buffer-cleared image.
     /// Finish the exact-base producer before capturing any subresource's CPU
     /// baseline: publishing its remaining suffix later would look like a CPU
@@ -14159,7 +14175,7 @@ pub const Renderer = struct {
             result.scissor_width = right - left;
             result.scissor_height = bottom - top;
         }
-        if (render.raster.polygon_mode != 0) return Error.UnsupportedGraphicsState;
+        try validateFilledPolygonMode(render.raster);
         try applyGuestDepthBias(&result, render.raster, if (render.depth_target) |depth| depthTargetFormat(depth) orelse 0 else 0);
         result.cull_mode = @as(u32, @intFromBool(render.raster.cull_front)) |
             (@as(u32, @intFromBool(render.raster.cull_back)) << 1);
@@ -14169,6 +14185,17 @@ pub const Renderer = struct {
         result.front_face = @intFromBool(render.raster.clockwise_front_face);
         result.rasterizer_discard = @intFromBool(render.raster.rasterizer_discard);
         return result;
+    }
+
+    fn validateFilledPolygonMode(raster: gpu.resources.RasterState) Error!void {
+        // POLY_MODE=0 ignores the per-face selectors; POLY_MODE=1 uses
+        // PTYPE=0/1/2 for points/lines/filled triangles. Explicit fill is the
+        // same Vulkan state as disabled polygon mode (Minecraft Legends UI).
+        if (raster.polygon_mode == 0) return;
+        if (raster.polygon_mode != 1) return Error.UnsupportedGraphicsState;
+        if ((!raster.cull_front and raster.polygon_type_front != 2) or
+            (!raster.cull_back and raster.polygon_type_back != 2))
+            return Error.UnsupportedGraphicsState;
     }
 
     fn applyGuestDepthBias(result: *GraphicsPipelineState, raster: gpu.resources.RasterState, depth_format: u32) Error!void {
@@ -18914,6 +18941,28 @@ pub const Renderer = struct {
         try std.testing.expectEqual(fill_readbacks + seed.len, self.frame_profile.storage_readback_bytes);
         if (!memory.read(memory.context, address, &actual)) return Error.GuestMemoryReadFailed;
         try std.testing.expectEqualSlices(u8, &pattern, &actual);
+
+        // A GPU producer can own an index arena whose draw starts in the
+        // middle. Generic CP reads must retain their exact-base restriction,
+        // while this explicit index consumer must see the new bytes.
+        const interior = try self.beginOneShot();
+        defer self.releaseOneShot(interior);
+        self.device_functions.cmd_pipeline_barrier(interior, vk.pipeline_stage_all_commands_bit, vk.pipeline_stage_transfer_bit, 0, 0, null, 1, @ptrCast(&writable), 0, null);
+        self.device_functions.cmd_fill_buffer(interior, entry.device_local.handle, 0, seed.len, 0x03020100);
+        try self.submitOneShot(interior);
+        self.markGuestBufferWritten(entry);
+        try self.flushGuestStorageRange(address + 4, 4);
+        try std.testing.expect(memory.read(memory.context, address, &actual));
+        try std.testing.expectEqualSlices(u8, &pattern, &actual);
+        try self.flushGuestIndexRange(address + 4, 4);
+        try std.testing.expect(memory.read(memory.context, address, &actual));
+        try std.testing.expectEqualSlices(u8, &.{ 0, 1, 2, 3 }, actual[4..8]);
+        try std.testing.expectEqualSlices(u8, pattern[8..], actual[8..]);
+        try std.testing.expect(entry.gpu_dirty);
+        const index_readback_bytes = self.frame_profile.storage_readback_bytes;
+        try self.flushGuestIndexRange(address + 4, 4);
+        try std.testing.expectEqual(index_readback_bytes, self.frame_profile.storage_readback_bytes);
+        try self.flushGuestStorageBuffer(index);
     }
 
     pub fn probeTrackedBufferWrites(self: *Renderer, address: u64) anyerror!void {
@@ -22023,6 +22072,8 @@ pub const Renderer = struct {
         vertex_stage: gpu.resources.ShaderStage,
         target_override: ?gpu.resources.ColorTarget,
     ) anyerror!void {
+        if (guest_draw.index_count) |count|
+            try self.flushGuestIndexRange(guest_draw.index_address, @as(usize, count) * @as(usize, if (guest_draw.index_uint32) 4 else 2));
         const tessellation = try self.prepareTessellation(state, guest_draw);
         const draw: GuestDraw = if (tessellation) |tess| .{
             .vertex_count = try std.math.mul(u32, tess.patch_count, tess.config.control_points),
@@ -22883,9 +22934,8 @@ pub const Renderer = struct {
             const recording = self.draw_reuse_recording;
             self.draw_reuse_recording = false;
             defer self.draw_reuse_recording = recording;
-            // Index data can itself be a compute result. Publish it before
-            // proving a host-side bound, just as before staging any GPU output.
-            if (draw.index_count) |count| try self.flushPendingGuestWrite(draw.index_address, @as(usize, count) * @as(usize, if (draw.index_uint32) 4 else 2));
+            // GPU-produced indices were published at draw entry, before any
+            // tessellation or host-side bounds proof consumes them.
             break :range drawVertexRange(reader, draw);
         } else null;
         const bounded_fetches_before = self.frame_profile.bounded_vertex_fetches;
@@ -30269,7 +30319,7 @@ pub const Renderer = struct {
         if (!self.draw_reuse_index_proof.needed and self.draw_reuse_fetch_bounds == null) return true;
         // The index source may be GPU-produced even though the vertex buffers
         // themselves are read-only. Check the current contents, not its address.
-        if (draw.index_count) |count| self.flushPendingGuestWrite(draw.index_address, @as(usize, count) * @as(usize, if (draw.index_uint32) 4 else 2)) catch return false;
+        if (draw.index_count) |count| self.flushGuestIndexRange(draw.index_address, @as(usize, count) * @as(usize, if (draw.index_uint32) 4 else 2)) catch return false;
         const range = drawVertexRange(reader, draw);
         if (!self.draw_reuse_index_proof.accepts(range)) return false;
         if (self.draw_reuse_fetch_bounds) |cached| {
@@ -33686,6 +33736,10 @@ pub const Renderer = struct {
         }
         if (!self.shouldReportDrawError(err)) return;
         std.debug.print("[vulkan dcb] draw rejected: {s}\n", .{@errorName(err)});
+        if (err == Error.UnsupportedGraphicsState) {
+            const rejected = gpu.resources.decodeRenderState(state);
+            std.debug.print("[vulkan dcb] rejected graphics viewport={any} raster={any} depth={any} blend0={any}\n", .{ rejected.viewport, rejected.raster, rejected.depth_target, rejected.blends[0] });
+        }
         if (err != Error.UnsupportedColorTarget) return;
         const rejected_state = gpu.resources.decodeRenderState(state);
         std.debug.print("[vulkan dcb] rejected color state ps={?x} target_mask=0x{x} shader_mask=0x{x} export_format={?x}\n", .{
@@ -44559,6 +44613,28 @@ test "integrated Vulkan device preference reverses the default adapter order" {
         physicalDeviceScore(vk.physical_device_type_integrated_gpu, true) >
             physicalDeviceScore(vk.physical_device_type_discrete_gpu, true),
     );
+}
+
+test "explicit filled polygon mode accepts visible filled faces only" {
+    var state = gpu.State{};
+    // Minecraft Legends uses explicit front/back fill, clockwise winding.
+    try state.writeRegister(.context, 0x205, 4 | (1 << 3) | (2 << 5) | (2 << 8));
+    var raster = gpu.resources.decodeRasterState(&state);
+    try Renderer.validateFilledPolygonMode(raster);
+    raster.polygon_type_front = 1;
+    try std.testing.expectError(Error.UnsupportedGraphicsState, Renderer.validateFilledPolygonMode(raster));
+    raster.cull_front = true;
+    try Renderer.validateFilledPolygonMode(raster);
+    raster.polygon_type_back = 0;
+    try std.testing.expectError(Error.UnsupportedGraphicsState, Renderer.validateFilledPolygonMode(raster));
+    raster.cull_back = true;
+    try Renderer.validateFilledPolygonMode(raster);
+    raster.polygon_mode = 2;
+    try std.testing.expectError(Error.UnsupportedGraphicsState, Renderer.validateFilledPolygonMode(raster));
+    raster.polygon_mode = 0;
+    raster.cull_front = false;
+    raster.cull_back = false;
+    try Renderer.validateFilledPolygonMode(raster);
 }
 
 test "captured D32 shadow depth bias preserves scale and rejects unequal faces" {

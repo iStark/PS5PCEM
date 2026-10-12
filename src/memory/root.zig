@@ -529,6 +529,28 @@ test "mapping identities survive splits and reject remapped allocation backing" 
     try std.testing.expectEqual(@as(u64, 0), space.mappingIdentity(std.math.maxInt(u64), 2));
 }
 
+test "system-managed aligned direct allocations support guest-page recycling" {
+    const base = system_managed.start;
+    const granule = windows_allocation_granularity;
+    var space = try AddressSpace.initWithDirectMemory(testing.allocator, 2 * granule);
+    defer space.deinit();
+    try space.mapFixed(base, 2 * granule, .read_write, .direct_memory, 0);
+    try space.writeInt(u32, base, 0xa1b2c3d4);
+    try space.writeInt(u32, base + 2 * granule - 4, 0x55667788);
+    // The allocator keeps both neighbours live while recycling an unaligned
+    // part of an originally 64 KiB-aligned acquisition.
+    try space.unmap(base + page_size, granule);
+    try space.reserveFixed(base + page_size, granule);
+    try space.mapInReservation(base + page_size, granule, .read_write, .direct_memory, page_size);
+    var bytes: [4]u8 = undefined;
+    try space.read(base, &bytes);
+    try testing.expectEqual(@as(u32, 0xa1b2c3d4), std.mem.readInt(u32, &bytes, .little));
+    try space.read(base + 2 * granule - 4, &bytes);
+    try testing.expectEqual(@as(u32, 0x55667788), std.mem.readInt(u32, &bytes, .little));
+    try space.writeInt(u32, base + page_size, 0x11223344);
+    try space.unmap(base, 2 * granule);
+}
+
 test "rejected partial direct unmap leaves earlier Windows views intact" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
     const base = user.start;
@@ -2801,6 +2823,11 @@ fn hostMappingViewSize(
     backing_offset: ?u64,
 ) u64 {
     if (builtin.os.tag == .windows and kind == .direct_memory) {
+        // System-managed CPU heaps recycle individual guest pages even when
+        // their original acquisition is aligned to 64 KiB. A wider native
+        // section view cannot be unmapped in parts, and rebuilding it would
+        // temporarily revoke live neighbouring pages from other guest threads.
+        if (system_managed.contains(address, size)) return page_size;
         const offset = backing_offset orelse return page_size;
         if (isAligned(address, windows_allocation_granularity) and
             isAligned(size, windows_allocation_granularity) and

@@ -144,6 +144,8 @@ pub const Reservation = struct {
 /// and identified by them later.
 pub const Pool = struct {
     size: u64 = direct_memory_size,
+    // Sorted, non-overlapping intervals. Reusing a lower hole inserts in place;
+    // allocation must not restart an unordered scan for every occupied range.
     reservations: std.ArrayList(Reservation) = .empty,
 
     pub fn deinit(self: *Pool, gpa: std.mem.Allocator) void {
@@ -158,19 +160,17 @@ pub const Pool = struct {
     }
 
     pub fn findContaining(self: *const Pool, addr: u64) ?*const Reservation {
-        for (self.reservations.items) |*r| {
-            if (addr >= r.start and addr < r.end()) return r;
-        }
-        return null;
+        const index = self.firstEndingAfter(addr);
+        if (index == self.reservations.items.len) return null;
+        const r = &self.reservations.items[index];
+        return if (r.start <= addr) r else null;
     }
 
     pub fn findContainingRange(self: *const Pool, start: u64, len: u64) ?*const Reservation {
         if (len == 0) return null;
         const end = std.math.add(u64, start, len) catch return null;
-        for (self.reservations.items) |*r| {
-            if (start >= r.start and end <= r.end()) return r;
-        }
-        return null;
+        const r = self.findContaining(start) orelse return null;
+        return if (end <= r.end()) r else null;
     }
 
     /// Whether any part of a range is reserved.
@@ -191,16 +191,18 @@ pub const Pool = struct {
         return true;
     }
 
-    /// Reservations are not sorted: a released hole can be filled after a
-    /// later allocation. Find the next occupied interval without scanning
-    /// every 16 KiB page of the multi-gigabyte pool.
-    fn nextReservation(self: *const Pool, start: u64, limit: u64) ?Reservation {
-        var next: ?Reservation = null;
-        for (self.reservations.items) |reservation| {
-            if (reservation.end() <= start or reservation.start >= limit) continue;
-            if (next == null or reservation.start < next.?.start) next = reservation;
+    fn firstEndingAfter(self: *const Pool, address: u64) usize {
+        var low: usize = 0;
+        var high = self.reservations.items.len;
+        while (low < high) {
+            const middle = low + (high - low) / 2;
+            if (self.reservations.items[middle].end() <= address) {
+                low = middle + 1;
+            } else {
+                high = middle;
+            }
         }
-        return next;
+        return low;
     }
 
     fn alignedCandidate(start: u64, step: u64) ?u64 {
@@ -228,23 +230,22 @@ pub const Pool = struct {
 
         const limit = @min(search_end, self.size);
         var candidate = alignedCandidate(search_start, step) orelse return error.OutOfDirectMemory;
-        while (candidate <= limit and len <= limit - candidate) {
-            if (self.nextReservation(candidate, limit)) |occupied| {
-                if (occupied.start < candidate + len) {
-                    candidate = alignedCandidate(occupied.end(), step) orelse return error.OutOfDirectMemory;
-                    continue;
-                }
-            }
-
-            try self.reservations.append(gpa, .{
-                .start = candidate,
-                .len = len,
-                .alignment = alignment,
-                .memory_type = memory_type,
-            });
-            return candidate;
+        if (candidate > limit or len > limit - candidate) return error.OutOfDirectMemory;
+        var index = self.firstEndingAfter(candidate);
+        while (index < self.reservations.items.len) : (index += 1) {
+            const occupied = self.reservations.items[index];
+            if (occupied.start >= candidate + len) break;
+            if (occupied.end() <= candidate) continue;
+            candidate = alignedCandidate(occupied.end(), step) orelse return error.OutOfDirectMemory;
+            if (candidate > limit or len > limit - candidate) return error.OutOfDirectMemory;
         }
-        return error.OutOfDirectMemory;
+        try self.reservations.insert(gpa, index, .{
+            .start = candidate,
+            .len = len,
+            .alignment = alignment,
+            .memory_type = memory_type,
+        });
+        return candidate;
     }
 
     /// Largest run of unreserved memory inside a search window, as the guest
@@ -264,9 +265,14 @@ pub const Pool = struct {
         var best_len: u64 = 0;
 
         var candidate = alignedCandidate(search_start, step) orelse return null;
-        while (candidate < limit) {
-            const occupied = self.nextReservation(candidate, limit);
-            const free_end = if (occupied) |reservation| @min(limit, reservation.start) else limit;
+        var index = self.firstEndingAfter(candidate);
+        while (candidate < limit) : (index += 1) {
+            const occupied: ?Reservation = if (index < self.reservations.items.len and
+                self.reservations.items[index].start < limit) self.reservations.items[index] else null;
+            if (occupied) |reservation| {
+                if (reservation.end() <= candidate) continue;
+            }
+            const free_end = if (occupied) |reservation| reservation.start else limit;
             if (free_end > candidate) {
                 // A partial final page cannot be reserved within the window.
                 const run_len = std.mem.alignBackward(u64, free_end - candidate, page_size);
@@ -1938,7 +1944,7 @@ fn sceKernelMemoryPoolExpand(search_start: i64, search_end: i64, len: u64, align
     const count: usize = @intCast(len / pool_block_size);
     pool_blocks.ensureUnusedCapacity(gpa, count) catch return KernelError.enomem.raw();
     const physical = pool.reserve(gpa, @intCast(search_start), @intCast(search_end), len, @max(alignment, pool_block_size), .wb_onion) catch return KernelError.enomem.raw();
-    pool.reservations.items[pool.reservations.items.len - 1].pooled = true;
+    pool.reservations.items[pool.firstEndingAfter(physical)].pooled = true;
     for (0..count) |index| pool_blocks.appendAssumeCapacity(.{ .physical = physical + index * pool_block_size });
     pool_available_blocks += count;
     poolNotifyWrite(@intFromPtr(output), @sizeOf(u64));
@@ -2512,6 +2518,21 @@ test "MemoryPool fragmented backing exhaustion and safe coexistence with direct 
     try testing.expectEqual(second, space.query(address, false).?.backing_offset.?);
 }
 
+test "MemoryPool expansion into a lower hole marks only the donated interval" {
+    init(testing.allocator);
+    defer deinit();
+    var direct: u64 = undefined;
+    var donated: u64 = undefined;
+    try testing.expectEqual(errno.ok, sceKernelAllocateDirectMemory(pool_block_size, 2 * pool_block_size, pool_block_size, 0, 0, &direct));
+    try testing.expectEqual(errno.ok, sceKernelMemoryPoolExpand(0, direct_memory_size, pool_block_size, 0, &donated));
+    try testing.expectEqual(@as(u64, 0), donated);
+    try testing.expect(pool.findContaining(donated).?.pooled);
+    try testing.expect(!pool.findContaining(direct).?.pooled);
+    try testing.expectEqual(errno.ok, sceKernelReleaseDirectMemory(donated, pool_block_size));
+    try testing.expect(pool.findContaining(direct) != null);
+    try expectPoolStats(0, 0);
+}
+
 test "MemoryPool batch reports completed prefix and applies protection and type" {
     var space = try memory.AddressSpace.initWithDirectMemory(testing.allocator, 4 * pool_block_size);
     defer space.deinit();
@@ -2635,17 +2656,12 @@ test "direct memory interval search matches a page map across fragmented windows
     defer p.deinit(testing.allocator);
     for (0..256) |mask| {
         p.reservations.clearRetainingCapacity();
-        // Deliberately reverse the reservation order. Hole reuse does not
-        // preserve sorting in the real pool either.
+        // Allocate in reverse order to exercise insertion ahead of an
+        // existing reservation, as happens when a lower hole is reused.
         for (0..8) |reverse| {
             const page = 7 - reverse;
             if (mask & (@as(usize, 1) << @intCast(page)) == 0) continue;
-            try p.reservations.append(testing.allocator, .{
-                .start = page * page_size,
-                .len = page_size,
-                .alignment = page_size,
-                .memory_type = .wb_onion,
-            });
+            _ = try p.reserve(testing.allocator, page * page_size, (page + 1) * page_size, page_size, page_size, .wb_onion);
         }
         for ([_]u64{ 0, 1, page_size, 2 * page_size + 7 }) |start| {
             for ([_]u64{ 3 * page_size, 6 * page_size + 17, 8 * page_size, 9 * page_size }) |end| {
@@ -2680,7 +2696,7 @@ test "direct memory interval search matches a page map across fragmented windows
                     for (lengths, first_fit) |length, expected| {
                         if (expected) |address| {
                             try testing.expectEqual(address, try p.reserve(testing.allocator, start, end, length, alignment, .wb_onion));
-                            _ = p.reservations.pop();
+                            try p.release(testing.allocator, address, length);
                         } else {
                             try testing.expectError(error.OutOfDirectMemory, p.reserve(testing.allocator, start, end, length, alignment, .wb_onion));
                         }
@@ -2689,6 +2705,26 @@ test "direct memory interval search matches a page map across fragmented windows
             }
         }
     }
+}
+
+test "dense direct allocations reuse split holes and retain ordered query metadata" {
+    const count = 2048;
+    var p = Pool{ .size = (count + 8) * page_size };
+    defer p.deinit(testing.allocator);
+    for (0..count) |index| {
+        try testing.expectEqual(index * page_size, try p.reserve(testing.allocator, 0, p.size, page_size, page_size, .wb_onion));
+    }
+    try p.release(testing.allocator, 3 * page_size, 5 * page_size);
+    try testing.expectEqual(4 * page_size, try p.reserve(testing.allocator, 0, p.size, 2 * page_size, 4 * page_size, .wc_garlic));
+    try testing.expectEqual(3 * page_size, try p.reserve(testing.allocator, 0, p.size, page_size, page_size, .wb_onion));
+    try testing.expectEqual(6 * page_size, try p.reserve(testing.allocator, 0, p.size, 2 * page_size, page_size, .wb_onion));
+    for (p.reservations.items[1..], p.reservations.items[0 .. p.reservations.items.len - 1]) |current, previous| {
+        try testing.expect(previous.end() <= current.start);
+    }
+    try testing.expectEqual(MemoryType.wc_garlic, p.findContaining(5 * page_size).?.memory_type);
+    const largest = p.largestFree(0, p.size, page_size).?;
+    try testing.expectEqual(count * page_size, largest.start);
+    try testing.expectEqual(8 * page_size, largest.len);
 }
 
 test "direct memory search clips partial pages and rejects overflowing windows" {
