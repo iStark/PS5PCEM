@@ -50,6 +50,10 @@ pub const Posix = struct {
     /// implementing one particular control request.
     pub const enodev: i32 = 19;
     pub const eexist: i32 = 17;
+    pub const exdev: i32 = 18;
+    pub const enotdir: i32 = 20;
+    pub const eisdir: i32 = 21;
+    pub const enotempty: i32 = 66;
     pub const einval: i32 = 22;
     /// The device does not implement the requested control operation.
     pub const enotty: i32 = 25;
@@ -89,6 +93,10 @@ pub const KernelError = enum(i32) {
     efault = @bitCast(kernel_error_base | 14),
     ebusy = @bitCast(kernel_error_base | 16),
     eexist = @bitCast(kernel_error_base | 17),
+    exdev = @bitCast(kernel_error_base | 18),
+    enotdir = @bitCast(kernel_error_base | 20),
+    eisdir = @bitCast(kernel_error_base | 21),
+    enotempty = @bitCast(kernel_error_base | 66),
     enodev = @bitCast(kernel_error_base | 19),
     einval = @bitCast(kernel_error_base | 22),
     enfile = @bitCast(kernel_error_base | 23),

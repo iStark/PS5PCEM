@@ -31,11 +31,16 @@ fn kernelStatus(err: Error) i32 {
         Error.BadDescriptor => KernelError.ebadf.raw(),
         Error.TooManyOpenFiles => KernelError.emfile.raw(),
         Error.ReadOnly => KernelError.eacces.raw(),
-        Error.IsDirectory => KernelError.eacces.raw(),
+        Error.IsDirectory => KernelError.eisdir.raw(),
         Error.InvalidArgument => KernelError.einval.raw(),
         Error.IoFailed => KernelError.eio.raw(),
         Error.NotSupported => KernelError.enodev.raw(),
         Error.Exists => KernelError.eexist.raw(),
+        Error.CrossDevice => KernelError.exdev.raw(),
+        Error.NotDirectory => KernelError.enotdir.raw(),
+        Error.DirectoryNotEmpty => KernelError.enotempty.raw(),
+        Error.Busy => KernelError.ebusy.raw(),
+        Error.NoSpace => KernelError.enospc.raw(),
     };
 }
 
@@ -47,11 +52,16 @@ fn posixNumber(err: Error) i32 {
         Error.BadDescriptor => errno.Posix.ebadf,
         Error.TooManyOpenFiles => errno.Posix.emfile,
         Error.ReadOnly => errno.Posix.eacces,
-        Error.IsDirectory => errno.Posix.eacces,
+        Error.IsDirectory => errno.Posix.eisdir,
         Error.InvalidArgument => errno.Posix.einval,
         Error.IoFailed => errno.Posix.eio,
         Error.NotSupported => errno.Posix.enodev,
         Error.Exists => errno.Posix.eexist,
+        Error.CrossDevice => errno.Posix.exdev,
+        Error.NotDirectory => errno.Posix.enotdir,
+        Error.DirectoryNotEmpty => errno.Posix.enotempty,
+        Error.Busy => errno.Posix.ebusy,
+        Error.NoSpace => errno.Posix.enospc,
     };
 }
 
@@ -231,6 +241,20 @@ fn kernelMkdir(path: ?[*:0]const u8, _: u16) callconv(abi.guest) i32 {
     return errno.ok;
 }
 
+fn kernelRename(old_path: ?[*:0]const u8, new_path: ?[*:0]const u8) callconv(abi.guest) i32 {
+    const old_name = spanOf(old_path) orelse return KernelError.efault.raw();
+    const new_name = spanOf(new_path) orelse return KernelError.efault.raw();
+    filesystem.rename(old_name, new_name) catch |err| return kernelStatus(err);
+    return errno.ok;
+}
+
+fn posixRename(old_path: ?[*:0]const u8, new_path: ?[*:0]const u8) callconv(abi.guest) i32 {
+    const status = kernelRename(old_path, new_path);
+    if (status == errno.ok) return errno.ok;
+    runtime_api.setPosixErrno(errno.kernelToPosix(status));
+    return -1;
+}
+
 fn readOnlyStatus(
     _: u64,
     _: u64,
@@ -341,6 +365,8 @@ fn posixFtruncate(descriptor: i32, length: i64) callconv(abi.guest) i64 {
 }
 
 pub const exports = [_]symbols.Export{
+    .{ .name = "sceKernelRename", .function = trace.wrap("sceKernelRename", &kernelRename), .expect_id = "52NcYU9+lEo" },
+    .{ .name = "rename", .function = trace.wrap("rename", &posixRename), .expect_id = "NN01qLRhiqU" },
     .{ .name = "sceKernelSync", .function = trace.wrap("sceKernelSync", &kernelSync), .expect_id = "uvT2iYBBnkY" },
     .{ .name = "sceKernelCheckReachability", .function = trace.wrap("sceKernelCheckReachability", &kernelCheckReachability), .expect_id = "uWyW3v98sU4" },
     .{ .name = "sceKernelOpen", .function = trace.wrap("sceKernelOpen", &kernelOpen), .expect_id = "1G3lF1Gg1k8" },
@@ -376,6 +402,7 @@ pub const exports = [_]symbols.Export{
 };
 
 const posix_exports = [_]symbols.Export{
+    .{ .name = "rename", .function = trace.wrap("rename", &posixRename), .expect_id = "NN01qLRhiqU" },
     .{ .name = "fsync", .function = trace.wrap("fsync", &posixFsync), .expect_id = "juWbTNM+8hw" },
     .{ .name = "ftruncate", .function = trace.wrap("ftruncate", &posixFtruncate), .expect_id = "ih4CD9-gghM" },
 };
@@ -436,6 +463,64 @@ const Fixture = struct {
         self.tmp.cleanup();
     }
 };
+
+test "rename publishes database files and preserves open descriptors" {
+    var fixture = try Fixture.init();
+    defer fixture.deinit();
+    filesystem.attachTemporaryData(fixture.tmp.dir);
+    defer filesystem.detachTemporaryData();
+    try fixture.tmp.dir.writeFile(testing.io, .{ .sub_path = "CURRENT", .data = "old" });
+    try fixture.tmp.dir.writeFile(testing.io, .{ .sub_path = "000001.dbtmp", .data = "manifest" });
+    const previous = kernelOpen("/temp0/CURRENT", filesystem.O.rdonly, 0);
+    defer _ = kernelClose(previous);
+    const pending = kernelOpen("/temp0/000001.dbtmp", filesystem.O.rdonly, 0);
+    defer _ = kernelClose(pending);
+    try testing.expectEqual(@as(i64, 3), kernelLseek(pending, 3, filesystem.Seek.set));
+    try testing.expectEqual(errno.ok, posixRename("/temp0/000001.dbtmp", "/temp0/CURRENT"));
+    try testing.expectEqual(KernelError.enoent.raw(), kernelCheckReachability("/temp0/000001.dbtmp"));
+    const published = kernelOpen("/temp0/CURRENT", filesystem.O.rdonly, 0);
+    defer _ = kernelClose(published);
+    var contents: [8]u8 = undefined;
+    try testing.expectEqual(@as(i64, 8), kernelRead(published, &contents, contents.len));
+    try testing.expectEqualStrings("manifest", &contents);
+    try testing.expectEqual(@as(i64, 3), kernelRead(previous, &contents, contents.len));
+    try testing.expectEqualStrings("old", contents[0..3]);
+    try testing.expectEqual(@as(i64, 5), kernelRead(pending, &contents, contents.len));
+    try testing.expectEqualStrings("ifest", contents[0..5]);
+    try testing.expectEqual(errno.ok, kernelRename("/temp0/CURRENT", "/temp0/CURRENT"));
+    try testing.expectEqual(KernelError.enoent.raw(), kernelRename("/temp0/missing", "/temp0/CURRENT"));
+    try testing.expectEqual(@as(i64, 8), kernelPread(published, &contents, contents.len, 0));
+    try testing.expectEqualStrings("manifest", &contents);
+}
+
+test "rename enforces guest mount boundaries and reports failures through both ABIs" {
+    var fixture = try Fixture.init();
+    defer fixture.deinit();
+    var db = symbols.Database{};
+    defer db.deinit(testing.allocator);
+    try register(&db, testing.allocator);
+    try runtime_api.register(&db, testing.allocator);
+    const error_entry = db.findByName("__error", .function) orelse return error.TestExpectedSymbol;
+    const error_address: *const fn () callconv(abi.guest) *i32 = @ptrFromInt(error_entry.address);
+    filesystem.attachTemporaryData(fixture.tmp.dir);
+    defer filesystem.detachTemporaryData();
+    try testing.expectEqual(KernelError.eacces.raw(), kernelRename("/app0/data.bin", "/temp0/file"));
+    try testing.expectEqual(KernelError.eacces.raw(), kernelRename("/temp0/data.bin", "/app0/file"));
+    try testing.expectEqual(KernelError.exdev.raw(), kernelRename("/temp0/data.bin", "/savedata0/file"));
+    try testing.expectEqual(KernelError.ebusy.raw(), kernelRename("/temp0/../", "/temp0/file"));
+    try testing.expectEqual(KernelError.ebusy.raw(), kernelRename("/temp0/data.bin", "/temp0/"));
+    try testing.expectEqual(KernelError.enoent.raw(), kernelRename("/temp0/data.bin", "/temp0/missing/file"));
+    try testing.expectEqual(@as(i32, -1), posixRename("/temp0/missing", "/temp0/data.bin"));
+    try testing.expectEqual(errno.Posix.enoent, error_address().*);
+    try testing.expectEqual(@as(i32, -1), posixRename(null, "/temp0/data.bin"));
+    try testing.expectEqual(errno.Posix.efault, error_address().*);
+    try testing.expectEqual(KernelError.efault.raw(), kernelRename("/temp0/data.bin", null));
+    try fixture.tmp.dir.createDir(testing.io, "old-dir", .default_dir);
+    try fixture.tmp.dir.writeFile(testing.io, .{ .sub_path = "old-dir/child", .data = "kept" });
+    try testing.expectEqual(errno.ok, kernelRename("/temp0/old-dir", "/temp0/new-dir"));
+    try testing.expectEqual(errno.ok, kernelCheckReachability("/temp0/new-dir/child"));
+    try testing.expectEqual(KernelError.enoent.raw(), kernelCheckReachability("/temp0/old-dir/child"));
+}
 
 test "the kernel entry points read a file end to end" {
     var fixture = try Fixture.init();

@@ -41,6 +41,11 @@ pub const Error = error{
     NotSupported,
     /// An exclusive create found the file already there.
     Exists,
+    CrossDevice,
+    NotDirectory,
+    DirectoryNotEmpty,
+    Busy,
+    NoSpace,
 };
 
 /// Devices a title can open by name.
@@ -1143,6 +1148,36 @@ pub fn makeDirectory(path: []const u8) Error!void {
     const relative = hostRelative(path, &relative_storage, io, directory) orelse return Error.NotFound;
     if (std.mem.eql(u8, relative, ".")) return;
     directory.createDirPath(io, relative) catch return Error.IoFailed;
+}
+
+/// Atomically publishes a file or directory under another name in the same
+/// writable guest mount. In particular, database CURRENT/manifest replacement
+/// must not delete the destination before the host rename succeeds.
+pub fn rename(old_path: []const u8, new_path: []const u8) Error!void {
+    const old_mount = mountOf(old_path);
+    const new_mount = mountOf(new_path);
+    if (old_mount == .title or new_mount == .title) return Error.ReadOnly;
+    if (old_mount != new_mount) return Error.CrossDevice;
+    const io = active_io orelse return Error.NotAttached;
+    const directory = rootFor(old_mount) orelse return Error.NotAttached;
+    var old_storage: [maximum_path]u8 = undefined;
+    var new_storage: [maximum_path]u8 = undefined;
+    const old_relative = hostRelative(old_path, &old_storage, io, directory) orelse return Error.NotFound;
+    const new_relative = hostRelative(new_path, &new_storage, io, directory) orelse return Error.NotFound;
+    if (std.mem.eql(u8, old_relative, ".") or std.mem.eql(u8, new_relative, ".")) return Error.Busy;
+    // Do not create missing parents, copy across mounts, or close open guest
+    // descriptors: native rename preserves their object and file position.
+    directory.rename(old_relative, directory, new_relative, io) catch |err| return switch (err) {
+        error.FileNotFound => Error.NotFound,
+        error.NotDir => Error.NotDirectory,
+        error.IsDir => Error.IsDirectory,
+        error.DirNotEmpty => Error.DirectoryNotEmpty,
+        error.AccessDenied, error.PermissionDenied, error.ReadOnlyFileSystem => Error.ReadOnly,
+        error.CrossDevice => Error.CrossDevice,
+        error.FileBusy => Error.Busy,
+        error.NoSpaceLeft, error.DiskQuota => Error.NoSpace,
+        else => Error.IoFailed,
+    };
 }
 
 fn openDirectory(

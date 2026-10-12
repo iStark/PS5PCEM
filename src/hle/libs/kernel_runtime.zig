@@ -2377,7 +2377,6 @@ pub const exports = [_]symbols.Export{
     .{ .name = "sceKernelStat", .function = trace.wrap("sceKernelStat", &kernelUnsupported), .expect_id = "eV9wAD2riIA" },
     .{ .name = "sceKernelMkdir", .function = trace.wrap("sceKernelMkdir", &kernelUnsupported), .expect_id = "1-LFLmRFxxM" },
     .{ .name = "sceKernelUtimes", .function = trace.wrap("sceKernelUtimes", &kernelUnsupported), .expect_id = "0Cq8ipKr9n0" },
-    .{ .name = "sceKernelRename", .function = trace.wrap("sceKernelRename", &kernelUnsupported), .expect_id = "52NcYU9+lEo" },
     .{ .name = "sceKernelTruncate", .function = trace.wrap("sceKernelTruncate", &kernelUnsupported), .expect_id = "WlyEA-sLDf0" },
     .{ .name = "sceKernelUnlink", .function = trace.wrap("sceKernelUnlink", &kernelUnsupported), .expect_id = "AUXVxWeJU-A" },
     .{ .name = "sceKernelChmod", .function = trace.wrap("sceKernelChmod", &kernelUnsupported), .expect_id = "fgIsQ10xYVA" },
@@ -2442,7 +2441,6 @@ pub const unity_exports = [_]symbols.Export{
 pub const posix_exports = [_]symbols.Export{
     .{ .name = "mkdir", .function = trace.wrap("mkdir", &posixUnsupported), .expect_id = "JGMio+21L4c" },
     .{ .name = "chmod", .function = trace.wrap("chmod", &posixUnsupported), .expect_id = "z0dtnPxYgtg" },
-    .{ .name = "rename", .function = trace.wrap("rename", &posixUnsupported), .expect_id = "NN01qLRhiqU" },
     .{ .name = "fchmod", .function = trace.wrap("fchmod", &posixUnsupported), .expect_id = "n01yNbQO5W4" },
     .{ .name = "write", .function = trace.wrap("write", &guestWrite), .expect_id = "FN4gaPmuFV8" },
     .{ .name = "futimes", .function = trace.wrap("futimes", &posixUnsupported), .expect_id = "+0EDo7YzcoU" },

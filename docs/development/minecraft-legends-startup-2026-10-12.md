@@ -1,5 +1,7 @@
 # Minecraft Legends: linking, memory and startup rendering
 
+**Follow-up, October 13:** the main menu and controllable opening tutorial are now verified after implementing file rename for the campaign database. Severe rendering defects remain. See the [gameplay report and capture](minecraft-legends-campaign-2026-10-13.md). The observations below retain the earlier startup checkpoint.
+
 October 12, 2026. Development build, PPSA05510 v01.013.000, RTX 3070 Ti,
 1920×1080 output, Speed preset. Game files were supplied locally.
 
