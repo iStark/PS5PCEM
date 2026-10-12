@@ -607,6 +607,9 @@ fn sceKernelReleaseDirectMemory(start: u64, len: u64) callconv(abi.guest) i32 {
     pool.reservations.ensureUnusedCapacity(gpa, 1) catch return KernelError.enomem.raw();
     if (guest_address_space) |address_space| {
         _ = address_space.unmapDirectMemoryBacking(start, len);
+        // A native view can reject a partial unmap. Keep physical ownership
+        // in that case rather than recycling pages that remain guest-visible.
+        if (address_space.hasDirectMemoryMappings(start, len)) return KernelError.eacces.raw();
     }
     pool.release(gpa, start, len) catch |err| return switch (err) {
         error.NotReserved => KernelError.einval.raw(),
@@ -1176,6 +1179,73 @@ fn mmap(
         return -1;
     }
     return @bitCast(mapped);
+}
+
+fn posixMemoryFailure(number: i32) i32 {
+    runtime_api.setPosixErrno(number);
+    return -1;
+}
+
+/// POSIX lengths cover every touched guest page, but the starting address
+/// must already be aligned. Reject overflow before changing any mappings.
+fn posixMemoryLength(address: u64, len: u64) ?u64 {
+    if (address % page_size != 0) return null;
+    const rounded = (std.math.add(u64, len, page_size - 1) catch return null) & ~(page_size - 1);
+    _ = std.math.add(u64, address, rounded) catch return null;
+    return rounded;
+}
+
+fn mprotect(address: u64, len: u64, protection_bits: i32) callconv(abi.guest) i32 {
+    const supported = posix_prot_read | posix_prot_write | posix_prot_exec;
+    if (protection_bits & ~supported != 0) return posixMemoryFailure(errno.Posix.einval);
+    const rounded = posixMemoryLength(address, len) orelse return posixMemoryFailure(errno.Posix.einval);
+    if (rounded == 0) return 0;
+    const protection = memory.Protection{
+        .read = protection_bits & posix_prot_read != 0,
+        .write = protection_bits & posix_prot_write != 0,
+        .execute = protection_bits & posix_prot_exec != 0,
+    };
+    pool_lock.lock();
+    defer pool_lock.unlock();
+    const space = guest_address_space orelse return posixMemoryFailure(errno.Posix.enosys);
+    space.protectGuest(address, rounded, protection, protection.guestBits()) catch |err|
+        return posixMemoryFailure(if (err == error.RangeNotMapped)
+            errno.Posix.enomem
+        else
+            errno.kernelToPosix(mapAddressSpaceError(err)));
+    return 0;
+}
+
+fn munmap(address: u64, len: u64) callconv(abi.guest) i32 {
+    if (len == 0) return posixMemoryFailure(errno.Posix.einval);
+    const rounded = posixMemoryLength(address, len) orelse return posixMemoryFailure(errno.Posix.einval);
+    const end = address + rounded;
+    pool_lock.lock();
+    defer pool_lock.unlock();
+    const space = guest_address_space orelse return posixMemoryFailure(errno.Posix.enosys);
+    if (has_memory_pool_reservations and space.hasPooledMappings(address, rounded) and
+        (address % pool_block_size != 0 or rounded % pool_block_size != 0))
+        return posixMemoryFailure(errno.Posix.einval);
+
+    // POSIX permits holes and repeated unmaps. Remove each contiguous mapped
+    // run, retaining adjacent protection splits in the same host transaction.
+    var cursor = address;
+    while (cursor < end) {
+        const first = space.query(cursor, true) orelse break;
+        if (first.address >= end) break;
+        const start = @max(cursor, first.address);
+        var stop = @min(end, first.end());
+        while (stop < end) {
+            const next = space.query(stop, true) orelse break;
+            if (next.address != stop) break;
+            stop = @min(end, next.end());
+        }
+        space.unmap(start, stop - start) catch |err|
+            return posixMemoryFailure(errno.kernelToPosix(mapAddressSpaceError(err)));
+        returnPoolBlocks(start, stop - start);
+        cursor = stop;
+    }
+    return 0;
 }
 
 /// Memory reserved for development hardware.
@@ -2191,16 +2261,163 @@ pub const exports = [_]symbols.Export{
 };
 
 pub const library = symbols.Library{ .name = "libkernel", .version = 1 };
+pub const posix_library = symbols.Library{ .name = "libScePosix", .version = 1 };
 pub const module = symbols.Module{ .name = "libkernel", .version_major = 1, .version_minor = 1 };
+
+const posix_exports = [_]symbols.Export{
+    .{ .name = "mprotect", .function = trace.wrap("mprotect", &mprotect), .expect_id = "YQOfxL4QfeU" },
+    .{ .name = "munmap", .function = trace.wrap("munmap", &munmap), .expect_id = "UqDGjXA5yUM" },
+};
 
 /// Registers this library with a symbol database.
 pub fn register(db: *symbols.Database, gpa: std.mem.Allocator) symbols.Error!void {
     try db.addLibrary(gpa, library, module, &exports);
+    try db.addLibrary(gpa, library, module, &posix_exports);
+    try db.addLibrary(gpa, posix_library, module, &posix_exports);
 }
 
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
+
+test "POSIX memory permissions execute JIT code and unmap across holes" {
+    var space = try memory.AddressSpace.init(testing.allocator);
+    defer space.deinit();
+    init(testing.allocator);
+    defer deinit();
+    attachAddressSpace(&space);
+
+    const result = mmap(0, 3 * page_size, posix_prot_read | posix_prot_write, posix_map_anonymous, -1, 0);
+    try testing.expect(result > 0);
+    const address: u64 = @intCast(result);
+    // mov eax, 42; ret. Exercise the host RX mapping, not just its metadata.
+    try space.write(address, &.{ 0xb8, 42, 0, 0, 0, 0xc3 });
+    try testing.expectEqual(@as(i32, 0), mprotect(address, 1, posix_prot_read | posix_prot_exec));
+    try testing.expect(!space.isWritable(address, 1));
+    try testing.expect(space.query(address, false).?.protection.execute);
+    const generated: *const fn () callconv(abi.guest) u32 = @ptrFromInt(address);
+    try testing.expectEqual(@as(u32, 42), generated());
+    try testing.expectEqual(@as(i32, 0), mprotect(address, page_size, 0));
+    try testing.expect(!space.isReadable(address, 1));
+    try testing.expectEqual(@as(i32, 0), mprotect(address, page_size, posix_prot_read | posix_prot_write));
+    try space.write(address, "restored");
+    try testing.expectEqual(@as(i32, 0), munmap(address + page_size, 1));
+    try testing.expect(space.query(address + page_size, false) == null);
+    try testing.expect(space.isWritable(address + 2 * page_size, 1));
+    try testing.expectEqual(@as(i32, 0), munmap(address, 2 * page_size + 1));
+    try testing.expect(space.query(address, false) == null);
+    try testing.expect(space.query(address + 2 * page_size, false) == null);
+    try testing.expectEqual(@as(i32, 0), munmap(address, 3 * page_size));
+    try testing.expectEqual(@as(u64, 0), space.mappedBytes(.flexible));
+}
+
+test "fixed direct mapping spans adjacent recycled virtual reservations" {
+    var space = try memory.AddressSpace.initWithDirectMemory(testing.allocator, 32 * page_size);
+    defer space.deinit();
+    init(testing.allocator);
+    defer deinit();
+    attachAddressSpace(&space);
+    var physical: u64 = 0;
+    try testing.expectEqual(errno.ok, sceKernelAllocateDirectMemory(0, direct_memory_size, 16 * page_size, page_size, 0, &physical));
+    var base: u64 = 0;
+    try testing.expectEqual(errno.ok, sceKernelReserveVirtualRange(&base, 32 * page_size, 0, page_size));
+    var first = base;
+    try testing.expectEqual(errno.ok, sceKernelMapDirectMemory(&first, 2 * page_size, 3, map_fixed, physical, 0));
+    try space.write(base, "keep");
+    // Recycling one allocation leaves two adjacent logical reservations and
+    // two differently sized host placeholders, as in Minecraft's allocator.
+    var recycled = base + page_size;
+    try testing.expectEqual(errno.ok, sceKernelReserveVirtualRange(&recycled, page_size, map_fixed, page_size));
+    var combined = recycled;
+    try testing.expectEqual(errno.ok, sceKernelMapDirectMemory(&combined, 8 * page_size, 3, map_fixed, physical + 2 * page_size, 0));
+    try space.write(combined + 8 * page_size - 4, "tail");
+    var bytes: [4]u8 = undefined;
+    try space.read(base, &bytes);
+    try testing.expectEqualStrings("keep", &bytes);
+    try testing.expectEqual(memory.MappingKind.reserved, space.query(base + 9 * page_size, false).?.kind);
+}
+
+test "partial direct release preserves both surviving sides of every alias" {
+    var space = try memory.AddressSpace.initWithDirectMemory(testing.allocator, 8 * page_size);
+    defer space.deinit();
+    init(testing.allocator);
+    defer deinit();
+    attachAddressSpace(&space);
+    var physical: u64 = 0;
+    try testing.expectEqual(errno.ok, sceKernelAllocateDirectMemory(0, direct_memory_size, 3 * page_size, page_size, 0, &physical));
+    var first: u64 = 0;
+    var second: u64 = 0;
+    try testing.expectEqual(errno.ok, sceKernelMapDirectMemory(&first, 3 * page_size, 3, 0, physical, 0));
+    try testing.expectEqual(errno.ok, sceKernelMapDirectMemory(&second, 3 * page_size, 3, 0, physical, 0));
+    try space.write(first, "head");
+    try space.write(first + 2 * page_size, "tail");
+    try testing.expectEqual(errno.ok, sceKernelReleaseDirectMemory(physical + page_size, page_size));
+    for ([_]u64{ first, second }) |address| {
+        try testing.expect(space.query(address + page_size, false) == null);
+        var bytes: [4]u8 = undefined;
+        try space.read(address, &bytes);
+        try testing.expectEqualStrings("head", &bytes);
+        try space.read(address + 2 * page_size, &bytes);
+        try testing.expectEqualStrings("tail", &bytes);
+    }
+    try testing.expectEqual(errno.ok, sceKernelReleaseDirectMemory(physical, page_size));
+    try testing.expectEqual(errno.ok, sceKernelReleaseDirectMemory(physical + 2 * page_size, page_size));
+}
+
+test "POSIX memory errors set guest errno without changing valid pages" {
+    var space = try memory.AddressSpace.init(testing.allocator);
+    defer space.deinit();
+    init(testing.allocator);
+    defer deinit();
+    attachAddressSpace(&space);
+    var db = symbols.Database{};
+    defer db.deinit(testing.allocator);
+    try runtime_api.register(&db, testing.allocator);
+    const get_errno: *const fn () callconv(abi.guest) *i32 = @ptrFromInt(db.findById("9BcDykPmo1I", .function).?.address);
+    const cell = get_errno();
+    const previous_errno = cell.*;
+    defer cell.* = previous_errno;
+    const result = mmap(0, page_size, posix_prot_read | posix_prot_write, posix_map_anonymous, -1, 0);
+    try testing.expect(result > 0);
+    const address: u64 = @intCast(result);
+    try testing.expectEqual(@as(i32, -1), mprotect(address + 1, 1, posix_prot_read));
+    try testing.expectEqual(errno.Posix.einval, cell.*);
+    try testing.expectEqual(@as(i32, -1), mprotect(address, page_size, 0x8000));
+    try testing.expectEqual(errno.Posix.einval, cell.*);
+    try testing.expectEqual(@as(i32, -1), mprotect(address, 2 * page_size, posix_prot_read));
+    try testing.expectEqual(errno.Posix.enomem, cell.*);
+    try testing.expectEqual(@as(i32, -1), munmap(address + 1, page_size));
+    try testing.expectEqual(errno.Posix.einval, cell.*);
+    try testing.expectEqual(@as(i32, -1), munmap(address, 0));
+    try testing.expectEqual(errno.Posix.einval, cell.*);
+    try testing.expectEqual(@as(i32, -1), munmap(address, std.math.maxInt(u64)));
+    try testing.expectEqual(errno.Posix.einval, cell.*);
+    try testing.expectEqual(@as(i32, -1), mprotect(address, std.math.maxInt(u64), posix_prot_read));
+    try testing.expectEqual(errno.Posix.einval, cell.*);
+    try testing.expect(space.isWritable(address, page_size));
+    try testing.expectEqual(@as(i32, 0), mprotect(address, 0, posix_prot_read));
+    try testing.expect(space.isWritable(address, page_size));
+    cell.* = 123;
+    try testing.expectEqual(@as(i32, 0), munmap(address, page_size));
+    try testing.expectEqual(@as(i32, 123), cell.*);
+}
+
+test "POSIX memory exports resolve by NID in both libraries" {
+    var db = symbols.Database{};
+    defer db.deinit(testing.allocator);
+    try register(&db, testing.allocator);
+    for (posix_exports) |entry| {
+        for ([_]symbols.Library{ library, posix_library }) |lib| {
+            const found = db.find(.{
+                .id = @import("../nid.zig").fromName(entry.name),
+                .library = lib,
+                .module = module,
+                .type = .function,
+            }) orelse return error.MissingPosixMemoryExport;
+            try testing.expectEqualStrings(entry.name, found.name);
+        }
+    }
+}
 
 fn expectPoolStats(available: i32, allocated: i32) !void {
     var stats: MemoryPoolBlockStats = undefined;
@@ -3520,7 +3737,7 @@ test "the library registers under the expected identifiers" {
     defer db.deinit(testing.allocator);
 
     try register(&db, testing.allocator);
-    try testing.expectEqual(exports.len, db.count());
+    try testing.expectEqual(exports.len + 2 * posix_exports.len, db.count());
 
     const found = db.findByName("sceKernelGetDirectMemorySize", .function) orelse
         return error.TestExpectedSymbol;

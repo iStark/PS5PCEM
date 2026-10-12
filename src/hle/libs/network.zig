@@ -390,6 +390,13 @@ fn sslUnavailable(_: u64, _: u64, _: u64, _: u64, _: u64, _: u64) callconv(abi.g
 }
 
 const ssl_exports = [_]symbols.Export{
+    // TLS transport is unavailable, just like peer-dependent socket calls.
+    // Refuse connection and I/O requests without inventing sessions or bytes.
+    .{ .name = "sceSslCreateConnection", .function = trace.wrap("sceSslCreateConnection", &sslUnavailable), .expect_id = "tuscfitnhEo" },
+    .{ .name = "sceSslDeleteConnection", .function = trace.wrap("sceSslDeleteConnection", &sslUnavailable), .expect_id = "HJ1n138CQ2g" },
+    .{ .name = "sceSslConnect", .function = trace.wrap("sceSslConnect", &sslUnavailable), .expect_id = "zXvd6iNyfgc" },
+    .{ .name = "sceSslRead", .function = trace.wrap("sceSslRead", &sslUnavailable), .expect_id = "jltWpVKtetg" },
+    .{ .name = "sceSslWrite", .function = trace.wrap("sceSslWrite", &sslUnavailable), .expect_id = "iNjkt9Poblw" },
     .{ .name = "sceSslInit", .function = trace.wrap("sceSslInit", &sslInit), .expect_id = "hdpVEUDFW3s" },
     .{ .name = "sceSslTerm", .function = trace.wrap("sceSslTerm", &sslTerm), .expect_id = "0K1yQ6Lv-Yc" },
     .{ .name = "sceSslGetCaCerts", .function = trace.wrap("sceSslGetCaCerts", &sslGetCaCerts), .expect_id = "TDfQqO-gMbY" },
@@ -994,6 +1001,14 @@ test "network families register the title import surface" {
     try std.testing.expect(db.findById("IWalAn-guFs", .function) != null);
     try std.testing.expect(db.findById("IZ-qjhRqvjk", .function) != null);
     try std.testing.expect(db.findById("lQOCF84lvzw", .function) != null);
+    const ssl_ids = [_][]const u8{ "tuscfitnhEo", "HJ1n138CQ2g", "zXvd6iNyfgc", "jltWpVKtetg", "iNjkt9Poblw" };
+    for (ssl_ids) |id| {
+        const entry = db.findById(id, .function) orelse return error.MissingSslExport;
+        const invoke: *const @TypeOf(sslUnavailable) = @ptrFromInt(entry.address);
+        var buffer: [16]u8 = @splat(0xa5);
+        try std.testing.expectEqual(ssl_error_not_found, invoke(1, @intFromPtr(&buffer), buffer.len, 0, 0, 0));
+        try std.testing.expectEqualSlices(u8, &([_]u8{0xa5} ** 16), &buffer);
+    }
     inline for (&.{
         "Kiwv9r4IZCc",
         "tsGVru3hCe8",

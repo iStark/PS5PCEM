@@ -119,6 +119,18 @@ fn kernelFsync(descriptor: i32) callconv(abi.guest) i32 {
     return errno.ok;
 }
 
+fn kernelSync() callconv(abi.guest) i32 {
+    filesystem.sync() catch |err| return kernelStatus(err);
+    return errno.ok;
+}
+
+fn kernelCheckReachability(path: ?[*:0]const u8) callconv(abi.guest) i32 {
+    const name = spanOf(path) orelse return KernelError.efault.raw();
+    var info: filesystem.Stat = undefined;
+    filesystem.stat(name, &info) catch |err| return kernelStatus(err);
+    return errno.ok;
+}
+
 fn posixFsync(descriptor: i32) callconv(abi.guest) i64 {
     filesystem.fsync(descriptor) catch |err| return posixFail(err);
     return 0;
@@ -329,6 +341,8 @@ fn posixFtruncate(descriptor: i32, length: i64) callconv(abi.guest) i64 {
 }
 
 pub const exports = [_]symbols.Export{
+    .{ .name = "sceKernelSync", .function = trace.wrap("sceKernelSync", &kernelSync), .expect_id = "uvT2iYBBnkY" },
+    .{ .name = "sceKernelCheckReachability", .function = trace.wrap("sceKernelCheckReachability", &kernelCheckReachability), .expect_id = "uWyW3v98sU4" },
     .{ .name = "sceKernelOpen", .function = trace.wrap("sceKernelOpen", &kernelOpen), .expect_id = "1G3lF1Gg1k8" },
     .{ .name = "sceKernelClose", .function = trace.wrap("sceKernelClose", &kernelClose), .expect_id = "UK2Tl2DWUns" },
     .{ .name = "sceKernelRead", .function = trace.wrap("sceKernelRead", &kernelRead), .expect_id = "Cg4srZ6TKbU" },
@@ -378,6 +392,34 @@ pub fn register(db: *symbols.Database, gpa: std.mem.Allocator) symbols.Error!voi
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
+
+test "reachability checks mounted files and global sync propagates host failures" {
+    var fixture = try Fixture.init();
+    defer fixture.deinit();
+    try testing.expectEqual(errno.ok, kernelCheckReachability("/app0/data.bin"));
+    try testing.expectEqual(errno.ok, kernelCheckReachability("/app0"));
+    try testing.expectEqual(KernelError.enoent.raw(), kernelCheckReachability("/app0/missing.bin"));
+    try testing.expectEqual(KernelError.efault.raw(), kernelCheckReachability(null));
+    filesystem.attachTemporaryData(fixture.tmp.dir);
+    defer filesystem.detachTemporaryData();
+    const fd = kernelOpen("/temp0/flush.bin", filesystem.O.rdwr | filesystem.O.creat, 0);
+    try testing.expect(fd >= filesystem.first_descriptor);
+    defer _ = kernelClose(fd);
+    try testing.expectEqual(@as(i64, 4), kernelWrite(fd, "save", 4));
+    try testing.expectEqual(errno.ok, kernelSync());
+    const Fail = struct {
+        fn sync(_: ?*anyopaque, _: std.Io.File) std.Io.File.SyncError!void {
+            return error.InputOutput;
+        }
+    };
+    var vtable = testing.io.vtable.*;
+    vtable.fileSync = &Fail.sync;
+    var failing_io = testing.io;
+    failing_io.vtable = &vtable;
+    filesystem.attach(failing_io, fixture.tmp.dir);
+    defer filesystem.attach(testing.io, fixture.tmp.dir);
+    try testing.expectEqual(KernelError.eio.raw(), kernelSync());
+}
 
 const Fixture = struct {
     tmp: testing.TmpDir,

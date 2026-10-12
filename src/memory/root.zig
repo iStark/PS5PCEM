@@ -1285,7 +1285,8 @@ pub const AddressSpace = struct {
     /// does this for it, and refusing the release until it does would fail every
     /// hand-back a title makes.
     ///
-    /// Returns how many mappings were removed.
+    /// Returns how many mapped slices were removed. Aliases outside the
+    /// released physical interval retain their pages and contents.
     pub fn unmapDirectMemoryBacking(self: *AddressSpace, offset: u64, size: u64) usize {
         if (size == 0) return 0;
         const end = std.math.add(u64, offset, size) catch return 0;
@@ -1294,8 +1295,8 @@ pub const AddressSpace = struct {
         while (true) {
             const victim = self.findDirectMemoryAlias(offset, end) orelse return removed;
             // Dropped outside the lock the search took, because unmapping takes
-            // it again. Re-searching from the start each time is fine: the list
-            // shrinks by one every round.
+            // it again. Each successful removal eliminates one overlap with
+            // the released interval, even when it splits a surviving mapping.
             self.unmap(victim.address, victim.size) catch return removed;
             removed += 1;
         }
@@ -1308,7 +1309,11 @@ pub const AddressSpace = struct {
             if (mapping.kind != .direct_memory) continue;
             const mapping_offset = mapping.backing_offset orelse continue;
             const mapping_end = std.math.add(u64, mapping_offset, mapping.size) catch continue;
-            if (mapping_offset < end and offset < mapping_end) return mapping;
+            if (mapping_offset < end and offset < mapping_end) {
+                const overlap_start = @max(offset, mapping_offset);
+                const overlap_end = @min(end, mapping_end);
+                return offsetMapping(mapping, mapping.address + overlap_start - mapping_offset, overlap_end - overlap_start);
+            }
         }
         return null;
     }
@@ -1604,7 +1609,12 @@ pub const AddressSpace = struct {
         }
         try self.mappings.ensureUnusedCapacity(self.allocator, 1);
 
-        const free_range = self.freeRangeLocked(address, size) orelse {
+        // Adjacent guest reservations may share larger host placeholders.
+        // After replacing only part of them, a metadata boundary can fall
+        // inside the next placeholder. Coalescing up to that artificial end
+        // fails on Windows. The overlap check above still protects all guest
+        // mappings; only placeholder preparation may cross reserved metadata.
+        const free_range = self.hostFreeRangeIgnoringReservationsLocked(address, size) orelse {
             std.debug.print("[memory] fixed map has no host extent addr=0x{x} size=0x{x} kind={s}\n", .{ address, size, @tagName(kind) });
             return Error.AddressUnavailable;
         };

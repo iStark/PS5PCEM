@@ -42,6 +42,7 @@ pub const avplayer_exports = [_]symbols.Export{
 
 pub const coredump_exports = [_]symbols.Export{
     .{ .name = "sceCoredumpRegisterCoredumpHandler", .function = trace.wrap("sceCoredumpRegisterCoredumpHandler", &services.accept), .expect_id = "8zLSfEfW5AU" },
+    .{ .name = "sceCoredumpUnregisterCoredumpHandler", .function = trace.wrap("sceCoredumpUnregisterCoredumpHandler", &services.accept), .expect_id = "fFkhOgztiCA" },
     .{ .name = "sceCoredumpSetUserDataType", .function = trace.wrap("sceCoredumpSetUserDataType", &services.accept), .expect_id = "Uxqkdta7wEg" },
     .{ .name = "sceCoredumpWriteUserData", .function = trace.wrap("sceCoredumpWriteUserData", &services.accept), .expect_id = "Dbbkj6YHWdo" },
     .{ .name = "sceCoredumpAttachUserFile", .function = trace.wrap("sceCoredumpAttachUserFile", &services.accept), .expect_id = "5nc2gdLNsok" },

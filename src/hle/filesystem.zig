@@ -1463,6 +1463,50 @@ pub fn fsync(descriptor: i32) Error!void {
     file.sync(io) catch return Error.IoFailed;
 }
 
+/// Flush every writable guest file while keeping its host handle alive.
+pub fn sync() Error!void {
+    const io = active_io orelse return Error.NotAttached;
+    table_lock.lock();
+    defer table_lock.unlock();
+    var failed = false;
+    for (open_files) |slot| {
+        const entry = slot orelse continue;
+        if (!entry.writable and !entry.diagnostic_log) continue;
+        if (entry.file) |file| file.sync(io) catch {
+            failed = true;
+        };
+    }
+    if (failed) return Error.IoFailed;
+}
+
+pub const DescriptorReadiness = struct {
+    readable: bool = false,
+    writable: bool = false,
+    bytes: u64 = 0,
+    eof: bool = false,
+};
+
+/// Observe readiness without advancing the descriptor's read position.
+pub fn descriptorReadiness(descriptor: i32, low_water: u64) Error!DescriptorReadiness {
+    table_lock.lock();
+    defer table_lock.unlock();
+    const slot = slotOf(descriptor) orelse return Error.BadDescriptor;
+    const entry = slot.* orelse return Error.BadDescriptor;
+    if (entry.virtual_socket) return .{
+        .readable = virtualSocketReadable(),
+        .writable = true,
+        .bytes = if (virtualSocketReadable()) 1 else 0,
+    };
+    if (entry.file == null and entry.memory == null) return Error.InvalidArgument;
+    const remaining = entry.size -| entry.offset;
+    return .{
+        .readable = remaining >= @max(low_water, 1) or remaining == 0,
+        .writable = entry.writable or entry.diagnostic_log,
+        .bytes = remaining,
+        .eof = remaining == 0,
+    };
+}
+
 pub fn seek(descriptor: i32, offset: i64, whence: i32) Error!i64 {
     table_lock.lock();
     defer table_lock.unlock();

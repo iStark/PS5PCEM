@@ -11,6 +11,7 @@ const symbols = @import("../symbols.zig");
 const threading = @import("kernel_threading.zig");
 const runtime_api = @import("kernel_runtime.zig");
 const kernel_memory = @import("kernel_memory.zig");
+const filesystem = @import("../filesystem.zig");
 
 const KernelError = errno.KernelError;
 const maximum_queues = 64;
@@ -23,6 +24,8 @@ const maximum_registrations = 64;
 const maximum_pending_events = 1024;
 const user_filter: i16 = -11;
 const timer_filter: i16 = -7;
+const read_filter: i16 = -1;
+const write_filter: i16 = -2;
 pub const ampr_filter: i16 = -16;
 pub const video_out_filter: i16 = -13;
 pub const video_out_flip_ident: u64 = 6;
@@ -59,6 +62,7 @@ const Registration = struct {
     /// Repeat interval, or null for a timer that fires once.
     period_microseconds: ?u64 = null,
     user_data: u64 = 0,
+    low_water: u64 = 1,
 };
 
 const Queue = struct {
@@ -215,6 +219,7 @@ const RegistrationOptions = struct {
     period_microseconds: ?u64 = null,
     user_data: u64 = 0,
     replace_existing: bool = false,
+    low_water: u64 = 1,
 };
 
 fn addRegistration(handle: i64, id: i32, options: RegistrationOptions) i32 {
@@ -230,6 +235,7 @@ fn addRegistration(handle: i64, id: i32, options: RegistrationOptions) i32 {
                 registration.deadline_microseconds = options.deadline_microseconds;
                 registration.period_microseconds = options.period_microseconds;
                 registration.user_data = options.user_data;
+                registration.low_water = options.low_water;
                 // EV_ADD modifies an existing kevent. Events already queued for
                 // that registration must expose the new callback token too.
                 for (0..queue.pending_count) |pending_offset| {
@@ -262,6 +268,7 @@ fn addRegistration(handle: i64, id: i32, options: RegistrationOptions) i32 {
             .deadline_microseconds = options.deadline_microseconds,
             .period_microseconds = options.period_microseconds,
             .user_data = options.user_data,
+            .low_water = options.low_water,
         };
         if (options.filter == graphics_filter and graphics_registration_reports < 32) {
             std.debug.print(
@@ -279,6 +286,76 @@ fn addRegistration(handle: i64, id: i32, options: RegistrationOptions) i32 {
 ///
 /// Null when no clock is attached, which makes timers inert rather than
 /// letting them fire at an arbitrary moment.
+fn addReadEvent(handle: i64, descriptor: i32, low_water: u64, user_data: u64) callconv(abi.guest) i32 {
+    return addDescriptorEvent(handle, descriptor, read_filter, low_water, user_data);
+}
+
+fn addWriteEvent(handle: i64, descriptor: i32, low_water: u64, user_data: u64) callconv(abi.guest) i32 {
+    return addDescriptorEvent(handle, descriptor, write_filter, low_water, user_data);
+}
+
+fn addDescriptorEvent(handle: i64, descriptor: i32, filter: i16, low_water: u64, user_data: u64) i32 {
+    _ = filesystem.descriptorReadiness(descriptor, low_water) catch |err|
+        return if (err == error.BadDescriptor) KernelError.ebadf.raw() else KernelError.einval.raw();
+    return addRegistration(handle, descriptor, .{
+        .filter = filter,
+        .edge = false,
+        .low_water = @max(low_water, 1),
+        .user_data = user_data,
+        .replace_existing = true,
+    });
+}
+
+fn deleteReadEvent(handle: i64, descriptor: i32) callconv(abi.guest) i32 {
+    return deleteDescriptorEvent(handle, descriptor, read_filter);
+}
+
+fn deleteWriteEvent(handle: i64, descriptor: i32) callconv(abi.guest) i32 {
+    return deleteDescriptorEvent(handle, descriptor, write_filter);
+}
+
+fn deleteDescriptorEvent(handle: i64, descriptor: i32, filter: i16) i32 {
+    lock.lock();
+    defer lock.unlock();
+    const queue = findQueue(handle) orelse return KernelError.ebadf.raw();
+    for (&queue.registrations) |*registration| {
+        if (registration.active and registration.filter == filter and
+            registration.ident == @as(u64, @bitCast(@as(i64, descriptor))))
+        {
+            registration.* = .{};
+            return errno.ok;
+        }
+    }
+    return KernelError.enoent.raw();
+}
+
+/// Level events are evaluated at delivery, so consuming bytes or closing a
+/// descriptor cannot leave an old readiness notification in the pending ring.
+fn descriptorEvents(queue: *Queue, output: []Event, next_deadline: *?u64) usize {
+    var count: usize = 0;
+    for (&queue.registrations) |*registration| {
+        if (!registration.active or (registration.filter != read_filter and registration.filter != write_filter)) continue;
+        const readiness = filesystem.descriptorReadiness(@intCast(registration.ident), registration.low_water) catch {
+            registration.* = .{};
+            continue;
+        };
+        // Local wake sockets have no host event handle. Poll only queues which
+        // actually register descriptors, without delaying graphics/user events.
+        next_deadline.* = @min(next_deadline.* orelse 1000, 1000);
+        const ready = if (registration.filter == read_filter) readiness.readable else readiness.writable;
+        if (!ready or count == output.len) continue;
+        output[count] = .{
+            .ident = registration.ident,
+            .filter = registration.filter,
+            .flags = if (registration.filter == read_filter and readiness.eof) 0x8000 else 0,
+            .data = if (registration.filter == read_filter) @intCast(@min(readiness.bytes, std.math.maxInt(i64))) else 0,
+            .user_data = registration.user_data,
+        };
+        count += 1;
+    }
+    return count;
+}
+
 fn nowMicroseconds() ?u64 {
     const io = runtime_api.activeIo() orelse return null;
     const nanoseconds = std.Io.Clock.awake.now(io).nanoseconds;
@@ -712,7 +789,7 @@ fn dequeue(
         queue.pending_head = (queue.pending_head + 1) % maximum_pending_events;
     }
     queue.pending_count -= count;
-    return @intCast(count);
+    return @intCast(count + descriptorEvents(queue, output[count..capacity], next_deadline));
 }
 
 fn waitEqueue(
@@ -726,6 +803,8 @@ fn waitEqueue(
     const count_output = out_count orelse return KernelError.efault.raw();
     if (capacity < 1) return KernelError.einval.raw();
     const event_capacity: usize = @intCast(capacity);
+    var remaining = if (timeout_microseconds) |value| @as(?u64, value.*) else null;
+    const started = nowMicroseconds();
 
     while (true) {
         var observed: u64 = 0;
@@ -735,7 +814,12 @@ fn waitEqueue(
         count_output.* = delivered;
         if (delivered != 0) return errno.ok;
 
-        const requested = if (timeout_microseconds) |value| @as(?u64, value.*) else null;
+        if (started) |start| {
+            if (timeout_microseconds) |value| {
+                if (nowMicroseconds()) |now| remaining = @as(u64, value.*) -| (now -| start);
+            }
+        }
+        const requested = remaining;
         if (requested == 0) return KernelError.etimedout.raw();
         // Sleeping past a timer would deliver it late, so the wait is cut short
         // at the nearest deadline. Waking early only costs one more round.
@@ -755,6 +839,7 @@ fn waitEqueue(
         {
             return KernelError.etimedout.raw();
         }
+        if (result == .timed_out and remaining != null and timeout != null) remaining.? -|= timeout.?;
     }
 }
 
@@ -821,6 +906,10 @@ fn keventFailure(status: i32) i32 {
 }
 
 pub const exports = [_]symbols.Export{
+    .{ .name = "sceKernelAddReadEvent", .function = trace.wrap("sceKernelAddReadEvent", &addReadEvent), .expect_id = "VHCS3rCd0PM" },
+    .{ .name = "sceKernelDeleteReadEvent", .function = trace.wrap("sceKernelDeleteReadEvent", &deleteReadEvent), .expect_id = "JxJ4tfgKlXA" },
+    .{ .name = "sceKernelAddWriteEvent", .function = trace.wrap("sceKernelAddWriteEvent", &addWriteEvent), .expect_id = "R-tyYMpYaxY" },
+    .{ .name = "sceKernelDeleteWriteEvent", .function = trace.wrap("sceKernelDeleteWriteEvent", &deleteWriteEvent), .expect_id = "cBGTk8S92XM" },
     .{ .name = "sceKernelCreateEqueue", .function = trace.wrap("sceKernelCreateEqueue", &createEqueue), .expect_id = "D0OdFMjp46I" },
     .{ .name = "sceKernelDeleteEqueue", .function = trace.wrap("sceKernelDeleteEqueue", &deleteEqueue), .expect_id = "jpFjmgAC5AE" },
     .{ .name = "sceKernelWaitEqueue", .function = trace.wrap("sceKernelWaitEqueue", &waitEqueue), .expect_id = "fzyMKs9kim0" },
@@ -844,6 +933,50 @@ pub const module = symbols.Module{ .name = "libkernel", .version_major = 1, .ver
 pub fn register(db: *symbols.Database, gpa: std.mem.Allocator) symbols.Error!void {
     @import("../apr.zig").attachCompletionSink(&triggerAmprCompletion);
     try db.addLibrary(gpa, library, module, &exports);
+}
+
+test "descriptor events track reads, updates, deletion and close" {
+    const testing = std.testing;
+    reset();
+    defer reset();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "ready.bin", .data = "abcd" });
+    filesystem.attach(testing.io, tmp.dir);
+    filesystem.attachTemporaryData(tmp.dir);
+    defer filesystem.detachTemporaryData();
+    defer filesystem.detach();
+    const fd = try filesystem.open("/temp0/ready.bin", filesystem.O.rdwr);
+    var handle: i64 = 0;
+    try testing.expectEqual(errno.ok, createEqueue(&handle, "readiness"));
+    try testing.expectEqual(errno.ok, addReadEvent(handle, fd, 5, 11));
+    var events: [4]Event = undefined;
+    var count: i32 = -1;
+    const poll: u32 = 0;
+    try testing.expectEqual(KernelError.etimedout.raw(), waitEqueue(handle, &events, 4, &count, &poll));
+    try testing.expectEqual(errno.ok, addReadEvent(handle, fd, 1, 22));
+    try testing.expectEqual(errno.ok, addWriteEvent(handle, fd, 1, 33));
+    try testing.expectEqual(errno.ok, waitEqueue(handle, &events, 4, &count, &poll));
+    try testing.expectEqual(@as(i32, 2), count);
+    try testing.expectEqual(read_filter, events[0].filter);
+    try testing.expectEqual(@as(i64, 4), events[0].data);
+    try testing.expectEqual(@as(u64, 22), events[0].user_data);
+    try testing.expectEqual(write_filter, events[1].filter);
+    var data: [4]u8 = undefined;
+    try testing.expectEqual(@as(usize, 4), try filesystem.read(fd, &data));
+    try testing.expectEqual(errno.ok, waitEqueue(handle, &events, 4, &count, &poll));
+    try testing.expectEqual(@as(i64, 0), events[0].data);
+    try testing.expect(events[0].flags & 0x8000 != 0);
+    try testing.expectEqual(errno.ok, deleteReadEvent(handle, fd));
+    try testing.expectEqual(KernelError.enoent.raw(), deleteReadEvent(handle, fd));
+    try testing.expectEqual(errno.ok, waitEqueue(handle, &events, 4, &count, &poll));
+    try testing.expectEqual(@as(i32, 1), count);
+    try testing.expectEqual(write_filter, events[0].filter);
+    try testing.expectEqual(errno.ok, deleteWriteEvent(handle, fd));
+    try testing.expectEqual(errno.ok, addReadEvent(handle, fd, 1, 0));
+    try filesystem.close(fd);
+    try testing.expectEqual(KernelError.etimedout.raw(), waitEqueue(handle, &events, 4, &count, &poll));
+    try testing.expectEqual(KernelError.ebadf.raw(), addWriteEvent(handle, fd, 1, 0));
 }
 
 test "an armed timer is delivered to whoever waits" {
