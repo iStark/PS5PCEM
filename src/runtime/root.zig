@@ -91,6 +91,9 @@ pub const Runtime = struct {
         try hle.registerAll(&self.database, allocator);
         hle.libs.audio.reset();
         hle.libs.font.reset();
+        hle.libs.share.reset();
+        hle.libs.audio_propagation.reset();
+        hle.libs.json.reset();
         hle.apr.reset();
         hle.libs.bootstrap_services.reset();
         hle.libs.dialogs.reset();
@@ -125,6 +128,9 @@ pub const Runtime = struct {
         hle.libs.kernel_memory.deinit();
         hle.libs.audio.reset();
         hle.libs.font.reset();
+        hle.libs.share.reset();
+        hle.libs.audio_propagation.reset();
+        hle.libs.json.reset();
         hle.libs.bootstrap_services.reset();
         hle.libs.dialogs.reset();
         hle.libs.fiber.reset();
@@ -644,7 +650,7 @@ fn unsupportedServiceFunction(import: *const loader.Import) ?u64 {
         return @intFromPtr(&hle.libs.services.offline);
     }
     if (std.mem.eql(u8, library, "libSceJson2")) {
-        return @intFromPtr(&hle.libs.services.absent);
+        return @intFromPtr(hle.trace.wrap("unimplemented libSceJson2", &hle.libs.services.absent));
     }
     return null;
 }

@@ -511,7 +511,7 @@ pub fn proveUniformBranchesWithPlan(
                     .s_not_b32,
                     .s_wqm_b32,
                     => executeScalar(&local, bindings.program_address, inst, &scc),
-                    .s_nop, .s_waitcnt, .s_inst_prefetch, .s_branch, .s_endpgm, .s_code_end => {},
+                    .s_nop, .s_waitcnt, .s_inst_prefetch, .s_setprio, .s_branch, .s_endpgm, .s_code_end => {},
                     .s_cbranch_scc0, .s_cbranch_scc1 => if (scc) |value| {
                         decisions[block.index] = value == (inst.opcode == .s_cbranch_scc1);
                     },

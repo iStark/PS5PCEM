@@ -31,11 +31,15 @@ pub const Style = struct {
     width: f32 = 16,
     height: f32 = 16,
     slant: f32 = 0,
+    weight_x: f32 = 0,
+    weight_y: f32 = 0,
 
     pub fn valid(self: Style) bool {
         return std.math.isFinite(self.width) and std.math.isFinite(self.height) and
             std.math.isFinite(self.slant) and self.width >= 1.0 / 64.0 and self.height >= 1.0 / 64.0 and
-            self.width <= 1024 and self.height <= 1024 and @abs(self.slant) <= 1;
+            self.width <= 1024 and self.height <= 1024 and @abs(self.slant) <= 1 and
+            std.math.isFinite(self.weight_x) and std.math.isFinite(self.weight_y) and
+            @abs(self.weight_x) <= 0.04 and @abs(self.weight_y) <= 0.04;
     }
 };
 pub const Glyph = struct {
@@ -157,7 +161,11 @@ pub const Face = struct {
             .vertical_bearing_y = fixed(m.vertBearingY),
             .vertical_advance = fixed(m.vertAdvance),
         };
-        if (style.slant != 0) {
+        if (style.weight_x != 0 or style.weight_y != 0) {
+            if (ft.FT_Outline_EmboldenXY(&slot.*.outline, @intFromFloat(@round(style.width * style.weight_x * 64)), @intFromFloat(@round(style.height * style.weight_y * 64))) != 0)
+                return error.RasterizationFailed;
+        }
+        if (style.slant != 0 or style.weight_x != 0 or style.weight_y != 0) {
             var box: ft.FT_BBox = undefined;
             ft.FT_Outline_Get_CBox(&slot.*.outline, &box);
             metrics.width = fixed(box.xMax - box.xMin);

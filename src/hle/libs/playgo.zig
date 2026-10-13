@@ -138,6 +138,26 @@ fn parseManifestChunkIds(text: []const u8) u32 {
 /// package shipped; other dumps keep the whole id space.
 fn loadInstalledChunks() void {
     resetInstalledChunks();
+    // FPKG directory dumps carry the package's own binary chunk table, not
+    // necessarily an extractor-generated JSON manifest. Its IDs are dense.
+    // Advertising IDs beyond this table can make a title select unavailable
+    // language or optional content even though the installed game is complete.
+    if (filesystem.open("/app0/sce_sys/playgo-chunk.dat", filesystem.O.rdonly)) |fd| {
+        defer filesystem.close(fd) catch {};
+        var header: [16]u8 = undefined;
+        var filled: usize = 0;
+        while (filled < header.len) {
+            const size = filesystem.read(fd, header[filled..]) catch break;
+            if (size == 0) break;
+            filled += size;
+        }
+        if (packageChunkCount(header[0..filled])) |count| {
+            for (installed_chunks[0..count], 0..) |*id, i| id.* = @intCast(i);
+            installed_chunk_count = count;
+            chunks_from_manifest = true;
+            return;
+        }
+    } else |_| {}
     var info: filesystem.Stat = .{};
     filesystem.stat("/app0/package.manifest", &info) catch return;
     if (info.size <= 0 or info.size > maximum_manifest_bytes) return;
@@ -158,6 +178,27 @@ fn loadInstalledChunks() void {
         installed_chunk_count = count;
         chunks_from_manifest = true;
     }
+}
+
+fn packageChunkCount(header: []const u8) ?u32 {
+    if (header.len < 12 or !std.mem.eql(u8, header[0..4], "plgx")) return null;
+    const count = std.mem.readInt(u16, header[10..12], .little);
+    return if (count > 0 and count <= maximum_entries) count else null;
+}
+
+test "playgo binary package chunk count is bounded and little endian" {
+    var header: [16]u8 = @splat(0);
+    @memcpy(header[0..4], "plgx");
+    std.mem.writeInt(u16, header[10..12], 100, .little);
+    try std.testing.expectEqual(@as(?u32, 100), packageChunkCount(&header));
+    try std.testing.expectEqual(@as(?u32, null), packageChunkCount(header[0..11]));
+    header[0] = 'x';
+    try std.testing.expectEqual(@as(?u32, null), packageChunkCount(&header));
+    header[0] = 'p';
+    std.mem.writeInt(u16, header[10..12], 0, .little);
+    try std.testing.expectEqual(@as(?u32, null), packageChunkCount(&header));
+    std.mem.writeInt(u16, header[10..12], 0xffff, .little);
+    try std.testing.expectEqual(@as(?u32, null), packageChunkCount(&header));
 }
 
 fn readable(address: u64, size: u64) bool {

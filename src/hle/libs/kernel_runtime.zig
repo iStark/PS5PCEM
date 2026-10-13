@@ -728,7 +728,7 @@ fn readGuestCString(address: u64, buffer: []u8) ?[]const u8 {
 fn aprKernelError(err: apr.Error) i32 {
     return switch (err) {
         error.FileNotFound, error.UnknownFile => KernelError.enoent.raw(),
-        error.FileTableFull, error.CommandBufferTableFull, error.SubmissionTableFull => KernelError.enomem.raw(),
+        error.FileTableFull, error.CommandBufferTableFull, error.SubmissionTableFull, error.OutOfMemory => KernelError.enomem.raw(),
         error.IoFailed => KernelError.eio.raw(),
         error.InvalidPath, error.InvalidCommandBuffer, error.TooManyCommands, error.InvalidRead, error.UnknownSubmission, error.MappingFailed => KernelError.einval.raw(),
         error.OutOfDirectMemory => KernelError.eagain.raw(),
@@ -2267,6 +2267,10 @@ fn setGpo(bits: u32) callconv(abi.guest) void {
     gpo_state.store(bits, .release);
 }
 
+fn getGpi() callconv(abi.guest) u64 {
+    return gpo_state.load(.acquire);
+}
+
 fn convertLocaltimeToUtc(
     local_time: i64,
     _: i64,
@@ -2408,6 +2412,7 @@ pub const exports = [_]symbols.Export{
     .{ .name = "sceKernelSyncOnAddressWait", .function = trace.wrap("sceKernelSyncOnAddressWait", &syncOnAddressWait), .expect_id = "Hc4CaR6JBL0" },
     .{ .name = "sceKernelIsTrinityMode", .function = trace.wrap("sceKernelIsTrinityMode", &isTrinityMode), .expect_id = "tU5e3f9gSiU" },
     .{ .name = "sceKernelSetGPO", .function = trace.wrap("sceKernelSetGPO", &setGpo), .expect_id = "ca7v6Cxulzs" },
+    .{ .name = "sceKernelGetGPI", .function = trace.wrap("sceKernelGetGPI", &getGpi), .expect_id = "4oXYe9Xmk0Q" },
     .{ .name = "sceKernelCancelEventFlag", .function = trace.wrap("sceKernelCancelEventFlag", &cancelEventFlag), .expect_id = "PZku4ZrXJqg" },
     .{ .name = "sceKernelDeleteSema", .function = trace.wrap("sceKernelDeleteSema", &deleteSemaphore), .expect_id = "R1Jvn8bSCW8" },
     .{ .name = "sceKernelAprResolveFilepathsToIdsAndFileSizes", .function = trace.wrap("sceKernelAprResolveFilepathsToIdsAndFileSizes", &aprResolveFilepathsToIdsAndFileSizes), .expect_id = "gEpBkcwxUjw" },

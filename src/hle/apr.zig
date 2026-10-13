@@ -19,11 +19,6 @@ pub const counters = @import("ampr_counters.zig");
 
 pub const maximum_path: usize = 1024;
 pub const maximum_command_buffers: usize = 32;
-pub const maximum_reads_per_buffer: usize = 32;
-pub const maximum_writes_per_buffer: usize = 32;
-pub const maximum_completions_per_buffer: usize = 32;
-pub const maximum_maps_per_buffer: usize = 32;
-pub const maximum_ops_per_buffer: usize = 128;
 pub const maximum_auto_pool: usize = 8;
 pub const maximum_submissions: usize = 64;
 pub const maximum_cached_files: usize = 64;
@@ -40,6 +35,7 @@ pub const Error = error{
     InvalidCommandBuffer,
     CommandBufferTableFull,
     TooManyCommands,
+    OutOfMemory,
     InvalidRead,
     SubmissionTableFull,
     UnknownSubmission,
@@ -126,11 +122,12 @@ pub const CounterCommand = union(enum) {
     read: CounterRead,
 };
 
-const OpKind = enum { read, write, completion, map, counter };
-
-const Op = struct {
-    kind: OpKind,
-    index: u8,
+const Op = union(enum) {
+    read: ReadCommand,
+    write: WriteCommand,
+    completion: CompletionCommand,
+    map: AmmMapCommand,
+    counter: CounterCommand,
 };
 
 const AutoPoolRange = struct {
@@ -148,20 +145,23 @@ const CommandBuffer = struct {
     storage_size: usize = 0,
     record_bytes: usize = 0,
     command_count: usize = 0,
-    reads: [maximum_reads_per_buffer]ReadCommand = undefined,
-    read_count: usize = 0,
-    completions: [maximum_completions_per_buffer]CompletionCommand = undefined,
-    completion_count: usize = 0,
-    writes: [maximum_writes_per_buffer]WriteCommand = undefined,
-    write_count: usize = 0,
-    maps: [maximum_maps_per_buffer]AmmMapCommand = undefined,
-    map_count: usize = 0,
-    counter_commands: [maximum_ops_per_buffer]CounterCommand = undefined,
-    counter_count: usize = 0,
-    ops: [maximum_ops_per_buffer]Op = undefined,
-    op_count: usize = 0,
+    // The guest storage capacity limits recording, not an arbitrary number of
+    // reads or an 8-bit index. Keep values in order for independent submissions.
+    ops: std.ArrayList(Op) = .empty,
     cursor: ?GatherScatterCursor = null,
     map_active: bool = false,
+
+    fn deinit(self: *CommandBuffer) void {
+        self.ops.deinit(file_allocator);
+        self.* = .{};
+    }
+
+    fn clone(self: *const CommandBuffer) Error!CommandBuffer {
+        var result = self.*;
+        result.ops = .empty;
+        try result.ops.appendSlice(file_allocator, self.ops.items);
+        return result;
+    }
 };
 
 const Submission = struct {
@@ -230,7 +230,7 @@ pub fn reset() void {
     files.deinit(file_allocator);
     files = .empty;
     cached_file_count = 0;
-    command_buffers = [_]CommandBuffer{.{}} ** maximum_command_buffers;
+    for (&command_buffers) |*buffer| buffer.deinit();
     submissions = [_]Submission{.{}} ** maximum_submissions;
     next_submission_identifier = 1;
     auto_pool = [_]AutoPoolRange{.{}} ** maximum_auto_pool;
@@ -359,6 +359,7 @@ pub fn constructCommandBuffer(address: u64) Error!void {
     lock.lock();
     defer lock.unlock();
     if (findCommandBufferLocked(address)) |buffer| {
+        buffer.deinit();
         buffer.* = .{ .active = true, .address = address };
         return;
     }
@@ -374,7 +375,7 @@ pub fn destroyCommandBuffer(address: u64) Error!void {
     lock.lock();
     defer lock.unlock();
     const buffer = findCommandBufferLocked(address) orelse return error.InvalidCommandBuffer;
-    buffer.* = .{};
+    buffer.deinit();
 }
 
 pub fn setCommandBufferStorage(address: u64, storage_address: u64, storage_size: usize) Error!void {
@@ -390,12 +391,7 @@ pub fn resetCommandBuffer(address: u64) Error!void {
     lock.lock();
     defer lock.unlock();
     const buffer = findCommandBufferLocked(address) orelse return error.InvalidCommandBuffer;
-    buffer.read_count = 0;
-    buffer.completion_count = 0;
-    buffer.write_count = 0;
-    buffer.map_count = 0;
-    buffer.counter_count = 0;
-    buffer.op_count = 0;
+    buffer.ops.clearRetainingCapacity();
     buffer.record_bytes = 0;
     buffer.command_count = 0;
     buffer.cursor = null;
@@ -456,14 +452,11 @@ pub fn appendReadRecord(address: u64, command: ReadCommand, record_bytes: usize)
     lock.lock();
     defer lock.unlock();
     const buffer = findCommandBufferLocked(address) orelse return error.InvalidCommandBuffer;
-    if (buffer.read_count >= buffer.reads.len) return error.TooManyCommands;
     if (findFileLocked(command.file_identifier) == null) return error.UnknownFile;
     const next_bytes = std.math.add(usize, buffer.record_bytes, record_bytes) catch
         return error.InvalidCommandBuffer;
     if (buffer.storage_size != 0 and next_bytes > buffer.storage_size) return error.InvalidCommandBuffer;
-    try pushOpLocked(buffer, .read, buffer.read_count);
-    buffer.reads[buffer.read_count] = command;
-    buffer.read_count += 1;
+    try buffer.ops.append(file_allocator, .{ .read = command });
     buffer.record_bytes = next_bytes;
     buffer.command_count += 1;
     buffer.cursor = .{
@@ -477,13 +470,10 @@ pub fn appendCompletion(address: u64, command: CompletionCommand) Error!void {
     lock.lock();
     defer lock.unlock();
     const buffer = findCommandBufferLocked(address) orelse return error.InvalidCommandBuffer;
-    if (buffer.completion_count >= buffer.completions.len) return error.TooManyCommands;
     const next_bytes = std.math.add(usize, buffer.record_bytes, 0x30) catch
         return error.InvalidCommandBuffer;
     if (buffer.storage_size != 0 and next_bytes > buffer.storage_size) return error.InvalidCommandBuffer;
-    try pushOpLocked(buffer, .completion, buffer.completion_count);
-    buffer.completions[buffer.completion_count] = command;
-    buffer.completion_count += 1;
+    try buffer.ops.append(file_allocator, .{ .completion = command });
     buffer.record_bytes = next_bytes;
     buffer.command_count += 1;
 }
@@ -493,13 +483,10 @@ pub fn appendWrite(address: u64, command: WriteCommand, record_bytes: usize) Err
     lock.lock();
     defer lock.unlock();
     const buffer = findCommandBufferLocked(address) orelse return error.InvalidCommandBuffer;
-    if (buffer.write_count >= buffer.writes.len) return error.TooManyCommands;
     const next_bytes = std.math.add(usize, buffer.record_bytes, record_bytes) catch
         return error.InvalidCommandBuffer;
     if (buffer.storage_size != 0 and next_bytes > buffer.storage_size) return error.InvalidCommandBuffer;
-    try pushOpLocked(buffer, .write, buffer.write_count);
-    buffer.writes[buffer.write_count] = command;
-    buffer.write_count += 1;
+    try buffer.ops.append(file_allocator, .{ .write = command });
     buffer.record_bytes = next_bytes;
     buffer.command_count += 1;
 }
@@ -517,12 +504,9 @@ pub fn appendCounter(address: u64, command: CounterCommand, record_bytes: usize)
     lock.lock();
     defer lock.unlock();
     const buffer = findCommandBufferLocked(address) orelse return error.InvalidCommandBuffer;
-    if (buffer.counter_count >= buffer.counter_commands.len) return error.TooManyCommands;
     const next_bytes = std.math.add(usize, buffer.record_bytes, record_bytes) catch return error.InvalidCommandBuffer;
     if (buffer.storage_size != 0 and next_bytes > buffer.storage_size) return error.InvalidCommandBuffer;
-    try pushOpLocked(buffer, .counter, buffer.counter_count);
-    buffer.counter_commands[buffer.counter_count] = command;
-    buffer.counter_count += 1;
+    try buffer.ops.append(file_allocator, .{ .counter = command });
     buffer.record_bytes = next_bytes;
     buffer.command_count += 1;
 }
@@ -539,13 +523,10 @@ pub fn appendAmmMap(address: u64, command: AmmMapCommand, record_bytes: usize) E
     lock.lock();
     defer lock.unlock();
     const buffer = findCommandBufferLocked(address) orelse return error.InvalidCommandBuffer;
-    if (buffer.map_count >= buffer.maps.len) return error.TooManyCommands;
     const next_bytes = std.math.add(usize, buffer.record_bytes, record_bytes) catch
         return error.InvalidCommandBuffer;
     if (buffer.storage_size != 0 and next_bytes > buffer.storage_size) return error.InvalidCommandBuffer;
-    try pushOpLocked(buffer, .map, buffer.map_count);
-    buffer.maps[buffer.map_count] = command;
-    buffer.map_count += 1;
+    try buffer.ops.append(file_allocator, .{ .map = command });
     buffer.record_bytes = next_bytes;
     buffer.command_count += 1;
 }
@@ -574,7 +555,8 @@ pub fn mapActive(address: u64) Error!bool {
 }
 
 pub fn submitCommandBuffer(address: u64) Error!u32 {
-    var pending: CommandBuffer = undefined;
+    var pending: CommandBuffer = .{};
+    defer pending.deinit();
     var sink: ?CompletionSink = null;
     const slot = blk: {
         lock.lock();
@@ -586,10 +568,11 @@ pub fn submitCommandBuffer(address: u64) Error!u32 {
         const index = for (&submissions, 0..) |*submission, i| {
             if (!submission.active) break i;
         } else return error.SubmissionTableFull;
-        pending = buffer.*;
-        for (pending.maps[0..pending.map_count]) |*command| {
-            if (command.kind != .map_auto) continue;
-            command.dmem_offset = takeAutoLocked(command.size, command.memory_type) orelse return error.OutOfDirectMemory;
+        pending = try buffer.clone();
+        for (pending.ops.items) |*op| {
+            if (op.* == .map and op.map.kind == .map_auto) {
+                op.map.dmem_offset = takeAutoLocked(op.map.size, op.map.memory_type) orelse return error.OutOfDirectMemory;
+            }
         }
         const identifier = next_submission_identifier;
         next_submission_identifier +%= 1;
@@ -610,27 +593,27 @@ pub fn submitCommandBuffer(address: u64) Error!u32 {
     if (complete) {
         submissions[slot].complete = true;
     } else {
-        // Only blocked submissions allocate or launch a worker. Common APR
-        // reads retain the synchronous fast path. The snapshot outlives a
+        // Only blocked submissions launch a worker. Common APR reads retain
+        // the synchronous fast path. The snapshot outlives a
         // guest resetting/reusing its command buffer immediately after submit.
-        const snapshot = std.heap.page_allocator.create(CommandBuffer) catch return error.IoFailed;
+        const snapshot = std.heap.page_allocator.create(CommandBuffer) catch return error.OutOfMemory;
         errdefer std.heap.page_allocator.destroy(snapshot);
         snapshot.* = pending;
         submissions[slot].worker = std.Thread.spawn(.{}, deferredMain, .{ slot, snapshot, cursor, sink }) catch return error.IoFailed;
+        pending.ops = .empty; // Ownership transfers only after a successful spawn.
     }
     return submissions[slot].identifier;
 }
 
 fn executePending(pending: *const CommandBuffer, cursor: *usize, sink: ?CompletionSink) Error!bool {
-    while (cursor.* < pending.op_count) : (cursor.* += 1) {
+    while (cursor.* < pending.ops.items.len) : (cursor.* += 1) {
         if (stopping.load(.acquire) or runtime.guestStopRequested()) return error.IoFailed;
-        const op = pending.ops[cursor.*];
-        switch (op.kind) {
-            .read => try applyRead(pending.reads[op.index]),
-            .write => try applyWrite(pending.writes[op.index]),
-            .completion => try applyCompletion(pending.completions[op.index], sink),
-            .map => try applyAmmMap(pending.maps[op.index]),
-            .counter => switch (pending.counter_commands[op.index]) {
+        switch (pending.ops.items[cursor.*]) {
+            .read => |command| try applyRead(command),
+            .write => |command| try applyWrite(command),
+            .completion => |command| try applyCompletion(command, sink),
+            .map => |command| try applyAmmMap(command),
+            .counter => |counter| switch (counter) {
                 .write => |command| counter_bank.write(command),
                 .wait => |command| if (!counter_bank.satisfied(command)) return false,
                 .read => |command| try applyWrite(.{
@@ -667,6 +650,7 @@ fn deferredMain(slot: usize, snapshot: *CommandBuffer, start: usize, sink: ?Comp
         if (complete) break;
         sleepWaiter();
     }
+    snapshot.deinit();
     std.heap.page_allocator.destroy(snapshot);
     lock.lock();
     defer lock.unlock();
@@ -695,12 +679,6 @@ pub fn waitCommandBuffer(identifier: u32) Error!void {
         lock.unlock();
         sleepWaiter();
     }
-}
-
-fn pushOpLocked(buffer: *CommandBuffer, kind: OpKind, index: usize) Error!void {
-    if (buffer.op_count >= buffer.ops.len) return error.TooManyCommands;
-    buffer.ops[buffer.op_count] = .{ .kind = kind, .index = @intCast(index) };
-    buffer.op_count += 1;
 }
 
 fn takeAutoLocked(size: u64, memory_type: i32) ?u64 {
@@ -843,6 +821,62 @@ test "AMPR pending reset cancels writes and clears process counters" {
     try std.testing.expectEqual(@as(u64, 0), label);
     try std.testing.expectEqual(@as(u64, 0), counter_bank.read(4, .word));
     try std.testing.expectError(error.UnknownSubmission, waitCommandBuffer(identifier));
+}
+
+test "AMPR large file batches honor byte capacity and own deferred commands" {
+    reset();
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const io = std.testing.io;
+    filesystem.attach(io, temporary.dir);
+    defer filesystem.detach();
+    defer reset();
+    const Sink = struct {
+        var label: u64 = 0;
+        var count: usize = 0;
+        var ordered: bool = true;
+        fn publish(_: CompletionCommand) bool {
+            count += 1;
+            ordered = ordered and label == count;
+            return true;
+        }
+    };
+    Sink.label = 0;
+    Sink.count = 0;
+    Sink.ordered = true;
+    attachCompletionSink(Sink.publish);
+    defer attachCompletionSink(null);
+    var payload: [300]u8 = undefined;
+    for (&payload, 0..) |*byte, i| byte.* = @truncate(i);
+    try temporary.dir.writeFile(io, .{ .sub_path = "large-batch.bin", .data = &payload });
+    const file = try resolve("/app0/large-batch.bin");
+    var destination = [_]u8{0xcc} ** payload.len;
+    try constructCommandBuffer(0x1000);
+    const capacity = 32 + payload.len * (0x30 + 32 + 0x30);
+    try setCommandBufferStorage(0x1000, 0x2000, capacity);
+    try appendCounter(0x1000, .{ .wait = .{ .counter = 6, .access = .word, .reference = 1, .compare = .equal } }, 32);
+    for (0..payload.len) |i| {
+        try appendRead(0x1000, .{ .file_identifier = file.identifier, .destination = @intFromPtr(&destination[i]), .size = 1, .file_offset = i });
+        try appendWrite(0x1000, .{ .destination = @intFromPtr(&Sink.label), .value = i + 1 }, 32);
+        try appendCompletion(0x1000, .{ .queue_handle = 1, .ident = i, .completion_token = 0, .user_data = 0 });
+    }
+    const before = try commandBufferInfo(0x1000);
+    try std.testing.expectEqual(@as(usize, 901), before.command_count);
+    try std.testing.expectEqual(capacity, before.write_offset);
+    try std.testing.expectError(error.InvalidCommandBuffer, appendWrite(0x1000, .{ .destination = @intFromPtr(&Sink.label), .value = 999 }, 32));
+    try std.testing.expectEqualDeep(before, try commandBufferInfo(0x1000));
+    const waiting = try submitCommandBuffer(0x1000);
+    try std.testing.expectEqual(@as(usize, 0), Sink.count);
+    // The original storage can be freed and reused while the submitted batch waits.
+    try destroyCommandBuffer(0x1000);
+    try constructCommandBuffer(0x1000);
+    try appendCounter(0x1000, .{ .write = .{ .counter = 6, .access = .word, .value = 1, .operation = .store } }, 32);
+    try waitCommandBuffer(try submitCommandBuffer(0x1000));
+    try expectSubmissionReady(waiting);
+    try waitCommandBuffer(waiting);
+    try std.testing.expectEqualSlices(u8, &payload, &destination);
+    try std.testing.expectEqual(payload.len, Sink.count);
+    try std.testing.expect(Sink.ordered);
 }
 
 test "AMPR table exhaustion has no counter side effects" {

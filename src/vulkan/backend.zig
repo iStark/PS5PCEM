@@ -474,6 +474,24 @@ pub const DisplayBufferResolver = struct {
     list_addresses: ?*const fn (?*anyopaque, []u64) usize = null,
 };
 
+fn packedScanoutRequiresBgr(address: u64, source_format: u32, registration: ?DisplayBuffer) bool {
+    const buffer = registration orelse return false;
+    // VideoOut B10_G10_R10_A2_SRGB stores B in the least significant bits.
+    // The ordinary RGBA10 render-target view gives those same bits the name R.
+    return buffer.address == address and buffer.pixel_format == 0x8100_0000_0000_0000 and
+        source_format == vk.format_a2b10g10r10_unorm_pack32;
+}
+
+test "packed VideoOut BGR is restricted to the registered address and format" {
+    var buffer = DisplayBuffer{ .address = 0x10000, .width = 1920, .height = 1080, .pitch_in_pixels = 1920, .pixel_format = 0x8100_0000_0000_0000 };
+    try std.testing.expect(packedScanoutRequiresBgr(0x10000, vk.format_a2b10g10r10_unorm_pack32, buffer));
+    try std.testing.expect(!packedScanoutRequiresBgr(0x20000, vk.format_a2b10g10r10_unorm_pack32, buffer));
+    try std.testing.expect(!packedScanoutRequiresBgr(0x10000, vk.format_r8g8b8a8_unorm, buffer));
+    try std.testing.expect(!packedScanoutRequiresBgr(0x10000, vk.format_a2b10g10r10_unorm_pack32, null));
+    buffer.pixel_format = 0x8100_0000_2200_0000; // RGB VideoOut order.
+    try std.testing.expect(!packedScanoutRequiresBgr(0x10000, vk.format_a2b10g10r10_unorm_pack32, buffer));
+}
+
 pub const StagedBuffer = struct {
     buffer: vk.Buffer,
     descriptor_set: vk.DescriptorSet,
@@ -7230,8 +7248,9 @@ pub const Renderer = struct {
                 },
             );
         }
-        const bgra_source = if (swap_red_blue)
-            try self.acquireMagnifySourceImage(target.target.descriptor.width, target.target.descriptor.height, vk.format_b8g8r8a8_unorm)
+        const reinterpret_format: ?u32 = if (swap_red_blue) vk.format_b8g8r8a8_unorm else if (self.packedScanoutSwapsRedBlue(target.target.descriptor.address, target.target.format.vulkan, flip)) vk.format_a2r10g10b10_unorm_pack32 else null;
+        const bgra_source = if (reinterpret_format) |format|
+            try self.acquireMagnifySourceImage(target.target.descriptor.width, target.target.descriptor.height, format)
         else
             null;
         const presentation = &(self.window_presentation orelse return Error.PresentationRejected);
@@ -7489,6 +7508,11 @@ pub const Renderer = struct {
             return false;
         self.noteScanoutSetProvenance(address, exported);
         return !self.scanout_filled_by_copy;
+    }
+
+    fn packedScanoutSwapsRedBlue(self: *const Renderer, address: u64, format: u32, flip: ?gpu.state.Flip) bool {
+        const resolver = self.display_buffer_resolver orelse return false;
+        return packedScanoutRequiresBgr(address, format, resolver.resolve(resolver.context, flip orelse return false));
     }
 
     /// Preserve physical texel bits while interpreting the scanout as BGRA.
@@ -18923,10 +18947,15 @@ pub const Renderer = struct {
     /// Exercise physical RGBA -> BGRA reinterpretation and the normal Vulkan
     /// blit conversion without requiring a window or guest title.
     pub fn probeScanoutChannelOrder(self: *Renderer) anyerror!void {
+        try self.probeScanoutChannelOrderCase(vk.format_r8g8b8a8_unorm, vk.format_b8g8r8a8_unorm, .{ 0x19, 0x62, 0xe3, 0xff, 0xc1, 0x38, 0x07, 0x80 });
+        try self.probeScanoutChannelOrderCase(vk.format_a2b10g10r10_unorm_pack32, vk.format_a2r10g10b10_unorm_pack32, .{ 0xff, 0x03, 0x00, 0xc0, 0x00, 0xfc, 0x0f, 0x40 });
+    }
+
+    fn probeScanoutChannelOrderCase(self: *Renderer, source_format: u32, view_format: u32, pixels: [8]u8) anyerror!void {
         const usage = vk.image_usage_transfer_src_bit | vk.image_usage_transfer_dst_bit;
-        const source = try self.createImage(2, 1, vk.format_r8g8b8a8_unorm, usage);
+        const source = try self.createImage(2, 1, source_format, usage);
         defer self.destroyImage(source);
-        const bgra = try self.createImage(2, 1, vk.format_b8g8r8a8_unorm, usage);
+        const bgra = try self.createImage(2, 1, view_format, usage);
         defer self.destroyImage(bgra);
         const rgba = try self.createImage(2, 1, vk.format_r8g8b8a8_unorm, usage);
         defer self.destroyImage(rgba);
@@ -18934,7 +18963,6 @@ pub const Renderer = struct {
         defer self.destroyBuffer(upload);
         const readback = try self.createBuffer(16, vk.buffer_usage_transfer_dst_bit, vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit);
         defer self.destroyBuffer(readback);
-        const pixels = [_]u8{ 0x19, 0x62, 0xe3, 0xff, 0xc1, 0x38, 0x07, 0x80 };
         try self.writeMapped(upload, &pixels);
         const cb = try self.beginOneShot();
         defer self.releaseOneShot(cb);
@@ -18984,6 +19012,7 @@ pub const Renderer = struct {
         var observed: [16]u8 = undefined;
         try self.readMapped(readback, &observed);
         var expected = pixels;
+        if (source_format == vk.format_a2b10g10r10_unorm_pack32) convertA2B10G10R10ToRgba8(&pixels, &expected);
         swapRedBlue(&expected);
         try std.testing.expectEqualSlices(u8, &expected, observed[0..8]);
         try std.testing.expectEqualSlices(u8, &pixels, observed[8..16]);
@@ -23759,6 +23788,7 @@ pub const Renderer = struct {
         const fragment_translate_started = self.resourceTimestampNs();
         const fragment_lease = self.graphics_translations.acquirePrepared(self.allocator, &fragment_analysis.program, .{
             .stage = .fragment,
+            .wave32 = graphicsWave32(state, .pixel),
             .program_address = if (rdna2.scalar_calls.present(fragment_analysis.program.instructions.items)) fragment_address else 0,
             .maximum_dispatcher_iterations = fragment_dispatcher_budget,
             .structure_branch_loops = @atomicLoad(bool, &fragment_branch_loops, .monotonic),
@@ -24120,6 +24150,7 @@ pub const Renderer = struct {
             else
                 self.graphics_translations.acquirePrepared(self.allocator, &vertex_program, .{
                     .stage = .vertex,
+                    .wave32 = graphicsWave32(state, vertex_stage),
                     .program_address = if (rdna2.scalar_calls.present(vertex_instructions)) vertex_address else 0,
                     // The PS5 NGG/export ABI supplies S_NGG_VERTEX_INDEX in v5;
                     // ordinary VS programs retain the legacy v0 convention.
@@ -27665,6 +27696,7 @@ pub const Renderer = struct {
             self.markStorageContentWritten(cache_index);
             _ = self.image_aliases.markWrite(cached.alias_token);
             if (try self.commitCachedStorageVolume(prepared, cache_index)) continue;
+            self.invalidateStorageRasterAliases(prepared.descriptor);
             if (cached.depth_snapshot != null) {
                 if (self.storageDepthSource(cached.descriptor)) |source|
                     try self.transferStorageDepth(cache_index, source, true);
@@ -27673,6 +27705,103 @@ pub const Renderer = struct {
                 try self.flushCachedStorageImage(memory, cache_index);
             }
         }
+    }
+
+    /// A compute writer may reuse a raster allocation at a new DRS extent.
+    /// Retaining the old attachment lets the sampled fast path copy its small
+    /// image over the freshly computed full-size result. Storage staging has
+    /// already published the previous raster contents before initializing its
+    /// view. Retire those representations after the write, including deferred
+    /// CPU copies, without destroying images still used by recorded commands.
+    fn invalidateStorageRasterAliases(self: *Renderer, descriptor: gpu.ImageDescriptor) void {
+        if (descriptor.image_type != .color_2d or descriptor.depth_or_layers != 1 or
+            descriptor.base_array != 0 or descriptor.viewBaseLevel() != 0 or
+            descriptor.viewMipLevels() != 1 or descriptor.max_mip != 0) return;
+        var candidates = self.render_target_address_index.candidatesBy(self.render_targets.items, descriptor.address, CachedRenderTarget.address);
+        while (candidates.next()) |index| {
+            const target = self.render_targets.items[index].target.descriptor;
+            if (target.mip_level != 0 or target.maximum_mip != 0 or
+                target.base_array_slice != 0 or target.last_array_slice != 0 or
+                target.fragments_log2 != 0 or target.samples_log2 != 0 or target.resource_type == 2) continue;
+            invalidateResidentTarget(&self.render_targets.items[index]);
+        }
+        for (self.completed_frames.items) |*frame| {
+            const view = frame.target orelse continue;
+            const target = view.descriptor;
+            if (target.address != descriptor.address or target.mip_level != 0 or target.maximum_mip != 0 or
+                target.base_array_slice != 0 or target.last_array_slice != 0 or
+                target.fragments_log2 != 0 or target.samples_log2 != 0 or target.resource_type == 2) continue;
+            frame.needs_writeback = false;
+            frame.guest_address = 0;
+            frame.sequence = 0;
+            frame.target = null;
+        }
+    }
+
+    pub fn probeStorageRasterReplacement(self: *Renderer, descriptor: gpu.ImageDescriptor, published: bool) anyerror!void {
+        var color = std.mem.zeroes(gpu.resources.ColorTarget);
+        color.address = descriptor.address;
+        color.width = descriptor.width / 2;
+        color.height = descriptor.height / 2;
+        color.pitch = color.width;
+        color.format = 10;
+        color.tile_mode = .linear;
+        color.write_mask = 15;
+        const index = try self.acquireRenderTarget(try guestColorTarget(color));
+        const old_image = self.render_targets.items[index].image.handle;
+        const range = vk.ImageSubresourceRange{ .aspect_mask = vk.image_aspect_color_bit };
+        const clear_commands = try self.beginOneShot();
+        try self.transitionTrackedImage(clear_commands, old_image, range, image_state.transfer_destination_usage);
+        const green = vk.ClearColorValue{ .float32 = .{ 0, 1, 0, 1 } };
+        self.device_functions.cmd_clear_color_image(clear_commands, old_image, vk.image_layout_transfer_dst_optimal, &green, 1, @ptrCast(&range));
+        try self.transitionTrackedImage(clear_commands, old_image, range, image_state.color_attachment_usage);
+        try self.submitOneShot(clear_commands);
+        self.releaseOneShot(clear_commands);
+        self.render_targets.items[index].initialized = true;
+        self.markRenderTargetWritten(&self.render_targets.items[index]);
+        try self.materializeRenderTarget(index);
+
+        try self.beginComputeDispatch();
+        const writer = try self.stageStorageImageRaw(descriptor, 0, true);
+        defer self.releaseStorageImage(writer.cache_index.?);
+        const expected = try self.allocator.alloc(u8, writer.staging_bytes);
+        defer self.allocator.free(expected);
+        for (0..expected.len / 4) |i| @memcpy(expected[i * 4 ..][0..4], &[_]u8{ 31, 63, 127, 255 });
+        try self.uploadCachedStorageImage(writer.cache_index.?, expected);
+        const resources = try self.allocator.create(ComputeResources);
+        defer self.allocator.destroy(resources);
+        resources.* = .{};
+        resources.storage_images[0] = writer;
+        resources.storage_image_count = 1;
+        try self.commitStorageImages(self.guest_memory.?, resources);
+        if (published) try self.flushCachedStorageImage(self.guest_memory.?, writer.cache_index.?);
+
+        const sampled = try GraphicsResources.acquire(self);
+        defer sampled.deinit(self);
+        sampled.images[0] = try self.stageSampledImage(descriptor, try gpu.resources.decodeSamplerDescriptor(&.{ 0, 0, 0, 0 }), 0, .two_d, null);
+        sampled.image_count = 1;
+        const image_handle = sampled.images[0].image.handle;
+        const output = try self.createBuffer(expected.len, vk.buffer_usage_transfer_dst_bit, vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit);
+        defer self.destroyBuffer(output);
+        const commands = try self.beginOneShot();
+        defer self.releaseOneShot(commands);
+        try self.transitionTrackedImage(commands, image_handle, range, image_state.transfer_source_usage);
+        const copy = vk.BufferImageCopy{ .image_subresource = .{ .aspect_mask = vk.image_aspect_color_bit }, .image_extent = .{ .width = descriptor.width, .height = descriptor.height, .depth = 1 } };
+        self.device_functions.cmd_copy_image_to_buffer(commands, image_handle, vk.image_layout_transfer_src_optimal, output.handle, 1, @ptrCast(&copy));
+        try self.transitionTrackedImage(commands, image_handle, range, image_state.storage_read_usage);
+        const host = vk.BufferMemoryBarrier{ .source_access_mask = vk.access_transfer_write_bit, .destination_access_mask = vk.access_host_read_bit, .buffer = output.handle, .offset = 0, .size = expected.len };
+        self.device_functions.cmd_pipeline_barrier(commands, vk.pipeline_stage_transfer_bit, vk.pipeline_stage_host_bit, 0, 0, null, 1, @ptrCast(&host), 0, null);
+        try self.submitOneShot(commands);
+        const actual = try self.allocator.alloc(u8, expected.len);
+        defer self.allocator.free(actual);
+        try self.readMapped(output, actual);
+        try std.testing.expectEqualSlices(u8, expected, actual);
+        try self.flushPendingGuestWrites();
+        const backing = try self.allocator.alloc(u8, writer.allocation_bytes);
+        defer self.allocator.free(backing);
+        try std.testing.expect(self.guest_memory.?.read(self.guest_memory.?.context, descriptor.address, backing));
+        try writer.subresource.detile(backing, actual);
+        try std.testing.expectEqualSlices(u8, expected, actual);
     }
 
     fn captureGraphicsTarget(self: *Renderer, target: GuestColorTarget, prefix: []const u8, phase: []const u8) !void {
@@ -32747,6 +32876,8 @@ pub const Renderer = struct {
             convertR11G11B10ToRgba8(frame.pixels.items, self.guest_frame_scratch.items);
         } else {
             convertA2B10G10R10ToRgba8(frame.pixels.items, self.guest_frame_scratch.items);
+            if (self.packedScanoutSwapsRedBlue(frame.guest_address, target.format.vulkan, flip))
+                swapRedBlue(self.guest_frame_scratch.items);
         }
         return self.guest_frame_scratch.items;
     }
@@ -35940,7 +36071,7 @@ fn scalarPrefixEnd(analysis: *const gpu.ShaderAnalysis) u32 {
         switch (inst.family) {
             .sop1, .sop2, .sopk, .smem => end = inst.pc + inst.word_count * 4,
             .sopp => switch (inst.opcode) {
-                .s_nop, .s_waitcnt, .s_barrier, .s_sleep, .s_sendmsg, .s_ttrace_data, .s_cbranch_cdbgsys, .s_cbranch_cdbguser, .s_cbranch_cdbgsys_or_user, .s_cbranch_cdbgsys_and_user, .s_inst_prefetch => {
+                .s_nop, .s_waitcnt, .s_barrier, .s_sleep, .s_setprio, .s_sendmsg, .s_ttrace_data, .s_cbranch_cdbgsys, .s_cbranch_cdbguser, .s_cbranch_cdbgsys_or_user, .s_cbranch_cdbgsys_and_user, .s_inst_prefetch => {
                     end = inst.pc + inst.word_count * 4;
                 },
                 else => break,
@@ -36191,11 +36322,40 @@ test "draw resource reuse excludes draw-dependent rectangle completion" {
     try std.testing.expect(!drawReuseShapeSafe(.vertex, 17, .{ .vertex_count = 6 }));
 }
 
+fn graphicsWave32(state: *const gpu.State, stage: gpu.resources.ShaderStage) bool {
+    if (stage == .pixel) return (state.readRegister(.context, 0x1b6) orelse 0) & 0x8000 != 0;
+    const mask: u32 = switch (stage) {
+        .vertex => 1 << 23,
+        .geometry, .export_shader => 1 << 22,
+        .hull => 1 << 21,
+        else => return false,
+    };
+    return (state.readRegister(.context, 0x2d5) orelse 0) & mask != 0;
+}
+
+test "graphics Wave32 flags follow the selected hardware stage" {
+    var state: gpu.State = .{};
+    try std.testing.expect(!graphicsWave32(&state, .pixel));
+    try state.writeRegister(.context, 0x1b6, 0x8003);
+    try std.testing.expect(graphicsWave32(&state, .pixel));
+    try state.writeRegister(.context, 0x2d5, 1 << 22);
+    try std.testing.expect(graphicsWave32(&state, .export_shader));
+    try std.testing.expect(graphicsWave32(&state, .geometry));
+    try std.testing.expect(!graphicsWave32(&state, .vertex));
+    try std.testing.expect(!graphicsWave32(&state, .hull));
+    try state.writeRegister(.context, 0x2d5, (1 << 21) | (1 << 23));
+    try std.testing.expect(graphicsWave32(&state, .vertex));
+    try std.testing.expect(graphicsWave32(&state, .hull));
+    try std.testing.expect(!graphicsWave32(&state, .export_shader));
+}
+
 fn drawReuseInputKey(state: *const gpu.State, pipeline: GraphicsPipelineState, stage: gpu.resources.ShaderStage, primitive: u32, vertex: *const gpu.ShaderAnalysis, fragment: *const gpu.ShaderAnalysis) u64 {
     var hasher = std.hash.Wyhash.init(0);
     std.hash.autoHash(&hasher, pipeline.pipelineKey());
     std.hash.autoHash(&hasher, stage);
     std.hash.autoHash(&hasher, primitive);
+    std.hash.autoHash(&hasher, graphicsWave32(state, stage));
+    std.hash.autoHash(&hasher, graphicsWave32(state, .pixel));
     // Export routing/packing can change without changing the shader program
     // or Vulkan attachment formats (for example, an MRT hole moves).
     std.hash.autoHash(&hasher, state.readRegister(.context, 0x08f));

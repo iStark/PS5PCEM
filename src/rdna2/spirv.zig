@@ -3250,7 +3250,7 @@ const Builder = struct {
 
     fn destinationF16(self: *Builder, op: operand.Operand, value: u32) Error!void {
         var half = op;
-        if (half.sdwa_sel == 6) {
+        if (half.sdwa_sel == 6 and !half.explicit_sdwa_dst) {
             half.sdwa_sel = 4;
             half.sdwa_dst_unused = 2;
         }
@@ -3626,23 +3626,24 @@ const Builder = struct {
     }
 
     fn findFirstBit(self: *Builder, inst: instruction.Instruction, from_high: bool) Error!void {
-        const bits = try self.source(inst.src0, .bits32);
+        const signed = inst.opcode == .v_ffbh_i32;
+        const bits = try self.source(inst.src0, if (signed) .sint32 else .bits32);
         const position = self.id();
         try self.emit(&self.body, 12, &.{
             self.signed_type,
             position,
             self.ensureGlslStd450(),
-            if (from_high) @as(u32, 75) else 73,
+            if (signed) @as(u32, 74) else if (from_high) @as(u32, 75) else 73,
             bits,
         });
         const result = if (from_high) blk: {
-            // GLSL FindUMsb reports the bit index from the least-significant
-            // side, while V_FFBH_U32/S_FLBIT_I32_B32 report the number of
-            // leading zeroes.  Preserve the ISA's -1 result for an all-zero
-            // source rather than turning FindUMsb's -1 into 32.
-            const zero = try self.constant(.bits32, 0);
-            const is_zero = self.id();
-            try self.emit(&self.body, 170, &.{ self.bool_type, is_zero, bits, zero });
+            // GLSL reports the bit index from the least-significant side;
+            // RDNA counts from the high side. FindSMsb searches for a zero in
+            // negative inputs. Both scans return -1 when no such bit exists
+            // (zero, and also -1 for the signed instruction).
+            const not_found = try self.constant(.sint32, 0xffff_ffff);
+            const not_found_bit = self.id();
+            try self.emit(&self.body, 170, &.{ self.bool_type, not_found_bit, position, not_found });
             const from_top = self.id();
             try self.emit(&self.body, 130, &.{
                 self.signed_type,
@@ -3654,7 +3655,7 @@ const Builder = struct {
             try self.emit(&self.body, 169, &.{
                 self.signed_type,
                 selected,
-                is_zero,
+                not_found_bit,
                 try self.constant(.sint32, 0xffff_ffff),
                 from_top,
             });
@@ -4189,8 +4190,19 @@ const Builder = struct {
     fn madU64U32(self: *Builder, inst: instruction.Instruction) Error!void {
         const a = try self.source(inst.src0, .bits32);
         const b = try self.source(inst.src1, .bits32);
-        const add_low = try self.source(inst.src2, .bits32);
-        const add_high = try self.source(try consecutiveRegister(inst.src2, 1), .bits32);
+        // Unsigned 64-bit literals zero-extend; negative inline integer
+        // constants sign-extend. An inline floating constant supplies its
+        // double-precision bit pattern even when the operation is integer.
+        const addend: [2]u32 = switch (inst.src2.kind) {
+            .literal_constant => .{ try self.source(inst.src2, .bits32), try self.constant(.bits32, 0) },
+            .float_inline_constant => blk: {
+                const bits: u64 = @bitCast(@as(f64, @as(f32, @bitCast(inst.src2.value))));
+                break :blk .{ try self.constant(.bits32, @truncate(bits)), try self.constant(.bits32, @truncate(bits >> 32)) };
+            },
+            else => try self.sourcePair(inst.src2),
+        };
+        const add_low = addend[0];
+        const add_high = addend[1];
         const low_product = try self.multiplyBits(a, b);
         const high_product = try self.multiplyHighUnsignedBits(a, b);
         const low = try self.addBits(low_product, add_low);
@@ -4204,8 +4216,27 @@ const Builder = struct {
             try self.constant(.bits32, 1),
             try self.constant(.bits32, 0),
         });
-        const high = try self.addBits(try self.addBits(high_product, add_high), carry_bits);
-        try self.destinationPair(inst.dst, .{ low, high });
+        const high_partial = try self.addBits(high_product, add_high);
+        const high = try self.addBits(high_partial, carry_bits);
+        const overflow_add = self.id();
+        const overflow_carry = self.id();
+        const overflow = self.id();
+        try self.emit(&self.body, 176, &.{ self.bool_type, overflow_add, high_partial, high_product });
+        try self.emit(&self.body, 176, &.{ self.bool_type, overflow_carry, high, high_partial });
+        try self.emit(&self.body, 166, &.{ self.bool_type, overflow, overflow_add, overflow_carry });
+        var result = [2]u32{ low, high };
+        if (inst.dst.clamp) {
+            const maximum = try self.constant(.bits32, 0xffffffff);
+            for (&result) |*word| word.* = try self.bvhSelect(self.bits_type, overflow, maximum, word.*);
+        }
+        var result_operand = inst.dst;
+        result_operand.clamp = false; // Integer saturation was applied to the pair.
+        try self.destinationPair(result_operand, result);
+        if (inst.dst2.kind != .unknown and inst.dst2.kind != .null) {
+            var carry_inst = inst;
+            carry_inst.dst = inst.dst2;
+            try self.vectorConditionDestination(carry_inst, overflow);
+        }
     }
 
     fn vectorSubBorrow(self: *Builder, inst: instruction.Instruction) Error!void {
@@ -6452,7 +6483,13 @@ const Builder = struct {
         dimension: StorageImageDimension,
     ) Error!u32 {
         const x = try self.source(try imageIntegerAddressOperand(inst, 0), .bits32);
-        const y = try self.source(try imageIntegerAddressOperand(inst, 1), .bits32);
+        // Guest 1D resources are represented by height-one 2D Vulkan views.
+        // DIM=1D carries no Y register; reading the adjacent VGPR would turn
+        // unrelated shader data into an out-of-range texel coordinate.
+        const y = if (inst.image_dimension == .dim_1d)
+            try self.constant(.bits32, 0)
+        else
+            try self.source(try imageIntegerAddressOperand(inst, 1), .bits32);
         const coordinates = self.id();
         if (dimension != .two_d) {
             if (self.vector3_bits_type == 0) return Error.InvalidStorageBinding;
@@ -6688,9 +6725,9 @@ const Builder = struct {
             return;
         }
         if ((inst.opcode_id != 0 and inst.opcode_id != 1) or
-            (inst.image_dimension != .dim_2d and inst.image_dimension != .dim_3d and
+            (inst.image_dimension != .dim_1d and inst.image_dimension != .dim_2d and inst.image_dimension != .dim_3d and
                 inst.image_dimension != .dim_2d_array_alt) or
-            (inst.image_address_components < 2 or inst.image_address_components > 4) or
+            (inst.image_address_components < (if (inst.image_dimension == .dim_1d) @as(u8, 1) else 2) or inst.image_address_components > 4) or
             inst.data_mask == 0 or
             inst.src0.kind != .vgpr or inst.src1.kind != .sgpr)
         {
@@ -6747,9 +6784,10 @@ const Builder = struct {
     fn imageStore(self: *Builder, inst: instruction.Instruction) Error!void {
         if ((self.stage != .compute and self.stage != .fragment) or
             (inst.opcode_id != 8 and inst.opcode_id != 9) or
-            (inst.image_dimension != .dim_2d and inst.image_dimension != .dim_3d and
+            (inst.image_dimension != .dim_1d and inst.image_dimension != .dim_2d and inst.image_dimension != .dim_3d and
                 inst.image_dimension != .dim_2d_array_alt) or
-            (inst.image_address_components != 2 and inst.image_address_components != 3) or
+            (inst.image_address_components != 2 and inst.image_address_components != 3 and
+                !(inst.image_dimension == .dim_1d and inst.image_address_components == 1)) or
             inst.data_mask == 0 or
             inst.dst.kind != .vgpr or inst.src0.kind != .vgpr or inst.src1.kind != .sgpr)
         {
@@ -6832,8 +6870,9 @@ const Builder = struct {
             return;
         }
         if (self.stage != .compute or
-            (inst.image_dimension != .dim_2d and inst.image_dimension != .dim_3d) or
-            (inst.image_address_components != 2 and inst.image_address_components != 3) or
+            (inst.image_dimension != .dim_1d and inst.image_dimension != .dim_2d and inst.image_dimension != .dim_3d) or
+            (inst.image_address_components != 2 and inst.image_address_components != 3 and
+                !(inst.image_dimension == .dim_1d and inst.image_address_components == 1)) or
             inst.data_mask != 1 or inst.dst.kind != .vgpr or inst.src0.kind != .vgpr or
             inst.src1.kind != .sgpr)
         {
@@ -11366,6 +11405,9 @@ const Builder = struct {
             else => {},
         }
         switch (inst.opcode) {
+            // Wave scheduling priority is a hardware hint. Vulkan schedules
+            // the host waves; no guest register, flag or memory is modified.
+            .s_setprio => {},
             .s_nop,
             .s_waitcnt,
             .s_waitcnt_depctr,
@@ -11418,6 +11460,7 @@ const Builder = struct {
             .s_and_saveexec_b64 => try self.saveExec(inst, .and_mask),
             .s_and_saveexec_b32 => try self.saveExec32(inst, .and_mask),
             .s_orn2_saveexec_b64 => try self.saveExec(inst, .or_not),
+            .s_orn2_saveexec_b32 => try self.saveExec32(inst, .or_not),
             .s_andn1_saveexec_b64 => try self.saveExec(inst, .not_and),
             .s_andn1_saveexec_b32 => try self.saveExec32(inst, .not_and),
             .v_cndmask_b32 => try self.cndmask(inst),
@@ -11569,6 +11612,7 @@ const Builder = struct {
             .v_cvt_f32_f16 => try self.convertF16ToF32(inst),
             .v_cvt_f16_f32 => try self.convertF32ToF16(inst),
             .v_ffbh_u32 => try self.findFirstBit(inst, true),
+            .v_ffbh_i32 => try self.findFirstBit(inst, true),
             .v_ffbl_b32 => try self.findFirstBit(inst, false),
             .s_ff1_i32_b32 => try self.findFirstBit(inst, false),
             .s_ff1_i32_b64 => try self.findFirstBit64(inst, false),
@@ -14272,6 +14316,18 @@ test "and-saveexec preserves the old mask and lowers the new mask" {
 test "zero register delta accepts a high mask register" {
     const same = try Builder.consecutiveRegister(.{ .kind = .vcc_hi }, 0);
     try std.testing.expectEqual(isa.OperandKind.vcc_hi, same.kind);
+}
+
+test "graphics Wave32 SDWA comparison can write VCC_HI without a register pair" {
+    const code = [_]u32{ 0x7c0862f9, 0x0686eb25 };
+    var program = instruction.Program{ .code = &code, .instructions = .empty };
+    defer program.deinit(std.testing.allocator);
+    try program.instructions.append(std.testing.allocator, try @import("vector_alu.zig").decodeVopc(0, &code, 0));
+    try program.instructions.append(std.testing.allocator, .{ .opcode = .s_endpgm });
+    try std.testing.expectEqual(isa.OperandKind.vcc_hi, program.instructions.items[0].dst.kind);
+    var module = try translate(std.testing.allocator, &program, .{ .stage = .fragment, .wave32 = true });
+    defer module.deinit(std.testing.allocator);
+    try std.testing.expect(countOpcode(module.words, 186) != 0);
 }
 
 test "vector shifts and low unsigned multiply lower to SPIR-V arithmetic" {

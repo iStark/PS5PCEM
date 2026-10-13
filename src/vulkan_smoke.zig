@@ -2187,15 +2187,16 @@ fn runSaveExecProbe(allocator: std.mem.Allocator) !void {
     var guest = GuestMemory{};
     _ = renderer.dcbBackend(guest.interface());
     var case: u32 = 0;
-    for ([_]u32{ 64, 512 }) |lanes| for ([_]u8{ 0x24, 0x28, 0x37, 0x3c, 0x44 }) |opcode| for (pairs) |pair| {
+    for ([_]u32{ 64, 512 }) |lanes| for ([_]u8{ 0x24, 0x28, 0x37, 0x3c, 0x40, 0x44 }) |opcode| for (pairs) |pair| {
         case += 1;
-        const narrow = opcode == 0x3c or opcode == 0x44;
+        const narrow = opcode == 0x3c or opcode == 0x40 or opcode == 0x44;
         const code = [_]u32{
             if (lanes == 64) 0xd760_0018 else 0xbf80_0000,
             if (lanes == 64) 256 | (191 << 9) else 0xbf80_0000,
             vop1(1, 2, 170),
             sop1(4, 126, 8),
             sop1(opcode, 10, 10), // destination overlaps the source pair
+            0xbf8f0000 | (case % 4), // priority leaves EXEC, SCC and SGPRs intact
             0x8514_8081, // capture SCC before restoring EXEC
             vop1(1, 2, 129),
             sop1(4, 126, 193),
@@ -2216,7 +2217,7 @@ fn runSaveExecProbe(allocator: std.mem.Allocator) !void {
         _ = try renderer.dispatchRdna2State(&state, .{ lanes, 1, 1 }, .{ 1, 1, 1 });
         var output: [512 * 16]u8 = undefined;
         try renderer.readbackGuestStorageBuffer(0x10000, output[0 .. lanes * 16]);
-        const combined = if (opcode == 0x28) pair[1] | ~pair[0] else if (opcode == 0x37 or opcode == 0x44) ~pair[1] & pair[0] else pair[1] & pair[0];
+        const combined = if (opcode == 0x28 or opcode == 0x40) pair[1] | ~pair[0] else if (opcode == 0x37 or opcode == 0x44) ~pair[1] & pair[0] else pair[1] & pair[0];
         const active = if (narrow) (pair[0] & 0xffff_ffff_0000_0000) | (combined & 0xffff_ffff) else combined;
         const scc: u32 = @intFromBool(if (narrow) combined & 0xffff_ffff != 0 else combined != 0);
         for (0..lanes) |lane| {
@@ -2234,6 +2235,116 @@ fn runSaveExecProbe(allocator: std.mem.Allocator) !void {
         }
     };
     std.debug.print("SAVEEXEC passed: AND/ANDN1/ORN2 operand order, saved masks, overlapping destinations, SCC and preserved EXEC_HI for 32-bit operations\n", .{});
+}
+
+fn runImage1dStorageProbe(allocator: std.mem.Allocator) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{});
+    defer renderer.deinit();
+    var guest = GuestMemory{};
+    _ = renderer.dcbBackend(guest.interface());
+    const image_address = 0x6000;
+    const output_address = 0x7000;
+    for (0..16) |i| guest.word(image_address + i * 4, 0xcccccccc);
+    // Poison the VGPR following every X coordinate. A 1D operation must not
+    // consume it as Y in the height-one Vulkan representation.
+    const store_code = [_]u32{
+        vop1(1, 1, 255), 0xdeadbeef,
+        vop1(1, 2, 255), 1000,
+        0xf0200100, 0x00000200, // image_store v2, v0, T#s0, DIM=1D
+        0xbf810000,
+    };
+    const atomic_code = [_]u32{
+        vop1(1, 4, 256), // preserve lane index
+        vop2Source(0x1b, 5, 135, 0), // x = lane & 7
+        vop1(1, 6, 255),
+        0xdeadbeef,
+        vop1(1, 2, 129),
+        0xf0442100, 0x00000205, // returning atomic add, DIM=1D
+        0xe0702000, 0x80020204, // store returned value by lane, V#s8
+        0xbf810000,
+    };
+    const load_code = [_]u32{
+        vop1(1, 1, 255), 0xdeadbeef,
+        0xf0000100, 0x00000200, // image_load v2, v0, T#s0, DIM=1D
+        0xe0702000, 0x80020200,
+        0xbf810000,
+    };
+    const programs = [_][]const u32{ &store_code, &atomic_code, &load_code };
+    var returned: [128 * 4]u8 = undefined;
+    var loaded: [8 * 4]u8 = undefined;
+    for (programs, 0..) |code, phase| {
+        const address = 0x100 + @as(u32, @intCast(phase)) * 0x100;
+        for (code, 0..) |word, i| guest.word(address + i * 4, word);
+        var state = gpu.State{};
+        try state.writeRegister(.shader, 0x20c, address >> 8);
+        try state.writeRegister(.shader, 0x20d, 0);
+        try state.writeRegister(.shader, 0x213, 12 << 1);
+        var descriptor = imageDescriptorWords(image_address, 16, 1);
+        descriptor[1] = (descriptor[1] & ~(@as(u32, 0x1ff) << 20)) | (20 << 20); // R32_UINT
+        descriptor[3] = 0x80000004; // 1D, linear, X destination select
+        for (descriptor, 0..) |word, i|
+            try state.writeRegister(.shader, 0x240 + @as(u32, @intCast(i)), word);
+        const output: u32 = output_address + (if (phase == 2) @as(u32, 512) else 0);
+        for ([_]u32{ output, 4 << 16, if (phase == 2) 8 else 128, 0 }, 0..) |word, i|
+            try state.writeRegister(.shader, 0x248 + @as(u32, @intCast(i)), word);
+        const report = try renderer.dispatchRdna2State(&state, .{ if (phase == 1) 128 else 8, 1, 1 }, .{ 1, 1, 1 });
+        try std.testing.expect(report.spirv_words != 0);
+        if (phase == 1) try renderer.readbackGuestStorageBuffer(output, &returned);
+        if (phase == 2) try renderer.readbackGuestStorageBuffer(output, &loaded);
+    }
+    var observed: [8]u16 = @splat(0);
+    for (0..128) |lane| {
+        const previous = std.mem.readInt(u32, returned[lane * 4 ..][0..4], .little);
+        try std.testing.expect(previous >= 1000 and previous < 1016);
+        const bit = @as(u16, 1) << @as(u4, @intCast(previous - 1000));
+        try std.testing.expect(observed[lane % 8] & bit == 0);
+        observed[lane % 8] |= bit;
+    }
+    for (observed) |mask| try std.testing.expectEqual(@as(u16, 0xffff), mask);
+    for (0..8) |i| try std.testing.expectEqual(@as(u32, 1016), std.mem.readInt(u32, loaded[i * 4 ..][0..4], .little));
+    try renderer.flushPendingGuestWrites();
+    for (0..16) |i| try std.testing.expectEqual(@as(u32, if (i < 8) 1016 else 0xcccccccc), std.mem.readInt(u32, guest.bytes[image_address + i * 4 ..][0..4], .little));
+    std.debug.print("1D storage passed: store/load, 128 contending atomic adds, unique returned values, poisoned adjacent coordinates and untouched trailing texels\n", .{});
+}
+
+fn runSetprioProbe(allocator: std.mem.Allocator) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{});
+    defer renderer.deinit();
+    var guest = GuestMemory{};
+    _ = renderer.dcbBackend(guest.interface());
+    // Captured clear kernel: one 8-byte record per lane, with a wave priority
+    // hint before its writes. Previously the entire dispatch was discarded.
+    for (0..4) |priority| {
+        const code = [_]u32{
+            0xbf8f0000 | @as(u32, @intCast(priority)),
+            0xd7460002,
+            0x04010a04,
+            0x7e0002c1,
+            0x7e0270c2,
+            0xe0742000,
+            0x80000002,
+            0xbf810000,
+        };
+        const program: u32 = 0x100 + @as(u32, @intCast(priority)) * 0x100;
+        const output_address: u32 = 0x10000 + @as(u32, @intCast(priority)) * 0x1000;
+        for (code, 0..) |word, i| guest.word(program + i * 4, word);
+        for (0..130 * 2) |i| guest.word(output_address + i * 4, 0xcccccccc);
+        var state = gpu.State{};
+        try state.writeRegister(.shader, 0x20c, program >> 8);
+        try state.writeRegister(.shader, 0x20d, 0);
+        try state.writeRegister(.shader, 0x213, (4 << 1) | (1 << 7));
+        for ([_]u32{ output_address, 8 << 16, 130, 0 }, 0..) |word, i|
+            try state.writeRegister(.shader, 0x240 + @as(u32, @intCast(i)), word);
+        const report = try renderer.dispatchRdna2State(&state, .{ 32, 1, 1 }, .{ 4, 1, 1 });
+        try std.testing.expect(report.spirv_words != 0);
+        var output: [130 * 8]u8 = undefined;
+        try renderer.readbackGuestStorageBuffer(output_address, &output);
+        for (0..130) |i| {
+            try std.testing.expectEqual(@as(u32, if (i < 128) 0xffffffff else 0xcccccccc), std.mem.readInt(u32, output[i * 8 ..][0..4], .little));
+            try std.testing.expectEqual(@as(u32, if (i < 128) 0x7fffffff else 0xcccccccc), std.mem.readInt(u32, output[i * 8 + 4 ..][0..4], .little));
+        }
+    }
+    std.debug.print("SETPRIO passed: four priorities, captured buffer clear, four workgroups and untouched trailing records\n", .{});
 }
 
 fn runBufferCompactionProbe(allocator: std.mem.Allocator) !void {
@@ -12981,6 +13092,18 @@ fn runNativeLsHsProbe(allocator: std.mem.Allocator, triangles: bool) !void {
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
     const args = try init.minimal.args.toSlice(allocator);
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--half-writes")) {
+        try @import("half_write_probe.zig").run(allocator, GuestMemory);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--first-bit")) {
+        try @import("first_bit_probe.zig").run(allocator, GuestMemory);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--mad-u64")) {
+        try @import("mad_u64_probe.zig").run(allocator, GuestMemory);
+        return;
+    }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--scalar-calls")) {
         try @import("scalar_call_probe.zig").run(allocator, GuestMemory);
         return;
@@ -13128,6 +13251,27 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--save-exec")) {
         try runSaveExecProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--storage-raster-replacement")) {
+        for ([_]bool{ false, true }) |timeline| for ([_]bool{ false, true }) |published| {
+            var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = timeline });
+            defer renderer.deinit();
+            var guest = GuestMemory{};
+            _ = renderer.dcbBackend(guest.interface());
+            var descriptor = imageDescriptorWords(0x6000, 16, 16);
+            descriptor[1] = (descriptor[1] & ~(@as(u32, 0x1ff) << 20)) | (56 << 20);
+            try renderer.probeStorageRasterReplacement(try gpu.resources.decodeImageDescriptor(&descriptor), published);
+        };
+        std.debug.print("storage/raster replacement passed: resized compute output survives sampled lookup and guest publication, synchronous/timeline, pending/published\n", .{});
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--image-1d-storage")) {
+        try runImage1dStorageProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--setprio")) {
+        try runSetprioProbe(allocator);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--partial-register-merges")) {

@@ -41,7 +41,7 @@ fn success() callconv(abi.guest) i32 {
 fn aprError(err: apr.Error) i32 {
     return switch (err) {
         error.FileNotFound, error.UnknownFile => errno.KernelError.enoent.raw(),
-        error.FileTableFull, error.CommandBufferTableFull, error.SubmissionTableFull => errno.KernelError.enomem.raw(),
+        error.FileTableFull, error.CommandBufferTableFull, error.SubmissionTableFull, error.OutOfMemory => errno.KernelError.enomem.raw(),
         error.IoFailed => errno.KernelError.eio.raw(),
         error.InvalidPath, error.InvalidCommandBuffer, error.TooManyCommands, error.InvalidRead, error.UnknownSubmission, error.MappingFailed => errno.KernelError.einval.raw(),
         error.OutOfDirectMemory => errno.KernelError.eagain.raw(),

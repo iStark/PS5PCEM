@@ -49,6 +49,7 @@ fn vop1Opcode(id: u32) isa.Opcode {
         0x38 => .v_bfrev_b32,
         0x39 => .v_ffbh_u32,
         0x3a => .v_ffbl_b32,
+        0x3b => .v_ffbh_i32,
         0x3f => .v_frexp_exp_i32_f32,
         0x40 => .v_frexp_mant_f32,
         0x42 => .v_movreld_b32,
@@ -339,6 +340,7 @@ fn decodeVop1Modifier(inst: *Instruction, code: []const u32, word_index: u32, es
     inst.src0 = try sdwaSource(modifier & 0xff, escape == 249 and (modifier >> 23) & 1 != 0);
     inst.src_count = 1;
     if (escape == 249) {
+        inst.dst.explicit_sdwa_dst = true;
         inst.dst.sdwa_sel = @intCast((modifier >> 8) & 7);
         inst.dst.sdwa_dst_unused = @intCast((modifier >> 11) & 3);
         inst.dst.clamp = (modifier >> 13) & 1 != 0;
@@ -367,6 +369,7 @@ fn decodeVop2Modifier(inst: *Instruction, code: []const u32, word_index: u32, es
     } else if (escape == 249) {
         inst.src0 = try sdwaSource(modifier & 0xff, (modifier >> 23) & 1 != 0);
         inst.src1 = try sdwaSource(vsrc1, (modifier >> 31) & 1 != 0);
+        inst.dst.explicit_sdwa_dst = true;
         inst.dst.sdwa_sel = @intCast((modifier >> 8) & 7);
         inst.dst.sdwa_dst_unused = @intCast((modifier >> 11) & 3);
         inst.dst.clamp = (modifier >> 13) & 1 != 0;
@@ -612,7 +615,7 @@ pub fn decodeVop3(pc: u32, code: []const u32, word_index: u32) Error!Instruction
         inst.dst = try operand.decodeVectorGpr(word0 & 0xff);
     }
     const carry_output = switch (op) {
-        .v_addc_u32, .v_subrev_co_ci_u32, .v_add_co_u32, .v_sub_co_u32, .v_subrev_co_u32 => true,
+        .v_addc_u32, .v_subrev_co_ci_u32, .v_add_co_u32, .v_sub_co_u32, .v_subrev_co_u32, .v_mad_u64_u32 => true,
         else => false,
     };
     if (carry_output) {
@@ -822,6 +825,17 @@ test "VOP3 retains both encoding words and modifiers" {
     try std.testing.expectEqual(isa.Family.vop3, inst.family);
     try std.testing.expectEqual(@as(u32, 2), inst.word_count);
     try std.testing.expect(inst.dst.clamp);
+}
+
+test "V_MAD_U64_U32 decodes VOP3B carry destination and shared literal" {
+    const inst = try decodeVop3(0x1ec4, &.{ 0xd5766a05, 0x03feb8ff, 0x92492492 }, 0);
+    try std.testing.expectEqual(isa.Opcode.v_mad_u64_u32, inst.opcode);
+    try std.testing.expectEqual(isa.OperandKind.vcc_lo, inst.dst2.kind);
+    try std.testing.expectEqual(@as(u32, 5), inst.dst.reg);
+    try std.testing.expectEqual(@as(u32, 0x92492492), inst.src2.value);
+    try std.testing.expectEqual(isa.OperandKind.literal_constant, inst.src2.kind);
+    try std.testing.expect(!inst.src0.absolute and !inst.src1.absolute and !inst.src2.absolute);
+    try std.testing.expect(!inst.src0.op_sel and !inst.src1.op_sel and !inst.src2.op_sel);
 }
 
 test "native VOP3 shift-add opcode uses three sources" {
@@ -1152,6 +1166,39 @@ test "VOP3 compares retain explicit scalar mask destinations" {
     const cmpx = try decodeVop3(0, &.{ 0xd4f5_001c, 0x0001_0018 }, 0);
     try std.testing.expectEqual(isa.Opcode.v_cmpx_ne_u64, cmpx.opcode);
     try std.testing.expectEqual(isa.OperandKind.exec_lo, cmpx.dst.kind);
+}
+
+test "SDWA explicit DWORD half destinations differ from ordinary VOP1 VOP2 and VOP3" {
+    const captured = try decodeVop1(0x418, &.{ 0x7e4814f9, 0x0006060b }, 0);
+    try std.testing.expectEqual(isa.Opcode.v_cvt_f16_f32, captured.opcode);
+    try std.testing.expect(captured.dst.explicit_sdwa_dst);
+    try std.testing.expectEqual(6, captured.dst.sdwa_sel);
+    try std.testing.expectEqual(0, captured.dst.sdwa_dst_unused);
+    try std.testing.expectEqual(36, captured.dst.reg);
+    try std.testing.expectEqual(11, captured.src0.reg);
+    const ordinary = try decodeVop1(0, &.{0x7e48150b}, 0);
+    try std.testing.expect(!ordinary.dst.explicit_sdwa_dst);
+    const binary = try decodeVop2(0, &.{ 0x6a080ef9, 0x06060606 }, 0);
+    try std.testing.expectEqual(isa.Opcode.v_mul_f16, binary.opcode);
+    try std.testing.expect(binary.dst.explicit_sdwa_dst);
+    try std.testing.expectEqual(6, binary.dst.sdwa_sel);
+    const normal_binary = try decodeVop2(0, &.{0x6a080f06}, 0);
+    try std.testing.expect(!normal_binary.dst.explicit_sdwa_dst);
+    const extended = try decodeVop3(0, &.{ 0xd58a4004, 0x105 }, 0);
+    try std.testing.expect(!extended.dst.explicit_sdwa_dst);
+    try std.testing.expectEqual(5, extended.dst.sdwa_sel);
+    try std.testing.expectEqual(2, extended.dst.sdwa_dst_unused);
+}
+
+test "ASTRO signed first-bit instruction decodes VOP1 and VOP3" {
+    const compact = try decodeVop1(0x21c, &.{0x7e30770e}, 0);
+    try std.testing.expectEqual(isa.Opcode.v_ffbh_i32, compact.opcode);
+    try std.testing.expectEqual(24, compact.dst.reg);
+    try std.testing.expectEqual(14, compact.src0.reg);
+    const extended = try decodeVop3(0, &.{ 0xd5bb0018, 0x10e }, 0);
+    try std.testing.expectEqual(isa.Opcode.v_ffbh_i32, extended.opcode);
+    try std.testing.expectEqual(24, extended.dst.reg);
+    try std.testing.expectEqual(14, extended.src0.reg);
 }
 
 test "Yotei 64-bit unsigned greater CMPX decodes both encodings and literal width" {

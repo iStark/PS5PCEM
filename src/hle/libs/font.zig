@@ -124,20 +124,26 @@ var fonts: [128]Font = @splat(.{});
 var next_handle: usize = 0x464f0000;
 var library_selection = LibrarySelection{};
 var renderer_selection = RendererSelection{};
+const OwnedGlyph = struct { handle: usize, glyph: raster.Glyph, attribute: u32 = 0, value: u64 = 0 };
+var generated_glyphs: std.ArrayList(OwnedGlyph) = .empty;
 
 pub fn reset() void {
+    @import("font_text.zig").reset();
     lock.lock();
     defer lock.unlock();
+    for (generated_glyphs.items) |glyph| allocator.free(glyph.glyph.pixels);
+    generated_glyphs.deinit(allocator);
+    generated_glyphs = .empty;
     for (&fonts) |*font| font.close();
     for (&device_caches) |*cache| cache.clear();
     @memset(&libraries, 0);
     @memset(&renderers, 0);
     // Do not recycle stale handles when another title starts in this process.
 }
-fn readable(address: usize, size: usize) bool {
+pub fn readable(address: usize, size: usize) bool {
     return address != 0 and kernel_memory.isGuestRangeAccessible(address, size);
 }
-fn writable(address: usize, size: usize) bool {
+pub fn writable(address: usize, size: usize) bool {
     if (address == 0) return false;
     _ = std.math.add(usize, address, size) catch return false;
     if (kernel_memory.attachedAddressSpace()) |space| {
@@ -148,7 +154,7 @@ fn writable(address: usize, size: usize) bool {
     }
     return true; // Host-only tests, as in kernel_memory's read boundary.
 }
-fn notifyWrite(address: usize, size: usize) void {
+pub fn notifyWrite(address: usize, size: usize) void {
     if (kernel_memory.attachedAddressSpace()) |space| space.notifyGuestWrite(address, size);
 }
 fn validOutput(comptime T: type, output: ?*T) bool {
@@ -402,7 +408,72 @@ fn setEffectSlant(handle: usize, slant: f32) callconv(abi.guest) i32 {
 fn setupRenderEffectSlant(handle: usize, slant: f32) callconv(abi.guest) i32 {
     return setSlant(handle, slant, true);
 }
-fn metricsImpl(handle: usize, codepoint: u32, output: ?*GlyphMetrics, render: bool) i32 {
+fn setWeight(handle: usize, x: f32, y: f32, mode: u32, render: bool) i32 {
+    if (mode != 0 or !std.math.isFinite(x) or !std.math.isFinite(y)) return invalid_parameter;
+    lock.lock();
+    defer lock.unlock();
+    const f = findFont(handle) orelse return invalid_font;
+    var style = if (render) f.render_style orelse f.style else f.style;
+    style.weight_x = std.math.clamp(x - 1, -0.04, 0.04);
+    style.weight_y = std.math.clamp(y - 1, -0.04, 0.04);
+    if (render) f.render_style = style else f.style = style;
+    return 0;
+}
+fn setEffectWeight(handle: usize, x: f32, y: f32, mode: u32) callconv(abi.guest) i32 {
+    return setWeight(handle, x, y, mode, false);
+}
+fn setupRenderEffectWeight(handle: usize, x: f32, y: f32, mode: u32) callconv(abi.guest) i32 {
+    return setWeight(handle, x, y, mode, true);
+}
+fn getVerticalLayout(handle: usize, output: ?*HorizontalLayout) callconv(abi.guest) i32 {
+    if (!validOutput(HorizontalLayout, output)) return invalid_parameter;
+    lock.lock();
+    defer lock.unlock();
+    const f = findFont(handle) orelse return invalid_font;
+    writeOutput(HorizontalLayout, output.?, .{ .baseline = f.style.width / 2, .height = f.style.width, .effect_height = f.style.width * (1 + f.style.weight_x) });
+    return 0;
+}
+fn generateGlyph(handle: usize, code: u32, _: usize, output: ?*usize) callconv(abi.guest) i32 {
+    if (!validOutput(usize, output)) return invalid_parameter;
+    lock.lock();
+    defer lock.unlock();
+    const f = findFont(handle) orelse return invalid_font;
+    const rendered = f.face.?.getGlyph(code, f.style) catch |err| return fontError(err);
+    var glyph = rendered.*;
+    glyph.pixels = allocator.dupe(u8, rendered.pixels) catch return errno.KernelError.enomem.raw();
+    const id = newHandle();
+    generated_glyphs.append(allocator, .{ .handle = id, .glyph = glyph }) catch {
+        allocator.free(glyph.pixels);
+        return errno.KernelError.enomem.raw();
+    };
+    writeOutput(usize, output.?, id);
+    return 0;
+}
+fn deleteGlyph(_: usize, output: ?*usize) callconv(abi.guest) i32 {
+    if (!validOutput(usize, output)) return invalid_parameter;
+    lock.lock();
+    defer lock.unlock();
+    for (generated_glyphs.items, 0..) |glyph, i| if (glyph.handle == output.?.*) {
+        allocator.free(glyph.glyph.pixels);
+        _ = generated_glyphs.swapRemove(i);
+        writeOutput(usize, output.?, 0);
+        return 0;
+    };
+    return invalid_parameter;
+}
+fn glyphAttribute(handle: usize, attribute: u32, value: u64) callconv(abi.guest) i32 {
+    lock.lock();
+    defer lock.unlock();
+    for (generated_glyphs.items) |*glyph| if (glyph.handle == handle) {
+        // Observed default attribute; nondefault shaping attributes are unknown.
+        if (attribute != 0x11 or value != 0) return @bitCast(@as(u32, 0x80460020));
+        glyph.attribute = attribute;
+        glyph.value = value;
+        return 0;
+    };
+    return invalid_parameter;
+}
+pub fn metricsImpl(handle: usize, codepoint: u32, output: ?*GlyphMetrics, render: bool) i32 {
     if (!validOutput(GlyphMetrics, output)) return errno.KernelError.efault.raw();
     lock.lock();
     defer lock.unlock();
@@ -529,6 +600,12 @@ fn selectRenderer(value: i32) callconv(abi.guest) ?*const RendererSelection {
 }
 
 pub const exports = [_]symbols.Export{
+    .{ .name = "sceFontGenerateCharGlyph", .function = trace.wrap("sceFontGenerateCharGlyph", &generateGlyph), .expect_id = "C-4Qw5Srlyw" },
+    .{ .name = "sceFontDeleteGlyph", .function = trace.wrap("sceFontDeleteGlyph", &deleteGlyph), .expect_id = "LHDoRWVFGqk" },
+    .{ .name = "sceFontGlyphDefineAttribute", .function = trace.wrap("sceFontGlyphDefineAttribute", &glyphAttribute), .expect_id = "8-zmgsxkBek" },
+    .{ .name = "sceFontSetEffectWeight", .function = trace.wrap("sceFontSetEffectWeight", &setEffectWeight), .expect_id = "v0phZwa4R5o" },
+    .{ .name = "sceFontSetupRenderEffectWeight", .function = trace.wrap("sceFontSetupRenderEffectWeight", &setupRenderEffectWeight), .expect_id = "XIGorvLusDQ" },
+    .{ .name = "sceFontGetVerticalLayout", .function = trace.wrap("sceFontGetVerticalLayout", &getVerticalLayout), .expect_id = "3BrWWFU+4ts" },
     .{ .name = "sceFontCreateLibrary", .function = trace.wrap("sceFontCreateLibrary", &createLibraryDefault), .expect_id = "nWrfPI4Okmg" },
     .{ .name = "sceFontOpenFontInstance", .function = trace.wrap("sceFontOpenFontInstance", &openFontInstance), .expect_id = "JzCH3SCFnAU" },
     .{ .name = "sceFontRebindRenderer", .function = trace.wrap("sceFontRebindRenderer", &rebindRenderer), .expect_id = "Z2cdsqJH+5k" },
@@ -557,12 +634,36 @@ pub const exports = [_]symbols.Export{
     .{ .name = "sceFontGetCharGlyphMetrics", .function = trace.wrap("sceFontGetCharGlyphMetrics", &glyphMetrics), .expect_id = "L97d+3OgMlE" },
     .{ .name = "sceFontRenderCharGlyphImageHorizontal", .function = trace.wrap("sceFontRenderCharGlyphImageHorizontal", &renderGlyph), .expect_id = "kAenWy1Zw5o" },
     .{ .name = "sceFontSetScalePixel", .function = trace.wrap("sceFontSetScalePixel", &setScalePixel), .expect_id = "N1EBMeGhf7E" },
-};
+} ++ @import("font_text.zig").exports;
 
 pub const ft_exports = [_]symbols.Export{
     .{ .name = "sceFontSelectLibraryFt", .function = trace.wrap("sceFontSelectLibraryFt", &selectLibrary), .expect_id = "oM+XCzVG3oM" },
     .{ .name = "sceFontSelectRendererFt", .function = trace.wrap("sceFontSelectRendererFt", &selectRenderer), .expect_id = "Xx974EW-QFY" },
 };
+
+test "font generated glyphs own their pixels and weight changes outlines" {
+    reset();
+    defer reset();
+    var library: usize = 0;
+    var handle: usize = 0;
+    var glyph: usize = 0;
+    try std.testing.expectEqual(errno.ok, createLibraryDefault(null, 0, &library));
+    try std.testing.expectEqual(errno.ok, openFontSet(library, 0, 0, 0, &handle));
+    try std.testing.expectEqual(errno.ok, setScalePixel(handle, 64, 64));
+    try std.testing.expectEqual(errno.ok, generateGlyph(handle, 'W', 0, &glyph));
+    const original = generated_glyphs.items[0].glyph;
+    const hash = std.hash.Wyhash.hash(0, original.pixels);
+    try std.testing.expectEqual(errno.ok, setEffectWeight(handle, 1.04, 1.04, 0));
+    var bold: GlyphMetrics = .{};
+    try std.testing.expectEqual(errno.ok, glyphMetrics(handle, 'W', &bold));
+    try std.testing.expect(bold.width > original.metrics.width);
+    try std.testing.expectEqual(hash, std.hash.Wyhash.hash(0, generated_glyphs.items[0].glyph.pixels));
+    try std.testing.expectEqual(errno.ok, glyphAttribute(glyph, 0x11, 0));
+    try std.testing.expectEqual(errno.ok, closeFont(handle));
+    try std.testing.expectEqual(hash, std.hash.Wyhash.hash(0, generated_glyphs.items[0].glyph.pixels));
+    try std.testing.expectEqual(errno.ok, deleteGlyph(0, &glyph));
+    try std.testing.expectEqual(@as(usize, 0), glyph);
+}
 
 test "font writes invalidate GPU watches and reject read-only guest surfaces" {
     if (@import("builtin").os.tag != .windows) return error.SkipZigTest;

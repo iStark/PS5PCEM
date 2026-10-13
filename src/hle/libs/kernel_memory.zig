@@ -1761,6 +1761,10 @@ fn sceKernelSetVirtualRangeName(
     return errno.ok;
 }
 
+fn sceKernelClearVirtualRangeName(address: u64, len: u64) callconv(abi.guest) i32 {
+    return sceKernelSetVirtualRangeName(address, len, "");
+}
+
 fn sceKernelReserveVirtualRange(
     out_address: ?*u64,
     len: u64,
@@ -2259,6 +2263,7 @@ pub const exports = [_]symbols.Export{
         .function = trace.wrap("sceKernelSetVirtualRangeName", &sceKernelSetVirtualRangeName),
         .expect_id = "DGMG3JshrZU",
     },
+    .{ .name = "sceKernelClearVirtualRangeName", .function = trace.wrap("sceKernelClearVirtualRangeName", &sceKernelClearVirtualRangeName), .expect_id = "mkgXxsoxWHg" },
     .{
         .name = "sceKernelReserveVirtualRange",
         .function = trace.wrap("sceKernelReserveVirtualRange", &sceKernelReserveVirtualRange),

@@ -26,6 +26,26 @@ test "whole quad mode decodes the captured single-word VCC high destination" {
     try std.testing.expectEqual(@as(u32, 1), inst.word_count);
 }
 
+test "ORN2 SAVEEXEC B32 decodes captured VCC destination and scalar source" {
+    const inst = try decodeSop1(0x1660, &.{0xbeea4020}, 0);
+    try std.testing.expectEqual(Opcode.s_orn2_saveexec_b32, inst.opcode);
+    try std.testing.expectEqual(isa.OperandKind.vcc_lo, inst.dst.kind);
+    try std.testing.expectEqual(isa.OperandKind.sgpr, inst.src0.kind);
+    try std.testing.expectEqual(@as(u32, 32), inst.src0.reg);
+    try std.testing.expectEqual(@as(u32, 1), inst.word_count);
+}
+
+test "SETPRIO decodes the wave scheduling priority without a register destination" {
+    for (0..4) |priority| {
+        const inst = try decodeSopp(0, &.{0xbf8f0000 | @as(u32, @intCast(priority))}, 0);
+        try std.testing.expectEqual(Opcode.s_setprio, inst.opcode);
+        try std.testing.expectEqual(@as(u32, @intCast(priority)), inst.src0.value);
+        try std.testing.expectEqual(@as(u32, 1), inst.word_count);
+        try std.testing.expectEqual(@as(u8, 1), inst.src_count);
+        try std.testing.expect(!inst.opcode.isBranch());
+    }
+}
+
 /// Expands a list of pairs into a direct-index array.
 /// Everything happens at compile time; only the array survives into the binary.
 fn buildTable(comptime size: usize, comptime entries: []const Entry) [size]Opcode {
@@ -68,6 +88,7 @@ const sop1_table = buildTable(256, &.{
     .{ 0x37, .s_andn1_saveexec_b64 },
     .{ 0x3b, .s_bitreplicate_b64_b32 },
     .{ 0x3c, .s_and_saveexec_b32 },
+    .{ 0x40, .s_orn2_saveexec_b32 },
     .{ 0x44, .s_andn1_saveexec_b32 },
 });
 
@@ -126,17 +147,18 @@ const sopk_table = buildTable(32, &.{
 });
 
 const sopp_table = buildTable(128, &.{
-    .{ 0x00, .s_nop },                      .{ 0x01, .s_endpgm },
-    .{ 0x02, .s_branch },                   .{ 0x04, .s_cbranch_scc0 },
-    .{ 0x05, .s_cbranch_scc1 },             .{ 0x06, .s_cbranch_vccz },
-    .{ 0x07, .s_cbranch_vccnz },            .{ 0x08, .s_cbranch_execz },
-    .{ 0x09, .s_cbranch_execnz },           .{ 0x0a, .s_barrier },
-    .{ 0x0c, .s_waitcnt },                  .{ 0x0e, .s_sleep },
-    .{ 0x10, .s_sendmsg },                  .{ 0x12, .s_trap },
-    .{ 0x16, .s_ttrace_data },              .{ 0x17, .s_cbranch_cdbgsys },
-    .{ 0x18, .s_cbranch_cdbguser },         .{ 0x19, .s_cbranch_cdbgsys_or_user },
-    .{ 0x1a, .s_cbranch_cdbgsys_and_user }, .{ 0x1f, .s_code_end },
-    .{ 0x20, .s_inst_prefetch },            .{ 0x23, .s_waitcnt_depctr },
+    .{ 0x00, .s_nop },                     .{ 0x01, .s_endpgm },
+    .{ 0x02, .s_branch },                  .{ 0x04, .s_cbranch_scc0 },
+    .{ 0x05, .s_cbranch_scc1 },            .{ 0x06, .s_cbranch_vccz },
+    .{ 0x07, .s_cbranch_vccnz },           .{ 0x08, .s_cbranch_execz },
+    .{ 0x09, .s_cbranch_execnz },          .{ 0x0a, .s_barrier },
+    .{ 0x0c, .s_waitcnt },                 .{ 0x0e, .s_sleep },
+    .{ 0x0f, .s_setprio },                 .{ 0x10, .s_sendmsg },
+    .{ 0x12, .s_trap },                    .{ 0x16, .s_ttrace_data },
+    .{ 0x17, .s_cbranch_cdbgsys },         .{ 0x18, .s_cbranch_cdbguser },
+    .{ 0x19, .s_cbranch_cdbgsys_or_user }, .{ 0x1a, .s_cbranch_cdbgsys_and_user },
+    .{ 0x1f, .s_code_end },                .{ 0x20, .s_inst_prefetch },
+    .{ 0x23, .s_waitcnt_depctr },
 });
 
 comptime {
@@ -374,7 +396,7 @@ pub fn decodeSopp(pc: u32, code: []const u32, word_index: u32) Error!Instruction
     // For some SOPP instructions the immediate field is an operand; for the
     // rest (branches) it is an offset, printed as a target instead of a source.
     inst.src_count = switch (inst.opcode) {
-        .s_nop, .s_waitcnt, .s_sleep, .s_sendmsg, .s_ttrace_data, .s_inst_prefetch => 1,
+        .s_nop, .s_waitcnt, .s_sleep, .s_setprio, .s_sendmsg, .s_ttrace_data, .s_inst_prefetch => 1,
         else => 0,
     };
 

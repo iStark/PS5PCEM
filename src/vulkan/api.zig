@@ -339,6 +339,7 @@ pub const format_r32g32b32a32_sint: u32 = 108;
 pub const format_r32g32b32a32_sfloat: u32 = 109;
 pub const format_b10g11r11_ufloat_pack32: u32 = 122;
 pub const format_a2b10g10r10_unorm_pack32: u32 = 64;
+pub const format_a2r10g10b10_unorm_pack32: u32 = 58;
 pub const format_bc1_rgba_unorm_block: u32 = 133;
 pub const format_bc1_rgba_srgb_block: u32 = 134;
 pub const format_bc2_unorm_block: u32 = 135;

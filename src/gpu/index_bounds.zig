@@ -34,7 +34,7 @@ fn writes(inst: Instruction, location: Location) bool {
     if (location.lane == null and location.register >= 126 and location.register <= 127) {
         switch (inst.opcode) {
             .s_and_saveexec_b64, .s_orn2_saveexec_b64, .s_andn1_saveexec_b64 => return true,
-            .s_and_saveexec_b32, .s_andn1_saveexec_b32 => if (location.register == 126) return true,
+            .s_and_saveexec_b32, .s_andn1_saveexec_b32, .s_orn2_saveexec_b32 => if (location.register == 126) return true,
             else => {},
         }
     }

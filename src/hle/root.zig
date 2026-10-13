@@ -26,11 +26,14 @@ pub const symbols = @import("symbols.zig");
 
 pub const libs = struct {
     pub const audio = @import("libs/audio.zig");
+    pub const audio_propagation = @import("libs/audio_propagation.zig");
     pub const bootstrap_services = @import("libs/bootstrap_services.zig");
     pub const cxx_abi = @import("libs/cxx_abi.zig");
     pub const dialogs = @import("libs/dialogs.zig");
     pub const fiber = @import("libs/fiber.zig");
     pub const font = @import("libs/font.zig");
+    pub const json = @import("libs/json.zig");
+    pub const share = @import("libs/share.zig");
     pub const kernel_event_queue = @import("libs/kernel_event_queue.zig");
     pub const kernel_info = @import("libs/kernel_info.zig");
     pub const kernel_ioctl = @import("libs/kernel_ioctl.zig");
@@ -71,6 +74,7 @@ pub const KernelError = errno.KernelError;
 /// Registration is explicit rather than automatic: the list is what the guest
 /// can see, so it should be readable in one place.
 pub fn registerAll(db: *Database, gpa: @import("std").mem.Allocator) symbols.Error!void {
+    try @import("libs/optional_services.zig").register(db, gpa);
     try libs.audio.register(db, gpa);
     try libs.agc.register(db, gpa);
     try libs.kernel_aio.register(db, gpa);
@@ -102,6 +106,7 @@ pub fn registerAll(db: *Database, gpa: @import("std").mem.Allocator) symbols.Err
 
 test {
     _ = libs.font;
+    _ = libs.json;
     _ = @import("font_rasterizer.zig");
     _ = @import("font_kerning.zig");
     _ = libs.audio;

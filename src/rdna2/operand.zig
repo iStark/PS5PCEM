@@ -30,6 +30,9 @@ pub const Operand = struct {
     // decoded instruction independent of the source encoding (VOP3/SDWA/DPP).
     sdwa_sel: u3 = 6,
     sdwa_dst_unused: u2 = 0,
+    /// Explicit SDWA DWORD writes replace all 32 bits, even for f16 results.
+    /// A normal f16 instruction with the default selector preserves WORD1.
+    explicit_sdwa_dst: bool = false,
     omod: u2 = 0,
     dpp_ctrl: u9 = 0,
     /// Eight three-bit lane selectors packed from the DPP8 extension word.

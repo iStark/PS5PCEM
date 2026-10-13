@@ -497,6 +497,10 @@ fn run(init: std.process.Init) !bool {
     if (temporary_data) |directory| runtime.firmware.filesystem.attachTemporaryData(directory);
     defer runtime.firmware.filesystem.detachTemporaryData();
 
+    runtime.firmware.libs.audio_propagation.configureNoPropagation(
+        init.minimal.environ.containsUnempty(allocator, "PS5_AUDIO_PROPAGATION_DISABLED") catch false,
+    );
+
     // A contained fault prints the retained calls afterwards, but a process
     // that dies outright takes the buffer with it. This is the escape hatch for
     // those, and it is far too noisy for anything else.
