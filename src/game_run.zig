@@ -72,6 +72,7 @@ const yotei_title_id = "PPSA26344";
 const gta_iii_title_id = "PPSA03527";
 const quake_ii_title_id = "PPSA09477";
 const subnautica_below_zero_title_id = "PPSA02457";
+const astro_bot_title_id = "PPSA21564";
 const terminator_audio_latency_ms: u16 = 128;
 
 /// Compatibility stays the global default, while profiles enable only paths
@@ -497,8 +498,10 @@ fn run(init: std.process.Init) !bool {
     if (temporary_data) |directory| runtime.firmware.filesystem.attachTemporaryData(directory);
     defer runtime.firmware.filesystem.detachTemporaryData();
 
+    // Propagation reports no paths unless a diagnosis asks the module to
+    // refuse, as it did before titles were known to require it.
     runtime.firmware.libs.audio_propagation.configureNoPropagation(
-        init.minimal.environ.containsUnempty(allocator, "PS5_AUDIO_PROPAGATION_DISABLED") catch false,
+        !(init.minimal.environ.containsUnempty(allocator, "PS5_AUDIO_PROPAGATION_UNSUPPORTED") catch false),
     );
 
     // A contained fault prints the retained calls afterwards, but a process
@@ -636,12 +639,20 @@ fn run(init: std.process.Init) !bool {
     const translate_compute_only = init.minimal.environ.containsUnempty(allocator, "PS5_COMPUTE_TRANSLATE_ONLY") catch false;
     const prefer_integrated_gpu = init.minimal.environ.containsUnempty(allocator, "PS5_VULKAN_PREFER_INTEGRATED") catch false;
     const use_big_helmet_gpu_profile = std.ascii.eqlIgnoreCase(title_identifier, "PPSA19943");
-    // Big Helmet Heroes' packed menu scanout has been checked against the
-    // CPU conversion. Avoid reading its 4K attachment back every flip.
+    const use_astro_bot_gpu_profile = std.ascii.eqlIgnoreCase(title_identifier, astro_bot_title_id);
+    // Big Helmet Heroes' and ASTRO BOT's packed 10-bit scanouts have been
+    // checked against the CPU conversion. Avoid reading their 4K attachment
+    // back every flip: about 32 MiB and 12 ms per ASTRO BOT frame.
     vulkan.backend.gpu_packed_scanout = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_PACKED_SCANOUT")) |text| enabled: {
         defer allocator.free(text);
         break :enabled !std.mem.eql(u8, std.mem.trim(u8, text, " \t\r\n"), "0");
-    } else |_| use_big_helmet_gpu_profile;
+    } else |_| use_big_helmet_gpu_profile or use_astro_bot_gpu_profile;
+    // Checked BVH traversal renders ray-query compute instead of skipping it.
+    // PS5_GPU_BVH=0 restores the skip for comparisons.
+    vulkan.backend.checked_bvh_diagnostics = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_BVH")) |text| enabled: {
+        defer allocator.free(text);
+        break :enabled !std.mem.eql(u8, std.mem.trim(u8, text, " \t\r\n"), "0");
+    } else |_| true;
     // Keep the GPU fed while the CPU prepares the next resources. This only
     // submits recorded work asynchronously; guest ordering remains intact.
     const default_batch_age_us: u64 = if (use_big_helmet_gpu_profile) 1000 else 0;
@@ -786,8 +797,11 @@ fn run(init: std.process.Init) !bool {
     const enable_gpu_buffer_content_cache = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_BUFFER_CONTENT_CACHE")) |text| enabled: {
         defer allocator.free(text);
         break :enabled text.len != 0 and !std.mem.eql(u8, text, "0");
-    } else |_| std.ascii.eqlIgnoreCase(title_identifier, yotei_title_id) or use_gta_iii_buffer_profile;
-    const default_copy_workers: u8 = if (use_big_helmet_gpu_profile or use_gta_iii_buffer_profile or
+    } else |_| std.ascii.eqlIgnoreCase(title_identifier, yotei_title_id) or use_gta_iii_buffer_profile or
+        // ASTRO BOT republishes compute output every frame; unchanged ranges
+        // are recognised by fingerprint instead of uploaded again.
+        use_astro_bot_gpu_profile;
+    const default_copy_workers: u8 = if (use_big_helmet_gpu_profile or use_gta_iii_buffer_profile or use_astro_bot_gpu_profile or
         std.ascii.eqlIgnoreCase(title_identifier, yotei_title_id) or
         std.ascii.eqlIgnoreCase(title_identifier, little_nightmares_enhanced_title_id)) 4 else 1;
     const gpu_copy_workers: u8 = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_COPY_WORKERS")) |text| parse: {

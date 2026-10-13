@@ -108,6 +108,7 @@ test {
     _ = libs.font;
     _ = libs.json;
     _ = @import("font_rasterizer.zig");
+    _ = @import("font_substitutes.zig");
     _ = @import("font_kerning.zig");
     _ = libs.audio;
     _ = @import("audio_fs.zig");

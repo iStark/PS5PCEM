@@ -14,6 +14,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const audio_fs = @import("audio_fs.zig");
+const font_substitutes = @import("font_substitutes.zig");
 const savedata = @import("savedata.zig");
 const boot_config = @import("boot_config.zig");
 const guest_memory = @import("memory");
@@ -434,6 +435,9 @@ const OpenFile = struct {
     /// In-memory payload for synthesised files (FSB-backed virtual WAVs).
     /// Owned by this descriptor; freed on close via page_allocator.
     memory: ?[]u8 = null,
+    /// `memory` is a bundled read-only payload, such as a substitute font,
+    /// that outlives the descriptor and must not be freed with it.
+    borrowed_memory: bool = false,
     /// Read position. Kept here and used with positional reads so that two
     /// descriptors on one file cannot disturb each other.
     offset: u64 = 0,
@@ -882,7 +886,9 @@ pub fn detach() void {
             if (slot.*) |entry| {
                 if (entry.file) |file| file.close(io);
                 if (entry.directory) |directory| directory.close(io);
-                if (entry.memory) |bytes| std.heap.page_allocator.free(bytes);
+                if (entry.memory) |bytes| {
+                    if (!entry.borrowed_memory) std.heap.page_allocator.free(bytes);
+                }
             }
             slot.* = null;
         }
@@ -1021,6 +1027,7 @@ pub fn open(path: []const u8, flags: i32) Error!i32 {
                     break :missing aliased;
                 } else |_| {}
             }
+            if (font_substitutes.forPath(relative)) |substitute| return openSubstituteFont(path, substitute);
             // Sparse dumps omit loose Media/Resources/audio/**.wav; serve PCM
             // extracted from FSB5 banks inside resources.resource instead.
             return openVirtualAudio(path, relative, io, directory);
@@ -1204,6 +1211,22 @@ fn openDirectory(
     return insertFileLocked(entry);
 }
 
+/// Answers a title's missing font file with a bundled freely licensed face.
+/// See font_substitutes.zig for why the request cannot simply fail.
+fn openSubstituteFont(path: []const u8, substitute: font_substitutes.Substitute) Error!i32 {
+    std.debug.print("[font] {s} is missing from the title; serving {s} (SIL OFL) in its place\n", .{ path, substitute.name });
+    table_lock.lock();
+    defer table_lock.unlock();
+    var entry = OpenFile{
+        .memory = @constCast(substitute.bytes),
+        .borrowed_memory = true,
+        .size = substitute.bytes.len,
+    };
+    entry.path_length = @min(path.len, maximum_path);
+    @memcpy(entry.path_buffer[0..entry.path_length], path[0..entry.path_length]);
+    return insertFileLocked(entry);
+}
+
 fn openVirtualAudio(path: []const u8, relative: []const u8, io: std.Io, directory: std.Io.Dir) Error!i32 {
     const resolved = audio_fs.resolveVirtualWav(relative, directory, io, std.heap.page_allocator) catch {
         return Error.NotFound;
@@ -1292,7 +1315,7 @@ pub fn close(descriptor: i32) Error!void {
         directory.close(io);
     }
     if (entry.memory) |memory| {
-        std.heap.page_allocator.free(memory);
+        if (!entry.borrowed_memory) std.heap.page_allocator.free(memory);
     }
     slot.* = null;
 }
@@ -1636,6 +1659,12 @@ pub fn stat(path: []const u8, out: *Stat) Error!void {
 
     const info = directory.statFile(io, relative, .{}) catch |err| switch (err) {
         error.FileNotFound, error.NotDir, error.BadPathName => {
+            if (mountOf(path) == .title) {
+                if (font_substitutes.forPath(relative)) |substitute| {
+                    fillStat(out, substitute.bytes.len, false);
+                    return;
+                }
+            }
             if (audio_fs.virtualWavSize(relative, directory, io)) |size| {
                 fillStat(out, size, false);
                 return;
@@ -2011,6 +2040,36 @@ test "display boot overlay has consistent reads and stat without modifying title
     defer close(raw) catch {};
     const length = try read(raw, &bytes);
     try testing.expectEqualStrings(original, bytes[0..length]);
+}
+
+test "a missing title font is served from the bundled stand-ins and a shipped one is not" {
+    var fixture = try Fixture.init("title data");
+    defer fixture.deinit();
+    try fixture.tmp.dir.createDirPath(testing.io, "data/common/font");
+    try fixture.tmp.dir.writeFile(testing.io, .{ .sub_path = "data/common/font/FuturaStd-Bold.otf", .data = "shipped font" });
+
+    const missing = "/app0/data/common/font/SIE-ShinGoPr6N-Heavy.otf";
+    const substitute = font_substitutes.forPath(missing).?;
+    var info: Stat = undefined;
+    try stat(missing, &info);
+    try testing.expectEqual(@as(i64, @intCast(substitute.bytes.len)), info.size);
+    const fd = try open(missing, O.rdonly);
+    var head: [4]u8 = undefined;
+    try testing.expectEqual(@as(usize, 4), try pread(fd, &head, 0));
+    try testing.expectEqualSlices(u8, substitute.bytes[0..4], &head);
+    // Closing must not free the bundled bytes; a second open reads them again.
+    try close(fd);
+    const again = try open(missing, O.rdonly);
+    defer close(again) catch {};
+    try testing.expectEqual(@as(usize, 4), try pread(again, &head, 0));
+    try testing.expectEqualSlices(u8, substitute.bytes[0..4], &head);
+
+    const shipped = try open("/app0/data/common/font/FuturaStd-Bold.otf", O.rdonly);
+    defer close(shipped) catch {};
+    var bytes: [32]u8 = undefined;
+    const length = try read(shipped, &bytes);
+    try testing.expectEqualStrings("shipped font", bytes[0..length]);
+    try testing.expectError(Error.NotFound, stat("/app0/data/common/missing.xml", &info));
 }
 
 test "save-data delete is confined to an unmounted slot of the active title" {

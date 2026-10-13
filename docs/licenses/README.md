@@ -10,13 +10,14 @@ upstream notices from the source versions pinned in `build.zig.zon`.
 | FAAD2 | `knik0/faad2`, version `2.11.2` | [GPL text](FAAD2-COPYING.txt), [upstream README and copyright notices](FAAD2-README.txt) |
 | Opus | `xiph/opus`, version `1.5.2` | [BSD license](Opus-COPYING.txt), [upstream licensing note](Opus-LICENSE_PLEASE_READ.txt) |
 | FreeType | `freetype/freetype`, version `2.14.3` | [FreeType License](FreeType-FTL.txt) |
-| Noto Sans Regular | `notofonts/noto-fonts`, commit `ffebf8c1ee449e544955a7e813c54f9b73848eac` | [SIL Open Font License 1.1 and copyright notice](NotoSans-OFL.txt) |
+| Noto Sans (Regular, Light, Light Italic, Medium, Bold, Black) | `notofonts/noto-fonts`, commit `ffebf8c1ee449e544955a7e813c54f9b73848eac` | [SIL Open Font License 1.1 and copyright notice](NotoSans-OFL.txt) |
+| Noto Sans JP (Medium, Black) | `notofonts/noto-cjk`, commit `f8d157532fbfaeda587e826d4cd5b21a49186f7c` | [SIL Open Font License 1.1 and copyright notice](NotoSansCJK-OFL.txt) |
 
 Portions of this software are copyright © 2026 The FreeType Project
 (https://freetype.org). All rights reserved.
 
-The unmodified Noto Sans font is embedded as a substitute for system-font
-requests. Its source, checksum and scope are recorded in
-[the font asset notes](../../src/hle/fonts/README.md).
+The unmodified Noto fonts are embedded as substitutes for system-font
+requests and for font files a title's dump lacks. Their sources, checksums and
+scope are recorded in [the font asset notes](../../src/hle/fonts/README.md).
 
 PS5PCEM's own license is provided in the package's root `LICENSE` file.

@@ -1,10 +1,17 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Artur Strazewicz
 
-//! Opt-in no-propagation backend for startup diagnostics. Object lifetimes,
-//! caller-owned system memory and attribute storage are implemented; acoustic
-//! rays, occlusion and reflections are not. Nonempty path input is rejected.
-//! ABI descriptors were cross-checked against observed calls and AnyPS5.
+//! A no-propagation backend. Object lifetimes, caller-owned system memory and
+//! attribute storage are implemented; acoustic rays, occlusion and reflections
+//! are not, so every source reports no propagated paths and only its direct
+//! sound is heard. Nonempty path input is rejected. ABI descriptors were
+//! cross-checked against observed calls and AnyPS5.
+//!
+//! This is the default. ASTRO BOT asserts during audio initialisation when the
+//! module refuses to report its memory needs, and the propagated reverb and
+//! occlusion are a refinement of sound it otherwise plays. Refusing outright
+//! (`configureNoPropagation(false)`, `PS5_AUDIO_PROPAGATION_UNSUPPORTED=1`)
+//! remains available to tell the two apart when diagnosing a title.
 const std = @import("std");
 const memory = @import("memory");
 const abi = @import("../abi.zig");
@@ -44,7 +51,7 @@ const Object = struct {
 var mutex: memory.HostMutex = .{};
 var objects: std.ArrayList(Object) = .empty;
 var next_id: usize = 0x41500000;
-var no_propagation = false;
+var no_propagation = true;
 
 pub fn configureNoPropagation(enabled: bool) void {
     mutex.lock();
@@ -58,7 +65,7 @@ pub fn reset() void {
     objects.deinit(allocator);
     objects = .empty;
     next_id = 0x41500000;
-    no_propagation = false;
+    no_propagation = true;
 }
 fn read(comptime T: type, address: usize) ?T {
     if (!access.readable(address, @sizeOf(T))) return null;
@@ -299,6 +306,7 @@ test "audio propagation diagnostics preserve descriptors and invalidate children
     var options: [16]u8 = @splat(0);
     var header = Header{};
     var mem = SystemMemory{ .cpu = @intFromPtr(&header), .gpu = 123 };
+    configureNoPropagation(false);
     try std.testing.expectEqual(unsupported, queryMemory(@intFromPtr(&options), @intFromPtr(&mem)));
     configureNoPropagation(true);
     try std.testing.expectEqual(@as(i32, 0), queryMemory(@intFromPtr(&options), @intFromPtr(&mem)));

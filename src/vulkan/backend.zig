@@ -34,12 +34,16 @@ pub export var capture_storage_flip: u64 = 0;
 pub export var capture_storage_address: u64 = 0;
 pub export var capture_storage_bytes: u64 = 0;
 pub export var capture_compute_sampled_images: bool = false;
-// Diagnose generic BVH kernels with checked runtime memory faults. The
-// production path still requires a fully staged acceleration structure.
-pub export var checked_bvh_diagnostics: bool = false;
-/// Bounded diagnostic comparison for rays visiting unusually large trees.
-/// Exhaustion remains an explicit failure at either budget.
-pub export var checked_bvh_diagnostic_iterations: u32 = 4096;
+// Run generic BVH kernels (IMAGE_BVH_INTERSECT_RAY) through checked
+// software traversal: the referenced TLAS/BLAS ranges are snapshotted and an
+// unmapped node is recorded as a runtime fault rather than read. Without it
+// those dispatches are skipped, and ASTRO BOT loses the lighting they feed.
+// game-run sets this from PS5_GPU_BVH (default on).
+pub export var checked_bvh_diagnostics: bool = true;
+/// Dispatcher budget for rays visiting large trees. ASTRO BOT's arrival
+/// scene exhausts 4,096 blocks in 13 invocations and completes at 16,384.
+/// Exhaustion remains an explicit failure at any budget.
+pub export var checked_bvh_diagnostic_iterations: u32 = 16384;
 pub export var capture_storage_image_address: u64 = 0;
 pub export var capture_vertex_program: u64 = 0;
 pub export var capture_vertex_flip: u64 = 0;
@@ -1491,7 +1495,13 @@ const DeferredRelease = struct {
     fn size(self: DeferredRelease) usize {
         if (self.query_counters) return 16 * 16 - 8;
         if (self.fixed != null) return self.fixed_size;
-        return if (self.release.data_selection == 1) 4 else 8;
+        return switch (self.release.data_selection) {
+            1 => 4,
+            2, 3, 4 => 8,
+            // No data (0) and GDS (5, not modelled) write no guest bytes; the
+            // entry exists only to deliver the interrupt in stream order.
+            else => 0,
+        };
     }
 };
 
@@ -1519,6 +1529,24 @@ const BufferPageObservation = struct {
 };
 
 const buffer_write_ranges = @import("buffer_write_ranges.zig");
+
+/// A guest index range kept in its own buffer while its pages stay unchanged.
+const CachedIndexBuffer = struct {
+    address: u64,
+    bytes: usize,
+    buffer: OwnedBuffer,
+    observation: BufferPageObservation = .{},
+    generation: u64,
+    last_used_frame: u64,
+    /// Rewrites since the range was cached. A range rewritten every frame is
+    /// streamed data; it goes back to the per-draw upload ring.
+    rewrites: u8 = 0,
+};
+/// Below this an upload costs less than a cache lookup and its buffer.
+const index_cache_min_bytes: usize = 16 * 1024;
+const index_cache_max_bytes: usize = 512 * 1024 * 1024;
+const index_cache_max_entries: usize = 2048;
+const index_cache_max_rewrites: u8 = 3;
 
 /// Attribution only: this never relaxes publication coverage. Keep the
 /// instruction that forced a full snapshot available after the dispatch and
@@ -5416,6 +5444,10 @@ pub const Renderer = struct {
     /// Command-processor writes and dispatches close the batch before they can
     /// invalidate these entries, so later draws may safely reuse each slice.
     draw_upload_cache: std.ArrayList(DrawUploadCacheEntry) = .empty,
+    index_cache: std.ArrayList(CachedIndexBuffer) = .empty,
+    index_cache_bytes: usize = 0,
+    /// Ranges given up as streamed after repeated rewrites, by address.
+    index_cache_streamed: std.AutoHashMapUnmanaged(u64, void) = .empty,
     /// Opt-in: check compact GPU fault records at timeline/batch boundaries.
     defer_flat_memory_fault_checks: bool = false,
     flat_fault_buffer: ?OwnedBuffer = null,
@@ -6818,6 +6850,9 @@ pub const Renderer = struct {
         for (self.imported_allocations.items) |allocation| self.releaseImportedAllocation(allocation);
         self.imported_allocations.deinit(self.allocator);
         self.draw_upload_cache.deinit(self.allocator);
+        for (self.index_cache.items) |entry| self.destroyBuffer(entry.buffer);
+        self.index_cache.deinit(self.allocator);
+        self.index_cache_streamed.deinit(self.allocator);
         self.draw_upload_source_scratch.deinit(self.allocator);
         for (self.draw_upload_spills.items) |buffer| self.destroyBuffer(buffer);
         self.draw_upload_spills.deinit(self.allocator);
@@ -17918,8 +17953,14 @@ pub const Renderer = struct {
                 const index_bytes = std.math.mul(u64, index_count, index_stride) catch
                     return Error.GuestBufferTooLarge;
                 if (index_bytes == 0 or index_bytes > maximum_frame_bytes) return Error.GuestBufferTooLarge;
-                const memory = self.guest_memory orelse return Error.GuestMemoryUnavailable;
                 const bytes: usize = @intCast(index_bytes);
+                index_upload = try self.cachedIndexBuffer(draw.index_address, bytes);
+            }
+        }
+        if (draw.index_count) |index_count| {
+            if (index_count != 0 and index_upload == null) {
+                const memory = self.guest_memory orelse return Error.GuestMemoryUnavailable;
+                const bytes: usize = @intCast(@as(u64, index_count) * @as(u64, if (draw.index_uint32) 4 else 2));
                 // Read before allocateDrawUpload, which can flush queued GPU
                 // work. Reuse storage, but refresh the guest bytes every draw.
                 var index_scratch = try self.index_scratch.acquire(self.allocator, bytes);
@@ -18255,11 +18296,15 @@ pub const Renderer = struct {
                 if (bytes > maximum_frame_bytes) return Error.GuestBufferTooLarge;
                 const memory = self.guest_memory orelse return Error.GuestMemoryUnavailable;
                 var available_offset = self.draw_upload_offset;
-                if (reserveAlignedRange(&available_offset, draw_upload_ring_bytes, bytes, draw_upload_alignment) != null) {
+                if (try self.cachedIndexBuffer(draw.index_address, bytes)) |cached| {
+                    indices = cached;
+                } else if (reserveAlignedRange(&available_offset, draw_upload_ring_bytes, bytes, draw_upload_alignment) != null) {
                     indices = try self.allocateDrawUpload(bytes);
                     const mapping = try self.mapDrawUpload(indices.?);
                     defer mapping.release(self);
                     if (!memory.read(memory.context, draw.index_address, mapping.bytes)) return Error.GuestMemoryReadFailed;
+                    self.frame_profile.upload_bytes +|= bytes;
+                    self.frame_profile.index_upload_bytes +|= bytes;
                 } else {
                     // A wrap could overwrite storage/scalar snapshots already
                     // bound for this not-yet-recorded draw. Keep them intact.
@@ -18269,9 +18314,9 @@ pub const Renderer = struct {
                     defer mapping.release(self);
                     if (!memory.read(memory.context, draw.index_address, mapping.bytes)) return Error.GuestMemoryReadFailed;
                     indices = .{ .buffer = buffer.handle, .offset = 0, .size = bytes };
+                    self.frame_profile.upload_bytes +|= bytes;
+                    self.frame_profile.index_upload_bytes +|= bytes;
                 }
-                self.frame_profile.upload_bytes +|= bytes;
-                self.frame_profile.index_upload_bytes +|= bytes;
             }
         }
 
@@ -31373,6 +31418,96 @@ pub const Renderer = struct {
         return findMemoryTypeIn(self.memory_properties, supported_bits, required);
     }
 
+    /// Index data for an indexed draw from a buffer kept across draws and
+    /// frames, or null when the range should take the per-draw upload ring.
+    ///
+    /// Indices were read from guest memory and copied into the ring for
+    /// every draw: 150 MiB per frame in ASTRO BOT's hub, for meshes whose
+    /// indices never change. The page tracker's generation proves a range
+    /// unchanged; a new generation writes a fresh buffer and retires the old
+    /// one once the GPU has finished reading it, so queued draws keep theirs.
+    /// The guest bytes are read exactly as the ring path reads them.
+    fn cachedIndexBuffer(self: *Renderer, address: u64, bytes: usize) anyerror!?DrawUploadSlice {
+        if (bytes < index_cache_min_bytes or bytes > index_cache_max_bytes / 4) return null;
+        const memory = self.guest_memory orelse return null;
+        if (memory.track_gpu_read == null) return null;
+        if (self.index_cache_streamed.contains(address)) return null;
+        var found: ?usize = null;
+        for (self.index_cache.items, 0..) |entry, index| {
+            if (entry.address == address and entry.bytes == bytes) {
+                found = index;
+                break;
+            }
+        }
+        var observation: BufferPageObservation = if (found) |index| self.index_cache.items[index].observation else .{};
+        const generation = observation.observe(memory, address, bytes);
+        if (generation == 0) return null;
+        if (found) |index| {
+            const entry = &self.index_cache.items[index];
+            entry.observation = observation;
+            entry.last_used_frame = self.frame_sequence;
+            if (entry.generation == generation)
+                return .{ .buffer = entry.buffer.handle, .offset = 0, .size = bytes };
+            entry.rewrites +|= 1;
+            if (entry.rewrites > index_cache_max_rewrites) {
+                // Streamed indices: stop caching and let the ring take them.
+                self.destroyBuffer(entry.buffer);
+                self.index_cache_bytes -= entry.bytes;
+                _ = self.index_cache.swapRemove(index);
+                try self.index_cache_streamed.put(self.allocator, address, {});
+                return null;
+            }
+        } else {
+            try self.trimIndexCache(bytes);
+        }
+        const buffer = try self.createBufferWithMemoryPreference(
+            bytes,
+            vk.buffer_usage_index_buffer_bit,
+            vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit,
+            vk.memory_property_device_local_bit,
+        );
+        errdefer self.destroyBuffer(buffer);
+        {
+            const mapping = try self.mapBufferRange(buffer, 0, bytes);
+            defer mapping.release(self);
+            if (!memory.read(memory.context, address, mapping.bytes)) return Error.GuestMemoryReadFailed;
+        }
+        self.frame_profile.upload_bytes +|= bytes;
+        self.frame_profile.index_upload_bytes +|= bytes;
+        if (found) |index| {
+            const entry = &self.index_cache.items[index];
+            self.destroyBuffer(entry.buffer);
+            entry.buffer = buffer;
+            entry.generation = generation;
+        } else {
+            try self.index_cache.append(self.allocator, .{
+                .address = address,
+                .bytes = bytes,
+                .buffer = buffer,
+                .observation = observation,
+                .generation = generation,
+                .last_used_frame = self.frame_sequence,
+            });
+            self.index_cache_bytes += bytes;
+        }
+        return .{ .buffer = buffer.handle, .offset = 0, .size = bytes };
+    }
+
+    /// Retires the least recently used ranges until `incoming` fits.
+    fn trimIndexCache(self: *Renderer, incoming: usize) anyerror!void {
+        while (self.index_cache.items.len != 0 and
+            (self.index_cache.items.len >= index_cache_max_entries or self.index_cache_bytes + incoming > index_cache_max_bytes))
+        {
+            var oldest: usize = 0;
+            for (self.index_cache.items, 0..) |entry, index| {
+                if (entry.last_used_frame < self.index_cache.items[oldest].last_used_frame) oldest = index;
+            }
+            const victim = self.index_cache.swapRemove(oldest);
+            self.index_cache_bytes -= victim.bytes;
+            self.destroyBuffer(victim.buffer);
+        }
+    }
+
     fn writeMapped(self: *Renderer, buffer: OwnedBuffer, bytes: []const u8) Error!void {
         return self.writeMappedAt(buffer, 0, bytes);
     }
@@ -31958,10 +32093,11 @@ pub const Renderer = struct {
             covered = true;
         }
         if (!covered) return false;
-        // Deferred labels never overlap a cached guest buffer, so the bytes
-        // around them are CPU-owned and current in guest memory.
+        // A cache entry without GPU writes is a copy of guest memory, so the
+        // bytes around a pending label are current there. One holding
+        // unpublished GPU output is not; read through the ordinary path.
         for (self.guest_buffers.items) |entry| {
-            if (byteRangesOverlap(address, bytes.len, entry.guest_address, entry.size)) return false;
+            if (entry.gpu_dirty and byteRangesOverlap(address, bytes.len, entry.guest_address, entry.size)) return false;
         }
         const memory = self.guest_memory orelse return false;
         if (!memory.read(memory.context, address, bytes)) return false;
@@ -32171,17 +32307,24 @@ pub const Renderer = struct {
         // be delayed. 64-bit immediate labels and end-of-pipe interrupts are
         // queued too: the guest is told only when the label is published.
         if (!self.defer_internal_releases or !self.timeline_scheduler_enabled or
-            self.imported_allocations.items.len != 0 or
-            release.address == 0 or release.destination > 1 or
-            release.data_selection < 1 or release.data_selection > 4) return false;
-        const size: usize = if (release.data_selection == 1) 4 else 8;
-        // A label inside a cached buffer needs the ordinary writeback and
-        // invalidation path. CPU-consumed compute output written before the
-        // label is published with it, when the label is (drainInternalReleases).
+            self.imported_allocations.items.len != 0 or release.data_selection > 5) return false;
+        const pending = DeferredRelease{ .tick = 0, .release = release };
+        const size = pending.size();
+        // A label needs a CPU-visible destination. A release without one
+        // (no data, or GDS) only orders its interrupt behind the work before
+        // it, which a queued entry does as well as a host wait would.
+        if (size != 0 and (release.address == 0 or release.destination > 1)) return false;
+        // ASTRO BOT keeps its labels beside small constant blocks the GPU
+        // reads, so most of its releases land inside a cached buffer; refusing
+        // them cost a host wait each, about half of every frame. Publication
+        // goes through dcbWrite, which writes back and invalidates overlapping
+        // cache entries like any CP write; any reader staged later drains the
+        // label first. Only a buffer still holding unpublished GPU writes needs
+        // the immediate path, so those writes reach memory before the label.
         var label_candidates = self.guest_buffer_overlap_index.candidates(self.guest_buffers.items, release.address, size);
         while (label_candidates.next()) |index| {
             const entry = &self.guest_buffers.items[index];
-            if (byteRangesOverlap(release.address, size, entry.guest_address, entry.size)) return false;
+            if (entry.gpu_dirty and byteRangesOverlap(release.address, size, entry.guest_address, entry.size)) return false;
         }
         if (self.deferred_internal_release_count == self.deferred_internal_releases.len)
             try self.drainInternalReleases(self.deferred_internal_release_count);
@@ -32294,6 +32437,10 @@ pub const Renderer = struct {
                 if (!dcbRead(self, release.address, &counters)) return Error.GuestMemoryReadFailed;
                 for (0..16) |db| @memcpy(counters[db * 16 ..][0..8], &pending.fixed.?);
                 if (!dcbWrite(self, release.address, &counters)) return Error.GuestMemoryWriteFailed;
+                continue;
+            }
+            if (size == 0) {
+                if (self.deferred_release_observer) |observe| observe(release);
                 continue;
             }
             var bytes: [8]u8 = undefined;
@@ -42435,10 +42582,15 @@ test "wait projection handles 64-bit release halves and ordered overwrites witho
     try std.testing.expect(renderer.readProjectedReleases(0x10f0, &high));
     try std.testing.expectEqual(@as(u32, 0x92913344), std.mem.readInt(u32, &high, .little));
     try std.testing.expect(std.mem.allEqual(u8, &memory.bytes, 0xcc));
+    // A cached copy of guest memory leaves the surrounding bytes current
+    // there; one holding unpublished GPU output does not.
     var resident: GuestBufferEntry = undefined;
     resident.guest_address = 0x1000;
     resident.size = 32;
+    resident.gpu_dirty = false;
     renderer.guest_buffers = .{ .items = @as(*[1]GuestBufferEntry, @ptrCast(&resident)), .capacity = 1 };
+    try std.testing.expect(renderer.readProjectedReleases(0x1000, &bytes));
+    resident.gpu_dirty = true;
     try std.testing.expect(!renderer.readProjectedReleases(0x1000, &bytes));
 }
 
