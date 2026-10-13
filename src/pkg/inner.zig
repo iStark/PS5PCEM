@@ -250,6 +250,9 @@ fn decodeTail(
     const logical_base = blocks[start_index].logical;
     var total: usize = 0;
     for (blocks[start_index..]) |b| total += b.uncomp;
+    std.debug.print("  decoding meta {d} bytes from {d} blocks at logical 0x{x} (mount base 0x{x})\n", .{
+        total, blocks.len - start_index, blocks[start_index].logical, meta_base,
+    });
     var buf = allocator.alloc(u8, total) catch return error.OutOfMemory;
     errdefer allocator.free(buf);
     var off: usize = 0;

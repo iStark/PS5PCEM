@@ -44,6 +44,24 @@ const WriteCtx = struct {
     }
 };
 
+/// The CNT region of the package file, read where each entry lies.
+const FileSource = struct {
+    file: std.Io.File,
+    io: std.Io,
+    offset: u64,
+    size: u64,
+
+    pub fn len(self: FileSource) u64 {
+        return self.size;
+    }
+
+    pub fn read(self: FileSource, offset: u64, buffer: []u8) !void {
+        if (offset > self.size or buffer.len > self.size - offset) return error.TruncatedPackage;
+        const got = try self.file.readPositionalAll(self.io, buffer, self.offset + offset);
+        if (got != buffer.len) return error.TruncatedPackage;
+    }
+};
+
 fn defaultOutputPath(allocator: std.mem.Allocator, pkg_path: []const u8) ![]u8 {
     const stem = std.fs.path.stem(pkg_path);
     const dir = std.fs.path.dirname(pkg_path) orelse ".";
@@ -126,6 +144,8 @@ pub fn main(init: std.process.Init) !void {
 
     var cnt_offset: u64 = 0;
     var cnt_size: u64 = file_size;
+    // The CNT runs to the end of the file; its entries are read one at a
+    // time, so no part of it needs to fit in memory at once.
     var pfs_offset: u64 = 0;
     var pfs_size: u64 = 0;
     var superblock_abs: u64 = 0;
@@ -146,14 +166,7 @@ pub fn main(init: std.process.Init) !void {
         );
     }
 
-    if (cnt_size > 64 * 1024 * 1024) cnt_size = 64 * 1024 * 1024;
-    const cnt_len: usize = std.math.cast(usize, cnt_size) orelse return error.TruncatedPackage;
-    const cnt_buf = try arena.alloc(u8, cnt_len);
-    const got = file.readPositionalAll(io, cnt_buf, cnt_offset) catch |err| {
-        try stderr.print("cannot read CNT: {s}\n", .{@errorName(err)});
-        try stderr.flush();
-        return err;
-    };
+    const source = FileSource{ .file = file, .io = io, .offset = cnt_offset, .size = cnt_size };
 
     std.Io.Dir.cwd().createDirPath(io, dest_path) catch |err| switch (err) {
         error.PathAlreadyExists => {},
@@ -171,7 +184,7 @@ pub fn main(init: std.process.Init) !void {
     defer dest.close(io);
 
     var ctx = WriteCtx{ .dest = dest, .io = io, .allocator = arena };
-    const result = pkg.visitExtractable(cnt_buf[0..got], &ctx, WriteCtx.visit) catch |err| {
+    const result = pkg.visitExtractable(std.heap.page_allocator, source, &ctx, WriteCtx.visit) catch |err| {
         try stderr.print("extract failed: {s}\n", .{@errorName(err)});
         try stderr.flush();
         return err;

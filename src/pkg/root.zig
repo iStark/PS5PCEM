@@ -194,30 +194,82 @@ pub fn sceSysRelative(name: []const u8) []const u8 {
     return trimmed;
 }
 
+/// A CNT held in memory, as a source for `visitExtractable`.
+pub const MemorySource = struct {
+    bytes: []const u8,
+
+    pub fn len(self: MemorySource) u64 {
+        return self.bytes.len;
+    }
+
+    pub fn read(self: MemorySource, offset: u64, buffer: []u8) Error!void {
+        if (offset > self.bytes.len or buffer.len > self.bytes.len - offset) return error.TruncatedPackage;
+        @memcpy(buffer, self.bytes[@intCast(offset)..][0..buffer.len]);
+    }
+};
+
+pub const ExtractResult = struct { written: u32, skipped_encrypted: u32, content_id: [36]u8 };
+
 /// Yields unencrypted CNT payloads with `sce_sys/`-relative names.
+///
+/// `source` provides `len() u64` and `read(offset, buffer) !void` over the
+/// CNT. Only its header, entry table and names are kept; each payload is read
+/// when its turn comes. A finished package's CNT holds the store artwork and
+/// image digests, which reach hundreds of megabytes: reading a fixed prefix of
+/// it cut off every entry stored after the first 64 MiB, param.json among
+/// them, and the package was reported truncated.
+///
+/// The bytes handed to `visitor` are valid only until it returns.
 pub fn visitExtractable(
-    cnt: []const u8,
+    allocator: std.mem.Allocator,
+    source: anytype,
     context: anytype,
     comptime visitor: fn (@TypeOf(context), relative: []const u8, bytes: []const u8) anyerror!void,
-) !struct { written: u32, skipped_encrypted: u32, content_id: [36]u8 } {
-    const info = try parseCnt(cnt);
-    const names = namesTable(cnt, info);
-    var written: u32 = 0;
-    var skipped: u32 = 0;
+) !ExtractResult {
+    const available = source.len();
+    var header: [0x70]u8 = undefined;
+    if (available < header.len) return error.TruncatedPackage;
+    try source.read(0, &header);
+    const entry_count = std.mem.readInt(u32, header[16..20], .big);
+    const table_offset = std.mem.readInt(u32, header[24..28], .big);
+    const table_end = @as(u64, table_offset) + @as(u64, entry_count) * 0x20;
+    if (table_end > available) return error.InvalidCnt;
+    const metadata = try allocator.alloc(u8, @intCast(@max(table_end, header.len)));
+    defer allocator.free(metadata);
+    try source.read(0, metadata);
+    const info = try parseCnt(metadata);
+
+    var names: []u8 = &.{};
+    defer allocator.free(names);
     var i: u32 = 0;
     while (i < info.entry_count) : (i += 1) {
-        const entry = try readEntry(cnt, info, i);
+        const entry = try readEntry(metadata, info, i);
+        if (entry.id != 0x0200 or entry.encrypted() or @as(u64, entry.offset) + entry.size > available) continue;
+        names = try allocator.alloc(u8, entry.size);
+        try source.read(entry.offset, names);
+        break;
+    }
+
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(allocator);
+    var written: u32 = 0;
+    var skipped: u32 = 0;
+    i = 0;
+    while (i < info.entry_count) : (i += 1) {
+        const entry = try readEntry(metadata, info, i);
         if (entry.size == 0) continue;
         if (entry.encrypted()) {
             skipped += 1;
             continue;
         }
         const end = @as(u64, entry.offset) + entry.size;
-        if (end > cnt.len) return error.TruncatedPackage;
+        if (end > available) return error.TruncatedPackage;
         const raw_name = sceSysRelative(entryName(names, entry));
         if (raw_name.len == 0) continue;
         if (std.mem.eql(u8, raw_name, "unnamed.bin") and entry.id != 0x040a) continue;
-        try visitor(context, raw_name, cnt[entry.offset..][0..entry.size]);
+        try payload.resize(allocator, entry.size);
+        try source.read(entry.offset, payload.items);
+        try visitor(context, raw_name, payload.items);
         written += 1;
     }
     return .{ .written = written, .skipped_encrypted = skipped, .content_id = info.content_id };
@@ -247,8 +299,22 @@ test "parseFih reads little-endian segment offsets" {
     try std.testing.expectEqual(Kind.fih_debug, fih.kind());
 }
 
+/// Copies what it is given: the extractor reuses its buffers between entries.
 fn testCollect(list: *std.ArrayList(ExtractedFile), relative: []const u8, bytes: []const u8) anyerror!void {
-    try list.append(std.testing.allocator, .{ .relative = relative, .bytes = bytes });
+    const allocator = std.testing.allocator;
+    const owned_relative = try allocator.dupe(u8, relative);
+    errdefer allocator.free(owned_relative);
+    const owned_bytes = try allocator.dupe(u8, bytes);
+    errdefer allocator.free(owned_bytes);
+    try list.append(allocator, .{ .relative = owned_relative, .bytes = owned_bytes });
+}
+
+fn freeCollected(list: *std.ArrayList(ExtractedFile)) void {
+    for (list.items) |file| {
+        std.testing.allocator.free(file.relative);
+        std.testing.allocator.free(file.bytes);
+    }
+    list.deinit(std.testing.allocator);
 }
 
 test "visitExtractable yields unencrypted param.json" {
@@ -264,8 +330,8 @@ test "visitExtractable yields unencrypted param.json" {
     @memcpy(cnt[0xa0..0xaf], "{\"titleId\":\"X\"}");
 
     var list: std.ArrayList(ExtractedFile) = .empty;
-    defer list.deinit(std.testing.allocator);
-    const result = try visitExtractable(&cnt, &list, testCollect);
+    defer freeCollected(&list);
+    const result = try visitExtractable(std.testing.allocator, MemorySource{ .bytes = &cnt }, &list, testCollect);
     try std.testing.expectEqual(@as(u32, 1), result.written);
     try std.testing.expectEqualStrings("param.json", list.items[0].relative);
     try std.testing.expectEqualStrings("{\"titleId\":\"X\"}", list.items[0].bytes);
@@ -281,8 +347,38 @@ test "encrypted CNT entries are skipped" {
     std.mem.writeInt(u32, cnt[0x90..][0..4], 0x90, .big);
     std.mem.writeInt(u32, cnt[0x94..][0..4], 4, .big);
     var list: std.ArrayList(ExtractedFile) = .empty;
-    defer list.deinit(std.testing.allocator);
-    const result = try visitExtractable(&cnt, &list, testCollect);
+    defer freeCollected(&list);
+    const result = try visitExtractable(std.testing.allocator, MemorySource{ .bytes = &cnt }, &list, testCollect);
     try std.testing.expectEqual(@as(u32, 0), result.written);
     try std.testing.expectEqual(@as(u32, 1), result.skipped_encrypted);
+}
+
+test "entries far into a large CNT are read where they lie" {
+    // An entry beyond the first 64 MiB, as param.json is in a package whose
+    // CNT also carries large artwork and image digests.
+    const size = 64 * 1024 * 1024 + 0x1000;
+    const cnt = try std.testing.allocator.alloc(u8, size);
+    defer std.testing.allocator.free(cnt);
+    @memset(cnt, 0);
+    cnt[0..4].* = cnt_magic;
+    std.mem.writeInt(u32, cnt[12..16], 1, .big);
+    std.mem.writeInt(u32, cnt[16..20], 1, .big);
+    std.mem.writeInt(u32, cnt[24..28], 0x80, .big);
+    const payload_offset: u32 = size - 0x100;
+    std.mem.writeInt(u32, cnt[0x80..][0..4], 0x2000, .big);
+    std.mem.writeInt(u32, cnt[0x90..][0..4], payload_offset, .big);
+    std.mem.writeInt(u32, cnt[0x94..][0..4], 15, .big);
+    @memcpy(cnt[payload_offset..][0..15], "{\"titleId\":\"Y\"}");
+
+    var list: std.ArrayList(ExtractedFile) = .empty;
+    defer freeCollected(&list);
+    const result = try visitExtractable(std.testing.allocator, MemorySource{ .bytes = cnt }, &list, testCollect);
+    try std.testing.expectEqual(@as(u32, 1), result.written);
+    try std.testing.expectEqualStrings("{\"titleId\":\"Y\"}", list.items[0].bytes);
+
+    // A payload past the real end is still reported as truncation.
+    std.mem.writeInt(u32, cnt[0x94..][0..4], 0x200, .big);
+    var short: std.ArrayList(ExtractedFile) = .empty;
+    defer freeCollected(&short);
+    try std.testing.expectError(error.TruncatedPackage, visitExtractable(std.testing.allocator, MemorySource{ .bytes = cnt }, &short, testCollect));
 }

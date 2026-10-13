@@ -81,10 +81,13 @@ pub const Layout = struct {
     counts: Counts,
     file_offsets: []FileOffset,
     cblocks: []CblockInfo,
+    /// Every file offset, ascending, for `nextBoundary`.
+    boundaries: []u64,
 
     pub fn deinit(self: Layout, allocator: std.mem.Allocator) void {
         allocator.free(self.file_offsets);
         allocator.free(self.cblocks);
+        allocator.free(self.boundaries);
     }
 
     /// The terminal entry. Earlier file boundaries can carry the same kind.
@@ -98,14 +101,20 @@ pub const Layout = struct {
         return 0;
     }
 
+    /// The first file offset after `cur`, or `mount` if none comes sooner.
+    ///
+    /// Asked once per 256 KiB block. A scan of every offset made that
+    /// quadratic: a 35 GB title with tens of thousands of files spent many
+    /// minutes here before writing its first byte.
     pub fn nextBoundary(self: Layout, cur: u64, mount: u64) u64 {
-        var best: u64 = mount;
-        for (self.file_offsets) |entry| {
-            if (entry.uncompressed_offset > cur and entry.uncompressed_offset <= mount and entry.uncompressed_offset < best) {
-                best = entry.uncompressed_offset;
-            }
+        var low: usize = 0;
+        var high = self.boundaries.len;
+        while (low < high) {
+            const mid = low + (high - low) / 2;
+            if (self.boundaries[mid] <= cur) low = mid + 1 else high = mid;
         }
-        return best;
+        if (low == self.boundaries.len) return mount;
+        return @min(self.boundaries[low], mount);
     }
 };
 
@@ -196,7 +205,34 @@ pub fn parse(allocator: std.mem.Allocator, blob: []const u8) Error!Layout {
         cblocks[i] = try decodeCblock(blob[rec_off..][0..cblock_stride]);
     }
 
-    return .{ .counts = counts, .file_offsets = file_offsets, .cblocks = cblocks };
+    const boundaries = allocator.alloc(u64, fidx_n) catch return error.TruncatedNaps;
+    errdefer allocator.free(boundaries);
+    for (file_offsets, boundaries) |entry, *boundary| boundary.* = entry.uncompressed_offset;
+    std.mem.sort(u64, boundaries, {}, std.sort.asc(u64));
+
+    return .{ .counts = counts, .file_offsets = file_offsets, .cblocks = cblocks, .boundaries = boundaries };
+}
+
+test "the next boundary is the first offset past the cursor, capped at the mount" {
+    var offsets = [_]FileOffset{
+        .{ .kind = 0, .uncompressed_offset = 0x80000 },
+        .{ .kind = 0, .uncompressed_offset = 0 },
+        .{ .kind = 0, .uncompressed_offset = 0x40000 },
+        .{ .kind = 0x40, .uncompressed_offset = 0x100000 },
+    };
+    var boundaries = [_]u64{ 0, 0x40000, 0x80000, 0x100000 };
+    const layout = Layout{
+        .counts = undefined,
+        .file_offsets = &offsets,
+        .cblocks = &.{},
+        .boundaries = &boundaries,
+    };
+    try std.testing.expectEqual(@as(u64, 0x40000), layout.nextBoundary(0, 0x100000));
+    try std.testing.expectEqual(@as(u64, 0x80000), layout.nextBoundary(0x40000, 0x100000));
+    try std.testing.expectEqual(@as(u64, 0x80000), layout.nextBoundary(0x50000, 0x100000));
+    try std.testing.expectEqual(@as(u64, 0x100000), layout.nextBoundary(0x80000, 0x100000));
+    try std.testing.expectEqual(@as(u64, 0xc0000), layout.nextBoundary(0x80000, 0xc0000));
+    try std.testing.expectEqual(@as(u64, 0x100000), layout.nextBoundary(0x100000, 0x100000));
 }
 
 fn sectionEnd(counts: Counts, fidx_n: usize) usize {
