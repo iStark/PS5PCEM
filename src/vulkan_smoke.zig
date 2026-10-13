@@ -3557,9 +3557,10 @@ fn runDppProbe(allocator: std.mem.Allocator) !void {
 }
 
 fn runDeferredShaderMetadataProbe(allocator: std.mem.Allocator) !void {
-    for ([_]bool{ false, true }) |deferred| {
+    for ([_]bool{ false, true }) |indexed| for ([_]bool{ false, true }) |deferred| {
         var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true, .defer_small_storage_writes = deferred });
         defer renderer.deinit();
+        renderer.indexed_buffer_alias_queries = indexed;
         var guest = GuestMemory{};
         _ = renderer.dcbBackend(guest.interface());
         // One GPU dispatch generates a V# inside a small output buffer. The
@@ -3586,6 +3587,13 @@ fn runDeferredShaderMetadataProbe(allocator: std.mem.Allocator) !void {
             try state.writeRegister(.shader, stage.userDataBase() + @as(u32, @intCast(i)), word);
         _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
         try std.testing.expectEqual(@as(u32, if (deferred) 0 else 0x6000), std.mem.readInt(u32, guest.bytes[0x1010..][0..4], .little));
+        // Add unrelated small producers to exercise descriptor discovery with
+        // a populated range index. Check their final contents too: publication
+        // can occur at another synchronization point before the consumer.
+        for (0..64) |i| {
+            try state.writeRegister(.shader, stage.userDataBase(), 0x4000 + @as(u32, @intCast(i * 32)));
+            _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
+        }
         try state.writeRegister(.shader, stage.programRegisterBase(), 2);
         for ([_]u32{ 0x1000, 0, 0, 0, 0x3000, 0, 4, 0 }, 0..) |word, i|
             try state.writeRegister(.shader, stage.userDataBase() + @as(u32, @intCast(i)), word);
@@ -3638,8 +3646,10 @@ fn runDeferredShaderMetadataProbe(allocator: std.mem.Allocator) !void {
         if (renderer.last_draw_error) |err| return err;
         try renderer.flushPendingGuestWrites();
         for (0..64) |pixel| try std.testing.expectEqual(@as(u32, 0xff0000ff), std.mem.readInt(u32, guest.bytes[0x2000 + pixel * 4 ..][0..4], .little));
-    }
-    std.debug.print("GPU-generated shader metadata passed: interior descriptor reads before dependent compute and graphics, eager and deferred writes\n", .{});
+        for (0..64) |i| try std.testing.expectEqual(@as(u32, 0x6000), std.mem.readInt(u32, guest.bytes[0x4010 + i * 32 ..][0..4], .little));
+        std.debug.print("  metadata indexed={any} deferred={any} candidates={d}\n", .{ indexed, deferred, renderer.frame_profile.shader_metadata_candidates });
+    };
+    std.debug.print("GPU-generated shader metadata passed: interior descriptor reads before dependent compute and graphics, eager/deferred and indexed/linear paths, contents of 64 unrelated producers preserved\n", .{});
 }
 
 /// Exercise both command processors against the actual renderer: a blocked
@@ -5252,6 +5262,11 @@ fn runZeroDepthSampleProbe(allocator: std.mem.Allocator) !void {
 }
 
 fn runDepthStorageProbe(allocator: std.mem.Allocator) !void {
+    for ([_]u32{ 22, 20 }) |format| try runDepth32StorageProbe(allocator, format);
+    for ([_]u32{ 7, 11 }) |format| try runDepth16StorageProbe(allocator, format);
+}
+
+fn runDepth32StorageProbe(allocator: std.mem.Allocator, format: u32) !void {
     var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true });
     defer renderer.deinit();
     var guest = GuestMemory{};
@@ -5274,7 +5289,7 @@ fn runDepthStorageProbe(allocator: std.mem.Allocator) !void {
     for (load, 0..) |word, index| guest.word(0x100 + index * 4, word);
     for (store, 0..) |word, index| guest.word(0x400 + index * 4, word);
     var depth = sampledImageDescriptorWords(0x1000, 32, 32);
-    depth[1] = (depth[1] & ~@as(u32, 0x1ff00000)) | (22 << 20);
+    depth[1] = (depth[1] & ~@as(u32, 0x1ff00000)) | (format << 20);
     var stencil = sampledImageDescriptorWords(0x3000, 32, 32);
     stencil[1] = (stencil[1] & ~@as(u32, 0x1ff00000)) | (5 << 20);
     var state = gpu.State{};
@@ -5303,7 +5318,62 @@ fn runDepthStorageProbe(allocator: std.mem.Allocator) !void {
     try std.testing.expectEqual(@as(f32, 0.5), result.depth);
     try std.testing.expectEqual(@as(u8, 0x23), result.stencil);
     try renderer.probeIndependentDepthStencilPlanes();
-    std.debug.print("depth storage passed: current D32/S8 reads, repeated clears and compute writes returned to the attachment\n", .{});
+    std.debug.print("depth storage passed: D32 color format={d}/S8 reads, repeated clears and compute writes returned to the attachment\n", .{format});
+}
+
+fn runDepth16StorageProbe(allocator: std.mem.Allocator, format: u32) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true });
+    defer renderer.deinit();
+    var guest = GuestMemory{};
+    _ = renderer.dcbBackend(guest.interface());
+    const load = [_]u32{
+        vop1(1, 0, 128), vop1(1, 1, 128),
+        0xf000_0108, 0x0000_0200, // image_load depth v2, T#s0
+        0xe070_0000, 0x8002_0200, // buffer_store_dword v2, V#s8
+        0xbf81_0000,
+    };
+    const store = [_]u32{
+        vop1(1, 0, 128), vop1(1, 1, 128),
+        vop1(1, 2, 255), if (format == 11) @as(u32, 0x1234) else @as(u32, 0x3f00_0000),
+        0xf020_0108,     0x0000_0200,
+        0xbf81_0000,
+    };
+    for (load, 0..) |word, index| guest.word(0x100 + index * 4, word);
+    for (store, 0..) |word, index| guest.word(0x400 + index * 4, word);
+    var depth = sampledImageDescriptorWords(0x1000, 32, 32);
+    depth[1] = (depth[1] & ~@as(u32, 0x1ff00000)) | (format << 20);
+    var state = gpu.State{};
+    const compute = gpu.resources.ShaderStage.compute;
+    try state.writeRegister(.shader, compute.programRegisterBase(), 1);
+    try state.writeRegister(.shader, compute.programRegisterBase() + 1, 0);
+    try state.writeRegister(.shader, 0x213, 12 << 1);
+    const userdata = depth ++ [_]u32{ 0x8000, 4 << 16, 1, 0 };
+    for (userdata, 0..) |word, index| try state.writeRegister(.shader, compute.userDataBase() + @as(u32, @intCast(index)), word);
+    for ([_]f32{ 0.25, 0.75 }) |value| {
+        try renderer.probeDepth16Clear(value);
+        const bits = try renderer.probeDepth16Bits();
+        for (0..2) |_| {
+            _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
+            var bytes: [4]u8 = undefined;
+            try renderer.readbackGuestStorageBuffer(0x8000, &bytes);
+            const raw = std.mem.readInt(u32, &bytes, .little);
+            if (format == 11) {
+                try std.testing.expectEqual(@as(u32, bits), raw);
+            } else {
+                try std.testing.expectApproxEqAbs(@as(f32, @floatFromInt(bits)) / 65535.0, @as(f32, @bitCast(raw)), 0.000001);
+            }
+        }
+        try std.testing.expect(std.mem.allEqual(u8, guest.bytes[0x1000..0x1800], 0));
+    }
+    try state.writeRegister(.shader, compute.programRegisterBase(), 4);
+    _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
+    const stored = try renderer.probeDepth16Bits();
+    if (format == 11) {
+        try std.testing.expectEqual(@as(u16, 0x1234), stored);
+    } else {
+        try std.testing.expect(stored == 32767 or stored == 32768);
+    }
+    std.debug.print("depth storage passed: D16 color format={d} loads, repeated clears and storage writes preserve attachment bits\n", .{format});
 }
 
 fn runLayeredVolumeProbe(allocator: std.mem.Allocator) !void {
@@ -9604,7 +9674,9 @@ fn runFlatWaveSnapshotProbe(allocator: std.mem.Allocator) !void {
     for (code, 0..) |word, index| guest.word(0x100 + index * 4, word);
     var analysis = try gpu.shader_analysis.decode(allocator, .{ .context = &guest, .read_fn = GuestMemory.read }, 0x100, code.len);
     defer analysis.deinit(allocator);
-    for ([_]bool{ false, true }) |compact_lookup| for ([_]bool{ false, true }) |bvh_mode1| {
+    const regions = [_]@import("rdna2").spirv.FlatMemoryBinding{ .{ .descriptor_index = 2, .fault_record_word = 20 }, .{ .descriptor_index = 4 }, .{ .descriptor_index = 5 }, .{ .descriptor_index = 3 } } ** 4;
+    for ([_]bool{ false, true }) |compact_lookup| for ([_]bool{ false, true }) |bvh_mode1| for ([_]bool{ false, true }) |lookup_helper| {
+        if (!compact_lookup and lookup_helper) continue;
         if (bvh_mode1 and !renderer.storage_buffer_nonuniform_indexing) continue;
         var module = try analysis.translateSpirv(allocator, .{
             .stage = .compute,
@@ -9615,10 +9687,11 @@ fn runFlatWaveSnapshotProbe(allocator: std.mem.Allocator) !void {
                 .{ .resource_sgpr = 12, .descriptor_index = 1, .stride = 16 },
             },
             .flat_memories = if (compact_lookup)
-                &.{ .{ .descriptor_index = 2, .fault_record_word = 20 }, .{ .descriptor_index = 4 }, .{ .descriptor_index = 5 }, .{ .descriptor_index = 3 } }
+                &regions
             else
                 &.{ .{ .descriptor_index = 2, .fault_record_word = 20 }, .{ .descriptor_index = 3 } },
             .snapshot_unbound_reads = compact_lookup,
+            .snapshot_lookup_helper = lookup_helper,
             .bvh_intersection_mode1 = bvh_mode1,
         });
         defer module.deinit(allocator);
@@ -9676,7 +9749,7 @@ fn runFlatWaveSnapshotProbe(allocator: std.mem.Allocator) !void {
             try std.testing.expectEqual(@as(u32, 12), std.mem.readInt(u32, header[80..84], .little));
         }
     };
-    std.debug.print("FLAT wave snapshots passed: divergent descriptors, last overlapping region wins, unaligned loads, relocation, partial vector bounds and faults\n", .{});
+    std.debug.print("FLAT wave snapshots passed: divergent descriptors, last overlapping region wins, unaligned loads, relocation, partial vector bounds and faults; inline and shared lookup\n", .{});
 }
 
 fn runFlatPointerProbe(allocator: std.mem.Allocator) !void {
@@ -9975,6 +10048,7 @@ fn runUnboundSnapshotProbe(allocator: std.mem.Allocator) !void {
     defer renderer.deinit();
     var guest = GuestMemory{};
     _ = renderer.dcbBackend(guest.interface());
+    const regions = [_]@import("rdna2").spirv.FlatMemoryBinding{ .{ .descriptor_index = 1, .fault_record_word = 132 }, .{ .descriptor_index = 2 }, .{ .descriptor_index = 3 }, .{ .descriptor_index = 4 } } ** 4;
     for ([_]bool{ false, true }) |repeat| {
         const body = [_]u32{
             sop1(3, 0, 255), 0x1000, sop1(3, 1, 255), 0x20,
@@ -10003,7 +10077,7 @@ fn runUnboundSnapshotProbe(allocator: std.mem.Allocator) !void {
                 .snapshot_unbound_reads = true,
                 .storage_buffers = &.{.{ .resource_sgpr = 12, .descriptor_index = 0, .stride = 16 }},
                 .flat_memories = if (compact_lookup)
-                    &.{ .{ .descriptor_index = 1, .fault_record_word = 132 }, .{ .descriptor_index = 2 }, .{ .descriptor_index = 3 }, .{ .descriptor_index = 4 } }
+                    &regions
                 else
                     &.{.{ .descriptor_index = 1, .fault_record_word = 132 }},
             });
@@ -10053,6 +10127,7 @@ fn runBvhIntersectionProbe(allocator: std.mem.Allocator) !void {
     defer renderer.deinit();
     var guest = GuestMemory{};
     _ = renderer.dcbBackend(guest.interface());
+    const regions = [_]@import("rdna2").spirv.FlatMemoryBinding{ .{ .descriptor_index = 2, .fault_record_word = 148 }, .{ .descriptor_index = 3 }, .{ .descriptor_index = 4 }, .{ .descriptor_index = 5 } } ** 4;
     var code: std.ArrayList(u32) = .empty;
     defer code.deinit(allocator);
     // The captured instruction uses NSA operands and overwrites v2:v5.
@@ -10076,7 +10151,7 @@ fn runBvhIntersectionProbe(allocator: std.mem.Allocator) !void {
             .storage_buffers = &.{ .{ .resource_sgpr = 0, .descriptor_index = 0, .stride = 44 }, .{ .resource_sgpr = 12, .descriptor_index = 1, .stride = 16 } },
             .snapshot_unbound_reads = compact_lookup,
             .flat_memories = if (compact_lookup)
-                &.{ .{ .descriptor_index = 2, .fault_record_word = 148 }, .{ .descriptor_index = 3 }, .{ .descriptor_index = 4 }, .{ .descriptor_index = 5 } }
+                &regions
             else
                 &.{.{ .descriptor_index = 2, .fault_record_word = 148 }},
         });
@@ -12934,6 +13009,12 @@ pub fn main(init: std.process.Init) !void {
         try runDeferredShaderMetadataProbe(allocator);
         return;
     }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--zero-position-clip")) {
+        var renderer = try vulkan.Renderer.init(allocator, .{});
+        defer renderer.deinit();
+        try renderer.probeZeroPositionClip();
+        return;
+    }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--tessellation-inputs")) {
         var renderer = try vulkan.Renderer.init(allocator, .{});
         defer renderer.deinit();
@@ -12997,7 +13078,7 @@ pub fn main(init: std.process.Init) !void {
             memory.fingerprint = GuestMemory.fingerprint;
             _ = renderer.dcbBackend(memory);
             try renderer.probeSampledArrayRefresh();
-            std.debug.print("sampled array refresh passed: timeline={any}, preserved layers, queued revisions, CPU-write and prepared-binding rejection, no texture upload/readback\n", .{timeline});
+            std.debug.print("sampled array refresh passed: timeline={any}, preserved layers, queued and materialized revisions, unknown-version/CPU-write/prepared-binding rejection, no extra texture upload/readback\n", .{timeline});
         }
         return;
     }

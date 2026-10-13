@@ -3223,6 +3223,7 @@ const FrameProfile = struct {
     sampled_view_hits: u64 = 0,
     sampled_array_refreshes: u64 = 0,
     sampled_array_layers: u64 = 0,
+    sampled_array_rejections: [10]u64 = @splat(0),
     sampled_slow_paths: u64 = 0,
     flush_alias_ns: u64 = 0,
     flush_storage_image_ns: u64 = 0,
@@ -3275,6 +3276,10 @@ const FrameProfile = struct {
     graphics_scalar_upload_ns: u64 = 0,
     graphics_record_ns: u64 = 0,
     draw_reuse_hits: u64 = 0,
+    dynamic_state_commands: u64 = 0,
+    dynamic_state_avoided: u64 = 0,
+    pipeline_binds: u64 = 0,
+    pipeline_binds_avoided: u64 = 0,
     draw_reuse_scalar_hits: u64 = 0,
     draw_reuse_misses: u64 = 0,
     draw_reuse_rejections: [6]u64 = @splat(0),
@@ -3302,6 +3307,9 @@ const CachedFrame = struct {
     height: u32 = 0,
     guest_address: u64 = 0,
     sequence: u64 = 0,
+    /// Nonzero only for an exact readback of a retained render target.
+    /// Lets GPU consumers reuse that same version while CPU publication waits.
+    source_content_generation: u64 = 0,
     /// Tiling metadata of the render that produced `pixels`, retained so a
     /// deferred (lazy) writeback can tile the linear frame back into guest
     /// memory when the guest actually needs it.
@@ -3312,6 +3320,67 @@ const CachedFrame = struct {
     backing_was_accessible: bool = false,
     backing_snapshot: ColorBackingSnapshot = .{},
 };
+
+const CompletedFramePixelBudget = struct {
+    capacity: usize = 512 * 1024 * 1024,
+    retained_slack: usize = 16 * 1024 * 1024,
+};
+
+/// The caller is replacing every pixel of this slot. Keep useful capacity,
+/// but do not let a past large readback permanently inflate every LRU slot.
+/// Only the replaced slot may be discarded; pending peers retain their bytes.
+fn prepareCompletedFramePixels(allocator: std.mem.Allocator, frames: []CachedFrame, index: usize, bytes: usize, budget: CompletedFramePixelBudget) !void {
+    const pixels = &frames[index].pixels;
+    var capacity: usize = 0;
+    for (frames) |frame| capacity +|= frame.pixels.capacity;
+    const release_slack = capacity > budget.capacity and pixels.capacity -| bytes > budget.retained_slack;
+    if (bytes > pixels.capacity or release_slack) {
+        // Allocate before releasing the old image so failure preserves its
+        // pending writeback. No old pixels need copying into the replacement.
+        var replacement: std.ArrayList(u8) = .empty;
+        try replacement.ensureTotalCapacityPrecise(allocator, bytes);
+        pixels.deinit(allocator);
+        pixels.* = replacement;
+    }
+    pixels.items.len = bytes;
+}
+
+test "completed frame replacement bounds slack and preserves pending peers" {
+    const allocator = std.testing.allocator;
+    var frames: [3]CachedFrame = @splat(.{});
+    defer for (&frames) |*frame| frame.pixels.deinit(allocator);
+    for (&frames) |*frame| {
+        try frame.pixels.resize(allocator, 256);
+        @memset(frame.pixels.items, 0x5a);
+        frame.needs_writeback = true;
+        frame.source_content_generation = 17;
+    }
+    const peer = frames[1].pixels.items.ptr;
+    const budget = CompletedFramePixelBudget{ .capacity = 512, .retained_slack = 64 };
+    try prepareCompletedFramePixels(allocator, &frames, 0, 32, budget);
+    try std.testing.expectEqual(@as(usize, 32), frames[0].pixels.capacity);
+    try std.testing.expectEqual(@as(usize, 32), frames[0].pixels.items.len);
+    try std.testing.expectEqual(peer, frames[1].pixels.items.ptr);
+    try std.testing.expectEqualSlices(u8, &(@as([256]u8, @splat(0x5a))), frames[1].pixels.items);
+    try std.testing.expect(frames[1].needs_writeback);
+    try std.testing.expectEqual(@as(u64, 17), frames[1].source_content_generation);
+
+    // A modest size change keeps backing even when another slot is large.
+    const retained = frames[1].pixels.items.ptr;
+    try prepareCompletedFramePixels(allocator, &frames, 1, frames[1].pixels.capacity - 32, budget);
+    try std.testing.expectEqual(retained, frames[1].pixels.items.ptr);
+    // Growth is exact and does not preserve bytes that the readback replaces.
+    try prepareCompletedFramePixels(allocator, &frames, 0, 1024, budget);
+    try std.testing.expectEqual(@as(usize, 1024), frames[0].pixels.capacity);
+    try std.testing.expectEqual(@as(usize, 1024), frames[0].pixels.items.len);
+    @memset(frames[0].pixels.items, 0x3c);
+    const preserved = frames[0].pixels.items.ptr;
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, prepareCompletedFramePixels(failing.allocator(), &frames, 0, 2048, budget));
+    try std.testing.expectEqual(preserved, frames[0].pixels.items.ptr);
+    try std.testing.expectEqual(@as(usize, 1024), frames[0].pixels.items.len);
+    for (frames[0].pixels.items) |byte| try std.testing.expectEqual(@as(u8, 0x3c), byte);
+}
 
 /// A deferred colour write belongs to the guest contents observed before the
 /// render. Residency alone is insufficient: freed image pages can remain mapped
@@ -5178,6 +5247,9 @@ const CachedSampledImage = struct {
     source_generation: u64,
     // Separate CPU-write proof for refreshing individual resident array layers.
     guest_page_generation: u64 = 0,
+    // Globally unique render-target write serials, not cache eviction ages.
+    // A new upload starts with no layer proofs; unknown serial zero never hits.
+    array_layer_generations: [32]u64 = @splat(0),
     content_hash: u64,
     image: OwnedImage,
     view: vk.ImageView,
@@ -5361,6 +5433,8 @@ pub const Renderer = struct {
     pending_command_buffers: std.ArrayList(vk.CommandBuffer) = .empty,
     pending_command_slots: std.ArrayList(usize) = .empty,
     recording_command_buffer: ?vk.CommandBuffer = null,
+    recording_graphics_pipeline: vk.Pipeline = 0,
+    recording_graphics_state: ?GraphicsPipelineState = null,
     recording_started_ns: u64 = 0,
     recording_command_slot: ?usize = null,
     draw_batch_active: bool = false,
@@ -5449,6 +5523,7 @@ pub const Renderer = struct {
     shader_layer_available: bool = false,
     geometry_shaders_available: bool,
     tessellation_shaders_available: bool,
+    shader_clip_distance_available: bool,
     cube_arrays_available: bool,
     shader_float64_available: bool,
     image_float32_atomic_min_max_available: bool,
@@ -6117,6 +6192,8 @@ pub const Renderer = struct {
         // gives. Without the feature those draws keep their single triangle.
         const geometry_shaders = supported_features.values[vk.feature_geometry_shader] != 0;
         const tessellation_shaders = supported_features.values[vk.feature_tessellation_shader] != 0;
+        const shader_clip_distance = supported_features.values[vk.feature_shader_clip_distance] != 0;
+        if (shader_clip_distance) enabled_features.values[vk.feature_shader_clip_distance] = vk.true_value;
         if (tessellation_shaders) enabled_features.values[vk.feature_tessellation_shader] = vk.true_value;
         if (geometry_shaders) {
             enabled_features.values[vk.feature_geometry_shader] = vk.true_value;
@@ -6486,6 +6563,7 @@ pub const Renderer = struct {
             .geometry_shaders_available = geometry_shaders,
             .shader_layer_available = shader_layer,
             .tessellation_shaders_available = tessellation_shaders,
+            .shader_clip_distance_available = shader_clip_distance,
             .cube_arrays_available = cube_arrays,
             .shader_float64_available = shader_float64,
             .image_float32_atomic_min_max_available = image_float32_atomic_min_max,
@@ -8725,8 +8803,20 @@ pub const Renderer = struct {
         if (self.defer_small_storage_writes_enabled and bytes.len != 0 and
             (!self.deferred_shader_metadata_bounds_enabled or overlaps_metadata))
         {
-            var pending = self.deferred_shader_metadata_slots.iterator(.{});
+            // Reuse the exact buffer-range index before walking dirty metadata.
+            // A scalar read inside one descriptor must not inspect every small
+            // GPU producer retained elsewhere in the scene. Preserve slot
+            // order and the exact overlap/dirty checks below (hash collisions
+            // are candidates, not proof that a buffer aliases this read).
+            var pending = if (self.indexed_buffer_alias_queries)
+                self.bufferAliasCandidates(address, bytes.len)
+            else
+                @import("buffer_overlap_index.zig").Index(maximum_retained_buffer_entries).Iterator{
+                    .remaining = self.deferred_shader_metadata_slots,
+                };
+            pending.remaining.setIntersection(self.deferred_shader_metadata_slots);
             while (pending.next()) |index| {
+                if (!gpu.bit_sets.contains(&self.deferred_shader_metadata_slots, index)) continue;
                 self.frame_profile.shader_metadata_candidates +|= 1;
                 const entry = &self.guest_buffers.items[index];
                 if (!entry.gpu_dirty or entry.size >= deferred_storage_write_min_bytes or
@@ -9570,7 +9660,7 @@ pub const Renderer = struct {
             const bytes = std.math.mul(u64, total_groups, lds_bytes) catch return Error.GuestBufferTooLarge;
             if (bytes == 0 or bytes > 16 * 1024 * 1024) return Error.GuestBufferTooLarge;
             lds_slot = resources.freeDescriptor() orelse return Error.InvalidStorageDescriptor;
-            spilled_lds = try self.createBuffer(bytes, vk.buffer_usage_storage_buffer_bit, vk.memory_property_device_local_bit);
+            spilled_lds = try self.createBuffer(bytes, vk.buffer_usage_storage_buffer_bit | vk.buffer_usage_transfer_src_bit, vk.memory_property_device_local_bit);
             self.updateStorageDescriptorRange(lds_slot.?, spilled_lds.?.handle, 0, bytes);
             resources.occupied[lds_slot.?] = true;
             // Spilled guest LDS no longer consumes workgroup memory. Keep
@@ -9742,6 +9832,7 @@ pub const Renderer = struct {
                 std.debug.print("[vulkan diagnostic] storage capture failed: {s}\n", .{@errorName(err)});
             };
             try self.captureStorageBuffers(resources, capture_prefix, "before", null);
+            try self.captureComputeAuxiliaryBuffers(resources, capture_prefix, "before", spilled_lds, lds_slot);
         }
         const report = try self.dispatchSpirvWithGds(module.words, group_count, module_lease, uses_gds);
         if (capture_storage) {
@@ -9749,6 +9840,7 @@ pub const Renderer = struct {
                 std.debug.print("[vulkan diagnostic] storage capture failed: {s}\n", .{@errorName(err)});
             };
             try self.captureStorageBuffers(resources, capture_prefix, "after", null);
+            try self.captureComputeAuxiliaryBuffers(resources, capture_prefix, "after", spilled_lds, lds_slot);
         }
         try self.checkSampledImageFault(resources, program_address, vk.pipeline_stage_compute_shader_bit);
         try self.checkFlatMemoryFault(resources, program_address, vk.pipeline_stage_compute_shader_bit);
@@ -14262,6 +14354,7 @@ pub const Renderer = struct {
     }
 
     fn setGraphicsDynamicState(self: *Renderer, command_buffer: vk.CommandBuffer, state: GraphicsPipelineState) void {
+        const previous = self.recording_graphics_state;
         const viewport = vk.Viewport{
             .x = @bitCast(state.viewport_x_bits),
             .y = @bitCast(state.viewport_y_bits),
@@ -14274,16 +14367,48 @@ pub const Renderer = struct {
             .offset = .{ .x = state.scissor_x, .y = state.scissor_y },
             .extent = .{ .width = state.scissor_width, .height = state.scissor_height },
         };
-        // Set every dynamic value for every draw: a new command buffer starts with undefined
-        // dynamic state, even if it reuses the preceding draw's pipeline.
-        self.device_functions.cmd_set_viewport(command_buffer, 0, 1, @ptrCast(&viewport));
-        self.device_functions.cmd_set_scissor(command_buffer, 0, 1, @ptrCast(&scissor));
-        self.device_functions.cmd_set_depth_bias(command_buffer, @bitCast(state.depth_bias_constant_bits), 0, @bitCast(state.depth_bias_slope_bits));
-        if (state.stencil_front_reference == state.stencil_back_reference) {
-            self.device_functions.cmd_set_stencil_reference(command_buffer, vk.stencil_face_front_bit | vk.stencil_face_back_bit, state.stencil_front_reference);
+        // State survives render passes and compute binds, but never a fresh
+        // recording of a recycled command buffer. beginOneShot clears it.
+        if (previous == null or !std.meta.eql(viewportKey(previous.?), viewportKey(state))) {
+            self.device_functions.cmd_set_viewport(command_buffer, 0, 1, @ptrCast(&viewport));
+            self.frame_profile.dynamic_state_commands += 1;
+        } else self.frame_profile.dynamic_state_avoided += 1;
+        if (previous == null or !std.meta.eql(scissorKey(previous.?), scissorKey(state))) {
+            self.device_functions.cmd_set_scissor(command_buffer, 0, 1, @ptrCast(&scissor));
+            self.frame_profile.dynamic_state_commands += 1;
+        } else self.frame_profile.dynamic_state_avoided += 1;
+        if (previous == null or previous.?.depth_bias_constant_bits != state.depth_bias_constant_bits or previous.?.depth_bias_slope_bits != state.depth_bias_slope_bits) {
+            self.device_functions.cmd_set_depth_bias(command_buffer, @bitCast(state.depth_bias_constant_bits), 0, @bitCast(state.depth_bias_slope_bits));
+            self.frame_profile.dynamic_state_commands += 1;
+        } else self.frame_profile.dynamic_state_avoided += 1;
+        if (previous == null or previous.?.stencil_front_reference != state.stencil_front_reference or previous.?.stencil_back_reference != state.stencil_back_reference) {
+            if (state.stencil_front_reference == state.stencil_back_reference) {
+                self.device_functions.cmd_set_stencil_reference(command_buffer, vk.stencil_face_front_bit | vk.stencil_face_back_bit, state.stencil_front_reference);
+                self.frame_profile.dynamic_state_commands += 1;
+            } else {
+                self.device_functions.cmd_set_stencil_reference(command_buffer, vk.stencil_face_front_bit, state.stencil_front_reference);
+                self.device_functions.cmd_set_stencil_reference(command_buffer, vk.stencil_face_back_bit, state.stencil_back_reference);
+                self.frame_profile.dynamic_state_commands += 2;
+            }
+        } else self.frame_profile.dynamic_state_avoided += 1;
+        self.recording_graphics_state = state;
+    }
+
+    fn viewportKey(state: GraphicsPipelineState) [6]u32 {
+        return .{ state.viewport_x_bits, state.viewport_y_bits, state.viewport_width_bits, state.viewport_height_bits, state.viewport_min_depth_bits, state.viewport_max_depth_bits };
+    }
+
+    fn scissorKey(state: GraphicsPipelineState) [4]u32 {
+        return .{ @bitCast(state.scissor_x), @bitCast(state.scissor_y), state.scissor_width, state.scissor_height };
+    }
+
+    fn bindGraphicsPipeline(self: *Renderer, command_buffer: vk.CommandBuffer, pipeline: vk.Pipeline) void {
+        if (self.recording_graphics_pipeline == pipeline) {
+            self.frame_profile.pipeline_binds_avoided += 1;
         } else {
-            self.device_functions.cmd_set_stencil_reference(command_buffer, vk.stencil_face_front_bit, state.stencil_front_reference);
-            self.device_functions.cmd_set_stencil_reference(command_buffer, vk.stencil_face_back_bit, state.stencil_back_reference);
+            self.device_functions.cmd_bind_pipeline(command_buffer, vk.pipeline_bind_point_graphics, pipeline);
+            self.recording_graphics_pipeline = pipeline;
+            self.frame_profile.pipeline_binds += 1;
         }
     }
 
@@ -17238,6 +17363,11 @@ pub const Renderer = struct {
             forceColorTargetAlphaOne(frame, snapshot.target.format);
         }
         self.finishCompletedFrame(frame_index, snapshot.target, snapshot.backing_was_accessible, snapshot.backing_snapshot);
+        // CPU postprocessing changes the readback independently of the image.
+        // Only an unmodified copy can prove that a resident GPU version is an
+        // interchangeable source while publication to guest RAM is pending.
+        self.completed_frames.items[frame_index].source_content_generation = if (!snapshot.scanout_flip_vertical and
+            !snapshot.target.descriptor.force_destination_alpha_one) snapshot.content_generation else 0;
         self.render_targets.items[index].host_generation = snapshot.gpu_generation;
         self.render_targets.items[index].shader_read_layout = false;
 
@@ -17850,7 +17980,7 @@ pub const Renderer = struct {
             .clear_values = undefined,
         };
         self.device_functions.cmd_begin_render_pass(command_buffer, &begin_info, vk.subpass_contents_inline);
-        self.device_functions.cmd_bind_pipeline(command_buffer, vk.pipeline_bind_point_graphics, pipeline);
+        self.bindGraphicsPipeline(command_buffer, pipeline);
         self.setGraphicsDynamicState(command_buffer, pipeline_state);
         if (bind_graphics_descriptors or vertex_scalars.len != 0 or fragment_scalars.len != 0 or pipeline_state.programmable_blend != 0) {
             if (pipeline_state.programmable_blend != 0) self.writePackedUnormFeedbackDescriptor();
@@ -18013,7 +18143,7 @@ pub const Renderer = struct {
             .clear_values = undefined,
         };
         self.device_functions.cmd_begin_render_pass(command_buffer, &begin, vk.subpass_contents_inline);
-        self.device_functions.cmd_bind_pipeline(command_buffer, vk.pipeline_bind_point_graphics, pipeline);
+        self.bindGraphicsPipeline(command_buffer, pipeline);
         self.setGraphicsDynamicState(command_buffer, state);
         if (bind_graphics_descriptors or vertex_scalars.len != 0 or fragment_scalars.len != 0) {
             self.flushStorageDescriptors();
@@ -18254,7 +18384,7 @@ pub const Renderer = struct {
             .clear_values = @ptrCast(&clear),
         };
         self.device_functions.cmd_begin_render_pass(command_buffer, &begin_info, vk.subpass_contents_inline);
-        self.device_functions.cmd_bind_pipeline(command_buffer, vk.pipeline_bind_point_graphics, pipeline);
+        self.bindGraphicsPipeline(command_buffer, pipeline);
         self.setGraphicsDynamicState(command_buffer, pipeline_state);
         if (bind_graphics_descriptors or vertex_scalars.len != 0 or fragment_scalars.len != 0) {
             self.flushStorageDescriptors();
@@ -18659,11 +18789,7 @@ pub const Renderer = struct {
                 frame_index = oldest_index;
             }
         }
-        const cached = &self.completed_frames.items[frame_index.?];
-        // Every byte is replaced below. Clearing the old list first poisons
-        // the entire previous image in safety builds, adding a redundant pass.
-        try cached.pixels.ensureTotalCapacity(self.allocator, frame_bytes);
-        cached.pixels.items.len = frame_bytes;
+        try prepareCompletedFramePixels(self.allocator, self.completed_frames.items, frame_index.?, frame_bytes, .{});
         return frame_index.?;
     }
 
@@ -18674,6 +18800,7 @@ pub const Renderer = struct {
         cached.height = target.descriptor.height;
         cached.guest_address = target.descriptor.address;
         cached.sequence = self.frame_sequence;
+        cached.source_content_generation = 0;
         cached.target = target;
         cached.needs_writeback = true;
         cached.backing_was_accessible = backing_was_accessible or self.colorTargetBackingAccessible(target);
@@ -20384,6 +20511,11 @@ pub const Renderer = struct {
         const index = try self.acquireRenderTarget(target);
         self.render_targets.items[index].pin_count += 1;
         defer self.releaseRenderTarget(index);
+        color.base_array_slice = 2;
+        color.last_array_slice = 2;
+        const stable_index = try self.acquireRenderTarget(try guestColorTarget(color));
+        self.render_targets.items[stable_index].pin_count += 1;
+        defer self.releaseRenderTarget(stable_index);
         const output_bytes = 8 * 8 * 4 * 3;
         const readback = try self.createBuffer(2 * output_bytes, vk.buffer_usage_transfer_dst_bit, vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit);
         defer self.destroyBuffer(readback);
@@ -20391,6 +20523,19 @@ pub const Renderer = struct {
         const before_readback = self.frame_profile.readback_bytes;
         for (0..2) |pass| {
             try self.beginDescriptorBatch(true);
+            if (pass == 0) {
+                const stable = self.render_targets.items[stable_index].image.handle;
+                const commands = try self.beginOneShot();
+                defer self.releaseOneShot(commands);
+                const range = vk.ImageSubresourceRange{ .aspect_mask = vk.image_aspect_color_bit };
+                try self.transitionTrackedImage(commands, stable, range, image_state.transfer_destination_usage);
+                const green = vk.ClearColorValue{ .float32 = .{ 0, 1, 0, 1 } };
+                self.device_functions.cmd_clear_color_image(commands, stable, vk.image_layout_transfer_dst_optimal, &green, 1, @ptrCast(&range));
+                try self.transitionTrackedImage(commands, stable, range, image_state.color_attachment_usage);
+                try self.submitOneShot(commands);
+                self.render_targets.items[stable_index].initialized = true;
+                self.markRenderTargetWritten(&self.render_targets.items[stable_index]);
+            }
             const image = self.render_targets.items[index].image.handle;
             const one = vk.ImageSubresourceRange{ .aspect_mask = vk.image_aspect_color_bit };
             const clear_commands = try self.beginOneShot();
@@ -20404,6 +20549,20 @@ pub const Renderer = struct {
             self.render_targets.items[index].initialized = true;
             self.markRenderTargetWritten(&self.render_targets.items[index]);
             self.render_targets.items[index].last_used_sequence = self.render_target_sequence;
+            if (pass == 1) {
+                // Readback leaves a pending CPU copy and marks the attachment
+                // host-current. Refresh must still take the new blue GPU layer.
+                try self.materializeRenderTarget(index);
+                const frame_index = self.latest_frame_index.?;
+                const generation = self.completed_frames.items[frame_index].source_content_generation;
+                try std.testing.expectEqual(self.render_targets.items[index].content_generation, generation);
+                try std.testing.expect(self.completed_frames.items[frame_index].needs_writeback);
+                self.completed_frames.items[frame_index].source_content_generation = 0;
+                try std.testing.expect(!try self.refreshSampledColorArray(sampled_index, descriptor, page_generation, 1));
+                self.completed_frames.items[frame_index].source_content_generation = generation + 1;
+                try std.testing.expect(!try self.refreshSampledColorArray(sampled_index, descriptor, page_generation, 1));
+                self.completed_frames.items[frame_index].source_content_generation = generation;
+            }
             // Missing CPU tracking and a changed CPU generation both reject.
             try std.testing.expect(!try self.refreshSampledColorArray(sampled_index, descriptor, 0, 1));
             try std.testing.expect(!try self.refreshSampledColorArray(sampled_index, descriptor, page_generation + 1, 1));
@@ -20440,7 +20599,7 @@ pub const Renderer = struct {
         try self.readMapped(readback, &observed);
         for (0..2) |pass| {
             for (0..3) |layer| {
-                const expected = if (layer != 1) [4]u8{ 0x3a, 0x3a, 0x3a, 0x3a } else if (pass == 0) [4]u8{ 255, 0, 0, 255 } else [4]u8{ 0, 0, 255, 255 };
+                const expected: [4]u8 = if (layer == 0) .{ 0x3a, 0x3a, 0x3a, 0x3a } else if (layer == 2) .{ 0, 255, 0, 255 } else if (pass == 0) .{ 255, 0, 0, 255 } else .{ 0, 0, 255, 255 };
                 for (0..64) |pixel| {
                     const offset = pass * output_bytes + (layer * 64 + pixel) * 4;
                     try std.testing.expectEqualSlices(u8, &expected, observed[offset..][0..4]);
@@ -20448,6 +20607,9 @@ pub const Renderer = struct {
             }
         }
         try std.testing.expectEqual(@as(u64, 2), self.frame_profile.sampled_array_refreshes);
+        // Both producers stay newer than guest memory. The second refresh
+        // copies only the changed red/blue slice, retaining the green slice.
+        try std.testing.expectEqual(@as(u64, 3), self.frame_profile.sampled_array_layers);
         // Rebinding the producer changes its eviction age, not its pixels.
         // A read-only source must retain the already refreshed sampled array.
         try self.beginDescriptorBatch(true);
@@ -20460,7 +20622,12 @@ pub const Renderer = struct {
         try std.testing.expectEqual(original.image.handle, reused.image.handle);
         try std.testing.expectEqual(@as(u64, 2), self.frame_profile.sampled_array_refreshes);
         try std.testing.expectEqual(before_upload, self.frame_profile.texture_upload_bytes);
-        try std.testing.expectEqual(before_readback, self.frame_profile.readback_bytes);
+        try std.testing.expectEqual(before_readback + 8 * 8 * 4, self.frame_profile.readback_bytes);
+        try std.testing.expect(self.completed_frames.items[self.latest_frame_index.?].needs_writeback);
+        try self.beginDescriptorBatch(true);
+        try std.testing.expect(try self.refreshSampledColorArray(sampled_index, descriptor, page_generation, epoch));
+        try std.testing.expectEqual(@as(u64, 3), self.frame_profile.sampled_array_layers);
+        try std.testing.expectEqual(@as(u64, 2), self.frame_profile.sampled_array_refreshes);
         // A CPU write to another slice must not discard this GPU producer.
         if (!memory.write(memory.context, descriptor.address, &.{ 0x11, 0x22, 0x33, 0x44 })) return Error.GuestMemoryWriteFailed;
         try std.testing.expect(!self.render_targets.items[index].backing_snapshot.changed(memory, target));
@@ -20757,6 +20924,52 @@ pub const Renderer = struct {
             .clear_stencil = stencil,
         };
         try self.clearDepthProbeTarget(target);
+    }
+
+    pub fn probeDepth16Clear(self: *Renderer, value: f32) anyerror!void {
+        try self.clearDepthProbeTarget(.{
+            .address = 0x1000,
+            .allocation_bytes = 2048,
+            .width = 32,
+            .height = 32,
+            .guest_format = 1,
+            .format = vk.format_d16_unorm,
+            .has_stencil = false,
+            .tile_mode = .linear,
+            .base_array_slice = 0,
+            .mip_level = 0,
+            .clear_depth = value,
+            .clear_stencil = 0,
+        });
+    }
+
+    pub fn probeDepth16Bits(self: *Renderer) anyerror!u16 {
+        // Inspect the attachment independently of its color storage snapshot.
+        const cached = self.depth_targets.items[0];
+        const readback = try self.createBuffer(2048, vk.buffer_usage_transfer_dst_bit, vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit);
+        defer self.destroyBuffer(readback);
+        const commands = try self.beginOneShot();
+        defer self.releaseOneShot(commands);
+        const range = vk.ImageSubresourceRange{ .aspect_mask = vk.image_aspect_depth_bit };
+        try self.transitionTrackedImage(commands, cached.image.handle, range, image_state.transfer_source_usage);
+        const copy = vk.BufferImageCopy{
+            .image_subresource = .{ .aspect_mask = vk.image_aspect_depth_bit },
+            .image_extent = .{ .width = 32, .height = 32, .depth = 1 },
+        };
+        self.device_functions.cmd_copy_image_to_buffer(commands, cached.image.handle, vk.image_layout_transfer_src_optimal, readback.handle, 1, @ptrCast(&copy));
+        const barrier = vk.BufferMemoryBarrier{
+            .source_access_mask = vk.access_transfer_write_bit,
+            .destination_access_mask = vk.access_host_read_bit,
+            .buffer = readback.handle,
+            .offset = 0,
+            .size = readback.size,
+        };
+        self.device_functions.cmd_pipeline_barrier(commands, vk.pipeline_stage_transfer_bit, vk.pipeline_stage_host_bit, 0, 0, null, 1, @ptrCast(&barrier), 0, null);
+        try self.transitionTrackedImage(commands, cached.image.handle, range, image_state.depth_attachment_usage);
+        try self.submitOneShot(commands);
+        var bytes: [2]u8 = undefined;
+        try self.readMapped(readback, &bytes);
+        return std.mem.readInt(u16, &bytes, .little);
     }
 
     fn clearDepthProbeTarget(self: *Renderer, target: GuestDepthTarget) anyerror!void {
@@ -21263,6 +21476,52 @@ pub const Renderer = struct {
             }
         }
         std.debug.print("bounded vertex fetches passed: full/prefix/replayed pixels match for vertex and instance selection, changing base instance and descriptor-ring wrap\n", .{});
+    }
+
+    pub fn probeZeroPositionClip(self: *Renderer) anyerror!void {
+        if (!self.shader_clip_distance_available) return error.ShaderClipDistanceUnavailable;
+        const buffer = try self.createBuffer(48, vk.buffer_usage_storage_buffer_bit, vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit);
+        defer self.destroyBuffer(buffer);
+        var program = rdna2.Program{ .code = &.{}, .instructions = .empty };
+        defer program.deinit(self.allocator);
+        const v = struct {
+            fn reg(index: u32) rdna2.Operand {
+                return .{ .kind = .vgpr, .reg = index };
+            }
+        }.reg;
+        try program.instructions.appendSlice(self.allocator, &.{
+            .{ .pc = 0, .family = .mubuf, .opcode = .buffer_load_format_xyzw, .dst = v(12), .src0 = v(5), .src1 = .{ .kind = .sgpr, .reg = 16 }, .src2 = .{ .kind = .literal_constant, .value = 0 }, .index_enable = true, .data_words = 4 },
+            .{ .pc = 8, .family = .exp, .opcode = .exp, .export_target = 12, .export_enable = 15, .export_done = true, .src0 = v(12), .src1 = v(13), .src2 = v(14), .src3 = v(15) },
+            .{ .pc = 16, .opcode = .s_endpgm },
+        });
+        const triangle = [3][4]f32{ .{ -0.8, -0.8, 0.5, 1 }, .{ 0.8, -0.8, 0.5, 1 }, .{ 0, 0.8, 0.5, 1 } };
+        var reference: [graphics_probe_bytes]u8 = undefined;
+        for ([_]bool{ false, true }) |clipping| {
+            var module = try rdna2.translateSpirv(self.allocator, &program, .{
+                .stage = .vertex,
+                .vertex_index_vgpr = 5,
+                .clip_zero_position = clipping,
+                .storage_buffers = &.{.{ .resource_sgpr = 16, .descriptor_index = 0, .stride = 16, .unified_format = 77 }},
+            });
+            defer module.deinit(self.allocator);
+            for (0..4) |pass| {
+                if (!clipping and pass != 0) continue;
+                var positions = triangle;
+                if (pass == 1) positions[2] = .{ 0, 0, 0, 0 };
+                if (pass == 2) positions[2] = .{ -0.0, 0, -0.0, 0 };
+                try self.writeMappedAt(buffer, 0, std.mem.asBytes(&positions));
+                try self.beginFrameDraw();
+                self.updateStorageDescriptorRange(0, buffer.handle, 0, buffer.size);
+                try self.drawGraphicsShaders(module.words, &graphics_probe_fragment_spirv, &.{}, &.{}, GraphicsPipelineState.default(graphics_probe_width, graphics_probe_height), null, &.{}, null, false, true, false, .{ .vertex_count = 3 });
+                if (!clipping) {
+                    try std.testing.expect(self.graphics_probe_colored_pixels > 0);
+                    @memcpy(&reference, &self.graphics_probe_frame);
+                } else if (pass == 0 or pass == 3) {
+                    try std.testing.expectEqualSlices(u8, &reference, &self.graphics_probe_frame);
+                } else try std.testing.expectEqual(@as(u32, 0), self.graphics_probe_colored_pixels);
+            }
+        }
+        std.debug.print("zero-position clipping passed: ordinary triangles unchanged, +/-zero dormant vertex clipped, valid geometry restored\n", .{});
     }
 
     pub fn probePrivateSpills(self: *Renderer) anyerror!void {
@@ -23870,6 +24129,8 @@ pub const Renderer = struct {
                     .vertex_index_vgpr = if (tessellation == null) 5 else null,
                     .tessellation_inputs = if (tessellation) |tess| tess.config.inputs else null,
                     .convert_negative_one_to_one_depth = convert_guest_depth,
+                    .clip_zero_position = self.shader_clip_distance_available and
+                        rectangleCompletionMode(vertex_stage, render_state.primitive_type, draw, fullscreen_corner) == 0,
                     .scalar_registers = vertex_scalar_regs[0..vertex_scalar_count],
                     .dynamic_scalar_binding = if (vertex_scalar_count != 0) .{
                         .binding = dynamic_scalar_descriptor_binding,
@@ -26498,9 +26759,15 @@ pub const Renderer = struct {
             const target = cached.target;
             if (!cached.initialized or target.samples_log2 != 0 or
                 target.width != descriptor.width or target.height != descriptor.height) continue;
-            const aspect: u32 = if (target.address == descriptor.address and
-                (target.format == vk.format_d32_sfloat or target.format == vk.format_d32_sfloat_s8_uint) and
-                format.vulkan == vk.format_r32_sfloat)
+            // Color IMAGE_LOAD/STORE views reinterpret the plane's bits. Only
+            // pair formats with identical transfer representations: a guest
+            // D16 attachment widened to D24/S8 must not take the raw D16 path.
+            const compatible_depth = switch (target.format) {
+                vk.format_d32_sfloat, vk.format_d32_sfloat_s8_uint => format.vulkan == vk.format_r32_sfloat or format.vulkan == vk.format_r32_uint,
+                vk.format_d16_unorm => format.vulkan == vk.format_r16_unorm or format.vulkan == vk.format_r16_uint,
+                else => false,
+            };
+            const aspect: u32 = if (target.address == descriptor.address and compatible_depth)
                 vk.image_aspect_depth_bit
             else if (target.has_stencil and target.stencil_address == descriptor.address and
                 format.vulkan == vk.format_r8_uint)
@@ -26514,7 +26781,7 @@ pub const Renderer = struct {
     }
 
     // Depth/stencil images cannot have STORAGE usage. Preserve their exact
-    // D32/S8 payload through a GPU buffer when IMAGE_LOAD/STORE uses a color
+    // D16/D32/S8 payload through a GPU buffer when IMAGE_LOAD/STORE uses a color
     // view of the same plane, including when CPU depth transfers are disabled.
     fn transferStorageDepth(self: *Renderer, index: usize, source: StorageDepthSource, to_depth: bool) anyerror!void {
         const storage = self.storage_image_cache.items[index];
@@ -27632,6 +27899,46 @@ pub const Renderer = struct {
         return null;
     }
 
+    /// Pointer-form SMEM snapshots and spilled LDS have no guest address in
+    /// resources.addresses. Preserve them explicitly for a complete replay;
+    /// a hole between regular and FLAT bindings is not necessarily the LDS slot.
+    fn captureComputeAuxiliaryBuffers(self: *Renderer, resources: *const ComputeResources, prefix: []const u8, phase: []const u8, spilled_lds: ?OwnedBuffer, lds_slot: ?u32) !void {
+        try dumpDiagnosticBytes(self.allocator, prefix, ".buffer-ranges", std.mem.asBytes(&self.active_storage_ranges));
+        var suffix_buffer: [96]u8 = undefined;
+        var captured: [maximum_storage_descriptors]bool = @splat(false);
+        for (resources.scalar_memories[0..resources.scalar_memory_count]) |binding| {
+            const slot = binding.descriptor_index;
+            if (slot >= maximum_storage_descriptors or !resources.occupied[slot]) return Error.InvalidStorageDescriptor;
+            if (captured[slot]) continue;
+            captured[slot] = true;
+            const size = std.math.cast(usize, self.active_storage_ranges[slot]) orelse return error.DiagnosticBufferLimit;
+            if (size == 0 or size > 8 * 1024 * 1024) return error.DiagnosticBufferLimit;
+            const mapping = try self.mapDrawUpload(.{ .buffer = self.active_storage_buffers[slot], .offset = self.active_storage_offsets[slot], .size = size });
+            defer mapping.release(self);
+            const suffix = try std.fmt.bufPrint(&suffix_buffer, "-{s}-scalar-{d}.bin", .{ phase, slot });
+            try dumpDiagnosticBytes(self.allocator, prefix, suffix, mapping.bytes);
+        }
+        const source = spilled_lds orelse return;
+        const slot = lds_slot orelse return Error.InvalidStorageDescriptor;
+        if (source.size > 16 * 1024 * 1024) return error.DiagnosticBufferLimit;
+        const transfer = try self.createBuffer(source.size, vk.buffer_usage_transfer_dst_bit, vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit);
+        defer self.destroyBuffer(transfer);
+        const commands = try self.beginOneShot();
+        defer self.releaseOneShot(commands);
+        const before = vk.BufferMemoryBarrier{ .source_access_mask = vk.access_shader_write_bit, .destination_access_mask = vk.access_transfer_read_bit, .buffer = source.handle, .offset = 0, .size = source.size };
+        self.device_functions.cmd_pipeline_barrier(commands, vk.pipeline_stage_all_commands_bit, vk.pipeline_stage_transfer_bit, 0, 0, null, 1, @ptrCast(&before), 0, null);
+        const copy = vk.BufferCopy{ .source_offset = 0, .destination_offset = 0, .size = source.size };
+        self.device_functions.cmd_copy_buffer(commands, source.handle, transfer.handle, 1, @ptrCast(&copy));
+        const after = vk.BufferMemoryBarrier{ .source_access_mask = vk.access_transfer_write_bit, .destination_access_mask = vk.access_host_read_bit, .buffer = transfer.handle, .offset = 0, .size = source.size };
+        self.device_functions.cmd_pipeline_barrier(commands, vk.pipeline_stage_transfer_bit, vk.pipeline_stage_host_bit, 0, 0, null, 1, @ptrCast(&after), 0, null);
+        try self.submitOneShot(commands);
+        try self.waitForSubmittedWork();
+        const mapping = try self.mapBufferRange(transfer, 0, @intCast(source.size));
+        defer mapping.release(self);
+        const suffix = try std.fmt.bufPrint(&suffix_buffer, "-{s}-lds-{d}.bin", .{ phase, slot });
+        try dumpDiagnosticBytes(self.allocator, prefix, suffix, mapping.bytes);
+    }
+
     fn captureStorageBuffers(self: *Renderer, resources: *const ComputeResources, prefix: []const u8, phase: []const u8, already_captured: ?*const ComputeResources) !void {
         try self.captureFlatMemoryBuffers(resources, prefix, phase);
         const bound = self.active_storage_buffers;
@@ -28337,30 +28644,44 @@ pub const Renderer = struct {
         const snapshot = self.sampled_image_cache.items[index];
         const key = snapshot.backing_key orelse return false;
         const max_layers = 32;
-        if (self.canonical_image_aliases_enabled or descriptor.image_type != .color_2d_array or
+        if (descriptor.image_type != .color_2d_array or descriptor.depth_or_layers < 2) return false;
+        if (self.canonical_image_aliases_enabled or
             descriptor.viewBaseLevel() != 0 or descriptor.viewMipLevels() != 1 or
-            descriptor.base_array != 0 or descriptor.depth_or_layers < 2 or descriptor.depth_or_layers > max_layers or
+            descriptor.base_array != 0 or descriptor.depth_or_layers > max_layers or
             descriptor.dcc_enabled or descriptor.metadata_address != 0 or
-            page_generation == 0 or page_generation != snapshot.guest_page_generation or
-            snapshot.last_used_batch == self.sampled_image_batch or key.array_layers != descriptor.depth_or_layers)
-            return false;
+            key.array_layers != descriptor.depth_or_layers) return self.rejectSampledArray(0);
+        if (page_generation == 0 or page_generation != snapshot.guest_page_generation) return self.rejectSampledArray(1);
+        if (snapshot.last_used_batch == self.sampled_image_batch) return self.rejectSampledArray(2);
 
         // Ordered copies can update a snapshot used by recorded commands, but
         // must not mutate one already handed to this descriptor batch.
         const address = descriptor.address;
         const span = snapshot.guest_bytes;
-        if (self.pendingBufferWrite(address, span) != null) return false;
+        if (self.pendingBufferWrite(address, span) != null) return self.rejectSampledArray(3);
         for (self.storage_image_cache.items) |storage| {
-            if (storage.valid and storage.gpu_dirty and byteRangesOverlap(address, span, storage.descriptor.address, storage.allocation_bytes)) return false;
+            if (storage.valid and storage.gpu_dirty and byteRangesOverlap(address, span, storage.descriptor.address, storage.allocation_bytes)) return self.rejectSampledArray(4);
         }
         for (self.depth_targets.items) |depth| {
             if (depth.initialized and depth.gpu_generation != depth.host_generation and
                 (byteRangesOverlap(address, span, depth.target.address, depth.target.allocation_bytes) or
-                    byteRangesOverlap(address, span, depth.target.stencil_address, depth.target.stencil_allocation_bytes))) return false;
+                    byteRangesOverlap(address, span, depth.target.stencil_address, depth.target.stencil_allocation_bytes))) return self.rejectSampledArray(5);
         }
+        var materialized_layers: [max_layers]bool = @splat(false);
         for (self.completed_frames.items) |frame| {
             if (frame.needs_writeback) if (frame.target) |target| {
-                if (byteRangesOverlap(address, span, frame.guest_address, target.layout.required_source_bytes)) return false;
+                if (!byteRangesOverlap(address, span, frame.guest_address, target.layout.required_source_bytes)) continue;
+                // Readback does not make guest RAM current. The resident image
+                // is still a valid source if it is the exact captured version;
+                // CPU-only frames and superseded/evicted sources must fall back.
+                const layer = target.descriptor.base_array_slice;
+                if (frame.source_content_generation == 0 or layer >= descriptor.depth_or_layers)
+                    return self.rejectSampledArray(6);
+                const resident = for (self.render_targets.items) |candidate| {
+                    if (candidate.initialized and candidate.content_generation == frame.source_content_generation and
+                        sameRenderTarget(candidate.target, target)) break true;
+                } else false;
+                if (!resident) return self.rejectSampledArray(6);
+                materialized_layers[layer] = true;
             };
         }
         // Legacy descriptors with only mip zero selected use the surface
@@ -28371,10 +28692,11 @@ pub const Renderer = struct {
             upload_descriptor.extended = true;
             upload_descriptor.max_mip = 0;
         }
-        const texture = gpu.TextureLayout.fromImage(upload_descriptor) catch return false;
+        const texture = gpu.TextureLayout.fromImage(upload_descriptor) catch return self.rejectSampledArray(7);
         var sources: [max_layers]?usize = @splat(null);
         var seen: [max_layers]bool = @splat(false);
         var count: usize = 0;
+        var dirty_count: usize = 0;
         for (self.render_targets.items, 0..) |target, target_index| {
             if (!target.initialized or
                 !byteRangesOverlap(address, span, target.target.descriptor.address, target.target.layout.required_source_bytes)) continue;
@@ -28383,11 +28705,11 @@ pub const Renderer = struct {
             if (color.address != address or color.mip_level != 0 or color.dcc_enabled or
                 color.samples_log2 != 0 or color.fragments_log2 != 0 or
                 layer >= descriptor.depth_or_layers or target.target.layout.layers != 1 or
-                target.target.format.vulkan != key.format or seen[layer]) return false;
+                target.target.format.vulkan != key.format or seen[layer]) return self.rejectSampledArray(7);
             seen[layer] = true;
-            const subresource = texture.subresource(0, layer, 1) catch return false;
+            const subresource = texture.subresource(0, layer, 1) catch return self.rejectSampledArray(8);
             if (target.target.layout.subresource) |resident| {
-                if (!std.meta.eql(subresource, resident)) return false;
+                if (!std.meta.eql(subresource, resident)) return self.rejectSampledArray(8);
             } else {
                 const layout = target.target.layout;
                 if (color.tile_mode != descriptor.tile_mode or layout.block.bytes_per_element != subresource.block.bytes_per_element or
@@ -28396,14 +28718,22 @@ pub const Renderer = struct {
                     layout.width != subresource.width or layout.height != subresource.height or
                     layout.first_slice != subresource.first_slice or layout.row_pitch_elements != subresource.padded_width or
                     layout.source_slice_bytes != subresource.source_layer_bytes or
-                    layout.required_source_bytes != subresource.required_source_bytes) return false;
+                    layout.required_source_bytes != subresource.required_source_bytes) return self.rejectSampledArray(8);
             }
-            if (target.gpu_generation == target.host_generation) continue;
-            if (self.image_states.current(target.image.handle, vk.image_aspect_color_bit, 0, 0) == null) return false;
+            if (target.gpu_generation == target.host_generation and !materialized_layers[layer]) continue;
+            dirty_count += 1;
+            if (target.content_generation != 0 and
+                snapshot.array_layer_generations[layer] == target.content_generation) continue;
+            if (self.image_states.current(target.image.handle, vk.image_aspect_color_bit, 0, 0) == null) return self.rejectSampledArray(9);
             sources[layer] = target_index;
             count += 1;
         }
-        if (count == 0) return false;
+        if (dirty_count == 0) return false;
+        if (count == 0) {
+            self.sampled_image_cache.items[index].source_generation = source_generation;
+            _ = self.image_aliases.markSynchronized(snapshot.alias_token);
+            return true;
+        }
         for (sources) |source| if (source) |target_index| {
             self.render_targets.items[target_index].pin_count += 1;
         };
@@ -28430,11 +28760,19 @@ pub const Renderer = struct {
         }
         try self.transitionTrackedImage(commands, snapshot.image.handle, range, image_state.shader_read_usage);
         try self.submitOneShot(commands);
+        for (sources, 0..) |source, layer| if (source) |target_index| {
+            self.sampled_image_cache.items[index].array_layer_generations[layer] = self.render_targets.items[target_index].content_generation;
+        };
         self.sampled_image_cache.items[index].source_generation = source_generation;
         _ = self.image_aliases.markSynchronized(snapshot.alias_token);
         self.frame_profile.sampled_array_refreshes +|= 1;
         self.frame_profile.sampled_array_layers +|= count;
         return true;
+    }
+
+    fn rejectSampledArray(self: *Renderer, reason: usize) bool {
+        self.frame_profile.sampled_array_rejections[reason] +|= 1;
+        return false;
     }
 
     fn stageSampledImage(
@@ -29975,6 +30313,8 @@ pub const Renderer = struct {
             return Error.CommandBufferBeginFailed;
         }
         self.recording_command_buffer = command_buffer;
+        self.recording_graphics_pipeline = 0;
+        self.recording_graphics_state = null;
         self.recording_started_ns = hostTimestampNs();
         self.recording_command_slot = slot;
         self.command_buffer_ticks.items[slot] = command_buffer_pending_tick;
@@ -32882,6 +33222,10 @@ pub const Renderer = struct {
                 "[gpu sampled arrays] flip={d} refreshes={d} layers={d}\n",
                 .{ self.flip_callbacks, profile.sampled_array_refreshes, profile.sampled_array_layers },
             );
+            if (!std.mem.allEqual(u64, &profile.sampled_array_rejections, 0)) std.debug.print(
+                "[gpu sampled array rejects] flip={d} shape/pages/batch/buffer/storage/depth/frame/target/layout/state={any}\n",
+                .{ self.flip_callbacks, profile.sampled_array_rejections },
+            );
             std.debug.print(
                 "[gpu graphics res] flip={d} fragment_ms={d} sampled_scan_ms={d} append_ms={d} descriptors_ms={d} total_ms={d}\n",
                 .{ self.flip_callbacks, profile.graphics_fragment_resource_ns / std.time.ns_per_ms, profile.graphics_sampled_scan_ns / std.time.ns_per_ms, profile.graphics_append_resource_ns / std.time.ns_per_ms, profile.graphics_descriptor_ns / std.time.ns_per_ms, profile.graphics_resource_ns / std.time.ns_per_ms },
@@ -32957,6 +33301,7 @@ pub const Renderer = struct {
                 },
             );
             std.debug.print("[gpu uploads] flip={d} wraps={d} spills={d} spill_kib={d}\n", .{ self.flip_callbacks, profile.draw_upload_wraps, profile.draw_upload_spills, profile.draw_upload_spill_bytes / 1024 });
+            std.debug.print("[gpu state] flip={d} dynamic={d} avoided={d} pipelines={d} avoided={d}\n", .{ self.flip_callbacks, profile.dynamic_state_commands, profile.dynamic_state_avoided, profile.pipeline_binds, profile.pipeline_binds_avoided });
             if (profile.cold_storage_images != 0) std.debug.print("[gpu cold storage] flip={d} evicted={d} bytes={d}\n", .{
                 self.flip_callbacks, profile.cold_storage_images, profile.cold_storage_image_bytes,
             });

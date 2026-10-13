@@ -495,6 +495,7 @@ pub const feature_vertex_pipeline_stores_and_atomics: usize = 25;
 pub const feature_fragment_stores_and_atomics: usize = 26;
 pub const feature_shader_image_gather_extended: usize = 28;
 pub const feature_shader_storage_image_extended_formats: usize = 29;
+pub const feature_shader_clip_distance: usize = 37;
 pub const feature_shader_float64: usize = 39;
 
 pub const PhysicalDeviceFeatures2 = extern struct {

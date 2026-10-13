@@ -426,6 +426,10 @@ pub const Options = struct {
     /// Converts a guest -W..W position export to Vulkan's 0..W clip-depth
     /// convention. Leave clear when PA_CL_CLIP_CNTL selects DX clip space.
     convert_negative_one_to_one_depth: bool = false,
+    /// Match AMD's clipping of dormant (0,0,0,0) vertices on hosts whose
+    /// perspective divide otherwise puts them at the viewport centre.
+    /// Requires shaderClipDistance on the device and a direct raster path.
+    clip_zero_position: bool = false,
     storage_buffers: []const StorageBufferBinding = &.{},
     scalar_memories: []const ScalarMemoryBinding = &.{},
     flat_memories: []const FlatMemoryBinding = &.{},
@@ -436,6 +440,9 @@ pub const Options = struct {
     /// Resolve unmapped read-only SMEM/MUBUF resources through the checked
     /// snapshots. Requires nonuniform storage-buffer indexing on the host.
     snapshot_unbound_reads: bool = false,
+    /// Keep large snapshot-address searches in one callable function instead
+    /// of expanding every region comparison at every scalar/FLAT load site.
+    snapshot_lookup_helper: bool = true,
     /// Whether the program narrows the execution mask, and so needs to know
     /// which stores are active. Decided from the program by `translate`.
     uses_execution_mask: bool = false,
@@ -1041,6 +1048,8 @@ const Builder = struct {
     vertex_index_input: u32 = 0,
     instance_index_input: u32 = 0,
     position_output: u32 = 0,
+    zero_position_clip_output: u32 = 0,
+    output_float_pointer: u32 = 0,
     layer_variable: u32 = 0,
     fragment_depth_output: u32 = 0,
     color_outputs: [8]u32 = @splat(0),
@@ -1068,6 +1077,9 @@ const Builder = struct {
     bvh_intersection_mode1: bool,
     snapshot_unbound_reads: bool,
     flat_memory_headers: std.ArrayList([3]u32) = .empty,
+    snapshot_lookup_helper: bool = false,
+    snapshot_lookup_function: u32 = 0,
+    helper_functions: std.ArrayList(u32) = .empty,
     scalar_memory_headers: std.AutoHashMapUnmanaged(u32, struct { base: [2]u32, extent: u32 }) = .empty,
     sampled_bindings: []const SampledImageBinding,
     storage_image_bindings: []const StorageImageBinding,
@@ -1228,6 +1240,7 @@ const Builder = struct {
             .flat_apertures = options.flat_apertures,
             .bvh_intersection_mode1 = options.bvh_intersection_mode1,
             .snapshot_unbound_reads = options.snapshot_unbound_reads,
+            .snapshot_lookup_helper = options.snapshot_lookup_helper,
             .sampled_bindings = options.sampled_images,
             .storage_image_bindings = options.storage_images,
             .ngg_lds_exports = options.ngg_lds_exports,
@@ -1358,6 +1371,17 @@ const Builder = struct {
                 try self.emit(&self.declarations, 23, &.{ self.vector4_type, self.float_type, 4 }); // OpTypeVector
                 try self.emit(&self.declarations, 32, &.{ output_pointer, 3, self.vector4_type }); // ptr Output
                 try self.emit(&self.declarations, 59, &.{ output_pointer, self.position_output, 3 }); // OpVariable
+                if (options.clip_zero_position) {
+                    const array_type = self.id();
+                    const array_pointer = self.id();
+                    self.output_float_pointer = self.id();
+                    self.zero_position_clip_output = self.id();
+                    try self.emit(&self.declarations, 28, &.{ array_type, self.float_type, try self.constant(.bits32, 1) });
+                    try self.emit(&self.declarations, 32, &.{ array_pointer, 3, array_type });
+                    try self.emit(&self.declarations, 32, &.{ self.output_float_pointer, 3, self.float_type });
+                    try self.emit(&self.declarations, 59, &.{ array_pointer, self.zero_position_clip_output, 3 });
+                    try self.emit(&self.annotations, 71, &.{ self.zero_position_clip_output, 11, 3 }); // BuiltIn ClipDistance
+                }
 
                 for (0..32) |location| {
                     const bit = @as(u32, 1) << @intCast(location);
@@ -1898,6 +1922,7 @@ const Builder = struct {
         self.annotations.deinit(self.allocator);
         self.declarations.deinit(self.allocator);
         self.body.deinit(self.allocator);
+        self.helper_functions.deinit(self.allocator);
         self.constants.deinit(self.allocator);
         self.lane_spills.deinit(self.allocator);
         self.private_spills.deinit(self.allocator);
@@ -4976,6 +5001,7 @@ const Builder = struct {
                 zero_float,
             }); // OpCompositeConstruct
             try self.emit(&self.body, 62, &.{ self.position_output, zero_vector });
+            try self.storeZeroPositionClip(zero_vector);
             if (self.layer_variable != 0) try self.emit(&self.body, 62, &.{ self.layer_variable, try self.constant(.sint32, 0) });
             for (self.parameter_variables) |variable| {
                 if (variable != 0) try self.emit(&self.body, 62, &.{ variable, zero_vector });
@@ -5875,6 +5901,7 @@ const Builder = struct {
             exported = selected;
         }
         try self.emit(&self.body, 62, &.{ output, exported }); // OpStore
+        if (is_position) try self.storeZeroPositionClip(exported);
         if (self.stage == .vertex and inst.export_target >= 0x20 and inst.export_target < 0x40) {
             const targets = self.vertex_parameter_targets[inst.export_target - 0x20];
             for (self.parameter_variables, 0..) |variable, location| {
@@ -5882,6 +5909,30 @@ const Builder = struct {
                     try self.emit(&self.body, 62, &.{ variable, exported });
             }
         }
+    }
+
+    fn storeZeroPositionClip(self: *Builder, position: u32) Error!void {
+        if (self.zero_position_clip_output == 0) return;
+        const zero = try self.constant(.float32, 0);
+        var all_zero: u32 = 0;
+        for (0..4) |component| {
+            const value = self.id();
+            const equal = self.id();
+            try self.emit(&self.body, 81, &.{ self.float_type, value, position, @intCast(component) });
+            try self.emit(&self.body, 180, &.{ self.bool_type, equal, value, zero }); // FOrdEqual (+/-0)
+            if (all_zero == 0) {
+                all_zero = equal;
+            } else {
+                const both = self.id();
+                try self.emit(&self.body, 167, &.{ self.bool_type, both, all_zero, equal });
+                all_zero = both;
+            }
+        }
+        const distance = self.id();
+        const pointer = self.id();
+        try self.emit(&self.body, 169, &.{ self.float_type, distance, all_zero, try self.constant(.float32, @bitCast(@as(f32, -1))), zero });
+        try self.emit(&self.body, 65, &.{ self.output_float_pointer, pointer, self.zero_position_clip_output, try self.constant(.bits32, 0) });
+        try self.emit(&self.body, 62, &.{ pointer, distance });
     }
 
     fn declarePackedUnormFeedback(self: *Builder) Error!void {
@@ -10120,11 +10171,87 @@ const Builder = struct {
     /// Select a bounded snapshot once for all the words in a BVH node. The
     /// resulting descriptor is nonuniform: lanes may traverse different trees.
     fn bvhSnapshot(self: *Builder, address: [2]u32, size: u32) Error!BufferAddress {
+        if (self.snapshot_lookup_helper and self.flat_memory_bindings.len >= 16) {
+            const function = try self.ensureSnapshotLookupFunction();
+            const result_type = try self.ensureVec4(.bits32);
+            const result = self.id();
+            try self.emit(&self.body, 57, &.{ result_type, result, function, address[0], address[1], size });
+            var values: [3]u32 = undefined;
+            for (&values, 0..) |*value, component| {
+                value.* = self.id();
+                try self.emit(&self.body, 81, &.{ self.bits_type, value.*, result, @intCast(component) });
+            }
+            self.uses_nonuniform_storage_buffers = true;
+            try self.emit(&self.annotations, 71, &.{ values[0], 5300 });
+            return .{
+                .binding = .{ .resource_sgpr = 0, .descriptor_index = self.flat_memory_bindings[0].descriptor_index },
+                .byte_offset = values[1],
+                .descriptor_index = values[0],
+                .descriptor_matches = try self.isNonZero(values[2]),
+            };
+        }
+        return self.selectSnapshot(address, size, self.flat_memory_headers.items);
+    }
+
+    fn ensureSnapshotLookupFunction(self: *Builder) Error!u32 {
+        if (self.snapshot_lookup_function != 0) return self.snapshot_lookup_function;
+        const result_type = try self.ensureVec4(.bits32);
+        const function_type = self.id();
+        const function = self.id();
+        try self.emit(&self.declarations, 33, &.{ function_type, result_type, self.bits_type, self.bits_type, self.bits_type });
+        // Emit a separate function, without referring to any main-function
+        // SSA IDs. Snapshot headers are immutable throughout the dispatch.
+        const main_body = self.body;
+        self.body = .empty;
+        defer {
+            self.body.deinit(self.allocator);
+            self.body = main_body;
+        }
+        try self.emit(&self.body, 54, &.{ result_type, function, 2, function_type }); // DontInline
+        var parameters: [3]u32 = undefined;
+        for (&parameters) |*parameter| {
+            parameter.* = self.id();
+            try self.emit(&self.body, 55, &.{ self.bits_type, parameter.* });
+        }
+        try self.emit(&self.body, 248, &.{self.id()});
+        var headers: std.ArrayList([3]u32) = .empty;
+        defer headers.deinit(self.allocator);
+        for (self.flat_memory_bindings) |region| {
+            var header: [3]u32 = undefined;
+            // Do not reuse scalar_memory_headers: their cached IDs belong to
+            // main. Keep the same bounded load semantics for short buffers.
+            const structure = self.id();
+            const extent = self.id();
+            try self.emit(&self.body, 65, &.{ self.storage_block_pointer_type, structure, self.storage_array, try self.constant(.bits32, region.descriptor_index) });
+            try self.emit(&self.body, 68, &.{ self.bits_type, extent, structure, 0 });
+            for (&header, [_]u32{ 0, 1, 3 }) |*value, word| {
+                const in_range = try self.bvhBinary(176, self.bool_type, try self.constant(.bits32, word), extent);
+                const safe_word = try self.bvhSelect(self.bits_type, in_range, try self.constant(.bits32, word), try self.constant(.bits32, 0));
+                const pointer = self.id();
+                const loaded = self.id();
+                try self.emit(&self.body, 65, &.{ self.storage_word_pointer_type, pointer, self.storage_array, try self.constant(.bits32, region.descriptor_index), try self.constant(.bits32, 0), safe_word });
+                try self.emit(&self.body, 61, &.{ self.bits_type, loaded, pointer });
+                value.* = try self.bvhSelect(self.bits_type, in_range, loaded, try self.constant(.bits32, 0));
+            }
+            try headers.append(self.allocator, header);
+        }
+        const selected = try self.selectSnapshot(.{ parameters[0], parameters[1] }, parameters[2], headers.items);
+        const result = self.id();
+        const found = try self.bvhSelect(self.bits_type, selected.descriptor_matches.?, try self.constant(.bits32, 1), try self.constant(.bits32, 0));
+        try self.emit(&self.body, 80, &.{ result_type, result, selected.descriptor_index.?, selected.byte_offset, found, try self.constant(.bits32, 0) });
+        try self.emit(&self.body, 254, &.{result});
+        try self.emit(&self.body, 56, &.{});
+        try self.helper_functions.appendSlice(self.allocator, self.body.items);
+        self.snapshot_lookup_function = function;
+        return function;
+    }
+
+    fn selectSnapshot(self: *Builder, address: [2]u32, size: u32, headers: []const [3]u32) Error!BufferAddress {
         const zero = try self.constant(.bits32, 0);
         var slot = try self.constant(.bits32, self.flat_memory_bindings[0].descriptor_index);
         var offset = zero;
         var found = try self.constantBool(false);
-        for (self.flat_memory_bindings, self.flat_memory_headers.items) |region, header| {
+        for (self.flat_memory_bindings, headers) |region, header| {
             const relative = try self.bvhBinary(130, self.bits_type, address[0], header[0]);
             const borrow = try self.bvhBinary(176, self.bool_type, address[0], header[0]);
             const high = try self.addBits(header[1], try self.bvhSelect(self.bits_type, borrow, try self.constant(.bits32, 1), zero));
@@ -13004,6 +13131,7 @@ fn assemble(allocator: std.mem.Allocator, builder: *Builder, options: Options) E
         0,
     });
     try appendInstruction(allocator, &words, 17, &.{1}); // OpCapability Shader
+    if (builder.zero_position_clip_output != 0) try appendInstruction(allocator, &words, 17, &.{32});
 
     if (builder.layer_variable != 0) {
         try appendInstruction(allocator, &words, 17, &.{if (options.stage == .vertex) @as(u32, 5254) else 2});
@@ -13134,6 +13262,7 @@ fn assemble(allocator: std.mem.Allocator, builder: *Builder, options: Options) E
         try entry_point.append(allocator, variable);
     };
     if (builder.position_output != 0) try entry_point.append(allocator, builder.position_output);
+    if (builder.zero_position_clip_output != 0) try entry_point.append(allocator, builder.zero_position_clip_output);
     if (builder.fragment_depth_output != 0) try entry_point.append(allocator, builder.fragment_depth_output);
     for (builder.color_outputs) |color_output| {
         if (color_output != 0) try entry_point.append(allocator, color_output);
@@ -13162,6 +13291,7 @@ fn assemble(allocator: std.mem.Allocator, builder: *Builder, options: Options) E
     }
     try words.appendSlice(allocator, builder.annotations.items);
     try words.appendSlice(allocator, builder.declarations.items);
+    try words.appendSlice(allocator, builder.helper_functions.items);
     try appendInstruction(allocator, &words, 54, &.{ builder.void_type, builder.main_function, 0, builder.function_type });
     try words.appendSlice(allocator, builder.body.items);
     try appendInstruction(allocator, &words, 56, &.{});
