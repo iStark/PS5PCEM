@@ -453,6 +453,9 @@ pub const Options = struct {
     /// Synchronize guest 64-lane compute waves through workgroup memory.
     /// Multiple waves require a converged dispatcher around divergent blocks.
     wave64_workgroup: bool = false,
+    /// Keep wave32 scalar branches uniform and rendezvous divergent waves at
+    /// guest LDS barriers. Ballots/shuffles use native 32-lane subgroups.
+    wave32_workgroup: bool = false,
     wave_exchange_double_buffer: bool = true,
     sampled_images: []const SampledImageBinding = &.{},
     storage_images: []const StorageImageBinding = &.{},
@@ -1250,11 +1253,12 @@ const Builder = struct {
             .workgroup_memory_storage_slot = options.workgroup_memory_storage_slot,
             .maximum_dispatcher_iterations = options.maximum_dispatcher_iterations,
             .report_dispatcher_exhaustion = options.report_dispatcher_exhaustion,
-            .wave64_workgroup = options.wave64_workgroup,
+            .wave64_workgroup = options.wave64_workgroup or options.wave32_workgroup,
             .synchronize_wave64_lds = options.wave64_workgroup and
                 @as(u64, options.local_size[0]) * options.local_size[1] * options.local_size[2] == 64,
             .wave_exchange_double_buffer = options.wave_exchange_double_buffer,
-            .converged_workgroup_dispatch = options.wave64_workgroup and @as(u64, options.local_size[0]) * options.local_size[1] * options.local_size[2] > 64,
+            .converged_workgroup_dispatch = (options.wave64_workgroup or options.wave32_workgroup) and
+                @as(u64, options.local_size[0]) * options.local_size[1] * options.local_size[2] > @as(u32, if (options.wave32) 32 else 64),
             .wave32 = options.wave32,
             .fragment_extent = options.fragment_extent,
             .fragment_inputs = options.fragment_inputs,
@@ -1646,7 +1650,7 @@ const Builder = struct {
             try self.emit(&self.declarations, 59, &.{ storage_array_pointer, self.storage_array, 12 }); // OpVariable
         }
         {
-            var needs_thread_id = options.uses_lane_identity or options.wave64_workgroup;
+            var needs_thread_id = options.uses_lane_identity or options.wave64_workgroup or options.wave32_workgroup;
             for (options.storage_buffers) |binding| {
                 needs_thread_id = needs_thread_id or binding.add_thread_id;
             }
@@ -1876,9 +1880,10 @@ const Builder = struct {
             try self.emit(&self.declarations, 32, &.{ self.workgroup_word_pointer_type, 4, self.bits_type });
             try self.emit(&self.declarations, 59, &.{ array_pointer_type, self.workgroup_memory, 4 }); // OpVariable
         }
-        if (options.wave64_workgroup) {
+        if (options.wave64_workgroup or options.wave32_workgroup) {
             const invocations = @as(u64, options.local_size[0]) * options.local_size[1] * options.local_size[2];
-            if (options.stage != .compute or options.wave32 or invocations < 64 or invocations > 1024 or invocations % 64 != 0)
+            const wave_size: u64 = if (options.wave32) 32 else 64;
+            if (options.stage != .compute or options.wave32_workgroup != options.wave32 or invocations < wave_size or invocations > 1024 or invocations % wave_size != 0)
                 return Error.InvalidStageInterface;
             const array_type = self.id();
             const array_pointer = self.id();
@@ -2778,13 +2783,21 @@ const Builder = struct {
                 const zero = try self.constant(.bits32, 0);
                 const value = try self.bvhSelect(self.bits_type, active_condition, bit, zero);
                 const high = try self.isNonZero(try self.shiftRightBits(lane, 5));
+                if (self.wave32) {
+                    try self.destination(inst.dst, .{ .id = value, .value_type = .bits32 });
+                    return;
+                }
                 try self.destinationPair(inst.dst, .{
                     try self.bvhSelect(self.bits_type, high, zero, value),
                     try self.bvhSelect(self.bits_type, high, value, zero),
                 });
                 return;
             }
-            try self.destinationPair(inst.dst, try self.waveBallot(active_condition));
+            const ballot = try self.waveBallot(active_condition);
+            if (self.wave32) {
+                // VALU mask writes in wave32 must preserve the adjacent SGPR.
+                try self.destination(inst.dst, .{ .id = ballot[0], .value_type = .bits32 });
+            } else try self.destinationPair(inst.dst, ballot);
             return;
         }
         const mask = self.id();
@@ -9034,7 +9047,7 @@ const Builder = struct {
         if (self.converged_workgroup_dispatch) {
             const invocation = self.id();
             try self.emit(&self.body, 61, &.{ self.bits_type, invocation, self.local_invocation_index });
-            index = try self.addBits(try self.andBits(invocation, ~@as(u32, 63)), lane);
+            index = try self.addBits(try self.andBits(invocation, ~@as(u32, if (self.wave32) 31 else 63)), lane);
         }
         if (self.wave_exchange_phase != 0) {
             const phase = self.id();
@@ -9073,6 +9086,14 @@ const Builder = struct {
     }
 
     fn waveShuffle(self: *Builder, value: u32, source_lane: u32) Error!u32 {
+        if (self.wave32) {
+            const result = self.id();
+            // A host subgroup may contain more than one guest wave32.
+            const base = try self.andBits(try self.subgroupLocalInvocationId(), ~@as(u32, 31));
+            const target = try self.addBits(base, try self.andBits(source_lane, 31));
+            try self.emit(&self.body, 345, &.{ self.bits_type, result, try self.constant(.bits32, 3), value, target });
+            return result;
+        }
         const pointer = try self.wavePointer(try self.currentLaneId());
         try self.emit(&self.body, 62, &.{ pointer, value });
         try self.controlBarrier();
@@ -9082,6 +9103,15 @@ const Builder = struct {
     }
 
     fn waveBallot(self: *Builder, predicate: u32) Error![2]u32 {
+        if (self.wave32) {
+            const ballot_type = try self.ensureVec4(.bits32);
+            const ballot = self.id();
+            try self.emit(&self.body, 339, &.{ ballot_type, ballot, try self.constant(.bits32, 3), predicate });
+            const low = self.id();
+            const half = try self.shiftRightBits(try self.subgroupLocalInvocationId(), 5);
+            try self.emit(&self.body, 77, &.{ self.bits_type, low, ballot, half });
+            return .{ low, try self.constant(.bits32, 0) };
+        }
         const lane = try self.currentLaneId();
         const pointer = try self.wavePointer(try self.shiftRightBits(lane, 5));
         const scope = try self.constant(.bits32, 2);
@@ -10470,8 +10500,10 @@ const Builder = struct {
                 far = try self.glslBinaryValue(37, .float32, far, try self.glslBinaryValue(40, .float32, a, b));
             }
             const pointer = try self.loadBufferWord(address, @intCast(child));
-            const ordinary_node = try self.bvhBinary(176, self.bool_type, try self.andBits(pointer, 7), try self.constant(.bits32, 6));
-            const hit = try self.logicalAndValue(ordered_bounds, try self.logicalAndValue(ordinary_node, try self.floatCompareValue(188, near, try self.floatMultiplyValue(far, expansion))));
+            // Box traversal returns opaque child pointers, including the
+            // application-handled node kinds 6/7. Only a direct intersection
+            // request rejects a node kind it cannot intersect itself.
+            const hit = try self.logicalAndValue(ordered_bounds, try self.floatCompareValue(188, near, try self.floatMultiplyValue(far, expansion)));
             children[child] = try self.bvhSelect(self.bits_type, hit, pointer, invalid);
             distances[child] = try self.selectFloatValue(hit, near, inf);
         }
@@ -10511,7 +10543,13 @@ const Builder = struct {
         const known = try self.bvhBinary(178, self.bool_type, kind, try self.constant(.bits32, 5));
         const mode1 = try self.isNonZero(try self.andBits(descriptor[3], 1 << 24));
         const format_ok = try self.logicalAndValue(try self.bvhBinary(170, self.bool_type, try self.shiftRightBits(descriptor[3], 28), try self.constant(.bits32, 8)), try self.bvhBinary(166, self.bool_type, box, mode1));
-        const in_bounds = try self.bvhBinary(166, self.bool_type, try self.isNonZero(try self.andBits(descriptor[3], 0x3ff)), try self.bvhBinary(178, self.bool_type, try self.shiftRightBits(node, 3), descriptor[2]));
+        const node_index = try self.shiftRightBits(node, 3);
+        // SIZE is the last 64-byte node index. FP32 boxes consume two
+        // nodes, so equality is valid only for triangles and FP16 boxes.
+        // Reject an out-of-bounds node before looking up its memory: it is
+        // an ordinary hardware miss, not an unmapped guest-memory fault.
+        const low_in_bounds = try self.bvhSelect(self.bool_type, full_box, try self.bvhBinary(176, self.bool_type, node_index, descriptor[2]), try self.bvhBinary(178, self.bool_type, node_index, descriptor[2]));
+        const in_bounds = try self.bvhBinary(166, self.bool_type, try self.isNonZero(try self.andBits(descriptor[3], 0x3ff)), low_in_bounds);
         const base = [2]u32{
             try self.multiplyBits(descriptor[0], try self.constant(.bits32, 256)),
             try self.bvhBinary(197, self.bits_type, try self.multiplyBits(try self.andBits(descriptor[1], 255), try self.constant(.bits32, 256)), try self.shiftRightBits(descriptor[0], 24)),
@@ -11981,7 +12019,7 @@ fn structuredCondition(builder: *Builder, condition: control_flow.Condition) Err
             if (builder.wave64_workgroup) {
                 const mask = try builder.sourcePair(.{ .kind = if (condition == .vcc_zero) .vcc_lo else .exec_lo });
                 const combined = builder.id();
-                try builder.emit(&builder.body, 197, &.{ builder.bits_type, combined, mask[0], mask[1] });
+                try builder.emit(&builder.body, 197, &.{ builder.bits_type, combined, mask[0], if (builder.wave32) try builder.constant(.bits32, 0) else mask[1] });
                 const empty = builder.id();
                 try builder.emit(&builder.body, 168, &.{ builder.bool_type, empty, try builder.isNonZero(combined) });
                 break :blk empty;
@@ -12785,7 +12823,7 @@ fn selectWorkgroupDispatchPc(builder: *Builder, instructions: []const instructio
     const count = builder.local_size[0] * builder.local_size[1] * builder.local_size[2];
     var selected = try builder.constant(.bits32, dispatch_sentinel);
     var base: u32 = 0;
-    while (base < count) : (base += 64) {
+    while (base < count) : (base += if (builder.wave32) @as(u32, 32) else 64) {
         const wave_pc = builder.id();
         try builder.emit(&builder.body, 61, &.{ builder.bits_type, wave_pc, try builder.waveSchedulerPointer(try builder.constant(.bits32, base)) });
         const earlier = builder.id();
@@ -12841,7 +12879,7 @@ fn translateDispatcher(builder: *Builder, instructions: []const instruction.Inst
         builder.bool_type,
         budget_done,
         iteration,
-        try builder.constant(.bits32, builder.maximum_dispatcher_iterations *| (if (builder.converged_workgroup_dispatch) @max(1, builder.local_size[0] * builder.local_size[1] * builder.local_size[2] / 64) else 1)),
+        try builder.constant(.bits32, builder.maximum_dispatcher_iterations *| (if (builder.converged_workgroup_dispatch) @max(1, builder.local_size[0] * builder.local_size[1] * builder.local_size[2] / @as(u32, if (builder.wave32) 32 else 64)) else 1)),
     }); // OpUGreaterThanEqual
     const done = builder.id();
     try builder.emit(&builder.body, 166, &.{ builder.bool_type, done, pc_done, budget_done }); // OpLogicalOr
@@ -13437,6 +13475,7 @@ fn translateInstructions(
     var uses_gds = false;
     var scans_wave_mask = false;
     var uses_lds = false;
+    var uses_barrier = false;
     var uses_wave_permute = false;
     for (effective.ngg_lds_exports) |ngg_export| {
         if (effective.stage == .vertex and effective.vertex_parameter_sources.len == 0 and ngg_export.target >= 0x20 and ngg_export.target < 0x40) {
@@ -13450,6 +13489,7 @@ fn translateInstructions(
             if (constantWaveLane(candidate.src1)) |lane| cross_half_read = cross_half_read or lane >= 32;
         }
         uses_gds = uses_gds or candidate.gds;
+        uses_barrier = uses_barrier or candidate.opcode == .s_barrier;
         const lane_permute = candidate.opcode == .ds_permute_b32 or candidate.opcode == .ds_bpermute_b32;
         uses_wave_permute = uses_wave_permute or lane_permute;
         uses_lds = uses_lds or (candidate.family == .ds and !candidate.gds and
@@ -13551,8 +13591,20 @@ fn translateInstructions(
     // boundary. Keep scalar branches uniform across the complete guest wave
     // so every invocation reaches the rendezvous before each LDS access.
     const single_wave_lds = invocation_count == 64 and uses_lds;
-    if (!effective.wave32 and effective.stage == .compute and invocation_count >= 64 and invocation_count <= 1024 and invocation_count % 64 == 0 and (cross_half_read or uses_gds or single_wave_mask_scan or single_wave_lds or uses_wave_permute) and (!uses_gds or invocation_count == 64)) {
+    // A larger workgroup can initialize LDS under lane-zero EXEC and then
+    // consume it after S_BARRIER without a constant upper-half READLANE.
+    // Its scalar branches still belong to complete guest waves, and its
+    // barriers must rendezvous waves that take different control-flow paths.
+    const workgroup_lds_barrier = uses_lds and uses_barrier;
+    if (!effective.wave32 and effective.stage == .compute and invocation_count >= 64 and invocation_count <= 1024 and invocation_count % 64 == 0 and (cross_half_read or uses_gds or single_wave_mask_scan or single_wave_lds or uses_wave_permute or workgroup_lds_barrier) and (!uses_gds or invocation_count == 64)) {
         effective.wave64_workgroup = true;
+        effective.uses_lane_identity = true;
+        effective.uses_execution_mask = true;
+    }
+    if (effective.wave32 and effective.stage == .compute and uses_lds and uses_barrier and
+        invocation_count >= 32 and invocation_count <= 1024 and invocation_count % 32 == 0)
+    {
+        effective.wave32_workgroup = true;
         effective.uses_lane_identity = true;
         effective.uses_execution_mask = true;
     }
@@ -13576,7 +13628,7 @@ fn translateInstructions(
         try allocator.alloc(@import("fragment_min.zig").Reduction, 0);
     defer allocator.free(fragment_min_pcs);
     builder.fragment_min_pcs = fragment_min_pcs;
-    const local_vcc_pcs = if (effective.wave64_workgroup)
+    const local_vcc_pcs = if (effective.wave64_workgroup or effective.wave32_workgroup)
         try @import("local_vcc.zig").scanPcs(allocator, instructions, &graph)
     else
         try allocator.alloc(u32, 0);

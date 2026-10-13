@@ -34,6 +34,12 @@ pub export var capture_storage_flip: u64 = 0;
 pub export var capture_storage_address: u64 = 0;
 pub export var capture_storage_bytes: u64 = 0;
 pub export var capture_compute_sampled_images: bool = false;
+// Diagnose generic BVH kernels with checked runtime memory faults. The
+// production path still requires a fully staged acceleration structure.
+pub export var checked_bvh_diagnostics: bool = false;
+/// Bounded diagnostic comparison for rays visiting unusually large trees.
+/// Exhaustion remains an explicit failure at either budget.
+pub export var checked_bvh_diagnostic_iterations: u32 = 4096;
 pub export var capture_storage_image_address: u64 = 0;
 pub export var capture_vertex_program: u64 = 0;
 pub export var capture_vertex_flip: u64 = 0;
@@ -9663,6 +9669,11 @@ pub const Renderer = struct {
             programHasRawInstruction(analysis, 0x6e4, &.{ 0xe034_2000, 0x8005_181d }) and
             programHasRawInstruction(analysis, 0x764, &.{ 0xdc30_8000, 0x197d_0018 });
         const scene_collision_query = isSceneCollisionQuery(analysis) and resources.flat_memory_count != 0;
+        const checked_bvh = scene_collision_query or (@atomicLoad(bool, &checked_bvh_diagnostics, .monotonic) and self.storage_buffer_nonuniform_indexing and for (analysis.program.instructions.items) |inst| {
+            if (inst.opcode == .image_bvh_intersect_ray) break true;
+        } else false);
+        if (checked_bvh and resources.flat_memory_count == 0)
+            try self.prepareCheckedBvhMemory(resources, reader, analysis);
         // Query inputs change which branch provenance visits first. The same
         // producer/register set must still use the same dynamic uniform words,
         // or its large SPIR-V module recompiles solely because discovery order
@@ -9700,8 +9711,8 @@ pub const Renderer = struct {
             .program_address = if (rdna2.scalar_calls.present(analysis.program.instructions.items)) bindings.program_address else 0,
             .local_size = local_size,
             .physical_local_size = try @import("compute_shape.zig").fit(local_size, self.device_info.max_compute_work_group_size, self.device_info.max_compute_work_group_invocations),
-            .maximum_dispatcher_iterations = if (scene_collision_query) 4096 else if (yotei_environment_lighting) 2048 else if (yotei_atmosphere_multiscatter) 1024 else if (yotei_atmosphere_precompute) 512 else 256,
-            .report_dispatcher_exhaustion = scene_collision_query,
+            .maximum_dispatcher_iterations = if (checked_bvh) (if (@atomicLoad(bool, &checked_bvh_diagnostics, .monotonic)) std.math.clamp(@atomicLoad(u32, &checked_bvh_diagnostic_iterations, .monotonic), 4096, 65536) else 4096) else if (yotei_environment_lighting) 2048 else if (yotei_atmosphere_multiscatter) 1024 else if (yotei_atmosphere_precompute) 512 else 256,
+            .report_dispatcher_exhaustion = checked_bvh,
             .wave32 = initiator & (1 << 15) != 0,
             .wave_exchange_double_buffer = wave_exchange_double_buffer,
             .storage_buffers = resources.mappings[0..resources.mapping_count],
@@ -9730,8 +9741,8 @@ pub const Renderer = struct {
             .specialized_scalar_prefix_end = resources.specialized_scalar_prefix_end,
             .zero_unmapped_flat_loads = yotei_empty_cluster_flat_read,
             .flat_memories = resources.flat_memories[0..resources.flat_memory_count],
-            .bvh_intersection_mode1 = scene_collision_query,
-            .snapshot_unbound_reads = scene_collision_query,
+            .bvh_intersection_mode1 = checked_bvh,
+            .snapshot_unbound_reads = checked_bvh,
             .flat_apertures = if (scene_collision_query) .{ .shared = 0x8000_0000, .private = 0x7000_0000 } else .{},
             // These traversal kernels spill beyond 15 LDS stack entries into
             // a private stack bounded at byte 0xd4, rounded to a 256-byte slot.
@@ -9740,6 +9751,14 @@ pub const Renderer = struct {
             .allow_image_float32_atomic_min_max = self.image_float32_atomic_min_max_available,
         }, analysis.pipeline_options, if (self.prepared_program_keys_enabled) analysis.translation_key else null) catch |err| {
             self.frame_profile.compute_translate_ns +|= elapsedHostNanoseconds(translate_started);
+            // Failed shaders never reach the normal before/after capture.
+            // Keep their actual prepared inputs available for a bounded,
+            // explicitly selected diagnostic replay as well.
+            if (self.shouldCaptureStorage(resources, program_address)) {
+                self.captureFailedCompute(state, &bindings, reader, analysis, resources, local_size, group_count) catch |capture_error| {
+                    std.debug.print("[vulkan diagnostic] failed compute capture: {s}\n", .{@errorName(capture_error)});
+                };
+            }
             if (self.shouldReportComputeShaderFailure(program_address, err)) {
                 std.debug.print(
                     "[vulkan dcb] compute program 0x{x}: {d} instructions, groups={d}x{d}x{d}, local={d}x{d}x{d}, rsrc2=0x{x}\n",
@@ -11828,6 +11847,106 @@ pub const Renderer = struct {
                 result.scalar_memory_count += 1;
             }
         }
+    }
+
+    const BvhSnapshot = struct { address: u64, bytes: []u8, header: gpu.bvh_snapshot.Header };
+
+    fn appendBvhSnapshot(self: *Renderer, reader: gpu.ShaderMemoryReader, snapshots: *std.ArrayList(BvhSnapshot), address: u64, required: bool, total: *usize) anyerror!void {
+        for (snapshots.items) |snapshot| if (snapshot.address == address) return;
+        if (address == 0 or address & 255 != 0) {
+            if (required) return Error.InvalidStorageDescriptor;
+            return;
+        }
+        var bytes: [256]u8 = undefined;
+        const previous_failure = self.last_shader_read_failure;
+        defer self.last_shader_read_failure = previous_failure;
+        try self.flushGuestStorageRange(address, bytes.len);
+        reader.read(address, &bytes) catch |err| {
+            if (required) return err;
+            return;
+        };
+        const header = gpu.bvh_snapshot.decode(&bytes) orelse {
+            if (required) return Error.InvalidStorageDescriptor;
+            return;
+        };
+        if (snapshots.items.len == maximum_storage_descriptors or header.size > 16 * 1024 * 1024 - total.*)
+            return Error.GuestBufferTooLarge;
+        const allocation = try self.allocator.alloc(u8, header.size);
+        errdefer self.allocator.free(allocation);
+        try self.flushGuestStorageRange(address, allocation.len);
+        try reader.read(address, allocation);
+        try snapshots.append(self.allocator, .{ .address = address, .bytes = allocation, .header = header });
+        total.* += allocation.len;
+    }
+
+    fn prepareCheckedBvhMemory(self: *Renderer, result: *ComputeResources, reader: gpu.ShaderMemoryReader, analysis: *const gpu.ShaderAnalysis) anyerror!void {
+        var snapshots: std.ArrayList(BvhSnapshot) = .empty;
+        defer {
+            for (snapshots.items) |snapshot| self.allocator.free(snapshot.bytes);
+            snapshots.deinit(self.allocator);
+        }
+        var total: usize = 0;
+        const scalars = result.scalar_registers[0..result.scalar_count];
+        for (scalars) |low| {
+            if (low.register & 1 != 0 or low.value & 255 != 0) continue;
+            if (low.producer_pc) |pc| {
+                const index = analysis.instructionBefore(pc);
+                if (index == analysis.program.instructions.items.len or
+                    analysis.program.instructions.items[index].pc != pc or
+                    !isPointerScalarLoad(analysis.program.instructions.items[index].opcode)) continue;
+            }
+            const high = for (scalars) |candidate| {
+                if (candidate.producer_pc == low.producer_pc and candidate.register == low.register + 1) break candidate.value;
+            } else continue;
+            try self.appendBvhSnapshot(reader, &snapshots, @as(u64, low.value) | (@as(u64, high & 0xffff) << 32), false, &total);
+        }
+        var cursor: usize = 0;
+        while (cursor < snapshots.items.len) : (cursor += 1) {
+            const snapshot = snapshots.items[cursor];
+            for (0..snapshot.header.instance_count) |index| {
+                const offset = snapshot.header.instance_offset + index * 128;
+                const address = gpu.bvh_snapshot.instanceAddress(snapshot.bytes[offset..][0..128]);
+                try self.appendBvhSnapshot(reader, &snapshots, address, true, &total);
+            }
+        }
+        if (snapshots.items.len == 0) {
+            try self.stageFlatMaterialPage(result, 0, &.{});
+            return;
+        }
+        var free: usize = 0;
+        for (result.occupied) |used| if (!used) {
+            free += 1;
+        };
+        if (snapshots.items.len > free) return Error.InvalidStorageDescriptor;
+        var upload_size: usize = 0;
+        for (snapshots.items, 0..) |snapshot, index|
+            upload_size += std.mem.alignForward(usize, 16 + snapshot.bytes.len + @as(usize, if (index == 0) 16 else 0), draw_upload_alignment);
+        // Reserve all regions before publishing any binding, so an upload
+        // ring wrap cannot overwrite an earlier snapshot from this dispatch.
+        const upload = try self.allocateDrawUpload(upload_size);
+        const mapping = try self.mapDrawUpload(upload);
+        defer mapping.release(self);
+        var offset: usize = 0;
+        for (snapshots.items, 0..) |snapshot, index| {
+            const size = 16 + snapshot.bytes.len + @as(usize, if (index == 0) 16 else 0);
+            const bytes = mapping.bytes[offset..][0..size];
+            std.mem.writeInt(u64, bytes[0..8], snapshot.address, .little);
+            std.mem.writeInt(u32, bytes[8..12], 0, .little);
+            std.mem.writeInt(u32, bytes[12..16], @intCast(snapshot.bytes.len), .little);
+            @memcpy(bytes[16..][0..snapshot.bytes.len], snapshot.bytes);
+            if (index == 0) @memset(bytes[16 + snapshot.bytes.len ..], 0);
+            const slot = result.freeDescriptor() orelse return Error.InvalidStorageDescriptor;
+            self.updateStorageDescriptorRange(slot, upload.buffer, upload.offset + offset, size);
+            result.occupied[slot] = true;
+            result.flat_memories[result.flat_memory_count] = .{ .descriptor_index = slot, .fault_record_word = if (index == 0) @intCast((16 + snapshot.bytes.len) / 4) else null };
+            result.flat_memory_count += 1;
+            if (index == 0) result.flat_memory_fault = .{ .buffer = upload.buffer, .offset = upload.offset + 8, .size = size - 8 };
+            offset += std.mem.alignForward(usize, size, draw_upload_alignment);
+        }
+        self.active_descriptor_set = self.descriptor_set;
+        self.frame_profile.upload_bytes +%= upload_size;
+        self.frame_profile.storage_upload_bytes +%= upload_size;
+        if (self.traceCurrentGraphicsFrame()) std.debug.print("[vulkan dcb] checked BVH snapshot regions={d} bytes={d}\n", .{ snapshots.items.len, total });
     }
 
     fn stageFlatMaterialPage(self: *Renderer, result: *ComputeResources, address: u64, bytes: []const u8) anyerror!void {
@@ -28013,6 +28132,38 @@ pub const Renderer = struct {
             if (writable and address >= base and address - base < size and bytes <= size - (address - base)) return true;
         }
         return false;
+    }
+
+    fn captureFailedCompute(self: *Renderer, state: *const gpu.State, bindings: *const gpu.ShaderBindings, reader: gpu.ShaderMemoryReader, analysis: *const gpu.ShaderAnalysis, resources: *const ComputeResources, local_size: [3]u32, group_count: [3]u32) !void {
+        var prefix_buffer: [128]u8 = undefined;
+        const prefix = try std.fmt.bufPrint(&prefix_buffer, "out/compute-failed-{d}-{x}-{d}", .{ self.flip_callbacks + 1, bindings.program_address, self.frame_profile.dispatches });
+        try dumpDiagnosticBytes(self.allocator, prefix, ".state", std.mem.asBytes(state));
+        try dumpDiagnosticBytes(self.allocator, prefix, ".code", std.mem.sliceAsBytes(analysis.program.code));
+        try dumpDiagnosticBytes(self.allocator, prefix, ".user-data", std.mem.asBytes(&bindings.user_data));
+        try dumpDiagnosticBytes(self.allocator, prefix, ".scalars", std.mem.sliceAsBytes(resources.scalar_registers[0..resources.scalar_count]));
+        try dumpDiagnosticBytes(self.allocator, prefix, ".local", std.mem.asBytes(&local_size));
+        try dumpDiagnosticBytes(self.allocator, prefix, ".groups", std.mem.asBytes(&group_count));
+        try dumpDiagnosticBytes(self.allocator, prefix, ".buffer-mappings", std.mem.sliceAsBytes(resources.mappings[0..resources.mapping_count]));
+        try dumpDiagnosticBytes(self.allocator, prefix, ".scalar-mappings", std.mem.sliceAsBytes(resources.scalar_memories[0..resources.scalar_memory_count]));
+        try self.captureStorageBuffers(resources, prefix, "before", null);
+        try self.captureComputeAuxiliaryBuffers(resources, prefix, "before", null, null);
+        // SRT and acceleration-structure headers can be GPU-written. Resolve
+        // coherence before inspecting pointer-form user data; a CPU-only dump
+        // otherwise misleadingly reports zero-filled input pages.
+        var page: [4096]u8 = undefined;
+        var suffix_buffer: [96]u8 = undefined;
+        var index: usize = 0;
+        while (index + 1 < bindings.user_data.len) : (index += 2) {
+            const address = @as(u64, bindings.user_data[index]) | (@as(u64, bindings.user_data[index + 1] & 0xffff) << 32);
+            if (address == 0 or address & 3 != 0) continue;
+            const previous_failure = self.last_shader_read_failure;
+            defer self.last_shader_read_failure = previous_failure;
+            self.flushGuestStorageRange(address, page.len) catch continue;
+            reader.read(address, &page) catch continue;
+            const suffix = try std.fmt.bufPrint(&suffix_buffer, "-user-{d}-{x}.bin", .{ index, address });
+            try dumpDiagnosticBytes(self.allocator, prefix, suffix, &page);
+        }
+        std.debug.print("[vulkan diagnostic] captured failed compute inputs: {s}\n", .{prefix});
     }
 
     fn diagnosticBufferRange(address: u64, size: usize, phase: []const u8) ?struct { offset: usize, size: usize } {
