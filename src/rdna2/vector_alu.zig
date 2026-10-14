@@ -54,6 +54,8 @@ fn vop1Opcode(id: u32) isa.Opcode {
         0x40 => .v_frexp_mant_f32,
         0x42 => .v_movreld_b32,
         0x43 => .v_movrels_b32,
+        0x44 => .v_movrelsd_b32,
+        0x48 => .v_movrelsd_2_b32,
         0x50 => .v_cvt_f16_u16,
         0x51 => .v_cvt_f16_i16,
         0x52 => .v_cvt_u16_f16,
@@ -1093,6 +1095,12 @@ test "VOP1 frexp and relative-move encodings decode" {
     try std.testing.expectEqual(isa.Opcode.v_frexp_exp_i32_f32, frexp.opcode);
     const movreld = try decodeVop1(0, &.{(@as(u32, 0x3f) << 25) | (@as(u32, 2) << 17) | (@as(u32, 0x42) << 9) | 256}, 0);
     try std.testing.expectEqual(isa.Opcode.v_movreld_b32, movreld.opcode);
+    for ([_]isa.Opcode{ .v_movrels_b32, .v_movrelsd_b32, .v_movrelsd_2_b32 }, [_]u32{ 0x43, 0x44, 0x48 }) |expected, opcode| {
+        const decoded = try decodeVop1(0, &.{(@as(u32, 0x3f) << 25) | (@as(u32, 2) << 17) | (opcode << 9) | 256 + 7}, 0);
+        try std.testing.expectEqual(expected, decoded.opcode);
+        try std.testing.expectEqual(@as(u32, 7), decoded.src0.reg);
+        try std.testing.expectEqual(@as(u32, 2), decoded.dst.reg);
+    }
 }
 
 test "VOP3 packed-norm and 16-bit native encodings decode" {

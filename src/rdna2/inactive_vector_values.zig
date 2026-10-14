@@ -8,6 +8,7 @@ const std = @import("std");
 const instruction = @import("instruction.zig");
 const operand = @import("operand.zig");
 const control_flow = @import("control_flow.zig");
+const relative_moves = @import("relative_vector_moves.zig");
 
 const Mask = u256;
 const State = struct { live: Mask = 0, observed: Mask = 0 };
@@ -55,7 +56,7 @@ fn transfer(effect: Effect, state: *State) void {
 
 fn candidate(inst: instruction.Instruction) bool {
     return inst.dst.kind == .vgpr and inst.dst.reg < 256 and switch (inst.family) {
-        .vop1, .vop2, .vop3, .vop3p, .vintrp => inst.opcode != .v_writelane_b32,
+        .vop1, .vop2, .vop3, .vop3p, .vintrp => inst.opcode != .v_writelane_b32 and !relative_moves.destinationRelative(inst.opcode),
         else => false,
     };
 }
@@ -66,13 +67,17 @@ fn candidate(inst: instruction.Instruction) bool {
 pub fn scanPcs(allocator: std.mem.Allocator, instructions: []const instruction.Instruction, graph: *const control_flow.Graph) ![]u32 {
     for (instructions) |inst| {
         if (inst.opcode == .unknown or inst.opcode == .unsupported or inst.family == .unknown or
-            inst.opcode == .s_setpc_b64 or inst.opcode == .s_call_b64 or inst.opcode == .s_swappc_b64 or
-            std.mem.startsWith(u8, @tagName(inst.opcode), "v_movrel"))
+            inst.opcode == .s_setpc_b64 or inst.opcode == .s_call_b64 or inst.opcode == .s_swappc_b64)
             return allocator.alloc(u32, 0);
     }
     const effects = try allocator.alloc(Effect, instructions.len);
     defer allocator.free(effects);
-    for (instructions, effects) |inst, *effect| effect.* = describe(inst);
+    const relative_bounds = try relative_moves.analyze(allocator, instructions, graph);
+    defer allocator.free(relative_bounds);
+    for (instructions, effects) |inst, *effect| {
+        effect.* = describe(inst);
+        if (relative_moves.isRelative(inst.opcode)) effect.reads |= relative_moves.vectorMask(inst, relative_bounds);
+    }
     const incoming = try allocator.alloc(State, graph.blocks.items.len);
     defer allocator.free(incoming);
     @memset(incoming, .{});
@@ -169,4 +174,21 @@ test "inactive vector observation follows loop backedges and rejects indirect ac
     const indirect = try scanPcs(a, &code, &graph);
     defer a.free(indirect);
     try std.testing.expectEqual(@as(usize, 0), indirect.len);
+}
+
+test "inactive values include relative reads after EXEC expansion" {
+    const a = std.testing.allocator;
+    const code = [_]instruction.Instruction{
+        .{ .pc = 0, .family = .sop1, .opcode = .s_mov_b32, .dst = .{ .kind = .m0 }, .src0 = .{ .kind = .integer_inline_constant, .value = 40 } },
+        .{ .pc = 4, .family = .vop1, .opcode = .v_mov_b32, .dst = .{ .kind = .vgpr, .reg = 50 } },
+        .{ .pc = 8, .family = .sop1, .opcode = .s_mov_b64, .dst = .{ .kind = .exec_lo } },
+        .{ .pc = 12, .family = .vop1, .opcode = .v_movrels_b32, .dst = .{ .kind = .vgpr, .reg = 80 }, .src0 = .{ .kind = .vgpr, .reg = 10 } },
+        .{ .pc = 16, .family = .vop1, .opcode = .v_movreld_b32, .dst = .{ .kind = .vgpr, .reg = 80 }, .src0 = .{ .kind = .vgpr, .reg = 1 } },
+        .{ .pc = 20, .family = .sopp, .opcode = .s_endpgm },
+    };
+    var graph = try control_flow.buildInstructionsWithBarriers(a, &code, false);
+    defer graph.deinit(a);
+    const result = try scanPcs(a, &code, &graph);
+    defer a.free(result);
+    try std.testing.expectEqualSlices(u32, &.{12}, result);
 }

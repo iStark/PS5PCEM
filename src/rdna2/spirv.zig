@@ -9,6 +9,7 @@ const operand = @import("operand.zig");
 const instruction = @import("instruction.zig");
 const control_flow = @import("control_flow.zig");
 const shader_ir = @import("ir.zig");
+const relative_moves = @import("relative_vector_moves.zig");
 
 pub const Stage = enum(u32) {
     vertex = 0,
@@ -1176,6 +1177,7 @@ const Builder = struct {
     dpp_write_predicate: ?u32 = null,
     unobserved_vector_pcs: []const u32 = &.{},
     unobserved_vector_destination: ?u32 = null,
+    relative_move_bounds: []const relative_moves.Entry = &.{},
     /// SPIR-V splits arbitrary-lane and relative-lane subgroup shuffles into
     /// separate capabilities. NVIDIA may accept a module that omits these and
     /// only report the mistake as DEVICE_LOST when a large compute kernel runs,
@@ -2350,6 +2352,67 @@ const Builder = struct {
             self.exec_mask_lane_predicate_condition = 0;
             self.lane_predicate_mask = null;
             self.lane_predicate = 0;
+        }
+    }
+
+    fn relativeRegisterMask(self: *Builder, inst: instruction.Instruction, base: u32, destination_relative: bool) [256]bool {
+        var mask: [256]bool = @splat(false);
+        if (base >= 256) return mask;
+        if (relative_moves.find(self.relative_move_bounds, inst.pc)) |values| {
+            for (values.data[0..values.len]) |m0| {
+                const delta = relative_moves.offset(inst.opcode, m0, destination_relative);
+                if (delta < 256 - base) mask[base + delta] = true;
+            }
+        } else @memset(mask[base..], true);
+        return mask;
+    }
+
+    fn relativeVectorMove(self: *Builder, inst: instruction.Instruction) Error!void {
+        const m0 = try self.registerBits(124, 0);
+        var source_offset = m0;
+        var destination_offset = m0;
+        if (inst.opcode == .v_movrelsd_2_b32) {
+            source_offset = try self.andBits(m0, 0x3ff);
+            const high = self.id();
+            try self.emit(&self.body, 194, &.{ self.bits_type, high, m0, try self.constant(.bits32, 16) });
+            destination_offset = try self.andBits(high, 0x3ff);
+        }
+        // Snapshot the selected source before any destination is changed.
+        // Constant-register selects keep bounded indexing in host registers.
+        var selected_source: u32 = undefined;
+        if (relative_moves.sourceRelative(inst.opcode)) {
+            if (inst.src0.kind != .vgpr or inst.src0.reg >= 256 or inst.src0.dpp or
+                inst.src0.sdwa_sel != 6 or inst.src0.negate or inst.src0.absolute)
+                return Error.UnsupportedOpcode;
+            selected_source = try self.constant(.bits32, 0);
+            const mask = self.relativeRegisterMask(inst, inst.src0.reg, false);
+            for (mask, 0..) |possible, reg| {
+                if (!possible) continue;
+                const matches = self.id();
+                try self.emit(&self.body, 170, &.{ self.bool_type, matches, source_offset, try self.constant(.bits32, @intCast(reg - inst.src0.reg)) });
+                const selected = self.id();
+                try self.emit(&self.body, 169, &.{ self.bits_type, selected, matches, try self.registerBits(128 + reg, 0), selected_source });
+                selected_source = selected;
+            }
+        } else selected_source = try self.source(inst.src0, .bits32);
+        if (!relative_moves.destinationRelative(inst.opcode)) {
+            try self.destination(inst.dst, .{ .id = selected_source, .value_type = .bits32 });
+            return;
+        }
+        if (inst.dst.kind != .vgpr or inst.dst.reg >= 256) return Error.UnsupportedDestination;
+        const mask = self.relativeRegisterMask(inst, inst.dst.reg, true);
+        for (mask, 0..) |possible, reg| {
+            if (!possible) continue;
+            const matches = self.id();
+            try self.emit(&self.body, 170, &.{ self.bool_type, matches, destination_offset, try self.constant(.bits32, @intCast(reg - inst.dst.reg)) });
+            const selected = self.id();
+            try self.emit(&self.body, 169, &.{ self.bits_type, selected, matches, selected_source, try self.registerBits(128 + reg, 0) });
+            var dst = inst.dst;
+            dst.reg = @intCast(reg);
+            // destination() retains EXEC and invalidates this register's lane
+            // spills. A relative destination never uses the explicit-only
+            // inactive-value optimization.
+            try self.destination(dst, .{ .id = selected, .value_type = .bits32 });
         }
     }
 
@@ -11491,7 +11554,7 @@ const Builder = struct {
             .v_writelane_b32 => try self.writeLane(inst),
             .v_permlane16_b32 => try self.permlane(inst, false),
             .v_permlanex16_b32 => try self.permlane(inst, true),
-            .v_movreld_b32, .v_movrels_b32 => try self.unary(inst, 83, .bits32),
+            .v_movreld_b32, .v_movrels_b32, .v_movrelsd_b32, .v_movrelsd_2_b32 => try self.relativeVectorMove(inst),
             .s_mov_b64 => try self.mov64(inst),
             .s_getpc_b64, .s_call_b64, .s_swappc_b64 => try self.getPcFallback(inst),
             .s_not_b64 => try self.not64(inst),
@@ -12382,6 +12445,13 @@ fn setpcSuccessor(graph: *const control_flow.Graph, block_index: u32) ?u32 {
 
 fn markMutableOperand(marked: *[384]bool, op: operand.Operand) void {
     const first = Builder.registerIndex(op) orelse return;
+    if (op.kind == .m0) {
+        // M0 is one architectural word, never a descriptor tuple. Extending
+        // its window used to invent an EXEC dependency in otherwise unmasked
+        // compute loops, without declaring LocalInvocationIndex for it.
+        marked[first] = true;
+        return;
+    }
     // Memory instructions name the first word of a descriptor, coordinate or
     // result tuple. A small conservative window covers those implicit words
     // as well as all scalar/vector pairs without teaching the CFG pass every
@@ -12397,6 +12467,13 @@ fn configureMutableLoopState(builder: *Builder, instructions: []const instructio
         markMutableOperand(&marked, inst.dst2);
         const sources = inst.sources();
         for (sources.slice()) |source_op| markMutableOperand(&marked, source_op);
+        if (relative_moves.isRelative(inst.opcode)) {
+            marked[124] = true;
+            const mask = relative_moves.vectorMask(inst, builder.relative_move_bounds);
+            for (0..256) |reg| if (mask & (@as(u256, 1) << @intCast(reg)) != 0) {
+                marked[128 + reg] = true;
+            };
+        }
     }
 
     builder.function_bits_pointer_type = builder.id();
@@ -13626,6 +13703,9 @@ fn translateInstructions(
     try builder.configureLaneSpills(instructions);
     var graph = try control_flow.buildInstructionsWithBarriers(allocator, instructions, builder.converged_workgroup_dispatch);
     defer graph.deinit(allocator);
+    const relative_move_bounds = try relative_moves.analyze(allocator, instructions, &graph);
+    defer allocator.free(relative_move_bounds);
+    builder.relative_move_bounds = relative_move_bounds;
     if (effective.scalarize_private_spills) try builder.configurePrivateSpills(instructions, &graph);
     const lane_mask_scans = if (effective.stage == .fragment and !effective.wave32)
         try @import("lane_mask_provenance.zig").scanPcs(allocator, instructions, &graph)
@@ -13700,6 +13780,7 @@ fn translateInstructions(
             builder.fragment_min_pcs = fragment_min_pcs;
             builder.local_vcc_pcs = local_vcc_pcs;
             builder.unobserved_vector_pcs = unobserved_vector_pcs;
+            builder.relative_move_bounds = relative_move_bounds;
             try builder.configureLaneSpills(instructions);
             if (effective.scalarize_private_spills) try builder.configurePrivateSpills(instructions, &graph);
             translateDispatcher(&builder, instructions, &graph) catch |dispatch_err| {
@@ -13712,6 +13793,7 @@ fn translateInstructions(
                 builder.lane_mask_scan_pcs = lane_mask_scans;
                 builder.fragment_min_pcs = fragment_min_pcs;
                 builder.local_vcc_pcs = local_vcc_pcs;
+                builder.relative_move_bounds = relative_move_bounds;
                 try builder.configureLaneSpills(instructions);
                 builder.used_control_flow_fallback = true;
                 try builder.emit(&builder.body, 248, &.{builder.label});

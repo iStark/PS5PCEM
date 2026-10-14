@@ -31,6 +31,7 @@ fn blockAt(graph: *const Graph, index: usize) ?u32 {
 
 fn writes(inst: Instruction, location: Location) bool {
     if (inst.opcode == .unknown) return true;
+    if (location.lane != null and rdna2.relative_vector_moves.destinationRelative(inst.opcode)) return true;
     if (location.lane == null and location.register >= 126 and location.register <= 127) {
         switch (inst.opcode) {
             .s_and_saveexec_b64, .s_orn2_saveexec_b64, .s_andn1_saveexec_b64 => return true,
@@ -61,6 +62,14 @@ fn writes(inst: Instruction, location: Location) bool {
         if (location.register - first < destination_width) return true;
     }
     return false;
+}
+
+test "relative vector destinations are reaching clobbers beyond their encoded base" {
+    for ([_]rdna2.Opcode{ .v_movreld_b32, .v_movrelsd_b32, .v_movrelsd_2_b32 }) |opcode| {
+        const inst = Instruction{ .opcode = opcode, .dst = .{ .kind = .vgpr, .reg = 4 } };
+        try std.testing.expect(writes(inst, .{ .register = 200, .lane = 0 }));
+        try std.testing.expect(!writes(inst, .{ .register = 4 }));
+    }
 }
 
 /// Require the same reaching definition on every predecessor, including loop

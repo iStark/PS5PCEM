@@ -5,6 +5,30 @@ Output is 1920×1080; the game still controls its internal surface dimensions.
 Existing shader caches were retained. The 25–30 FPS target is **not reached**.
 Rendering defects remain, and controllable gameplay is not established.
 
+## Follow-up: relative vector moves
+
+Candidate 51 implements M0-indexed source, destination and combined VGPR moves,
+including the split-offset encoding. The previous source-relative lowering
+ignored M0. Indirect reads and writes now participate in register liveness,
+loop state, lane-mask provenance and resource analysis. A bounded scalar proof
+narrows all 51 relative moves in the captured material shader to eight possible
+registers each; unknown offsets retain checked access to the complete register
+file. The analysis is informed by SharpEmu's GPL-compatible implementation.
+
+The native probe passes 128 GPU dispatches covering wave32/wave64, masked lanes,
+dynamic offsets, overlapping registers, high registers and loops. GPU/Vulkan
+unit tests pass 534/534; the focused RDNA2 suite passes 10/10. The full RDNA2
+suite retains its ten previously recorded failures (282/292 pass).
+
+A warmed title sample measured 220 frames in 20.000 seconds (11.00 FPS).
+The subsequent 1,320-frame observation across two animation cycles measured
+**10.85 FPS**, without new draw/dispatch failures in the log. This is comparable
+to candidate 50, not an established speedup. No new screenshot or visual/control
+verification was possible because window automation remained unavailable.
+The 25 FPS target is still unmet. Profiling identifies repeated CPU baseline
+copies, resource evaluation and synchronous buffer/image publication as
+remaining costs.
+
 ## Follow-up: proven full compute-image stores
 
 A conservative shader analysis now proves rectangular output coverage from

@@ -14003,6 +14003,10 @@ fn runNativeLsHsProbe(allocator: std.mem.Allocator, triangles: bool) !void {
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
     const args = try init.minimal.args.toSlice(allocator);
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--relative-moves")) {
+        try @import("relative_move_probe.zig").run(allocator, GuestMemory);
+        return;
+    }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--half-writes")) {
         try @import("half_write_probe.zig").run(allocator, GuestMemory);
         return;

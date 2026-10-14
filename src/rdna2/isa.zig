@@ -255,6 +255,8 @@ pub const Opcode = enum {
     v_mov_b32,
     v_movreld_b32,
     v_movrels_b32,
+    v_movrelsd_b32,
+    v_movrelsd_2_b32,
     v_readfirstlane_b32,
     v_readlane_b32,
     v_writelane_b32,

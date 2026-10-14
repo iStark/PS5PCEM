@@ -82,6 +82,11 @@ fn write(state: State, op: operand.Operand, values: []const Kind) void {
 }
 
 fn transfer(state: State, spills: []const Spill, inst: instruction.Instruction) void {
+    if (@import("relative_vector_moves.zig").destinationRelative(inst.opcode)) {
+        // The encoded destination is only a base; M0 can overwrite any saved
+        // lane. Do not propagate a stale scalar-mask tag through READLANE.
+        @memset(state[128..], .integer);
+    }
     // The graphics backend keeps scalar WRITELANE spills in private slots.
     // Their mask tags must follow the same slots across CFG joins/back edges.
     if (inst.opcode == .v_writelane_b32 and inst.dst.kind == .vgpr) {
@@ -134,6 +139,16 @@ fn transfer(state: State, spills: []const Spill, inst: instruction.Instruction) 
             write(state, inst.dst2, &.{.integer});
         },
     }
+}
+
+test "relative vector writes invalidate saved lane mask tags" {
+    var state: [129]Kind = @splat(.integer);
+    const spills = [_]Spill{.{ .vgpr = 200, .lane = 0 }};
+    state[128] = .mask;
+    transfer(&state, &spills, .{ .opcode = .v_movrels_b32, .dst = .{ .kind = .vgpr, .reg = 4 } });
+    try std.testing.expectEqual(Kind.mask, state[128]);
+    transfer(&state, &spills, .{ .opcode = .v_movreld_b32, .dst = .{ .kind = .vgpr, .reg = 4 } });
+    try std.testing.expectEqual(Kind.integer, state[128]);
 }
 
 pub fn scanPcs(allocator: std.mem.Allocator, instructions: []const instruction.Instruction, graph: *const control_flow.Graph) ![]u32 {

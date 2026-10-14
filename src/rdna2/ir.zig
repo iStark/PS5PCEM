@@ -833,6 +833,10 @@ fn dceEligible(node: Node) bool {
 /// leaders retain their decoded PC even when their value is dead, preserving
 /// the guest address domain used by control-flow lowering.
 pub fn optimize(allocator: std.mem.Allocator, module: *Module) std.mem.Allocator.Error!void {
+    // SSA currently lists explicit operands only. Indirect VGPR accesses must
+    // preserve every reaching definition until their dependencies are modelled.
+    for (module.instructions.items) |inst| if (@import("relative_vector_moves.zig").isRelative(inst.opcode))
+        return optimizeConservative(allocator, module);
     module.optimization = .{};
     for (module.nodes.items, 0..) |*node, index| {
         node.elided = false;

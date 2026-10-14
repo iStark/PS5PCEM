@@ -120,6 +120,10 @@ const LaneSpills = struct {
 
     fn invalidateInstruction(self: *LaneSpills, inst: *const rdna2.Instruction) void {
         if (self.occupied == 0) return;
+        if (rdna2.relative_vector_moves.destinationRelative(inst.opcode)) {
+            self.invalidate(0, 256);
+            return;
+        }
         const name = @tagName(inst.opcode);
         const wide = std.mem.indexOf(u8, name, "64") != null;
         const count: u32 = @max(inst.data_words, if (inst.family == .ds) @as(u8, 4) else if (wide) @as(u8, 2) else 1);
@@ -150,6 +154,16 @@ const BranchSites = struct {
         self.bits.set(index);
     }
 };
+
+test "relative VGPR destinations invalidate scalar lane spills" {
+    for ([_]rdna2.Opcode{ .v_movreld_b32, .v_movrelsd_b32, .v_movrelsd_2_b32 }) |opcode| {
+        var spills = LaneSpills{};
+        spills.slots[0] = .{ .vgpr = 200, .lane = 3, .value = .{ .known = true, .value = 0x12345678 } };
+        spills.occupied = 1;
+        spills.invalidateInstruction(&.{ .opcode = opcode, .dst = .{ .kind = .vgpr, .reg = 4 } });
+        try std.testing.expectEqual(@as(usize, 0), spills.occupied);
+    }
+}
 
 test "lane spills recycle invalidated slots and preserve occupied lanes" {
     var spills = LaneSpills{};

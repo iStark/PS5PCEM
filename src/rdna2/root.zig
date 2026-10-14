@@ -18,6 +18,7 @@ pub const control_flow = @import("control_flow.zig");
 pub const ir = @import("ir.zig");
 pub const spirv = @import("spirv.zig");
 pub const cache_key = @import("cache_key.zig");
+pub const relative_vector_moves = @import("relative_vector_moves.zig");
 
 pub const Family = isa.Family;
 pub const Opcode = isa.Opcode;
@@ -82,4 +83,5 @@ test {
     _ = spirv;
     _ = @import("inactive_vector_values.zig");
     _ = cache_key;
+    _ = relative_vector_moves;
 }
