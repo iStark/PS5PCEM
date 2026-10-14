@@ -75,3 +75,9 @@ implementation, not a claim that their renderers have been fully imported.
 - AnyPS5's [16-byte stream-copy kernel](https://github.com/boykopovar/AnyPS5/commit/fc24253487fa6a407a9093ccd5f3cb0970af4ddf)
   has a precise code/descriptor match. No matching ASTRO BOT dispatch has been
   established here, so no title-wide copy shortcut was added.
+
+## Follow-up: unused uniform reads and compute scans
+
+[Later comparison and reference review](astro-bot-uniform-scan-2026-10-15.md):
+49 CPU proof reads omitted per frame, **14.95 versus 14.91 FPS**, with no
+established performance improvement; 560 GPU/Vulkan tests pass.

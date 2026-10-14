@@ -30,6 +30,7 @@ const tessellation_spirv = @import("tessellation_spirv.zig");
 pub export var native_tessellation: bool = false;
 pub export var graphics_uniform_specialization: bool = false;
 pub export var vertex_uniform_specialization: bool = false;
+pub export var indexed_compute_sampled_scan: bool = true;
 pub export var capture_storage_program: u64 = 0;
 pub export var capture_storage_flip: u64 = 0;
 pub export var capture_storage_address: u64 = 0;
@@ -13988,7 +13989,9 @@ pub const Renderer = struct {
             return result;
         }
         const sampled_loop_started = self.resourceTimestampNs();
-        for (instructions) |inst| {
+        var sampled_instructions = gpu.resource_checkpoints.Iterator.init(instructions, if (@atomicLoad(bool, &indexed_compute_sampled_scan, .monotonic)) (if (analysis.resource_checkpoints) |*plan| plan else null) else null, .sampled);
+        while (sampled_instructions.next()) |instruction_index| {
+            const inst = instructions[instruction_index];
             const image_fetch = inst.opcode == .image_load or inst.opcode == .image_load_mip;
             if (!image_fetch and inst.opcode != .image_sample and inst.opcode != .image_gather4) continue;
             if (inst.src1.kind != .sgpr or inst.src2.kind != .sgpr) {

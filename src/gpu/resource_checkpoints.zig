@@ -83,6 +83,9 @@ pub const Plan = struct {
     /// Only the entry block can supply unconditional, single-visit snapshots.
     /// Manual plans deliberately provide no proof.
     entry_block_end: u32 = 0,
+    /// Scalar inputs consumed by uniform control-flow interpretation. Manual
+    /// plans opt out; this summary belongs to the exact decoded allocation.
+    uniform_scalar_reads: ?u128 = null,
 
     pub fn init(allocator: std.mem.Allocator, instructions: []const rdna2.Instruction) !Plan {
         const resource = try collect(allocator, instructions, .resource);
@@ -111,6 +114,7 @@ pub const Plan = struct {
             .graphics_interface = GraphicsInterface.collect(instructions),
             .static_calls = rdna2.scalar_calls.present(instructions),
             .entry_block_end = entryBlockEnd(instructions),
+            .uniform_scalar_reads = scalar.uniformScalarReadMask(instructions),
         };
     }
 

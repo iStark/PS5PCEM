@@ -14,6 +14,57 @@ const shaders = @import("shaders.zig");
 const bit_sets = @import("bit_sets.zig");
 pub export var saturated_resource_dependencies: bool = true;
 pub export var cached_scalar_call_analysis: bool = true;
+pub export var skip_unused_uniform_loads: bool = true;
+pub export var unused_uniform_loads_skipped: u64 = 0;
+
+/// Over-approximate every scalar source used by the uniform CFG proof, across
+/// all blocks and loop iterations. Vector arithmetic is not interpreted by
+/// that proof: its scalar destinations are invalidated independently of input
+/// values. Keep sixteen words for non-vector sources, including wide operands,
+/// and both implicit branch masks. Ignoring definition order is conservative.
+/// This must never be used to omit resource discovery or GPU instructions.
+pub fn uniformScalarReadMask(instructions: []const rdna2.Instruction) u128 {
+    var mask: u128 = (@as(u128, 3) << 106) | (@as(u128, 3) << 126);
+    for (instructions) |*inst| {
+        switch (inst.family) {
+            .vop1, .vop2, .vop3, .vop3p, .vopc, .vintrp, .mubuf, .mtbuf, .flat, .ds, .mimg, .exp => continue,
+            else => {},
+        }
+        // SMEM addresses need at most three V# words and a scalar offset.
+        // Other scalar opcodes are deliberately over-approximated; unknown
+        // implicit addressing is rejected by canPruneUniformBranches.
+        for ([_]rdna2.Operand{ inst.src0, inst.src1, inst.src2 }, 0..) |operand, source_index| {
+            const first = scalarRegisterIndex(operand) orelse continue;
+            const width: usize = if (inst.family == .smem) (if (source_index == 0) 3 else 1) else 16;
+            for (first..@min(first + width, maximum_scalar_registers)) |index|
+                mask |= @as(u128, 1) << @intCast(index);
+        }
+    }
+    return mask;
+}
+
+fn uniformLoadUnused(mask: u128, inst: *const rdna2.Instruction) bool {
+    switch (inst.opcode) {
+        .s_load_dword,
+        .s_load_dwordx2,
+        .s_load_dwordx4,
+        .s_load_dwordx8,
+        .s_load_dwordx16,
+        .s_buffer_load_dword,
+        .s_buffer_load_dwordx2,
+        .s_buffer_load_dwordx4,
+        .s_buffer_load_dwordx8,
+        .s_buffer_load_dwordx16,
+        => {},
+        else => return false,
+    }
+    const first = scalarRegisterIndex(inst.dst) orelse return false;
+    if (inst.data_words == 0 or inst.data_words > 16 or first + inst.data_words > maximum_scalar_registers) return false;
+    for (first..first + inst.data_words) |index| {
+        if (mask & (@as(u128, 1) << @intCast(index)) != 0) return false;
+    }
+    return true;
+}
 
 pub const maximum_scalar_registers = 128;
 // Dense lighting shaders contain more than 250 distinct scalar loads. Keep
@@ -460,6 +511,12 @@ pub fn proveUniformBranchesWithPlan(
     eligible: ?bool,
 ) !?UniformBranchProof {
     if (!(eligible orelse canPruneUniformBranches(instructions, graph))) return null;
+    const uniform_reads = if (@atomicLoad(bool, &skip_unused_uniform_loads, .monotonic) and
+        plan != null and plan.?.matches(instructions)) plan.?.uniform_scalar_reads else null;
+    var skipped_loads: u64 = 0;
+    defer if (skipped_loads != 0) {
+        _ = @atomicRmw(u64, &unused_uniform_loads_skipped, .Add, skipped_loads, .monotonic);
+    };
     var invariant: Evaluation = undefined;
     invariant.reset();
     const scalar_base: usize = bindings.scalar_user_data_base;
@@ -545,6 +602,13 @@ pub fn proveUniformBranchesWithPlan(
                 const position = if (steps) |indices| if (cursor < indices.len) indices[cursor] else break else cursor;
                 if (position >= end) break;
                 const inst = &instructions[position];
+                if (uniform_reads) |mask| if (uniformLoadUnused(mask, inst)) {
+                    // Remove only this CPU proof read. The original program,
+                    // GPU load and resource/specialization walks are unchanged.
+                    invalidateDestination(&local, inst.dst, inst.data_words);
+                    skipped_loads += 1;
+                    continue;
+                };
                 switch (inst.opcode) {
                     .s_load_dword, .s_load_dwordx2, .s_load_dwordx4, .s_load_dwordx8, .s_load_dwordx16 => {
                         _ = executeSmem(&local, reader, bindings, inst, false);
@@ -3733,4 +3797,77 @@ test "lazy call discovery preserves repeated returns and the indirect-jump limit
         try std.testing.expectEqual(StopReason.branch, limited.stop_reason);
         try std.testing.expectEqual(@as(u32, 10), limited.instruction_count);
     }
+}
+
+test "uniform proof omits only unused CPU loads and preserves dispatch-specific branch actions" {
+    const allocator = std.testing.allocator;
+    const saved = skip_unused_uniform_loads;
+    defer skip_unused_uniform_loads = saved;
+    var bytes: [128]u8 = @splat(0);
+    var memory = TestMemory{ .base = 0x1000, .bytes = &bytes };
+    var bindings = testBindings(0x2000, 0x1000);
+    bindings.user_data_count = 8;
+    bindings.user_data[4] = 0x1000;
+    bindings.user_data[5] = 0;
+    bindings.user_data[6] = 128;
+    bindings.user_data[7] = 0;
+    var instructions = [_]rdna2.Instruction{
+        .{ .pc = 0, .word_count = 2, .family = .smem, .opcode = .s_load_dwordx16, .dst = .{ .kind = .sgpr, .reg = 32 }, .src0 = .{ .kind = .sgpr }, .src1 = .{ .kind = .null }, .data_words = 16 },
+        .{ .pc = 8, .word_count = 2, .family = .smem, .opcode = .s_buffer_load_dwordx16, .dst = .{ .kind = .sgpr, .reg = 64 }, .src0 = .{ .kind = .sgpr, .reg = 4 }, .src1 = .{ .kind = .null }, .data_words = 16 },
+        .{ .pc = 16, .word_count = 1, .family = .vop2, .opcode = .v_mul_f32, .dst = .{ .kind = .vgpr }, .src0 = .{ .kind = .sgpr, .reg = 32 }, .src1 = .{ .kind = .vgpr } },
+        .{ .pc = 20, .word_count = 2, .family = .smem, .opcode = .s_load_dword, .dst = .{ .kind = .sgpr, .reg = 100 }, .src0 = .{ .kind = .sgpr }, .src1 = .{ .kind = .null }, .memory_offset = 64, .data_words = 1 },
+        .{ .pc = 28, .word_count = 1, .family = .sopc, .opcode = .s_cmp_eq_u32, .src0 = .{ .kind = .sgpr, .reg = 100 }, .src1 = .{ .kind = .integer_inline_constant } },
+        .{ .pc = 32, .word_count = 1, .family = .sopp, .opcode = .s_cbranch_scc1, .branch_target = 44 },
+        .{ .pc = 36, .word_count = 2, .family = .mimg, .opcode = .image_sample },
+        .{ .pc = 44, .word_count = 1, .family = .sopp, .opcode = .s_endpgm },
+    };
+    // A use of the very last word must preserve the whole wide load.
+    for ([_]u32{ 100, 79 }) |guard| {
+        instructions[4].src0.reg = guard;
+        var graph = try rdna2.control_flow.buildInstructions(allocator, &instructions);
+        defer graph.deinit(allocator);
+        var plan = try @import("resource_checkpoints.zig").Plan.init(allocator, &instructions);
+        defer plan.deinit(allocator);
+        for ([_]u32{ 0, 1, 0, 0xffffffff }) |flag| {
+            memory.write(0x1040, flag);
+            memory.write(0x103c, flag);
+            skip_unused_uniform_loads = false;
+            memory.read_count = 0;
+            var old = (try proveUniformBranchesWithPlan(allocator, memory.reader(), &bindings, &instructions, &graph, &plan, null)).?;
+            defer old.deinit(allocator);
+            try std.testing.expectEqual(@as(usize, 3), memory.read_count);
+            skip_unused_uniform_loads = true;
+            memory.read_count = 0;
+            var current = (try proveUniformBranchesWithPlan(allocator, memory.reader(), &bindings, &instructions, &graph, &plan, null)).?;
+            defer current.deinit(allocator);
+            try std.testing.expectEqualSlices(UniformBlockAction, old.actions, current.actions);
+            try std.testing.expectEqual(@as(usize, 1), memory.read_count);
+        }
+        // Reconstructed programs and manual summaries must use the original
+        // read path. No summary based on a different instruction allocation.
+        const other = instructions;
+        memory.read_count = 0;
+        var replaced = (try proveUniformBranchesWithPlan(allocator, memory.reader(), &bindings, &other, &graph, &plan, null)).?;
+        replaced.deinit(allocator);
+        try std.testing.expectEqual(@as(usize, 3), memory.read_count);
+        plan.uniform_scalar_reads = null;
+        memory.read_count = 0;
+        var manual = (try proveUniformBranchesWithPlan(allocator, memory.reader(), &bindings, &instructions, &graph, &plan, null)).?;
+        manual.deinit(allocator);
+        try std.testing.expectEqual(@as(usize, 3), memory.read_count);
+    }
+}
+
+test "uniform load read mask retains pointer chains wide operands offsets and implicit masks" {
+    const instructions = [_]rdna2.Instruction{
+        .{ .family = .smem, .opcode = .s_load_dwordx16, .src0 = .{ .kind = .sgpr, .reg = 20 }, .src1 = .{ .kind = .sgpr, .reg = 40 } },
+        .{ .family = .sop1, .opcode = .s_mov_b64, .src0 = .{ .kind = .sgpr, .reg = 60 } },
+    };
+    const mask = uniformScalarReadMask(&instructions);
+    for ([_]u32{ 20, 21, 22, 40, 60, 61, 106, 107, 126, 127 }) |needed| {
+        const load = rdna2.Instruction{ .opcode = .s_load_dword, .dst = .{ .kind = .sgpr, .reg = needed }, .data_words = 1 };
+        try std.testing.expect(!uniformLoadUnused(mask, &load));
+    }
+    try std.testing.expect(uniformLoadUnused(mask, &.{ .opcode = .s_buffer_load_dword, .dst = .{ .kind = .sgpr, .reg = 90 }, .data_words = 1 }));
+    try std.testing.expect(!uniformLoadUnused(mask, &.{ .opcode = .s_buffer_load_dwordx16, .dst = .{ .kind = .sgpr, .reg = 120 }, .data_words = 16 }));
 }
