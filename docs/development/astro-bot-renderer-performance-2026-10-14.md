@@ -5,6 +5,73 @@ Output is 1920×1080; the game still controls its internal surface dimensions.
 Existing shader caches were retained. The 25–30 FPS target is **not reached**.
 Rendering defects remain, and controllable gameplay is not established.
 
+## Follow-up: storage ownership and scalar loop budgets
+
+The latest balanced title comparison measures **14.48 FPS**, versus
+**14.26 FPS** with the conservative maximum-gap loop-budget proof.
+Each setting covers 660 frames distributed across eleven animation phases in
+one warmed process. These are title-screen measurements; **25 FPS is not
+reached and character control remains unverified**.
+
+| Setting | Frames | Seconds | FPS |
+| --- | ---: | ---: | ---: |
+| Conservative maximum-gap loop budget | 660 | 46.280 | 14.26 |
+| Exact dense-path instruction budget | 660 | 45.586 | 14.48 |
+
+The scalar interpreter counts vector instructions skipped by its index,
+including gaps entered through branches. Only an executed END establishes a
+complete dense-path count. Results are shared only within the original dense
+instruction budget. Malformed targets saturate the proof; manual or incomplete
+proofs retain the conservative bound. The tests accept a 43-instruction loop
+at budget 43 and reject it at 42. Cache entries and declined plans distinguish
+both proof modes.
+
+Storage images can transfer between incompatible native layouts on the GPU.
+The retained tiled backing preserves bytes that become padding in the new view.
+Exact allocation ownership, CPU replacement checks, queued uses and overlapping
+writers remain part of the decision. Retired views replaced by the CPU no longer
+block an otherwise valid transfer. ASTRO BOT uses this path twice per title frame.
+
+Full-image overwrite proofs now cover rectangular workgroups and sampled inputs.
+They reject input/output aliases, partial dispatches, masked stores, unknown
+coordinates and EXEC changes. Full texel coverage does not cover native padding:
+an existing GPU layout transfer therefore takes priority over discarding an
+upload when it preserves unpublished bytes. The final path avoids five extra
+initial uploads per title frame while retaining both GPU layout conversions.
+
+The separate layout comparison measured:
+
+| Setting | Frames | Seconds | FPS |
+| --- | ---: | ---: | ---: |
+| GPU layout conversion, prior overwrite proof | 660 | 44.484 | 14.84 |
+| Rectangular overwrite proof before layout transfer | 660 | 45.221 | 14.59 |
+| Preserve GPU layout before full overwrite | 660 | 44.571 | 14.81 |
+| Same, with draw-resource reuse disabled experimentally | 660 | 43.792 | 15.07 |
+
+The layout ordering avoids the extra CPU round trip introduced by the
+initial overwrite experiment, but this comparison does not establish another
+material FPS gain. Disabling draw-resource reuse measured a small improvement
+in this title; it remains an experiment, not a global default change.
+Measurements from separate processes are not release-to-release speed claims.
+
+Descriptor-read capture now searches only potentially overlapping ranges through
+a sorted index. Exact duplicates, conflicting overlapping bytes, capacity limits,
+reused snapshots and runtime mode changes preserve the original fallback behavior.
+
+Validation: **551/551 GPU/Vulkan tests**, **12/12 ReleaseFast build steps**, and
+native scalar-loop, scalar-call, resource-worker, storage-layout and rectangular
+overwrite probes with Vulkan synchronization validation. Native layout checks
+cover CPU replacement before/after conversion, padding edits, reverse conversion,
+partial-overlap fallback, stale retired views and preparation without executing
+the promised store. Rectangular checks compare every texel and row-padding byte
+with aliased inputs and incomplete dispatches. No validation errors were reported
+by these probes; later-scene graphics correctness remains unverified.
+
+![ASTRO BOT title screen after storage ownership changes](../images/astro-bot-title-storage-layouts-2026-10-14.png)
+
+This is an actual capture of the game-owned 3840×2160 scanout. Host output remains
+1920×1080. Builds, tests and native probes run outside the FPS comparisons.
+
 ## Follow-up: static shader analysis and narrow layouts
 
 The latest balanced title comparison measures **14.25 FPS**, versus

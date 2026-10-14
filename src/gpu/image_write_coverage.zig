@@ -10,6 +10,8 @@ const std = @import("std");
 const rdna2 = @import("rdna2");
 const resources = @import("resources.zig");
 
+pub export var rectangular_image_write_coverage: bool = true;
+
 pub const Output = struct {
     resource_sgpr: u32,
     first_pc: u32,
@@ -35,6 +37,7 @@ pub const Proof = struct {
 pub const Cache = struct {
     const Entry = struct {
         identity: u64,
+        rectangular: bool,
         system: resources.ComputeSystemRegisters,
         local_size: [3]u32,
         proof: ?Proof,
@@ -43,11 +46,12 @@ pub const Cache = struct {
 
     pub fn get(self: *Cache, identity: u64, instructions: []const rdna2.Instruction, system: resources.ComputeSystemRegisters, local_size: [3]u32) ?Proof {
         if (identity == 0) return null;
+        const rectangular = @atomicLoad(bool, &rectangular_image_write_coverage, .monotonic);
         const slot = &self.entries[identity % self.entries.len];
-        if (slot.*) |entry| if (entry.identity == identity and std.meta.eql(entry.system, system) and
+        if (slot.*) |entry| if (entry.identity == identity and entry.rectangular == rectangular and std.meta.eql(entry.system, system) and
             std.meta.eql(entry.local_size, local_size)) return entry.proof;
         const proof = analyze(instructions, system, local_size);
-        slot.* = .{ .identity = identity, .system = system, .local_size = local_size, .proof = proof };
+        slot.* = .{ .identity = identity, .rectangular = rectangular, .system = system, .local_size = local_size, .proof = proof };
         return proof;
     }
 };
@@ -117,15 +121,16 @@ const Registers = struct {
 
     fn ternary(self: *const Registers, inst: rdna2.Instruction) ?Affine {
         const a = self.get(inst.src0) orelse return null;
-        const b = (self.get(inst.src1) orelse return null).constant() orelse return null;
+        const b = self.get(inst.src1) orelse return null;
         const c = self.get(inst.src2) orelse return null;
         return switch (inst.opcode) {
-            .v_lshl_add_u32 => Affine.add(a.shift(b), c),
-            .v_and_or_b32 => .{ .bias = ((a.constant() orelse return null) & b) | (c.constant() orelse return null) },
+            .v_add3_u32 => Affine.add(Affine.add(a, b), c),
+            .v_lshl_add_u32 => Affine.add(a.shift(b.constant() orelse return null), c),
+            .v_and_or_b32 => .{ .bias = ((a.constant() orelse return null) & (b.constant() orelse return null)) | (c.constant() orelse return null) },
             .v_bfe_u32 => blk: {
                 const width = (c.constant() orelse return null) & 31;
                 const mask = (@as(u32, 1) << @as(u5, @intCast(width))) - 1;
-                break :blk .{ .bias = ((a.constant() orelse return null) >> @as(u5, @truncate(b))) & mask };
+                break :blk .{ .bias = ((a.constant() orelse return null) >> @as(u5, @truncate(b.constant() orelse return null))) & mask };
             },
             else => null,
         };
@@ -149,8 +154,12 @@ fn addressRegister(inst: rdna2.Instruction, component: u32) ?u32 {
 /// caller must additionally resolve every image input and reject physical
 /// overlap with the output before it may omit initialization.
 pub fn analyze(instructions: []const rdna2.Instruction, system: resources.ComputeSystemRegisters, local_size: [3]u32) ?Proof {
-    if (local_size[0] == 0 or local_size[0] > 256 or local_size[1] != 1 or local_size[2] != 1 or
-        system.local_invocation_id_components != 1 or system.threadgroup_size_sgpr != null or
+    const rectangular = @atomicLoad(bool, &rectangular_image_write_coverage, .monotonic);
+    const threads = std.math.mul(u32, local_size[0], local_size[1]) catch return null;
+    if (local_size[0] == 0 or local_size[1] == 0 or threads > 256 or local_size[2] != 1 or
+        (!rectangular and (local_size[1] != 1 or system.local_invocation_id_components != 1)) or
+        system.local_invocation_id_components == 0 or
+        (local_size[1] > 1 and system.local_invocation_id_components < 2) or system.threadgroup_size_sgpr != null or
         system.workgroup_id_sgprs[0] == null or system.workgroup_id_sgprs[1] == null or
         system.workgroup_id_sgprs[0].? >= 128 or system.workgroup_id_sgprs[1].? >= 128 or
         system.workgroup_id_sgprs[0] == system.workgroup_id_sgprs[1] or
@@ -158,9 +167,11 @@ pub fn analyze(instructions: []const rdna2.Instruction, system: resources.Comput
         instructions[instructions.len - 1].opcode != .s_endpgm) return null;
     var tiles: [4]Tile = undefined;
     var count: usize = 0;
-    for (0..local_size[0]) |lane| {
+    for (0..threads) |lane| {
         var registers = Registers{};
-        registers.vector[0] = .{ .bias = @intCast(lane) };
+        registers.vector[0] = .{ .bias = @intCast(lane % local_size[0]) };
+        if (system.local_invocation_id_components >= 2) registers.vector[1] = .{ .bias = @intCast(lane / local_size[0]) };
+        if (system.local_invocation_id_components >= 3) registers.vector[2] = .{};
         registers.scalar[system.workgroup_id_sgprs[0].?] = .{ .x = 1 };
         registers.scalar[system.workgroup_id_sgprs[1].?] = .{ .y = 1 };
         for (instructions, 0..) |inst, position| {
@@ -190,9 +201,15 @@ pub fn analyze(instructions: []const rdna2.Instruction, system: resources.Comput
                 },
                 .v_mov_b32 => if (!registers.vectorWrite(inst, registers.get(inst.src0))) return null,
                 .v_add_nc_u32, .v_lshlrev_b32, .v_lshrrev_b32, .v_and_b32, .v_or_b32, .v_xor_b32 => if (!registers.vectorWrite(inst, registers.binary(inst))) return null,
+                .v_add3_u32 => {
+                    if (!rectangular or !registers.vectorWrite(inst, registers.ternary(inst))) return null;
+                },
                 .v_lshl_add_u32, .v_and_or_b32, .v_bfe_u32 => if (!registers.vectorWrite(inst, registers.ternary(inst))) return null,
                 // These write one whole VGPR and cannot alter EXEC. Their
                 // numerical result is irrelevant unless it reaches an address.
+                .v_cndmask_b32, .v_cvt_f32_u32 => {
+                    if (!rectangular or !registers.vectorWrite(inst, null)) return null;
+                },
                 .v_add_f32,
                 .v_sub_f32,
                 .v_mul_f32,
@@ -206,9 +223,26 @@ pub fn analyze(instructions: []const rdna2.Instruction, system: resources.Comput
                 .v_max3_f32,
                 .v_sub_nc_u32,
                 => if (!registers.vectorWrite(inst, null)) return null,
-                .image_load => {
+                .v_cmp_eq_u32, .v_cmp_ge_u32 => {
+                    // Ordinary comparisons update VCC/an SGPR pair, never
+                    // EXEC. Their values cannot become proven coordinates.
+                    if (!rectangular) return null;
+                    switch (inst.dst.kind) {
+                        .vcc_lo => {},
+                        .sgpr => {
+                            if (inst.dst.reg > 126) return null;
+                            for (inst.dst.reg..inst.dst.reg + 2) |reg| {
+                                registers.scalar[reg] = null;
+                                registers.scalar_definitions[reg] = @intCast(position + 1);
+                            }
+                        },
+                        else => return null,
+                    }
+                },
+                .image_load, .image_sample => {
+                    if (inst.opcode == .image_sample and !rectangular) return null;
                     if (inst.dst.kind != .vgpr or inst.data_words == 0 or inst.dst.reg + inst.data_words > 256 or
-                        inst.image_elements != 0 or !std.meta.eql(inst.image_sample_flags, rdna2.isa.ImageSampleFlags{})) return null;
+                        inst.image_elements != 0 or (inst.opcode == .image_load and !std.meta.eql(inst.image_sample_flags, rdna2.isa.ImageSampleFlags{}))) return null;
                     for (inst.dst.reg..inst.dst.reg + inst.data_words) |reg| registers.vector[reg] = null;
                 },
                 .image_store => {
@@ -291,4 +325,49 @@ test "complete tiled stores require every lane, component and tile pixel" {
     try std.testing.expect(cache.get(1, &code, system, .{ 32, 1, 1 }) == null);
     code[0].opcode = .unknown;
     try std.testing.expect(cache.get(2, &code, system, .{ 64, 1, 1 }) == null);
+}
+
+test "rectangular groups prove sampled full stores and reject masked or incomplete coverage" {
+    const saved = rectangular_image_write_coverage;
+    defer rectangular_image_write_coverage = saved;
+    rectangular_image_write_coverage = true;
+    const system = resources.ComputeSystemRegisters{ .workgroup_id_sgprs = .{ 14, 15, null }, .local_invocation_id_components = 2 };
+    var code = [_]rdna2.Instruction{
+        .{ .opcode = .v_lshl_add_u32, .dst = .{ .kind = .vgpr, .reg = 2 }, .src0 = .{ .kind = .sgpr, .reg = 14 }, .src1 = .{ .kind = .integer_inline_constant, .value = 3 }, .src2 = .{ .kind = .vgpr, .reg = 0 } },
+        .{ .opcode = .v_lshl_add_u32, .dst = .{ .kind = .vgpr, .reg = 3 }, .src0 = .{ .kind = .sgpr, .reg = 15 }, .src1 = .{ .kind = .integer_inline_constant, .value = 3 }, .src2 = .{ .kind = .vgpr, .reg = 1 } },
+        .{ .opcode = .v_cmp_ge_u32, .dst = .{ .kind = .vcc_lo }, .src0 = .{ .kind = .integer_inline_constant, .value = 1 }, .src1 = .{ .kind = .vgpr, .reg = 0 } },
+        .{ .opcode = .v_cndmask_b32, .dst = .{ .kind = .vgpr, .reg = 4 }, .src0 = .{ .kind = .vgpr, .reg = 0 }, .src1 = .{ .kind = .vgpr, .reg = 1 } },
+        .{ .opcode = .image_sample, .dst = .{ .kind = .vgpr, .reg = 10 }, .src1 = .{ .kind = .sgpr, .reg = 32 }, .data_words = 4 },
+        .{ .opcode = .image_store, .pc = 40, .data_mask = 15, .image_address_components = 2, .src0 = .{ .kind = .vgpr, .reg = 2 }, .src1 = .{ .kind = .sgpr, .reg = 16 } },
+        .{ .opcode = .s_endpgm },
+    };
+    var cache = Cache{};
+    const proof = cache.get(1, &code, system, .{ 8, 8, 1 }).?;
+    try std.testing.expectEqual(@as(u8, 1), proof.count);
+    try std.testing.expect(proof.outputs[0].covers(.{ 3, 2, 1 }, 23, 15));
+    try std.testing.expect(analyze(&code, system, .{ 8, 4, 1 }) == null);
+    try std.testing.expect(analyze(&code, system, .{ 8, 8, 2 }) == null);
+    var missing_y = system;
+    missing_y.local_invocation_id_components = 1;
+    try std.testing.expect(analyze(&code, missing_y, .{ 8, 8, 1 }) == null);
+    rectangular_image_write_coverage = false;
+    try std.testing.expect(cache.get(1, &code, system, .{ 8, 8, 1 }) == null);
+    rectangular_image_write_coverage = true;
+    try std.testing.expect(cache.get(1, &code, system, .{ 8, 8, 1 }) != null);
+    code[5].data_mask = 7;
+    try std.testing.expect(analyze(&code, system, .{ 8, 8, 1 }) == null);
+    code[5].data_mask = 15;
+    code[2].opcode = .v_cmpx_ge_u32;
+    try std.testing.expect(analyze(&code, system, .{ 8, 8, 1 }) == null);
+    code[2].opcode = .v_cmp_ge_u32;
+    code[3].dst.reg = 2;
+    try std.testing.expect(analyze(&code, system, .{ 8, 8, 1 }) == null);
+    code[3].dst.reg = 4;
+    code[4].dst.reg = 2;
+    try std.testing.expect(analyze(&code, system, .{ 8, 8, 1 }) == null);
+    code[4].dst.reg = 10;
+    code[0].src1.value = 4;
+    code[1].src1.value = 4;
+    try std.testing.expect(analyze(&code, system, .{ 16, 16, 1 }) != null);
+    try std.testing.expect(analyze(&code, system, .{ 32, 32, 1 }) == null);
 }

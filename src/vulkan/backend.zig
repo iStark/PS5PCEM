@@ -94,6 +94,8 @@ pub export var batch_release_interrupts: bool = false;
 pub export var indexed_completion_buffers: bool = true;
 pub export var indexed_release_projection: bool = true;
 pub export var cache_ngg_export_analysis: bool = true;
+pub export var native_storage_layout_conversion: bool = true;
+pub export var preserve_storage_layout_before_overwrite: bool = true;
 pub export var exact_buffer_readback_ranges: bool = true;
 pub export var discard_full_image_initialization: bool = true;
 pub export var discard_covered_raster_initialization: bool = true;
@@ -13303,7 +13305,7 @@ pub const Renderer = struct {
         // Prove descriptor identity from the complete scalar state. Heuristic
         // SRT fallback slots are useful for rendering, not for discarding data.
         for (analysis.program.instructions.items) |inst| {
-            if (inst.opcode != .image_load and inst.opcode != .image_store) continue;
+            if (inst.opcode != .image_load and inst.opcode != .image_store and inst.opcode != .image_sample) continue;
             const scalar = scalarRegistersAtCheckpoint(pcs, snapshots, inst.pc);
             const other = (scalarImageDescriptor(scalar, inst.src1.reg, inst.imageResourceWords()) catch return false) orelse return false;
             if (inst.opcode == .image_store and inst.src1.reg == output.resource_sgpr) {
@@ -27800,6 +27802,16 @@ pub const Renderer = struct {
     }
 
     fn invalidateStorageGuestContents(self: *Renderer, cache_index: usize) void {
+        self.discardStorageContents(cache_index);
+        const cached = &self.storage_image_cache.items[cache_index];
+        self.storage_cpu_invalidations +%= 1;
+        if (self.storage_cpu_invalidations <= 8) std.debug.print(
+            "[vulkan dcb] invalidated stale storage image after guest texel change: addr=0x{x} {d}x{d} fmt={d}\n",
+            .{ cached.descriptor.address, cached.subresource.width, cached.subresource.height, cached.descriptor.unified_format },
+        );
+    }
+
+    fn discardStorageContents(self: *Renderer, cache_index: usize) void {
         self.releaseStorageNativeBaseline(cache_index);
         self.releaseStorageRetileBacking(cache_index);
         const cached = &self.storage_image_cache.items[cache_index];
@@ -27814,11 +27826,6 @@ pub const Renderer = struct {
         cached.guest_native_texel_hash = null;
         cached.depth_snapshot = null;
         _ = self.image_aliases.markGuestWrite(aliasRange(cached.descriptor.address, cached.allocation_bytes));
-        self.storage_cpu_invalidations +%= 1;
-        if (self.storage_cpu_invalidations <= 8) std.debug.print(
-            "[vulkan dcb] invalidated stale storage image after guest texel change: addr=0x{x} {d}x{d} fmt={d}\n",
-            .{ cached.descriptor.address, cached.subresource.width, cached.subresource.height, cached.descriptor.unified_format },
-        );
     }
 
     fn storageGuestContentsChanged(self: *Renderer, memory: GuestMemory, cache_index: usize) (Error || std.mem.Allocator.Error)!bool {
@@ -29185,6 +29192,14 @@ pub const Renderer = struct {
             break;
         }
 
+        // Full texel coverage does not overwrite native padding. An older
+        // storage layout can still own those bytes; keep its backing on the
+        // GPU instead of publishing it merely to skip the next upload. This
+        // path also leaves a complete image if the following dispatch aborts.
+        if (!discard_initial or @atomicLoad(bool, &preserve_storage_layout_before_overwrite, .monotonic)) {
+            if (try self.tryStageStorageLayout(descriptor, descriptor_index, writable, subresource, format, allocation_bytes, staging_bytes, matching_index, matching_view)) |converted|
+                return converted;
+        }
         if (!discard_initial) {
             if (try self.tryStageColorStorageLayout(descriptor, descriptor_index, writable, subresource, format, allocation_bytes, staging_bytes, matching_index, matching_view)) |converted|
                 return converted;
@@ -29748,6 +29763,182 @@ pub const Renderer = struct {
         return linear;
     }
 
+    /// Transfer one complete native allocation between incompatible storage
+    /// layouts. A retained tiled backing also carries unpublished bytes that
+    /// are padding in the new view. Ambiguous or partial ownership falls back.
+    fn tryStageStorageLayout(
+        self: *Renderer,
+        descriptor: gpu.ImageDescriptor,
+        descriptor_index: u32,
+        writable: bool,
+        subresource: gpu.TextureSubresourceLayout,
+        format: StorageImageFormat,
+        allocation_bytes: usize,
+        staging_bytes: usize,
+        matching_index: ?usize,
+        matching_view: vk.ImageView,
+    ) anyerror!?PreparedStorageImage {
+        if (!@atomicLoad(bool, &native_storage_layout_conversion, .monotonic) or
+            self.detile_pipeline == 0 or descriptor.image_type != .color_2d or
+            descriptor.depth_or_layers != 1 or descriptor.base_array != 0 or
+            descriptor.viewBaseLevel() != 0 or descriptor.resourceMipLevels() != 1 or
+            allocation_bytes % 4 != 0 or
+            self.storage_layout_backing_bytes + allocation_bytes > 128 * 1024 * 1024 or
+            !gpu.computeDetileSupported((try subresource.computePlan(0, 0)).params))
+        {
+            if (self.traceCurrentGraphicsFrame()) std.debug.print("[gpu storage layout reject] eligibility @0x{x} retained={d}\n", .{ descriptor.address, self.storage_layout_backing_bytes });
+            return null;
+        }
+        const memory = self.guest_memory orelse return null;
+        try self.drainInternalReleasesForRange(descriptor.address, allocation_bytes);
+        if (self.pendingBufferWrite(descriptor.address, allocation_bytes)) |pending| {
+            if (self.traceCurrentGraphicsFrame()) std.debug.print("[gpu storage layout reject] buffer @0x{x} bytes={d} image @0x{x}\n", .{ pending.guest_address, pending.size, descriptor.address });
+            return null;
+        }
+        var selected: ?usize = null;
+        for (self.storage_image_cache.items, 0..) |cached, index| {
+            if (!cached.valid or !cached.gpu_dirty or !byteRangesOverlap(descriptor.address, allocation_bytes, cached.descriptor.address, cached.allocation_bytes)) continue;
+            // Old scratch views can overlap a reused allocation long after
+            // the CPU replaced their contents. They are no longer producers;
+            // apply the same replacement proof as normal storage publication
+            // before deciding that ownership is ambiguous.
+            if (cached.pin_count == 0 and try self.storageGuestContentsChanged(memory, index)) {
+                self.invalidateStorageGuestContents(index);
+                if (self.traceCurrentGraphicsFrame()) std.debug.print("[gpu storage layout] retired replaced source index={d} @0x{x}\n", .{ index, cached.descriptor.address });
+                continue;
+            }
+            if (selected != null or matching_index == index or cached.initialization_pending or
+                cached.descriptor.address != descriptor.address or cached.allocation_bytes != allocation_bytes or
+                cached.descriptor.image_type != .color_2d or cached.descriptor.depth_or_layers != 1 or
+                cached.descriptor.base_array != 0 or cached.descriptor.viewBaseLevel() != 0 or
+                cached.descriptor.resourceMipLevels() != 1 or cached.depth_snapshot != null or
+                !nativeRetileSupported((try cached.subresource.computePlan(0, 0)).params))
+            {
+                if (self.traceCurrentGraphicsFrame()) std.debug.print("[gpu storage layout reject] source index={d} selected={any} matching={any} @0x{x} bytes={d} fmt={d} tile={f} init={any} depth={any} image @0x{x} bytes={d}\n", .{ index, selected, matching_index, cached.descriptor.address, cached.allocation_bytes, cached.descriptor.unified_format, cached.descriptor.tile_mode, cached.initialization_pending, cached.depth_snapshot != null, descriptor.address, allocation_bytes });
+                return null;
+            }
+            // Uploads without a CPU baseline cannot prove that their old GPU
+            // output still belongs to this guest allocation.
+            if (cached.guest_texel_hash == null and cached.guest_native_baseline == null and
+                cached.guest_native_baseline_digest == null and !cached.strict_guest_backing)
+            {
+                if (self.traceCurrentGraphicsFrame()) std.debug.print("[gpu storage layout reject] no baseline index={d} @0x{x}\n", .{ index, descriptor.address });
+                return null;
+            }
+            selected = index;
+        }
+        const source_index = selected orelse {
+            if (self.traceCurrentGraphicsFrame()) std.debug.print("[gpu storage layout reject] no producer @0x{x}\n", .{descriptor.address});
+            return null;
+        };
+        for (self.render_targets.items) |cached| {
+            if (cached.initialized and cached.gpu_generation != cached.host_generation and
+                byteRangesOverlap(descriptor.address, allocation_bytes, cached.target.descriptor.address, cached.target.layout.required_source_bytes))
+            {
+                if (self.traceCurrentGraphicsFrame()) std.debug.print("[gpu storage layout reject] raster @0x{x} image @0x{x}\n", .{ cached.target.descriptor.address, descriptor.address });
+                return null;
+            }
+        }
+        for (self.completed_frames.items) |frame| {
+            if (!frame.needs_writeback) continue;
+            const target = frame.target orelse continue;
+            if (byteRangesOverlap(descriptor.address, allocation_bytes, target.descriptor.address, target.layout.required_source_bytes)) {
+                if (self.traceCurrentGraphicsFrame()) std.debug.print("[gpu storage layout reject] completed @0x{x} image @0x{x}\n", .{ target.descriptor.address, descriptor.address });
+                return null;
+            }
+        }
+        for (self.depth_targets.items) |depth| {
+            if (!depth.initialized or depth.gpu_generation == depth.host_generation) continue;
+            if (byteRangesOverlap(descriptor.address, allocation_bytes, depth.target.address, depth.target.allocation_bytes) or
+                (depth.target.has_stencil and byteRangesOverlap(descriptor.address, allocation_bytes, depth.target.stencil_address, depth.target.stencil_allocation_bytes)))
+            {
+                if (self.traceCurrentGraphicsFrame()) std.debug.print("[gpu storage layout reject] depth @0x{x} image @0x{x}\n", .{ depth.target.address, descriptor.address });
+                return null;
+            }
+        }
+        if (try self.storageGuestContentsChanged(memory, source_index)) {
+            if (self.traceCurrentGraphicsFrame()) std.debug.print("[gpu storage layout reject] changed source index={d} @0x{x}\n", .{ source_index, descriptor.address });
+            return null;
+        }
+        self.storage_image_cache.items[source_index].pin_count += 1;
+        defer self.releaseStorageImage(source_index);
+        const index = matching_index orelse try self.createCachedStorageImage(descriptor, subresource, format, allocation_bytes, staging_bytes);
+        if (matching_index != null) self.storage_image_cache.items[index].pin_count += 1;
+        var completed = false;
+        defer if (!completed) {
+            if (matching_index == null) self.destroyCachedStorageImage(index) else {
+                self.discardStorageContents(index);
+                self.releaseStorageImage(index);
+            }
+        };
+        var allocation = try self.image_scratch.acquire(self.allocator, allocation_bytes);
+        defer allocation.release();
+        const generation = if (memory.track_gpu_read) |track| track(memory.context, descriptor.address, allocation_bytes) else 0;
+        if (!memory.read(memory.context, descriptor.address, allocation.bytes)) return Error.GuestMemoryReadFailed;
+        // Allocation/eviction may publish another producer. Revalidate the
+        // source after capturing the baseline used for later CPU replacement.
+        if (try self.storageGuestContentsChanged(memory, source_index)) {
+            if (self.traceCurrentGraphicsFrame()) std.debug.print("[gpu storage layout reject] changed baseline index={d} @0x{x}\n", .{ source_index, descriptor.address });
+            return null;
+        }
+        const baseline_hash = gpu.parallel_copy.fingerprint(allocation.bytes);
+        const source = self.storage_image_cache.items[source_index];
+        const usage = vk.buffer_usage_storage_buffer_bit | vk.buffer_usage_transfer_src_bit | vk.buffer_usage_transfer_dst_bit;
+        const tiled = try self.createBuffer(allocation_bytes, usage, vk.memory_property_device_local_bit);
+        var backing_owned = false;
+        defer if (!backing_owned) self.destroyBuffer(tiled);
+        const linear = try self.createBuffer(std.mem.alignForward(usize, @max(staging_bytes, source.staging_bytes), 4), usage, vk.memory_property_device_local_bit);
+        defer self.destroyBuffer(linear);
+        var upload: ?OwnedBuffer = null;
+        defer if (upload) |buffer| self.destroyBuffer(buffer);
+        const backing_source = source.retile_backing orelse cpu: {
+            upload = try self.createBuffer(allocation_bytes, vk.buffer_usage_transfer_src_bit, vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit);
+            try self.writeMapped(upload.?, allocation.bytes);
+            break :cpu upload.?;
+        };
+        {
+            const command = try self.beginOneShot();
+            defer self.releaseOneShot(command);
+            const barrier = vk.BufferMemoryBarrier{ .source_access_mask = vk.access_memory_write_bit | vk.access_host_write_bit, .destination_access_mask = vk.access_transfer_read_bit, .buffer = backing_source.handle, .offset = 0, .size = allocation_bytes };
+            self.device_functions.cmd_pipeline_barrier(command, vk.pipeline_stage_all_commands_bit | vk.pipeline_stage_host_bit, vk.pipeline_stage_transfer_bit, 0, 0, null, 1, @ptrCast(&barrier), 0, null);
+            const copy = vk.BufferCopy{ .source_offset = 0, .destination_offset = 0, .size = allocation_bytes };
+            self.device_functions.cmd_copy_buffer(command, backing_source.handle, tiled.handle, 1, @ptrCast(&copy));
+            try self.submitOneShot(command);
+        }
+        try self.copyStorageImageBuffer(source_index, linear, true);
+        try self.transformImageLayout(source.subresource, linear, tiled, true);
+        try self.transformImageLayout(subresource, tiled, linear, false);
+        try self.copyStorageImageBuffer(index, linear, false);
+        // All commands are recorded before transferring publication ownership.
+        self.discardStorageContents(source_index);
+        self.releaseStorageRetileBacking(index);
+        self.releaseStorageNativeBaseline(index);
+        const cached = &self.storage_image_cache.items[index];
+        cached.retile_backing = tiled;
+        backing_owned = true;
+        self.storage_layout_backing_bytes += tiled.size;
+        cached.strict_guest_backing = true;
+        cached.guest_backing_hash = baseline_hash;
+        cached.guest_content_hash = baseline_hash;
+        cached.guest_content_hash_valid = true;
+        cached.guest_texel_hash = null;
+        cached.guest_page_generation = generation;
+        cached.gpu_dirty = true;
+        cached.depth_snapshot = null;
+        cached.last_used_sequence = self.storage_image_sequence;
+        self.markStorageContentWritten(index);
+        _ = self.image_aliases.markWrite(cached.alias_token);
+        self.storage_layout_conversions +|= 1;
+        if (upload != null) {
+            self.frame_profile.upload_bytes +%= allocation_bytes;
+            self.frame_profile.texture_upload_bytes +%= allocation_bytes;
+        }
+        const view = if (matching_index != null) matching_view else cached.view;
+        self.updateStorageImageDescriptor(descriptor_index, view);
+        completed = true;
+        return .{ .descriptor = descriptor, .subresource = subresource, .image = cached.image, .view = view, .allocation_bytes = allocation_bytes, .staging_bytes = staging_bytes, .writable = writable, .cache_index = index };
+    }
+
     fn tryStageColorStorageLayout(
         self: *Renderer,
         descriptor: gpu.ImageDescriptor,
@@ -30303,6 +30494,150 @@ pub const Renderer = struct {
                 try std.testing.expectEqual(@as(u64, if (native_publication) expected.len else 0), self.storage_native_baseline_bytes);
             }
         }
+    }
+
+    pub fn probeStorageLayoutConversion(self: *Renderer) anyerror!void {
+        try self.probeStorageLayoutConversionSize(37, 23);
+        try self.probeStorageLayoutConversionSize(257, 131);
+    }
+
+    fn probeStorageLayoutConversionSize(self: *Renderer, width: u32, height: u32) anyerror!void {
+        const memory = self.guest_memory.?;
+        const saved = native_storage_layout_conversion;
+        defer native_storage_layout_conversion = saved;
+        const saved_overwrite = preserve_storage_layout_before_overwrite;
+        preserve_storage_layout_before_overwrite = true;
+        defer preserve_storage_layout_before_overwrite = saved_overwrite;
+        var descriptor = std.mem.zeroInit(gpu.ImageDescriptor, .{ .image_type = .color_2d });
+        descriptor.address = 0x10000;
+        descriptor.width = width;
+        descriptor.height = height;
+        descriptor.pitch = width;
+        descriptor.depth_or_layers = 1;
+        descriptor.unified_format = 36;
+        descriptor.tile_mode = .render_target;
+        descriptor.extended = true;
+        var consumer = descriptor;
+        consumer.unified_format = 22;
+        consumer.tile_mode = .depth;
+        const source_layout = try gpu.TextureLayout.fromImage(descriptor);
+        const source_view = try source_layout.subresource(0, 0, 1);
+        const target_layout = try gpu.TextureLayout.fromImage(consumer);
+        const target_view = try target_layout.subresource(0, 0, 1);
+        try std.testing.expectEqual(source_layout.required_source_bytes, target_layout.required_source_bytes);
+        const expected = try self.allocator.alloc(u8, @intCast(source_layout.required_source_bytes));
+        defer self.allocator.free(expected);
+        const actual = try self.allocator.alloc(u8, expected.len);
+        defer self.allocator.free(actual);
+        const linear = try self.allocator.alloc(u8, @intCast(try source_view.stagingBytes()));
+        defer self.allocator.free(linear);
+        const observed = try self.allocator.alloc(u8, linear.len);
+        defer self.allocator.free(observed);
+        const readback = try self.createBuffer(linear.len, vk.buffer_usage_transfer_dst_bit, vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit);
+        defer self.destroyBuffer(readback);
+        for ([_]bool{ false, true }) |enabled| {
+            native_storage_layout_conversion = enabled;
+            for (0..7) |phase| {
+                if (phase == 6 and !enabled) continue;
+                std.debug.print("storage layout case {d}x{d} enabled={} phase={d}\n", .{ width, height, enabled, phase });
+                for (self.storage_image_cache.items, 0..) |cached, i| {
+                    if (cached.valid) self.discardStorageContents(i);
+                }
+                var stale_index: ?usize = null;
+                if (phase == 5) {
+                    var stale = descriptor;
+                    stale.address += 256;
+                    @memset(expected, 0x5a);
+                    try std.testing.expect(memory.write(memory.context, stale.address, expected));
+                    const old = try self.stageStorageImage(stale, 0, true);
+                    stale_index = old.cache_index.?;
+                    @memset(linear, 0x33);
+                    try self.uploadCachedStorageImage(stale_index.?, linear);
+                    self.storage_image_cache.items[stale_index.?].gpu_dirty = true;
+                    self.releaseStorageImage(stale_index.?);
+                    // The replacement guard deliberately excludes in-flight
+                    // images. This case models an old, fully retired view.
+                    try self.waitForSubmittedWork();
+                }
+                @memset(expected, 0xa5);
+                try std.testing.expect(memory.write(memory.context, descriptor.address, expected));
+                const source = try self.stageStorageImage(descriptor, 0, true);
+                if (enabled and stale_index != null) {
+                    if (self.storage_image_cache.items[stale_index.?].gpu_dirty) return error.StaleStorageViewNotRetired;
+                }
+                const source_index = source.cache_index.?;
+                for (0..linear.len / 4) |i| std.mem.writeInt(u32, linear[i * 4 ..][0..4], 0x3c003c00 ^ @as(u32, @truncate(i *% 29)), .little);
+                try self.uploadCachedStorageImage(source_index, linear);
+                self.storage_image_cache.items[source_index].gpu_dirty = true;
+                self.markStorageContentWritten(source_index);
+                _ = self.image_aliases.markWrite(self.storage_image_cache.items[source_index].alias_token);
+                self.releaseStorageImage(source_index);
+                try source_view.tile(linear, expected);
+                if (phase == 1) {
+                    @memset(expected, 0x5a);
+                    try std.testing.expect(memory.write(memory.context, descriptor.address, expected));
+                } else if (phase == 2) {
+                    @memset(actual, 1);
+                    @memset(observed, 0);
+                    try source_view.tile(observed, actual);
+                    const padding = std.mem.indexOfScalar(u8, actual, 1).?;
+                    expected[padding] = 0x77;
+                    try std.testing.expect(memory.write(memory.context, descriptor.address + padding, &.{0x77}));
+                }
+                const conversions = self.storage_layout_conversions;
+                const reads = self.frame_profile.readback_bytes;
+                var partial = consumer;
+                partial.address += 256;
+                if (try self.tryStageStorageLayout(partial, 0, false, target_view, storageImageFormat(partial.unified_format).?, expected.len, linear.len, null, 0) != null) return error.PartialStorageLayoutAccepted;
+                // Even a proven full-store preparation retains old texels and
+                // native padding until its dispatch actually executes. Read
+                // the prepared image without executing a store in phase 6.
+                const destination = try self.stageStorageImageWithContents(consumer, 0, true, phase == 6);
+                if (phase == 6) try std.testing.expect(!destination.discarded_initial_contents);
+                const index = destination.cache_index.?;
+                if (enabled and phase != 1) {
+                    try std.testing.expectEqual(conversions + 1, self.storage_layout_conversions);
+                    try std.testing.expectEqual(reads, self.frame_profile.readback_bytes);
+                } else try std.testing.expectEqual(conversions, self.storage_layout_conversions);
+                try target_view.detile(expected, linear);
+                try self.copyStorageImageBuffer(index, readback, true);
+                try self.waitForSubmittedWork();
+                try self.readMapped(readback, observed);
+                try std.testing.expectEqualSlices(u8, linear, observed);
+                self.releaseStorageImage(index);
+                var final_index = index;
+                if (phase == 3) {
+                    // The intermediate view overwrites different native texel
+                    // spans; the return conversion must retain both histories.
+                    for (0..linear.len / 4) |i| std.mem.writeInt(u32, linear[i * 4 ..][0..4], 0x3e400000 ^ @as(u32, @truncate(i *% 17)), .little);
+                    try self.uploadCachedStorageImage(index, linear);
+                    self.storage_image_cache.items[index].gpu_dirty = true;
+                    self.markStorageContentWritten(index);
+                    _ = self.image_aliases.markWrite(self.storage_image_cache.items[index].alias_token);
+                    try target_view.tile(linear, expected);
+                    const returned = try self.stageStorageImage(descriptor, 0, false);
+                    final_index = returned.cache_index.?;
+                    if (enabled) try std.testing.expectEqual(conversions + 2, self.storage_layout_conversions);
+                    try source_view.detile(expected, linear);
+                    try self.copyStorageImageBuffer(final_index, readback, true);
+                    try self.waitForSubmittedWork();
+                    try self.readMapped(readback, observed);
+                    try std.testing.expectEqualSlices(u8, linear, observed);
+                    self.releaseStorageImage(final_index);
+                }
+                if (phase == 4) {
+                    // CPU reuse after conversion must discard the complete
+                    // retained backing, including the old view's padding.
+                    @memset(expected, 0x66);
+                    try std.testing.expect(memory.write(memory.context, descriptor.address, expected));
+                }
+                try self.flushCachedStorageImage(memory, final_index);
+                try std.testing.expect(memory.read(memory.context, descriptor.address, actual));
+                try std.testing.expectEqualSlices(u8, expected, actual);
+                try std.testing.expectEqual(@as(u64, 0), self.storage_layout_backing_bytes);
+            }
+        }
+        std.debug.print("storage layout conversion {d}x{d} passed: R_X/Z_X native bits, CPU replacement before/after, padding edits, reverse conversion, partial-overlap fallback, stale overlapping views and retained unpublished spans\n", .{ width, height });
     }
 
     pub fn probeColorStorageLayout(self: *Renderer) anyerror!void {

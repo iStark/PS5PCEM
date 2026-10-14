@@ -13228,6 +13228,75 @@ noinline fn runBufferReadbackProbe(allocator: std.mem.Allocator, comptime probe:
     }
 }
 
+noinline fn runRectangularImageOverwriteProbe(allocator: std.mem.Allocator) !void {
+    const saved = gpu.image_write_coverage.rectangular_image_write_coverage;
+    defer gpu.image_write_coverage.rectangular_image_write_coverage = saved;
+    for ([_]bool{ false, true }) |enabled| for ([_]bool{ false, true }) |batch| {
+        gpu.image_write_coverage.rectangular_image_write_coverage = enabled;
+        const renderer = try allocator.create(vulkan.Renderer);
+        defer allocator.destroy(renderer);
+        renderer.* = try vulkan.Renderer.init(allocator, .{ .enable_validation = true, .enable_timeline_scheduler = true });
+        defer renderer.deinit();
+        var guest = GuestMemory{ .watch_generation = 1 };
+        var memory = guest.interface();
+        memory.fingerprint = GuestMemory.fingerprint;
+        memory.track_gpu_read = GuestMemory.track;
+        memory.gpu_generation = GuestMemory.generation;
+        const backend = renderer.dcbBackend(memory);
+        renderer.draw_batch_active = batch;
+        for (0..4) |phase| {
+            const aliases = phase & 1 != 0;
+            const partial = phase & 2 != 0;
+            const source: u32 = @intCast(0x10000 + phase * 0x2000);
+            const destination = if (aliases) source else source + 0x1000;
+            const program: u32 = @intCast(0x1000 + phase * 0x100);
+            // Workgroup X/Y enter s20/s21, local X/Y enter v0/v1.
+            // A sampled read makes the alias guard observable: its source
+            // must survive even though every output coordinate is covered.
+            const code = [_]u32{
+                0xd746_0002,     20 | (131 << 9) | (256 << 18),
+                0xd746_0003,     21 | (131 << 9) | (257 << 18),
+                vop1(1, 4, 128), vop1(1, 5, 128),
+                0xf09c_0f08, 0x0080_0804, // sample_lz v8:v11, v4:v5, T#s0, S#s16
+                0xf020_0f08, 0x0002_0802, // store v8:v11, v2:v3, T#s8
+                0xbf81_0000,
+            };
+            for (code, 0..) |word, i| guest.word(program + i * 4, word);
+            var initial: [4096]u8 = @splat(0xa5);
+            try std.testing.expect(memory.write(memory.context, source, &initial));
+            try std.testing.expect(memory.write(memory.context, destination, &initial));
+            const color = [_]u8{ 17, 51, 85, 255 };
+            try std.testing.expect(memory.write(memory.context, source, &color));
+            var state = gpu.State{};
+            const compute = gpu.resources.ShaderStage.compute;
+            try state.writeRegister(.shader, compute.programRegisterBase(), program >> 8);
+            try state.writeRegister(.shader, compute.programRegisterBase() + 1, 0);
+            try state.writeRegister(.shader, 0x213, (20 << 1) | (1 << 7) | (1 << 8) | (1 << 11));
+            try state.writeRegister(.shader, 0x207, 8);
+            try state.writeRegister(.shader, 0x208, 8);
+            try state.writeRegister(.shader, 0x209, 1);
+            const descriptors = [_][8]u32{ sampledImageDescriptorWords(source, 23, 15), sampledImageDescriptorWords(destination, 23, 15) };
+            for (descriptors, 0..) |descriptor, index| for (descriptor, 0..) |word, component| {
+                try state.writeRegister(.shader, compute.userDataBase() + @as(u32, @intCast(index * 8 + component)), word);
+            };
+            for (0..4) |component| try state.writeRegister(.shader, compute.userDataBase() + 16 + @as(u32, @intCast(component)), 0);
+            const before = renderer.storage_initial_uploads_avoided;
+            var executor = gpu.DcbExecutor{ .state = &state, .backend = backend, .allocator = allocator };
+            _ = try executor.execute(&.{ command(gpu.pm4.dispatch_direct, 4), if (partial) @as(u32, 2) else 3, 2, 1, 0x41 });
+            if (renderer.last_dispatch_error) |err| return err;
+            try std.testing.expectEqual(before + @as(u64, if (enabled and !aliases and !partial) 1 else 0), renderer.storage_initial_uploads_avoided);
+            try renderer.flushPendingGuestWrites();
+            try std.testing.expect(memory.read(memory.context, destination, &initial));
+            for (0..15) |y| for (0..64) |x| {
+                const written = x < (if (partial) @as(usize, 16) else 23);
+                const expected = if (written) color else [_]u8{0xa5} ** 4;
+                try std.testing.expectEqualSlices(u8, &expected, initial[y * 256 + x * 4 ..][0..4]);
+            };
+        }
+        std.debug.print("rectangular image overwrite passed: enabled={} batch={}, sampled input aliases, partial dispatch, full coverage and row padding\n", .{ enabled, batch });
+    };
+}
+
 noinline fn runFullImageOverwriteProbe(allocator: std.mem.Allocator) !void {
     const Memory = SizedGuestMemory(1024 * 1024);
     const original_lean = vulkan.backend.lean_storage_overwrite_baselines;
@@ -13292,6 +13361,26 @@ noinline fn runColorStorageLayoutProbe(allocator: std.mem.Allocator) !void {
         renderer.draw_batch_active = batch;
         try renderer.probeColorStorageLayout();
         std.debug.print("color/storage layout batch={} passed\n", .{batch});
+    }
+}
+
+noinline fn runStorageLayoutConversionProbe(allocator: std.mem.Allocator) !void {
+    const LayoutMemory = SizedGuestMemory(1024 * 1024);
+    for ([_]bool{ false, true }) |batch| {
+        const renderer = try allocator.create(vulkan.Renderer);
+        defer allocator.destroy(renderer);
+        renderer.* = try vulkan.Renderer.init(allocator, .{ .enable_validation = true, .enable_timeline_scheduler = true, .defer_internal_releases = true });
+        defer renderer.deinit();
+        var guest = LayoutMemory{};
+        guest.watch_generation = 1;
+        var memory = guest.interface();
+        memory.track_gpu_read = LayoutMemory.track;
+        memory.gpu_generation = LayoutMemory.generation;
+        memory.fingerprint = LayoutMemory.fingerprint;
+        _ = renderer.dcbBackend(memory);
+        renderer.draw_batch_active = batch;
+        try renderer.probeStorageLayoutConversion();
+        std.debug.print("storage layout conversion batch={} passed\n", .{batch});
     }
 }
 
@@ -14778,6 +14867,10 @@ pub fn main(init: std.process.Init) !void {
         try runFullImageOverwriteProbe(allocator);
         return;
     }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--rectangular-image-overwrite")) {
+        try runRectangularImageOverwriteProbe(allocator);
+        return;
+    }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--covered-raster-initialization")) {
         try runBufferReadbackProbe(allocator, vulkan.Renderer.probeCoveredRasterInitialization, "covered raster initialization");
         return;
@@ -14788,6 +14881,10 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--color-storage-layout")) {
         try runColorStorageLayoutProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--storage-layout-conversion")) {
+        try runStorageLayoutConversionProbe(allocator);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--typed-indices")) {

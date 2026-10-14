@@ -277,6 +277,10 @@ pub const Evaluation = struct {
     /// duplicate an earlier load, so only revisits need a history search.
     highest_load_pc: u32 = 0,
     instruction_count: u32 = 0,
+    /// Visits the dense interpreter would need along this same path. Only an
+    /// executed END establishes a complete budget; indexed vector gaps count
+    /// too, including gaps entered through a branch. Saturation rejects reuse.
+    dense_instruction_count: ?u64 = null,
     stop_pc: u32 = 0,
     stop_reason: StopReason = .instruction_limit,
     /// A scalar load failed. The address list then omits bytes the next
@@ -294,6 +298,7 @@ pub const Evaluation = struct {
         self.load_count = 0;
         self.highest_load_pc = 0;
         self.instruction_count = 0;
+        self.dense_instruction_count = null;
         self.stop_pc = 0;
         self.stop_reason = .instruction_limit;
         self.memory_read_failed = false;
@@ -308,6 +313,7 @@ pub const Evaluation = struct {
         self.load_count = source_.load_count;
         self.highest_load_pc = source_.highest_load_pc;
         self.instruction_count = source_.instruction_count;
+        self.dense_instruction_count = source_.dense_instruction_count;
         self.stop_pc = source_.stop_pc;
         self.stop_reason = source_.stop_reason;
         self.memory_read_failed = source_.memory_read_failed;
@@ -1001,12 +1007,12 @@ fn evaluateInto(
     var setpc_follows: u8 = 0;
     // Most walks never reach the indirect-jump limit. Scan the immutable
     // program for static calls only if that distinction can change execution.
-    var has_static_calls: ?bool = if (@atomicLoad(bool, &cached_scalar_call_analysis, .monotonic)) null else
-        if (decoded_instructions) |instructions| rdna2.scalar_calls.present(instructions) else false;
+    var has_static_calls: ?bool = if (@atomicLoad(bool, &cached_scalar_call_analysis, .monotonic)) null else if (decoded_instructions) |instructions| rdna2.scalar_calls.present(instructions) else false;
     var unknown_scalar_exits = BranchSites{};
     var revisited_loop_edges = BranchSites{};
     var dense_walk = steps == null;
     var current_step: usize = 0;
+    var skipped_instructions: u64 = 0;
     const instruction_limit: u32 = if (follow_lane_mask_fallthrough) bindings.resource_instruction_budget else maximum_instructions;
     while (result.instruction_count < instruction_limit) {
         if (steps) |list| {
@@ -1029,7 +1035,19 @@ fn evaluateInto(
                 }
                 current_step = index;
                 const step_pc = instructions[list[index]].pc;
-                if (step_pc != pc) pc = step_pc;
+                if (step_pc != pc) {
+                    const first_dense = if (decoded_cursor < instructions.len and instructions[decoded_cursor].pc == pc)
+                        decoded_cursor
+                    else
+                        decodedInstructionIndexAtOrAfter(instructions, pc);
+                    // A malformed branch into an instruction is not a dense
+                    // budget proof, even if resource recovery can continue.
+                    if (first_dense >= instructions.len or instructions[first_dense].pc != pc or first_dense > list[index])
+                        skipped_instructions = std.math.maxInt(u64)
+                    else
+                        skipped_instructions +|= list[index] - first_dense;
+                    pc = step_pc;
+                }
                 decoded_cursor = list[index];
             }
         }
@@ -1138,6 +1156,7 @@ fn evaluateInto(
             }
         } else switch (inst.opcode) {
             .s_endpgm, .s_code_end => {
+                result.dense_instruction_count = @as(u64, result.instruction_count) +| skipped_instructions;
                 result.stop_reason = .end_program;
                 return;
             },
@@ -1262,6 +1281,7 @@ fn evaluateInto(
                     return;
                 }
                 current_step += 1;
+                skipped_instructions +|= list[current_step] - decoded_cursor;
                 pc = instructions[list[current_step]].pc;
             }
         } else {

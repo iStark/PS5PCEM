@@ -13,6 +13,8 @@ const shaders = @import("shaders.zig");
 const cpu = @import("cpu_workers.zig");
 
 pub export var share_bounded_scalar_loops: bool = true;
+pub export var exact_scalar_walk_budget: bool = true;
+pub export var indexed_resource_snapshot_capture: bool = true;
 
 fn io() std.Io {
     return std.Io.Threaded.global_single_threaded.io();
@@ -27,6 +29,7 @@ const Snapshot = struct {
     reads: [scalar.maximum_loads]Read = undefined,
     order: [scalar.maximum_loads]u16 = undefined,
     count: usize = 0,
+    indexed_count: usize = 0,
     complete: bool = true,
     missing: bool = false,
     source: shaders.MemoryReader = undefined,
@@ -36,6 +39,7 @@ const Snapshot = struct {
         self.complete = other.complete;
         self.missing = false;
         self.source = undefined;
+        self.indexed_count = 0;
         @memcpy(self.reads[0..self.count], other.reads[0..other.count]);
         // Shared owner walks never replay through the sorted index.
     }
@@ -50,15 +54,23 @@ const Snapshot = struct {
             self.complete = false;
             return true;
         }
-        for (self.reads[0..self.count]) |*read| {
-            if (read.address == address and read.size == bytes.len) {
-                if (!std.mem.eql(u8, read.bytes[0..read.size], bytes)) self.complete = false;
-                return true;
+        const indexed = @atomicLoad(bool, &indexed_resource_snapshot_capture, .monotonic) and bytes.len != 0;
+        var insertion: usize = 0;
+        if (indexed) {
+            if (self.indexed_count != self.count) self.sort();
+            // Reads are at most 64 bytes. Only nearby starts can overlap;
+            // unrelated descriptor tables need no pairwise comparison.
+            var position = self.lowerBound(address -| 63);
+            while (position < self.count) : (position += 1) {
+                const read = &self.reads[self.order[position]];
+                if (read.address >= address + bytes.len) break;
+                if (self.compareRead(read, address, bytes)) return true;
             }
-            const first = @max(address, read.address);
-            const end = @min(address + bytes.len, read.address + read.size);
-            if (first < end and !std.mem.eql(u8, bytes[@intCast(first - address)..@intCast(end - address)], read.bytes[@intCast(first - read.address)..@intCast(end - read.address)]))
-                self.complete = false;
+            insertion = self.lowerBound(address);
+        } else {
+            for (self.reads[0..self.count]) |*read| {
+                if (self.compareRead(read, address, bytes)) return true;
+            }
         }
         if (self.count == self.reads.len) {
             self.complete = false;
@@ -68,8 +80,35 @@ const Snapshot = struct {
         read.address = address;
         read.size = @intCast(bytes.len);
         @memcpy(read.bytes[0..bytes.len], bytes);
+        if (indexed) {
+            std.mem.copyBackwards(u16, self.order[insertion + 1 .. self.count + 1], self.order[insertion..self.count]);
+            self.order[insertion] = @intCast(self.count);
+            self.indexed_count = self.count + 1;
+        } else self.indexed_count = 0;
         self.count += 1;
         return true;
+    }
+
+    fn compareRead(self: *Snapshot, read: *const Read, address: u64, bytes: []const u8) bool {
+        if (read.address == address and read.size == bytes.len) {
+            if (!std.mem.eql(u8, read.bytes[0..read.size], bytes)) self.complete = false;
+            return true;
+        }
+        const first = @max(address, read.address);
+        const end = @min(address + bytes.len, read.address + read.size);
+        if (first < end and !std.mem.eql(u8, bytes[@intCast(first - address)..@intCast(end - address)], read.bytes[@intCast(first - read.address)..@intCast(end - read.address)]))
+            self.complete = false;
+        return false;
+    }
+
+    fn lowerBound(self: *const Snapshot, address: u64) usize {
+        var low: usize = 0;
+        var high = self.count;
+        while (low < high) {
+            const middle = low + (high - low) / 2;
+            if (self.reads[self.order[middle]].address < address) low = middle + 1 else high = middle;
+        }
+        return low;
     }
 
     fn sort(self: *Snapshot) void {
@@ -79,6 +118,7 @@ const Snapshot = struct {
                 return snapshot.reads[a].address < snapshot.reads[b].address;
             }
         }.less);
+        self.indexed_count = self.count;
     }
 
     fn replay(context: ?*anyopaque, address: u64, bytes: []u8) bool {
@@ -158,6 +198,7 @@ const WalkCache = struct {
         sampled: []scalar.ScalarRegisters,
         resource: []scalar.ScalarRegisters,
         has_sampled: bool,
+        exact_loop_budget: bool,
         age: u64,
 
         fn bytes(self: *const Entry) usize {
@@ -184,6 +225,7 @@ const WalkCache = struct {
         for (self.entries) |maybe| {
             const entry = maybe orelse continue;
             if (entry.plan_identity != plan.identity or (needs_sampled and !entry.has_sampled) or
+                (!plan.forward_only and entry.exact_loop_budget != @atomicLoad(bool, &exact_scalar_walk_budget, .monotonic)) or
                 !std.meta.eql(entry.bindings, bindings.*)) continue;
             if (!entry.snapshot.matches(reader)) return null;
             self.sequence +%= 1;
@@ -217,6 +259,7 @@ const WalkCache = struct {
                         @memcpy(entry.sampled, sampled_values);
                         @memcpy(entry.resource, resource);
                         entry.has_sampled = sampled != null;
+                        entry.exact_loop_budget = @atomicLoad(bool, &exact_scalar_walk_budget, .monotonic);
                         self.sequence +%= 1;
                         entry.age = self.sequence;
                         return;
@@ -248,7 +291,7 @@ const WalkCache = struct {
             return;
         };
         self.sequence +%= 1;
-        entry.* = .{ .plan_identity = plan.identity, .bindings = bindings.*, .snapshot = .{}, .evaluation = undefined, .sampled = sampled_copy, .resource = resource_copy, .has_sampled = sampled != null, .age = self.sequence };
+        entry.* = .{ .plan_identity = plan.identity, .bindings = bindings.*, .snapshot = .{}, .evaluation = undefined, .sampled = sampled_copy, .resource = resource_copy, .has_sampled = sampled != null, .exact_loop_budget = @atomicLoad(bool, &exact_scalar_walk_budget, .monotonic), .age = self.sequence };
         entry.snapshot.copyFrom(snapshot);
         entry.evaluation.copyFrom(evaluation);
         self.entries[slot.?] = entry;
@@ -282,7 +325,7 @@ pub const Pool = struct {
     walk_cache: WalkCache = .{},
     /// Failed bounded-loop proofs are not useful work to repeat per draw.
     /// Opting out can only miss an optimization if later inputs shorten a loop.
-    loop_declines: [256]struct { identity: u64 = 0, budget: u32 = 0 } = @splat(.{}),
+    loop_declines: [256]struct { identity: u64 = 0, budget: u32 = 0, exact: bool = false } = @splat(.{}),
 
     // A stage snapshot is immutable until both jobs complete. Separate jobs
     // allow a long checkpoint walk to overlap the other stage's scalar walk.
@@ -351,6 +394,7 @@ pub const Pool = struct {
             self.configured_adaptive = self.adaptive;
         }
         stage.snapshot.count = 0;
+        stage.snapshot.indexed_count = 0;
         stage.snapshot.complete = true;
         stage.snapshot.missing = false;
         return stage;
@@ -364,11 +408,13 @@ pub const Pool = struct {
             plan.?.resource.len + plan.?.sampled.len == 0) return null;
         if (!plan.?.forward_only and plan.?.identity != 0) {
             const declined = self.loop_declines[plan.?.identity % self.loop_declines.len];
-            if (declined.identity == plan.?.identity and declined.budget == bindings.resource_instruction_budget) return null;
+            if (declined.identity == plan.?.identity and declined.budget == bindings.resource_instruction_budget and
+                declined.exact == @atomicLoad(bool, &exact_scalar_walk_budget, .monotonic)) return null;
         }
         const stage = &self.stages[slot];
         if (stage.active or stage.shared_declined) return null;
         stage.snapshot.count = 0;
+        stage.snapshot.indexed_count = 0;
         stage.snapshot.complete = true;
         stage.snapshot.missing = false;
         return stage;
@@ -377,10 +423,15 @@ pub const Pool = struct {
     fn sharedResultFits(self: *Pool, stage: *Stage, plan: *const checkpoints.Plan, bindings: *const shaders.StageBindings, evaluation: *const scalar.Evaluation) bool {
         if (plan.forward_only) return true;
         // The indexed and dense evaluators follow the same scalar/control
-        // steps. Share a completed loop only when even this upper bound on
-        // dense visits fits its original budget. A shorter sparse walk must
-        // never lend results from beyond the dense interpreter's limit.
-        const dense_bound = (@as(u64, evaluation.instruction_count) + 1) * plan.maximum_dense_step_ratio;
+        // steps. Count the skipped vector visits on the executed path; the
+        // former maximum-gap bound remains a fallback for incomplete/manual
+        // proofs. Never lend results beyond the dense interpreter's budget.
+        const exact = @atomicLoad(bool, &exact_scalar_walk_budget, .monotonic);
+        const conservative_bound = (@as(u64, evaluation.instruction_count) + 1) * plan.maximum_dense_step_ratio;
+        const dense_bound = if (exact and plan.identity != 0)
+            evaluation.dense_instruction_count orelse conservative_bound
+        else
+            conservative_bound;
         if (evaluation.stop_reason == .end_program and dense_bound <= bindings.resource_instruction_budget) {
             self.stats.shared_loop_walks += 1;
             return true;
@@ -389,6 +440,7 @@ pub const Pool = struct {
         if (plan.identity != 0) self.loop_declines[plan.identity % self.loop_declines.len] = .{
             .identity = plan.identity,
             .budget = bindings.resource_instruction_budget,
+            .exact = exact,
         };
         self.stats.shared_loop_fallbacks += 1;
         return false;
@@ -742,6 +794,82 @@ test "resource snapshots reject missing and inconsistent reads" {
     try std.testing.expect(!snapshot.matches(memory.reader()));
 }
 
+test "indexed snapshot capture matches linear overlap, duplicate and capacity checks" {
+    const Memory = struct {
+        bytes: [32768]u8 = undefined,
+        fn read(context: ?*anyopaque, address: u64, output: []u8) bool {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            if (address > self.bytes.len or output.len > self.bytes.len - address) return false;
+            @memcpy(output, self.bytes[@intCast(address)..][0..output.len]);
+            return true;
+        }
+    };
+    var memory = Memory{};
+    for (&memory.bytes, 0..) |*byte, i| byte.* = @truncate(i *% 37);
+    const a = std.testing.allocator;
+    const reference = try a.create(Snapshot);
+    defer a.destroy(reference);
+    const indexed = try a.create(Snapshot);
+    defer a.destroy(indexed);
+    const reader = shaders.MemoryReader{ .context = &memory, .read_fn = Memory.read };
+    reference.* = .{ .source = reader };
+    indexed.* = .{ .source = reader };
+    const saved = indexed_resource_snapshot_capture;
+    defer indexed_resource_snapshot_capture = saved;
+    var before: [65]u8 = undefined;
+    var after: [65]u8 = undefined;
+    for (0..scalar.maximum_loads * 2 + 3) |i| {
+        // Permuted starts, nested overlaps, duplicate reads, a conflicting
+        // CPU write, a full table, an oversized read and a missing range.
+        const slot = (i * 149) % scalar.maximum_loads;
+        var address: u64 = slot * 48;
+        var size: usize = if (slot % 2 == 0) 64 else 4;
+        if (i == scalar.maximum_loads + 7) memory.bytes[@intCast(address)] ^= 1;
+        if (i == scalar.maximum_loads * 2) address = 30000;
+        if (i == scalar.maximum_loads * 2 + 1) size = 65;
+        if (i == scalar.maximum_loads * 2 + 2) address = 32768;
+        indexed_resource_snapshot_capture = false;
+        const expected = Snapshot.capture(reference, address, before[0..size]);
+        indexed_resource_snapshot_capture = true;
+        try std.testing.expectEqual(expected, Snapshot.capture(indexed, address, after[0..size]));
+        if (expected) try std.testing.expectEqualSlices(u8, before[0..size], after[0..size]);
+        try std.testing.expectEqual(reference.count, indexed.count);
+        try std.testing.expectEqual(reference.complete, indexed.complete);
+    }
+    reference.sort();
+    indexed.sort();
+    for (reference.reads[0..reference.count]) |read| {
+        try std.testing.expectEqual(Snapshot.replay(reference, read.address + 1, before[0 .. read.size - 1]), Snapshot.replay(indexed, read.address + 1, after[0 .. read.size - 1]));
+        try std.testing.expectEqualSlices(u8, before[0 .. read.size - 1], after[0 .. read.size - 1]);
+    }
+    // A copied capture and a runtime diagnostic toggle rebuild their index.
+    indexed.copyFrom(reference);
+    indexed.source = reader;
+    indexed.complete = true;
+    reference.complete = true;
+    indexed_resource_snapshot_capture = false;
+    _ = Snapshot.capture(reference, 1, before[0..3]);
+    indexed_resource_snapshot_capture = true;
+    _ = Snapshot.capture(indexed, 1, after[0..3]);
+    try std.testing.expectEqual(reference.complete, indexed.complete);
+
+    // The next capture may have the same length but a different address
+    // order. A diagnostic toggle must not mistake the old index for current.
+    indexed.count = 0;
+    indexed.complete = true;
+    indexed.indexed_count = 3;
+    @memcpy(indexed.order[0..3], &[_]u16{ 2, 0, 1 });
+    indexed_resource_snapshot_capture = false;
+    for ([_]u64{ 8, 4, 16 }) |address| try std.testing.expect(Snapshot.capture(indexed, address, after[0..4]));
+    indexed_resource_snapshot_capture = true;
+    try std.testing.expect(Snapshot.capture(indexed, 8, after[0..4]));
+    try std.testing.expectEqual(@as(usize, 3), indexed.count);
+    try std.testing.expect(indexed.complete);
+    memory.bytes[8] ^= 1;
+    try std.testing.expect(Snapshot.capture(indexed, 8, after[0..4]));
+    try std.testing.expect(!indexed.complete);
+}
+
 test "shared indexed resource walk preserves lane clobbers and branch checkpoints" {
     const a = std.testing.allocator;
     var instructions = [_]rdna2.Instruction{
@@ -804,6 +932,8 @@ test "shared indexed resource walk preserves lane clobbers and branch checkpoint
 
 test "shared loop resource walks preserve dense budgets and checkpoint history" {
     const a = std.testing.allocator;
+    const saved_exact = exact_scalar_walk_budget;
+    defer exact_scalar_walk_budget = saved_exact;
     var instructions = [_]rdna2.Instruction{
         .{ .family = .sop1, .opcode = .s_mov_b32, .dst = .{ .kind = .sgpr, .reg = 6 }, .src0 = .{ .kind = .integer_inline_constant, .value = 4 } },
         .{ .family = .smem, .opcode = .s_load_dword, .dst = .{ .kind = .sgpr, .reg = 4 }, .src0 = .{ .kind = .sgpr }, .src1 = .{ .kind = .integer_inline_constant }, .data_words = 1 },
@@ -848,46 +978,92 @@ test "shared loop resource walks preserve dense budgets and checkpoint history" 
     defer a.free(reference_resource);
     const reference_sampled = try a.alloc(scalar.ScalarRegisters, plan.sampled.len);
     defer a.free(reference_sampled);
-    for ([_]u32{ 256, 30, 13 }) |budget| {
-        bindings.resource_instruction_budget = budget;
-        var expected: scalar.Evaluation = undefined;
-        scalar.evaluateDecodedResourceStateAtTwoCheckpointsInto(&expected, memory.reader(), &bindings, &instructions, plan.sampled, reference_sampled, plan.resource, reference_resource, null);
-        var sampled = (try pool.startSampled(0, memory.reader(), &bindings, &instructions, &plan, &scratch, a)).?;
-        defer sampled.release();
-        var sampled_oracle = try serial.prepare(a, &instructions, &plan, .sampled, memory.reader(), &bindings);
-        defer sampled_oracle.release();
-        try std.testing.expectEqualDeep(sampled_oracle.snapshots, sampled.snapshots);
-        var actual: scalar.Evaluation = undefined;
-        const shared = pool.takeScalar(0, &bindings, &instructions, memory.reader(), &actual);
-        try std.testing.expectEqual(budget == 256, shared);
-        if (shared) {
-            var resource = pool.take(&instructions, &bindings, .resource, memory.reader()).?;
-            defer resource.release();
-            try std.testing.expectEqualDeep(reference_sampled, sampled.snapshots);
-            try std.testing.expectEqualDeep(reference_resource, resource.snapshots);
-            try std.testing.expectEqualDeep(expected.registers, actual.registers);
-            try std.testing.expectEqual(expected.stop_reason, actual.stop_reason);
-            try std.testing.expectEqual(@as(u32, 43), expected.instruction_count);
-            try std.testing.expectEqual(@as(u32, 0), actual.registers[6].value);
-            try std.testing.expectEqual(@as(usize, 1), actual.load_count);
-            try std.testing.expectEqual(expected.load_count, actual.load_count);
-            for (expected.loadSlice(), actual.loadSlice()) |want, got| {
-                try std.testing.expectEqual(want.address, got.address);
-                try std.testing.expectEqual(want.pc, got.pc);
-                try std.testing.expectEqualSlices(u32, want.values[0..want.word_count], got.values[0..got.word_count]);
+    for ([_]bool{ false, true }) |exact| {
+        exact_scalar_walk_budget = exact;
+        for ([_]u32{ 256, 43, 42, 30, 13 }) |budget| {
+            const can_share = budget == 256 or (exact and budget == 43);
+            bindings.resource_instruction_budget = budget;
+            var expected: scalar.Evaluation = undefined;
+            scalar.evaluateDecodedResourceStateAtTwoCheckpointsInto(&expected, memory.reader(), &bindings, &instructions, plan.sampled, reference_sampled, plan.resource, reference_resource, null);
+            var sampled = (try pool.startSampled(0, memory.reader(), &bindings, &instructions, &plan, &scratch, a)).?;
+            defer sampled.release();
+            var sampled_oracle = try serial.prepare(a, &instructions, &plan, .sampled, memory.reader(), &bindings);
+            defer sampled_oracle.release();
+            try std.testing.expectEqualDeep(sampled_oracle.snapshots, sampled.snapshots);
+            var actual: scalar.Evaluation = undefined;
+            const shared = pool.takeScalar(0, &bindings, &instructions, memory.reader(), &actual);
+            try std.testing.expectEqual(can_share, shared);
+            if (shared) {
+                var resource = pool.take(&instructions, &bindings, .resource, memory.reader()).?;
+                defer resource.release();
+                try std.testing.expectEqualDeep(reference_sampled, sampled.snapshots);
+                try std.testing.expectEqualDeep(reference_resource, resource.snapshots);
+                try std.testing.expectEqualDeep(expected.registers, actual.registers);
+                try std.testing.expectEqual(expected.stop_reason, actual.stop_reason);
+                try std.testing.expectEqual(@as(u32, 43), expected.instruction_count);
+                try std.testing.expectEqual(@as(?u64, 43), actual.dense_instruction_count);
+                try std.testing.expectEqual(@as(u32, 0), actual.registers[6].value);
+                try std.testing.expectEqual(@as(usize, 1), actual.load_count);
+                try std.testing.expectEqual(expected.load_count, actual.load_count);
+                for (expected.loadSlice(), actual.loadSlice()) |want, got| {
+                    try std.testing.expectEqual(want.address, got.address);
+                    try std.testing.expectEqual(want.pc, got.pc);
+                    try std.testing.expectEqualSlices(u32, want.values[0..want.word_count], got.values[0..got.word_count]);
+                }
+            } else {
+                try std.testing.expectEqual(if (budget < 43) scalar.StopReason.instruction_limit else scalar.StopReason.end_program, expected.stop_reason);
+                try std.testing.expect(pool.stages[0].shared_declined);
+                try std.testing.expect(!pool.startScalar(0, memory.reader(), &bindings, &instructions, &plan, &actual));
             }
-        } else {
-            try std.testing.expectEqual(scalar.StopReason.instruction_limit, expected.stop_reason);
-            try std.testing.expect(pool.stages[0].shared_declined);
-            try std.testing.expect(!pool.startScalar(0, memory.reader(), &bindings, &instructions, &plan, &actual));
+            pool.finish();
+            try std.testing.expectEqual(can_share, pool.startScalar(0, memory.reader(), &bindings, &instructions, &plan, &actual));
+            if (can_share) try std.testing.expectEqualDeep(expected.registers, actual.registers);
+            pool.finish();
         }
-        pool.finish();
-        try std.testing.expectEqual(budget == 256, pool.startScalar(0, memory.reader(), &bindings, &instructions, &plan, &actual));
-        if (budget == 256) try std.testing.expectEqualDeep(expected.registers, actual.registers);
-        pool.finish();
     }
-    try std.testing.expectEqual(@as(u64, 2), pool.stats.shared_loop_walks);
-    try std.testing.expectEqual(@as(u64, 2), pool.stats.shared_loop_fallbacks);
+    try std.testing.expectEqual(@as(u64, 6), pool.stats.shared_loop_walks);
+    try std.testing.expectEqual(@as(u64, 7), pool.stats.shared_loop_fallbacks);
+}
+
+test "indexed dense visit counts include branch gaps and reject malformed destinations" {
+    const a = std.testing.allocator;
+    for (0..5) |variant| {
+        var instructions = [_]rdna2.Instruction{
+            .{ .family = .vop1, .opcode = .v_mov_b32, .dst = .{ .kind = .vgpr } },
+            .{ .family = .sopp, .opcode = .s_branch, .branch_target = 12 },
+            .{ .family = .vop1, .opcode = .v_mov_b32, .dst = .{ .kind = .vgpr } },
+            .{ .family = .vop1, .opcode = .v_mov_b32, .dst = .{ .kind = .vgpr } },
+            .{ .family = .sop1, .opcode = .s_mov_b32, .dst = .{ .kind = .sgpr, .reg = 8 }, .src0 = .{ .kind = .integer_inline_constant, .value = 17 } },
+            .{ .family = .vop1, .opcode = .v_mov_b32, .dst = .{ .kind = .vgpr } },
+            .{ .family = .mimg, .opcode = .image_sample, .dst = .{ .kind = .vgpr, .reg = 2 }, .src1 = .{ .kind = .sgpr, .reg = 8 } },
+            .{ .family = .sopp, .opcode = .s_endpgm },
+        };
+        if (variant == 1) instructions[1].branch_target = 16;
+        if (variant == 2) instructions[1].branch_target = 14;
+        if (variant == 3) instructions[1].opcode = .s_cbranch_scc0;
+        if (variant == 4) instructions[7] = .{ .family = .vop1, .opcode = .v_mov_b32, .dst = .{ .kind = .vgpr } };
+        for (&instructions, 0..) |*inst, i| {
+            inst.pc = @intCast(i * 4);
+            inst.word_count = 1;
+        }
+        var plan = try checkpoints.Plan.init(a, &instructions);
+        defer plan.deinit(a);
+        var memory = TestMemory{ .owner = std.Thread.getCurrentId() };
+        var bindings = std.mem.zeroes(shaders.StageBindings);
+        bindings.resource_instruction_budget = 128;
+        var dense: scalar.Evaluation = undefined;
+        var indexed: scalar.Evaluation = undefined;
+        scalar.evaluateDecodedResourceStateInto(&dense, memory.reader(), &bindings, &instructions);
+        scalar.evaluateDecodedResourceStateAtCheckpointsInto(&indexed, memory.reader(), &bindings, &instructions, &.{}, &.{}, plan.scalar_steps);
+        try std.testing.expectEqualDeep(dense.registers, indexed.registers);
+        if (variant == 2) {
+            try std.testing.expectEqual(@as(?u64, std.math.maxInt(u64)), indexed.dense_instruction_count);
+        } else if (variant == 4) {
+            try std.testing.expectEqual(@as(?u64, null), indexed.dense_instruction_count);
+        } else {
+            try std.testing.expectEqual(@as(?u64, dense.instruction_count), indexed.dense_instruction_count);
+        }
+    }
 }
 
 test "cached resource walks validate bytes bindings and immutable plan identity" {
