@@ -2007,10 +2007,17 @@ pub fn computeDestinationOffset(params: ComputeDetileParams, x: u32, y: u32, z: 
     return dest_base + (texel * params.samples + sample) * bpp;
 }
 
+pub export var narrow_compute_layouts: bool = true;
+
 pub fn computeDetileSupported(params: ComputeDetileParams) bool {
     if (params.samples != 1) return false;
     const bpp = computeElementBytes(params);
-    if (bpp != 4 and bpp != 8 and bpp != 16) return false;
+    if (bpp == 1 or bpp == 2) {
+        if (!@atomicLoad(bool, &narrow_compute_layouts, .monotonic)) return false;
+        // A halfword must not straddle a dword; byte layouts have no such
+        // restriction. Allocations are padded to permit the final word load.
+        if (params.source_offset_lo % bpp != 0 or params.destination_offset_lo % bpp != 0) return false;
+    } else if (bpp != 4 and bpp != 8 and bpp != 16) return false;
     const kind: TextureKind = @enumFromInt(@as(u8, @truncate(params.flags >> 24)));
     return switch (computeFamily(params)) {
         .linear, .standard_256b, .standard_4kb, .standard_64kb, .partially_resident => kind == .array_2d,
@@ -3818,4 +3825,24 @@ test "parallel macro rows preserve tiled padding clipped blocks and array slices
         }
     }
     try std.testing.expectEqual(@as(usize, 3), parallel.worker_count);
+}
+
+test "narrow compute layouts preserve byte offsets and reject split halfwords" {
+    const saved = narrow_compute_layouts;
+    defer narrow_compute_layouts = saved;
+    for ([_]u8{ 1, 2 }) |bpp| {
+        const surface = try Layout.init(.{ .tile_mode = .render_target, .width = 13, .height = 71 }, bpp);
+        var plan = try (try surface.subresourceView()).computePlan(0, 0);
+        narrow_compute_layouts = true;
+        try testing.expect(computeDetileSupported(plan.params));
+        plan.params.source_offset_lo = 1;
+        try testing.expectEqual(bpp == 1, computeDetileSupported(plan.params));
+        plan.params.source_offset_lo = 2;
+        plan.params.destination_offset_lo = 1;
+        try testing.expectEqual(bpp == 1, computeDetileSupported(plan.params));
+        plan.params.destination_offset_lo = 2;
+        try testing.expect(computeDetileSupported(plan.params));
+        narrow_compute_layouts = false;
+        try testing.expect(!computeDetileSupported(plan.params));
+    }
 }

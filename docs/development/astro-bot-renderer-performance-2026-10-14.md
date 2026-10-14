@@ -5,6 +5,93 @@ Output is 1920×1080; the game still controls its internal surface dimensions.
 Existing shader caches were retained. The 25–30 FPS target is **not reached**.
 Rendering defects remain, and controllable gameplay is not established.
 
+## Follow-up: static shader analysis and narrow layouts
+
+The latest balanced title comparison measures **14.25 FPS**, versus
+**14.19 FPS** with call-presence and NGG-export analysis reuse disabled.
+Every setting below covers 660 frames distributed across eleven animation
+phases in the same warmed process. Separate comparisons are not release-to-release
+speed claims. These measurements cover the title screen, not character control.
+The latest difference is only about 0.5% and does not establish a material FPS gain.
+
+| Setting | Frames | Seconds | FPS |
+| --- | ---: | ---: | ---: |
+| Repeated call/NGG analysis | 660 | 46.517 | 14.19 |
+| Deferred and retained call-presence analysis | 660 | 46.315 | 14.25 |
+| Also retain NGG export inference | 660 | 46.300 | 14.25 |
+
+Static call discovery is deferred until the indirect-jump limit makes it
+relevant. Translation reuses call presence only for an exact immutable program.
+The NGG cache includes the immutable plan identity, mapped PARAM components and
+layered ABI; every draw receives independent output storage. Reconstructed
+programs and missing plans retain the original analysis.
+
+The earlier buffer-query change advances through overlap bitsets once and
+uses the same index for projected release checks. It retains exact overlap,
+live dirty-state checks, cache order and independent iterators:
+
+| Setting | Frames | Seconds | FPS |
+| --- | ---: | ---: | ---: |
+| Original overlap iteration and release scan | 660 | 49.844 | 13.24 |
+| Sequential overlap iteration | 660 | 49.206 | 13.41 |
+| Also index projected release checks | 660 | 48.752 | 13.54 |
+
+GPU layout transforms now cover 8- and 16-bit texels, including odd byte
+offsets, odd row widths, mip tails and thick 3D layouts. Disjoint atomic masks
+preserve neighboring bytes during narrow writes. The native probes compare
+87 detile layouts and 285 inverse/round-trip views against the CPU implementation,
+with Vulkan synchronization validation. Storage coherence tests also cover
+CPU replacement, padding writes and switching the upload mode.
+
+| Setting | Frames | Seconds | FPS |
+| --- | ---: | ---: | ---: |
+| Previous narrow-format fallback | 660 | 46.796 | 14.10 |
+| Narrow GPU transforms available | 660 | 46.734 | 14.12 |
+| Also enable GPU storage uploads | 660 | 47.484 | 13.90 |
+
+There was no meaningful title gain from narrow-format support in this
+sample. GPU storage uploads remain disabled by default because they were slower.
+The layout support is retained for compatibility and other workloads.
+
+Bounded semaphore polling uses real `vkWaitSemaphores` calls with timeout zero,
+then falls back to a blocking wait. Errors are returned immediately; both time
+and iteration limits prevent an unbounded spin. The selected 50-microsecond
+budget produced a small improvement in this comparison:
+
+| Setting | Frames | Seconds | FPS |
+| --- | ---: | ---: | ---: |
+| Blocking wait | 660 | 46.843 | 14.09 |
+| Poll for up to 20 microseconds | 660 | 46.619 | 14.16 |
+| Poll for up to 50 microseconds | 660 | 46.215 | 14.28 |
+| Poll for up to 100 microseconds | 660 | 46.813 | 14.10 |
+
+The corresponding process CPU totals were 71.281, 68.000, 67.625 and
+72.469 CPU-seconds per 660 frames. These totals include all game-run threads;
+they are not GPU timings. Polling follows the Vulkan
+[semaphore wait contract](https://docs.vulkan.org/refpages/latest/refpages/source/vkWaitSemaphores.html).
+
+Validation: **548/548 GPU/Vulkan tests**, **12/12 ReleaseFast build steps**,
+and native scalar-call, resource-worker, distinct-scalar and loop probes.
+The general native smoke suite also passes without validation errors after fixing
+its manual descriptor-state reset to discard unconsumed staged writes, as the
+normal runner already does.
+Earlier native checks in this checkpoint also cover deferred/internal release
+queues, buffer publication and storage-image coherence. No synchronization
+validation errors were reported by these probes.
+
+The title still reports twelve unresolved scalar-buffer resource bindings in
+four compute shaders. This counts preparation gaps, not proven executed missing
+accesses. No draw/dispatch failures or unsupported compute programs were counted
+in the sampled title frames. These observations do not establish correctness
+in later scenes.
+
+![ASTRO BOT title screen after static shader analysis changes](../images/astro-bot-title-static-analysis-2026-10-14.png)
+
+This is an actual renderer capture of the game-owned 3840×2160 scanout;
+host output remains 1920×1080. Builds, tests, profiling and capture ran outside
+FPS comparisons. **25 FPS is not reached; character control and later-scene
+correctness remain unverified.**
+
 ## Follow-up: scalar analysis and queued completion
 
 The latest warmed title comparison measures **13.79 FPS**, versus

@@ -92,6 +92,8 @@ pub export var native_release_timestamps: bool = false;
 pub export var batch_release_interrupts: bool = false;
 /// Completion boundaries inspect tracked GPU writers instead of clean cache entries.
 pub export var indexed_completion_buffers: bool = true;
+pub export var indexed_release_projection: bool = true;
+pub export var cache_ngg_export_analysis: bool = true;
 pub export var exact_buffer_readback_ranges: bool = true;
 pub export var discard_full_image_initialization: bool = true;
 pub export var discard_covered_raster_initialization: bool = true;
@@ -100,6 +102,7 @@ pub export var prefetch_storage_readbacks: bool = false;
 // Native storage transfers are byte-validated, but the balanced ASTRO title
 // comparison remains slower than the CPU path. Keep them opt-in for profiling.
 pub export var gpu_storage_detile: bool = false;
+pub export var storage_detile_minimum_bytes: usize = 1024 * 1024;
 pub export var gpu_storage_retile: bool = false;
 pub export var transient_read_only_buffers: bool = true;
 pub export var cache_vertex_index_bounds: bool = true;
@@ -6345,6 +6348,7 @@ pub const Renderer = struct {
     sampled_descriptor_scratch: ?*SampledDescriptorScratch = null,
     buffer_image_candidate_scratch: ?*BufferImageCandidates = null,
     resource_preparation: gpu.resource_preparation.Pool = .{},
+    ngg_export_analysis: ?*NggExportAnalysis = null,
     resource_preparation_in_use: bool = false,
     resource_preparation_bindings: [2]?*const gpu.ShaderBindings = @splat(null),
     uniform_specialization_cache_enabled: bool = true,
@@ -6375,6 +6379,7 @@ pub const Renderer = struct {
 
     fn destroyResourcePools(self: *Renderer) void {
         self.resource_preparation.deinit();
+        if (self.ngg_export_analysis) |cache| self.allocator.destroy(cache);
         self.image_scratch.deinit(self.allocator);
         self.index_scratch.deinit(self.allocator);
         self.checkpoint_scratch.deinit(self.allocator);
@@ -10483,7 +10488,7 @@ pub const Renderer = struct {
         const module_lease = self.compute_translations.acquirePrepared(self.allocator, &analysis.program, .{
             .stage = .compute,
             .omit_unobserved_exec_selects = @atomicLoad(bool, &omit_unobserved_exec_selects, .monotonic),
-            .program_address = if (rdna2.scalar_calls.present(analysis.program.instructions.items)) bindings.program_address else 0,
+            .program_address = if (gpu.resource_checkpoints.hasStaticCalls(analysis.program.instructions.items, if (analysis.resource_checkpoints) |*plan| plan else null)) bindings.program_address else 0,
             .local_size = local_size,
             .physical_local_size = try @import("compute_shape.zig").fit(local_size, self.device_info.max_compute_work_group_size, self.device_info.max_compute_work_group_invocations),
             .maximum_dispatcher_iterations = if (checked_bvh) (if (@atomicLoad(bool, &checked_bvh_diagnostics, .monotonic)) std.math.clamp(@atomicLoad(u32, &checked_bvh_diagnostic_iterations, .monotonic), 4096, 65536) else 4096) else if (yotei_environment_lighting) 2048 else if (yotei_atmosphere_multiscatter) 1024 else if (yotei_atmosphere_precompute) 512 else 256,
@@ -18794,6 +18799,20 @@ pub const Renderer = struct {
         return destination_index;
     }
 
+    fn inferCachedNggExports(self: *Renderer, instructions: []const gpu.ShaderInstruction, plan: ?*const gpu.resource_checkpoints.Plan, components: *const [32]u4, output: *[34]gpu.ShaderSpirvNggLdsExport, layered: bool) usize {
+        if (!@atomicLoad(bool, &cache_ngg_export_analysis, .monotonic) or plan == null or
+            plan.?.identity == 0 or !plan.?.matches(instructions))
+            return inferNggLdsExports(instructions, components, output, layered);
+        const cache = self.ngg_export_analysis orelse created: {
+            const value = self.allocator.create(NggExportAnalysis) catch
+                return inferNggLdsExports(instructions, components, output, layered);
+            value.* = .{};
+            self.ngg_export_analysis = value;
+            break :created value;
+        };
+        return cache.infer(instructions, plan, components, output, layered);
+    }
+
     fn drawPersistentGraphicsShaders(
         self: *Renderer,
         vertex_words: []const u32,
@@ -24488,8 +24507,9 @@ pub const Renderer = struct {
         }
 
         var ngg_lds_exports: [34]gpu.ShaderSpirvNggLdsExport = undefined;
-        const ngg_lds_export_count = inferNggLdsExports(
+        const ngg_lds_export_count = self.inferCachedNggExports(
             vertex_instructions,
+            if (vertex_analysis.resource_checkpoints) |*plan| plan else null,
             &parameter_components,
             &ngg_lds_exports,
             target.descriptor.resource_type == 2,
@@ -25287,7 +25307,7 @@ pub const Renderer = struct {
             .stage = .fragment,
             .omit_unobserved_exec_selects = @atomicLoad(bool, &omit_unobserved_exec_selects, .monotonic),
             .wave32 = graphicsWave32(state, .pixel),
-            .program_address = if (rdna2.scalar_calls.present(fragment_analysis.program.instructions.items)) fragment_address else 0,
+            .program_address = if (gpu.resource_checkpoints.hasStaticCalls(fragment_analysis.program.instructions.items, if (fragment_analysis.resource_checkpoints) |*plan| plan else null)) fragment_address else 0,
             .maximum_dispatcher_iterations = fragment_dispatcher_budget,
             .structure_branch_loops = @atomicLoad(bool, &fragment_branch_loops, .monotonic),
             .structure_short_fragment_loops = @atomicLoad(bool, &fragment_short_loops, .monotonic),
@@ -25650,7 +25670,7 @@ pub const Renderer = struct {
                     .stage = .vertex,
                     .omit_unobserved_exec_selects = @atomicLoad(bool, &omit_unobserved_exec_selects, .monotonic),
                     .wave32 = graphicsWave32(state, vertex_stage),
-                    .program_address = if (rdna2.scalar_calls.present(vertex_instructions)) vertex_address else 0,
+                    .program_address = if (gpu.resource_checkpoints.hasStaticCalls(vertex_instructions, if (vertex_analysis.resource_checkpoints) |*plan| plan else null)) vertex_address else 0,
                     // The PS5 NGG/export ABI supplies S_NGG_VERTEX_INDEX in v5;
                     // ordinary VS programs retain the legacy v0 convention.
                     // Prospero's merged graphics ABI supplies the vertex id in v5
@@ -29646,7 +29666,7 @@ pub const Renderer = struct {
         matching_index: ?usize,
         matching_view: vk.ImageView,
     ) anyerror!?PreparedStorageImage {
-        if (!@atomicLoad(bool, &gpu_storage_detile, .monotonic) or staging_bytes < 1024 * 1024 or
+        if (!@atomicLoad(bool, &gpu_storage_detile, .monotonic) or staging_bytes < @atomicLoad(usize, &storage_detile_minimum_bytes, .monotonic) or
             descriptor.image_type != .color_2d or descriptor.depth_or_layers != 1 or
             descriptor.base_array != 0 or descriptor.viewBaseLevel() != 0 or
             descriptor.resourceMipLevels() != 1 or descriptor.tile_mode.isLinear()) return null;
@@ -33666,11 +33686,19 @@ pub const Renderer = struct {
             .values = &values,
         };
         const wait_started = hostTimestampNs();
-        const result = self.device_functions.wait_semaphores(
-            self.device,
-            &wait_info,
-            std.math.maxInt(u64),
-        );
+        const Wait = struct {
+            renderer: *Renderer,
+            info: *const vk.SemaphoreWaitInfo,
+            pub fn now(_: *@This()) u64 {
+                return hostTimestampNs();
+            }
+            pub fn call(waiter: *@This(), timeout: u64) vk.Result {
+                return waiter.renderer.device_functions.wait_semaphores(waiter.renderer.device, waiter.info, timeout);
+            }
+        };
+        var waiter = Wait{ .renderer = self, .info = &wait_info };
+        const timeline = @import("timeline_wait.zig");
+        const result = timeline.wait(&waiter, @atomicLoad(u64, &timeline.timeline_poll_budget_ns, .monotonic));
         if (result == vk.error_device_lost) {
             self.reportDeviceLost();
             return Error.DeviceLost;
@@ -35002,13 +35030,13 @@ pub const Renderer = struct {
         for ([_]bool{ false, true }) |volume| {
             for ([_]gpu.resources.TileMode{ .linear, .standard_256b, .standard_4kb, .standard_64kb, .partially_resident, .render_target, .depth }) |mode| {
                 if (volume and (mode == .linear or mode == .standard_256b)) continue;
-                for ([_]u8{ 4, 8, 16 }) |bpp| {
+                for ([_]u8{ 1, 2, 4, 8, 16 }) |bpp| {
                     if (mode == .depth and bpp > 8) continue;
                     const texture = try gpu.TextureLayout.init(.{
                         .tile_mode = mode,
                         .kind = if (volume) .volume_3d else .array_2d,
-                        .width = if (volume) 73 else 273,
-                        .height = if (volume) 39 else 139,
+                        .width = if (volume) (if (bpp < 4) @as(u32, 105) else 73) else 273,
+                        .height = if (volume) (if (bpp < 4) @as(u32, 67) else 39) else 139,
                         .depth_or_layers = if (volume) 9 else 2,
                         .first_slice = if (volume) 0 else 1,
                         .mip_levels = 4,
@@ -35019,8 +35047,8 @@ pub const Renderer = struct {
                         .level_count = 4,
                         .first_layer = 0,
                         .layer_count = if (volume) 1 else 2,
-                        .texel_width = if (volume) 73 else 273,
-                        .texel_height = if (volume) 39 else 139,
+                        .texel_width = if (volume) (if (bpp < 4) @as(u32, 105) else 73) else 273,
+                        .texel_height = if (volume) (if (bpp < 4) @as(u32, 67) else 39) else 139,
                         .texel_depth = if (volume) 9 else 1,
                         .volume = volume,
                     };
@@ -35061,7 +35089,7 @@ pub const Renderer = struct {
         // Compare the GPU output with the independent surface CPU detiler,
         // including nonzero base offsets and partial edge tiles.
         for ([_]gpu.resources.TileMode{ .standard_256b, .standard_4kb, .standard_64kb, .partially_resident, .render_target, .depth }) |mode| {
-            for ([_]u8{ 4, 8, 16 }) |bpp| {
+            for ([_]u8{ 1, 2, 4, 8, 16 }) |bpp| {
                 if (mode == .depth and bpp > 8) continue;
                 var surface = try gpu.SurfaceLayout.init(.{ .tile_mode = mode, .width = 273, .height = 139, .layers = 2, .first_slice = 3, .row_pitch_elements = 401 }, bpp);
                 surface.source_base_offset = 256;
@@ -35096,11 +35124,13 @@ pub const Renderer = struct {
             self.specialize_detile = specialize;
             for ([_]gpu.resources.TileMode{ .linear, .render_target, .depth }) |mode| {
                 for ([_]u32{ 13, 274 }) |width| {
-                    var surface = try gpu.SurfaceLayout.init(.{ .tile_mode = mode, .width = width, .height = 71, .layers = 2, .first_slice = 3, .row_pitch_elements = 401 }, 2);
-                    surface.source_base_offset = 258;
-                    surface.required_source_bytes += 258;
-                    try self.probeGpuRetileView(try surface.subresourceView());
-                    cases += 1;
+                    for ([_]u8{ 1, 2 }) |bpp| {
+                        var surface = try gpu.SurfaceLayout.init(.{ .tile_mode = mode, .width = width, .height = 71, .layers = 2, .first_slice = 3, .row_pitch_elements = 401 }, bpp);
+                        surface.source_base_offset = 256 + @as(u64, bpp);
+                        surface.required_source_bytes += surface.source_base_offset;
+                        try self.probeGpuRetileView(try surface.subresourceView());
+                        cases += 1;
+                    }
                 }
             }
         }
@@ -35108,13 +35138,13 @@ pub const Renderer = struct {
         for ([_]bool{ false, true }) |volume| {
             for ([_]gpu.resources.TileMode{ .linear, .standard_256b, .standard_4kb, .standard_64kb, .partially_resident, .render_target, .depth }) |mode| {
                 if (volume and (mode == .linear or mode == .standard_256b)) continue;
-                for ([_]u8{ 4, 8, 16 }) |bpp| {
+                for ([_]u8{ 1, 2, 4, 8, 16 }) |bpp| {
                     if (mode == .depth and bpp > 8) continue;
                     const texture = try gpu.TextureLayout.init(.{
                         .tile_mode = mode,
                         .kind = if (volume) .volume_3d else .array_2d,
-                        .width = if (volume) 73 else 273,
-                        .height = if (volume) 39 else 139,
+                        .width = if (volume) (if (bpp < 4) @as(u32, 105) else 73) else 273,
+                        .height = if (volume) (if (bpp < 4) @as(u32, 67) else 39) else 139,
                         .depth_or_layers = if (volume) 9 else 2,
                         .first_slice = if (volume) 0 else 1,
                         .mip_levels = 4,
@@ -35127,7 +35157,7 @@ pub const Renderer = struct {
             }
         }
         for ([_]gpu.resources.TileMode{ .standard_256b, .standard_4kb, .standard_64kb, .partially_resident, .render_target, .depth }) |mode| {
-            for ([_]u8{ 4, 8, 16 }) |bpp| {
+            for ([_]u8{ 1, 2, 4, 8, 16 }) |bpp| {
                 if (mode == .depth and bpp > 8) continue;
                 var surface = try gpu.SurfaceLayout.init(.{ .tile_mode = mode, .width = 273, .height = 139, .layers = 2, .first_slice = 3, .row_pitch_elements = 401 }, bpp);
                 surface.source_base_offset = 256;
@@ -35136,7 +35166,7 @@ pub const Renderer = struct {
                 cases += 1;
             }
         }
-        std.debug.print("GPU retile passed: {d} views, preserved padding/mips/layers; inverse checked for 32/64/128-bit texels\n", .{cases});
+        std.debug.print("GPU retile passed: {d} views, preserved padding/mips/layers; inverse checked for 8/16/32/64/128-bit texels\n", .{cases});
     }
 
     fn probeGpuRetileView(self: *Renderer, view: gpu.TextureSubresourceLayout) anyerror!void {
@@ -35160,7 +35190,6 @@ pub const Renderer = struct {
         try self.transformImageLayout(view, source, destination, true);
         try self.readMapped(destination, actual);
         try std.testing.expectEqualSlices(u8, tiled, actual);
-        if (view.block.bytes_per_element == 2) return;
         // The inverse reads the GPU-written tiled bytes with no intermediate
         // host upload. Source/destination hazards must preserve every texel.
         try self.transformImageLayout(view, destination, source, false);
@@ -35241,9 +35270,8 @@ pub const Renderer = struct {
 
     fn nativeRetileSupported(params: gpu.ComputeDetileParams) bool {
         if (gpu.computeDetileSupported(params)) return true;
-        // Narrow texels use atomic dword masks; the ordinary detile uploader
-        // retains its existing 32-bit minimum. Only these equations include
-        // the verified 16-bit address mapping in the inverse shader.
+        // Preserve the preexisting 16-bit raster inverse path when the new
+        // narrow-layout option is disabled for a controlled comparison.
         if (params.samples != 1 or gpu.tiling.computeElementBytes(params) != 2 or
             (params.flags >> 24) & 0xff != 0 or params.block_depth != 1) return false;
         return switch (gpu.tiling.computeFamily(params)) {
@@ -35292,7 +35320,7 @@ pub const Renderer = struct {
         const command_slot = self.recording_command_slot.?;
         const before = [_]vk.BufferMemoryBarrier{
             .{ .source_access_mask = vk.access_memory_write_bit, .destination_access_mask = vk.access_shader_read_bit, .buffer = source.handle, .offset = 0, .size = source.size },
-            .{ .source_access_mask = vk.access_memory_read_bit | vk.access_memory_write_bit, .destination_access_mask = vk.access_shader_write_bit, .buffer = destination.handle, .offset = 0, .size = destination.size },
+            .{ .source_access_mask = vk.access_memory_read_bit | vk.access_memory_write_bit, .destination_access_mask = vk.access_shader_read_bit | vk.access_shader_write_bit, .buffer = destination.handle, .offset = 0, .size = destination.size },
         };
         self.device_functions.cmd_pipeline_barrier(command, vk.pipeline_stage_all_commands_bit | vk.pipeline_stage_host_bit, vk.pipeline_stage_compute_shader_bit, 0, 0, null, before.len, &before, 0, null);
         self.flushStorageDescriptors();
@@ -35343,8 +35371,9 @@ pub const Renderer = struct {
         const descriptor_slot = try self.acquireDetileSet();
         const descriptor_set = self.detile_sets[descriptor_slot];
 
+        const padded_tiled_bytes = std.mem.alignForward(usize, tiled.len, 4);
         const upload = try self.createBuffer(
-            tiled.len,
+            padded_tiled_bytes,
             vk.buffer_usage_storage_buffer_bit | vk.buffer_usage_transfer_src_bit,
             vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit,
         );
@@ -35354,13 +35383,13 @@ pub const Renderer = struct {
         // host-cached memory can cost far more than one contiguous DMA copy.
         // The upload survives until this submission retires, just like src.
         const src = if (device_source) try self.createBuffer(
-            tiled.len,
+            padded_tiled_bytes,
             vk.buffer_usage_storage_buffer_bit | vk.buffer_usage_transfer_dst_bit,
             vk.memory_property_device_local_bit,
         ) else upload;
         defer if (src.handle != upload.handle) self.destroyBuffer(src);
         const dst = try self.createBuffer(
-            linear_bytes,
+            std.mem.alignForward(usize, linear_bytes, 4),
             vk.buffer_usage_storage_buffer_bit | vk.buffer_usage_transfer_src_bit,
             // Normal uploads copy this result straight into a Vulkan image.
             // Keep the detiler's writes in device memory instead of sending
@@ -35398,7 +35427,7 @@ pub const Renderer = struct {
         const command_buffer = try self.beginOneShot();
         defer self.releaseOneShot(command_buffer);
         if (src.handle != upload.handle) {
-            const copy = vk.BufferCopy{ .source_offset = 0, .destination_offset = 0, .size = tiled.len };
+            const copy = vk.BufferCopy{ .source_offset = 0, .destination_offset = 0, .size = padded_tiled_bytes };
             self.device_functions.cmd_copy_buffer(command_buffer, upload.handle, src.handle, 1, @ptrCast(&copy));
             const source_barrier = vk.BufferMemoryBarrier{
                 .source_access_mask = vk.access_transfer_write_bit,
@@ -35428,7 +35457,7 @@ pub const Renderer = struct {
             if (level_index != 0) {
                 const mip_barrier = vk.BufferMemoryBarrier{
                     .source_access_mask = vk.access_shader_write_bit,
-                    .destination_access_mask = vk.access_shader_write_bit,
+                    .destination_access_mask = vk.access_shader_read_bit | vk.access_shader_write_bit,
                     .buffer = dst.handle,
                     .offset = 0,
                     .size = dst.size,
@@ -35624,7 +35653,12 @@ pub const Renderer = struct {
         // A cache entry without GPU writes is a copy of guest memory, so the
         // bytes around a pending label are current there. One holding
         // unpublished GPU output is not; read through the ordinary path.
-        for (self.guest_buffers.items) |entry| {
+        var candidates = if (@atomicLoad(bool, &indexed_release_projection, .monotonic))
+            self.bufferAliasCandidates(address, bytes.len)
+        else
+            @import("buffer_overlap_index.zig").Index(maximum_retained_buffer_entries).Iterator{ .linear_end = self.guest_buffers.items.len };
+        while (candidates.next()) |index| {
+            const entry = self.guest_buffers.items[index];
             if (entry.gpu_dirty and byteRangesOverlap(address, bytes.len, entry.guest_address, entry.size)) return false;
         }
         const memory = self.guest_memory orelse return false;
@@ -40127,6 +40161,44 @@ fn shaderOperandConstantBefore(
 /// Layered records instead place PARAMs before contiguous POS.xyzw and the
 /// render-target layer dword. The terminal `S_SETPC_B64 s[6:7]` invokes the
 /// hardware exporter for that record.
+// Inference depends only on the immutable shader, mapped PARAM components
+// and layered ABI. Copy retained results into each draw's independent scratch.
+const NggExportAnalysis = struct {
+    const Entry = struct {
+        identity: u64 = 0,
+        components: u128 = 0,
+        layered: bool = false,
+        count: usize = 0,
+        exports: [34]gpu.ShaderSpirvNggLdsExport = undefined,
+    };
+    entries: [64]Entry = @splat(.{}),
+    hits: u64 = 0,
+    misses: u64 = 0,
+
+    fn infer(self: *@This(), instructions: []const gpu.ShaderInstruction, plan: ?*const gpu.resource_checkpoints.Plan, components: *const [32]u4, output: *[34]gpu.ShaderSpirvNggLdsExport, layered: bool) usize {
+        const retained = plan orelse return inferNggLdsExports(instructions, components, output, layered);
+        if (!@atomicLoad(bool, &cache_ngg_export_analysis, .monotonic) or retained.identity == 0 or !retained.matches(instructions))
+            return inferNggLdsExports(instructions, components, output, layered);
+        var packed_components: u128 = 0;
+        for (components, 0..) |mask, index| packed_components |= @as(u128, mask) << @intCast(index * 4);
+        const hash = std.hash.Wyhash.hash(retained.identity, std.mem.asBytes(&packed_components));
+        const entry = &self.entries[(hash ^ @as(u64, @intFromBool(layered))) % self.entries.len];
+        if (entry.identity == retained.identity and entry.components == packed_components and entry.layered == layered) {
+            @memcpy(output[0..entry.count], entry.exports[0..entry.count]);
+            self.hits +|= 1;
+            return entry.count;
+        }
+        const count = inferNggLdsExports(instructions, components, output, layered);
+        entry.identity = retained.identity;
+        entry.components = packed_components;
+        entry.layered = layered;
+        entry.count = count;
+        @memcpy(entry.exports[0..count], output[0..count]);
+        self.misses +|= 1;
+        return count;
+    }
+};
+
 fn inferNggLdsExports(
     instructions: []const gpu.ShaderInstruction,
     parameter_components: *const [32]u4,
@@ -46234,6 +46306,9 @@ test "wait projection handles 64-bit release halves and ordered overwrites witho
     var memory = Memory{};
     renderer.publishing_internal_release = false;
     renderer.guest_buffers = .empty;
+    renderer.indexed_buffer_alias_queries = true;
+    renderer.guest_buffer_overlap_index = .{};
+    defer renderer.guest_buffer_overlap_index.deinit();
     renderer.guest_memory = .{ .context = &memory, .read = Memory.read, .write = Memory.write };
     var release = std.mem.zeroes(gpu.state.ReleaseMem);
     release.address = 0x1008;
@@ -46304,9 +46379,27 @@ test "wait projection handles 64-bit release halves and ordered overwrites witho
     resident.size = 32;
     resident.gpu_dirty = false;
     renderer.guest_buffers = .{ .items = @as(*[1]GuestBufferEntry, @ptrCast(&resident)), .capacity = 1 };
+    renderer.guest_buffer_overlap_index.invalidate();
     try std.testing.expect(renderer.readProjectedReleases(0x1000, &bytes));
     resident.gpu_dirty = true;
     try std.testing.expect(!renderer.readProjectedReleases(0x1000, &bytes));
+    // The overlap index is independent of GPU dirtiness. Repeated queries
+    // must inspect the live flag, and range replacements invalidate matches.
+    const saved = indexed_release_projection;
+    defer indexed_release_projection = saved;
+    for ([_]bool{ false, true }) |enabled| {
+        indexed_release_projection = enabled;
+        resident.gpu_dirty = false;
+        try std.testing.expect(renderer.readProjectedReleases(0x1000, &bytes));
+        resident.gpu_dirty = true;
+        try std.testing.expect(!renderer.readProjectedReleases(0x1000, &bytes));
+        renderer.guest_buffer_overlap_index.replace(0, 0x1000, 32, 0x1180, 32);
+        resident.guest_address = 0x1180;
+        try std.testing.expect(renderer.readProjectedReleases(0x1000, &bytes));
+        renderer.guest_buffer_overlap_index.replace(0, 0x1180, 32, 0x1000, 32);
+        resident.guest_address = 0x1000;
+        try std.testing.expect(!renderer.readProjectedReleases(0x1000, &bytes));
+    }
 }
 
 test "buffer descriptors batch final ranges and preserve eager staging outside draws" {
@@ -48366,6 +48459,8 @@ test "compute resources retain temporal scalar load specializations" {
 test "prepared resource pools reset bindings and keep active loans distinct" {
     var renderer: Renderer = undefined;
     renderer.allocator = std.testing.allocator;
+    renderer.ngg_export_analysis = try std.testing.allocator.create(NggExportAnalysis);
+    renderer.ngg_export_analysis.?.* = .{};
     renderer.image_scratch = .{};
     renderer.index_scratch = .{};
     renderer.checkpoint_scratch = .{};
@@ -49474,4 +49569,47 @@ test "completion candidates retain large writers and prune clean slots without s
     buffers[1].gpu_dirty = false; // publication or CPU replacement
     try std.testing.expectEqual(@as(usize, 2), renderer.completionBufferCandidates(true).count());
     try std.testing.expect(!renderer.completion_buffer_slots.isSet(1));
+}
+
+test "NGG analysis cache preserves mapped components layers and rebuilt programs" {
+    const a = std.testing.allocator;
+    const saved = cache_ngg_export_analysis;
+    defer cache_ngg_export_analysis = saved;
+    const instructions = [_]gpu.ShaderInstruction{
+        .{ .pc = 0, .word_count = 2, .opcode = .ds_write_b128, .src0 = .{ .kind = .vgpr, .reg = 0 }, .src1 = .{ .kind = .vgpr, .reg = 10 }, .memory_offset = 0 },
+        .{ .pc = 8, .word_count = 2, .opcode = .ds_write_b128, .src0 = .{ .kind = .vgpr, .reg = 0 }, .src1 = .{ .kind = .vgpr, .reg = 14 }, .memory_offset = 16 },
+        .{ .pc = 16, .word_count = 1, .opcode = .s_setpc_b64, .src0 = .{ .kind = .sgpr, .reg = 6 } },
+    };
+    const no_exports = [_]gpu.ShaderInstruction{.{ .pc = 0, .word_count = 1, .opcode = .s_endpgm }};
+    var plan = try gpu.resource_checkpoints.Plan.init(a, &instructions);
+    defer plan.deinit(a);
+    var rebuilt = try gpu.resource_checkpoints.Plan.init(a, &instructions);
+    defer rebuilt.deinit(a);
+    const cache = try a.create(NggExportAnalysis);
+    defer a.destroy(cache);
+    cache.* = .{};
+    var expected: [34]gpu.ShaderSpirvNggLdsExport = undefined;
+    var actual: [34]gpu.ShaderSpirvNggLdsExport = undefined;
+    for ([_]bool{ false, true }) |enabled| {
+        cache_ngg_export_analysis = enabled;
+        for ([_]bool{ false, true }) |layered| for ([_]u4{ 1, 3, 7 }) |mask| {
+            var components: [32]u4 = @splat(0);
+            components[0] = mask;
+            for ([_]?*const gpu.resource_checkpoints.Plan{ &plan, &rebuilt, null }) |active| {
+                const count = inferNggLdsExports(&instructions, &components, &expected, layered);
+                for (0..2) |_| {
+                    try std.testing.expectEqual(count, cache.infer(&instructions, active, &components, &actual, layered));
+                    try std.testing.expectEqualDeep(expected[0..count], actual[0..count]);
+                }
+                try std.testing.expectEqual(@as(usize, 0), cache.infer(&no_exports, active, &components, &actual, layered));
+            }
+        };
+    }
+    try std.testing.expect(cache.hits >= 12);
+    try std.testing.expect(cache.misses >= 12);
+    plan.identity = 0;
+    var components: [32]u4 = @splat(0);
+    const hits = cache.hits;
+    _ = cache.infer(&instructions, &plan, &components, &actual, false);
+    try std.testing.expectEqual(hits, cache.hits);
 }

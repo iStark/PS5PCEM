@@ -44,4 +44,5 @@ test {
     _ = @import("cache_budget_recovery.zig");
     _ = @import("spirv_cache.zig");
     _ = @import("release_clock.zig");
+    _ = @import("timeline_wait.zig");
 }

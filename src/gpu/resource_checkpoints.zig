@@ -79,6 +79,7 @@ pub const Plan = struct {
     /// a branch landing inside a skipped vector run. Manual plans opt out.
     maximum_dense_step_ratio: u32 = std.math.maxInt(u32),
     graphics_interface: ?GraphicsInterface = null,
+    static_calls: ?bool = null,
 
     pub fn init(allocator: std.mem.Allocator, instructions: []const rdna2.Instruction) !Plan {
         const resource = try collect(allocator, instructions, .resource);
@@ -105,6 +106,7 @@ pub const Plan = struct {
             .forward_only = walksForward(instructions),
             .maximum_dense_step_ratio = maximumDenseStepRatio(instructions.len, scalar_steps),
             .graphics_interface = GraphicsInterface.collect(instructions),
+            .static_calls = rdna2.scalar_calls.present(instructions),
         };
     }
 
@@ -893,5 +895,40 @@ test "indexed scalar history retains dependencies of vector memory operations" {
         try std.testing.expectEqual(std.math.maxInt(u64), indexed.address_user_data_mask);
         try std.testing.expectEqual(dense.address_user_data_mask, indexed.address_user_data_mask);
         try std.testing.expect(indexed.instruction_count < dense.instruction_count);
+    }
+}
+
+/// The call-presence bit belongs to one immutable decoded allocation. Linked
+/// fetch programs and manually constructed plans retain the complete scan.
+pub fn hasStaticCalls(instructions: []const rdna2.Instruction, plan: ?*const Plan) bool {
+    if (@atomicLoad(bool, &scalar.cached_scalar_call_analysis, .monotonic)) {
+        if (plan) |retained| if (retained.matches(instructions)) {
+            if (retained.static_calls) |present| return present;
+        };
+    }
+    return rdna2.scalar_calls.present(instructions);
+}
+
+test "call presence follows the immutable program and manual plans fall back" {
+    const a = std.testing.allocator;
+    const saved = scalar.cached_scalar_call_analysis;
+    defer scalar.cached_scalar_call_analysis = saved;
+    const leaf = [_]rdna2.Instruction{.{ .pc = 0, .word_count = 1, .opcode = .s_endpgm }};
+    const call = [_]rdna2.Instruction{.{ .pc = 0, .word_count = 1, .opcode = .s_call_b64 }};
+    var leaf_plan = try Plan.init(a, &leaf);
+    defer leaf_plan.deinit(a);
+    var call_plan = try Plan.init(a, &call);
+    defer call_plan.deinit(a);
+    for ([_]bool{ false, true }) |enabled| {
+        scalar.cached_scalar_call_analysis = enabled;
+        call_plan.static_calls = true;
+        try std.testing.expect(!hasStaticCalls(&leaf, &leaf_plan));
+        try std.testing.expect(hasStaticCalls(&call, &call_plan));
+        try std.testing.expect(hasStaticCalls(&call, &leaf_plan));
+        try std.testing.expect(!hasStaticCalls(&leaf, &call_plan));
+        try std.testing.expect(hasStaticCalls(&call, null));
+        try std.testing.expect(!hasStaticCalls(&leaf, null));
+        call_plan.static_calls = null;
+        try std.testing.expect(hasStaticCalls(&call, &call_plan));
     }
 }

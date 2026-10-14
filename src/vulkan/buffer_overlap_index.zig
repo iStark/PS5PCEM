@@ -6,6 +6,7 @@
 const std = @import("std");
 
 pub export var reuse_buffer_overlap_queries: bool = true;
+pub export var sequential_overlap_iteration: bool = true;
 
 pub fn Index(comptime capacity: usize) type {
     return struct {
@@ -66,11 +67,27 @@ pub fn Index(comptime capacity: usize) type {
             remaining: std.StaticBitSet(capacity) = .initEmpty(),
             linear_next: usize = 0,
             linear_end: usize = 0,
+            word_cursor: usize = 0,
 
             pub fn next(self: *Iterator) ?usize {
                 if (self.linear_next < self.linear_end) {
                     defer self.linear_next += 1;
                     return self.linear_next;
+                }
+                if (@hasField(std.StaticBitSet(capacity), "masks")) {
+                    if (@atomicLoad(bool, &sequential_overlap_iteration, .monotonic)) {
+                        const word_bits = @bitSizeOf(@TypeOf(self.remaining.masks[0]));
+                        while (self.word_cursor < self.remaining.masks.len) {
+                            const mask = self.remaining.masks[self.word_cursor];
+                            if (mask != 0) {
+                                const slot = self.word_cursor * word_bits + @ctz(mask);
+                                self.remaining.masks[self.word_cursor] = mask & (mask - 1);
+                                return slot;
+                            }
+                            self.word_cursor += 1;
+                        }
+                        return null;
+                    }
                 }
                 const slot = self.remaining.findFirstSet() orelse return null;
                 self.remaining.unset(slot);
@@ -359,5 +376,24 @@ test "a sparse tiny range does not force whole-cache overlap scans" {
         const next_size: u64 = if (round % 2 == 0) 32 else 1;
         index.replace(4095, entries[4095].guest_address, entries[4095].size, entries[4095].guest_address, next_size);
         entries[4095].size = next_size;
+    }
+}
+
+test "large overlap iterators traverse sparse high slots once in stable cache order" {
+    const saved = sequential_overlap_iteration;
+    defer sequential_overlap_iteration = saved;
+    for ([_]bool{ false, true }) |enabled| {
+        sequential_overlap_iteration = enabled;
+        var original = Index(4096).Iterator{};
+        const expected = [_]usize{ 0, 3, 63, 64, 77, 2047, 2048, 4095 };
+        for (expected) |slot| original.remaining.set(slot);
+        var first = original;
+        var second = original;
+        for (expected) |slot| try std.testing.expectEqual(@as(?usize, slot), first.next());
+        try std.testing.expectEqual(null, first.next());
+        try std.testing.expectEqual(null, first.next());
+        for (expected) |slot| try std.testing.expectEqual(@as(?usize, slot), second.next());
+        try std.testing.expectEqual(null, second.next());
+        try std.testing.expectEqual(expected.len, original.remaining.count());
     }
 }

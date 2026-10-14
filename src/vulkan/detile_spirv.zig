@@ -273,6 +273,12 @@ fn buildModule(gpa: std.mem.Allocator, specialization: ?Specialization, retile: 
     const depth_local = try xorRb(&b, uint_ty, bool_ty, bpp_log, .depth, sx, sy, absolute_z);
     pick_local = try b.sel(uint_ty, try b.bin(170, bool_ty, family, try b.constant(uint_ty, @intFromEnum(gpu.tiling.BlockFamily.render_target_64kb))), render_local, pick_local);
     pick_local = try b.sel(uint_ty, try b.bin(170, bool_ty, family, try b.constant(uint_ty, @intFromEnum(gpu.tiling.BlockFamily.depth_64kb))), depth_local, pick_local);
+    // Sub-dword formats use the same CPU-derived XOR basis as raster layouts.
+    // Retain the compact existing equations for wide specialized pipelines.
+    if (specialization == null or ((specialization.?.flags >> 4) & 0xf) < 2) {
+        const narrow_local = try narrowLocal(&b, uint_ty, bool_ty, family, bpp_log, local_x, local_y, swizzle_z, sx, sy, absolute_z);
+        pick_local = try b.sel(uint_ty, try b.bin(176, bool_ty, bpp_log, c2), narrow_local, pick_local);
+    }
     const slice_term = try b.bin(132, uint_ty, block_z, source_slice);
     const block_term = try b.bin(132, uint_ty, block_index, block_bytes);
     const tiled = try b.bin(128, uint_ty, block_term, pick_local);
@@ -288,20 +294,19 @@ fn buildModule(gpa: std.mem.Allocator, specialization: ?Specialization, retile: 
     const src_word = if (retile) linear_word else tiled_word;
     const dst_word = if (retile) tiled_word else linear_word;
 
-    // Adjacent 16-bit texels can occupy opposite halves of one dword.
-    // Atomic masks retain the other texel and untouched edge padding.
-    const half_merge = if (retile) b.id() else 0;
-    if (retile) {
-        const half = try b.bin(170, bool_ty, bpp_log, c1);
-        const half_body = b.id();
-        const word_body = b.id();
-        try b.emit(247, &.{ half_merge, 0 });
-        try b.emit(250, &.{ half, half_body, word_body });
-        try b.emit(248, &.{half_body});
-        try storeHalf(&b, uint_ty, ptr_uni_uint, src_var, dst_var, dest_byte, src_byte);
-        try b.emit(249, &.{half_merge});
-        try b.emit(248, &.{word_body});
-    }
+    // Byte and halfword texels share dwords, including across odd-width
+    // rows. Disjoint atomic masks preserve neighbors in both directions.
+    const half_merge = b.id();
+    const half = try b.bin(176, bool_ty, bpp_log, c2);
+    const half_body = b.id();
+    const word_body = b.id();
+    try b.emit(247, &.{ half_merge, 0 });
+    try b.emit(250, &.{ half, half_body, word_body });
+    try b.emit(248, &.{half_body});
+    const narrow_mask = try b.sel(uint_ty, try b.bin(170, bool_ty, bpp_log, c0), try b.constant(uint_ty, 0xff), try b.constant(uint_ty, 0xffff));
+    try storeNarrow(&b, uint_ty, ptr_uni_uint, src_var, dst_var, if (retile) dest_byte else src_byte, if (retile) src_byte else dest_byte, narrow_mask);
+    try b.emit(249, &.{half_merge});
+    try b.emit(248, &.{word_body});
     try storeLoaded(&b, uint_ty, ptr_uni_uint, src_var, dst_var, src_word, dst_word, c0);
     const need8 = try b.bin(174, bool_ty, bpp_log, c3); // UGreaterThanEqual 3 => 8-byte elements
     const merge8 = b.id();
@@ -322,10 +327,8 @@ fn buildModule(gpa: std.mem.Allocator, specialization: ?Specialization, retile: 
     try b.emit(248, &.{merge16});
     try b.emit(249, &.{merge8});
     try b.emit(248, &.{merge8});
-    if (retile) {
-        try b.emit(249, &.{half_merge});
-        try b.emit(248, &.{half_merge});
-    }
+    try b.emit(249, &.{half_merge});
+    try b.emit(248, &.{half_merge});
 
     try b.emit(249, &.{merge});
     try b.emit(248, &.{merge});
@@ -377,6 +380,45 @@ fn xorRb(b: *Builder, uint_ty: u32, bool_ty: u32, bpp_log: u32, mode: gpu.resour
     return b.sel(uint_ty, try b.bin(170, bool_ty, bpp_log, try b.constant(uint_ty, 1)), v2, wide);
 }
 
+fn xorBlockBytes(b: *Builder, uint_ty: u32, family: gpu.tiling.BlockFamily, bytes: u8, x: u32, y: u32, z: u32) std.mem.Allocator.Error!u32 {
+    const mode: gpu.resources.TileMode = switch (family) {
+        .linear => .linear,
+        .standard_256b => .standard_256b,
+        .standard_4kb, .standard_4kb_3d => .standard_4kb,
+        .standard_64kb, .standard_64kb_3d => .standard_64kb,
+        .partially_resident, .partially_resident_3d => .partially_resident,
+        .depth_64kb => .depth,
+        .render_target_64kb => .render_target,
+    };
+    const volume = family == .standard_4kb_3d or family == .standard_64kb_3d or family == .partially_resident_3d;
+    const block = gpu.tiling.SwizzleBlock.init(mode, bytes, volume, 0) catch unreachable;
+    var result = try b.constant(uint_ty, 0);
+    for ([_]u32{ x, y, z }, 0..) |coordinate, axis| {
+        for (0..32) |bit_index| {
+            var point: [3]u32 = @splat(0);
+            point[axis] = @as(u32, 1) << @intCast(bit_index);
+            const mask = block.byteOffset(point[0], point[1], point[2], 0) catch continue;
+            if (mask == 0) continue;
+            const term = try b.bin(132, uint_ty, try bitTerm(b, uint_ty, coordinate, @intCast(bit_index), 0), try b.constant(uint_ty, mask));
+            result = try b.bin(198, uint_ty, result, term);
+        }
+    }
+    return result;
+}
+
+fn narrowLocal(b: *Builder, uint_ty: u32, bool_ty: u32, family: u32, bpp_log: u32, x: u32, y: u32, z: u32, sx: u32, sy: u32, absolute_z: u32) std.mem.Allocator.Error!u32 {
+    var result = try b.constant(uint_ty, 0);
+    for (std.meta.tags(gpu.tiling.BlockFamily)) |kind| {
+        if (kind == .linear) continue;
+        const raster = kind == .render_target_64kb or kind == .depth_64kb;
+        const a = try xorBlockBytes(b, uint_ty, kind, 1, if (raster) sx else x, if (raster) sy else y, if (raster) absolute_z else z);
+        const c = try xorBlockBytes(b, uint_ty, kind, 2, if (raster) sx else x, if (raster) sy else y, if (raster) absolute_z else z);
+        const narrow = try b.sel(uint_ty, try b.bin(170, bool_ty, bpp_log, try b.constant(uint_ty, 0)), a, c);
+        result = try b.sel(uint_ty, try b.bin(170, bool_ty, family, try b.constant(uint_ty, @intFromEnum(kind))), narrow, result);
+    }
+    return result;
+}
+
 fn storeLoaded(
     b: *Builder,
     uint_ty: u32,
@@ -401,12 +443,11 @@ fn storeLoaded(
     try b.emit(62, &.{ dst_ptr, value });
 }
 
-fn storeHalf(b: *Builder, uint_ty: u32, ptr_ty: u32, src_var: u32, dst_var: u32, src_byte: u32, dst_byte: u32) std.mem.Allocator.Error!void {
+fn storeNarrow(b: *Builder, uint_ty: u32, ptr_ty: u32, src_var: u32, dst_var: u32, src_byte: u32, dst_byte: u32, mask: u32) std.mem.Allocator.Error!void {
     const zero = try b.constant(uint_ty, 0);
     const one = try b.constant(uint_ty, 1); // Device scope
     const two = try b.constant(uint_ty, 2);
     const three = try b.constant(uint_ty, 3);
-    const mask = try b.constant(uint_ty, 0xffff);
     const src_index = try b.bin(194, uint_ty, src_byte, two);
     const dst_index = try b.bin(194, uint_ty, dst_byte, two);
     const src_shift = try b.bin(196, uint_ty, try b.bin(199, uint_ty, src_byte, three), three);

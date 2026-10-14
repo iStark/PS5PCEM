@@ -13,6 +13,7 @@ const rdna2 = @import("rdna2");
 const shaders = @import("shaders.zig");
 const bit_sets = @import("bit_sets.zig");
 pub export var saturated_resource_dependencies: bool = true;
+pub export var cached_scalar_call_analysis: bool = true;
 
 pub const maximum_scalar_registers = 128;
 // Dense lighting shaders contain more than 250 distinct scalar loads. Keep
@@ -998,7 +999,10 @@ fn evaluateInto(
     var decoded_cursor: usize = 0;
     var lane_spills = LaneSpills{};
     var setpc_follows: u8 = 0;
-    const has_static_calls = if (decoded_instructions) |instructions| rdna2.scalar_calls.present(instructions) else false;
+    // Most walks never reach the indirect-jump limit. Scan the immutable
+    // program for static calls only if that distinction can change execution.
+    var has_static_calls: ?bool = if (@atomicLoad(bool, &cached_scalar_call_analysis, .monotonic)) null else
+        if (decoded_instructions) |instructions| rdna2.scalar_calls.present(instructions) else false;
     var unknown_scalar_exits = BranchSites{};
     var revisited_loop_edges = BranchSites{};
     var dense_walk = steps == null;
@@ -1149,7 +1153,11 @@ fn evaluateInto(
                 // translation; the initial resource walk keeps its continuation.
             },
             .s_setpc_b64 => {
-                if (setpc_follows < 8 or has_static_calls) {
+                if (setpc_follows < 8 or (has_static_calls orelse calls: {
+                    const present = if (decoded_instructions) |instructions| rdna2.scalar_calls.present(instructions) else false;
+                    has_static_calls = present;
+                    break :calls present;
+                })) {
                     if (setpcDestinationPc(result, bindings.program_address, inst.*)) |dest_pc| {
                         setpc_follows +|= 1;
                         pc = dest_pc;
@@ -1178,10 +1186,10 @@ fn evaluateInto(
                             // while merging away first-iteration constants
                             // from resource checkpoints inside the loop.
                             const loop_begin = decodedInstructionIndexAtOrAfter(instructions, inst.branch_target);
-                            for (instructions[loop_begin..]) |loop_inst| {
+                            for (instructions[loop_begin..]) |*loop_inst| {
                                 if (loop_inst.pc >= inst.pc) break;
                                 invalidateDestination(result, loop_inst.dst, @max(loop_inst.data_words, destinationWords(loop_inst.opcode)));
-                                lane_spills.invalidateInstruction(&loop_inst);
+                                lane_spills.invalidateInstruction(loop_inst);
                             }
                             scc = null;
                             if (inst.pc / 4 < revisited_loop_edges.capacity() and !revisited_loop_edges.isSet(inst.pc / 4)) {
@@ -3675,4 +3683,34 @@ test "load history deduplicates out-of-order PCs after copying and resets betwee
     try std.testing.expectEqual(@as(usize, 1), copied.load_count);
     try std.testing.expectEqual(@as(u32, 0), copied.highest_load_pc);
     try std.testing.expectEqual(@as(u32, 0x5678), copied.loads[0].values[0]);
+}
+
+test "lazy call discovery preserves repeated returns and the indirect-jump limit" {
+    const saved = cached_scalar_call_analysis;
+    defer cached_scalar_call_analysis = saved;
+    var bytes: [64]u8 = @splat(0);
+    var memory = TestMemory{ .base = 0x1000, .bytes = &bytes };
+    const bindings = testBindings(memory.base, 0);
+    const calls = [_]rdna2.Instruction{
+        .{ .pc = 0, .word_count = 1, .opcode = .s_mov_b32, .dst = .{ .kind = .sgpr, .reg = 20 }, .src0 = .{ .kind = .integer_inline_constant, .value = 0 } },
+        .{ .pc = 4, .word_count = 1, .opcode = .s_call_b64, .dst = .{ .kind = .sgpr, .reg = 8 }, .branch_target = 32 },
+        .{ .pc = 8, .word_count = 1, .opcode = .s_add_u32, .src_count = 2, .dst = .{ .kind = .sgpr, .reg = 20 }, .src0 = .{ .kind = .sgpr, .reg = 20 }, .src1 = .{ .kind = .integer_inline_constant, .value = 1 } },
+        .{ .pc = 12, .word_count = 1, .opcode = .s_cmp_lt_u32, .src0 = .{ .kind = .sgpr, .reg = 20 }, .src1 = .{ .kind = .integer_inline_constant, .value = 12 } },
+        .{ .pc = 16, .word_count = 1, .opcode = .s_cbranch_scc1, .branch_target = 4 },
+        .{ .pc = 20, .word_count = 1, .opcode = .s_endpgm },
+        .{ .pc = 32, .word_count = 1, .opcode = .s_setpc_b64, .src0 = .{ .kind = .sgpr, .reg = 8 } },
+    };
+    const indirect = [_]rdna2.Instruction{
+        .{ .pc = 0, .word_count = 1, .opcode = .s_mov_b64, .dst = .{ .kind = .sgpr, .reg = 8 }, .src0 = .{ .kind = .literal_constant, .value = 0x1004 } },
+        .{ .pc = 4, .word_count = 1, .opcode = .s_setpc_b64, .src0 = .{ .kind = .sgpr, .reg = 8 } },
+    };
+    for ([_]bool{ false, true }) |enabled| {
+        cached_scalar_call_analysis = enabled;
+        const returned = evaluateDecodedResourceState(memory.reader(), &bindings, &calls);
+        try std.testing.expectEqual(StopReason.end_program, returned.stop_reason);
+        try std.testing.expectEqual(@as(u32, 12), returned.register(20).?.value);
+        const limited = evaluateDecodedResourceState(memory.reader(), &bindings, &indirect);
+        try std.testing.expectEqual(StopReason.branch, limited.stop_reason);
+        try std.testing.expectEqual(@as(u32, 10), limited.instruction_count);
+    }
 }

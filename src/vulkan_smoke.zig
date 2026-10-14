@@ -7444,6 +7444,9 @@ fn runQueuedBufferReuseProbe(allocator: std.mem.Allocator, use_waits: bool, reta
         var result: [16]u8 = undefined;
         try renderer.readbackGuestStorageBuffer(destination, &result);
         renderer.draw_batch_active = false;
+        // The replacement was only staged, never consumed. Match the runner's
+        // reservation reset before manually switching descriptor sets.
+        renderer.pending_storage_descriptors = 0;
         renderer.current_descriptor_slot = null;
         renderer.descriptor_set = renderer.descriptor_sets[0];
         const actual = std.mem.readInt(u32, result[0..4], .little);
@@ -7519,6 +7522,7 @@ fn runQueuedBufferReuseProbe(allocator: std.mem.Allocator, use_waits: bool, reta
     try renderer.readbackGuestStorageBuffer(0x2200, &independent_result);
     try std.testing.expectEqual(@as(u32, 0x5566_7788), std.mem.readInt(u32, independent_result[0..4], .little));
     renderer.draw_batch_active = false;
+    renderer.pending_storage_descriptors = 0;
     renderer.current_descriptor_slot = null;
     renderer.descriptor_set = renderer.descriptor_sets[0];
     @memset(&renderer.active_storage_buffers, 0);
