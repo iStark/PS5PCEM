@@ -94,6 +94,7 @@ pub export var batch_release_interrupts: bool = false;
 pub export var indexed_completion_buffers: bool = true;
 pub export var indexed_release_projection: bool = true;
 pub export var cache_ngg_export_analysis: bool = true;
+pub export var avoid_unusable_draw_capture: bool = true;
 pub export var native_storage_layout_conversion: bool = true;
 pub export var preserve_storage_layout_before_overwrite: bool = true;
 pub export var exact_buffer_readback_ranges: bool = true;
@@ -8510,7 +8511,7 @@ pub const Renderer = struct {
         self.updateStorageDescriptorRangeKnown(descriptor_index, upload.buffer, upload.offset, size, null);
         // Draw reuse must validate the exact snapshot uploaded, never a later
         // guest read or a read from the potentially write-combined GPU mapping.
-        if (self.reuse_graphics_resources)
+        if (self.needsDrawUploadFingerprint())
             self.active_storage_source_hashes[descriptor_index] = gpu.parallel_copy.fingerprint(bytes[0..size]);
         self.active_descriptor_set = self.descriptor_set;
         self.frame_profile.upload_bytes +|= size;
@@ -24433,6 +24434,8 @@ pub const Renderer = struct {
         self.draw_reuse_reads_complete = true;
         self.draw_reuse_recording = self.reuse_graphics_resources and draw_epoch != 0;
         defer self.draw_reuse_recording = false;
+        if (tessellation != null or !drawReuseShapeSafe(vertex_stage, render_state.primitive_type, draw))
+            self.stopUnusableDrawCapture();
         var fragment_specialization = if (@atomicLoad(bool, &graphics_uniform_specialization, .monotonic) and
             shaderResourcesAreReadOnly(fragment_analysis, fragment_analysis.program.instructions.items))
             try fragment_analysis.acquireUniformSpecialization(self.allocator, reader, &fragment_bindings, self.uniform_specialization_cache_enabled)
@@ -24619,6 +24622,7 @@ pub const Renderer = struct {
             extra_colors,
         );
         defer graphics_resources.deinit(self);
+        self.checkDrawCaptureImages(graphics_resources);
         self.frame_profile.graphics_fragment_resource_ns +|= elapsedHostNanoseconds(resource_started);
         const append_started = self.resourceTimestampNs();
         const fragment_mapping_count = graphics_resources.mapping_count;
@@ -24632,6 +24636,7 @@ pub const Renderer = struct {
             extra_colors,
         );
         self.frame_profile.graphics_append_resource_ns +|= elapsedHostNanoseconds(append_started);
+        self.checkDrawCaptureImages(graphics_resources);
         const descriptor_started = self.resourceTimestampNs();
         try self.updateSampledImageDescriptors(
             graphics_resources.images[0..graphics_resources.image_count],
@@ -24757,6 +24762,8 @@ pub const Renderer = struct {
         const bounded_fetches_before = self.frame_profile.bounded_vertex_fetches;
         const read_only_snapshots = tessellation == null and shaderResourcesAreReadOnly(vertex_analysis, vertex_instructions) and
             shaderResourcesAreReadOnly(fragment_analysis, fragment_analysis.program.instructions.items);
+        if (!read_only_snapshots or vertex_instruction_storage.items.len != 0 or fragment_specialization != null)
+            self.stopUnusableDrawCapture();
         const vertex_storage = self.prepareComputeResources(
             &vertex_bindings,
             reader,
@@ -34736,8 +34743,34 @@ pub const Renderer = struct {
         return true;
     }
 
+    fn stopUnusableDrawCapture(self: *Renderer) void {
+        if (!@atomicLoad(bool, &avoid_unusable_draw_capture, .monotonic)) return;
+        // Once a draw is known to fail the existing replay eligibility checks,
+        // no later upload can make its incomplete transcript reusable.
+        self.draw_reuse_reads_complete = false;
+        self.draw_reuse_recording = false;
+    }
+
+    fn checkDrawCaptureImages(self: *Renderer, graphics: *const GraphicsResources) void {
+        if (!self.draw_reuse_recording) return;
+        for (graphics.images[0..graphics.image_count]) |image| {
+            if (image.owns_view or image.owns_sampler or image.owns_image or
+                image.storage_cache_index != null or image.render_target_index != null)
+            {
+                self.stopUnusableDrawCapture();
+                return;
+            }
+        }
+    }
+
+    fn needsDrawUploadFingerprint(self: *const Renderer) bool {
+        return self.reuse_graphics_resources and
+            (!@atomicLoad(bool, &avoid_unusable_draw_capture, .monotonic) or
+                (self.draw_reuse_recording and self.draw_reuse_reads_complete));
+    }
+
     fn copyDrawUploadSource(self: *Renderer, memory: GuestMemory, address: u64, destination: []u8) Error!?u64 {
-        if (self.reuse_graphics_resources and destination.len <= 256 * 1024) {
+        if (self.needsDrawUploadFingerprint() and destination.len <= 256 * 1024) {
             // Hash exactly the bytes uploaded, before writing GPU upload memory.
             // Never read the possibly write-combined Vulkan mapping on the CPU.
             self.draw_upload_source_scratch.resize(self.allocator, destination.len) catch {
@@ -41008,6 +41041,8 @@ test "draw reuse fingerprints exactly the uploaded bytes without reading the GPU
     renderer.allocator = std.testing.allocator;
     renderer.reuse_graphics_resources = true;
     renderer.guest_memory = memory;
+    renderer.draw_reuse_recording = true;
+    renderer.draw_reuse_reads_complete = true;
     renderer.active_storage_cache_indices = @splat(null);
     renderer.active_storage_buffers = @splat(0);
     renderer.active_storage_buffers[0] = 123;
@@ -41032,6 +41067,49 @@ test "draw reuse fingerprints exactly the uploaded bytes without reading the GPU
     try std.testing.expect(renderer.drawReuseBufferReadsMatch(memory));
     source.bytes[3] = 8;
     try std.testing.expect(!renderer.drawReuseBufferReadsMatch(memory));
+    const old_capture = avoid_unusable_draw_capture;
+    defer avoid_unusable_draw_capture = old_capture;
+    avoid_unusable_draw_capture = true;
+    renderer.draw_reuse_recording = false;
+    try std.testing.expectEqual(@as(?u64, null), try renderer.copyDrawUploadSource(memory, 0x4000, &ring));
+    try std.testing.expectEqualSlices(u8, &source.bytes, &ring);
+    renderer.draw_reuse_recording = true;
+    renderer.draw_reuse_reads_complete = false;
+    source.bytes[4] = 9;
+    try std.testing.expectEqual(@as(?u64, null), try renderer.copyDrawUploadSource(memory, 0x4000, &ring));
+    try std.testing.expectEqualSlices(u8, &source.bytes, &ring);
+    avoid_unusable_draw_capture = false;
+    try std.testing.expectEqual(@as(?u64, gpu.parallel_copy.fingerprint(&source.bytes)), try renderer.copyDrawUploadSource(memory, 0x4000, &ring));
+}
+
+test "draw reuse capture stops only for resources already ineligible for replay" {
+    const saved = avoid_unusable_draw_capture;
+    defer avoid_unusable_draw_capture = saved;
+    const renderer = try std.testing.allocator.create(Renderer);
+    defer std.testing.allocator.destroy(renderer);
+    const graphics = try std.testing.allocator.create(GraphicsResources);
+    defer std.testing.allocator.destroy(graphics);
+    graphics.image_count = 1;
+    for ([_]bool{ false, true }) |enabled| {
+        avoid_unusable_draw_capture = enabled;
+        for (0..6) |kind| {
+            renderer.draw_reuse_recording = true;
+            renderer.draw_reuse_reads_complete = true;
+            graphics.images[0] = .{
+                .image = undefined,
+                .view = 1,
+                .sampler = 2,
+                .owns_view = kind == 1,
+                .owns_sampler = kind == 2,
+                .owns_image = kind == 3,
+                .storage_cache_index = if (kind == 4) 0 else null,
+                .render_target_index = if (kind == 5) 0 else null,
+            };
+            renderer.checkDrawCaptureImages(graphics);
+            try std.testing.expectEqual(!enabled or kind == 0, renderer.draw_reuse_recording);
+            try std.testing.expectEqual(!enabled or kind == 0, renderer.draw_reuse_reads_complete);
+        }
+    }
 }
 
 test "draw reuse records descriptor metadata and rejects inconsistent observations" {

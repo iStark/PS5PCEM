@@ -15,6 +15,8 @@ const cpu = @import("cpu_workers.zig");
 pub export var share_bounded_scalar_loops: bool = true;
 pub export var exact_scalar_walk_budget: bool = true;
 pub export var indexed_resource_snapshot_capture: bool = true;
+pub export var resource_walk_cache_entries: u32 = 64;
+pub export var resource_walk_cache_bytes: u64 = 32 * 1024 * 1024;
 
 fn io() std.Io {
     return std.Io.Threaded.global_single_threaded.io();
@@ -188,8 +190,8 @@ pub const Stats = struct {
 /// This does not retain Vulkan resources or assume that a guest pointer names
 /// unchanged memory. Results are copied into independent operation-local leases.
 const WalkCache = struct {
-    const maximum_entries = 64;
-    const maximum_bytes = 32 * 1024 * 1024;
+    const maximum_entries = 512;
+    const maximum_bytes = 128 * 1024 * 1024;
     const Entry = struct {
         plan_identity: u64,
         bindings: shaders.StageBindings,
@@ -216,13 +218,37 @@ const WalkCache = struct {
     bytes: usize = 0,
     sequence: u64 = 0,
     enabled: bool = true,
+    entry_limit: usize = 64,
+    byte_limit: usize = 32 * 1024 * 1024,
     /// Admit only inputs seen twice. Streaming per-draw constants must not
     /// allocate and evict a large snapshot on every single cache miss.
     admission: [512]u64 = @splat(0),
 
+    fn updateLimits(self: *WalkCache) void {
+        const entries = std.math.clamp(@atomicLoad(u32, &resource_walk_cache_entries, .monotonic), 1, maximum_entries);
+        const bytes = std.math.clamp(@atomicLoad(u64, &resource_walk_cache_bytes, .monotonic), @sizeOf(Entry), maximum_bytes);
+        if (entries == self.entry_limit and bytes == self.byte_limit) return;
+        self.entry_limit = entries;
+        self.byte_limit = @intCast(bytes);
+        for (entries..self.entries.len) |i| self.remove(i);
+        while (self.bytes > self.byte_limit) {
+            const victim = self.oldest() orelse break;
+            self.remove(victim);
+        }
+    }
+
+    fn oldest(self: *const WalkCache) ?usize {
+        var result: ?usize = null;
+        for (self.entries[0..self.entry_limit], 0..) |maybe, i| if (maybe) |entry| {
+            if (result == null or entry.age < self.entries[result.?].?.age) result = i;
+        };
+        return result;
+    }
+
     fn lookup(self: *WalkCache, plan: *const checkpoints.Plan, bindings: *const shaders.StageBindings, reader: shaders.MemoryReader, needs_sampled: bool) ?*const Entry {
         if (!self.enabled or plan.identity == 0) return null;
-        for (self.entries) |maybe| {
+        self.updateLimits();
+        for (self.entries[0..self.entry_limit]) |maybe| {
             const entry = maybe orelse continue;
             if (entry.plan_identity != plan.identity or (needs_sampled and !entry.has_sampled) or
                 (!plan.forward_only and entry.exact_loop_budget != @atomicLoad(bool, &exact_scalar_walk_budget, .monotonic)) or
@@ -237,9 +263,10 @@ const WalkCache = struct {
 
     fn remember(self: *WalkCache, plan: *const checkpoints.Plan, bindings: *const shaders.StageBindings, snapshot: *const Snapshot, evaluation: *const scalar.Evaluation, sampled: ?[]const scalar.ScalarRegisters, resource: []const scalar.ScalarRegisters) void {
         if (!self.enabled or plan.identity == 0 or !snapshot.complete or evaluation.memory_read_failed) return;
+        self.updateLimits();
         const sampled_values = sampled orelse &.{};
         const size = @sizeOf(Entry) + (sampled_values.len + resource.len) * @sizeOf(scalar.ScalarRegisters);
-        if (size > maximum_bytes / 4) return;
+        if (size > self.byte_limit / 4) return;
         var hasher = std.hash.Wyhash.init(0);
         std.hash.autoHash(&hasher, plan.identity);
         std.hash.autoHash(&hasher, bindings.*);
@@ -250,7 +277,7 @@ const WalkCache = struct {
             return;
         }
         var slot: ?usize = null;
-        for (self.entries, 0..) |maybe, i| {
+        for (self.entries[0..self.entry_limit], 0..) |maybe, i| {
             if (maybe) |entry| {
                 if (entry.plan_identity == plan.identity and std.meta.eql(entry.bindings, bindings.*)) {
                     if (entry.sampled.len == sampled_values.len and entry.resource.len == resource.len) {
@@ -270,12 +297,8 @@ const WalkCache = struct {
                 }
             } else slot = i;
         }
-        while (slot == null or self.bytes + size > maximum_bytes) {
-            var oldest: ?usize = null;
-            for (self.entries, 0..) |maybe, i| if (maybe) |entry| {
-                if (oldest == null or entry.age < self.entries[oldest.?].?.age) oldest = i;
-            };
-            const victim = oldest orelse return;
+        while (slot == null or self.bytes + size > self.byte_limit) {
+            const victim = self.oldest() orelse return;
             self.remove(victim);
             slot = victim;
         }
@@ -1064,6 +1087,53 @@ test "indexed dense visit counts include branch gaps and reject malformed destin
             try std.testing.expectEqual(@as(?u64, dense.instruction_count), indexed.dense_instruction_count);
         }
     }
+}
+
+test "resource walk cache releases retired entries when bounded limits shrink" {
+    const saved_entries = resource_walk_cache_entries;
+    const saved_bytes = resource_walk_cache_bytes;
+    defer {
+        resource_walk_cache_entries = saved_entries;
+        resource_walk_cache_bytes = saved_bytes;
+    }
+    resource_walk_cache_entries = 3;
+    resource_walk_cache_bytes = 32 * 1024 * 1024;
+    var cache = WalkCache{};
+    defer cache.deinit();
+    const snapshot = try std.testing.allocator.create(Snapshot);
+    defer std.testing.allocator.destroy(snapshot);
+    snapshot.* = .{};
+    const evaluation = try std.testing.allocator.create(scalar.Evaluation);
+    defer std.testing.allocator.destroy(evaluation);
+    evaluation.reset();
+    var memory = TestMemory{ .owner = std.Thread.getCurrentId() };
+    var bindings = std.mem.zeroes(shaders.StageBindings);
+    const instructions = [_]rdna2.Instruction{.{ .opcode = .s_endpgm }};
+    var plan = try checkpoints.Plan.init(std.testing.allocator, &instructions);
+    defer plan.deinit(std.testing.allocator);
+    for (0..3) |i| {
+        bindings.user_data[0] = @intCast(i);
+        cache.remember(&plan, &bindings, snapshot, evaluation, null, &.{});
+        cache.remember(&plan, &bindings, snapshot, evaluation, null, &.{});
+        try std.testing.expect(cache.lookup(&plan, &bindings, memory.reader(), false) != null);
+    }
+    try std.testing.expectEqual(@as(usize, 3 * @sizeOf(WalkCache.Entry)), cache.bytes);
+    resource_walk_cache_entries = 1;
+    // The last insertion occupies slot zero; higher retired slots are freed.
+    try std.testing.expect(cache.lookup(&plan, &bindings, memory.reader(), false) != null);
+    try std.testing.expectEqual(@as(usize, @sizeOf(WalkCache.Entry)), cache.bytes);
+    bindings.user_data[0] = 0;
+    try std.testing.expect(cache.lookup(&plan, &bindings, memory.reader(), false) == null);
+    resource_walk_cache_entries = std.math.maxInt(u32);
+    resource_walk_cache_bytes = std.math.maxInt(u64);
+    cache.updateLimits();
+    try std.testing.expectEqual(@as(usize, 512), cache.entry_limit);
+    try std.testing.expectEqual(@as(usize, 128 * 1024 * 1024), cache.byte_limit);
+    resource_walk_cache_entries = 0;
+    resource_walk_cache_bytes = 0;
+    cache.updateLimits();
+    try std.testing.expectEqual(@as(usize, 1), cache.entry_limit);
+    try std.testing.expectEqual(@as(usize, @sizeOf(WalkCache.Entry)), cache.byte_limit);
 }
 
 test "cached resource walks validate bytes bindings and immutable plan identity" {

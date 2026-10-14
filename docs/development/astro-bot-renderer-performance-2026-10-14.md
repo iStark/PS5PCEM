@@ -5,6 +5,42 @@ Output is 1920×1080; the game still controls its internal surface dimensions.
 Existing shader caches were retained. The 25–30 FPS target is **not reached**.
 Rendering defects remain, and controllable gameplay is not established.
 
+## Follow-up: avoid unusable draw capture
+
+The balanced title comparison measures **15.33 versus 15.22 FPS**, with 660
+frames per setting across eleven animation phases in one warmed process.
+This is a small difference, not evidence that the 25 FPS target is close.
+The renderer stops copying and hashing replay data once the existing reuse
+rules already prove that a draw cannot be replayed. Image ownership, unsafe
+primitive shapes, incomplete reads and specialization retain their previous
+rejection rules. Upload bytes and GPU lifetime rules are unchanged.
+
+| Setting | Frames | Seconds | FPS |
+| --- | ---: | ---: | ---: |
+| Previous capture behavior | 660 | 43.359 | 15.22 |
+| Avoid unusable capture | 660 | 43.045 | 15.33 |
+| 512-entry / 128 MiB cache experiment | 660 | 43.860 | 15.05 |
+| 64-entry / 32 MiB cache, unchanged default | 660 | 42.384 | 15.57 |
+
+The cache experiment runs separately, after 660 warm-up frames for each limit.
+The larger cache retains about 78 MiB rather than 8 MiB, but measures worse
+despite slightly more hits. The default remains 64 entries / 32 MiB. Runtime
+limits are bounded, and shrinking releases retired entries before further use.
+
+Validation: **553/553 GPU/Vulkan tests**, ReleaseFast build, native transient
+storage tests with both timeline modes, and resource-worker/replay probes with
+Vulkan synchronization validation. No validation errors were reported. Tests
+cover inactive or incomplete capture and GPU reads of all uploaded bytes.
+
+A separate 20-second CPU stack sample still places substantial work in resource
+preparation, scalar evaluation, descriptor reads and readback synchronization.
+Profiling, builds and tests did not run during the FPS comparison. Results from
+separate processes are not release-to-release performance claims.
+
+![ASTRO BOT title after draw capture optimization](../images/astro-bot-title-draw-capture-2026-10-14.png)
+
+Actual game-owned 3840×2160 scanout; host output is 1920×1080. **25 FPS is not reached; gameplay and character control remain unverified.**
+
 ## Follow-up: storage ownership and scalar loop budgets
 
 The latest balanced title comparison measures **14.48 FPS**, versus

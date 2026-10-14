@@ -7774,6 +7774,9 @@ fn runTransientStorageProbe(allocator: std.mem.Allocator, timeline: bool) !void 
     });
     defer renderer.deinit();
     renderer.reuse_graphics_resources = true;
+    const old_capture = vulkan.backend.avoid_unusable_draw_capture;
+    defer vulkan.backend.avoid_unusable_draw_capture = old_capture;
+    vulkan.backend.avoid_unusable_draw_capture = true;
     var guest = GuestMemory{ .watch_generation = 1 };
     var memory = guest.interface();
     memory.track_gpu_read = GuestMemory.track;
@@ -7826,17 +7829,21 @@ fn runTransientStorageProbe(allocator: std.mem.Allocator, timeline: bool) !void 
         renderer.current_descriptor_slot = i;
         renderer.descriptor_set = renderer.descriptor_sets[i];
         @memset(&renderer.active_storage_buffers, 0);
+        renderer.draw_reuse_recording = i % 2 == 0;
+        renderer.draw_reuse_reads_complete = i != 6;
         if (i != 0) guest.word(source, @intCast(0x98760000 + i));
         if (i == 4) renderer.draw_upload_offset = 256 * 1024 * 1024 - 8;
         try std.testing.expect(try renderer.tryStageTransientStorageBuffer(0, source, 16));
         try std.testing.expect(renderer.active_storage_cache_indices[0] == null);
-        const uploaded_hash = renderer.active_storage_source_hashes[0] orelse return error.MissingSnapshotHash;
-        try std.testing.expectEqual(gpu.parallel_copy.fingerprint(guest.bytes[source..][0..16]), uploaded_hash);
+        const uploaded_hash = renderer.active_storage_source_hashes[0];
+        if (renderer.draw_reuse_recording and renderer.draw_reuse_reads_complete) {
+            try std.testing.expectEqual(@as(?u64, gpu.parallel_copy.fingerprint(guest.bytes[source..][0..16])), uploaded_hash);
+        } else try std.testing.expectEqual(@as(?u64, null), uploaded_hash);
         // A later guest write must not replace the proof of the queued bytes.
         const saved_word = std.mem.readInt(u32, guest.bytes[source..][0..4], .little);
         guest.word(source, saved_word ^ 0x101);
-        try std.testing.expect(gpu.parallel_copy.fingerprint(guest.bytes[source..][0..16]) != uploaded_hash);
-        try std.testing.expectEqual(uploaded_hash, renderer.active_storage_source_hashes[0].?);
+        if (uploaded_hash) |hash| try std.testing.expect(gpu.parallel_copy.fingerprint(guest.bytes[source..][0..16]) != hash);
+        try std.testing.expectEqual(uploaded_hash, renderer.active_storage_source_hashes[0]);
         guest.word(source, saved_word);
         _ = try renderer.stageGuestStorageBufferAt(1, 0x2000 + i * 0x100, 16);
         _ = try renderer.dispatchSpirv(module.words, .{ 1, 1, 1 });
