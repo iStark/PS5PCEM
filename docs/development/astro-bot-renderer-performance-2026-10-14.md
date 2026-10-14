@@ -5,6 +5,79 @@ Output is 1920×1080; the game still controls its internal surface dimensions.
 Existing shader caches were retained. The 25–30 FPS target is **not reached**.
 Rendering defects remain, and controllable gameplay is not established.
 
+## Follow-up: bounded recording and storage proofs
+
+ASTRO BOT now limits CPU command recording to **250 microseconds** before an
+asynchronous submission, keeping the GPU occupied while the next resources are
+prepared. The balanced warmed title comparison measured **12.43 FPS versus
+11.69 FPS**, 660 frames per setting (53.076 versus 56.475 seconds), an
+observed **6.4%** improvement. No commands or completion events are
+omitted. Other titles retain their existing recording-budget defaults.
+
+A second comparison keeps that budget enabled and tests exact storage baselines:
+
+| Setting | Frames | Seconds | FPS |
+| --- | ---: | ---: | ---: |
+| Previous storage path | 660 | 52.842 | 12.49 |
+| Avoid redundant whole-allocation hashes | 660 | 52.793 | 12.50 |
+| Hash optimization and interior raster producers | 660 | 52.595 | 12.55 |
+
+These small differences do **not** establish another FPS improvement. The hash
+path demonstrably avoids **26.125 MiB of redundant hashing per title frame**,
+while retaining exact texel checks. A texel-only proof cannot validate padding
+or another mip. Raster producers starting inside a destination allocation can
+now use the existing GPU layout conversion while preserving uncovered bytes;
+that path has **zero hits in this title comparison**, so it cannot explain its
+FPS. Producers starting before the destination still use the checked fallback.
+
+RELEASE_MEM timestamps now use the graphics reference clock's **100 MHz** rate,
+instead of raw CPU cycles. Optional calibrated Vulkan queries and queued EOP
+events preserve GPU position and FIFO notification order. They remain disabled
+by default: unrestricted batching regressed, and at the same 250-microsecond
+budget native queries measured **12.40 FPS**, versus
+**12.43 FPS** for the CPU-clock path. The clock mapping follows [Vulkan's
+calibrated timestamp domains](https://github.khronos.org/Vulkan-Site/features/latest/features/proposals/VK_EXT_calibrated_timestamps.html).
+
+Validation: **537/537 GPU/Vulkan tests**, **64 full-image overwrite
+configurations** with six phases each, and native color/storage layout checks
+with and without descriptor batching. Checks cover CPU texel replacement,
+padding changes, unavailable fingerprints, aborted initialization, interior
+producers and preserved outer bytes. Native release validation covers
+**902 queries and 900 ordered EOP events**, pool rollover, failed writes,
+blocked waits and submission sealing. Internal-release, deferred-output,
+covered-raster and GDS probes also pass without Vulkan validation errors.
+ReleaseFast runner/smoke builds pass 12/12 steps.
+
+![ASTRO BOT title screen captured after bounded recording and storage changes](../images/astro-bot-title-bounded-recording-2026-10-14.png)
+
+The capture comes from the renderer's actual 3840×2160 game-owned scanout;
+host output remains 1920×1080. It verifies title imagery and text. It does not
+verify character control or the later cinematic. The **25 FPS target remains
+unmet**, and earlier rendering defects remain unresolved. Compilation,
+profiling and image capture were outside every FPS comparison.
+
+## Follow-up: compact scalar checkpoints and uploads
+
+Resource checkpoints now copy 12-byte register records instead of 24-byte
+records. The evaluator keeps USER_DATA dependency masks in a separate array,
+including both halves of 64-bit operands. This also fixes a previously lost
+high-word dependency. The checkpoint array shrinks from 3,072 to 1,536 bytes.
+The 1,320-frame warmed title observation measured **11.62 FPS** in 113.568
+seconds; this is a separate run, not a controlled speedup claim.
+
+Scalar uploads now write the exact translated specialization prefixes. No
+shader index can refer to the unused tail, so clearing the whole 66 KiB slot
+per draw or dispatch is unnecessary. Native probes initialize the ring with
+nonzero poison and validate changing compute inputs, loops, masked lanes,
+fragment pixels and serial/worker/shared resource preparation. All 535
+GPU/Vulkan tests pass, including the corrected worker-mode probe.
+
+The balanced upload comparison measured **11.79 FPS without tail clearing**
+versus **11.69 FPS with clearing** (660 frames per setting, 55.971 versus
+56.465 seconds). The observed difference is only **0.9%**. The changes do not
+establish a sustained gameplay minimum or fix all rendering defects. No fresh
+screenshot or character-control check was available; **25 FPS is not reached**.
+
 ## Follow-up: CPU overwrite baselines
 
 Candidates 52–53 replace a full-image overwrite's retained CPU copy with a

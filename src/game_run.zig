@@ -655,7 +655,7 @@ fn run(init: std.process.Init) !bool {
     } else |_| true;
     // Keep the GPU fed while the CPU prepares the next resources. This only
     // submits recorded work asynchronously; guest ordering remains intact.
-    const default_batch_age_us: u64 = if (use_big_helmet_gpu_profile) 1000 else 0;
+    const default_batch_age_us: u64 = if (use_big_helmet_gpu_profile) 1000 else if (use_astro_bot_gpu_profile) 250 else 0;
     vulkan.backend.command_batch_max_ns = (if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_COMMAND_BATCH_US")) |text| parse: {
         defer allocator.free(text);
         break :parse @min(std.fmt.parseInt(u64, std.mem.trim(u8, text, " \t\r\n"), 10) catch default_batch_age_us, 1000000);

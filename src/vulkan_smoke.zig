@@ -1613,10 +1613,19 @@ fn runVectorImageProbe(allocator: std.mem.Allocator) !void {
     std.debug.print("vector image resources passed: masked descriptor tuples and readfirstlane waterfall\n", .{});
 }
 
+/// Use only immediately after renderer creation, before any GPU command can
+/// reference the ring. Native scalar probes must not depend on zeroed tails.
+fn poisonFreshScalarRing(renderer: *vulkan.Renderer) void {
+    const buffer = renderer.dynamic_scalar_buffer.?;
+    const words = renderer.dynamic_scalar_mapping_base.?[0 .. buffer.size / @sizeOf(u32)];
+    @memset(words, 0x7fcb_aadd);
+}
+
 fn runScalarLoopProbe(allocator: std.mem.Allocator) !void {
     for (0..2) |case_index| {
         var renderer = try vulkan.Renderer.init(allocator, .{});
         defer renderer.deinit();
+        poisonFreshScalarRing(&renderer);
         var guest = GuestMemory{};
         _ = renderer.dcbBackend(guest.interface());
         const code = [_]u32{
@@ -1656,6 +1665,7 @@ fn runScalarLoopProbe(allocator: std.mem.Allocator) !void {
 fn runRepeatedScalarLoadProbe(allocator: std.mem.Allocator) !void {
     var renderer = try vulkan.Renderer.init(allocator, .{});
     defer renderer.deinit();
+    poisonFreshScalarRing(&renderer);
     var guest = GuestMemory{};
     _ = renderer.dcbBackend(guest.interface());
     const code = [_]u32{
@@ -1699,6 +1709,7 @@ fn runDistinctScalarLoadProbe(allocator: std.mem.Allocator) !void {
     const lanes = 64;
     var renderer = try vulkan.Renderer.init(allocator, .{});
     defer renderer.deinit();
+    poisonFreshScalarRing(&renderer);
     const guest = try allocator.create(SizedGuestMemory(262144));
     defer allocator.destroy(guest);
     guest.* = .{};
@@ -13205,38 +13216,43 @@ noinline fn runBufferReadbackProbe(allocator: std.mem.Allocator, comptime probe:
 
 noinline fn runFullImageOverwriteProbe(allocator: std.mem.Allocator) !void {
     const Memory = SizedGuestMemory(1024 * 1024);
+    const original_lean = vulkan.backend.lean_storage_overwrite_baselines;
+    defer vulkan.backend.lean_storage_overwrite_baselines = original_lean;
     const original_digest = vulkan.backend.digest_storage_overwrite_baseline;
     defer vulkan.backend.digest_storage_overwrite_baseline = original_digest;
     const original_direct = vulkan.backend.direct_storage_overwrite_digest;
     defer vulkan.backend.direct_storage_overwrite_digest = original_direct;
-    for ([_]bool{ false, true }) |batch| {
-        for (0..4) |tracking| {
-            for ([_]bool{ false, true }) |digest| {
-                for ([_]bool{ false, true }) |direct| {
-                    const renderer = try allocator.create(vulkan.Renderer);
-                    defer allocator.destroy(renderer);
-                    renderer.* = try vulkan.Renderer.init(allocator, .{ .enable_validation = true, .enable_timeline_scheduler = true });
-                    defer renderer.deinit();
-                    var guest = Memory{};
-                    var memory = guest.interface();
-                    if (tracking != 0) memory.fingerprint = Memory.fingerprint;
-                    if (tracking == 3) memory.fingerprint = struct {
-                        fn decline(_: ?*anyopaque, _: u64, _: usize) ?u64 {
-                            return null;
+    for ([_]bool{ false, true }) |lean| {
+        vulkan.backend.lean_storage_overwrite_baselines = lean;
+        for ([_]bool{ false, true }) |batch| {
+            for (0..4) |tracking| {
+                for ([_]bool{ false, true }) |digest| {
+                    for ([_]bool{ false, true }) |direct| {
+                        const renderer = try allocator.create(vulkan.Renderer);
+                        defer allocator.destroy(renderer);
+                        renderer.* = try vulkan.Renderer.init(allocator, .{ .enable_validation = true, .enable_timeline_scheduler = true });
+                        defer renderer.deinit();
+                        var guest = Memory{};
+                        var memory = guest.interface();
+                        if (tracking != 0) memory.fingerprint = Memory.fingerprint;
+                        if (tracking == 3) memory.fingerprint = struct {
+                            fn decline(_: ?*anyopaque, _: u64, _: usize) ?u64 {
+                                return null;
+                            }
+                        }.decline;
+                        if (tracking == 2) {
+                            guest.watch_generation = 1;
+                            memory.track_gpu_read = Memory.track;
+                            memory.gpu_generation = Memory.generation;
+                            memory.fingerprint = Memory.fingerprint;
                         }
-                    }.decline;
-                    if (tracking == 2) {
-                        guest.watch_generation = 1;
-                        memory.track_gpu_read = Memory.track;
-                        memory.gpu_generation = Memory.generation;
-                        memory.fingerprint = Memory.fingerprint;
+                        _ = renderer.dcbBackend(memory);
+                        renderer.draw_batch_active = batch;
+                        vulkan.backend.digest_storage_overwrite_baseline = digest;
+                        vulkan.backend.direct_storage_overwrite_digest = direct;
+                        try renderer.probeFullImageOverwrite(0x1000);
+                        std.debug.print("full image overwrite passed: batch={} tracking={d} digest={} direct={} lean={}\n", .{ batch, tracking, digest, direct, lean });
                     }
-                    _ = renderer.dcbBackend(memory);
-                    renderer.draw_batch_active = batch;
-                    vulkan.backend.digest_storage_overwrite_baseline = digest;
-                    vulkan.backend.direct_storage_overwrite_digest = direct;
-                    try renderer.probeFullImageOverwrite(0x1000);
-                    std.debug.print("full image overwrite passed: batch={} tracking={d} digest={} direct={}\n", .{ batch, tracking, digest, direct });
                 }
             }
         }
@@ -14169,6 +14185,14 @@ pub fn main(init: std.process.Init) !void {
         }
         return;
     }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--release-timestamps")) {
+        var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true, .defer_internal_releases = true });
+        defer renderer.deinit();
+        var guest = GuestMemory{};
+        _ = renderer.dcbBackend(guest.interface());
+        try renderer.probeReleaseTimestamps();
+        return;
+    }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--gpu-timestamps")) {
         var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true });
         defer renderer.deinit();
@@ -15005,6 +15029,8 @@ pub fn main(init: std.process.Init) !void {
     }
     var renderer = try vulkan.Renderer.init(allocator, .{ .enable_graphics_probe = true });
     defer renderer.deinit();
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--resource-workers"))
+        poisonFreshScalarRing(&renderer);
     if (args.len == 3 and (std.mem.eql(u8, args[1], "--probe-spv") or std.mem.eql(u8, args[1], "--probe-spv-cached") or std.mem.eql(u8, args[1], "--probe-spv-no-opt"))) {
         const bytes = try std.Io.Dir.cwd().readFileAllocOptions(
             init.io,
@@ -15541,6 +15567,9 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (args.len == 2 and std.mem.eql(u8, args[1], "--resource-workers")) {
+        // Force the worker implementation for its worker-count assertions.
+        // The default shared owner walk legitimately submits no worker jobs.
+        renderer.resource_preparation.share_scalar_walks = false;
         for ([_]usize{ 0, 1, 2, 4, 4 }, 0..) |workers, mode| {
             renderer.resource_preparation.worker_limit = workers;
             renderer.resource_preparation.adaptive = mode == 4;
@@ -15554,7 +15583,12 @@ pub fn main(init: std.process.Init) !void {
                 try std.testing.expectEqual(before.fallback, renderer.resource_preparation.stats.fallback);
             }
         }
-        std.debug.print("resource workers passed: serial/1/2/4/adaptive Vulkan pixels, changed textures and scalar values, T#/S#/V# register lifetimes\n", .{});
+        renderer.resource_preparation.share_scalar_walks = true;
+        renderer.resource_preparation.worker_limit = 0;
+        const before_shared = renderer.resource_preparation.stats.shared_walks;
+        try runFragmentScalarReuseProbe(allocator, &renderer, &guest, backend, &state, color_target_address);
+        try std.testing.expect(renderer.resource_preparation.stats.shared_walks >= before_shared + 2);
+        std.debug.print("resource workers passed: serial/1/2/4/adaptive/shared Vulkan pixels, changed textures and scalar values, T#/S#/V# register lifetimes\n", .{});
     } else try runFragmentScalarReuseProbe(allocator, &renderer, &guest, backend, &state, color_target_address);
     try runFragmentStorageProbe(allocator, &renderer, &guest, backend, &state, color_target_address);
     if (args.len == 2 and std.mem.eql(u8, args[1], "--resource-workers")) return;

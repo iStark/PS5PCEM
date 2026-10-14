@@ -43,4 +43,5 @@ test {
     _ = @import("buffer_upload_chunks.zig");
     _ = @import("cache_budget_recovery.zig");
     _ = @import("spirv_cache.zig");
+    _ = @import("release_clock.zig");
 }

@@ -46,7 +46,17 @@ pub const ScalarValue = struct {
     user_bits: u64 = 0,
 };
 
-pub const ScalarRegisters = [maximum_scalar_registers]ScalarValue;
+/// Resource checkpoints consume values, origins and knownness, but never the
+/// evaluator's USER_DATA dependency masks. Keep those masks in one side array
+/// instead of copying another eight bytes for every register at every site.
+pub const RegisterValue = struct {
+    known: bool = false,
+    value: u32 = 0,
+    sources: Sources = .{},
+    producer_pc: u32 = 0,
+};
+
+pub const ScalarRegisters = [maximum_scalar_registers]RegisterValue;
 
 // Uniform SGPR spills use different lanes of the same VGPR as independent
 // slots. This belongs to the representative resource walk, not the CFG proof:
@@ -257,7 +267,8 @@ pub const StopReason = enum {
 };
 
 pub const Evaluation = struct {
-    registers: ScalarRegisters = [_]ScalarValue{.{}} ** maximum_scalar_registers,
+    registers: ScalarRegisters = @splat(.{}),
+    user_data_dependencies: [maximum_scalar_registers]u64 = @splat(0),
     loads: [maximum_loads]ScalarLoad = undefined,
     load_count: usize = 0,
     /// High-water mark of recorded load PCs. A first forward visit cannot
@@ -277,6 +288,7 @@ pub const Evaluation = struct {
     /// records merely to start a fresh draw-local scalar walk.
     pub fn reset(self: *Evaluation) void {
         @memset(&self.registers, .{});
+        @memset(&self.user_data_dependencies, 0);
         self.load_count = 0;
         self.highest_load_pc = 0;
         self.instruction_count = 0;
@@ -289,6 +301,7 @@ pub const Evaluation = struct {
     pub fn copyFrom(self: *Evaluation, source_: *const Evaluation) void {
         if (self == source_) return;
         self.registers = source_.registers;
+        self.user_data_dependencies = source_.user_data_dependencies;
         @memcpy(self.loads[0..source_.load_count], source_.loadSlice());
         self.load_count = source_.load_count;
         self.highest_load_pc = source_.highest_load_pc;
@@ -301,13 +314,50 @@ pub const Evaluation = struct {
 
     pub fn register(self: *const Evaluation, index: u8) ?ScalarValue {
         const value = self.registers[index];
-        return if (value.known) value else null;
+        return if (value.known) .{
+            .known = true,
+            .value = value.value,
+            .sources = value.sources,
+            .producer_pc = value.producer_pc,
+            .user_bits = self.user_data_dependencies[index],
+        } else null;
     }
 
     pub fn loadSlice(self: *const Evaluation) []const ScalarLoad {
         return self.loads[0..self.load_count];
     }
 };
+
+test "compact checkpoints retain values while evaluation copies keep high USER_DATA dependencies" {
+    var original = Evaluation{};
+    const high_bits = (@as(u64, 1) << 61) | (@as(u64, 1) << 63);
+    write(&original, .{ .kind = .sgpr, .reg = 4 }, 0x11223344, .{ .user_data = true }, 12, @as(u64, 1) << 61);
+    write(&original, .{ .kind = .sgpr, .reg = 5 }, 0x55667788, .{ .user_data = true }, 16, @as(u64, 1) << 63);
+    var scc: ?bool = null;
+    executeScalar(&original, 0, &.{ .pc = 20, .family = .sop1, .opcode = .s_mov_b64, .dst = .{ .kind = .sgpr, .reg = 8 }, .src0 = .{ .kind = .sgpr, .reg = 4 }, .src_count = 1 }, &scc);
+    try std.testing.expectEqual(high_bits, original.register(8).?.user_bits);
+    try std.testing.expectEqual(high_bits, original.register(9).?.user_bits);
+    const checkpoint = original.registers;
+    var copied: Evaluation = undefined;
+    copied.copyFrom(&original);
+    original.reset();
+    try std.testing.expectEqual(@as(u32, 0x11223344), checkpoint[8].value);
+    try std.testing.expectEqual(@as(u32, 0x55667788), checkpoint[9].value);
+    try std.testing.expectEqual(@as(u32, 20), checkpoint[9].producer_pc);
+    try std.testing.expectEqual(high_bits, copied.register(9).?.user_bits);
+    recordUserDataOperand(&copied, .{ .kind = .sgpr, .reg = 8 }, 2);
+    try std.testing.expectEqual(high_bits, copied.address_user_data_mask);
+    var spill = LaneSpills{};
+    spill.store(&copied, .{ .opcode = .v_writelane_b32, .dst = .{ .kind = .vgpr, .reg = 10 }, .src0 = .{ .kind = .sgpr, .reg = 9 }, .src1 = .{ .kind = .integer_inline_constant, .value = 3 } });
+    invalidateDestination(&copied, .{ .kind = .sgpr, .reg = 9 }, 1);
+    spill.restore(&copied, .{ .opcode = .v_readlane_b32, .dst = .{ .kind = .sgpr, .reg = 9 }, .src0 = .{ .kind = .vgpr, .reg = 10 }, .src1 = .{ .kind = .integer_inline_constant, .value = 3 } });
+    try std.testing.expectEqual(high_bits, copied.register(9).?.user_bits);
+    executeScalar(&copied, 0x4000, &.{ .pc = 24, .family = .sop1, .opcode = .s_getpc_b64, .dst = .{ .kind = .sgpr, .reg = 8 } }, &scc);
+    try std.testing.expectEqual(@as(u64, 0), copied.register(8).?.user_bits);
+    try std.testing.expectEqual(@as(u64, 0), copied.register(9).?.user_bits);
+    copied.reset();
+    try std.testing.expect(std.mem.allEqual(u64, &copied.user_data_dependencies, 0));
+}
 
 /// Propagate uniform constants through the dispatch's control-flow graph.
 /// Values survive a join only when every incoming path agrees, including loop
@@ -938,8 +988,8 @@ fn evaluateInto(
             .known = true,
             .value = word,
             .sources = .{ .user_data = true },
-            .user_bits = if (index < 64) @as(u64, 1) << @intCast(index) else 0,
         };
+        result.user_data_dependencies[scalar_base + index] = if (index < 64) @as(u64, 1) << @intCast(index) else 0;
     }
 
     var scc: ?bool = null;
@@ -1351,16 +1401,16 @@ fn executeSmem(
 
     const base_sources = Sources.merge(base_lo.sources, base_hi.sources);
     const loaded_sources = Sources.merge(Sources.merge(base_sources, offset.sources), .{ .memory = true });
-    const address_bits = base_lo.user_bits | base_hi.user_bits | offset.user_bits;
+    const address_bits = base_lo.user_bits | result.user_data_dependencies[base_index + 1] | offset.user_bits;
     result.address_user_data_mask |= address_bits;
     for (loaded[0..inst.data_words], 0..) |word, index| {
         result.registers[destination + index] = .{
             .known = true,
             .value = word,
-            .user_bits = address_bits,
             .sources = loaded_sources,
             .producer_pc = inst.pc,
         };
+        result.user_data_dependencies[destination + index] = address_bits;
     }
     if (!retain_load_history) return true;
     const load = ScalarLoad{
@@ -1406,7 +1456,10 @@ fn setpcDestinationPc(result: *const Evaluation, program_address: u64, inst: rdn
 fn recordUserDataOperand(result: *Evaluation, operand: rdna2.Operand, count: usize) void {
     const first = scalarRegisterIndex(operand) orelse return;
     const end = @min(@as(usize, first) + count, maximum_scalar_registers);
-    for (result.registers[first..end]) |value| result.address_user_data_mask |= value.user_bits;
+    for (result.registers[first..end], result.user_data_dependencies[first..end]) |value, bits|
+        if (value.known) {
+            result.address_user_data_mask |= bits;
+        };
 }
 
 fn recordResourceUserData(result: *Evaluation, inst: *const rdna2.Instruction) void {
@@ -1495,7 +1548,8 @@ fn executeScalar(result: *Evaluation, program_address: u64, inst: *const rdna2.I
             const destination = scalarRegisterIndex(inst.dst) orelse return;
             if (destination + 1 >= maximum_scalar_registers) return;
             write(result, inst.dst, @truncate(wide.value), wide.sources, inst.pc, wide.user_bits);
-            result.registers[destination + 1] = .{ .known = true, .value = @truncate(wide.value >> 32), .sources = wide.sources, .producer_pc = inst.pc, .user_bits = wide.user_bits };
+            result.registers[destination + 1] = .{ .known = true, .value = @truncate(wide.value >> 32), .sources = wide.sources, .producer_pc = inst.pc };
+            result.user_data_dependencies[destination + 1] = wide.user_bits;
         } else write(result, inst.dst, low.value, low.sources, inst.pc, low.user_bits);
         return;
     }
@@ -1504,6 +1558,7 @@ fn executeScalar(result: *Evaluation, program_address: u64, inst: *const rdna2.I
         const sources = Sources{ .program_counter = true };
         result.registers[inst.dst.reg] = .{ .known = true, .value = @truncate(address), .sources = sources, .producer_pc = inst.pc };
         result.registers[inst.dst.reg + 1] = .{ .known = true, .value = @truncate(address >> 32), .sources = sources, .producer_pc = inst.pc };
+        @memset(result.user_data_dependencies[inst.dst.reg..][0..2], 0);
         return;
     }
 
@@ -1655,7 +1710,7 @@ fn wideSource(
             return .{
                 .value = @as(u64, low.value) | (@as(u64, high.value) << 32),
                 .sources = Sources.merge(low.sources, high.sources),
-                .user_bits = low.user_bits | high.user_bits,
+                .user_bits = low.user_bits | result.user_data_dependencies[index + 1],
             };
         },
         .integer_inline_constant => {
@@ -1757,6 +1812,7 @@ fn executeScalar64(
         return;
     };
     var all_sources = Sources.merge(sources, wide_a.sources);
+    var all_user_bits = wide_a.user_bits;
     const av = wide_a.value;
     if (inst.src_count >= 2 and b == null) {
         invalidateDestination(result, inst.dst, 2);
@@ -1769,6 +1825,7 @@ fn executeScalar64(
         // requiring s108 makes an otherwise complete V# format unknown.
         if (inst.opcode == .s_bfe_u64) {
             bv = low.value;
+            all_user_bits |= low.user_bits;
         } else {
             const wide_b = wideSource(result, inst.src1, low) orelse {
                 invalidateDestination(result, inst.dst, 2);
@@ -1776,6 +1833,7 @@ fn executeScalar64(
             };
             bv = wide_b.value;
             all_sources = Sources.merge(all_sources, wide_b.sources);
+            all_user_bits |= wide_b.user_bits;
         }
     }
     const value: ?u64 = switch (inst.opcode) {
@@ -1803,9 +1861,10 @@ fn executeScalar64(
     };
     if (value) |known| {
         if (isBitwise64(inst.opcode)) scc.* = known != 0;
-        const bits = a.user_bits | if (b) |other| other.user_bits else 0;
+        const bits = all_user_bits;
         write(result, inst.dst, @truncate(known), all_sources, inst.pc, bits);
-        result.registers[destination + 1] = .{ .known = true, .value = @truncate(known >> 32), .sources = all_sources, .producer_pc = inst.pc, .user_bits = bits };
+        result.registers[destination + 1] = .{ .known = true, .value = @truncate(known >> 32), .sources = all_sources, .producer_pc = inst.pc };
+        result.user_data_dependencies[destination + 1] = bits;
     } else invalidateDestination(result, inst.dst, 2);
 }
 
@@ -1838,7 +1897,7 @@ test "64-bit BFE takes one control SGPR and retains both data words" {
 fn source(result: *const Evaluation, operand: rdna2.Operand) ?ScalarValue {
     return switch (operand.kind) {
         .sgpr, .vcc_lo, .vcc_hi, .exec_lo, .exec_hi, .m0 => if (scalarRegisterIndex(operand)) |index|
-            if (result.registers[index].known) result.registers[index] else null
+            result.register(@intCast(index))
         else
             null,
         .integer_inline_constant, .float_inline_constant, .literal_constant => .{
@@ -1882,13 +1941,15 @@ fn bitfieldMask32(width: u32, offset: u32) u32 {
 
 fn write(result: *Evaluation, destination: rdna2.Operand, value: u32, sources: Sources, pc: u32, user_bits: u64) void {
     const index = scalarRegisterIndex(destination) orelse return;
-    result.registers[index] = .{ .known = true, .value = value, .sources = sources, .producer_pc = pc, .user_bits = user_bits };
+    result.registers[index] = .{ .known = true, .value = value, .sources = sources, .producer_pc = pc };
+    result.user_data_dependencies[index] = user_bits;
 }
 
 fn invalidateDestination(result: *Evaluation, destination: rdna2.Operand, count: u8) void {
     const first = scalarRegisterIndex(destination) orelse return;
     const end = @min(maximum_scalar_registers, first + count);
     for (result.registers[first..end]) |*value| value.* = .{};
+    @memset(result.user_data_dependencies[first..end], 0);
 }
 
 /// Unified SGPR index, including scalar aliases such as VCC and EXEC.
@@ -2712,11 +2773,10 @@ test "reused scalar evaluation refreshes guest loads and clears failed or abando
 test "resource reuse pins scalar conditions, direct descriptors and SMEM bounds" {
     var evaluation: Evaluation = undefined;
     evaluation.reset();
-    for (0..32) |index| evaluation.registers[index] = .{
-        .known = true,
-        .value = @intCast(index),
-        .user_bits = @as(u64, 1) << @intCast(index),
-    };
+    for (0..32) |index| {
+        evaluation.registers[index] = .{ .known = true, .value = @intCast(index) };
+        evaluation.user_data_dependencies[index] = @as(u64, 1) << @intCast(index);
+    }
     recordResourceUserData(&evaluation, &.{ .family = .sopc, .opcode = .s_cmp_eq_u32, .src0 = .{ .kind = .sgpr, .reg = 20 }, .src1 = .{ .kind = .integer_inline_constant, .value = 0 }, .src_count = 2 });
     try std.testing.expect(evaluation.address_user_data_mask & (@as(u64, 1) << 20) != 0);
     recordResourceUserData(&evaluation, &.{ .family = .smem, .opcode = .s_buffer_load_dword, .src0 = .{ .kind = .sgpr, .reg = 0 }, .src1 = .{ .kind = .sgpr, .reg = 8 }, .src_count = 2 });
@@ -3216,8 +3276,10 @@ test "descriptor BFE comparison drives conditional select" {
 test "scalar BITSET preserves descriptor bits, dependencies and SCC" {
     for ([_]u32{ 18, 50, 31, 0xffff_ffff }) |bit| {
         var result = Evaluation{};
-        result.registers[1] = .{ .known = true, .value = 0x20, .user_bits = 2 };
-        result.registers[8] = .{ .known = true, .value = bit, .user_bits = 256 };
+        result.registers[1] = .{ .known = true, .value = 0x20 };
+        result.user_data_dependencies[1] = 2;
+        result.registers[8] = .{ .known = true, .value = bit };
+        result.user_data_dependencies[8] = 256;
         var scc: ?bool = true;
         var inst = rdna2.Instruction{
             .pc = 0x10,

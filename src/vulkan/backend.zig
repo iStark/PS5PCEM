@@ -20,6 +20,7 @@ const vk = @import("api.zig");
 const detile_spirv = @import("detile_spirv.zig");
 const image_alias = @import("image_alias.zig");
 const image_state = @import("image_state.zig");
+const release_clock = @import("release_clock.zig");
 const pipeline_compiler = @import("pipeline_compiler.zig");
 const pipeline_cache_save = @import("pipeline_cache_save.zig");
 const pipeline_warmup = @import("pipeline_warmup.zig");
@@ -71,11 +72,23 @@ pub export var avoid_completed_gds_snapshots: bool = true;
 pub export var discard_overwritten_storage_images: bool = true;
 pub export var native_storage_color_initialization: bool = true;
 pub export var native_color_storage_layout: bool = true;
+/// Native backing starts with the CPU bytes, so a producer need not begin
+/// at the destination base. Uncovered bytes retain their original contents.
+pub export var interior_color_storage_layout: bool = true;
 pub export var native_storage_texel_hashing: bool = false;
 /// A full compute overwrite only needs a digest of the previous CPU texels,
 /// rather than a second allocation-sized snapshot. Padding is excluded.
 pub export var digest_storage_overwrite_baseline: bool = true;
 pub export var direct_storage_overwrite_digest: bool = true;
+/// Exact texel proofs do not need a second full-allocation hash.
+pub export var lean_storage_overwrite_baselines: bool = true;
+/// Diagnostic baseline. Translated scalar loads use constant indices inside
+/// the specialization list, and each active prefix is written before use.
+pub export var clear_unused_dynamic_scalars: bool = false;
+// Accurate native queries remain available for comparisons; bounded CPU
+// recording provides the measured gain without their per-query GPU cost.
+pub export var native_release_timestamps: bool = false;
+pub export var batch_release_interrupts: bool = false;
 pub export var exact_buffer_readback_ranges: bool = true;
 pub export var discard_full_image_initialization: bool = true;
 pub export var discard_covered_raster_initialization: bool = true;
@@ -191,6 +204,7 @@ pub const Error = error{
     PresentationSemaphoreCreationFailed,
     TimelineSemaphoreQueryFailed,
     TimelineSemaphoreWaitFailed,
+    TimestampQueryFailed,
     QueueSubmissionFailed,
     FenceWaitFailed,
     DeviceWaitFailed,
@@ -1530,6 +1544,8 @@ const DeferredRelease = struct {
     /// Sixteen query counters share one value, with the opposite endpoint
     /// between them. Preserve those intervening words at publication time.
     query_counters: bool = false,
+    /// Query slots are retained until their exact ordered label is published.
+    timestamp_query: ?u32 = null,
 
     fn size(self: DeferredRelease) usize {
         if (self.query_counters) return 16 * 16 - 8;
@@ -5797,6 +5813,12 @@ pub const Renderer = struct {
     frame_command_buffers: std.ArrayList(vk.CommandBuffer) = .empty,
     command_buffer_ticks: std.ArrayList(u64) = .empty,
     gpu_timestamp_pool: vk.QueryPool = 0,
+    release_timestamp_pool: vk.QueryPool = 0,
+    release_timestamp_busy: std.StaticBitSet(256) = .initEmpty(),
+    release_timestamp_calibration: ?release_clock.Calibration = null,
+    calibrated_timestamps: ?release_clock.GetTimestamps = null,
+    release_timestamp_queries: u64 = 0,
+    release_timestamp_last_value: u64 = 0,
     gpu_timestamp_failed: bool = false,
     gpu_timestamp_samples: u64 = 0,
     gpu_timestamp_slots: [maximum_async_command_buffers]struct {
@@ -6019,6 +6041,8 @@ pub const Renderer = struct {
     storage_initial_uploads_avoided: u64 = 0,
     storage_initial_baseline_copies_avoided: u64 = 0,
     storage_initial_baseline_bytes_avoided: u64 = 0,
+    storage_initial_backing_hashes_avoided: u64 = 0,
+    storage_initial_backing_hash_bytes_avoided: u64 = 0,
     storage_initial_snapshot_reads_avoided: u64 = 0,
     storage_initial_snapshot_bytes_avoided: u64 = 0,
     storage_initial_upload_bytes_avoided: u64 = 0,
@@ -6654,6 +6678,12 @@ pub const Renderer = struct {
             candidate.physical_device,
             "VK_EXT_external_memory_host",
         );
+        const calibrated_timestamps = calibrated: {
+            if (builtin.os.tag != .windows or candidate.info.timestamp_valid_bits != 64 or
+                !physicalDeviceSupportsExtension(allocator, &instance_functions, candidate.physical_device, "VK_EXT_calibrated_timestamps")) break :calibrated false;
+            const get_domains = loader.instance(instance_handle, release_clock.GetDomains, "vkGetPhysicalDeviceCalibrateableTimeDomainsEXT") catch break :calibrated false;
+            break :calibrated release_clock.supportsDomains(get_domains, candidate.physical_device);
+        };
         var host_properties = external_host.HostProperties{};
         var subgroup_properties = vk.PhysicalDeviceSubgroupProperties{
             .p_next = if (host_import) &host_properties else null,
@@ -6672,8 +6702,12 @@ pub const Renderer = struct {
             .p_next = &timeline_enable,
             .rasterization_order_color_attachment_access = if (rasterization_order_color) vk.true_value else 0,
         };
-        var device_extension_names: [8][*:0]const u8 = undefined;
+        var device_extension_names: [9][*:0]const u8 = undefined;
         var device_extension_count: u32 = 0;
+        if (calibrated_timestamps) {
+            device_extension_names[device_extension_count] = "VK_EXT_calibrated_timestamps";
+            device_extension_count += 1;
+        }
         if (shader_layer) {
             device_extension_names[device_extension_count] = "VK_EXT_shader_viewport_index_layer";
             device_extension_count += 1;
@@ -6970,6 +7004,10 @@ pub const Renderer = struct {
             .pipeline_compile_queue = .{ .worker_limit = std.math.clamp(options.pipeline_compiler_workers, 1, pipeline_compiler.Queue.maximum_workers), .adaptation = .{ .enabled = options.adaptive_compiler_workers } },
             .memory_properties = memory_properties,
             .host_import_alignment = host_properties.alignment,
+            .calibrated_timestamps = if (calibrated_timestamps)
+                @ptrCast(instance_functions.get_device_proc_addr(device, "vkGetCalibratedTimestampsEXT"))
+            else
+                null,
             .host_import_properties = if (host_import)
                 @ptrCast(instance_functions.get_device_proc_addr(device, "vkGetMemoryHostPointerPropertiesEXT"))
             else
@@ -7137,6 +7175,7 @@ pub const Renderer = struct {
         }
         self.deferred_internal_release_count = 0;
         if (self.gpu_timestamp_pool != 0) self.device_functions.destroy_query_pool(self.device, self.gpu_timestamp_pool, null);
+        if (self.release_timestamp_pool != 0) self.device_functions.destroy_query_pool(self.device, self.release_timestamp_pool, null);
         self.destroyDeferredVulkanObjects();
         self.destroyResourcePools();
         self.pending_targetless_draws.deinit(self.allocator);
@@ -23336,6 +23375,133 @@ pub const Renderer = struct {
         std.debug.print("Fragment minimum passed: five known minima, uniform and two varying lane orders, with/without scalar wait, loop-carried inputs, triangle edges, subgroup_size={d}\n", .{self.device_info.subgroup_size});
     }
 
+    pub fn probeReleaseTimestamps(self: *Renderer) anyerror!void {
+        if (self.calibrated_timestamps == null) return error.CalibratedTimestampsUnavailable;
+        const memory = self.guest_memory.?;
+        const old_enabled = native_release_timestamps;
+        const old_batch_interrupts = batch_release_interrupts;
+        const old_observer = self.deferred_release_observer;
+        native_release_timestamps = true;
+        batch_release_interrupts = true;
+        defer native_release_timestamps = old_enabled;
+        defer batch_release_interrupts = old_batch_interrupts;
+        defer self.deferred_release_observer = old_observer;
+        const Observer = struct {
+            var values: [1024]u64 = undefined;
+            var count: usize = 0;
+            fn observe(value: gpu.state.ReleaseMem) void {
+                std.debug.assert(count < values.len);
+                values[count] = value.data;
+                count += 1;
+            }
+        };
+        self.deferred_release_observer = Observer.observe;
+        defer self.guest_memory = memory;
+        const sentinel = [_]u8{0xcd} ** 8;
+        const start_queries = self.release_timestamp_queries;
+        var last: u64 = 0;
+        var release = std.mem.zeroes(gpu.state.ReleaseMem);
+        release.destination = 1;
+        // Saturate and recycle the 256-slot pool, including automatic drains.
+        // Queue-only timestamps must not force a submission of their own.
+        for (0..3) |batch| {
+            try self.finishDrawBatchRecording(false);
+            Observer.count = 0;
+            // Releases also arrive between descriptor batches, including a
+            // command stream with no draws at all. Neither mode may submit
+            // one command buffer per timestamp.
+            if (batch != 1) try self.beginComputeDispatch();
+            const start_tick = self.submitted_tick;
+            const before = release_clock.now();
+            for (0..300) |index| {
+                release.address = 0x1000 + index * 8;
+                release.data_selection = if (index & 1 == 0) 3 else 4;
+                release.data = index * 2;
+                try std.testing.expect(memory.write(memory.context, release.address, &sentinel));
+                try std.testing.expect(try self.tryDeferInternalRelease(release));
+                // Engines often follow each timestamp with a no-data EOP.
+                // Preserve every callback without forcing a submission each.
+                var event = std.mem.zeroes(gpu.state.ReleaseMem);
+                event.destination = 1;
+                event.interrupt = 1;
+                event.data = index * 2 + 1;
+                try std.testing.expect(try self.tryDeferInternalRelease(event));
+                if (index < 64) {
+                    try std.testing.expectEqual(start_tick, self.submitted_tick);
+                    try std.testing.expectEqual(@as(usize, 0), Observer.count);
+                    var unpublished: [8]u8 = undefined;
+                    try std.testing.expect(memory.read(memory.context, release.address, &unpublished));
+                    try std.testing.expectEqualSlices(u8, &sentinel, &unpublished);
+                }
+            }
+            // A runtime toggle cannot change how already queued queries read.
+            native_release_timestamps = false;
+            switch (batch) {
+                0 => try self.drainInternalReleases(self.deferred_internal_release_count),
+                1 => try std.testing.expect(dcbWait(self, std.mem.zeroes(gpu.state.WaitRegMem), false)),
+                else => {
+                    var ticket: u64 = 0;
+                    try std.testing.expect(dcbSealSubmission(self, &ticket));
+                    try std.testing.expect(try self.pollSubmission(ticket, true) == .complete);
+                },
+            }
+            const after = release_clock.now();
+            try std.testing.expectEqual(@as(usize, 600), Observer.count);
+            for (Observer.values[0..Observer.count], 0..) |value, index|
+                try std.testing.expectEqual(@as(u64, index), value);
+            const tolerance = self.release_timestamp_calibration.?.max_deviation_ns / 10 + 100_000;
+            for (0..300) |index| {
+                var bytes: [8]u8 = undefined;
+                try std.testing.expect(memory.read(memory.context, 0x1000 + index * 8, &bytes));
+                const value = std.mem.readInt(u64, &bytes, .little);
+                try std.testing.expect(value >= last);
+                try std.testing.expect(value +| tolerance >= before and value <= after +| tolerance);
+                last = value;
+            }
+            try std.testing.expectEqual(@as(usize, 0), self.release_timestamp_busy.count());
+            try std.testing.expectEqual(@as(u64, (batch + 1) * 300), self.release_timestamp_queries - start_queries);
+            native_release_timestamps = true;
+        }
+        // A failed label write retains the query for an exact retry.
+        try self.beginComputeDispatch();
+        release.address = 0x2000;
+        release.data_selection = 3;
+        try std.testing.expect(try self.tryDeferInternalRelease(release));
+        const Denied = struct {
+            fn write(_: ?*anyopaque, _: u64, _: []const u8) bool {
+                return false;
+            }
+        };
+        self.guest_memory.?.write = Denied.write;
+        try std.testing.expectError(Error.GuestMemoryWriteFailed, self.drainInternalReleases(self.deferred_internal_release_count));
+        self.guest_memory = memory;
+        try std.testing.expectEqual(@as(usize, 1), self.release_timestamp_busy.count());
+        try self.drainInternalReleases(self.deferred_internal_release_count);
+        try std.testing.expectEqual(@as(usize, 0), self.release_timestamp_busy.count());
+        // Immediate writes after timestamps remain ordered at the same address.
+        try self.beginComputeDispatch();
+        try std.testing.expect(try self.tryDeferInternalRelease(release));
+        release.data_selection = 2;
+        release.data = 0x123456789abcdef0;
+        try std.testing.expect(try self.tryDeferInternalRelease(release));
+        try self.drainInternalReleases(self.deferred_internal_release_count);
+        var bytes: [8]u8 = undefined;
+        try std.testing.expect(memory.read(memory.context, 0x2000, &bytes));
+        try std.testing.expectEqual(release.data, std.mem.readInt(u64, &bytes, .little));
+        // Disabled native capture retains a real reference clock.
+        native_release_timestamps = false;
+        const before = release_clock.now();
+        const queries = self.release_timestamp_queries;
+        release.data_selection = 3;
+        try std.testing.expect(try self.tryDeferInternalRelease(release));
+        try self.drainInternalReleases(self.deferred_internal_release_count);
+        try std.testing.expect(memory.read(memory.context, 0x2000, &bytes));
+        const fallback = std.mem.readInt(u64, &bytes, .little);
+        try std.testing.expect(fallback >= before and fallback <= release_clock.now());
+        try std.testing.expectEqual(queries, self.release_timestamp_queries);
+        std.debug.print("release timestamps passed: {d} queries, 900 ordered EOP events, shared submissions with/without descriptors, pool saturation/reuse, blocked-wait and sealing progress, failed-write retry and fallback; calibration deviation={d}ns\n", .{ queries - start_queries, self.release_timestamp_calibration.?.max_deviation_ns });
+    }
+
     pub fn probeGpuTimestamps(self: *Renderer) anyerror!void {
         if (self.device_info.timestamp_valid_bits == 0) return error.TimestampQueriesUnavailable;
         const old_enabled = @atomicLoad(bool, &gpu_timestamp_profiling, .monotonic);
@@ -27679,6 +27845,21 @@ pub const Renderer = struct {
         if (page_generation == 0 and @atomicLoad(bool, &arm_storage_cpu_watches, .monotonic)) {
             if (memory.track_gpu_read) |track| page_generation = track(memory.context, cached.descriptor.address, cached.allocation_bytes);
         }
+        // A full-overwrite baseline owns only this view's texels. Fingerprint
+        // those spans directly; unchanged padding is not required and this
+        // proof must never rearm a sibling mip's generation.
+        if (@atomicLoad(bool, &lean_storage_overwrite_baselines, .monotonic) and !cached.strict_guest_backing) {
+            if (cached.guest_native_baseline_digest) |baseline| {
+                if (storageOverwriteGuestDigest(memory, cached.descriptor.address, cached.guest_native_coverage.?)) |current| {
+                    self.storage_native_hash_comparisons +|= 1;
+                    if (current != baseline) return true;
+                    cached.guest_page_generation = page_generation;
+                    cached.guest_backing_hash = null;
+                    cached.guest_content_hash_valid = false;
+                    return false;
+                }
+            }
+        }
         // Native memory can fingerprint the backing without copying or detiling
         // it. Only a changed allocation needs the more expensive texel check.
         self.frame_profile.storage_guest_hash_bytes +|= cached.allocation_bytes;
@@ -27727,6 +27908,9 @@ pub const Renderer = struct {
             self.frame_profile.storage_guest_page_hits +|= 1;
             return false;
         }
+        if (@atomicLoad(bool, &lean_storage_overwrite_baselines, .monotonic) and
+            !snapshot.strict_guest_backing and snapshot.guest_native_baseline_digest != null)
+            return self.storageTexelsChanged(snapshot, allocation);
         self.frame_profile.storage_guest_hash_bytes +|= allocation.len;
         return gpu.parallel_copy.fingerprint(allocation) != snapshot.guest_backing_hash and
             (snapshot.strict_guest_backing or try self.storageTexelsChanged(snapshot, allocation));
@@ -29210,15 +29394,20 @@ pub const Renderer = struct {
         else
             null;
         if (allocation == null and digest == null) return null;
-        const backing_hash = if (allocation) |bytes|
+        const lean = allocation == null and digest != null and @atomicLoad(bool, &lean_storage_overwrite_baselines, .monotonic);
+        const backing_hash: ?u64 = if (lean) null else if (allocation) |bytes|
             if (guest_page_generation == 0) guest_content_hash else gpu.parallel_copy.fingerprint(bytes)
         else
             self.guest_memory.?.fingerprint.?(self.guest_memory.?.context, descriptor.address, allocation_bytes) orelse return null;
-        const content_hash = if (allocation == null and guest_page_generation == 0) backing_hash else guest_content_hash;
+        const content_hash = if (allocation == null and guest_page_generation == 0) backing_hash orelse 0 else guest_content_hash;
         const baseline: ?[]u8 = if (digest == null) blk: {
             if (!try self.reserveStorageNativeBaseline(allocation_bytes, index)) return null;
             break :blk try self.allocator.dupe(u8, allocation.?);
         } else null;
+        if (lean) {
+            self.storage_initial_backing_hashes_avoided +|= 1;
+            self.storage_initial_backing_hash_bytes_avoided +|= allocation_bytes;
+        }
         if (allocation == null) {
             self.storage_initial_snapshot_reads_avoided +|= 1;
             self.storage_initial_snapshot_bytes_avoided +|= allocation_bytes;
@@ -29237,7 +29426,7 @@ pub const Renderer = struct {
         cached.guest_native_texel_hash = null;
         cached.guest_backing_hash = backing_hash;
         cached.guest_content_hash = content_hash;
-        cached.guest_content_hash_valid = true;
+        cached.guest_content_hash_valid = backing_hash != null;
         cached.guest_page_generation = guest_page_generation;
         cached.depth_snapshot = null;
         cached.last_used_sequence = self.storage_image_sequence;
@@ -29291,6 +29480,7 @@ pub const Renderer = struct {
             }
             const uploaded_before = self.frame_profile.texture_upload_bytes;
             const direct_before = self.storage_initial_snapshot_reads_avoided;
+            const hashes_before = self.storage_initial_backing_hashes_avoided;
             const prepared = try self.stageStorageImageWithContents(descriptor, 0, true, true);
             try std.testing.expect(prepared.discarded_initial_contents);
             try std.testing.expectEqual(uploaded_before, self.frame_profile.texture_upload_bytes);
@@ -29299,6 +29489,10 @@ pub const Renderer = struct {
                 if (memory.fingerprint) |fingerprint| fingerprint(memory.context, descriptor.address, expected.len) != null else false;
             try std.testing.expectEqual(direct_before + @as(u64, if (direct_expected) 1 else 0), self.storage_initial_snapshot_reads_avoided);
             const index = prepared.cache_index.?;
+            const lean_expected = direct_expected and lean_storage_overwrite_baselines;
+            try std.testing.expectEqual(hashes_before + @as(u64, if (lean_expected) 1 else 0), self.storage_initial_backing_hashes_avoided);
+            try std.testing.expectEqual(!lean_expected, self.storage_image_cache.items[index].guest_content_hash_valid);
+            try std.testing.expectEqual(!lean_expected, self.storage_image_cache.items[index].guest_backing_hash != null);
             try std.testing.expectEqual(expect_digest, self.storage_image_cache.items[index].guest_native_baseline_digest != null);
             try std.testing.expectEqual(!expect_digest, self.storage_image_cache.items[index].guest_native_baseline != null);
             if (phase == 2) digest_storage_overwrite_baseline = !use_digest;
@@ -29625,7 +29819,7 @@ pub const Renderer = struct {
             linear_bytes = @max(linear_bytes, @as(usize, @intCast(cached.target.layout.staging_bytes)));
             backing_bytes = @max(backing_bytes, @as(usize, @intCast(color.address - descriptor.address + cached.target.layout.required_source_bytes)));
         }
-        if (!has_base_producer) {
+        if (source_count == 0 or (!has_base_producer and !@atomicLoad(bool, &interior_color_storage_layout, .monotonic))) {
             if (self.traceCurrentGraphicsFrame()) std.debug.print("[gpu layout reject] no base producer image @0x{x} sources={d}\n", .{ descriptor.address, source_count });
             return null;
         }
@@ -30066,8 +30260,11 @@ pub const Renderer = struct {
 
     pub fn probeColorStorageLayout(self: *Renderer) anyerror!void {
         const memory = self.guest_memory orelse return Error.GuestMemoryUnavailable;
+        const saved_interior = interior_color_storage_layout;
+        defer interior_color_storage_layout = saved_interior;
+        interior_color_storage_layout = true;
         for ([_]bool{ false, true }) |wide| {
-            for (0..9) |phase| {
+            for (0..12) |phase| {
                 if (!wide and phase >= 6) continue;
                 var color = std.mem.zeroes(gpu.resources.ColorTarget);
                 color.address = 0x10000;
@@ -30078,7 +30275,6 @@ pub const Renderer = struct {
                 color.number_type = 7;
                 color.tile_mode = .render_target;
                 color.write_mask = 15;
-                const target = try guestColorTarget(color);
                 var descriptor = std.mem.zeroInit(gpu.ImageDescriptor, .{ .image_type = .color_2d });
                 descriptor.address = color.address;
                 descriptor.width = if (wide) 257 else color.width;
@@ -30090,7 +30286,10 @@ pub const Renderer = struct {
                 descriptor.extended = true;
                 const texture = try gpu.TextureLayout.fromImage(descriptor);
                 const view = try texture.subresource(0, 0, 1);
-                const outer_bytes: usize = if (phase >= 6) 256 else 0;
+                const source_offset: usize = if (phase >= 9) 256 else 0;
+                color.address += source_offset;
+                const target = try guestColorTarget(color);
+                const outer_bytes: usize = if (phase >= 6 and phase <= 8) 256 else 0;
                 const image_bytes: usize = @intCast(texture.required_source_bytes);
                 const expected = try self.allocator.alloc(u8, image_bytes + outer_bytes + (if (phase == 8) @as(usize, 384) else 0));
                 defer self.allocator.free(expected);
@@ -30099,7 +30298,7 @@ pub const Renderer = struct {
                 const initial = try self.allocator.alloc(u8, @intCast(target.layout.staging_bytes));
                 defer self.allocator.free(initial);
                 for (0..initial.len / 4) |i| std.mem.writeInt(u32, initial[i * 4 ..][0..4], 0x3c003c00 ^ @as(u32, @truncate(i *% 29)), .little);
-                try target.layout.tile(initial, expected);
+                try target.layout.tile(initial, expected[source_offset..]);
                 const source = try self.acquireRenderTarget(target);
                 const upload = try self.createBuffer(initial.len, vk.buffer_usage_transfer_src_bit, vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit);
                 defer self.destroyBuffer(upload);
@@ -30141,9 +30340,9 @@ pub const Renderer = struct {
                     if (!memory.write(memory.context, old_color.address, &replacement)) return Error.GuestMemoryWriteFailed;
                     stale_neighbor = old_index;
                 }
-                var interior_address: ?u64 = null;
+                var interior_address: ?u64 = if (phase >= 9) color.address else null;
                 var outside_writer: ?usize = null;
-                if (wide and phase >= 4) {
+                if (wide and phase >= 4 and phase <= 8) {
                     var neighbor = color;
                     const neighbor_offset: usize = if (phase >= 6) image_bytes - 256 else 256;
                     neighbor.address += neighbor_offset;
@@ -30196,7 +30395,20 @@ pub const Renderer = struct {
                     try std.testing.expectEqual(conversions, self.storage_layout_conversions);
                     try std.testing.expect(self.render_targets.items[outside_index].initialized);
                     try std.testing.expect(self.render_targets.items[source].initialized);
+                    // Finish this rejected case before reusing the guest
+                    // allocation for the next independent conversion.
+                    try self.flushPendingGuestWrites();
                     continue;
+                }
+                if (phase >= 9) {
+                    // The old path required a producer at the destination base.
+                    // Reject without modifying its source before testing the
+                    // same native conversion with interior producers enabled.
+                    interior_color_storage_layout = false;
+                    try std.testing.expect(try self.tryStageColorStorageLayout(descriptor, 0, false, view, storageImageFormat(descriptor.unified_format).?, image_bytes, @intCast(try view.stagingBytes()), null, 0) == null);
+                    try std.testing.expect(self.render_targets.items[source].initialized);
+                    try std.testing.expectEqual(conversions, self.storage_layout_conversions);
+                    interior_color_storage_layout = true;
                 }
                 const resources = try ComputeResources.acquire(self);
                 defer resources.deinit(self);
@@ -30238,11 +30450,11 @@ pub const Renderer = struct {
                     try self.commitStorageImages(memory, resources);
                     @memset(linear_expected, 0);
                     try view.tile(linear_expected, expected);
-                } else if (phase == 2) {
+                } else if (phase == 2 or phase == 10) {
                     @memset(expected, 0x5a);
                     if (!memory.write(memory.context, descriptor.address, expected)) return Error.GuestMemoryWriteFailed;
                 }
-                if (phase == 4 and interior_address != null)
+                if ((phase == 4 or phase == 11) and interior_address != null)
                     try self.flushPendingGuestWrite(interior_address.?, 256)
                 else
                     try self.flushCachedStorageImage(memory, index);
@@ -30271,7 +30483,7 @@ pub const Renderer = struct {
             try std.testing.expectEqualSlices(u8, baseline[0..508], actual[0..508]);
             try std.testing.expectEqualSlices(u8, &.{ 0x22, 0x33, 0x44, 0x55 }, actual[508..]);
         }
-        std.debug.print("color/storage layout conversion passed: native bits, contained/partial producers, preserved outer bytes and CPU replacement\n", .{});
+        std.debug.print("color/storage layout conversion passed: native bits, contained/partial/interior producers, preserved outer bytes and CPU replacement\n", .{});
     }
 
     fn createCachedStorageImage(
@@ -34218,7 +34430,12 @@ pub const Renderer = struct {
         const base = self.dynamic_scalar_mapping_base orelse return Error.InvalidStorageDescriptor;
         const word_offset = slot * descriptor_scalar_stride / @sizeOf(u32);
         self.dynamic_scalar_mapping = base + word_offset;
-        @memset(self.dynamic_scalar_mapping.?[0..dynamic_scalar_buffer_words], 0);
+        // A translated pipeline can only read indices in its exact scalar
+        // specialization list. write{Graphics,Compute}ScalarValues overwrites
+        // every such word before recording the operation. Clearing the unused
+        // 66 KiB slot tail would add a full mapped-memory write per operation.
+        if (@atomicLoad(bool, &clear_unused_dynamic_scalars, .monotonic))
+            @memset(self.dynamic_scalar_mapping.?[0..dynamic_scalar_buffer_words], 0);
     }
 
     fn beginFrameDraw(self: *Renderer) (Error || std.mem.Allocator.Error)!void {
@@ -35510,7 +35727,11 @@ pub const Renderer = struct {
                 break :blk dcbWrite(context, release.address, &bytes);
             },
             3, 4 => blk: {
-                std.mem.writeInt(u64, &bytes, releaseTimestampCounter(), .little);
+                const timestamp = self.readReleaseTimestamp(null) catch |err| {
+                    self.last_sync_error = err;
+                    return false;
+                };
+                std.mem.writeInt(u64, &bytes, timestamp, .little);
                 break :blk dcbWrite(context, release.address, &bytes);
             },
             // GDS is not modelled yet. It is not the packet payload and must
@@ -35544,7 +35765,61 @@ pub const Renderer = struct {
         return true;
     }
 
-    fn tryDeferInternalRelease(self: *Renderer, release: gpu.state.ReleaseMem) Error!bool {
+    fn recordReleaseTimestamp(self: *Renderer) (Error || std.mem.Allocator.Error)!?u32 {
+        if (!@atomicLoad(bool, &native_release_timestamps, .monotonic)) return null;
+        const calibrate = self.calibrated_timestamps orelse return null;
+        if (self.release_timestamp_calibration == null) {
+            self.release_timestamp_calibration = release_clock.capture(calibrate, self.device, self.device_info.timestamp_period);
+            if (self.release_timestamp_calibration == null) {
+                self.calibrated_timestamps = null;
+                return null;
+            }
+        }
+        if (self.release_timestamp_pool == 0) {
+            const info = vk.QueryPoolCreateInfo{ .query_count = 256 };
+            if (self.device_functions.create_query_pool(self.device, &info, null, &self.release_timestamp_pool) != vk.success) {
+                self.calibrated_timestamps = null;
+                return null;
+            }
+        }
+        var free = self.release_timestamp_busy.iterator(.{ .kind = .unset });
+        const slot = free.next() orelse return Error.TimestampQueryFailed;
+        self.release_timestamp_busy.set(slot);
+        errdefer self.release_timestamp_busy.unset(slot);
+        const command = try self.beginOneShot();
+        defer self.releaseOneShot(command);
+        self.device_functions.cmd_reset_query_pool(command, self.release_timestamp_pool, @intCast(slot), 1);
+        self.device_functions.cmd_write_timestamp(command, vk.pipeline_stage_bottom_of_pipe_bit, self.release_timestamp_pool, @intCast(slot));
+        // This CP operation has no descriptor or storage-buffer consumers.
+        // Keep it open even between draw batches. submitOneShot would flush
+        // immediately when draw_batch_active is false and would incorrectly
+        // extend the lifetime of the preceding draw's storage bindings.
+        // Range reads, pool saturation and submission sealing flush this
+        // buffer through the normal timeline path before publishing labels.
+        self.open_batch_commands = true;
+        if (self.trace_gpu_completion_from_frame) |first| {
+            if (self.flip_callbacks + 1 >= first) try self.submitOneShot(command);
+        }
+        self.release_timestamp_queries +|= 1;
+        return @intCast(slot);
+    }
+
+    fn readReleaseTimestamp(self: *Renderer, query: ?u32) Error!u64 {
+        const value = if (query) |slot| value: {
+            var ticks: u64 = 0;
+            // The deferred release's timeline ticket has already retired.
+            // Never add a query WAIT here or sample the clock at publication.
+            if (self.device_functions.get_query_pool_results(self.device, self.release_timestamp_pool, slot, 1, @sizeOf(u64), &ticks, @sizeOf(u64), 1) != vk.success)
+                return Error.TimestampQueryFailed;
+            break :value (self.release_timestamp_calibration orelse return Error.TimestampQueryFailed).convert(ticks) orelse return Error.TimestampQueryFailed;
+        } else releaseTimestampCounter();
+        // Calibration uncertainty must not make a native/fallback transition
+        // move the reference clock backwards.
+        self.release_timestamp_last_value = @max(self.release_timestamp_last_value, value);
+        return self.release_timestamp_last_value;
+    }
+
+    fn tryDeferInternalRelease(self: *Renderer, release: gpu.state.ReleaseMem) (Error || std.mem.Allocator.Error)!bool {
         // Imported pages share CPU memory with queued readers, so they cannot
         // be delayed. 64-bit immediate labels and end-of-pipe interrupts are
         // queued too: the guest is told only when the label is published.
@@ -35570,12 +35845,20 @@ pub const Renderer = struct {
         }
         if (self.deferred_internal_release_count == self.deferred_internal_releases.len)
             try self.drainInternalReleases(self.deferred_internal_release_count);
-        // Internal immediate labels can share the next queue submission. A
-        // guest read or unsatisfied wait submits their pending work before
-        // publication; interrupts and timestamps keep a distinct boundary.
-        if (release.interrupt != 0 or release.data_selection >= 3)
+        const timestamp_query = if (release.data_selection == 3 or release.data_selection == 4)
+            try self.recordReleaseTimestamp()
+        else
+            null;
+        // Device queries capture their own place in the stream. Interrupts
+        // retain individual FIFO callbacks, but can share a submission too.
+        // Sealing, reads, queue saturation and unsatisfied waits all flush
+        // before publishing completion; a parked CPU cannot depend on an
+        // interrupt left indefinitely inside an unsubmitted command buffer.
+        // CPU fallback timestamps retain their existing capture boundary.
+        if ((release.interrupt != 0 and !@atomicLoad(bool, &batch_release_interrupts, .monotonic)) or
+            (release.data_selection >= 3 and timestamp_query == null))
             try self.finishDrawBatchRecording(false);
-        self.deferred_internal_releases[self.deferred_internal_release_count] = .{ .tick = self.queuedReleaseTick(), .release = release };
+        self.deferred_internal_releases[self.deferred_internal_release_count] = .{ .tick = self.queuedReleaseTick(), .release = release, .timestamp_query = timestamp_query };
         self.deferred_internal_release_count += 1;
         self.internal_releases_deferred +|= 1;
         try self.publishRetiredInternalReleases();
@@ -35696,10 +35979,11 @@ pub const Renderer = struct {
                 bytes = fixed;
             } else switch (release.data_selection) {
                 1 => std.mem.writeInt(u32, bytes[0..4], @truncate(release.data), .little),
-                3, 4 => std.mem.writeInt(u64, &bytes, releaseTimestampCounter(), .little),
+                3, 4 => std.mem.writeInt(u64, &bytes, try self.readReleaseTimestamp(pending.timestamp_query), .little),
                 else => std.mem.writeInt(u64, &bytes, release.data, .little),
             }
             if (!dcbWrite(self, release.address, bytes[0..size])) return Error.GuestMemoryWriteFailed;
+            if (pending.timestamp_query) |slot| self.release_timestamp_busy.unset(slot);
             if (pending.gds_snapshot) |snapshot| self.destroyBuffer(snapshot);
             if (pending.fixed == null and pending.gds_snapshot == null) if (self.deferred_release_observer) |observe| observe(release);
         }
@@ -38475,23 +38759,10 @@ pub const Renderer = struct {
     }
 };
 
-var fallback_release_counter: std.atomic.Value(u64) = .init(0);
-
-/// A monotonic stand-in for the GPU/system clocks sampled by RELEASE_MEM.
-///
-/// RELEASE_MEM closes and fence-waits the preceding frame batch before this
-/// invariant host counter is sampled, preserving the ordering and progress
-/// properties titles rely on. A Vulkan timestamp query can replace this value
-/// when release packets are recorded on the device queue itself.
+/// Synchronous fallback in the same 100 MHz reference-clock domain as the
+/// calibrated GPU queries. Raw host RDTSC has a different, CPU-specific rate.
 fn releaseTimestampCounter() u64 {
-    if (builtin.cpu.arch != .x86_64) return fallback_release_counter.fetchAdd(1, .monotonic) + 1;
-    var low: u32 = undefined;
-    var high: u32 = undefined;
-    asm volatile ("rdtsc"
-        : [low] "={eax}" (low),
-          [high] "={edx}" (high),
-    );
-    return (@as(u64, high) << 32) | low;
+    return release_clock.now();
 }
 
 fn registerOperand(op: gpu.ShaderOperand, kind: gpu.ShaderOperandKind, register: u32) bool {
