@@ -297,6 +297,10 @@ pub const ScalarRegister = struct {
     /// this value. Keeping these distinct is essential when a shader reuses
     /// the same SGPRs for several loads.
     producer_pc: ?u32 = null,
+    /// The backend proved this SMEM executes once before any branch in a
+    /// read-only draw and recovered every destination from this producer.
+    /// Unlike a representative scalar walk, that snapshot may replace a V#.
+    entry_buffer_snapshot: bool = false,
 };
 
 /// Places recovered SGPR values in a host-updated storage buffer instead of
@@ -11213,23 +11217,18 @@ const Builder = struct {
                 binding.resource_sgpr == registerIndex(inst.src0)) return false;
         }
 
-        // A bound V# is the source of truth for s_buffer_load. Read its live
-        // contents and range instead of baking a CPU snapshot into the module.
-        switch (inst.opcode) {
+        // Live V# contents win unless the backend proved an immutable entry
+        // read and supplies every word through the draw's scalar upload.
+        const bound_buffer = switch (inst.opcode) {
             .s_buffer_load_dword,
             .s_buffer_load_dwordx2,
             .s_buffer_load_dwordx4,
             .s_buffer_load_dwordx8,
             .s_buffer_load_dwordx16,
-            => {
-                if (self.storage_array != 0 and inst.src0.kind == .sgpr and
-                    self.storageBinding(inst.src0.reg, inst.pc) != null)
-                {
-                    return false;
-                }
-            },
-            else => {},
-        }
+            => self.storage_array != 0 and inst.src0.kind == .sgpr and
+                self.storageBinding(inst.src0.reg, inst.pc) != null,
+            else => false,
+        };
 
         // Multi-dword SMEM writes may only be replaced when every destination
         // word was recovered from this exact instruction. A final register
@@ -11246,6 +11245,7 @@ const Builder = struct {
             var found = false;
             for (self.scalar_specializations, 0..) |scalar, specialization_index| {
                 if (scalar.producer_pc == inst.pc and scalar.register == register) {
+                    if (bound_buffer and !scalar.entry_buffer_snapshot) return false;
                     values[word_index] = scalar.value;
                     specialization_indices[word_index] = specialization_index;
                     found = true;
@@ -16661,6 +16661,12 @@ test "bound s_buffer_load is not replaced by a specialised zero" {
     });
     defer builder.deinit();
     try std.testing.expect(!try builder.lowerSpecializedScalarDestination(load));
+    // A partial proof must not suppress a live load. All four words must
+    // carry the entry-block guarantee, including recovered zero values.
+    zeros[0].entry_buffer_snapshot = true;
+    try std.testing.expect(!try builder.lowerSpecializedScalarDestination(load));
+    for (&zeros) |*value| value.entry_buffer_snapshot = true;
+    try std.testing.expect(try builder.lowerSpecializedScalarDestination(load));
 }
 
 test "vector and subword MUBUF operations lower explicitly" {

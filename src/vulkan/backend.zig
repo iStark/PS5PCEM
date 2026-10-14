@@ -4696,6 +4696,7 @@ const ComputeResources = struct {
     write_extent_seen: [maximum_storage_descriptors]bool = @splat(false),
     write_extent_tracked: [maximum_storage_descriptors]bool = @splat(false),
     specialized_scalar_prefix_end: u32 = 0,
+    entry_scalar_snapshot_end: u32 = 0,
     scalar_memories: [maximum_storage_mappings]rdna2.spirv.ScalarMemoryBinding = undefined,
     scalar_memory_count: usize = 0,
     flat_memories: [maximum_storage_descriptors]rdna2.spirv.FlatMemoryBinding = undefined,
@@ -4755,6 +4756,7 @@ const ComputeResources = struct {
             ranges.count = 0;
         }
         result.specialized_scalar_prefix_end = 0;
+        result.entry_scalar_snapshot_end = 0;
         result.scalar_memory_count = 0;
         result.flat_memory_count = 0;
         result.flat_memory_fault = null;
@@ -13358,6 +13360,8 @@ pub const Renderer = struct {
         if (vertex_table != null) result.scalar_reuse_safe = false;
         var used_vertex_attributes: [maximum_vertex_attributes]bool = @splat(false);
         result.scalar_count = collectScalarLoadSpecializations(scalar, &result.scalar_registers);
+        result.entry_scalar_snapshot_end = gpu.scalar_snapshots.prefix(instructions, if (analysis.resource_checkpoints) |*plan| plan else null, specialized_scalar_prefix_end, read_only_snapshots);
+        gpu.scalar_snapshots.mark(scalar, result.scalar_registers[0..result.scalar_count], result.entry_scalar_snapshot_end);
         result.scalar_count = mergeUserDataScalars(
             bindings,
             bindings.scalar_user_data_base,
@@ -13401,6 +13405,13 @@ pub const Renderer = struct {
         var buffer_instructions = gpu.resource_checkpoints.Iterator.init(instructions, if (analysis.resource_checkpoints) |*plan| plan else null, .resource);
         while (buffer_instructions.next()) |instruction_index| {
             const candidate = &instructions[instruction_index];
+            if (result.entry_scalar_snapshot_end != 0 and gpu.scalar_snapshots.complete(candidate.*, result.scalar_registers[0..result.scalar_count])) {
+                // Keep exact draw reuse, but pin all USER_DATA for scalar-only
+                // replay: these snapshots depend on the full read capture.
+                result.scalar_reuse_safe = false;
+                _ = @atomicRmw(u64, &gpu.scalar_snapshots.entry_scalar_buffer_snapshots_used, .Add, 1, .monotonic);
+                continue;
+            }
             const is_store = switch (candidate.opcode) {
                 .buffer_load_ubyte,
                 .buffer_load_sbyte,
@@ -25001,6 +25012,9 @@ pub const Renderer = struct {
             // already filled from evaluation; merge seeds into result scalars
         }
         scalar_scratch.vertex_merge.merge(&vertex_storage.scalar_registers, &vertex_storage.scalar_count, vertex_scalar_regs[0..vertex_scalar_count]);
+        // The vertex translator/upload uses the original seeded list, unlike
+        // the fragment path which copies the prepared list back below.
+        gpu.scalar_snapshots.mark(vertex_scalar, vertex_scalar_regs[0..vertex_scalar_count], vertex_storage.entry_scalar_snapshot_end);
         if (!self.reported_vertex_storage_bindings) {
             std.debug.print("[vulkan dcb] first vertex storage mappings={d}\n", .{vertex_storage.mapping_count});
             for (vertex_storage.mappings[0..vertex_storage.mapping_count]) |mapping| {

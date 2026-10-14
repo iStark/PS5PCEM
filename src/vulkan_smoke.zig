@@ -11629,6 +11629,143 @@ fn runBufferTableProbe(allocator: std.mem.Allocator) !void {
     try runScalarBufferTableProbe(allocator);
 }
 
+fn runEntryScalarDrawProbe(allocator: std.mem.Allocator) !void {
+    const saved = gpu.scalar_snapshots.entry_scalar_buffer_snapshots;
+    defer gpu.scalar_snapshots.entry_scalar_buffer_snapshots = saved;
+    var reference: [3]u32 = undefined;
+    for ([_]bool{ false, true }) |enabled| {
+        gpu.scalar_snapshots.entry_scalar_buffer_snapshots = enabled;
+        var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true });
+        defer renderer.deinit();
+        var guest = GuestMemory{};
+        const backend = renderer.dcbBackend(guest.interface());
+        const prefix = [_]u32{
+            0xf420_0300, 0xfa00_0000, // s12 = first V#s0 constant
+            sop1(4, 0, 4), sop1(4, 2, 6), // reuse s0:s3 for the second V#
+            0xe030_0000, 0x8000_0a00, // v10 = second V#s0 constant
+        };
+        const vertex = prefix ++ [_]u32{
+            vop1(6, 1, 261),  vop1(1, 2, 242), vop2(4, 3, 1, 2),
+            vop1(1, 4, 255),  0x3f40_0000,     vop2(8, 5, 3, 4),
+            vop2(8, 6, 3, 3), vop1(1, 7, 255), 0xbfc0_0000,
+            vop2(8, 6, 6, 7), vop1(1, 8, 255), 0x3f40_0000,
+            vop2(3, 6, 6, 8), vop1(1, 9, 12),  vop2(8, 5, 9, 5),
+            vop2(8, 6, 9, 6), vop1(1, 7, 266), vop1(1, 8, 242),
+            0xf800_08cf,      0x0807_0605,     0xbf81_0000,
+        };
+        const fragment = prefix ++ [_]u32{
+            vop1(1, 0, 12), vop1(1, 1, 266), vop1(1, 2, 128), vop1(1, 3, 242),
+            0xf800_080f,    0x0302_0100,     0xbf81_0000,
+        };
+        for (vertex, 0..) |word, i| guest.word(0x700 + i * 4, word);
+        for (fragment, 0..) |word, i| guest.word(0x900 + i * 4, word);
+        var state = gpu.State{};
+        for ([_]gpu.resources.ShaderStage{ .vertex, .pixel }, [_]u32{ 7, 9 }) |stage, program| {
+            try state.writeRegister(.shader, stage.programRegisterBase(), program);
+            try state.writeRegister(.shader, stage.programRegisterBase() + 1, 0);
+            try state.writeRegister(.shader, stage.programRegisterBase() + 3, 8 << 1);
+        }
+        const context = [_][2]u32{
+            .{ 0x319, 7 }, .{ 0x31b, 0 },               .{ 0x31c, 10 << 2 },                 .{ 0x31d, 0 },
+            .{ 0x390, 0 }, .{ 0x3b0, (63 << 14) | 63 }, .{ 0x3b8, 1 << 24 },                 .{ 0x08e, 0xf },
+            .{ 0x00c, 0 }, .{ 0x00d, 64 | (64 << 16) }, .{ 0x094, 1 << 31 },                 .{ 0x095, 64 | (64 << 16) },
+            .{ 0x1e0, 0 }, .{ 0x200, 0 },               .{ 0x202, (0xcc << 16) | (1 << 4) }, .{ 0x204, 0 },
+            .{ 0x205, 0 },
+        };
+        for (context) |entry| try state.writeRegister(.context, entry[0], entry[1]);
+        for ([_]f32{ 32, 32, 32, 32, 1, 0 }, 0..) |value, i| try state.writeRegister(.context, 0x10f + @as(u32, @intCast(i)), @bitCast(value));
+        var executor = gpu.DcbExecutor{ .state = &state, .backend = backend, .allocator = allocator };
+        const before = gpu.scalar_snapshots.entry_scalar_buffer_snapshots_used;
+        for (0..3) |pass| {
+            const source: u32 = 0x10000 + @as(u32, @intCast(pass)) * 0x100;
+            guest.word(source, @bitCast(@as(f32, 1)));
+            guest.word(source + 4, @bitCast(@as(f32, @floatFromInt(pass + 1)) * 0.25));
+            guest.word(source + 8, 0);
+            for ([_]gpu.resources.ShaderStage{ .vertex, .pixel }, 0..) |stage, index| {
+                for ([_]u32{ source + @as(u32, @intCast(index)) * 4, 0, 4, 0, source + 8, 0, 4, 0 }, 0..) |word, i|
+                    try state.writeRegister(.shader, stage.userDataBase() + @as(u32, @intCast(i)), word);
+            }
+            const target = 0x2000 + pass * 0x4000;
+            try state.writeRegister(.context, 0x318, @intCast(target >> 8));
+            _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 0 });
+            if (renderer.last_draw_error) |err| return err;
+            try renderer.flushPendingGuestWrites();
+            const center = (32 * 64 + 32) * 4;
+            const expected: u32 = 0xff000000 | @as(u32, switch (pass) {
+                0 => 64,
+                1 => 128,
+                else => 191,
+            });
+            const actual = std.mem.readInt(u32, guest.bytes[target + center ..][0..4], .little);
+            if (enabled) {
+                try std.testing.expectEqual(reference[pass], actual);
+            } else {
+                try std.testing.expectEqual(expected & 0xffffff00, actual & 0xffffff00);
+                const delta = @as(i32, @intCast(actual & 255)) - @as(i32, @intCast(expected & 255));
+                try std.testing.expect(@abs(delta) <= 1);
+                reference[pass] = actual;
+            }
+        }
+        try std.testing.expectEqual(@as(u64, if (enabled) 6 else 0), gpu.scalar_snapshots.entry_scalar_buffer_snapshots_used - before);
+    }
+    std.debug.print("Entry scalar graphics passed: vertex/fragment prepared lists, reused V# registers, changed constants and relocated sources\n", .{});
+}
+
+fn runEntryScalarSnapshotProbe(allocator: std.mem.Allocator) !void {
+    const rdna2 = @import("rdna2");
+    var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true });
+    defer renderer.deinit();
+    poisonFreshScalarRing(&renderer);
+    var guest = GuestMemory{};
+    _ = renderer.dcbBackend(guest.interface());
+    const code = [_]u32{
+        0xf428_0200,                 0xfa00_0000, // s_buffer_load_dwordx4 s8, V#s0, 0
+        vop1(1, 0, 8),               vop1(1, 1, 9),
+        vop1(1, 2, 10),              vop1(1, 3, 11),
+        mubuf(0x1e, 0, 0, 0, 4)[0],  mubuf(0x1e, 0, 0, 0, 4)[1],
+        mubuf(0x0c, 0, 4, 0, 0)[0],  mubuf(0x0c, 0, 4, 0, 0)[1],
+        mubuf(0x1c, 16, 4, 0, 4)[0], mubuf(0x1c, 16, 4, 0, 4)[1],
+        0xbf81_0000,
+    };
+    var program = try rdna2.decodeProgram(allocator, &code);
+    defer program.deinit(allocator);
+    var scalars: [4]rdna2.spirv.ScalarRegister = undefined;
+    for (0..3) |proof| {
+        for (&scalars, 0..) |*value, index| value.* = .{
+            .register = @intCast(8 + index),
+            .value = 0,
+            .producer_pc = 0,
+            .entry_buffer_snapshot = proof == 2 or (proof == 1 and index == 0),
+        };
+        var module = try rdna2.translateProgramSpirv(allocator, &program, .{
+            .stage = .compute,
+            .local_size = .{ 1, 1, 1 },
+            .scalar_registers = &scalars,
+            .specialized_scalar_prefix_end = 8,
+            .dynamic_scalar_binding = .{ .binding = 2 + rdna2.spirv.maximum_storage_images },
+            .storage_buffers = &.{ .{ .resource_sgpr = 0, .descriptor_index = 0 }, .{ .resource_sgpr = 4, .descriptor_index = 1 } },
+        });
+        defer module.deinit(allocator);
+        for (0..3) |pass| {
+            const source = 0x10000 + pass * 0x100;
+            for (0..4) |word| {
+                guest.word(source + word * 4, @intCast(0xa000 + pass * 16 + word));
+            }
+            _ = try renderer.stageGuestStorageBufferAt(0, source, if (pass == 2) 6 else 16);
+            _ = try renderer.stageGuestStorageBufferAt(1, 0x11000, 20);
+            for (0..4) |word| renderer.dynamic_scalar_mapping.?[word] = if (pass == 2 and word != 0) 0 else @intCast(0xb000 + pass * 16 + word);
+            _ = try renderer.dispatchSpirv(module.words, .{ 1, 1, 1 });
+            var output: [20]u8 = undefined;
+            try renderer.readbackGuestStorageBuffer(0x11000, &output);
+            for (0..5) |word| {
+                const expected: u32 = if (word == 4) @intCast(0xa000 + pass * 16) else if (pass == 2 and word != 0) 0 else @intCast((if (proof == 2) @as(usize, 0xb000) else 0xa000) + pass * 16 + word);
+                try std.testing.expectEqual(expected, std.mem.readInt(u32, output[word * 4 ..][0..4], .little));
+            }
+        }
+    }
+    std.debug.print("Entry scalar snapshots passed: full and partial proof, dynamic updates, relocation, partial-dword bounds and live MUBUF on the same V#\n", .{});
+}
+
 fn runScalarBufferFieldsProbe(allocator: std.mem.Allocator) !void {
     var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true });
     defer renderer.deinit();
@@ -15103,6 +15240,11 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--scalar-buffer-fields")) {
         try runScalarBufferFieldsProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--entry-scalar-snapshots")) {
+        try runEntryScalarSnapshotProbe(allocator);
+        try runEntryScalarDrawProbe(allocator);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--pipeline-cache")) {

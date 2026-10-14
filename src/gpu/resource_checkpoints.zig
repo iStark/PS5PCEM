@@ -80,6 +80,9 @@ pub const Plan = struct {
     maximum_dense_step_ratio: u32 = std.math.maxInt(u32),
     graphics_interface: ?GraphicsInterface = null,
     static_calls: ?bool = null,
+    /// Only the entry block can supply unconditional, single-visit snapshots.
+    /// Manual plans deliberately provide no proof.
+    entry_block_end: u32 = 0,
 
     pub fn init(allocator: std.mem.Allocator, instructions: []const rdna2.Instruction) !Plan {
         const resource = try collect(allocator, instructions, .resource);
@@ -107,6 +110,7 @@ pub const Plan = struct {
             .maximum_dense_step_ratio = maximumDenseStepRatio(instructions.len, scalar_steps),
             .graphics_interface = GraphicsInterface.collect(instructions),
             .static_calls = rdna2.scalar_calls.present(instructions),
+            .entry_block_end = entryBlockEnd(instructions),
         };
     }
 
@@ -199,6 +203,25 @@ fn walksForward(instructions: []const rdna2.Instruction) bool {
         else => {},
     };
     return true;
+}
+
+fn entryBlockEnd(instructions: []const rdna2.Instruction) u32 {
+    for (instructions) |inst| switch (inst.opcode) {
+        .s_endpgm,
+        .s_setpc_b64,
+        .s_call_b64,
+        .s_swappc_b64,
+        .s_branch,
+        .s_cbranch_scc0,
+        .s_cbranch_scc1,
+        .s_cbranch_vccz,
+        .s_cbranch_vccnz,
+        .s_cbranch_execz,
+        .s_cbranch_execnz,
+        => return inst.pc,
+        else => {},
+    };
+    return 0;
 }
 
 test "shared scalar walk rejects loops and indirect transfers" {

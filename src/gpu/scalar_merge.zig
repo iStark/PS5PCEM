@@ -52,7 +52,7 @@ pub const Index = struct {
                 }
             }
             if (match) |index| {
-                destination[index].value = value.value;
+                destination[index] = value;
             } else if (count.* < destination.len) {
                 const index = count.*;
                 destination[index] = value;
@@ -71,7 +71,7 @@ fn linear(destination: []Register, count: *usize, incoming: []const Register) vo
         var found = false;
         for (destination[0..count.*]) |*entry| {
             if (entry.register == value.register and entry.producer_pc == value.producer_pc) {
-                entry.value = value.value;
+                entry.* = value;
                 found = true;
                 break;
             }
@@ -94,6 +94,7 @@ test "indexed scalar merge preserves first matches producer identities and full 
         .register = @intCast((i * 37) % 140),
         .producer_pc = if (i % 3 == 0) null else @as(u32, @intCast((i / 140) * 16)),
         .value = @intCast(i),
+        .entry_buffer_snapshot = i % 2 == 0,
     };
     // Deliberate duplicate keys: only the earliest destination is overwritten.
     original[21] = original[3];
@@ -101,6 +102,7 @@ test "indexed scalar merge preserves first matches producer identities and full 
     for (&incoming, 0..) |*value, i| {
         value.* = original[(i * 19) % original.len];
         value.value = @intCast(0x1000 + i);
+        value.entry_buffer_snapshot = !value.entry_buffer_snapshot;
         if (i % 7 == 0) value.producer_pc = std.math.maxInt(u32) - @as(u32, @intCast(i));
     }
     for ([_]usize{ 0, 7, 16, 128, 511, 512 }) |initial_count| {

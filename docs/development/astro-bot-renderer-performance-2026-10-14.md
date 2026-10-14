@@ -5,6 +5,12 @@ Output is 1920×1080; the game still controls its internal surface dimensions.
 Existing shader caches were retained. The 25–30 FPS target is **not reached**.
 Rendering defects remain, and controllable gameplay is not established.
 
+## Follow-up: entry scalar reads (October 15)
+
+Balanced title comparison: **14.92 versus 15.02 FPS**, with approximately 411
+buffer preparations avoided per frame. No FPS improvement is established and
+25 FPS remains unmet. [Implementation, reference review, capture and validation](astro-bot-entry-scalars-2026-10-15.md).
+
 ## Follow-up: AnyPS5 descriptor review
 
 The new warmed title run measures **14.97 FPS** over 660 frames. Scalar
