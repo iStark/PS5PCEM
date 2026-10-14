@@ -14692,6 +14692,14 @@ pub fn main(init: std.process.Init) !void {
         try runBufferReadbackProbe(allocator, vulkan.Renderer.probeInteriorBufferReadbacks, "interior");
         return;
     }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--full-image-overwrite")) {
+        try runBufferReadbackProbe(allocator, vulkan.Renderer.probeFullImageOverwrite, "full image overwrite");
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--covered-raster-initialization")) {
+        try runBufferReadbackProbe(allocator, vulkan.Renderer.probeCoveredRasterInitialization, "covered raster initialization");
+        return;
+    }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--gpu-retile")) {
         try runRendererProbe(allocator, vulkan.Renderer.probeGpuRetile);
         return;

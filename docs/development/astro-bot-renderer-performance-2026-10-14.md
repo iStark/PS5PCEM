@@ -5,6 +5,52 @@ Output is 1920×1080; the game still controls its internal surface dimensions.
 Existing shader caches were retained. The 25–30 FPS target is **not reached**.
 Rendering defects remain, and controllable gameplay is not established.
 
+## Follow-up: proven full compute-image stores
+
+A conservative shader analysis now proves rectangular output coverage from
+workgroup coordinates and every local invocation. It rejects unknown address
+maths, control flow, execution-mask changes, partial components and overlapping
+input resources. The original shader still runs; only the upload of old output
+pixels can be omitted. CPU replacement checks and untouched padding remain
+protected, and abandoned preparation cannot leave an uninitialized cache hit.
+
+Candidate 48 passes 532 GPU/Vulkan unit tests. Native immediate and batched
+probes cover complete output, padding-only CPU changes, newer CPU texel writes,
+cache reuse and abandoned preparation, without synchronization-validation
+errors. Balanced title samples measured **9.45 FPS enabled versus 9.36 FPS
+disabled**, 660 frames per setting across the same 11 animation phases.
+The path omitted one **25.38 MiB** initialization upload per frame. The observed
+FPS difference is small; it does not establish a sustained gameplay minimum,
+and the 25 FPS objective remains unmet.
+
+Candidate 49 also omits publication of an older raster image when its entire
+native backing lies inside the proven output texels. The old GPU producer stays
+available until the replacement dispatch commits; failed preparation invalidates
+only the prepared storage image. Native tests verify full coverage, abandoned
+dispatches, a producer extending beyond the output, row-padding holes and newer
+CPU writes, with immediate and batched commands. Partial coverage retains the
+normal readback. Both native overwrite suites pass synchronization validation.
+Its warmed title interval measured **9.65 FPS**. Balanced 660-frame samples
+measured **9.64 FPS enabled versus 9.67 FPS disabled**, with **zero old raster
+publications omitted**. The observed raster producers have DCC enabled, which
+the first coverage predicate conservatively excluded. These samples establish
+no game speedup from skipping old raster publication.
+
+Candidate 50 retains the same full-coverage proof for DCC-enabled raster
+sources. Ordinary publication does not publish DCC metadata; CMASK/FMASK,
+multisampling, partial coverage and padding holes still use the normal path.
+The added native DCC-flag case verifies unchanged metadata and correct pixels
+with immediate and batched submissions under Vulkan synchronization validation.
+
+The balanced title comparison now skips **one old raster publication per frame**:
+660 frames in 60.293 seconds (**10.95 FPS**) with the change, versus 660 in
+68.202 seconds (**9.68 FPS**) without it, approximately **13.1% faster**.
+Both settings retain candidate 48's 25.38 MiB/frame upload reduction. Raster
+publications fall from two to one per frame. This result covers the warmed
+animated title scene, not the crowd scene or a gameplay minimum. The 25 FPS
+target remains unmet. No new screenshot or character-control verification
+was possible while window automation was unavailable.
+
 ## Follow-up: native image layout transfers
 
 Native GPU retiling now uses the same address equations as detiling. Byte-for-byte

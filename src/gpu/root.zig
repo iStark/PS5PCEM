@@ -19,6 +19,7 @@ pub const scalar_provenance = @import("scalar_provenance.zig");
 pub const bit_sets = @import("bit_sets.zig");
 pub const bvh_snapshot = @import("bvh_snapshot.zig");
 pub const resource_checkpoints = @import("resource_checkpoints.zig");
+pub const image_write_coverage = @import("image_write_coverage.zig");
 pub const cpu_workers = @import("cpu_workers.zig");
 pub const resource_preparation = @import("resource_preparation.zig");
 pub const shader_analysis = @import("shader_analysis.zig");

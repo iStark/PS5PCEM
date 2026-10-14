@@ -246,6 +246,7 @@ pub const StageBindings = struct {
     compute_dispatch: ?struct {
         system: resources.ComputeSystemRegisters,
         group_count: [3]u32,
+        local_size: [3]u32 = .{ 1, 1, 1 },
     } = null,
 
     pub fn capture(
