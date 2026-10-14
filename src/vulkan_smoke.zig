@@ -13203,6 +13203,46 @@ noinline fn runBufferReadbackProbe(allocator: std.mem.Allocator, comptime probe:
     }
 }
 
+noinline fn runFullImageOverwriteProbe(allocator: std.mem.Allocator) !void {
+    const Memory = SizedGuestMemory(1024 * 1024);
+    const original_digest = vulkan.backend.digest_storage_overwrite_baseline;
+    defer vulkan.backend.digest_storage_overwrite_baseline = original_digest;
+    const original_direct = vulkan.backend.direct_storage_overwrite_digest;
+    defer vulkan.backend.direct_storage_overwrite_digest = original_direct;
+    for ([_]bool{ false, true }) |batch| {
+        for (0..4) |tracking| {
+            for ([_]bool{ false, true }) |digest| {
+                for ([_]bool{ false, true }) |direct| {
+                    const renderer = try allocator.create(vulkan.Renderer);
+                    defer allocator.destroy(renderer);
+                    renderer.* = try vulkan.Renderer.init(allocator, .{ .enable_validation = true, .enable_timeline_scheduler = true });
+                    defer renderer.deinit();
+                    var guest = Memory{};
+                    var memory = guest.interface();
+                    if (tracking != 0) memory.fingerprint = Memory.fingerprint;
+                    if (tracking == 3) memory.fingerprint = struct {
+                        fn decline(_: ?*anyopaque, _: u64, _: usize) ?u64 {
+                            return null;
+                        }
+                    }.decline;
+                    if (tracking == 2) {
+                        guest.watch_generation = 1;
+                        memory.track_gpu_read = Memory.track;
+                        memory.gpu_generation = Memory.generation;
+                        memory.fingerprint = Memory.fingerprint;
+                    }
+                    _ = renderer.dcbBackend(memory);
+                    renderer.draw_batch_active = batch;
+                    vulkan.backend.digest_storage_overwrite_baseline = digest;
+                    vulkan.backend.direct_storage_overwrite_digest = direct;
+                    try renderer.probeFullImageOverwrite(0x1000);
+                    std.debug.print("full image overwrite passed: batch={} tracking={d} digest={} direct={}\n", .{ batch, tracking, digest, direct });
+                }
+            }
+        }
+    }
+}
+
 noinline fn runColorStorageLayoutProbe(allocator: std.mem.Allocator) !void {
     const LayoutMemory = SizedGuestMemory(1024 * 1024);
     for ([_]bool{ false, true }) |batch| {
@@ -14697,7 +14737,7 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--full-image-overwrite")) {
-        try runBufferReadbackProbe(allocator, vulkan.Renderer.probeFullImageOverwrite, "full image overwrite");
+        try runFullImageOverwriteProbe(allocator);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--covered-raster-initialization")) {

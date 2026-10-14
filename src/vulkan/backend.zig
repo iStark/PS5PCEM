@@ -72,6 +72,10 @@ pub export var discard_overwritten_storage_images: bool = true;
 pub export var native_storage_color_initialization: bool = true;
 pub export var native_color_storage_layout: bool = true;
 pub export var native_storage_texel_hashing: bool = false;
+/// A full compute overwrite only needs a digest of the previous CPU texels,
+/// rather than a second allocation-sized snapshot. Padding is excluded.
+pub export var digest_storage_overwrite_baseline: bool = true;
+pub export var direct_storage_overwrite_digest: bool = true;
 pub export var exact_buffer_readback_ranges: bool = true;
 pub export var discard_full_image_initialization: bool = true;
 pub export var discard_covered_raster_initialization: bool = true;
@@ -4295,6 +4299,7 @@ const CachedStorageImage = struct {
     /// Original native CPU bytes for uploads detiled on the GPU. Compute the
     /// texel-only comparison lazily if a later CPU write changes this backing.
     guest_native_baseline: ?[]u8 = null,
+    guest_native_baseline_digest: ?u64 = null,
     // Cached native byte spans occupied by this view's texels. Padding is
     // deliberately absent, so CPU padding edits cannot invalidate GPU output.
     guest_native_coverage: ?[]StorageTexelSpan = null,
@@ -6012,6 +6017,10 @@ pub const Renderer = struct {
     storage_prefetch_started: u64 = 0,
     storage_prefetch_used: u64 = 0,
     storage_initial_uploads_avoided: u64 = 0,
+    storage_initial_baseline_copies_avoided: u64 = 0,
+    storage_initial_baseline_bytes_avoided: u64 = 0,
+    storage_initial_snapshot_reads_avoided: u64 = 0,
+    storage_initial_snapshot_bytes_avoided: u64 = 0,
     storage_initial_upload_bytes_avoided: u64 = 0,
     storage_initial_publications_avoided: u64 = 0,
     image_write_coverage: gpu.image_write_coverage.Cache = .{},
@@ -11736,7 +11745,7 @@ pub const Renderer = struct {
             // This shortcut bypasses normal image staging and overwrites every
             // texel. Observe a CPU update before the clear as its new backing
             // baseline, so later publication does not discard the newer clear.
-            if ((snapshot.guest_texel_hash == null and snapshot.guest_native_baseline == null) or try self.storageGuestContentsChanged(memory, resolved_storage_index)) {
+            if ((snapshot.guest_texel_hash == null and snapshot.guest_native_baseline == null and snapshot.guest_native_baseline_digest == null) or try self.storageGuestContentsChanged(memory, resolved_storage_index)) {
                 var scratch = try self.image_scratch.acquire(self.allocator, snapshot.allocation_bytes);
                 defer scratch.release();
                 if (!memory.read(memory.context, snapshot.descriptor.address, scratch.bytes)) return Error.GuestMemoryReadFailed;
@@ -21663,6 +21672,18 @@ pub const Renderer = struct {
     pub fn probeStorageMipPublication(self: *Renderer, address: u64) anyerror!void {
         for (self.storage_image_cache.items, 0..) |cached, index| {
             if (cached.valid and cached.gpu_dirty and cached.descriptor.address == address) {
+                // A digest-only overwrite baseline has no linear texel hash.
+                // The batched path must decline both a protected first mip and
+                // a protected sibling, leaving CPU-replacement checks to the
+                // ordinary per-image publisher rather than treating null as
+                // evidence that the guest never changed these texels.
+                for (self.storage_image_cache.items, 0..) |other, protected| {
+                    if (!other.valid or !other.gpu_dirty or other.descriptor.address != address) continue;
+                    const previous = other.guest_native_baseline_digest;
+                    self.storage_image_cache.items[protected].guest_native_baseline_digest = 0;
+                    defer self.storage_image_cache.items[protected].guest_native_baseline_digest = previous;
+                    try std.testing.expect(!try self.flushCachedStorageMipChain(self.guest_memory.?, index, null));
+                }
                 try std.testing.expect(try self.flushCachedStorageMipChain(self.guest_memory.?, index, null));
                 return;
             }
@@ -27642,7 +27663,7 @@ pub const Renderer = struct {
     fn storageGuestContentsChanged(self: *Renderer, memory: GuestMemory, cache_index: usize) (Error || std.mem.Allocator.Error)!bool {
         const cached = &self.storage_image_cache.items[cache_index];
         const uploaded_hash = cached.guest_texel_hash;
-        if (uploaded_hash == null and cached.guest_native_baseline == null and !cached.strict_guest_backing) return false;
+        if (uploaded_hash == null and cached.guest_native_baseline == null and cached.guest_native_baseline_digest == null and !cached.strict_guest_backing) return false;
         self.frame_profile.storage_guest_checks +|= 1;
         // Another binding may have rearmed these shared pages. Reuse its
         // observation, or arm before hashing so a racing write invalidates
@@ -27700,7 +27721,7 @@ pub const Renderer = struct {
 
     fn storageGuestAllocationChanged(self: *Renderer, snapshot: CachedStorageImage, allocation: []const u8, page_generation: u64) (Error || std.mem.Allocator.Error)!bool {
         const uploaded_hash = snapshot.guest_texel_hash;
-        if (uploaded_hash == null and snapshot.guest_native_baseline == null and !snapshot.strict_guest_backing) return false;
+        if (uploaded_hash == null and snapshot.guest_native_baseline == null and snapshot.guest_native_baseline_digest == null and !snapshot.strict_guest_backing) return false;
         self.frame_profile.storage_guest_checks +|= 1;
         if (page_generation != 0 and page_generation == snapshot.guest_page_generation) {
             self.frame_profile.storage_guest_page_hits +|= 1;
@@ -27712,6 +27733,12 @@ pub const Renderer = struct {
     }
 
     fn storageTexelsChanged(self: *Renderer, snapshot: CachedStorageImage, allocation: []const u8) (Error || std.mem.Allocator.Error)!bool {
+        if (snapshot.guest_native_baseline_digest) |digest| {
+            // This proof owns the same coverage for its complete lifetime,
+            // independently of toggling the optimization for later bindings.
+            self.storage_native_hash_comparisons +|= 1;
+            return storageOverwriteDigest(snapshot.guest_native_coverage.?, allocation) != digest;
+        }
         if (snapshot.guest_native_baseline) |baseline| if (snapshot.guest_native_coverage) |spans| {
             std.debug.assert(baseline.len == allocation.len);
             self.storage_native_comparisons +|= 1;
@@ -27735,6 +27762,27 @@ pub const Renderer = struct {
         const spans = snapshot.guest_native_coverage orelse return null;
         var hash = std.hash.Wyhash.init(0);
         for (spans) |span| hash.update(allocation[span.offset..][0..span.size]);
+        return hash.final();
+    }
+
+    /// Use identical partitioning for a local snapshot and a checked guest
+    /// fingerprint callback. Each span is bounded by the retained view layout.
+    fn storageOverwriteDigest(spans: []const StorageTexelSpan, allocation: []const u8) u64 {
+        var hash = std.hash.Wyhash.init(0);
+        for (spans) |span| {
+            const value = gpu.parallel_copy.fingerprint(allocation[span.offset..][0..span.size]);
+            hash.update(std.mem.asBytes(&value));
+        }
+        return hash.final();
+    }
+
+    fn storageOverwriteGuestDigest(memory: GuestMemory, address: u64, spans: []const StorageTexelSpan) ?u64 {
+        const fingerprint = memory.fingerprint orelse return null;
+        var hash = std.hash.Wyhash.init(0);
+        for (spans) |span| {
+            const value = fingerprint(memory.context, std.math.add(u64, address, span.offset) catch return null, span.size) orelse return null;
+            hash.update(std.mem.asBytes(&value));
+        }
         return hash.final();
     }
 
@@ -27789,6 +27837,7 @@ pub const Renderer = struct {
     }
 
     fn releaseStorageNativeBaseline(self: *Renderer, index: usize) void {
+        self.storage_image_cache.items[index].guest_native_baseline_digest = null;
         if (self.storage_image_cache.items[index].guest_native_baseline) |bytes| {
             self.storage_image_cache.items[index].guest_native_baseline = null;
             self.storage_native_baseline_bytes -= bytes.len;
@@ -27981,7 +28030,7 @@ pub const Renderer = struct {
         const first = self.storage_image_cache.items[first_index];
         if (first.descriptor.image_type != .color_2d or first.descriptor.depth_or_layers != 1 or
             first.descriptor.viewMipLevels() != 1 or first.depth_snapshot != null or
-            first.guest_native_baseline != null or first.retile_backing != null) return false;
+            first.guest_native_baseline != null or first.guest_native_baseline_digest != null or first.retile_backing != null) return false;
         var indices: [16]usize = undefined;
         var offsets: [16]usize = undefined;
         var snapshots: [16]CachedStorageImage = undefined;
@@ -27995,7 +28044,7 @@ pub const Renderer = struct {
             // Do not reorder different interpretations of overlapping bytes.
             if (count == indices.len or cached.allocation_bytes != first.allocation_bytes or
                 cached.descriptor.viewMipLevels() != 1 or cached.depth_snapshot != null or
-                cached.guest_native_baseline != null or cached.retile_backing != null) return false;
+                cached.guest_native_baseline != null or cached.guest_native_baseline_digest != null or cached.retile_backing != null) return false;
             for (snapshots[0..count]) |previous| if (!disjointStorageImageMips(previous.descriptor, cached.descriptor)) return false;
             total_bytes = std.mem.alignForward(usize, total_bytes, 256);
             indices[count] = index;
@@ -29011,6 +29060,13 @@ pub const Renderer = struct {
             }
         }
 
+        if (discard_initial and memory.fingerprint != null and
+            @atomicLoad(bool, &digest_storage_overwrite_baseline, .monotonic) and
+            @atomicLoad(bool, &direct_storage_overwrite_digest, .monotonic))
+        {
+            if (try self.tryStageStorageOverwrite(descriptor, descriptor_index, subresource, format, null, allocation_bytes, staging_bytes, 0, guest_page_generation, matching_index, matching_view)) |prepared|
+                return prepared;
+        }
         var allocation_scratch = try self.image_scratch.acquire(self.allocator, allocation_bytes);
         defer allocation_scratch.release();
         const allocation = allocation_scratch.bytes;
@@ -29025,7 +29081,7 @@ pub const Renderer = struct {
             cached.last_used_sequence = self.storage_image_sequence;
             const native_hash_current = @atomicLoad(bool, &native_storage_texel_hashing, .monotonic) and
                 if (cached.guest_native_texel_hash) |proof| cached.guest_texel_hash == proof.linear else false;
-            const same_native_texels = (cached.guest_native_baseline != null or native_hash_current) and cached.guest_native_coverage != null and
+            const same_native_texels = (cached.guest_native_baseline != null or cached.guest_native_baseline_digest != null or native_hash_current) and cached.guest_native_coverage != null and
                 !try self.storageTexelsChanged(cached.*, allocation);
             if ((guest_page_generation == 0 and cached.guest_content_hash_valid and cached.guest_content_hash == guest_content_hash) or same_native_texels) {
                 if (same_native_texels) {
@@ -29051,7 +29107,7 @@ pub const Renderer = struct {
             }
         }
         if (discard_initial) {
-            if (try self.tryStageStorageOverwrite(descriptor, descriptor_index, subresource, format, allocation, staging_bytes, guest_content_hash, guest_page_generation, matching_index, matching_view)) |prepared|
+            if (try self.tryStageStorageOverwrite(descriptor, descriptor_index, subresource, format, allocation, allocation_bytes, staging_bytes, guest_content_hash, guest_page_generation, matching_index, matching_view)) |prepared|
                 return prepared;
         }
         if (try self.tryGpuStorageDetile(descriptor, descriptor_index, writable, subresource, format, allocation, staging_bytes, guest_content_hash, guest_page_generation, matching_index, matching_view)) |prepared|
@@ -29130,35 +29186,57 @@ pub const Renderer = struct {
         descriptor_index: u32,
         subresource: gpu.TextureSubresourceLayout,
         format: StorageImageFormat,
-        allocation: []const u8,
+        allocation: ?[]const u8,
+        allocation_bytes: usize,
         staging_bytes: usize,
         guest_content_hash: u64,
         guest_page_generation: u64,
         matching_index: ?usize,
         matching_view: vk.ImageView,
     ) anyerror!?PreparedStorageImage {
-        if (!try self.reserveStorageNativeBaseline(allocation.len, matching_index)) return null;
-        const index = matching_index orelse try self.createCachedStorageImage(descriptor, subresource, format, allocation.len, staging_bytes);
+        const index = matching_index orelse try self.createCachedStorageImage(descriptor, subresource, format, allocation_bytes, staging_bytes);
         if (matching_index != null) self.storage_image_cache.items[index].pin_count += 1;
-        errdefer {
-            if (matching_index == null) self.destroyCachedStorageImage(index) else {
-                self.invalidateStorageGuestContents(index);
-                self.releaseStorageImage(index);
-            }
-        }
+        var retained = false;
+        defer if (!retained) {
+            if (matching_index == null) self.destroyCachedStorageImage(index) else self.releaseStorageImage(index);
+        };
+        errdefer if (matching_index != null) {
+            self.invalidateStorageGuestContents(index);
+        };
         try self.prepareStorageNativeCoverage(index);
-        const baseline = try self.allocator.dupe(u8, allocation);
-        const backing_hash = if (guest_page_generation == 0) guest_content_hash else gpu.parallel_copy.fingerprint(allocation);
+        const spans = self.storage_image_cache.items[index].guest_native_coverage;
+        const digest = if (@atomicLoad(bool, &digest_storage_overwrite_baseline, .monotonic) and spans != null)
+            if (allocation) |bytes| storageOverwriteDigest(spans.?, bytes) else storageOverwriteGuestDigest(self.guest_memory.?, descriptor.address, spans.?)
+        else
+            null;
+        if (allocation == null and digest == null) return null;
+        const backing_hash = if (allocation) |bytes|
+            if (guest_page_generation == 0) guest_content_hash else gpu.parallel_copy.fingerprint(bytes)
+        else
+            self.guest_memory.?.fingerprint.?(self.guest_memory.?.context, descriptor.address, allocation_bytes) orelse return null;
+        const content_hash = if (allocation == null and guest_page_generation == 0) backing_hash else guest_content_hash;
+        const baseline: ?[]u8 = if (digest == null) blk: {
+            if (!try self.reserveStorageNativeBaseline(allocation_bytes, index)) return null;
+            break :blk try self.allocator.dupe(u8, allocation.?);
+        } else null;
+        if (allocation == null) {
+            self.storage_initial_snapshot_reads_avoided +|= 1;
+            self.storage_initial_snapshot_bytes_avoided +|= allocation_bytes;
+        }
         self.releaseStorageNativeBaseline(index);
         self.releaseStorageRetileBacking(index);
         const cached = &self.storage_image_cache.items[index];
         cached.guest_native_baseline = baseline;
-        self.storage_native_baseline_bytes += baseline.len;
+        cached.guest_native_baseline_digest = digest;
+        if (baseline) |bytes| self.storage_native_baseline_bytes += bytes.len else {
+            self.storage_initial_baseline_copies_avoided +|= 1;
+            self.storage_initial_baseline_bytes_avoided +|= allocation_bytes;
+        }
         cached.strict_guest_backing = false;
         cached.guest_texel_hash = null;
         cached.guest_native_texel_hash = null;
         cached.guest_backing_hash = backing_hash;
-        cached.guest_content_hash = guest_content_hash;
+        cached.guest_content_hash = content_hash;
         cached.guest_content_hash_valid = true;
         cached.guest_page_generation = guest_page_generation;
         cached.depth_snapshot = null;
@@ -29168,12 +29246,21 @@ pub const Renderer = struct {
         self.updateStorageImageDescriptor(descriptor_index, view);
         self.storage_initial_uploads_avoided +|= 1;
         self.storage_initial_upload_bytes_avoided +|= staging_bytes;
-        return .{ .descriptor = descriptor, .subresource = subresource, .image = cached.image, .view = view, .allocation_bytes = allocation.len, .staging_bytes = staging_bytes, .writable = true, .cache_index = index, .discarded_initial_contents = true };
+        retained = true;
+        return .{ .descriptor = descriptor, .subresource = subresource, .image = cached.image, .view = view, .allocation_bytes = allocation_bytes, .staging_bytes = staging_bytes, .writable = true, .cache_index = index, .discarded_initial_contents = true };
     }
 
     pub fn probeFullImageOverwrite(self: *Renderer, address: u64) anyerror!void {
         const memory = self.guest_memory.?;
-        for (0..5) |phase| {
+        const use_digest = digest_storage_overwrite_baseline;
+        defer digest_storage_overwrite_baseline = use_digest;
+        for (0..6) |phase| {
+            digest_storage_overwrite_baseline = use_digest;
+            const coverage_bytes = self.storage_native_coverage_bytes;
+            if (phase == 5) self.storage_native_coverage_bytes = 8 * 1024 * 1024;
+            defer if (phase == 5) {
+                self.storage_native_coverage_bytes = coverage_bytes;
+            };
             var descriptor = std.mem.zeroInit(gpu.ImageDescriptor, .{ .image_type = .color_2d });
             descriptor.address = address + phase * 128 * 1024;
             descriptor.width = 65;
@@ -29203,10 +29290,18 @@ pub const Renderer = struct {
                 try std.testing.expect(memory.write(memory.context, descriptor.address, expected));
             }
             const uploaded_before = self.frame_profile.texture_upload_bytes;
+            const direct_before = self.storage_initial_snapshot_reads_avoided;
             const prepared = try self.stageStorageImageWithContents(descriptor, 0, true, true);
             try std.testing.expect(prepared.discarded_initial_contents);
             try std.testing.expectEqual(uploaded_before, self.frame_profile.texture_upload_bytes);
+            const expect_digest = use_digest and phase != 5;
+            const direct_expected = expect_digest and direct_storage_overwrite_digest and
+                if (memory.fingerprint) |fingerprint| fingerprint(memory.context, descriptor.address, expected.len) != null else false;
+            try std.testing.expectEqual(direct_before + @as(u64, if (direct_expected) 1 else 0), self.storage_initial_snapshot_reads_avoided);
             const index = prepared.cache_index.?;
+            try std.testing.expectEqual(expect_digest, self.storage_image_cache.items[index].guest_native_baseline_digest != null);
+            try std.testing.expectEqual(!expect_digest, self.storage_image_cache.items[index].guest_native_baseline != null);
+            if (phase == 2) digest_storage_overwrite_baseline = !use_digest;
             const resources = try ComputeResources.acquire(self);
             resources.storage_images[0] = prepared;
             resources.storage_image_count = 1;

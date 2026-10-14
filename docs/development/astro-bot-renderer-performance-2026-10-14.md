@@ -5,6 +5,39 @@ Output is 1920×1080; the game still controls its internal surface dimensions.
 Existing shader caches were retained. The 25–30 FPS target is **not reached**.
 Rendering defects remain, and controllable gameplay is not established.
 
+## Follow-up: CPU overwrite baselines
+
+Candidates 52–53 replace a full-image overwrite's retained CPU copy with a
+digest of its exact native texel spans. Padding stays outside that proof.
+When the embedding exposes checked guest fingerprints, the renderer computes
+the digest directly from guest memory and also avoids the intermediate read.
+Unavailable fingerprints or coverage retain the snapshot path. Aborted
+preparation invalidates the uninitialized image; digest-only images keep the
+ordinary CPU-replacement guard when publishing mip chains.
+
+Native synchronization validation passes 32 configurations covering immediate
+and batched commands, tracking enabled/disabled, unavailable fingerprints,
+coverage-budget fallback, newer CPU texels, padding and abandoned preparation.
+Covered raster initialization and resident mip-chain probes also pass. Both
+ReleaseFast builds succeed. No fresh capture or visual/control verification
+was available.
+
+The balanced candidate 52 comparison measured 660 frames in 59.002 seconds
+(**11.19 FPS**) with digest baselines, versus 60.927 seconds (**10.83 FPS**)
+with retained copies, approximately **3.3% faster**. Candidate 53 measured
+660 frames in 57.354 seconds (**11.51 FPS**) using direct guest fingerprints,
+versus 58.100 seconds (**11.36 FPS**) using a temporary snapshot. The latter
+observed difference is only **1.3%**, so it is not a strong sustained-FPS claim.
+Each enabled step eliminates a **26.125 MiB CPU copy per title frame**; this
+is separate from the already avoided GPU upload and raster readback.
+
+The subsequent descriptor survey found almost no identical complete resource
+snapshots after normalizing the moving table address. For example, the main
+material program had 271 distinct snapshots in 271 sampled input variants.
+Rebasing the table address alone would therefore not solve the remaining
+preparation cost. These observations concern the warmed title animation;
+the 25 FPS objective and controllable gameplay remain unverified.
+
 ## Follow-up: relative vector moves
 
 Candidate 51 implements M0-indexed source, destination and combined VGPR moves,
