@@ -1221,6 +1221,9 @@ pub export var trace_guest_write_min_bytes: u64 = 0;
 pub export var trace_guest_write_reports: u32 = 0;
 pub export var skip_unchanged_guest_writes: bool = true;
 pub export var parallel_guest_publications: bool = true;
+// Bounded retained aliases keep CPU write tracking armed during publication.
+pub export var alias_guest_publications: bool = true;
+pub export var guest_write_alias_bytes: u64 = 0;
 pub export var guest_write_compared_bytes: u64 = 0;
 pub export var guest_write_unchanged_bytes: u64 = 0;
 
@@ -1285,6 +1288,44 @@ fn copyChangedGuestBytesSerial(space: ?*guest_address_space.AddressSpace, destin
         @memcpy(destination[start..], source[start..]);
     }
     return unchanged;
+}
+
+test "GPU callback publication keeps watches with aliases and retains copy fallback" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    reset();
+    defer reset();
+    const size = 8 * guest_address_space.page_size;
+    const base = guest_address_space.user.start;
+    var space = try guest_address_space.AddressSpace.initWithDirectMemory(testing.allocator, size);
+    defer space.deinit();
+    memory.attachAddressSpace(&space);
+    defer memory.attachAddressSpace(null);
+    try space.mapFixed(base, size, .read_write, .direct_memory, 0);
+    space.enableGpuMemoryTracking();
+    const source = try testing.allocator.alloc(u8, size);
+    defer testing.allocator.free(source);
+    @memset(source, 0x39);
+    const old_alias = alias_guest_publications;
+    const old_equal = skip_unchanged_guest_writes;
+    defer alias_guest_publications = old_alias;
+    defer skip_unchanged_guest_writes = old_equal;
+    alias_guest_publications = true;
+    skip_unchanged_guest_writes = true;
+    const initial = try space.trackGpuRead(base, size);
+    const calls = space.gpu_tracker.protection_calls;
+    const copied = guest_write_alias_bytes;
+    try testing.expect(writeGuestMemory(&space, base, source));
+    const after = space.gpuGeneration(base, size);
+    try testing.expect(after != 0 and after != initial);
+    try testing.expectEqual(calls, space.gpu_tracker.protection_calls);
+    try testing.expectEqual(copied + size, guest_write_alias_bytes);
+    try testing.expectEqualSlices(u8, source, @as([*]const u8, @ptrFromInt(base))[0..size]);
+    alias_guest_publications = false;
+    source[0] = 0x73;
+    try testing.expect(writeGuestMemory(&space, base, source));
+    try testing.expectEqual(@as(u64, 0), space.gpuGeneration(base, size));
+    try testing.expectEqual(@as(u8, 0x73), @as(*const u8, @ptrFromInt(base)).*);
+    try testing.expectEqual(copied + size, guest_write_alias_bytes);
 }
 
 test "equal GPU publications preserve page watches and changed pages advance" {
@@ -1419,7 +1460,17 @@ pub fn writeGuestMemory(context: ?*anyopaque, address: u64, bytes: []const u8) b
     }
     const destination: [*]u8 = @ptrFromInt(resolved);
     if (bytes.len >= 64 * 1024 and @atomicLoad(bool, &skip_unchanged_guest_writes, .monotonic)) {
-        const unchanged = copyChangedGuestBytes(addressSpaceFromContext(context), destination[0..bytes.len], bytes);
+        const unchanged = publication: {
+            if (@atomicLoad(bool, &alias_guest_publications, .monotonic)) {
+                if (addressSpaceFromContext(context)) |space| {
+                    if (space.publishGpuBytes(resolved, bytes)) |equal| {
+                        _ = @atomicRmw(u64, &guest_write_alias_bytes, .Add, bytes.len, .monotonic);
+                        break :publication equal;
+                    }
+                }
+            }
+            break :publication copyChangedGuestBytes(addressSpaceFromContext(context), destination[0..bytes.len], bytes);
+        };
         _ = @atomicRmw(u64, &guest_write_compared_bytes, .Add, bytes.len, .monotonic);
         _ = @atomicRmw(u64, &guest_write_unchanged_bytes, .Add, unchanged, .monotonic);
     } else {

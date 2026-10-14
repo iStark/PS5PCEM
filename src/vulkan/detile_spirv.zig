@@ -4,6 +4,7 @@
 //! Host compute SPIR-V that detiles a GFX10 surface using ComputeDetileParams.
 
 const std = @import("std");
+const gpu = @import("gpu");
 
 const storage_uniform: u32 = 2;
 const storage_input: u32 = 1;
@@ -252,6 +253,14 @@ pub fn buildSpecialized(gpa: std.mem.Allocator, specialization: ?Specialization)
     pick_local = try b.sel(uint_ty, try b.bin(170, bool_ty, family, c5), local_64k_3d, pick_local);
     pick_local = try b.sel(uint_ty, try b.bin(170, bool_ty, family, c6), local_prt, pick_local);
     pick_local = try b.sel(uint_ty, try b.bin(170, bool_ty, family, c7), local_prt_3d, pick_local);
+    // R_X/Z_X include macro-block coordinates and the absolute array slice
+    // in their pipe XOR. Local coordinates alone silently select other texels.
+    const surface_z = try loadParam(&b, uint_ty, ptr_push_uint, params_var, 17);
+    const absolute_z = try b.bin(128, uint_ty, surface_z, z);
+    const render_local = try xorRb(&b, uint_ty, bool_ty, bpp_log, .render_target, sx, sy, absolute_z);
+    const depth_local = try xorRb(&b, uint_ty, bool_ty, bpp_log, .depth, sx, sy, absolute_z);
+    pick_local = try b.sel(uint_ty, try b.bin(170, bool_ty, family, try b.constant(uint_ty, @intFromEnum(gpu.tiling.BlockFamily.render_target_64kb))), render_local, pick_local);
+    pick_local = try b.sel(uint_ty, try b.bin(170, bool_ty, family, try b.constant(uint_ty, @intFromEnum(gpu.tiling.BlockFamily.depth_64kb))), depth_local, pick_local);
     const slice_term = try b.bin(132, uint_ty, block_z, source_slice);
     const block_term = try b.bin(132, uint_ty, block_index, block_bytes);
     const tiled = try b.bin(128, uint_ty, block_term, pick_local);
@@ -306,6 +315,32 @@ fn loadParam(b: *Builder, uint_ty: u32, ptr_ty: u32, params: u32, index: u32) st
     const value = b.id();
     try b.emit(61, &.{ uint_ty, value, ptr });
     return value;
+}
+
+/// These address equations are linear over bits. Derive their XOR basis
+/// from the shared CPU equation, avoiding a second set of AMD pattern tables.
+/// Full-image GPU tests compare mixed coordinates, not just these basis bits.
+fn xorRbBytes(b: *Builder, uint_ty: u32, mode: gpu.resources.TileMode, bytes: u8, x: u32, y: u32, z: u32) std.mem.Allocator.Error!u32 {
+    const block = gpu.tiling.SwizzleBlock.init(mode, bytes, false, 0) catch unreachable;
+    var result = try b.constant(uint_ty, 0);
+    for ([_]u32{ x, y, z }, 0..) |coordinate, axis| {
+        for (0..32) |bit_index| {
+            var point: [3]u32 = @splat(0);
+            point[axis] = @as(u32, 1) << @intCast(bit_index);
+            const mask = block.byteOffset(point[0], point[1], point[2], 0) catch unreachable;
+            if (mask == 0) continue;
+            const term = try b.bin(132, uint_ty, try bitTerm(b, uint_ty, coordinate, @intCast(bit_index), 0), try b.constant(uint_ty, mask));
+            result = try b.bin(198, uint_ty, result, term);
+        }
+    }
+    return result;
+}
+
+fn xorRb(b: *Builder, uint_ty: u32, bool_ty: u32, bpp_log: u32, mode: gpu.resources.TileMode, x: u32, y: u32, z: u32) std.mem.Allocator.Error!u32 {
+    const v4 = try xorRbBytes(b, uint_ty, mode, 4, x, y, z);
+    const v8 = try xorRbBytes(b, uint_ty, mode, 8, x, y, z);
+    const v16 = if (mode == .depth) v8 else try xorRbBytes(b, uint_ty, mode, 16, x, y, z);
+    return pickBpp(b, uint_ty, bool_ty, bpp_log, v4, v8, v16);
 }
 
 fn storeLoaded(

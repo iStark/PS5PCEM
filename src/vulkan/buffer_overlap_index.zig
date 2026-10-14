@@ -5,12 +5,21 @@
 //! occupied region levels; collisions still require the caller's exact check.
 const std = @import("std");
 
+pub export var reuse_buffer_overlap_queries: bool = true;
+
 pub fn Index(comptime capacity: usize) type {
     return struct {
         const Self = @This();
         const Slot = if (capacity < std.math.maxInt(u16)) u16 else u32;
         const empty = std.math.maxInt(Slot);
         const bucket_count = std.math.ceilPowerOfTwoAssert(usize, @max(16, capacity * 2));
+        const Query = struct {
+            epoch: u64 = 0,
+            address: u64 = 0,
+            size: usize = 0,
+            count: usize = 0,
+            result: std.StaticBitSet(capacity) = .initEmpty(),
+        };
         heads: [bucket_count]Slot = undefined,
         links: [capacity]Slot = undefined,
         level_heads: [65]Slot = undefined,
@@ -19,6 +28,39 @@ pub fn Index(comptime capacity: usize) type {
         level_counts: [65]usize = undefined,
         levels: u128 = 0,
         valid: bool = false,
+        // Only the allocation ranges are memoized. Callers still inspect the
+        // current dirty state and write intervals for every returned slot.
+        queries: ?*[256]Query = null,
+        query_epoch: u64 = 1,
+        query_hits: u64 = 0,
+        query_misses: u64 = 0,
+
+        fn rangesChanged(self: *Self) void {
+            self.query_epoch +%= 1;
+            if (self.query_epoch == 0) {
+                if (self.queries) |queries| for (queries) |*query| {
+                    query.epoch = 0;
+                };
+                self.query_epoch = 1;
+            }
+        }
+
+        pub fn deinit(self: *Self) void {
+            if (self.queries) |queries| std.heap.page_allocator.destroy(queries);
+            self.queries = null;
+        }
+
+        fn queryFor(self: *Self, address: u64, size: usize) ?*Query {
+            if (!@atomicLoad(bool, &reuse_buffer_overlap_queries, .monotonic)) return null;
+            if (self.queries == null) {
+                const queries = std.heap.page_allocator.create([256]Query) catch return null;
+                // Initialize only the validity words, without a large stack
+                // temporary. Cached bit sets are read after their first store.
+                for (queries) |*query| query.epoch = 0;
+                self.queries = queries;
+            }
+            return &self.queries.?[bucket(address ^ (@as(u64, size) *% 0x9e3779b97f4a7c15), 0) % 256];
+        }
 
         pub const Iterator = struct {
             remaining: std.StaticBitSet(capacity) = .initEmpty(),
@@ -54,12 +96,14 @@ pub fn Index(comptime capacity: usize) type {
         }
 
         pub fn invalidate(self: *Self) void {
+            self.rangesChanged();
             self.valid = false;
         }
 
         pub fn insert(self: *Self, slot: usize, address: u64, size: u64) void {
             if (!self.valid) return;
             if (slot >= capacity) return self.invalidate();
+            self.rangesChanged();
             const height = level(address, size);
             const head = &self.heads[bucket(region(address, height), height)];
             self.links[slot] = head.*;
@@ -89,6 +133,7 @@ pub fn Index(comptime capacity: usize) type {
         pub fn replace(self: *Self, slot: usize, old_address: u64, old_size: u64, address: u64, size: u64) void {
             if (!self.valid) return;
             if (slot >= capacity) return self.invalidate();
+            self.rangesChanged();
             const old_height = level(old_address, old_size);
             const old_bucket = bucket(region(old_address, old_height), old_height);
             const new_height = level(address, size);
@@ -117,6 +162,12 @@ pub fn Index(comptime capacity: usize) type {
                 self.valid = true;
                 for (items, 0..) |item, slot| self.insert(slot, item.guest_address, item.size);
             }
+            const cached_query = self.queryFor(address, size);
+            if (cached_query) |query| if (query.epoch == self.query_epoch and query.address == address and query.size == size and query.count == items.len) {
+                self.query_hits +%= 1;
+                return .{ .remaining = query.result };
+            };
+            self.query_misses +%= 1;
             // A sparse level of tiny ranges must not force a scan of every
             // allocation. Choose bucket lookup or its own list independently.
             var result = Iterator{};
@@ -147,9 +198,43 @@ pub fn Index(comptime capacity: usize) type {
                 }
             }
             // A bit set deduplicates hash collisions and preserves cache order.
+            if (cached_query) |query| query.* = .{ .epoch = self.query_epoch, .address = address, .size = size, .count = items.len, .result = result.remaining };
             return result;
         }
     };
+}
+
+test "overlap query reuse follows range mutations and preserves iterator independence" {
+    const Entry = struct { guest_address: u64, size: u64 };
+    var entries = [_]Entry{ .{ .guest_address = 0x1000, .size = 4096 }, .{ .guest_address = 0x1000, .size = 8192 } };
+    var index = Index(16){};
+    defer index.deinit();
+    var first = index.candidates(entries[0..1], 0x1100, 16);
+    try std.testing.expectEqual(@as(?usize, 0), first.next());
+    try std.testing.expectEqual(null, first.next());
+    var repeated = index.candidates(entries[0..1], 0x1100, 16);
+    try std.testing.expectEqual(@as(u64, 1), index.query_hits);
+    try std.testing.expectEqual(@as(?usize, 0), repeated.next());
+    index.insert(1, entries[1].guest_address, entries[1].size);
+    var appended = index.candidates(&entries, 0x1100, 16);
+    try std.testing.expectEqual(@as(?usize, 0), appended.next());
+    try std.testing.expectEqual(@as(?usize, 1), appended.next());
+    index.replace(0, entries[0].guest_address, entries[0].size, 0x100000, 4096);
+    entries[0].guest_address = 0x100000;
+    const changed = index.candidates(&entries, 0x1100, 16);
+    try std.testing.expect(changed.remaining.isSet(1));
+    // Oversized lookups and empty ranges never enter the memoized path.
+    const hits = index.query_hits;
+    _ = index.candidates(&entries, 0x1100, 0);
+    try std.testing.expectEqual(hits, index.query_hits);
+    index.invalidate();
+    entries[1].guest_address = 0x200000;
+    var rebuilt = index.candidates(&entries, 0x1100, 16);
+    while (rebuilt.next()) |slot| try std.testing.expect(entries[slot].guest_address > 0x1100);
+    index.query_epoch = std.math.maxInt(u64);
+    index.invalidate();
+    try std.testing.expectEqual(@as(u64, 1), index.query_epoch);
+    for (index.queries.?) |query| try std.testing.expectEqual(@as(u64, 0), query.epoch);
 }
 
 test "overlap index preserves nested ranges, boundaries, replacement and removal" {
@@ -157,6 +242,7 @@ test "overlap index preserves nested ranges, boundaries, replacement and removal
     var entries: std.ArrayList(Entry) = .empty;
     defer entries.deinit(std.testing.allocator);
     var index = Index(128){};
+    defer index.deinit();
     for (0..96) |i| try entries.append(std.testing.allocator, .{ .guest_address = 0x1000 + i * 19, .size = 1 + (i * 71) % 1200 });
     for (0..3) |round| {
         for (0..240) |i| {
@@ -189,6 +275,7 @@ test "overlap index preserves nested ranges, boundaries, replacement and removal
 test "overlap index handles high address bits, append and oversized caches" {
     const Entry = struct { guest_address: u64, size: u64 };
     var index = Index(2){};
+    defer index.deinit();
     var entries = [_]Entry{
         .{ .guest_address = 0x7ffffffffffffff0, .size = 32 },
         .{ .guest_address = 0xfffffffffffffff8, .size = 8 },
@@ -216,6 +303,7 @@ test "short writes avoid scanning a full resident cache" {
     for (&entries, 0..) |*e, i| e.* = .{ .guest_address = 0x100000 + i * 4096, .size = 128 };
     entries[4000] = .{ .guest_address = 0x100000, .size = 8 * 1024 * 1024 };
     var index = Index(4096){};
+    defer index.deinit();
     var candidates = index.candidates(&entries, entries[1200].guest_address + 56, 4);
     var checked: usize = 0;
     var narrow = false;
@@ -235,6 +323,7 @@ test "buffer-sized overlap queries avoid scanning unrelated allocations" {
     for (&entries, 0..) |*entry, i| entry.* = .{ .guest_address = 0x100000 + i * 4096, .size = 128 };
     entries[4000] = .{ .guest_address = 0x100000, .size = 8 * 1024 * 1024 };
     var index = Index(4096){};
+    defer index.deinit();
     for ([_]usize{ 128, 512, 4096 }) |size| {
         var candidates = index.candidates(&entries, entries[1200].guest_address, size);
         var checked: usize = 0;
@@ -256,6 +345,7 @@ test "a sparse tiny range does not force whole-cache overlap scans" {
     for (&entries, 0..) |*entry, i| entry.* = .{ .guest_address = 0x100000 + i * 4096, .size = 128 };
     entries[4095].size = 1;
     var index = Index(4096){};
+    defer index.deinit();
     for (0..4) |round| {
         var candidates = index.candidates(&entries, entries[1200].guest_address, 4096);
         var checked: usize = 0;

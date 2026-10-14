@@ -55,10 +55,19 @@ pub export var yotei_visibility_gpu: bool = false;
 pub export var yotei_gds_culling_gpu: bool = false;
 // Optional GPU latency samples; query results are read only on normal slot reuse.
 pub export var gpu_timestamp_profiling: bool = false;
+/// Diagnostic only: separate a recording's work from earlier overlapping
+/// submissions. This serializes GPU execution and is never enabled for FPS runs.
+pub export var gpu_timestamp_isolate_batches: bool = false;
 pub export var gpu_timestamp_min_us: u64 = 1000;
 /// Optional upper bound on CPU recording latency; zero retains unlimited
 /// batching. Submission remains asynchronous and never drops guest work.
 pub export var command_batch_max_ns: u64 = 0;
+pub export var reuse_larger_buffers: bool = true;
+/// Keep immediate GDS clears in queue order without a host round trip.
+pub export var native_gds_dma: bool = true;
+pub export var native_storage_color_initialization: bool = true;
+pub export var transient_read_only_buffers: bool = true;
+pub export var cache_vertex_index_bounds: bool = true;
 pub export var track_large_buffer_writes: bool = true;
 pub export var arm_storage_cpu_watches: bool = true;
 /// Native comparison only; experimental CFG lowering is disabled by default.
@@ -66,6 +75,9 @@ pub export var fragment_branch_loops: bool = false;
 /// Proven single short loop with forward diamonds or terminal arms; other
 /// shapes retain their established translation. Exported for native A/B runs.
 pub export var fragment_short_loops: bool = true;
+/// Drop only inactive vector values proven unobservable by the shader CFG.
+/// Kept switchable for native comparisons; participates in translation keys.
+pub export var omit_unobserved_exec_selects: bool = true;
 pub export var capture_graphics_target: u64 = 0;
 /// Keep packet/resource tracing available without synchronously copying every
 /// attachment to disk. Full image traces remain the default for existing tools.
@@ -93,6 +105,10 @@ fn traceColorPublication(target: GuestColorTarget) bool {
 // the frame. Naming them is the only way to tell an unavoidable one from a
 // surface the sampler could have read in place.
 pub export var trace_materialized_targets: bool = false;
+pub export var share_compute_resource_walks: bool = true;
+pub export var single_level_compute_detile: bool = true;
+pub export var native_color_initialization_clear: bool = true;
+pub export var native_dcc_sampled_clears: bool = true;
 /// Resource microtimers normally sample the frames printed by the periodic
 /// report. Enable every-frame timing for an explicit profiling session.
 pub export var profile_all_resource_timings: bool = false;
@@ -921,15 +937,16 @@ const ColorTargetUpload = struct {
     offset: vk.DeviceSize = 0,
     owned_buffer: ?OwnedBuffer = null,
     clear_zero: bool = false,
-    storage_volume: ?usize = null,
+    clear_color: ?vk.ClearColorValue = null,
+    storage_image: ?usize = null,
 
     fn deinit(self: ColorTargetUpload, renderer: *Renderer) void {
-        if (self.storage_volume) |index| renderer.releaseStorageImage(index);
+        if (self.storage_image) |index| renderer.releaseStorageImage(index);
         if (self.owned_buffer) |buffer| renderer.destroyBuffer(buffer);
     }
 
     fn commit(self: ColorTargetUpload, renderer: *Renderer) void {
-        if (self.storage_volume) |index| {
+        if (self.storage_image) |index| {
             // The attachment now owns the current pixels. Publishing the old
             // compute view later would restore them over subsequent raster work.
             renderer.retireStorageVolume(index);
@@ -1529,6 +1546,7 @@ const BufferPageObservation = struct {
 };
 
 const buffer_write_ranges = @import("buffer_write_ranges.zig");
+const buffer_upload_chunks = @import("buffer_upload_chunks.zig");
 
 /// A guest index range kept in its own buffer while its pages stay unchanged.
 const CachedIndexBuffer = struct {
@@ -2135,10 +2153,45 @@ const GuestDraw = struct {
 const maximum_guest_draw_elements: u32 = 1 << 28;
 const maximum_guest_draw_instances: u32 = 1 << 20;
 
-/// Rejects corrupted/stale indirect arguments before shader resource staging.
-/// A multi-billion-element command cannot complete before the Windows GPU
-/// watchdog and often makes the backend copy equally implausible descriptor
-/// extents first. Zero-sized commands remain valid Vulkan no-ops.
+/// Only invalidate planes that this draw can modify. Read-only depth tests
+/// must not discard a storage snapshot of unchanged depth or stencil data.
+fn depthDrawWriteAspects(state: GraphicsPipelineState, draw: GuestDraw) u32 {
+    if (draw.instance_count == 0 or (draw.index_count orelse draw.vertex_count) == 0) return 0;
+    var aspects: u32 = if (state.depth_write_enable != 0) vk.image_aspect_depth_bit else 0;
+    if (state.stencil_test_enable != 0) {
+        const front = state.stencil_front_write_mask & 0xff != 0 and
+            (state.stencil_front_fail != vk.stencil_op_keep or state.stencil_front_pass != vk.stencil_op_keep or state.stencil_front_depth_fail != vk.stencil_op_keep);
+        const back = state.stencil_back_write_mask & 0xff != 0 and
+            (state.stencil_back_fail != vk.stencil_op_keep or state.stencil_back_pass != vk.stencil_op_keep or state.stencil_back_depth_fail != vk.stencil_op_keep);
+        if (front or back) aspects |= vk.image_aspect_stencil_bit;
+    }
+    return aspects;
+}
+
+test "depth and stencil snapshot invalidation follows possible raster writes" {
+    var state = GraphicsPipelineState.default(32, 32);
+    const draw = GuestDraw{ .vertex_count = 3 };
+    try std.testing.expectEqual(@as(u32, 0), depthDrawWriteAspects(state, draw));
+    state.depth_write_enable = 1;
+    try std.testing.expectEqual(vk.image_aspect_depth_bit, depthDrawWriteAspects(state, draw));
+    state.stencil_test_enable = 1;
+    state.stencil_front_write_mask = 0xff;
+    try std.testing.expectEqual(vk.image_aspect_depth_bit, depthDrawWriteAspects(state, draw));
+    state.stencil_front_depth_fail = vk.stencil_op_replace;
+    try std.testing.expectEqual(vk.image_aspect_depth_bit | vk.image_aspect_stencil_bit, depthDrawWriteAspects(state, draw));
+    state.depth_write_enable = 0;
+    try std.testing.expectEqual(vk.image_aspect_stencil_bit, depthDrawWriteAspects(state, draw));
+    state.stencil_front_write_mask = 0;
+    state.stencil_back_pass = vk.stencil_op_replace;
+    state.stencil_back_write_mask = 0xff;
+    try std.testing.expectEqual(vk.image_aspect_stencil_bit, depthDrawWriteAspects(state, draw));
+    try std.testing.expectEqual(@as(u32, 0), depthDrawWriteAspects(state, .{ .vertex_count = 0 }));
+    try std.testing.expectEqual(@as(u32, 0), depthDrawWriteAspects(state, .{ .vertex_count = 3, .index_count = 0 }));
+    try std.testing.expectEqual(@as(u32, 0), depthDrawWriteAspects(state, .{ .vertex_count = 3, .instance_count = 0 }));
+}
+
+/// Reject corrupted indirect arguments before resource staging. Zero-sized
+/// commands remain valid Vulkan no-ops.
 fn guestDrawWithinExecutionLimits(draw: GuestDraw) bool {
     const elements = draw.index_count orelse draw.vertex_count;
     return elements <= maximum_guest_draw_elements and
@@ -2884,7 +2937,13 @@ const CachedDepthTarget = struct {
     shader_read_layout: bool = false,
     gpu_generation: u64 = 0,
     host_generation: u64 = 0,
+    depth_content_generation: u64 = 0,
+    stencil_content_generation: u64 = 0,
     last_used_sequence: u64 = 0,
+
+    fn planeGeneration(self: CachedDepthTarget, aspect: u32) u64 {
+        return if (aspect == vk.image_aspect_stencil_bit) self.stencil_content_generation else self.depth_content_generation;
+    }
 };
 
 /// A render pass and framebuffer pairing one colour attachment with one depth
@@ -3161,6 +3220,8 @@ const FrameProfile = struct {
     upload_bytes: u64 = 0,
     readback_bytes: u64 = 0,
     storage_upload_bytes: u64 = 0,
+    partial_storage_uploads: u64 = 0,
+    partial_storage_upload_avoided_bytes: u64 = 0,
     storage_readback_bytes: u64 = 0,
     known_fill_publication_bytes: u64 = 0,
     buffer_transfer_readback_bytes: u64 = 0,
@@ -3169,6 +3230,14 @@ const FrameProfile = struct {
     storage_sparse_readbacks: u64 = 0,
     storage_sparse_avoided_bytes: u64 = 0,
     storage_image_readbacks: u64 = 0,
+    depth_storage_copies: u64 = 0,
+    depth_storage_copy_bytes: u64 = 0,
+    depth_storage_reuses: u64 = 0,
+    mip_cpu_reloads: u64 = 0,
+    mip_cpu_reload_bytes: u64 = 0,
+    mip_chain_creates: u64 = 0,
+    mip_chain_reuses: u64 = 0,
+    mip_chain_level_copies: u64 = 0,
     storage_discarded_readbacks: u64 = 0,
     storage_discarded_readback_bytes: u64 = 0,
     storage_guest_checks: u64 = 0,
@@ -3328,6 +3397,10 @@ const FrameProfile = struct {
     graphics_scalar_upload_ns: u64 = 0,
     graphics_record_ns: u64 = 0,
     draw_reuse_hits: u64 = 0,
+    transient_buffer_uploads: u64 = 0,
+    transient_buffer_bytes: u64 = 0,
+    index_bounds_hits: u64 = 0,
+    index_bounds_misses: u64 = 0,
     dynamic_state_commands: u64 = 0,
     dynamic_state_avoided: u64 = 0,
     pipeline_binds: u64 = 0,
@@ -3525,6 +3598,26 @@ fn colorTargetBackingRange(target: GuestColorTarget) ColorBackingRange {
 
 /// A typed storage view identifies exactly which mip and array slices a
 /// consumer needs, including bit-preserving FLOAT/UINT reinterpretations.
+fn storageColorInitializationLayoutsMatch(target: GuestColorTarget, descriptor: gpu.ImageDescriptor, view: gpu.TextureSubresourceLayout) bool {
+    if (target.descriptor.resource_type == 2) {
+        const layout = target.layout.subresource orelse return false;
+        return descriptor.image_type == .color_3d and std.meta.eql(layout, view);
+    }
+    // A same-address image is insufficient: pitches, mip tails and swizzles
+    // can name different texels. Prove both the storage subresource and the
+    // ordinary raster surface equation for a complete single-level 2D view.
+    if (target.descriptor.resource_type != 1 or descriptor.image_type != .color_2d or
+        target.layout.layers != 1 or target.layout.first_slice != 0 or
+        target.descriptor.maximum_mip != 0 or target.descriptor.mip_level != 0 or
+        descriptor.base_array != 0 or descriptor.depth_or_layers != 1 or
+        descriptor.viewBaseLevel() != 0 or descriptor.resourceMipLevels() != 1) return false;
+    const surface = gpu.SurfaceLayout.fromImage(descriptor) catch return false;
+    if (!std.meta.eql(surface, target.layout)) return false;
+    const texture = gpu.TextureLayout.fromColorTarget(target.descriptor) catch return false;
+    const subresource = texture.subresource(0, 0, 1) catch return false;
+    return std.meta.eql(view, subresource);
+}
+
 fn colorTargetMatchesStorageView(target: GuestColorTarget, descriptor: gpu.ImageDescriptor, view: gpu.TextureSubresourceLayout) bool {
     if (!sampledViewAliasesColorTarget(descriptor, target) or
         target.descriptor.fragments_log2 != 0 or target.descriptor.samples_log2 != 0 or
@@ -3533,6 +3626,41 @@ fn colorTargetMatchesStorageView(target: GuestColorTarget, descriptor: gpu.Image
     const source = target.layout.subresource orelse return false;
     return source.kind == view.kind and source.block.family == view.block.family and
         source.source_layer_bytes == view.source_layer_bytes and source.level_offset == view.level_offset;
+}
+
+test "storage color initialization requires identical full 2D addressing" {
+    var color = std.mem.zeroes(gpu.resources.ColorTarget);
+    color.address = 0x10000;
+    color.resource_type = 1;
+    color.width = 37;
+    color.height = 23;
+    color.format = 10;
+    color.tile_mode = .render_target;
+    var descriptor = std.mem.zeroInit(gpu.ImageDescriptor, .{ .image_type = .color_2d });
+    descriptor.address = color.address;
+    descriptor.width = color.width;
+    descriptor.height = color.height;
+    descriptor.depth_or_layers = 1;
+    descriptor.pitch = color.width;
+    descriptor.tile_mode = color.tile_mode;
+    descriptor.unified_format = 56;
+    descriptor.extended = true;
+    const target = try guestColorTarget(color);
+    const texture = try gpu.TextureLayout.fromImage(descriptor);
+    const view = try texture.subresource(0, 0, 1);
+    try std.testing.expect(storageColorInitializationLayoutsMatch(target, descriptor, view));
+    var changed = descriptor;
+    changed.pitch = 1024;
+    try std.testing.expect(!storageColorInitializationLayoutsMatch(target, changed, view));
+    changed = descriptor;
+    changed.tile_mode = .standard_64kb;
+    try std.testing.expect(!storageColorInitializationLayoutsMatch(target, changed, view));
+    changed = descriptor;
+    changed.max_mip = 2;
+    try std.testing.expect(!storageColorInitializationLayoutsMatch(target, changed, view));
+    var partial_view = view;
+    partial_view.level_offset = 256;
+    try std.testing.expect(!storageColorInitializationLayoutsMatch(target, descriptor, partial_view));
 }
 
 const ColorPublicationBaseline = struct {
@@ -3910,6 +4038,13 @@ const SampledStagingLayout = union(enum) {
             .subresource => |layout| try layout.detile(source, destination),
         };
     }
+
+    fn gpuView(self: SampledStagingLayout) gpu.tiling.Error!gpu.TextureSubresourceLayout {
+        return switch (self) {
+            .surface => |layout| try layout.subresourceView(),
+            .subresource => |layout| layout,
+        };
+    }
 };
 
 /// First-use sampled upload of one T# view: the guest mip range packed into a
@@ -4043,6 +4178,7 @@ const CachedStorageImage = struct {
     subresource: gpu.TextureSubresourceLayout,
     image: OwnedImage,
     view: vk.ImageView,
+    mutable_format: bool = false,
     allocation_bytes: usize,
     staging_bytes: usize,
     last_used_sequence: u64,
@@ -4115,6 +4251,12 @@ const MipChainSource = struct {
     width: u32,
     height: u32,
     restore: image_state.Usage,
+    generation: u64,
+
+    fn sameContents(a: MipChainSource, b: MipChainSource) bool {
+        return a.generation != 0 and a.generation == b.generation and a.image == b.image and
+            a.width == b.width and a.height == b.height;
+    }
 };
 
 const AssembledMipChain = struct {
@@ -4129,6 +4271,9 @@ const AssembledMipChain = struct {
     signature: u64,
     image: OwnedImage,
     view: vk.ImageView,
+    // Prepared consumers in this descriptor batch have not all been recorded.
+    last_used_batch: u64 = 0,
+    sources: [maximum_assembled_mip_levels]MipChainSource,
 };
 
 const ColorVolumeSnapshot = struct {
@@ -4660,6 +4805,29 @@ fn isFullscreenCornerTriangle(
 const DrawVertexRange = struct {
     minimum: i64,
     maximum: i64,
+};
+
+const IndexBoundsCache = struct {
+    const Key = struct { address: u64, count: u32, uint32: bool };
+    const Entry = struct { key: Key = .{ .address = 0, .count = 0, .uint32 = false }, generation: u64 = 0, range: DrawVertexRange = .{ .minimum = 0, .maximum = 0 } };
+    entries: [2048]Entry = @splat(.{}),
+
+    fn slot(self: *IndexBoundsCache, key: Key) *Entry {
+        var hash = std.hash.Wyhash.init(0);
+        std.hash.autoHash(&hash, key);
+        return &self.entries[hash.final() % self.entries.len];
+    }
+
+    fn find(self: *IndexBoundsCache, key: Key, generation: u64) ?DrawVertexRange {
+        if (generation == 0) return null;
+        const entry = self.slot(key);
+        return if (entry.generation == generation and std.meta.eql(entry.key, key)) entry.range else null;
+    }
+
+    fn remember(self: *IndexBoundsCache, key: Key, generation: u64, range: DrawVertexRange) void {
+        if (generation == 0) return;
+        self.slot(key).* = .{ .key = key, .generation = generation, .range = range };
+    }
 };
 
 // Keep the decisions made by validateVertexIndexMappings, including attributes
@@ -5485,6 +5653,7 @@ pub const Renderer = struct {
         programs: [2]u64 = @splat(0),
         frame: u64 = 0,
         caller: usize = 0,
+        isolated: bool = false,
     } = @splat(.{}),
     pending_command_buffers: std.ArrayList(vk.CommandBuffer) = .empty,
     pending_command_slots: std.ArrayList(usize) = .empty,
@@ -5554,6 +5723,7 @@ pub const Renderer = struct {
     direct_detile_uploads: bool = true,
     device_detile_sources: bool = false,
     direct_detile_upload_count: u64 = 0,
+    sampled_native_clear_count: u64 = 0,
     detile_fallback_reports: u32 = 0,
     detile_pipeline_layout: vk.PipelineLayout = 0,
     detile_pipeline: vk.Pipeline = 0,
@@ -5660,7 +5830,7 @@ pub const Renderer = struct {
     magnify_source_height: u32 = 0,
     magnify_source_format: u32 = 0,
     guest_buffers: std.ArrayList(GuestBufferEntry) = .empty,
-    write_extent_slots: std.ArrayList(struct { buffer: OwnedBuffer, used: bool }) = .empty,
+    write_extent_slots: std.ArrayList(struct { buffer: OwnedBuffer, readback: OwnedBuffer, used: bool }) = .empty,
     // Account retained backing capacity when ownership changes. Budget checks
     // run on every cache miss; rescanning thousands of entries there made a
     // streaming frame quadratic in the number of retained ranges.
@@ -5679,9 +5849,13 @@ pub const Renderer = struct {
     active_storage_source_hashes: [maximum_storage_descriptors]?u64 = @splat(null),
     active_storage_cache_indices: [maximum_storage_descriptors]?usize = @splat(null),
     guest_buffer_sequence: u64 = 0,
+    index_bounds_cache: IndexBoundsCache = .{},
+    buffer_upload_chunk_cache: buffer_upload_chunks.Cache = .{},
     gds_storage: std.ArrayList(u8) = .empty,
     gds_host_dirty: bool = true,
     gds_gpu_dirty: bool = false,
+    gds_dma_fills: u64 = 0,
+    storage_color_initializations: u64 = 0,
     retain_gds_on_gpu: bool = true,
     compute_pipelines: std.ArrayList(ComputePipelineEntry) = .empty,
     compute_pipeline_sequence: u64 = 0,
@@ -5702,6 +5876,8 @@ pub const Renderer = struct {
     sampled_image_cache: std.ArrayList(CachedSampledImage) = .empty,
     sampled_image_cache_bytes: u64 = 0,
     sampled_image_cache_budget_bytes: u64 = 2 * 1024 * 1024 * 1024,
+    sampled_image_cache_configured_budget_bytes: u64 = 2 * 1024 * 1024 * 1024,
+    sampled_image_budget_recovery: @import("cache_budget_recovery.zig").Recovery = .{},
     image_memory_reclaims: u64 = 0,
     image_memory_reclaimed_bytes: u64 = 0,
     sampled_image_batch: u64 = 0,
@@ -5715,6 +5891,7 @@ pub const Renderer = struct {
     // depth bridges are ordered transfers, so they share one high-water buffer
     // instead of retaining a host mirror for every cached image.
     storage_image_transfer: ?OwnedBuffer = null,
+    storage_depth_transfer: ?OwnedBuffer = null,
     storage_image_address_index: @import("sampled_image_index.zig").Index(maximum_cached_storage_images) = .{},
     storage_image_cache_bytes: usize = 0,
     storage_image_cache_limit: usize = 1280 * 1024 * 1024,
@@ -5753,6 +5930,7 @@ pub const Renderer = struct {
     reported_mrt_draw: bool = false,
     depth_targets: std.ArrayList(CachedDepthTarget) = .empty,
     depth_target_sequence: u64 = 0,
+    depth_content_sequence: u64 = 0,
     reported_depth_attachment: bool = false,
     depth_only_draw_reports: u8 = 0,
     reset_depth_extent_reports: u8 = 0,
@@ -6665,6 +6843,7 @@ pub const Renderer = struct {
             .storage_image_cache_limit = options.storage_image_cache_limit,
             .device_detile_sources = options.device_detile_sources,
             .sampled_image_cache_budget_bytes = options.sampled_image_cache_budget_bytes,
+            .sampled_image_cache_configured_budget_bytes = options.sampled_image_cache_budget_bytes,
             .compute_translations = .{ .maximum_bytes = options.compute_translation_cache_limit },
             .graphics_translations = .{ .maximum_bytes = options.graphics_translation_cache_limit },
             .persistent_host_mappings = options.persistent_host_mappings,
@@ -6735,7 +6914,7 @@ pub const Renderer = struct {
         @memset(renderer.gds_storage.items, 0);
         renderer.gds_buffer = try renderer.createBufferWithMemoryPreference(
             gds_slot_bytes,
-            vk.buffer_usage_storage_buffer_bit,
+            vk.buffer_usage_storage_buffer_bit | vk.buffer_usage_transfer_dst_bit,
             vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit,
             vk.memory_property_host_cached_bit,
         );
@@ -6808,6 +6987,7 @@ pub const Renderer = struct {
         }
         self.storage_image_cache.deinit(self.allocator);
         if (self.storage_image_transfer) |buffer| self.destroyBuffer(buffer);
+        if (self.storage_depth_transfer) |buffer| self.destroyBuffer(buffer);
         self.image_aliases.deinit(self.allocator);
         self.image_states.deinit(self.allocator);
         for (self.compute_pipelines.items) |entry| {
@@ -6843,7 +7023,10 @@ pub const Renderer = struct {
             if (entry.host_transfer) |transfer| self.destroyBuffer(transfer);
         }
         self.guest_buffers.deinit(self.allocator);
-        for (self.write_extent_slots.items) |slot| self.destroyBuffer(slot.buffer);
+        for (self.write_extent_slots.items) |slot| {
+            self.destroyBuffer(slot.buffer);
+            self.destroyBuffer(slot.readback);
+        }
         self.write_extent_slots.deinit(self.allocator);
         for (self.retired_storage_buffers.items) |entry| self.destroyBuffer(entry.buffer);
         self.retired_storage_buffers.deinit(self.allocator);
@@ -6903,6 +7086,7 @@ pub const Renderer = struct {
         self.device_functions.destroy_device(self.device, null);
         self.instance_functions.destroy_instance(self.instance_handle, null);
         self.loader.deinit();
+        self.guest_buffer_overlap_index.deinit();
         self.* = undefined;
     }
 
@@ -7768,6 +7952,92 @@ pub const Renderer = struct {
         if (reclaimed) try self.waitForSubmittedWork();
     }
 
+    fn storageChunkKey(entry: *const GuestBufferEntry, generation: u64) buffer_upload_chunks.Key {
+        return .{ .address = entry.guest_address, .size = @intCast(entry.size), .buffer = entry.device_local.handle, .content_epoch = entry.last_written_sequence, .page_generation = generation };
+    }
+
+    fn observeStorageChunks(memory: GuestMemory, entry: *const GuestBufferEntry, generation: u64, snapshot: *buffer_upload_chunks.Snapshot) bool {
+        if (generation == 0) return false;
+        const count = buffer_upload_chunks.count(@intCast(entry.size)) orelse return false;
+        const query = memory.gpu_generation orelse return false;
+        snapshot.key = storageChunkKey(entry, generation);
+        for (0..count) |index| {
+            const first = index * buffer_upload_chunks.chunk_bytes;
+            const bytes = @min(buffer_upload_chunks.chunk_bytes, entry.size - first);
+            const value = query(memory.context, entry.guest_address + first, bytes);
+            if (value == 0) return false;
+            snapshot.generations[index] = value;
+        }
+        return query(memory.context, entry.guest_address, @intCast(entry.size)) == generation;
+    }
+
+    fn rememberStorageChunks(self: *Renderer, memory: GuestMemory, entry: *const GuestBufferEntry) void {
+        var snapshot = buffer_upload_chunks.Snapshot{};
+        if (observeStorageChunks(memory, entry, entry.page_generation, &snapshot))
+            self.buffer_upload_chunk_cache.remember(&snapshot);
+    }
+
+    fn uploadChangedStorageChunks(self: *Renderer, memory: GuestMemory, entry: *GuestBufferEntry, generation: u64) (Error || std.mem.Allocator.Error)!bool {
+        if (entry.gpu_dirty or entry.device_local.host_mapping != null or
+            (!self.draw_uploads_enabled and !self.storageUploadUsesRing(entry))) return false;
+        const count = buffer_upload_chunks.count(@intCast(entry.size)) orelse return false;
+        const previous = self.buffer_upload_chunk_cache.find(storageChunkKey(entry, entry.page_generation)) orelse return false;
+        var current = buffer_upload_chunks.Snapshot{};
+        if (!observeStorageChunks(memory, entry, generation, &current)) return false;
+        const changed = buffer_upload_chunks.changes(previous.generations[0..count], current.generations[0..count], @intCast(entry.size)) orelse return false;
+        const spans = changed.spans[0..changed.count];
+        var total: usize = 0;
+        for (spans) |span| total += span.end - span.first;
+        // Heavily rewritten inputs use the existing contiguous copy path.
+        if (total > entry.size / 2) return false;
+        if (total != 0) {
+            // The ring owns only changed bytes. Queue-ordered copies preserve
+            // earlier shader readers and every untouched byte in the backing.
+            const upload = try self.allocateDrawUpload(total);
+            const mapping = try self.mapDrawUpload(upload);
+            defer mapping.release(self);
+            var copies: [buffer_write_ranges.capacity]vk.BufferCopy = undefined;
+            var offset: usize = 0;
+            for (spans, 0..) |span, index| {
+                const bytes = span.end - span.first;
+                if (!memory.read(memory.context, entry.guest_address + span.first, mapping.bytes[offset..][0..bytes]))
+                    return Error.GuestMemoryReadFailed;
+                copies[index] = .{ .source_offset = upload.offset + offset, .destination_offset = span.first, .size = bytes };
+                offset += bytes;
+            }
+            // A CPU write or a lost page watch during this snapshot invalidates
+            // the entire reuse proof. No partial GPU copy has been recorded yet.
+            if (memory.gpu_generation.?(memory.context, entry.guest_address, @intCast(entry.size)) != generation) return false;
+            errdefer {
+                entry.page_generation = 0;
+                entry.content_hash = null;
+            }
+            const command_buffer = try self.beginOneShot();
+            defer self.releaseOneShot(command_buffer);
+            const before = [_]vk.BufferMemoryBarrier{
+                .{ .source_access_mask = vk.access_memory_read_bit | vk.access_memory_write_bit, .destination_access_mask = vk.access_transfer_write_bit, .buffer = entry.device_local.handle, .offset = 0, .size = entry.size },
+                .{ .source_access_mask = vk.access_host_write_bit, .destination_access_mask = vk.access_transfer_read_bit, .buffer = upload.buffer, .offset = upload.offset, .size = total },
+            };
+            self.device_functions.cmd_pipeline_barrier(command_buffer, vk.pipeline_stage_all_commands_bit | vk.pipeline_stage_host_bit, vk.pipeline_stage_transfer_bit, 0, 0, null, before.len, &before, 0, null);
+            self.device_functions.cmd_copy_buffer(command_buffer, upload.buffer, entry.device_local.handle, @intCast(spans.len), &copies);
+            const ready = vk.BufferMemoryBarrier{ .source_access_mask = vk.access_transfer_write_bit, .destination_access_mask = vk.access_shader_read_bit | vk.access_shader_write_bit, .buffer = entry.device_local.handle, .offset = 0, .size = entry.size };
+            self.device_functions.cmd_pipeline_barrier(command_buffer, vk.pipeline_stage_transfer_bit, vk.pipeline_stage_all_commands_bit, 0, 0, null, 1, @ptrCast(&ready), 0, null);
+            entry.last_gpu_use = command_buffer_pending_tick;
+            self.advanceGuestBufferContents(entry);
+            try self.submitOneShot(command_buffer);
+            self.buffer_uploads += 1;
+            self.frame_profile.upload_bytes +%= total;
+            self.frame_profile.storage_upload_bytes +%= total;
+            entry.content_hash = null;
+        }
+        entry.page_generation = generation;
+        current.key = storageChunkKey(entry, generation);
+        self.buffer_upload_chunk_cache.remember(&current);
+        self.frame_profile.partial_storage_uploads +|= 1;
+        self.frame_profile.partial_storage_upload_avoided_bytes +|= entry.size - total;
+        return true;
+    }
+
     fn uploadStorageBacking(self: *Renderer, entry: *GuestBufferEntry, size: usize, upload: ?DrawUploadSlice) (Error || std.mem.Allocator.Error)!void {
         self.traceBufferLifetime("upload", entry.guest_address, size, null, entry.write_origin);
         if (entry.host_transfer == null and upload == null) return;
@@ -7863,6 +8133,100 @@ pub const Renderer = struct {
     /// Uploads one exact guest range and publishes it at a stable element of
     /// set 0 / binding 0. Descriptor-array identity is independent from the
     /// allocation cache, so slots can be rebound between dispatches.
+    var tmp_big_reports: u32 = 0;
+    const TmpChunks = struct { address: u64 = 0, size: usize = 0, gens: [1024]u64 = @splat(0) };
+    var tmp_chunks: [16]TmpChunks = @splat(.{});
+    fn tmpChunkChanges(self: *Renderer, address: u64, size: usize) [2]u32 {
+        const memory = self.guest_memory orelse return .{ 0, 0 };
+        const generation = memory.gpu_generation orelse return .{ 0, 0 };
+        const chunk: usize = 64 * 1024;
+        const count = @min((size + chunk - 1) / chunk, 1024);
+        var slot: ?*TmpChunks = null;
+        for (&tmp_chunks) |*entry| {
+            if (entry.address == address and entry.size == size) slot = entry;
+        }
+        var fresh = false;
+        if (slot == null) {
+            for (&tmp_chunks) |*entry| {
+                if (entry.address == 0) {
+                    entry.* = .{ .address = address, .size = size };
+                    slot = entry;
+                    fresh = true;
+                    break;
+                }
+            }
+        }
+        const table = slot orelse return .{ 0, @intCast(count) };
+        var changed: u32 = 0;
+        for (0..count) |index| {
+            const first = index * chunk;
+            const length = @min(chunk, size - first);
+            const value = generation(memory.context, address + first, length);
+            if (!fresh and value != table.gens[index]) changed += 1;
+            table.gens[index] = value;
+        }
+        return .{ changed, @intCast(count) };
+    }
+    fn tmpReportBigUpload(self: *Renderer, address: u64, size: usize, site: u8) void {
+        if (size < 4 * 1024 * 1024 or self.flip_callbacks < 600 or tmp_big_reports >= 400) return;
+        const chunks = self.tmpChunkChanges(address, size);
+        if (self.flip_callbacks % 120 == 2) std.debug.print("[tmp chunks] flip={d} addr=0x{x} size={d} changed={d}/{d}\n", .{ self.flip_callbacks, address, size, chunks[0], chunks[1] });
+        if (self.flip_callbacks % 120 != 0 and self.flip_callbacks % 120 != 1) return;
+        tmp_big_reports += 1;
+        var images: u32 = 0;
+        var dirty_images: u32 = 0;
+        for (self.storage_image_cache.items) |cached| {
+            if (!cached.valid or !byteRangesOverlap(address, size, cached.descriptor.address, cached.allocation_bytes)) continue;
+            images += 1;
+            if (cached.gpu_dirty) dirty_images += 1;
+        }
+        var targets: u32 = 0;
+        for (self.render_targets.items) |cached| {
+            const bytes = colorTargetFrameBytes(cached.target) catch continue;
+            if (byteRangesOverlap(address, size, cached.target.descriptor.address, bytes)) targets += 1;
+        }
+        var buffers: u32 = 0;
+        var dirty_buffers: u32 = 0;
+        for (self.guest_buffers.items) |entry| {
+            if (entry.guest_address == address and entry.size == size) continue;
+            if (!byteRangesOverlap(address, size, entry.guest_address, entry.size)) continue;
+            buffers += 1;
+            if (entry.gpu_dirty) dirty_buffers += 1;
+        }
+        std.debug.print("[tmp big upload] flip={d} addr=0x{x} size={d} site={d} program=0x{x} draws={d} images={d}/{d} targets={d} buffers={d}/{d}\n", .{ self.flip_callbacks, address, size, site, self.last_compute_program, self.frame_profile.draws, images, dirty_images, targets, buffers, dirty_buffers });
+    }
+
+    /// Small read-only constants need a snapshot for this operation, not a
+    /// persistent allocation per guest address. Callers must prove that every
+    /// shader stage sharing the descriptor table leaves buffers unchanged.
+    pub fn tryStageTransientStorageBuffer(self: *Renderer, descriptor_index: u32, guest_address: u64, size: usize) anyerror!bool {
+        if (!@atomicLoad(bool, &transient_read_only_buffers, .monotonic) or
+            !self.draw_uploads_enabled or self.current_descriptor_slot == null or
+            size == 0 or size > 4096) return false;
+        if (descriptor_index >= maximum_storage_descriptors) return Error.InvalidStorageDescriptor;
+        const memory = self.guest_memory orelse return Error.GuestMemoryUnavailable;
+        // Include earlier GPU writers before reading. The new ring slice then
+        // survives guest edits and every later draw, including ring spills.
+        try self.flushGuestIndexRange(guest_address, size);
+        var bytes: [4096]u8 = undefined;
+        if (!memory.read(memory.context, guest_address, bytes[0..size])) return Error.GuestMemoryReadFailed;
+        const upload = try self.allocateDrawUpload(size);
+        const mapping = try self.mapDrawUpload(upload);
+        defer mapping.release(self);
+        @memcpy(mapping.bytes, bytes[0..size]);
+        self.updateStorageDescriptorRangeKnown(descriptor_index, upload.buffer, upload.offset, size, null);
+        // Draw reuse must validate the exact snapshot uploaded, never a later
+        // guest read or a read from the potentially write-combined GPU mapping.
+        if (self.reuse_graphics_resources)
+            self.active_storage_source_hashes[descriptor_index] = gpu.parallel_copy.fingerprint(bytes[0..size]);
+        self.active_descriptor_set = self.descriptor_set;
+        self.frame_profile.upload_bytes +|= size;
+        self.frame_profile.storage_upload_bytes +|= size;
+        self.frame_profile.transient_buffer_uploads +|= 1;
+        self.frame_profile.transient_buffer_bytes +|= size;
+        return true;
+    }
+
     pub fn stageGuestStorageBufferAt(
         self: *Renderer,
         descriptor_index: u32,
@@ -8118,7 +8482,7 @@ pub const Renderer = struct {
                         }
                     }
                 }
-                if (changed) {
+                if (changed and !try self.uploadChangedStorageChunks(memory, entry, tracked_generation)) {
                     // Changed pages need a fresh snapshot while older timeline
                     // ticks may still read the persistent backing. Unchanged
                     // draws continue to bind that allocation directly.
@@ -8154,6 +8518,7 @@ pub const Renderer = struct {
                         }
                         self.frame_profile.upload_bytes +%= size;
                         self.frame_profile.storage_upload_bytes +%= size;
+                        self.tmpReportBigUpload(guest_address, size, 1);
                         self.buffer_uploads += 1;
                         if (tracked_generation == 0) {
                             // Fingerprint the bytes actually copied. A source
@@ -8188,7 +8553,8 @@ pub const Renderer = struct {
                     if (entry.content_hash == null or entry.content_hash != previous_content_hash)
                         self.advanceGuestBufferContents(entry);
                     try self.uploadStorageBacking(entry, size, upload);
-                } else {
+                    self.rememberStorageChunks(memory, entry);
+                } else if (!changed) {
                     self.frame_profile.resident_storage_bytes +%= size;
                     if (source_hash != null) self.frame_profile.content_reused_bytes +%= size;
                     if (tracked_generation != 0) self.frame_profile.page_reused_bytes +%= size;
@@ -8456,6 +8822,8 @@ pub const Renderer = struct {
                 entry.pending_host_writes = .{};
                 entry.page_generation = 0;
                 self.deferred_shader_metadata_slots.unset(index);
+                if (buffer_upload_chunks.count(entry_size) != null)
+                    self.buffer_upload_chunk_cache.publishGpuWrites(storageChunkKey(entry, 0), &.{}, true);
             }
             return;
         }
@@ -8491,6 +8859,8 @@ pub const Renderer = struct {
                 entry.pending_host_writes = .{};
                 self.deferred_shader_metadata_slots.unset(index);
                 entry.page_generation = 0;
+                if (buffer_upload_chunks.count(entry_size) != null)
+                    self.buffer_upload_chunk_cache.publishGpuWrites(storageChunkKey(entry, 0), &.{}, true);
             }
             return;
         }
@@ -8511,6 +8881,8 @@ pub const Renderer = struct {
             self.frame_profile.storage_sparse_avoided_bytes +|= size - published_size;
         }
         entry.pending_writes.consumePrefix(size, entry_size);
+        if (buffer_upload_chunks.count(entry_size) != null)
+            self.buffer_upload_chunk_cache.publishGpuWrites(storageChunkKey(entry, 0), spans, !entry.pending_writes.whole and entry.pending_writes.count == 0);
         if (!entry.pending_writes.whole and entry.pending_writes.count == 0) {
             entry.gpu_dirty = false;
             entry.pending_host_writes = .{};
@@ -8551,10 +8923,11 @@ pub const Renderer = struct {
         if (trace_min != 0 and bytes.len >= trace_min) {
             var before: [32]u8 = @splat(0);
             _ = memory.read(memory.context, entry.guest_address, &before);
-            std.debug.print("[gpu buffer publication] flip={d} address=0x{x} bytes={d} program=0x{x} pc=0x{x} reason={s} gpu_seq={d} used_seq={d} tick={d} whole={any} before={x} after={x}\n", .{
+            std.debug.print("[gpu buffer publication] flip={d} address=0x{x} bytes={d} program=0x{x} pc=0x{x} reason={s} gpu_seq={d} used_seq={d} tick={d} whole={any} before={x} after={x} consumer=0x{x}/0x{x} flush=0x{x}\n", .{
                 self.flip_callbacks,   entry.guest_address,                 bytes.len,                     entry.last_writer_program,
                 entry.write_origin.pc, @tagName(entry.write_origin.reason), entry.last_gpu_write_sequence, entry.last_used_sequence,
                 entry.last_gpu_use,    entry.pending_writes.whole,          before,                        bytes[0..@min(bytes.len, before.len)],
+                self.trace_gpu_programs[0], self.trace_gpu_programs[1], self.last_flush_caller,
             });
         }
         const end = entry.guest_address + bytes.len;
@@ -8734,6 +9107,41 @@ pub const Renderer = struct {
         }
     }
 
+    fn cachedDrawVertexRange(self: *Renderer, reader: gpu.ShaderMemoryReader, draw: GuestDraw) ?DrawVertexRange {
+        const count = draw.index_count orelse return drawVertexRange(reader, draw);
+        const memory = self.guest_memory orelse return drawVertexRange(reader, draw);
+        if (!@atomicLoad(bool, &cache_vertex_index_bounds, .monotonic) or count == 0 or draw.index_address == 0)
+            return drawVertexRange(reader, draw);
+        const generation = memory.gpu_generation orelse return drawVertexRange(reader, draw);
+        const size: usize = @as(usize, count) * @as(usize, if (draw.index_uint32) 4 else 2);
+        // Index lists can be an interior view of a compute-written arena.
+        // A CPU page stamp alone cannot validate an unpublished GPU result.
+        self.flushGuestIndexRange(draw.index_address, size) catch return null;
+        var before = generation(memory.context, draw.index_address, size);
+        if (before == 0) {
+            if (memory.track_gpu_read) |track| before = track(memory.context, draw.index_address, size);
+        }
+        const key = IndexBoundsCache.Key{ .address = draw.index_address, .count = count, .uint32 = draw.index_uint32 };
+        if (self.index_bounds_cache.find(key, before)) |range| {
+            self.frame_profile.index_bounds_hits +|= 1;
+            return .{ .minimum = range.minimum + draw.vertex_offset, .maximum = range.maximum + draw.vertex_offset };
+        }
+        self.frame_profile.index_bounds_misses +|= 1;
+        var unbiased = draw;
+        unbiased.vertex_offset = 0;
+        const range = drawVertexRange(reader, unbiased) orelse return null;
+        if (before != 0 and generation(memory.context, draw.index_address, size) == before)
+            self.index_bounds_cache.remember(key, before, range);
+        return .{ .minimum = range.minimum + draw.vertex_offset, .maximum = range.maximum + draw.vertex_offset };
+    }
+
+    pub fn probeVertexIndexBounds(self: *Renderer, draw: GuestDraw, expected: [2]i64) anyerror!void {
+        const memory = self.guest_memory orelse return Error.GuestMemoryUnavailable;
+        const range = self.cachedDrawVertexRange(.{ .context = memory.context, .read_fn = memory.read }, draw) orelse return error.IndexBoundsUnavailable;
+        try std.testing.expectEqual(expected[0], range.minimum);
+        try std.testing.expectEqual(expected[1], range.maximum);
+    }
+
     /// An attachment can be a face or mip of a larger buffer-cleared image.
     /// Finish the exact-base producer before capturing any subresource's CPU
     /// baseline: publishing its remaining suffix later would look like a CPU
@@ -8838,6 +9246,7 @@ pub const Renderer = struct {
         }
         var module = try analysis.translateSpirv(self.allocator, .{
             .stage = .compute,
+            .omit_unobserved_exec_selects = @atomicLoad(bool, &omit_unobserved_exec_selects, .monotonic),
             .local_size = local_size,
             .physical_local_size = try @import("compute_shape.zig").fit(local_size, self.device_info.max_compute_work_group_size, self.device_info.max_compute_work_group_invocations),
         });
@@ -9298,7 +9707,24 @@ pub const Renderer = struct {
         // gather of the R8 cube always missed.
         const specialized_scalar_prefix_end: u32 = 0x0010_0000;
         var scalar: gpu.ScalarEvaluation = undefined;
-        gpu.scalar_provenance.evaluateDecodedResourceStateInto(
+        // Keep compute's scalar specialization and instruction-local buffer
+        // descriptors from the same validated walk, as for graphics. Nested
+        // preparation retains the serial path and never borrows live leases.
+        const owns_preparation = @atomicLoad(bool, &share_compute_resource_walks, .monotonic) and !self.resource_preparation_in_use;
+        if (owns_preparation) self.resource_preparation_in_use = true;
+        defer if (owns_preparation) {
+            self.resource_preparation.finish();
+            self.resource_preparation_in_use = false;
+        };
+        const prepared_scalar = owns_preparation and self.resource_preparation.startScalar(
+            0,
+            reader,
+            &bindings,
+            analysis.program.instructions.items,
+            if (analysis.resource_checkpoints) |*plan| plan else null,
+            &scalar,
+        );
+        if (!prepared_scalar) gpu.scalar_provenance.evaluateDecodedResourceStateInto(
             &scalar,
             reader,
             &bindings,
@@ -9316,6 +9742,7 @@ pub const Renderer = struct {
                 null,
                 &.{},
                 null,
+                false,
             ) catch |err| {
                 // Keep NVIDIA's command stream alive if a future kernel exceeds
                 // the fixed physical descriptor budget. Unsupported formats
@@ -9743,6 +10170,7 @@ pub const Renderer = struct {
         // recognized query family its validated longer traversal budget.
         const module_lease = self.compute_translations.acquirePrepared(self.allocator, &analysis.program, .{
             .stage = .compute,
+            .omit_unobserved_exec_selects = @atomicLoad(bool, &omit_unobserved_exec_selects, .monotonic),
             .program_address = if (rdna2.scalar_calls.present(analysis.program.instructions.items)) bindings.program_address else 0,
             .local_size = local_size,
             .physical_local_size = try @import("compute_shape.zig").fit(local_size, self.device_info.max_compute_work_group_size, self.device_info.max_compute_work_group_invocations),
@@ -10581,7 +11009,7 @@ pub const Renderer = struct {
             if (is_3d) subresource.depth_or_layers else 1,
             if (is_2d_array) subresource.depth_or_layers else 1,
             if (is_3d) vk.image_type_3d else vk.image_type_2d,
-            0,
+            vk.image_create_mutable_format_bit,
             format.vulkan,
             vk.image_usage_transfer_src_bit | vk.image_usage_transfer_dst_bit |
                 vk.image_usage_storage_bit | vk.image_usage_sampled_bit,
@@ -10630,6 +11058,7 @@ pub const Renderer = struct {
             .subresource = subresource,
             .image = image,
             .view = view,
+            .mutable_format = true,
             .allocation_bytes = allocation_bytes,
             .staging_bytes = staging_bytes,
             .last_used_sequence = self.storage_image_sequence,
@@ -12017,6 +12446,7 @@ pub const Renderer = struct {
         scalar: *const gpu.scalar_provenance.ScalarRegisters,
         access: gpu.ShaderInstruction,
         writable: bool,
+        read_only_snapshots: bool,
     ) anyerror!bool {
         if (!self.storage_buffer_nonuniform_indexing or access.family == .smem or access.src1.kind != .sgpr) return false;
         const instructions = analysis.program.instructions.items;
@@ -12056,7 +12486,8 @@ pub const Renderer = struct {
             const size: usize = @intCast(descriptor.size_bytes);
             const slot = result.descriptorForRange(descriptor.address, size) orelse blk: {
                 const free = result.freeDescriptor() orelse return Error.InvalidStorageDescriptor;
-                _ = try self.stageGuestStorageBufferAt(free, descriptor.address, size);
+                if (!(read_only_snapshots and !writable and try self.tryStageTransientStorageBuffer(free, descriptor.address, size)))
+                    _ = try self.stageGuestStorageBufferAt(free, descriptor.address, size);
                 result.occupied[free] = true;
                 result.addresses[free] = descriptor.address;
                 result.sizes[free] = size;
@@ -12523,6 +12954,7 @@ pub const Renderer = struct {
         reserved_resources: ?*const ComputeResources,
         sampled_mappings: []const rdna2.spirv.SampledImageBinding,
         draw_bounds: ?DrawFetchBounds,
+        read_only_snapshots: bool,
     ) anyerror!*ComputeResources {
         const result = try ComputeResources.acquire(self);
         errdefer result.deinit(self);
@@ -12746,7 +13178,7 @@ pub const Renderer = struct {
                 takePlausibleBufferDescriptor(attribute.buffer)
             else
                 null) orelse {
-                if (try self.prepareBufferTableCandidates(result, bindings, reader, analysis, instruction_scalar, inst, is_store)) {
+                if (try self.prepareBufferTableCandidates(result, bindings, reader, analysis, instruction_scalar, inst, is_store, read_only_snapshots)) {
                     store_prepared = true;
                     continue;
                 }
@@ -12823,7 +13255,14 @@ pub const Renderer = struct {
                 };
                 self.frame_profile.staged_buffers.note(descriptor.address ^ (@as(u64, size) << 48));
                 const buffer_stage_started = self.resourceTimestampNs();
-                _ = self.stageGuestStorageBufferAt(free, descriptor.address, size) catch |err| {
+                const staged: anyerror!void = stage: {
+                    if (read_only_snapshots) {
+                        const transient = self.tryStageTransientStorageBuffer(free, descriptor.address, size) catch |err| break :stage err;
+                        if (transient) break :stage {};
+                    }
+                    _ = self.stageGuestStorageBufferAt(free, descriptor.address, size) catch |err| break :stage err;
+                };
+                staged catch |err| {
                     self.traceSkippedStorage(bindings, inst, @errorName(err), descriptor);
                     if (log_verbose_gpu) std.debug.print(
                         "[vulkan dcb] stage V# s{d} failed: {s} addr=0x{x} size=0x{x} stride={d} records={d}; soft-skip\n",
@@ -13388,9 +13827,14 @@ pub const Renderer = struct {
                 const slot = for (self.write_extent_slots.items, 0..) |counter, i| {
                     if (!counter.used) break i;
                 } else blk: {
-                    const buffer = try self.createBuffer(4, vk.buffer_usage_storage_buffer_bit | vk.buffer_usage_transfer_dst_bit, vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit);
+                    // Every instrumented store atomically updates this word.
+                    // Keep those contended atomics on the device; the CPU
+                    // needs only the final four-byte extent at publication.
+                    const buffer = try self.createBuffer(4, vk.buffer_usage_storage_buffer_bit | vk.buffer_usage_transfer_dst_bit | vk.buffer_usage_transfer_src_bit, vk.memory_property_device_local_bit);
                     errdefer self.destroyBuffer(buffer);
-                    try self.write_extent_slots.append(self.allocator, .{ .buffer = buffer, .used = false });
+                    const readback = try self.createBuffer(4, vk.buffer_usage_transfer_dst_bit, vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit);
+                    errdefer self.destroyBuffer(readback);
+                    try self.write_extent_slots.append(self.allocator, .{ .buffer = buffer, .readback = readback, .used = false });
                     break :blk self.write_extent_slots.items.len - 1;
                 };
                 self.write_extent_slots.items[slot].used = true;
@@ -13418,18 +13862,28 @@ pub const Renderer = struct {
     }
 
     fn makeWriteExtentReadable(self: *Renderer, entry: *GuestBufferEntry) anyerror!void {
-        const buffer = self.write_extent_slots.items[entry.write_extent_slot.?].buffer;
+        const slot = self.write_extent_slots.items[entry.write_extent_slot.?];
         const command = try self.beginOneShot();
         defer self.releaseOneShot(command);
-        const barrier = vk.BufferMemoryBarrier{ .source_access_mask = vk.access_shader_write_bit, .destination_access_mask = vk.access_host_read_bit, .buffer = buffer.handle, .offset = 0, .size = 4 };
-        self.device_functions.cmd_pipeline_barrier(command, vk.pipeline_stage_compute_shader_bit, vk.pipeline_stage_host_bit, 0, 0, null, 1, @ptrCast(&barrier), 0, null);
+        const before = [_]vk.BufferMemoryBarrier{
+            .{ .source_access_mask = vk.access_shader_write_bit, .destination_access_mask = vk.access_transfer_read_bit, .buffer = slot.buffer.handle, .offset = 0, .size = 4 },
+            .{ .source_access_mask = vk.access_transfer_write_bit | vk.access_host_read_bit, .destination_access_mask = vk.access_transfer_write_bit, .buffer = slot.readback.handle, .offset = 0, .size = 4 },
+        };
+        self.device_functions.cmd_pipeline_barrier(command, vk.pipeline_stage_compute_shader_bit | vk.pipeline_stage_transfer_bit | vk.pipeline_stage_host_bit, vk.pipeline_stage_transfer_bit, 0, 0, null, before.len, &before, 0, null);
+        const copy = vk.BufferCopy{ .source_offset = 0, .destination_offset = 0, .size = 4 };
+        self.device_functions.cmd_copy_buffer(command, slot.buffer.handle, slot.readback.handle, 1, @ptrCast(&copy));
+        const after = [_]vk.BufferMemoryBarrier{
+            .{ .source_access_mask = vk.access_transfer_read_bit, .destination_access_mask = vk.access_shader_read_bit | vk.access_shader_write_bit, .buffer = slot.buffer.handle, .offset = 0, .size = 4 },
+            .{ .source_access_mask = vk.access_transfer_write_bit, .destination_access_mask = vk.access_host_read_bit, .buffer = slot.readback.handle, .offset = 0, .size = 4 },
+        };
+        self.device_functions.cmd_pipeline_barrier(command, vk.pipeline_stage_transfer_bit, vk.pipeline_stage_compute_shader_bit | vk.pipeline_stage_host_bit, 0, 0, null, after.len, &after, 0, null);
         entry.last_gpu_use = command_buffer_pending_tick;
         try self.submitOneShot(command);
     }
 
     fn narrowCompletedBufferWrites(self: *Renderer, entry: *GuestBufferEntry) Error!void {
         if (!entry.write_extent_active) return;
-        const buffer = self.write_extent_slots.items[entry.write_extent_slot.?].buffer;
+        const buffer = self.write_extent_slots.items[entry.write_extent_slot.?].readback;
         const mapping = try self.mapBufferRange(buffer, 0, 4);
         defer mapping.release(self);
         const end = @min(entry.size, std.mem.readInt(u32, mapping.bytes[0..4], .little));
@@ -13583,7 +14037,12 @@ pub const Renderer = struct {
             entry.pending_writes.merge(ranges);
         if (!was_whole and !ranges.whole and ranges.count != 0 and entry.pending_writes.whole)
             entry.write_origin.reason = .span_budget;
+        const before_chunks = storageChunkKey(entry, entry.page_generation);
         self.advanceGuestBufferContents(entry);
+        // Keep the untouched CPU-page proofs, but prevent their use until
+        // publication has invalidated every completed GPU-written chunk.
+        if (buffer_upload_chunks.count(@intCast(entry.size)) != null)
+            self.buffer_upload_chunk_cache.beginGpuWrite(before_chunks, storageChunkKey(entry, entry.page_generation));
         entry.last_gpu_write_sequence = entry.last_written_sequence;
         self.guest_buffer_write_history.record(entry.guest_address, entry.size, entry.last_gpu_write_sequence);
         entry.gpu_dirty = true;
@@ -14078,6 +14537,25 @@ pub const Renderer = struct {
             range,
             image_state.depth_attachment_usage,
         );
+        self.markDepthPlanesWritten(depth_index, range.aspect_mask);
+    }
+
+    fn markDepthPlanesWritten(self: *Renderer, index: usize, requested: u32) void {
+        const cached = &self.depth_targets.items[index];
+        const aspects = requested & cached.target.aspectMask();
+        if (aspects == 0) return;
+        self.depth_content_sequence +%= 1;
+        if (self.depth_content_sequence == 0) self.depth_content_sequence = 1;
+        cached.gpu_generation +%= 1;
+        if (aspects & vk.image_aspect_depth_bit != 0) {
+            cached.depth_content_generation = self.depth_content_sequence;
+            _ = self.image_aliases.markWrite(cached.alias_token);
+        }
+        if (aspects & vk.image_aspect_stencil_bit != 0) {
+            cached.stencil_content_generation = self.depth_content_sequence;
+            // A stencil-only allocation uses the primary alias token.
+            _ = self.image_aliases.markWrite(cached.stencil_alias_token orelse cached.alias_token);
+        }
     }
 
     /// A render pass that keeps both attachments across draws.
@@ -15361,7 +15839,7 @@ pub const Renderer = struct {
         const snapshot = self.render_targets.items[index];
         const target = snapshot.target;
         const bytes = try colorTargetFrameBytes(target);
-        if (try self.stageStorageVolumeInitialization(index)) |upload| return upload;
+        if (try self.stageStorageImageInitialization(index)) |upload| return upload;
         if (@atomicLoad(bool, &trace_materialized_targets, .monotonic) and self.flip_callbacks % 120 == 0)
             std.debug.print("[gpu initial target] flip={d} @0x{x} {d}x{d} bytes={d} dcc={any} cmask={any}\n", .{ self.flip_callbacks, target.descriptor.address, target.descriptor.width, target.descriptor.height, bytes, target.descriptor.dcc_enabled, target.descriptor.cmask_fast_clear });
         const backing = colorTargetBackingRange(target);
@@ -15378,11 +15856,17 @@ pub const Renderer = struct {
         const fast_clear = try self.colorTargetFastClearTexel(target);
         if (fast_clear) |texel| {
             // Zero has the same native representation for every supported
-            // colour format. Keep nonzero, mixed and unknown DCC keys on the
-            // existing byte-exact upload path.
+            // colour format. Nonzero clears need an exact native-format
+            // conversion; exceptional float values retain the byte upload.
             if (std.mem.allEqual(u8, texel.bytes[0..texel.length], 0)) {
                 self.reportDccFastClearSeed(target, texel);
                 return .{ .clear_zero = true };
+            }
+            if (@atomicLoad(bool, &native_color_initialization_clear, .monotonic)) {
+                if (nativeDccClearColor(target.format.vulkan, texel)) |clear| {
+                    self.reportDccFastClearSeed(target, texel);
+                    return .{ .clear_color = clear };
+                }
             }
         }
         const upload: ColorTargetUpload = if (self.reuse_color_target_transfer and
@@ -15410,13 +15894,12 @@ pub const Renderer = struct {
         return upload;
     }
 
-    /// Transfer an exact native volume into the layered raster attachment.
+    /// Transfer an exact native storage view into the raster attachment.
     /// Other dirty aliases retain the normal publication path; matching only
     /// the guest base address would lose padding or reinterpret stale pixels.
-    fn stageStorageVolumeInitialization(self: *Renderer, target_index: usize) anyerror!?ColorTargetUpload {
+    fn stageStorageImageInitialization(self: *Renderer, target_index: usize) anyerror!?ColorTargetUpload {
         const target = self.render_targets.items[target_index].target;
-        const layout = target.layout.subresource orelse return null;
-        if (target.descriptor.resource_type != 2 or target.descriptor.samples_log2 != 0 or
+        if ((target.descriptor.resource_type != 2 and !@atomicLoad(bool, &native_storage_color_initialization, .monotonic)) or target.descriptor.samples_log2 != 0 or
             target.descriptor.fragments_log2 != 0 or target.descriptor.cmask_fast_clear) return null;
         const address = target.descriptor.address;
         const size: usize = @intCast(target.layout.required_source_bytes);
@@ -15425,7 +15908,8 @@ pub const Renderer = struct {
         while (candidates.next()) |index| {
             const source = self.storage_image_cache.items[index];
             if (!source.valid or !source.gpu_dirty or source.descriptor.address != address or
-                source.descriptor.image_type != .color_3d or !std.meta.eql(source.subresource, layout) or
+                !storageColorInitializationLayoutsMatch(target, source.descriptor, source.subresource) or
+                source.depth_snapshot != null or source.allocation_bytes != size or
                 (storageImageFormat(source.descriptor.unified_format) orelse continue).vulkan != target.format.vulkan) continue;
             if (selected == null or source.content_generation > self.storage_image_cache.items[selected.?].content_generation) selected = index;
         }
@@ -15437,6 +15921,14 @@ pub const Renderer = struct {
         }
         for (self.storage_image_cache.items, 0..) |other, i| {
             if (i != index and other.valid and other.gpu_dirty and byteRangesOverlap(address, size, other.descriptor.address, other.allocation_bytes)) return null;
+        }
+        // An evicted attachment can still own a completed CPU snapshot. Keep
+        // the publication path until that competing writer has been resolved.
+        for (self.completed_frames.items) |frame| {
+            if (!frame.needs_writeback) continue;
+            const other = frame.target orelse continue;
+            const backing = colorTargetBackingRange(other);
+            if (byteRangesOverlap(address, size, other.descriptor.address + backing.offset, backing.size)) return null;
         }
         const memory = self.guest_memory orelse return null;
         if (self.storage_image_cache.items[index].pin_count == 0 and try self.storageGuestContentsChanged(memory, index)) return null;
@@ -15455,7 +15947,9 @@ pub const Renderer = struct {
         }
         self.render_targets.items[target_index].backing_snapshot.refresh(memory, target);
         self.storage_image_cache.items[index].pin_count += 1;
-        return .{ .storage_volume = index, .clear_zero = clear_zero };
+        self.storage_color_initializations +|= 1;
+        if (self.storage_color_initializations <= 4) std.debug.print("[vulkan dcb] native storage-to-color initialization @0x{x} {d}x{d} type={s}\n", .{ address, target.descriptor.width, target.descriptor.height, @tagName(self.storage_image_cache.items[index].descriptor.image_type) });
+        return .{ .storage_image = index, .clear_zero = clear_zero };
     }
 
     fn recordColorInitialization(self: *Renderer, command: vk.CommandBuffer, image: vk.Image, target: GuestColorTarget, upload: ColorTargetUpload) anyerror!void {
@@ -15465,14 +15959,18 @@ pub const Renderer = struct {
             self.device_functions.cmd_clear_color_image(command, image, vk.image_layout_transfer_dst_optimal, &clear, 1, @ptrCast(&range));
             return;
         }
-        if (upload.storage_volume) |index| {
+        if (upload.clear_color) |clear| {
+            self.device_functions.cmd_clear_color_image(command, image, vk.image_layout_transfer_dst_optimal, &clear, 1, @ptrCast(&range));
+            return;
+        }
+        if (upload.storage_image) |index| {
             const source = self.storage_image_cache.items[index];
             const source_range = vk.ImageSubresourceRange{ .aspect_mask = vk.image_aspect_color_bit };
             try self.transitionTrackedImage(command, source.image.handle, source_range, image_state.transfer_source_usage);
             const copy = vk.ImageCopy{
                 .source_subresource = .{ .aspect_mask = vk.image_aspect_color_bit },
                 .destination_subresource = .{ .aspect_mask = vk.image_aspect_color_bit, .layer_count = target.layout.layers },
-                .extent = .{ .width = target.descriptor.width, .height = target.descriptor.height, .depth = target.layout.layers },
+                .extent = .{ .width = target.descriptor.width, .height = target.descriptor.height, .depth = if (source.descriptor.image_type == .color_3d) target.layout.layers else 1 },
             };
             self.device_functions.cmd_copy_image(command, source.image.handle, vk.image_layout_transfer_src_optimal, image, vk.image_layout_transfer_dst_optimal, 1, @ptrCast(&copy));
             try self.transitionTrackedImage(command, source.image.handle, source_range, image_state.storage_usage);
@@ -16147,6 +16645,7 @@ pub const Renderer = struct {
                 .width = cached.target.descriptor.width,
                 .height = cached.target.descriptor.height,
                 .restore = self.image_states.current(cached.image.handle, vk.image_aspect_color_bit, 0, 0) orelse return null,
+                .generation = cached.gpu_generation,
             };
             allocation_bytes = @max(allocation_bytes, cached.target.layout.required_source_bytes);
             const identity = [_]u64{ cached.image.handle, cached.gpu_generation };
@@ -16158,11 +16657,12 @@ pub const Renderer = struct {
             if (cached.valid and cached.gpu_dirty and byteRangesOverlap(descriptor.address, allocation_bytes, cached.descriptor.address, cached.allocation_bytes)) return null;
         }
         const signature = signature_hash.final();
-        for (self.assembled_mip_chains.items) |chain| {
+        for (self.assembled_mip_chains.items) |*chain| {
             if (chain.address != descriptor.address or chain.unified_format != descriptor.unified_format or
                 chain.width != descriptor.width or chain.height != descriptor.height or
                 chain.levels != levels or chain.image_format != image_format) continue;
             if (chain.signature != signature) break;
+            chain.last_used_batch = self.sampled_image_batch;
             return .{
                 .image = chain.image,
                 .view = try self.residentImageViewLevels(chain.image.handle, vk.image_view_type_2d, image_format, try sampledImageComponents(descriptor.dst_select, descriptor.unified_format), vk.image_aspect_color_bit, 1, levels),
@@ -16758,6 +17258,8 @@ pub const Renderer = struct {
         const cached = &self.depth_targets.items[index];
         cached.initialized = true;
         cached.shader_read_layout = false;
+        self.markDepthPlanesWritten(index, snapshot.target.aspectMask());
+        cached.host_generation = cached.gpu_generation;
         _ = self.image_aliases.markSynchronized(cached.alias_token);
         if (cached.stencil_alias_token) |token| _ = self.image_aliases.markSynchronized(token);
         self.frame_profile.upload_bytes +|= plan.total_bytes;
@@ -16906,8 +17408,7 @@ pub const Renderer = struct {
         const target = destination.target;
         var sources: [2]?usize = .{ null, null };
         for (self.depth_targets.items, 0..) |candidate, candidate_index| {
-            if (candidate_index == index or !candidate.initialized or
-                candidate.last_used_sequence <= destination.last_used_sequence) continue;
+            if (candidate_index == index or !candidate.initialized) continue;
             const other = candidate.target;
             const matching_extent = other.width == target.width and other.height == target.height;
             if (other.format != target.format or
@@ -16919,8 +17420,10 @@ pub const Renderer = struct {
                 target.has_stencil and target.stencil_address != 0 and target.stencil_address == other.stencil_address,
             };
             for (shared, 0..) |matches, plane| {
-                if (matches and (sources[plane] == null or candidate.last_used_sequence >
-                    self.depth_targets.items[sources[plane].?].last_used_sequence)) sources[plane] = candidate_index;
+                const aspect: u32 = if (plane == 0) vk.image_aspect_depth_bit else vk.image_aspect_stencil_bit;
+                if (matches and candidate.planeGeneration(aspect) > destination.planeGeneration(aspect) and
+                    (sources[plane] == null or candidate.planeGeneration(aspect) >
+                        self.depth_targets.items[sources[plane].?].planeGeneration(aspect))) sources[plane] = candidate_index;
             }
         }
         if (sources[0] == null and sources[1] == null) return false;
@@ -16955,7 +17458,13 @@ pub const Renderer = struct {
         const cached = &self.depth_targets.items[index];
         cached.initialized = true;
         cached.shader_read_layout = false;
-        cached.gpu_generation +%= 1;
+        if (!destination.initialized) {
+            self.markDepthPlanesWritten(index, target.aspectMask());
+        } else cached.gpu_generation +%= 1;
+        // A copy preserves the source's content version. Giving equivalent
+        // planes a new version would copy them back on the next rebind.
+        if (sources[0]) |source| cached.depth_content_generation = self.depth_targets.items[source].depth_content_generation;
+        if (sources[1]) |source| cached.stencil_content_generation = self.depth_targets.items[source].stencil_content_generation;
         for (sources) |source_index| {
             if (source_index) |source| cached.last_used_sequence = @max(cached.last_used_sequence, self.depth_targets.items[source].last_used_sequence);
         }
@@ -17062,11 +17571,7 @@ pub const Renderer = struct {
         const cached = &self.depth_targets.items[index];
         cached.initialized = true;
         cached.shader_read_layout = false;
-        cached.gpu_generation +%= 1;
-        _ = self.image_aliases.markWrite(cached.alias_token);
-        if (!snapshot.initialized) if (cached.stencil_alias_token) |token| {
-            _ = self.image_aliases.markWrite(token);
-        };
+        self.markDepthPlanesWritten(index, range.aspect_mask);
         // Clears participate in the same ordering as attachment writes.
         // Otherwise acquiring an older inferred-size view can restore a
         // pre-clear plane over this allocation's freshly cleared contents.
@@ -18236,10 +18741,7 @@ pub const Renderer = struct {
             extra_cached.last_used_sequence = self.render_target_sequence;
         }
         if (depth_index) |index| {
-            const depth_cached = &self.depth_targets.items[index];
-            depth_cached.gpu_generation +%= 1;
-            _ = self.image_aliases.markWrite(depth_cached.alias_token);
-            if (depth_cached.stencil_alias_token) |token| _ = self.image_aliases.markWrite(token);
+            self.markDepthPlanesWritten(index, depthDrawWriteAspects(pipeline_state, draw));
         }
         self.latest_render_target_index = target_index;
         if (report_checkpoints and self.capture_first_graphics_frame) {
@@ -18347,10 +18849,7 @@ pub const Renderer = struct {
         }
         self.device_functions.cmd_end_render_pass(command_buffer);
         try self.submitOneShot(command_buffer);
-        const cached = &self.depth_targets.items[depth_index];
-        cached.gpu_generation +%= 1;
-        _ = self.image_aliases.markWrite(cached.alias_token);
-        if (cached.stencil_alias_token) |token| _ = self.image_aliases.markWrite(token);
+        self.markDepthPlanesWritten(depth_index, depthDrawWriteAspects(pipeline_state, draw));
     }
 
     fn drawGraphicsShaders(
@@ -18644,10 +19143,7 @@ pub const Renderer = struct {
         // megabytes of discarded pixels and serializes the CPU with the GPU.
         if (!read_color) {
             try self.submitOneShot(command_buffer);
-            const depth_cached = &self.depth_targets.items[depth_index.?];
-            depth_cached.gpu_generation +%= 1;
-            _ = self.image_aliases.markWrite(depth_cached.alias_token);
-            if (depth_cached.stencil_alias_token) |token| _ = self.image_aliases.markWrite(token);
+            self.markDepthPlanesWritten(depth_index.?, depthDrawWriteAspects(pipeline_state, draw));
             return;
         }
         const readback = try self.createBuffer(
@@ -18709,10 +19205,7 @@ pub const Renderer = struct {
         );
         try self.submitOneShot(command_buffer);
         if (depth_index) |index| {
-            const depth_cached = &self.depth_targets.items[index];
-            depth_cached.gpu_generation +%= 1;
-            _ = self.image_aliases.markWrite(depth_cached.alias_token);
-            if (depth_cached.stencil_alias_token) |token| _ = self.image_aliases.markWrite(token);
+            self.markDepthPlanesWritten(index, depthDrawWriteAspects(pipeline_state, draw));
         }
         try self.readMapped(readback, frame);
         if (guest_target) |target| {
@@ -19448,6 +19941,43 @@ pub const Renderer = struct {
         }
     }
 
+    /// Sparse GPU publications must retain the old page proofs only outside
+    /// their write footprint, including a CPU update made before publication.
+    pub fn probeSparseUploadPublication(self: *Renderer, address: u64, size: usize) anyerror!void {
+        const memory = self.guest_memory.?;
+        const chunk = buffer_upload_chunks.chunk_bytes;
+        const index = self.active_storage_cache_indices[0].?;
+        const entry = &self.guest_buffers.items[index];
+        try std.testing.expectEqual(address, entry.guest_address);
+        const commands = try self.beginOneShot();
+        const barrier = vk.BufferMemoryBarrier{ .source_access_mask = vk.access_memory_read_bit | vk.access_memory_write_bit, .destination_access_mask = vk.access_transfer_write_bit, .buffer = entry.device_local.handle, .offset = 0, .size = size };
+        self.device_functions.cmd_pipeline_barrier(commands, vk.pipeline_stage_all_commands_bit, vk.pipeline_stage_transfer_bit, 0, 0, null, 1, @ptrCast(&barrier), 0, null);
+        self.device_functions.cmd_fill_buffer(commands, entry.device_local.handle, 4, 16, 0x12345678);
+        self.device_functions.cmd_fill_buffer(commands, entry.device_local.handle, 3 * chunk + 8, 16, 0x87654321);
+        entry.last_gpu_use = command_buffer_pending_tick;
+        try self.submitOneShot(commands);
+        self.releaseOneShot(commands);
+        var writes = buffer_write_ranges.Ranges{};
+        writes.include(.{ .first = 4, .end = 20 });
+        writes.include(.{ .first = 3 * chunk + 8, .end = 3 * chunk + 24 });
+        self.markGuestBufferRangesWritten(entry, &writes, .{});
+        try std.testing.expect(memory.write(memory.context, address + 5 * chunk, &.{ 0xa1, 0xb2, 0xc3, 0xd4 }));
+        try self.flushGuestStoragePrefix(index, 2 * chunk);
+        try std.testing.expect(entry.gpu_dirty);
+        try std.testing.expect(self.buffer_upload_chunk_cache.find(storageChunkKey(entry, 0)) == null);
+        try self.flushGuestStorageBuffer(index);
+        try std.testing.expect(!entry.gpu_dirty);
+        try std.testing.expect(self.buffer_upload_chunk_cache.find(storageChunkKey(entry, 0)) != null);
+        const before = self.frame_profile.storage_upload_bytes;
+        const partial = self.frame_profile.partial_storage_uploads;
+        _ = try self.stageGuestStorageBufferAt(0, address, size);
+        try std.testing.expectEqual(partial + 1, self.frame_profile.partial_storage_uploads);
+        try std.testing.expectEqual(before + 3 * chunk, self.frame_profile.storage_upload_bytes);
+        var observed: [20]u8 = undefined;
+        try self.readStorageBacking(entry, &observed);
+        for (1..5) |word| try std.testing.expectEqual(@as(u32, 0x12345678), std.mem.readInt(u32, observed[word * 4 ..][0..4], .little));
+    }
+
     /// Compare the GPU cost of identical SSBO reads from CPU-cached RAM and
     /// device-local memory. This diagnostic does not change guest allocation policy.
     pub fn probeStorageReadPlacement(self: *Renderer) anyerror![2]u64 {
@@ -19843,6 +20373,9 @@ pub const Renderer = struct {
     /// Verify retirement with a real queued copy, then exercise compatibility,
     /// persistent mapping, byte pressure and the entry cap on the same device.
     pub fn probeBufferRecycling(self: *Renderer) anyerror!void {
+        const previous_larger = @atomicLoad(bool, &reuse_larger_buffers, .monotonic);
+        defer @atomicStore(bool, &reuse_larger_buffers, previous_larger, .monotonic);
+        @atomicStore(bool, &reuse_larger_buffers, false, .monotonic);
         const properties = vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit;
         const usage = vk.buffer_usage_transfer_src_bit;
         const size = 4096;
@@ -19922,6 +20455,32 @@ pub const Renderer = struct {
         self.destroyBuffer(oversized);
         try std.testing.expectEqual(@as(usize, 0), self.recycled_buffers.items.len);
         try std.testing.expectEqual(@as(u64, 0), self.recycled_buffer_bytes);
+
+        // A retired allocation can serve a smaller logical buffer without
+        // changing its native capacity or the range exposed to a shader/copy.
+        @atomicStore(bool, &reuse_larger_buffers, true, .monotonic);
+        self.buffer_recycle_budget_bytes = 32 * 1024 * 1024;
+        const large = try self.createBuffer(size, usage, properties);
+        const middle = try self.createBuffer(size / 2, usage, properties);
+        self.destroyBuffer(large);
+        self.destroyBuffer(middle);
+        const narrow = try self.createBuffer(size / 2 - 4, usage, properties);
+        try std.testing.expectEqual(middle.handle, narrow.handle);
+        try std.testing.expectEqual(@as(u64, size / 2 - 4), narrow.size);
+        try std.testing.expectEqual(@as(u64, size / 2), narrow.reuse_key.?.size);
+        try self.writeMapped(narrow, poison[0 .. size / 2 - 4]);
+        try self.expectMapped(narrow, poison[0 .. size / 2 - 4]);
+        self.destroyBuffer(narrow);
+        const restored = try self.createBuffer(size / 2, usage, properties);
+        try std.testing.expectEqual(middle.handle, restored.handle);
+        try std.testing.expectEqual(@as(u64, size / 2), restored.size);
+        try self.writeMapped(restored, expected[0 .. size / 2]);
+        try self.expectMapped(restored, expected[0 .. size / 2]);
+        const tiny = try self.createBuffer(size / 8, usage, properties);
+        try std.testing.expect(tiny.handle != large.handle);
+        self.destroyBuffer(restored);
+        self.destroyBuffer(tiny);
+        self.clearRecycledBuffers();
         self.buffer_recycle_budget_bytes = 0;
     }
 
@@ -20260,6 +20819,53 @@ pub const Renderer = struct {
         }
     }
 
+    pub fn probeColorDccNativeClears(self: *Renderer) anyerror!void {
+        const memory = self.guest_memory.?;
+        for ([_]u8{ 10, 12 }) |format| {
+            var color = std.mem.zeroes(gpu.resources.ColorTarget);
+            color.address = 0x1a000;
+            color.width = 16;
+            color.height = 16;
+            color.pitch = 16;
+            color.format = format;
+            color.number_type = if (format == 12) 7 else 0;
+            color.tile_mode = .linear;
+            color.write_mask = 0xf;
+            color.dcc_enabled = true;
+            color.dcc_address = 0x1f000;
+            color.clear_words = .{ 0xb4003800, 0x40003a00 };
+            for ([_]u8{ 0x40, 0x80, 0xc0, 0x00, 0x20 }) |code| {
+                const target = try guestColorTarget(color);
+                const texel = colorDccClearTexel(code, color) orelse continue;
+                const metadata: [64]u8 = @splat(code);
+                try std.testing.expect(memory.write(memory.context, color.dcc_address, &metadata));
+                const index = try self.acquireRenderTarget(target);
+                invalidateResidentTarget(&self.render_targets.items[index]);
+                const before = self.frame_profile.target_upload_bytes;
+                const upload = try self.stageInitialColorUpload(index);
+                defer upload.deinit(self);
+                try std.testing.expect(upload.clear_zero or upload.clear_color != null);
+                try std.testing.expectEqual(before, self.frame_profile.target_upload_bytes);
+                const command = try self.beginOneShot();
+                defer self.releaseOneShot(command);
+                const image = self.render_targets.items[index].image.handle;
+                const range = vk.ImageSubresourceRange{ .aspect_mask = vk.image_aspect_color_bit };
+                try self.transitionTrackedImage(command, image, range, image_state.transfer_destination_usage);
+                try self.recordColorInitialization(command, image, target, upload);
+                try self.transitionTrackedImage(command, image, range, image_state.color_attachment_usage);
+                try self.submitOneShot(command);
+                self.render_targets.items[index].initialized = true;
+                self.markRenderTargetWritten(&self.render_targets.items[index]);
+                try self.readbackRenderTarget(index, true);
+                const actual = for (self.completed_frames.items) |frame| {
+                    if (frame.target) |view| if (sameRenderTarget(view, target)) break frame.pixels.items;
+                } else return error.MissingPresentedFrame;
+                try std.testing.expectEqual(try colorTargetFrameBytes(target), actual.len);
+                for (actual, 0..) |value, offset| try std.testing.expectEqual(texel.bytes[offset % texel.length], value);
+            }
+        }
+    }
+
     pub fn probeColorInitializationPadded(self: *Renderer) anyerror!void {
         // The second physical row starts beyond the entire linear pixel
         // payload. Its queued GPU writer must still precede initialization.
@@ -20547,7 +21153,7 @@ pub const Renderer = struct {
         const before_upload = self.frame_profile.upload_bytes;
         const upload = try self.stageInitialColorUpload(index);
         defer upload.deinit(self);
-        try std.testing.expectEqual(source_index, upload.storage_volume.?);
+        try std.testing.expectEqual(source_index, upload.storage_image.?);
         const command = try self.beginOneShot();
         defer self.releaseOneShot(command);
         const image = self.render_targets.items[index].image.handle;
@@ -21136,6 +21742,29 @@ pub const Renderer = struct {
         });
     }
 
+    pub fn probeDepthPlaneDraw(self: *Renderer, stencil: bool, read_only: bool, empty: bool) anyerror!void {
+        const target = self.depth_targets.items[0].target;
+        var state = GraphicsPipelineState.default(32, 32);
+        state.color_write_masks = @splat(0);
+        state.depth_attachment_format = target.format;
+        state.depth_test_enable = 1;
+        state.depth_write_enable = @intFromBool(!stencil and !read_only);
+        state.depth_compare_operation = 7;
+        state.viewport_min_depth_bits = @bitCast(@as(f32, 0.5));
+        state.viewport_max_depth_bits = @bitCast(@as(f32, 0.5));
+        state.stencil_test_enable = @intFromBool(stencil);
+        state.stencil_front_compare = 7;
+        state.stencil_back_compare = 7;
+        state.stencil_front_pass = vk.stencil_op_replace;
+        state.stencil_back_pass = vk.stencil_op_replace;
+        state.stencil_front_write_mask = if (read_only) 0 else 0xff;
+        state.stencil_back_write_mask = state.stencil_front_write_mask;
+        state.stencil_front_reference = 0x35;
+        state.stencil_back_reference = 0x35;
+        try self.beginFrameDraw();
+        try self.drawGraphicsShaders(&graphics_probe_vertex_spirv, &graphics_probe_fragment_spirv, &.{}, &.{}, state, null, &.{}, target, false, false, false, .{ .vertex_count = if (empty) 0 else 3 });
+    }
+
     pub fn probeDepth16Bits(self: *Renderer) anyerror!u16 {
         // Inspect the attachment independently of its color storage snapshot.
         const cached = self.depth_targets.items[0];
@@ -21178,7 +21807,7 @@ pub const Renderer = struct {
         try self.submitOneShot(command_buffer);
         self.depth_targets.items[index].initialized = true;
         self.depth_targets.items[index].shader_read_layout = false;
-        self.depth_targets.items[index].gpu_generation +%= 1;
+        self.markDepthPlanesWritten(index, range.aspect_mask);
     }
 
     pub fn probeIndependentDepthStencilPlanes(self: *Renderer) anyerror!void {
@@ -22157,11 +22786,16 @@ pub const Renderer = struct {
         if (self.device_info.timestamp_valid_bits == 0) return error.TimestampQueriesUnavailable;
         const old_enabled = @atomicLoad(bool, &gpu_timestamp_profiling, .monotonic);
         const old_minimum = @atomicLoad(u64, &gpu_timestamp_min_us, .monotonic);
+        const old_isolated = @atomicLoad(bool, &gpu_timestamp_isolate_batches, .monotonic);
         defer @atomicStore(bool, &gpu_timestamp_profiling, old_enabled, .monotonic);
         defer @atomicStore(u64, &gpu_timestamp_min_us, old_minimum, .monotonic);
+        defer @atomicStore(bool, &gpu_timestamp_isolate_batches, old_isolated, .monotonic);
         @atomicStore(bool, &gpu_timestamp_profiling, true, .monotonic);
         @atomicStore(u64, &gpu_timestamp_min_us, std.math.maxInt(u64), .monotonic);
-        for (0..40) |_| try self.drawGraphicsProbe();
+        for ([_]bool{ false, true }) |isolated| {
+            @atomicStore(bool, &gpu_timestamp_isolate_batches, isolated, .monotonic);
+            for (0..20) |_| try self.drawGraphicsProbe();
+        }
         try std.testing.expect(self.gpu_timestamp_samples >= 39);
         try std.testing.expect(self.gpu_timestamp_pool != 0 and !self.gpu_timestamp_failed);
         // Aborted command recording never executes its reset/timestamp pair.
@@ -23388,9 +24022,11 @@ pub const Renderer = struct {
             defer self.draw_reuse_recording = recording;
             // GPU-produced indices were published at draw entry, before any
             // tessellation or host-side bounds proof consumes them.
-            break :range drawVertexRange(reader, draw);
+            break :range self.cachedDrawVertexRange(reader, draw);
         } else null;
         const bounded_fetches_before = self.frame_profile.bounded_vertex_fetches;
+        const read_only_snapshots = tessellation == null and shaderResourcesAreReadOnly(vertex_analysis, vertex_instructions) and
+            shaderResourcesAreReadOnly(fragment_analysis, fragment_analysis.program.instructions.items);
         const vertex_storage = self.prepareComputeResources(
             &vertex_bindings,
             reader,
@@ -23401,6 +24037,7 @@ pub const Renderer = struct {
             null,
             graphics_resources.mappings[fragment_mapping_count..graphics_resources.mapping_count],
             DrawFetchBounds.init(vertex_range, draw),
+            read_only_snapshots,
         ) catch |err| blk: {
             if (log_verbose_gpu or self.trace_resource_failures) std.debug.print(
                 "[vulkan dcb] vertex storage incomplete: {s}; translating without buffers flip={d} draw={d} vs=0x{x} ps=0x{x}\n",
@@ -23831,6 +24468,7 @@ pub const Renderer = struct {
             vertex_storage,
             graphics_resources.mappings[0..fragment_mapping_count],
             null,
+            read_only_snapshots,
         ) catch |err| blk: {
             if (fragmentShadowRecords(fragment_analysis)) return err;
             if (log_verbose_gpu or self.trace_resource_failures) std.debug.print(
@@ -23952,6 +24590,7 @@ pub const Renderer = struct {
         const fragment_translate_started = self.resourceTimestampNs();
         const fragment_lease = self.graphics_translations.acquirePrepared(self.allocator, &fragment_analysis.program, .{
             .stage = .fragment,
+            .omit_unobserved_exec_selects = @atomicLoad(bool, &omit_unobserved_exec_selects, .monotonic),
             .wave32 = graphicsWave32(state, .pixel),
             .program_address = if (rdna2.scalar_calls.present(fragment_analysis.program.instructions.items)) fragment_address else 0,
             .maximum_dispatcher_iterations = fragment_dispatcher_budget,
@@ -24314,6 +24953,7 @@ pub const Renderer = struct {
             else
                 self.graphics_translations.acquirePrepared(self.allocator, &vertex_program, .{
                     .stage = .vertex,
+                    .omit_unobserved_exec_selects = @atomicLoad(bool, &omit_unobserved_exec_selects, .monotonic),
                     .wave32 = graphicsWave32(state, vertex_stage),
                     .program_address = if (rdna2.scalar_calls.present(vertex_instructions)) vertex_address else 0,
                     // The PS5 NGG/export ABI supplies S_NGG_VERTEX_INDEX in v5;
@@ -25647,12 +26287,23 @@ pub const Renderer = struct {
 
     fn createBufferWithMemoryPreference(self: *Renderer, size: vk.DeviceSize, usage: vk.Flags, properties: vk.Flags, preferred: vk.Flags) Error!OwnedBuffer {
         const key = BufferReuseKey{ .size = size, .usage = usage, .properties = properties, .preferred = preferred };
+        const allow_larger = @atomicLoad(bool, &reuse_larger_buffers, .monotonic);
+        var best: ?usize = null;
         for (self.recycled_buffers.items, 0..) |buffer, index| {
-            if (std.meta.eql(buffer.reuse_key.?, key)) {
-                self.recycled_buffer_bytes -= buffer.allocation_bytes;
-                self.frame_profile.buffer_recycles +|= 1;
-                return self.recycled_buffers.orderedRemove(index);
-            }
+            const capacity = buffer.reuse_key.?;
+            if (capacity.usage != usage or capacity.properties != properties or capacity.preferred != preferred or
+                capacity.size < size or (capacity.size != size and (!allow_larger or capacity.size > size *| 2))) continue;
+            if (best == null or capacity.size < self.recycled_buffers.items[best.?].reuse_key.?.size) best = index;
+            if (capacity.size == size) break;
+        }
+        if (best) |index| {
+            var buffer = self.recycled_buffers.orderedRemove(index);
+            self.recycled_buffer_bytes -= buffer.allocation_bytes;
+            self.frame_profile.buffer_recycles +|= 1;
+            // The native VkBuffer and any persistent mapping retain their
+            // original capacity. Every consumer sees the requested size.
+            buffer.size = size;
+            return buffer;
         }
         const started = hostTimestampNs();
         defer self.frame_profile.buffer_create_ns +|= elapsedHostNanoseconds(started);
@@ -25975,6 +26626,44 @@ pub const Renderer = struct {
     fn prepareGdsHostWrite(self: *Renderer) Error!void {
         try self.downloadGdsStorage();
         self.gds_host_dirty = true;
+    }
+
+    fn tryFillGdsDma(self: *Renderer, dma: gpu.state.DmaData) (Error || std.mem.Allocator.Error)!bool {
+        if (dma.source != 2 or dma.destination != 1 or dma.byte_count == 0 or
+            dma.destination_address & 3 != 0 or dma.byte_count & 3 != 0) return false;
+        const buffer = self.gds_buffer orelse return false;
+        if (dma.destination_address > self.gds_storage.items.len or
+            dma.byte_count > self.gds_storage.items.len - dma.destination_address) return false;
+        // A preceding CPU-only update remains authoritative until uploaded.
+        // Preserve the descriptor selection: this packet binds no shader.
+        const descriptor = self.active_descriptor_set;
+        defer self.active_descriptor_set = descriptor;
+        try self.uploadGdsStorage();
+        const command = try self.beginOneShot();
+        defer self.releaseOneShot(command);
+        const before = vk.BufferMemoryBarrier{
+            .source_access_mask = vk.access_memory_read_bit | vk.access_memory_write_bit,
+            .destination_access_mask = vk.access_transfer_write_bit,
+            .buffer = buffer.handle,
+            .offset = dma.destination_address,
+            .size = dma.byte_count,
+        };
+        self.device_functions.cmd_pipeline_barrier(command, vk.pipeline_stage_all_commands_bit | vk.pipeline_stage_host_bit, vk.pipeline_stage_transfer_bit, 0, 0, null, 1, @ptrCast(&before), 0, null);
+        self.device_functions.cmd_fill_buffer(command, buffer.handle, dma.destination_address, dma.byte_count, @truncate(dma.source_address));
+        const after = vk.BufferMemoryBarrier{
+            .source_access_mask = vk.access_transfer_write_bit,
+            .destination_access_mask = vk.access_memory_read_bit | vk.access_memory_write_bit,
+            .buffer = buffer.handle,
+            .offset = dma.destination_address,
+            .size = dma.byte_count,
+        };
+        self.device_functions.cmd_pipeline_barrier(command, vk.pipeline_stage_transfer_bit, vk.pipeline_stage_all_commands_bit | vk.pipeline_stage_host_bit, 0, 0, null, 1, @ptrCast(&after), 0, null);
+        try self.submitOneShot(command);
+        // Even a partial fill invalidates the host shadow. Its next reader
+        // waits for this transfer, preserving neighboring shader-written words.
+        self.gds_gpu_dirty = true;
+        self.gds_dma_fills +|= 1;
+        return true;
     }
 
     /// Publish all sampled-image bindings for one draw/dispatch in a single
@@ -26735,6 +27424,21 @@ pub const Renderer = struct {
         return replacement;
     }
 
+    /// Depth/color reinterpretations are GPU-only copies. Keep their bridge
+    /// in device memory rather than sending both legs through a host readback
+    /// allocation. Replaced bridges remain alive until recorded copies retire.
+    fn storageDepthTransfer(self: *Renderer, bytes: usize) (Error || std.mem.Allocator.Error)!OwnedBuffer {
+        if (self.storage_depth_transfer) |buffer| if (buffer.size >= bytes) return buffer;
+        const replacement = try self.createBuffer(
+            bytes,
+            vk.buffer_usage_transfer_src_bit | vk.buffer_usage_transfer_dst_bit,
+            vk.memory_property_device_local_bit,
+        );
+        if (self.storage_depth_transfer) |buffer| self.destroyBuffer(buffer);
+        self.storage_depth_transfer = replacement;
+        return replacement;
+    }
+
     fn orderStorageTransferWrite(self: *Renderer, commands: vk.CommandBuffer, buffer: OwnedBuffer) void {
         const barrier = vk.BufferMemoryBarrier{
             .source_access_mask = vk.access_transfer_read_bit | vk.access_transfer_write_bit,
@@ -26870,40 +27574,47 @@ pub const Renderer = struct {
         try std.testing.expect(self.frame_profile.draw_upload_wraps != 0);
         try self.finishDrawBatch();
 
-        // Exercise reuse and growth while earlier transfers are still queued.
-        // A later CPU upload must also wait before overwriting the shared buffer.
-        for ([_]usize{ 4, 16, 4 }, 0..) |bytes, revision| {
-            const transfer = try self.storageImageTransfer(bytes);
-            const copy_commands = try self.beginOneShot();
-            defer self.releaseOneShot(copy_commands);
-            self.orderStorageTransferWrite(copy_commands, transfer);
-            const value: u32 = 0x4567_0000 + @as(u32, @intCast(revision));
-            self.device_functions.cmd_fill_buffer(copy_commands, transfer.handle, 0, bytes, value);
-            const readable = vk.BufferMemoryBarrier{
-                .source_access_mask = vk.access_transfer_write_bit,
-                .destination_access_mask = vk.access_transfer_read_bit,
-                .buffer = transfer.handle,
-                .offset = 0,
-                .size = bytes,
-            };
-            self.device_functions.cmd_pipeline_barrier(copy_commands, vk.pipeline_stage_transfer_bit, vk.pipeline_stage_transfer_bit, 0, 0, null, 1, @ptrCast(&readable), 0, null);
-            const copy = vk.BufferCopy{ .source_offset = 0, .destination_offset = revision * 4, .size = 4 };
-            self.device_functions.cmd_copy_buffer(copy_commands, transfer.handle, output.handle, 1, @ptrCast(&copy));
-            const host_readable = vk.BufferMemoryBarrier{
-                .source_access_mask = vk.access_transfer_write_bit,
-                .destination_access_mask = vk.access_host_read_bit,
-                .buffer = output.handle,
-                .offset = revision * 4,
-                .size = 4,
-            };
-            self.device_functions.cmd_pipeline_barrier(copy_commands, vk.pipeline_stage_transfer_bit, vk.pipeline_stage_host_bit, 0, 0, null, 1, @ptrCast(&host_readable), 0, null);
-            try self.submitOneShot(copy_commands);
+        // Exercise both host transfers and device-only bridges while earlier
+        // copies are queued. A later CPU upload must remain independent of
+        // the device bridge and wait before overwriting its host transfer.
+        for ([_]bool{ false, true }) |device_bridge| {
+            for ([_]usize{ 4, 16, 4 }, 0..) |bytes, revision| {
+                const transfer = if (device_bridge) try self.storageDepthTransfer(bytes) else try self.storageImageTransfer(bytes);
+                const copy_commands = try self.beginOneShot();
+                defer self.releaseOneShot(copy_commands);
+                self.orderStorageTransferWrite(copy_commands, transfer);
+                const value: u32 = 0x4567_0000 + @as(u32, @intCast(revision));
+                self.device_functions.cmd_fill_buffer(copy_commands, transfer.handle, 0, bytes, value);
+                const readable = vk.BufferMemoryBarrier{
+                    .source_access_mask = vk.access_transfer_write_bit,
+                    .destination_access_mask = vk.access_transfer_read_bit,
+                    .buffer = transfer.handle,
+                    .offset = 0,
+                    .size = bytes,
+                };
+                self.device_functions.cmd_pipeline_barrier(copy_commands, vk.pipeline_stage_transfer_bit, vk.pipeline_stage_transfer_bit, 0, 0, null, 1, @ptrCast(&readable), 0, null);
+                const copy = vk.BufferCopy{ .source_offset = 0, .destination_offset = revision * 4, .size = 4 };
+                self.device_functions.cmd_copy_buffer(copy_commands, transfer.handle, output.handle, 1, @ptrCast(&copy));
+                const host_readable = vk.BufferMemoryBarrier{
+                    .source_access_mask = vk.access_transfer_write_bit,
+                    .destination_access_mask = vk.access_host_read_bit,
+                    .buffer = output.handle,
+                    .offset = revision * 4,
+                    .size = 4,
+                };
+                self.device_functions.cmd_pipeline_barrier(copy_commands, vk.pipeline_stage_transfer_bit, vk.pipeline_stage_host_bit, 0, 0, null, 1, @ptrCast(&host_readable), 0, null);
+                try self.submitOneShot(copy_commands);
+            }
+            try self.uploadCachedStorageImage(index, &.{ 1, 2, 3, 4 });
+            var copied: [12]u8 = undefined;
+            try self.readMapped(output, &copied);
+            for (0..3) |revision| try std.testing.expectEqual(0x4567_0000 + @as(u32, @intCast(revision)), std.mem.readInt(u32, copied[revision * 4 ..][0..4], .little));
+            try std.testing.expectEqual(@as(u64, 16), self.storage_image_transfer.?.size);
+            if (device_bridge) {
+                try std.testing.expectEqual(@as(u64, 16), self.storage_depth_transfer.?.size);
+                try std.testing.expect(self.storage_depth_transfer.?.handle != self.storage_image_transfer.?.handle);
+            }
         }
-        try self.uploadCachedStorageImage(index, &.{ 1, 2, 3, 4 });
-        var copied: [12]u8 = undefined;
-        try self.readMapped(output, &copied);
-        for (0..3) |revision| try std.testing.expectEqual(0x4567_0000 + @as(u32, @intCast(revision)), std.mem.readInt(u32, copied[revision * 4 ..][0..4], .little));
-        try std.testing.expectEqual(@as(u64, 16), self.storage_image_transfer.?.size);
         self.storage_image_cache.items[index].gpu_dirty = true;
         try self.flushCachedStorageImage(self.guest_memory.?, index);
         var guest_pixel: [4]u8 = undefined;
@@ -26969,7 +27680,9 @@ pub const Renderer = struct {
                 vk.image_aspect_stencil_bit
             else
                 continue;
-            if (selected == null or cached.last_used_sequence > self.depth_targets.items[selected.?.index].last_used_sequence)
+            if (selected == null or cached.planeGeneration(aspect) > self.depth_targets.items[selected.?.index].planeGeneration(aspect) or
+                (cached.planeGeneration(aspect) == self.depth_targets.items[selected.?.index].planeGeneration(aspect) and
+                    cached.last_used_sequence > self.depth_targets.items[selected.?.index].last_used_sequence))
                 selected = .{ .index = index, .aspect = aspect };
         }
         return selected;
@@ -26981,7 +27694,9 @@ pub const Renderer = struct {
     fn transferStorageDepth(self: *Renderer, index: usize, source: StorageDepthSource, to_depth: bool) anyerror!void {
         const storage = self.storage_image_cache.items[index];
         const depth = self.depth_targets.items[source.index];
-        const transfer = try self.storageImageTransfer(storage.staging_bytes);
+        self.frame_profile.depth_storage_copies +|= 1;
+        self.frame_profile.depth_storage_copy_bytes +|= storage.staging_bytes;
+        const transfer = try self.storageDepthTransfer(storage.staging_bytes);
         const command_buffer = try self.beginOneShot();
         defer self.releaseOneShot(command_buffer);
         try self.transitionTrackedImage(command_buffer, depth.image.handle, .{ .aspect_mask = depth.target.aspectMask() }, if (to_depth) image_state.transfer_destination_usage else image_state.transfer_source_usage);
@@ -27010,14 +27725,10 @@ pub const Renderer = struct {
         const resident = &self.depth_targets.items[source.index];
         resident.shader_read_layout = false;
         if (to_depth) {
-            resident.gpu_generation +%= 1;
-            _ = self.image_aliases.markWrite(if (source.aspect == vk.image_aspect_stencil_bit)
-                resident.stencil_alias_token orelse resident.alias_token
-            else
-                resident.alias_token);
+            self.markDepthPlanesWritten(source.index, source.aspect);
         }
         const cached = &self.storage_image_cache.items[index];
-        cached.depth_snapshot = .{ .image = resident.image.handle, .generation = resident.gpu_generation };
+        cached.depth_snapshot = .{ .image = resident.image.handle, .generation = resident.planeGeneration(source.aspect) };
         cached.guest_content_hash_valid = false;
         cached.guest_page_generation = 0;
         // The guest allocation remains stale until an explicit CPU consumer.
@@ -27031,7 +27742,10 @@ pub const Renderer = struct {
         const source = self.storageDepthSource(cached.descriptor) orelse return;
         const depth = self.depth_targets.items[source.index];
         if (cached.depth_snapshot) |snapshot| {
-            if (snapshot.image == depth.image.handle and snapshot.generation == depth.gpu_generation) return;
+            if (snapshot.image == depth.image.handle and snapshot.generation == depth.planeGeneration(source.aspect)) {
+                self.frame_profile.depth_storage_reuses +|= 1;
+                return;
+            }
         }
         try self.transferStorageDepth(index, source, false);
     }
@@ -27240,11 +27954,17 @@ pub const Renderer = struct {
 
         self.storage_image_sequence +%= 1;
         var matching_index: ?usize = null;
+        var matching_view: vk.ImageView = 0;
         var candidates = self.storage_image_address_index.candidatesBy(self.storage_image_cache.items, descriptor.address, CachedStorageImage.address);
         while (candidates.next()) |index| {
             const cached = self.storage_image_cache.items[index];
-            if (!cached.valid or !sameStorageImageDescriptor(cached.descriptor, descriptor)) continue;
+            if (!cached.valid or (!sameStorageImageDescriptor(cached.descriptor, descriptor) and
+                !(cached.mutable_format and storageImageCanReinterpret(cached.descriptor, descriptor)))) continue;
             matching_index = index;
+            matching_view = if (storageImageFormat(cached.descriptor.unified_format).?.vulkan == format.vulkan)
+                cached.view
+            else
+                try self.residentImageView(cached.image.handle, if (is_3d) vk.image_view_type_3d else if (is_2d_array) vk.image_view_type_2d_array else vk.image_view_type_2d, format.vulkan, .{}, vk.image_aspect_color_bit, if (is_2d_array) subresource.depth_or_layers else 1);
 
             // Rebinding the exact same image while an earlier dispatch is
             // pending is both safe and required: Vulkan submissions are
@@ -27265,13 +27985,13 @@ pub const Renderer = struct {
                 const resident = &self.storage_image_cache.items[index];
                 resident.pin_count += 1;
                 resident.last_used_sequence = self.storage_image_sequence;
-                self.updateStorageImageDescriptor(descriptor_index, resident.view);
+                self.updateStorageImageDescriptor(descriptor_index, matching_view);
                 self.frame_profile.resident_storage_bytes +%= resident.staging_bytes;
                 return .{
                     .descriptor = descriptor,
                     .subresource = resident.subresource,
                     .image = resident.image,
-                    .view = resident.view,
+                    .view = matching_view,
                     .allocation_bytes = resident.allocation_bytes,
                     .staging_bytes = resident.staging_bytes,
                     .writable = writable,
@@ -27302,13 +28022,13 @@ pub const Renderer = struct {
             if (unchanged) {
                 cached.pin_count += 1;
                 errdefer self.releaseStorageImage(index);
-                self.updateStorageImageDescriptor(descriptor_index, cached.view);
+                self.updateStorageImageDescriptor(descriptor_index, matching_view);
                 self.frame_profile.resident_storage_bytes +%= cached.staging_bytes;
                 return .{
                     .descriptor = descriptor,
                     .subresource = cached.subresource,
                     .image = cached.image,
-                    .view = cached.view,
+                    .view = matching_view,
                     .allocation_bytes = cached.allocation_bytes,
                     .staging_bytes = cached.staging_bytes,
                     .writable = writable,
@@ -27334,13 +28054,13 @@ pub const Renderer = struct {
             {
                 cached.pin_count += 1;
                 errdefer self.releaseStorageImage(index);
-                self.updateStorageImageDescriptor(descriptor_index, cached.view);
+                self.updateStorageImageDescriptor(descriptor_index, matching_view);
                 self.frame_profile.resident_storage_bytes +%= cached.staging_bytes;
                 return .{
                     .descriptor = descriptor,
                     .subresource = cached.subresource,
                     .image = cached.image,
-                    .view = cached.view,
+                    .view = matching_view,
                     .allocation_bytes = cached.allocation_bytes,
                     .staging_bytes = cached.staging_bytes,
                     .writable = writable,
@@ -27371,12 +28091,12 @@ pub const Renderer = struct {
             cached.guest_texel_hash = guest_texel_hash;
             cached.guest_backing_hash = guest_backing_hash;
             cached.guest_page_generation = guest_page_generation;
-            self.updateStorageImageDescriptor(descriptor_index, cached.view);
+            self.updateStorageImageDescriptor(descriptor_index, matching_view);
             return .{
                 .descriptor = descriptor,
                 .subresource = cached.subresource,
                 .image = cached.image,
-                .view = cached.view,
+                .view = matching_view,
                 .allocation_bytes = cached.allocation_bytes,
                 .staging_bytes = cached.staging_bytes,
                 .writable = writable,
@@ -27391,10 +28111,7 @@ pub const Renderer = struct {
             if (is_3d) subresource.depth_or_layers else 1,
             if (is_2d_array) subresource.depth_or_layers else 1,
             if (is_3d) vk.image_type_3d else vk.image_type_2d,
-            if (descriptor.unified_format == 56 or descriptor.unified_format == 130)
-                vk.image_create_mutable_format_bit
-            else
-                0,
+            vk.image_create_mutable_format_bit,
             format.vulkan,
             vk.image_usage_transfer_src_bit | vk.image_usage_transfer_dst_bit |
                 vk.image_usage_storage_bit | vk.image_usage_sampled_bit,
@@ -27445,6 +28162,7 @@ pub const Renderer = struct {
             .subresource = subresource,
             .image = image,
             .view = view,
+            .mutable_format = true,
             .allocation_bytes = allocation_bytes,
             .staging_bytes = staging_bytes,
             .last_used_sequence = self.storage_image_sequence,
@@ -28491,7 +29209,6 @@ pub const Renderer = struct {
         // sample undefined texels in the levels it could not fill, which is a
         // worse answer than the readback it replaces.
         var sources: [maximum_assembled_mip_levels]usize = undefined;
-        var signature_hash = std.hash.Wyhash.init(0);
         for (0..levels) |level| {
             const found = found: {
                 var newest: ?usize = null;
@@ -28510,11 +29227,7 @@ pub const Renderer = struct {
                 break :found newest;
             } orelse return null;
             sources[level] = found;
-            const cached = self.storage_image_cache.items[found];
-            const identity = [_]u64{ cached.image.handle, cached.content_generation };
-            signature_hash.update(std.mem.asBytes(&identity));
         }
-        const signature = signature_hash.final();
 
         const storage_format = storageImageFormat(descriptor.unified_format) orelse return null;
         if (!sampledViewFormatCompatible(storage_format.vulkan, image_format)) return null;
@@ -28542,7 +29255,8 @@ pub const Renderer = struct {
             if (cached.subresource.width < level_width or cached.subresource.height < level_height)
                 extents_usable = false;
         }
-        if (survey and self.reported_mip_surveys < 4) {
+        const trace_survey = survey and self.reported_mip_surveys < 4;
+        if (trace_survey) {
             self.reported_mip_surveys += 1;
             std.debug.print(
                 "[gpu mip survey] @0x{x} {d}x{d} levels={d} match={any}\n",
@@ -28566,27 +29280,55 @@ pub const Renderer = struct {
         if (!extents_usable) return null;
 
         const memory = self.guest_memory orelse return null;
-        // A raw buffer producer or a CPU replacement must go through the
-        // normal publication/upload path before these image copies are valid.
-        for (sources[0..levels]) |index| {
+        // Resolve incompatible producers before allocating or modifying any
+        // image. A CPU edit of one mip can be reloaded independently without
+        // publishing the newer GPU output of all its neighbours.
+        var cpu_changed: [maximum_assembled_mip_levels]bool = @splat(false);
+        for (sources[0..levels], 0..) |index, level| {
             const cached = self.storage_image_cache.items[index];
-            if (self.pendingBufferWrite(descriptor.address, cached.allocation_bytes) != null) return null;
+            if (self.pendingBufferWrite(descriptor.address, cached.allocation_bytes)) |buffer| {
+                if (trace_survey) std.debug.print("[gpu mip reject] buffer @0x{x} bytes={d} overlaps @0x{x} bytes={d}\n", .{ buffer.guest_address, buffer.size, descriptor.address, cached.allocation_bytes });
+                return null;
+            }
             for (self.render_targets.items, 0..) |target, target_index| {
                 if (target.initialized and target.gpu_generation != target.host_generation and
                     byteRangesOverlap(descriptor.address, cached.allocation_bytes, target.target.descriptor.address, target.target.layout.required_source_bytes) and
-                    !self.discardReplacedRenderTarget(target_index)) return null;
+                    !self.discardReplacedRenderTarget(target_index))
+                {
+                    if (trace_survey) std.debug.print("[gpu mip reject] color @0x{x} bytes={d} {d}x{d} overlaps @0x{x} bytes={d}\n", .{ target.target.descriptor.address, target.target.layout.required_source_bytes, target.target.descriptor.width, target.target.descriptor.height, descriptor.address, cached.allocation_bytes });
+                    return null;
+                }
             }
             if (cached.pin_count == 0 and try self.storageGuestContentsChanged(memory, index)) {
+                cpu_changed[level] = true;
+            }
+        }
+
+        // Ring growth and image allocation recovery may evict cold storage.
+        // Preserve every selected source, including the untouched GPU mips.
+        for (sources[0..levels]) |index| self.storage_image_cache.items[index].pin_count += 1;
+        defer for (sources[0..levels]) |index| self.releaseStorageImage(index);
+        for (sources[0..levels], cpu_changed[0..levels]) |index, changed| {
+            if (changed and !try self.reloadChangedStorageMip(memory, index)) {
+                if (trace_survey) std.debug.print("[gpu mip reject] CPU replacement has no stable snapshot @0x{x}\n", .{descriptor.address});
                 self.invalidateStorageGuestContents(index);
                 return null;
             }
         }
+        var signature_hash = std.hash.Wyhash.init(0);
+        for (sources[0..levels]) |index| {
+            const cached = self.storage_image_cache.items[index];
+            const identity = [_]u64{ cached.image.handle, cached.content_generation };
+            signature_hash.update(std.mem.asBytes(&identity));
+        }
+        const signature = signature_hash.final();
 
-        for (self.assembled_mip_chains.items) |chain| {
+        for (self.assembled_mip_chains.items) |*chain| {
             if (chain.address != descriptor.address or chain.unified_format != descriptor.unified_format or
                 chain.width != descriptor.width or chain.height != descriptor.height or
                 chain.levels != levels or chain.image_format != image_format) continue;
             if (chain.signature != signature) break;
+            chain.last_used_batch = self.sampled_image_batch;
             return .{
                 .image = chain.image,
                 .view = try self.residentImageViewLevels(chain.image.handle, vk.image_view_type_2d, image_format, try sampledImageComponents(descriptor.dst_select, descriptor.unified_format), vk.image_aspect_color_bit, 1, levels),
@@ -28594,6 +29336,37 @@ pub const Renderer = struct {
             };
         }
         return self.buildAssembledMipChain(descriptor, sampler_descriptor, image_format, sources[0..levels], signature);
+    }
+
+    /// Replace only a CPU-authored mip. Untouched levels can still contain
+    /// newer GPU output than RAM, so uploading the whole pyramid is incorrect.
+    fn reloadChangedStorageMip(self: *Renderer, memory: GuestMemory, index: usize) anyerror!bool {
+        const track = memory.track_gpu_read orelse return false;
+        const query = memory.gpu_generation orelse return false;
+        const source = self.storage_image_cache.items[index];
+        const generation = track(memory.context, source.descriptor.address, source.allocation_bytes);
+        if (generation == 0) return false;
+        var allocation = try self.image_scratch.acquire(self.allocator, source.allocation_bytes);
+        defer allocation.release();
+        if (!memory.read(memory.context, source.descriptor.address, allocation.bytes)) return Error.GuestMemoryReadFailed;
+        var linear = try self.image_scratch.acquire(self.allocator, source.staging_bytes);
+        defer linear.release();
+        try source.subresource.detile(allocation.bytes, linear.bytes);
+        const backing_hash = gpu.parallel_copy.fingerprint(allocation.bytes);
+        const texel_hash = gpu.parallel_copy.fingerprint(linear.bytes);
+        if (query(memory.context, source.descriptor.address, source.allocation_bytes) != generation) return false;
+        self.invalidateStorageGuestContents(index);
+        try self.uploadCachedStorageImage(index, linear.bytes);
+        const cached = &self.storage_image_cache.items[index];
+        cached.guest_content_hash = backing_hash;
+        cached.guest_content_hash_valid = true;
+        cached.guest_texel_hash = texel_hash;
+        cached.guest_backing_hash = backing_hash;
+        cached.guest_page_generation = generation;
+        cached.gpu_dirty = false;
+        self.frame_profile.mip_cpu_reloads +|= 1;
+        self.frame_profile.mip_cpu_reload_bytes +|= linear.bytes.len;
+        return true;
     }
 
     fn buildAssembledMipChain(
@@ -28611,7 +29384,7 @@ pub const Renderer = struct {
         var images: [maximum_assembled_mip_levels]MipChainSource = undefined;
         for (sources, 0..) |index, level| {
             const cached = self.storage_image_cache.items[index];
-            images[level] = .{ .image = cached.image.handle, .width = cached.subresource.width, .height = cached.subresource.height, .restore = image_state.storage_usage };
+            images[level] = .{ .image = cached.image.handle, .width = cached.subresource.width, .height = cached.subresource.height, .restore = image_state.storage_usage, .generation = cached.content_generation };
         }
         return self.buildMipChainImages(descriptor, sampler_descriptor, image_format, images[0..sources.len], signature);
     }
@@ -28625,7 +29398,23 @@ pub const Renderer = struct {
         signature: u64,
     ) anyerror!?PreparedSampledImage {
         const levels: u32 = @intCast(sources.len);
-        const destination = try self.createImageWithExtent(
+        // A changed level invalidates the contents, not the allocation. Older
+        // draws have already been recorded and the transfer barrier orders
+        // them before this overwrite. A current-batch view is still being
+        // prepared, so it must keep its own immutable version.
+        const reused: ?AssembledMipChain = reuse: {
+            if (self.current_descriptor_slot == null) break :reuse null;
+            for (self.assembled_mip_chains.items, 0..) |chain, index| {
+                if (chain.address != descriptor.address or chain.unified_format != descriptor.unified_format or
+                    chain.width != descriptor.width or chain.height != descriptor.height or
+                    chain.levels != levels or chain.image_format != image_format or
+                    chain.last_used_batch == self.sampled_image_batch) continue;
+                _ = self.assembled_mip_chains.swapRemove(index);
+                break :reuse chain;
+            }
+            break :reuse null;
+        };
+        const destination = if (reused) |chain| chain.image else try self.createImageWithExtent(
             descriptor.width,
             descriptor.height,
             1,
@@ -28637,7 +29426,11 @@ pub const Renderer = struct {
             vk.sample_count_1_bit,
             levels,
         );
-        errdefer self.destroyImage(destination);
+        errdefer {
+            self.invalidateResidentImageViews(destination.handle);
+            self.destroyImage(destination);
+        }
+        if (reused != null) self.frame_profile.mip_chain_reuses +|= 1 else self.frame_profile.mip_chain_creates +|= 1;
 
         const command_buffer = try self.beginOneShot();
         defer self.releaseOneShot(command_buffer);
@@ -28647,16 +29440,18 @@ pub const Renderer = struct {
             .layer_count = 1,
         };
         var to_destination = vk.ImageMemoryBarrier{
-            .source_access_mask = 0,
+            .source_access_mask = if (reused != null) vk.access_shader_read_bit else 0,
             .destination_access_mask = vk.access_transfer_write_bit,
-            .old_layout = vk.image_layout_undefined,
+            .old_layout = if (reused != null) vk.image_layout_shader_read_only_optimal else vk.image_layout_undefined,
             .new_layout = vk.image_layout_transfer_dst_optimal,
             .image = destination.handle,
             .subresource_range = whole,
         };
-        self.device_functions.cmd_pipeline_barrier(command_buffer, vk.pipeline_stage_top_of_pipe_bit, vk.pipeline_stage_transfer_bit, 0, 0, null, 0, null, 1, @ptrCast(&to_destination));
+        self.device_functions.cmd_pipeline_barrier(command_buffer, if (reused != null) vk.pipeline_stage_all_commands_bit else vk.pipeline_stage_top_of_pipe_bit, vk.pipeline_stage_transfer_bit, 0, 0, null, 0, null, 1, @ptrCast(&to_destination));
 
         for (sources, 0..) |source, level| {
+            if (reused) |chain| if (source.sameContents(chain.sources[level])) continue;
+            self.frame_profile.mip_chain_level_copies +|= 1;
             try self.transitionTrackedImage(command_buffer, source.image, .{
                 .aspect_mask = vk.image_aspect_color_bit,
                 .layer_count = 1,
@@ -28697,8 +29492,9 @@ pub const Renderer = struct {
             .image = destination.handle,
             .subresource_range = whole,
         };
-        self.device_functions.cmd_pipeline_barrier(command_buffer, vk.pipeline_stage_transfer_bit, vk.pipeline_stage_fragment_shader_bit | vk.pipeline_stage_compute_shader_bit, 0, 0, null, 0, null, 1, @ptrCast(&to_read));
-        for (sources) |source| {
+        self.device_functions.cmd_pipeline_barrier(command_buffer, vk.pipeline_stage_transfer_bit, vk.pipeline_stage_all_commands_bit, 0, 0, null, 0, null, 1, @ptrCast(&to_read));
+        for (sources, 0..) |source, level| {
+            if (reused) |chain| if (source.sameContents(chain.sources[level])) continue;
             try self.transitionTrackedImage(command_buffer, source.image, .{
                 .aspect_mask = vk.image_aspect_color_bit,
                 .layer_count = 1,
@@ -28729,6 +29525,8 @@ pub const Renderer = struct {
                 .{ descriptor.address, descriptor.width, descriptor.height, levels },
             );
         }
+        var retained_sources: [maximum_assembled_mip_levels]MipChainSource = undefined;
+        @memcpy(retained_sources[0..sources.len], sources);
         try self.retainAssembledMipChain(.{
             .address = descriptor.address,
             .unified_format = descriptor.unified_format,
@@ -28739,6 +29537,8 @@ pub const Renderer = struct {
             .signature = signature,
             .image = destination,
             .view = view,
+            .last_used_batch = self.sampled_image_batch,
+            .sources = retained_sources,
         });
         return .{
             .image = destination,
@@ -28799,7 +29599,8 @@ pub const Renderer = struct {
             // memory with the wrong detile equation (Yotei's 960x540 HiZ and
             // 4K reconstructed depth both hit this). The resident image stays
             // valid after the writeback clears gpu_dirty.
-            if (!cached.valid or !storageImageOverlapsSampledDescriptor(cached.descriptor, descriptor)) {
+            const reinterpreted = cached.mutable_format and storageImageCanReinterpret(cached.descriptor, descriptor);
+            if (!cached.valid or (!storageImageOverlapsSampledDescriptor(cached.descriptor, descriptor) and !reinterpreted)) {
                 continue;
             }
             // A command-processor write can replace a previously uploaded or
@@ -28813,7 +29614,8 @@ pub const Renderer = struct {
                 self.last_resident_reject = 4;
                 continue;
             };
-            if (!sampledViewFormatCompatible(storage_format.vulkan, image_format)) {
+            const view_format = if (reinterpreted) storageImageFormat(descriptor.unified_format).?.vulkan else storage_format.vulkan;
+            if (!sampledViewFormatCompatible(view_format, image_format)) {
                 self.last_resident_reject = 5;
                 continue;
             }
@@ -29552,6 +30354,7 @@ pub const Renderer = struct {
         const linear = linear_scratch.bytes;
         const reader = gpu.ShaderMemoryReader{ .context = memory.context, .read_fn = memory.read };
         var detiled_upload: ?OwnedBuffer = null;
+        var native_clear: ?vk.ClearColorValue = null;
         defer if (detiled_upload) |buffer| self.destroyBuffer(buffer);
         var source_available = true;
         const dcc_materialized_texel: ?DccClearTexel = if (fixed_clear) |texel|
@@ -29565,7 +30368,12 @@ pub const Renderer = struct {
                 bytes_per_texel,
             );
         if (dcc_materialized_texel) |texel| {
-            fillTexels(linear, texel.bytes[0..texel.length]);
+            // A sampled sRGB image needs encoded native bytes; the attachment
+            // helper assumes a UNORM backing there, so retain its byte upload.
+            if (@atomicLoad(bool, &native_dcc_sampled_clears, .monotonic) and
+                !log_verbose_gpu and image_format != vk.format_r8g8b8a8_srgb)
+                native_clear = nativeDccClearColor(image_format, texel);
+            if (native_clear == null) fillTexels(linear, texel.bytes[0..texel.length]);
             if (log_verbose_gpu or self.traceCurrentGraphicsFrame()) std.debug.print(
                 "[vulkan dcb] materialized DCC sample @0x{x} {d}x{d} key@0x{x} texel={x:0>2}{x:0>2}{x:0>2}{x:0>2}\n",
                 .{
@@ -29645,7 +30453,19 @@ pub const Renderer = struct {
                 source_available = false;
                 fillUnbackedDepthSample(descriptor.unified_format, linear);
             } else {
-                try layout.?.detile(tiled, linear);
+                const computed = if (@atomicLoad(bool, &single_level_compute_detile, .monotonic))
+                    try self.computeDetileViews(&.{try layout.?.gpuView()}, tiled, byte_count, true)
+                else
+                    null;
+                if (computed) |result| {
+                    if (self.direct_detile_uploads and !log_verbose_gpu) {
+                        detiled_upload = result;
+                        self.direct_detile_upload_count +|= 1;
+                    } else {
+                        defer self.destroyBuffer(result);
+                        try self.readMapped(result, linear);
+                    }
+                } else try layout.?.detile(tiled, linear);
             }
         }
         // Zero is a valid authored depth value (including a reversed-Z clear).
@@ -29672,7 +30492,9 @@ pub const Renderer = struct {
         // doing it unconditionally added another full 64 MiB CPU pass for a
         // 4096² texture after detiling. Normal rendering only needs to know
         // whether the image is entirely empty.
-        const nonzero = if (detiled_upload != null)
+        const nonzero = if (native_clear != null)
+            @as(u32, @intFromBool(containsNonzeroByte(dcc_materialized_texel.?.bytes[0..dcc_materialized_texel.?.length])))
+        else if (detiled_upload != null)
             // CPU texel diagnostics are unavailable on the direct path.
             @as(u32, 1)
         else if (log_verbose_gpu)
@@ -29694,7 +30516,7 @@ pub const Renderer = struct {
         const raw_probe_span = probe_span;
         var raw_nonzero: u32 = 0;
         var raw_probe_hits: u32 = 0;
-        if (detiled_upload == null and (log_verbose_gpu or self.texture_cache_misses <= 4) and raw_probe_span != 0) {
+        if (detiled_upload == null and native_clear == null and (log_verbose_gpu or self.texture_cache_misses <= 4) and raw_probe_span != 0) {
             const steps = [_]u64{ 0, raw_probe_span / 4, raw_probe_span / 2, (raw_probe_span * 3) / 4 };
             var step_i: usize = 0;
             while (step_i < steps.len) : (step_i += 1) {
@@ -29713,7 +30535,7 @@ pub const Renderer = struct {
                 }
             }
         }
-        if (detiled_upload == null and (log_verbose_gpu or self.texture_cache_misses <= 4)) std.debug.print(
+        if (detiled_upload == null and native_clear == null and (log_verbose_gpu or self.texture_cache_misses <= 4)) std.debug.print(
             "[vulkan dcb] staged sample {d}x{d}x{d} tile={f} addr=0x{x} mips={d} base={d} nonzero_texels={d}/{d} raw_probe_nz={d} hits={d} first_rgba=({d},{d},{d},{d})\n",
             .{
                 descriptor.width,
@@ -29811,13 +30633,25 @@ pub const Renderer = struct {
         else
             1;
         const mip_levels: u32 = if (mip_plan) |plan| plan.level_count else 1;
-        const upload = detiled_upload orelse try self.createBuffer(
+        const ring_upload: ?DrawUploadSlice = if (detiled_upload == null and native_clear == null and byte_count <= draw_upload_ring_bytes and self.current_descriptor_slot != null and self.draw_batch_active)
+            try self.allocateDrawUpload(byte_count)
+        else
+            null;
+        const owned_upload: ?OwnedBuffer = if (detiled_upload == null and native_clear == null and ring_upload == null) try self.createBuffer(
             byte_count,
             vk.buffer_usage_transfer_src_bit,
             vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit,
-        );
-        defer if (detiled_upload == null) self.destroyBuffer(upload);
-        if (detiled_upload == null) try self.writeMapped(upload, linear);
+        ) else null;
+        defer if (owned_upload) |buffer| self.destroyBuffer(buffer);
+        if (ring_upload) |slice| {
+            const mapping = try self.mapDrawUpload(slice);
+            defer mapping.release(self);
+            @memcpy(mapping.bytes, linear);
+        } else if (owned_upload) |buffer| try self.writeMapped(buffer, linear);
+        // Fresh ring slices retain every queued texture snapshot, including
+        // spills, without creating a host allocation for each streamed image.
+        const upload_buffer = if (native_clear != null) @as(vk.Buffer, 0) else if (detiled_upload) |buffer| buffer.handle else if (ring_upload) |slice| slice.buffer else owned_upload.?.handle;
+        const upload_offset = if (ring_upload) |slice| slice.offset else 0;
         const image_info = vk.ImageCreateInfo{
             .extent = .{ .width = image_width, .height = image_height, .depth = image_depth },
             .array_layers = upload_layers,
@@ -29830,7 +30664,7 @@ pub const Renderer = struct {
             .mip_levels = mip_levels,
         };
         const backing_key = SampledBackingKey.from(image_info);
-        const recycled = if (@atomicLoad(bool, &sampled_backing_reuse, .monotonic)) self.recycleSampledBacking(backing_key) else null;
+        const recycled = if (@atomicLoad(bool, &sampled_backing_reuse, .monotonic)) self.recycleSampledBacking(backing_key, descriptor.address, upload_state_hash) else null;
         // Keep the prior alias alive until the new one inherits its epoch.
         // Updating the same guest source must not reset its content generation.
         defer if (recycled) |old| self.image_aliases.unregister(old.alias_token);
@@ -29860,7 +30694,7 @@ pub const Renderer = struct {
                 const packed_bytes = try (try plan.view(level_index)).stagingBytes();
                 const extent = plan.mipTexels(level_index);
                 copies[copy_count] = .{
-                    .buffer_offset = cursor,
+                    .buffer_offset = upload_offset + cursor,
                     .image_subresource = .{
                         .aspect_mask = vk.image_aspect_color_bit,
                         .mip_level = level_index,
@@ -29877,6 +30711,7 @@ pub const Renderer = struct {
             }
         } else {
             copies[0] = .{
+                .buffer_offset = upload_offset,
                 .image_subresource = .{
                     .aspect_mask = vk.image_aspect_color_bit,
                     .layer_count = upload_layers,
@@ -29889,9 +30724,13 @@ pub const Renderer = struct {
             };
             copy_count = 1;
         }
-        self.device_functions.cmd_copy_buffer_to_image(
+        if (native_clear) |clear| {
+            const range = vk.ImageSubresourceRange{ .aspect_mask = vk.image_aspect_color_bit, .level_count = mip_levels, .layer_count = upload_layers };
+            self.device_functions.cmd_clear_color_image(command_buffer, image.handle, vk.image_layout_transfer_dst_optimal, &clear, 1, @ptrCast(&range));
+            self.sampled_native_clear_count +|= 1;
+        } else self.device_functions.cmd_copy_buffer_to_image(
             command_buffer,
-            upload.handle,
+            upload_buffer,
             image.handle,
             vk.image_layout_transfer_dst_optimal,
             copy_count,
@@ -29908,8 +30747,10 @@ pub const Renderer = struct {
             image_state.shader_read_usage,
         );
         try self.submitOneShot(command_buffer);
-        self.frame_profile.upload_bytes +%= byte_count;
-        self.frame_profile.texture_upload_bytes +%= byte_count;
+        if (native_clear == null) {
+            self.frame_profile.upload_bytes +%= byte_count;
+            self.frame_profile.texture_upload_bytes +%= byte_count;
+        }
 
         const view_info = vk.ImageViewCreateInfo{
             .image = image.handle,
@@ -30003,11 +30844,20 @@ pub const Renderer = struct {
         return .{ .image = image, .view = view, .sampler = sampler };
     }
 
-    fn recycleSampledBacking(self: *Renderer, requested: ?SampledBackingKey) ?RecycledSampledBacking {
+    fn recycleSampledBacking(self: *Renderer, requested: ?SampledBackingKey, address: u64, upload_state_hash: u64) ?RecycledSampledBacking {
         const key = requested orelse return null;
-        if (self.sampled_image_cache_bytes > self.sampled_image_cache_budget_bytes) return null;
         const trim_started = hostTimestampNs();
         defer self.frame_profile.sampled_trim_ns +|= elapsedHostNanoseconds(trim_started);
+        // A changed source replaces this revision even below the byte budget.
+        // Reuse its allocation in queue order instead of allocating/freeing a
+        // full-size image every frame. A view prepared for the current batch
+        // still needs the old texels and must retain its separate snapshot.
+        for (self.sampled_image_cache.items, 0..) |entry, index| {
+            if (entry.last_used_batch == self.sampled_image_batch or entry.guest_address != address or entry.upload_state_hash != upload_state_hash) continue;
+            if (entry.backing_key) |previous| if (std.meta.eql(previous, key))
+                return self.takeSampledBacking(index, false);
+        }
+        if (self.sampled_image_cache_bytes > self.sampled_image_cache_budget_bytes) return null;
         var victim: ?usize = null;
         var oldest: u64 = std.math.maxInt(u64);
         for (self.sampled_image_cache.items, 0..) |entry, index| {
@@ -30022,8 +30872,13 @@ pub const Renderer = struct {
         if (!std.meta.eql(entry.backing_key orelse return null, key)) return null;
         if (self.sampled_image_cache_bytes +| entry.image.allocation_bytes <= self.sampled_image_cache_budget_bytes and
             self.sampled_image_cache.items.len < maximum_cached_sampled_images) return null;
-        // Choose exactly the ordinary LRU victim. Keep the image's tracked
-        // usage: the next transfer barrier orders its old queued consumers
+        return self.takeSampledBacking(index, true);
+    }
+
+    fn takeSampledBacking(self: *Renderer, index: usize, eviction: bool) RecycledSampledBacking {
+        const entry = self.sampled_image_cache.items[index];
+        // Keep the image's tracked usage: the next transfer barrier orders
+        // its old queued consumers
         // before replacing texels. Prepared-but-unrecorded consumers are
         // protected by last_used_batch and can never reach this path.
         self.sampled_image_cache_bytes -= entry.image.allocation_bytes;
@@ -30032,7 +30887,7 @@ pub const Renderer = struct {
         self.invalidateResidentImageViews(entry.image.handle);
         _ = self.sampled_image_cache.orderedRemove(index);
         self.sampled_image_index.invalidate();
-        self.frame_profile.texture_evictions +|= 1;
+        if (eviction) self.frame_profile.texture_evictions +|= 1;
         self.frame_profile.sampled_backing_reuses +|= 1;
         return .{ .image = entry.image, .alias_token = entry.alias_token };
     }
@@ -30053,6 +30908,11 @@ pub const Renderer = struct {
 
     fn trimSampledImageCache(self: *Renderer, incoming_bytes: u64) Error!void {
         const trim_started = hostTimestampNs();
+        const recovered = self.sampled_image_budget_recovery.recover(trim_started, self.sampled_image_cache_budget_bytes, self.sampled_image_cache_configured_budget_bytes);
+        if (recovered != self.sampled_image_cache_budget_bytes) {
+            std.debug.print("[vulkan memory] sampled cache budget recovered {d}->{d}MiB\n", .{ self.sampled_image_cache_budget_bytes / (1024 * 1024), recovered / (1024 * 1024) });
+            self.sampled_image_cache_budget_bytes = recovered;
+        }
         var reclaimed = false;
         while (self.sampled_image_cache_bytes +| incoming_bytes > self.sampled_image_cache_budget_bytes or
             self.sampled_image_cache.items.len >= maximum_cached_sampled_images)
@@ -30112,13 +30972,14 @@ pub const Renderer = struct {
         try self.waitForSampledImageRetirement(0);
         self.image_memory_reclaims +|= 1;
         self.image_memory_reclaimed_bytes +|= reclaimed;
-        // Do not immediately fill the cache back to a budget that just failed
-        // alongside the other resident resources. Keep a small working floor;
-        // a single protected batch may still exceed this soft limit.
+        // Back off after real pressure, but do not permanently retain a tiny
+        // startup budget. A single protected batch may exceed this soft limit;
+        // subsequent successful allocations can gradually recover the ceiling.
         self.sampled_image_cache_budget_bytes = @min(
             self.sampled_image_cache_budget_bytes,
             @max(self.sampled_image_cache_bytes, 64 * 1024 * 1024),
         );
+        self.sampled_image_budget_recovery.pressure(hostTimestampNs());
         if (self.image_memory_reclaims <= 8) std.debug.print(
             "[vulkan memory] reclaimed sampled images bytes={d} cache={d}MiB budget={d}MiB for allocation={d}\n",
             .{ reclaimed, self.sampled_image_cache_bytes / (1024 * 1024), self.sampled_image_cache_budget_bytes / (1024 * 1024), incoming_bytes },
@@ -30538,8 +31399,8 @@ pub const Renderer = struct {
         self.gpu_timestamp_samples +|= 1;
         const minimum = @atomicLoad(u64, &gpu_timestamp_min_us, .monotonic);
         if (nanoseconds / 1000 >= @as(f64, @floatFromInt(minimum))) std.debug.print(
-            "[gpu timestamp] frame={d} span_us={d:.1} programs=0x{x}/0x{x} caller=0x{x}\n",
-            .{ sample.frame, nanoseconds / 1000, sample.programs[0], sample.programs[1], sample.caller },
+            "[gpu timestamp] frame={d} span_us={d:.1} programs=0x{x}/0x{x} caller=0x{x} isolated={any}\n",
+            .{ sample.frame, nanoseconds / 1000, sample.programs[0], sample.programs[1], sample.caller, sample.isolated },
         );
     }
 
@@ -30555,8 +31416,13 @@ pub const Renderer = struct {
         }
         const query: u32 = @intCast(slot * 2);
         self.device_functions.cmd_reset_query_pool(command_buffer, self.gpu_timestamp_pool, query, 2);
+        const isolated = @atomicLoad(bool, &gpu_timestamp_isolate_batches, .monotonic);
+        // A TOP/BOTTOM interval can otherwise include prior queue work that
+        // overlaps the beginning of this recording. Do not attribute that
+        // latency to the first copy/dispatch when surveying individual calls.
+        if (isolated) self.device_functions.cmd_pipeline_barrier(command_buffer, vk.pipeline_stage_all_commands_bit, vk.pipeline_stage_all_commands_bit, 0, 0, null, 0, null, 0, null);
         self.device_functions.cmd_write_timestamp(command_buffer, vk.pipeline_stage_top_of_pipe_bit, self.gpu_timestamp_pool, query);
-        self.gpu_timestamp_slots[slot] = .{ .active = true, .programs = self.trace_gpu_programs, .frame = self.flip_callbacks + 1, .caller = caller };
+        self.gpu_timestamp_slots[slot] = .{ .active = true, .programs = self.trace_gpu_programs, .frame = self.flip_callbacks + 1, .caller = caller, .isolated = isolated };
     }
 
     fn reusableCommandBuffer(self: *Renderer) ?usize {
@@ -30985,7 +31851,7 @@ pub const Renderer = struct {
         // The index source may be GPU-produced even though the vertex buffers
         // themselves are read-only. Check the current contents, not its address.
         if (draw.index_count) |count| self.flushGuestIndexRange(draw.index_address, @as(usize, count) * @as(usize, if (draw.index_uint32) 4 else 2)) catch return false;
-        const range = drawVertexRange(reader, draw);
+        const range = self.cachedDrawVertexRange(reader, draw);
         if (!self.draw_reuse_index_proof.accepts(range)) return false;
         if (self.draw_reuse_fetch_bounds) |cached| {
             const current = DrawFetchBounds.init(range, draw) orelse return false;
@@ -31326,8 +32192,8 @@ pub const Renderer = struct {
     }
 
     /// Called only after the existing retirement tick has completed. Keep the
-    /// original size, usage and memory preference: reuse never widens a shader
-    /// descriptor or substitutes an imported guest allocation. Contents remain
+    /// original capacity, usage and memory preference: reuse never widens a
+    /// logical buffer or substitutes an imported guest allocation. Contents remain
     /// unspecified, just as for a new Vulkan allocation; callers initialize it.
     fn recycleCompletedBuffer(self: *Renderer, buffer: OwnedBuffer) bool {
         if (self.buffer_recycle_budget_bytes == 0 or buffer.reuse_key == null or
@@ -31684,9 +32550,10 @@ pub const Renderer = struct {
         var cases: u32 = 0;
         var elapsed: [2]u64 = @splat(0);
         for ([_]bool{ false, true }) |volume| {
-            for ([_]gpu.resources.TileMode{ .linear, .standard_256b, .standard_4kb, .standard_64kb, .partially_resident }) |mode| {
+            for ([_]gpu.resources.TileMode{ .linear, .standard_256b, .standard_4kb, .standard_64kb, .partially_resident, .render_target, .depth }) |mode| {
                 if (volume and (mode == .linear or mode == .standard_256b)) continue;
                 for ([_]u8{ 4, 8, 16 }) |bpp| {
+                    if (mode == .depth and bpp > 8) continue;
                     const texture = try gpu.TextureLayout.init(.{
                         .tile_mode = mode,
                         .kind = if (volume) .volume_3d else .array_2d,
@@ -31738,6 +32605,34 @@ pub const Renderer = struct {
                     }
                     cases += 1;
                 }
+            }
+        }
+        // Base-level uploads retain explicit pitches and physical slice XORs.
+        // Compare the GPU output with the independent surface CPU detiler,
+        // including nonzero base offsets and partial edge tiles.
+        for ([_]gpu.resources.TileMode{ .standard_256b, .standard_4kb, .standard_64kb, .partially_resident, .render_target, .depth }) |mode| {
+            for ([_]u8{ 4, 8, 16 }) |bpp| {
+                if (mode == .depth and bpp > 8) continue;
+                var surface = try gpu.SurfaceLayout.init(.{ .tile_mode = mode, .width = 273, .height = 139, .layers = 2, .first_slice = 3, .row_pitch_elements = 401 }, bpp);
+                surface.source_base_offset = 256;
+                surface.required_source_bytes += 256;
+                const tiled = try self.allocator.alloc(u8, @intCast(surface.required_source_bytes));
+                defer self.allocator.free(tiled);
+                for (tiled, 0..) |*byte, i| byte.* = @truncate(i ^ (i >> 5) ^ (i >> 13) ^ (i >> 20));
+                const expected = try self.allocator.alloc(u8, @intCast(surface.staging_bytes));
+                defer self.allocator.free(expected);
+                const actual = try self.allocator.alloc(u8, expected.len);
+                defer self.allocator.free(actual);
+                try surface.detile(tiled, expected);
+                const view = try surface.subresourceView();
+                for ([_]bool{ false, true }) |specialize| {
+                    self.specialize_detile = specialize;
+                    const result = (try self.computeDetileViews(&.{view}, tiled, actual.len, true)) orelse return error.DetileProbeNotDispatched;
+                    defer self.destroyBuffer(result);
+                    try self.readMapped(result, actual);
+                    try std.testing.expectEqualSlices(u8, expected, actual);
+                }
+                cases += 1;
             }
         }
         std.debug.print("specialized detile passed: {d} layouts, full texel agreement, generic_us={d} specialized_us={d} (includes first compilation)\n", .{ cases, elapsed[0] / 1000, elapsed[1] / 1000 });
@@ -31798,18 +32693,29 @@ pub const Renderer = struct {
         tiled: []const u8,
         linear_bytes: usize,
     ) (Error || std.mem.Allocator.Error || gpu.tiling.Error)!?OwnedBuffer {
+        var views: [16]gpu.TextureSubresourceLayout = undefined;
+        if (plan.level_count > views.len) return null;
+        for (views[0..plan.level_count], 0..) |*view, index| view.* = try plan.view(@intCast(index));
+        return self.computeDetileViews(views[0..plan.level_count], tiled, linear_bytes, self.device_detile_sources);
+    }
+
+    fn computeDetileViews(
+        self: *Renderer,
+        views: []const gpu.TextureSubresourceLayout,
+        tiled: []const u8,
+        linear_bytes: usize,
+        device_source: bool,
+    ) (Error || std.mem.Allocator.Error || gpu.tiling.Error)!?OwnedBuffer {
         if (self.detile_pipeline == 0 or tiled.len == 0 or linear_bytes < 32 * 1024) return null;
-        var params_ok = true;
-        var level_index: u8 = 0;
-        while (level_index < plan.level_count) : (level_index += 1) {
-            const view = try plan.view(level_index);
-            const detile = try view.computePlan(0, 0);
-            if (!gpu.computeDetileSupported(detile.params)) {
-                params_ok = false;
-                break;
-            }
+        var required: u64 = 0;
+        for (views) |view| {
+            const detile = try view.computePlan(0, required);
+            if (!gpu.computeDetileSupported(detile.params) or view.required_source_bytes > tiled.len) return null;
+            const bytes = try view.stagingBytes();
+            if (required > linear_bytes or bytes > linear_bytes - required) return null;
+            required += std.mem.alignForward(u64, bytes, 16);
         }
-        if (!params_ok) return null;
+        if (views.len == 0) return null;
 
         const descriptor_slot = try self.acquireDetileSet();
         const descriptor_set = self.detile_sets[descriptor_slot];
@@ -31824,7 +32730,7 @@ pub const Renderer = struct {
         // Tiled reads are scattered. Reading them directly across PCIe from
         // host-cached memory can cost far more than one contiguous DMA copy.
         // The upload survives until this submission retires, just like src.
-        const src = if (self.device_detile_sources) try self.createBuffer(
+        const src = if (device_source) try self.createBuffer(
             tiled.len,
             vk.buffer_usage_storage_buffer_bit | vk.buffer_usage_transfer_dst_bit,
             vk.memory_property_device_local_bit,
@@ -31893,9 +32799,7 @@ pub const Renderer = struct {
             null,
         );
         var cursor: u64 = 0;
-        level_index = 0;
-        while (level_index < plan.level_count) : (level_index += 1) {
-            const view = try plan.view(level_index);
+        for (views, 0..) |view, level_index| {
             // Every mip dispatch binds the whole destination buffer. Keep its
             // shader writes ordered before reusing that storage descriptor.
             if (level_index != 0) {
@@ -32854,11 +33758,15 @@ pub const Renderer = struct {
         const self = fromContext(context);
         self.dma_data_callbacks += 1;
         if (!dmaMovesBytes(dma)) return true;
+        if (self.flat_memory_fault_failed or self.sampled_fault_failed) return false;
+        const native_gds = @atomicLoad(bool, &native_gds_dma, .monotonic);
+        if (native_gds and (self.tryFillGdsDma(dma) catch return false)) return true;
         // Recorded shaders already own their input snapshots. As with
         // WRITE_DATA, CPU copies need only publish the actual source/writers;
         // an unrelated DMA must not submit every queued draw. Imported pages
-        // retain the older boundary, and GDS still needs its host shadow idle.
-        const synchronized = if (dma.source == 1 or dma.destination == 1)
+        // retain the older boundary. GDS host access waits in its shadow
+        // download; it need not also publish unrelated deferred releases.
+        const synchronized = if (!native_gds and (dma.source == 1 or dma.destination == 1))
             self.synchronizeDrawBatch("dma-data")
         else if (!self.timeline_scheduler_enabled or self.imported_allocations.items.len != 0)
             self.recordDrawBatch("dma-data")
@@ -33633,6 +34541,9 @@ pub const Renderer = struct {
             std.debug.print("[gpu buffer writes] flip={d} sparse_readbacks={d} avoided_kib={d} known_fill_kib={d} transfer_kib={d}\n", .{
                 self.flip_callbacks, profile.storage_sparse_readbacks, profile.storage_sparse_avoided_bytes / 1024, profile.known_fill_publication_bytes / 1024, profile.buffer_transfer_readback_bytes / 1024,
             });
+            if (profile.partial_storage_uploads != 0) std.debug.print("[gpu partial uploads] flip={d} updates={d} avoided_kib={d}\n", .{
+                self.flip_callbacks, profile.partial_storage_uploads, profile.partial_storage_upload_avoided_bytes / 1024,
+            });
             std.debug.print("[gpu volume snapshots] flip={d} hits={d} copies={d} cache={d}/{d}KiB\n", .{
                 self.flip_callbacks, profile.volume_snapshot_hits, profile.volume_snapshot_copies, self.color_volume_snapshots.items.len, self.color_volume_snapshot_bytes / 1024,
             });
@@ -33683,8 +34594,8 @@ pub const Renderer = struct {
             if (preparation_stats.submitted != 0 or preparation_stats.shared_walks != 0) {
                 const workers = self.resource_preparation.queue.status();
                 std.debug.print(
-                    "[gpu resource workers] flip={d} cumulative_jobs={d} shared_walks={d} used={d} fallback={d} worker_ms={d} wait_ms={d} limit={d} threads={d} peak={d} auto={any} changes={d}/{d} job_us={d} queue_us={d}\n",
-                    .{ self.flip_callbacks, preparation_stats.submitted, preparation_stats.shared_walks, preparation_stats.used, preparation_stats.fallback, preparation_stats.worker_ns / std.time.ns_per_ms, preparation_stats.wait_ns / std.time.ns_per_ms, workers.limit, workers.threads, workers.peak_active, workers.adaptation.enabled, workers.adaptation.increases, workers.adaptation.decreases, workers.adaptation.average_job_ns / std.time.ns_per_us, workers.adaptation.average_wait_ns / std.time.ns_per_us },
+                    "[gpu resource workers] flip={d} cumulative_jobs={d} shared_walks={d} shared_loops={d}/{d} cached_walks={d}/{d} cache_kib={d} used={d} fallback={d} worker_ms={d} wait_ms={d} limit={d} threads={d} peak={d} auto={any} changes={d}/{d} job_us={d} queue_us={d}\n",
+                    .{ self.flip_callbacks, preparation_stats.submitted, preparation_stats.shared_walks, preparation_stats.shared_loop_walks, preparation_stats.shared_loop_fallbacks, preparation_stats.cached_walks, preparation_stats.cache_misses, self.resource_preparation.walk_cache.bytes / 1024, preparation_stats.used, preparation_stats.fallback, preparation_stats.worker_ns / std.time.ns_per_ms, preparation_stats.wait_ns / std.time.ns_per_ms, workers.limit, workers.threads, workers.peak_active, workers.adaptation.enabled, workers.adaptation.increases, workers.adaptation.decreases, workers.adaptation.average_job_ns / std.time.ns_per_us, workers.adaptation.average_wait_ns / std.time.ns_per_us },
                 );
             }
             const compilers = self.pipeline_compile_queue.status();
@@ -33712,6 +34623,12 @@ pub const Renderer = struct {
                 .{ self.flip_callbacks, profile.storage_guest_checks, profile.storage_guest_page_hits, profile.storage_guest_hash_bytes / 1024, profile.storage_image_readbacks, profile.storage_discarded_readbacks, profile.storage_discarded_readback_bytes / 1024 },
             );
             std.debug.print(
+                "[gpu depth storage] flip={d} copies={d} copy_kib={d} reuses={d}\n",
+                .{ self.flip_callbacks, profile.depth_storage_copies, profile.depth_storage_copy_bytes / 1024, profile.depth_storage_reuses },
+            );
+            std.debug.print("[gpu mip reload] flip={d} levels={d} upload_kib={d}\n", .{ self.flip_callbacks, profile.mip_cpu_reloads, profile.mip_cpu_reload_bytes / 1024 });
+            std.debug.print("[gpu mip backing] flip={d} creates={d} reuses={d} copied_levels={d}\n", .{ self.flip_callbacks, profile.mip_chain_creates, profile.mip_chain_reuses, profile.mip_chain_level_copies });
+            std.debug.print(
                 "[gpu sampled cache] flip={d} creates={d}/{d}us allocs={d}/{d}us retries={d} trim_us={d} retire_waits={d} blocked={d} retire_fence_us={d} pending_kib={d} slack_kib={d} reuses={d}\n",
                 .{
                     self.flip_callbacks,
@@ -33731,6 +34648,8 @@ pub const Renderer = struct {
             );
             std.debug.print("[gpu uploads] flip={d} wraps={d} spills={d} spill_kib={d}\n", .{ self.flip_callbacks, profile.draw_upload_wraps, profile.draw_upload_spills, profile.draw_upload_spill_bytes / 1024 });
             std.debug.print("[gpu state] flip={d} dynamic={d} avoided={d} pipelines={d} avoided={d}\n", .{ self.flip_callbacks, profile.dynamic_state_commands, profile.dynamic_state_avoided, profile.pipeline_binds, profile.pipeline_binds_avoided });
+            std.debug.print("[gpu transient buffers] flip={d} uploads={d} kib={d}\n", .{ self.flip_callbacks, profile.transient_buffer_uploads, profile.transient_buffer_bytes / 1024 });
+            std.debug.print("[gpu index bounds] flip={d} hit={d} miss={d}\n", .{ self.flip_callbacks, profile.index_bounds_hits, profile.index_bounds_misses });
             if (profile.cold_storage_images != 0) std.debug.print("[gpu cold storage] flip={d} evicted={d} bytes={d}\n", .{
                 self.flip_callbacks, profile.cold_storage_images, profile.cold_storage_image_bytes,
             });
@@ -37589,6 +38508,23 @@ fn storageImageFormatsCompatible(a: u16, b: u16) bool {
         storageImageBytesPerTexel(a) == storageImageBytesPerTexel(b);
 }
 
+/// Supported storage formats are uncompressed color formats in Vulkan's
+/// 8/16/32/64/128-bit compatibility classes. A mutable view can reinterpret
+/// their bits without publishing to RAM and uploading the same bytes again.
+/// Require the same guest layout as well; equal byte counts alone do not
+/// prove that two differently tiled images address the same texels.
+fn storageImageCanReinterpret(a: gpu.ImageDescriptor, b: gpu.ImageDescriptor) bool {
+    if (storageImageFormat(a.unified_format) == null or storageImageFormat(b.unified_format) == null or
+        storageImageBytesPerTexel(a.unified_format) != storageImageBytesPerTexel(b.unified_format) or
+        a.tile_mode != b.tile_mode or a.pitch != b.pitch or a.array_pitch != b.array_pitch or
+        a.resourceMipLevels() != b.resourceMipLevels() or a.dcc_enabled or b.dcc_enabled or
+        a.cmask_fast_clear or b.cmask_fast_clear or a.fmask_compression or b.fmask_compression or
+        a.samplesLog2() != 0 or b.samplesLog2() != 0) return false;
+    var same_format = b;
+    same_format.unified_format = a.unified_format;
+    return sameStorageImageDescriptor(a, same_format);
+}
+
 fn storageImageCanAliasRenderTarget(
     initialized: bool,
     fragments_log2: u8,
@@ -37654,6 +38590,15 @@ fn packedBufferClearColor(image_format: u32, words: [4]u32) ?vk.ClearColorValue 
         }
     }
     return .{ .float32 = values };
+}
+
+fn nativeDccClearColor(image_format: u32, texel: DccClearTexel) ?vk.ClearColorValue {
+    if (texel.length == 0 or texel.length > 16 or 16 % texel.length != 0) return null;
+    var bytes: [16]u8 = undefined;
+    for (&bytes, 0..) |*value, index| value.* = texel.bytes[index % texel.length];
+    var words: [4]u32 = undefined;
+    for (&words, 0..) |*word, index| word.* = std.mem.readInt(u32, bytes[index * 4 ..][0..4], .little);
+    return packedBufferClearColor(image_format, words);
 }
 
 test "packed clear patterns preserve native texels and reject lossy half conversion" {

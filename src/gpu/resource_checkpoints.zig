@@ -9,9 +9,14 @@ const shaders = @import("shaders.zig");
 
 pub const Kind = enum { resource, sampled };
 
+var next_plan_identity: std.atomic.Value(u64) = .init(1);
+
 /// Owned by the exact immutable decoded instruction allocation. Branch-pruned
 /// analyses build their own locations; guest addresses are never cache keys.
 pub const Plan = struct {
+    /// Distinguishes immutable analyses even if their allocations are reused.
+    /// A manually constructed plan has no cross-operation cache identity.
+    identity: u64 = 0,
     instructions: []const rdna2.Instruction,
     resource: []const u32,
     sampled: []const u32,
@@ -25,8 +30,11 @@ pub const Plan = struct {
     scalar_steps: []const u32,
     reads_only_resources: bool,
     /// A full walk and the sparse checkpoint walks cannot exhaust different
-    /// loop budgets when control flow only moves forward.
+    /// loop budgets when control flow only moves forward and there are no calls.
     forward_only: bool,
+    /// Conservative ratio between dense visits and indexed visits, including
+    /// a branch landing inside a skipped vector run. Manual plans opt out.
+    maximum_dense_step_ratio: u32 = std.math.maxInt(u32),
 
     pub fn init(allocator: std.mem.Allocator, instructions: []const rdna2.Instruction) !Plan {
         const resource = try collect(allocator, instructions, .resource);
@@ -39,16 +47,19 @@ pub const Plan = struct {
         errdefer allocator.free(sampled_indices);
         const storage_images = try collectStorageImages(allocator, instructions);
         errdefer allocator.free(storage_images);
+        const scalar_steps = try collectScalarSteps(allocator, instructions, resource, sampled);
         return .{
+            .identity = next_plan_identity.fetchAdd(1, .monotonic),
             .instructions = instructions,
             .resource = resource,
             .sampled = sampled,
             .resource_indices = resource_indices,
             .sampled_indices = sampled_indices,
             .storage_images = storage_images,
-            .scalar_steps = try collectScalarSteps(allocator, instructions, resource, sampled),
+            .scalar_steps = scalar_steps,
             .reads_only_resources = readsOnlyResources(instructions),
             .forward_only = walksForward(instructions),
+            .maximum_dense_step_ratio = maximumDenseStepRatio(instructions.len, scalar_steps),
         };
     }
 
@@ -82,9 +93,16 @@ pub const Plan = struct {
     }
 };
 
+fn maximumDenseStepRatio(instruction_count: usize, steps: []const u32) u32 {
+    if (steps.len == 0) return std.math.maxInt(u32);
+    var maximum: usize = steps[0] + 1;
+    for (steps[1..], steps[0 .. steps.len - 1]) |next, previous| maximum = @max(maximum, next - previous);
+    return @intCast(@max(maximum, instruction_count - steps[steps.len - 1]));
+}
+
 fn walksForward(instructions: []const rdna2.Instruction) bool {
     for (instructions) |inst| switch (inst.opcode) {
-        .s_setpc_b64 => return false,
+        .s_setpc_b64, .s_call_b64, .s_swappc_b64 => return false,
         .s_branch,
         .s_cbranch_scc0,
         .s_cbranch_scc1,
@@ -116,6 +134,12 @@ test "shared scalar walk rejects loops and indirect transfers" {
     var indirect = try Plan.init(a, &instructions);
     defer indirect.deinit(a);
     try std.testing.expect(!indirect.forward_only);
+    for ([_]rdna2.Opcode{ .s_call_b64, .s_swappc_b64 }) |opcode| {
+        instructions[1].opcode = opcode;
+        var call = try Plan.init(a, &instructions);
+        defer call.deinit(a);
+        try std.testing.expect(!call.forward_only);
+    }
 }
 
 /// Borrow immutable resource locations when they belong to this exact program.
@@ -164,11 +188,23 @@ fn collectIndices(allocator: std.mem.Allocator, instructions: []const rdna2.Inst
     return indices;
 }
 
-/// Static eligibility for resource reuse. Unknown or flat-memory operations
-/// cannot prove that a draw leaves every guest resource unchanged.
+/// Static eligibility for resource reuse. Only explicitly decoded flat loads
+/// prove read-only access; unknown operations, stores and atomics do not.
 pub fn readsOnlyResources(instructions: []const rdna2.Instruction) bool {
     for (instructions) |inst| {
-        if (inst.opcode == .unknown or inst.family == .flat) return false;
+        if (inst.opcode == .unknown or inst.opcode == .unsupported) return false;
+        if (inst.family == .flat) switch (inst.opcode) {
+            .flat_load_ubyte,
+            .flat_load_sbyte,
+            .flat_load_ushort,
+            .flat_load_sshort,
+            .flat_load_dword,
+            .flat_load_dwordx2,
+            .flat_load_dwordx3,
+            .flat_load_dwordx4,
+            => {},
+            else => return false,
+        };
         const name = @tagName(inst.opcode);
         if (std.mem.startsWith(u8, name, "buffer_store") or std.mem.startsWith(u8, name, "tbuffer_store") or
             std.mem.startsWith(u8, name, "buffer_atomic") or std.mem.startsWith(u8, name, "image_store") or
@@ -177,6 +213,17 @@ pub fn readsOnlyResources(instructions: []const rdna2.Instruction) bool {
             std.mem.startsWith(u8, name, "s_buffer_atomic")) return false;
     }
     return true;
+}
+
+test "read-only resource proof accepts flat loads but rejects stores and unknown memory" {
+    const loads = [_]rdna2.Opcode{ .flat_load_ubyte, .flat_load_sbyte, .flat_load_ushort, .flat_load_sshort, .flat_load_dword, .flat_load_dwordx2, .flat_load_dwordx3, .flat_load_dwordx4 };
+    for (loads) |opcode| {
+        try std.testing.expect(readsOnlyResources(&.{.{ .family = .flat, .opcode = opcode }}));
+    }
+    for ([_]rdna2.Opcode{ .flat_store_byte, .flat_store_short, .flat_store_dword, .flat_store_dwordx2, .flat_store_dwordx3, .flat_store_dwordx4, .unsupported, .unknown }) |opcode| {
+        try std.testing.expect(!readsOnlyResources(&.{.{ .family = .flat, .opcode = opcode }}));
+    }
+    try std.testing.expect(!readsOnlyResources(&.{ .{ .family = .mubuf, .opcode = .buffer_store_dword }, .{ .family = .flat, .opcode = .flat_load_dword } }));
 }
 
 fn collect(allocator: std.mem.Allocator, instructions: []const rdna2.Instruction, kind: Kind) ![]const u32 {
@@ -732,4 +779,36 @@ test "scalar steps skip vector instructions and a repeated walk reuses the load 
     defer second.release();
     try std.testing.expectEqual(first.instructions_walked, second.instructions_walked);
     try std.testing.expectEqual(@as(u32, 9), second.snapshots[0][4].value);
+}
+
+test "indexed scalar history retains dependencies of vector memory operations" {
+    const a = std.testing.allocator;
+    var instructions = [_]rdna2.Instruction{
+        .{ .pc = 0, .family = .vop1, .opcode = .v_mov_b32, .dst = .{ .kind = .vgpr }, .word_count = 1 },
+        .{ .pc = 4, .family = .flat, .opcode = .flat_load_dword, .dst = .{ .kind = .vgpr, .reg = 1 }, .word_count = 1 },
+        .{ .pc = 8, .family = .sopp, .opcode = .s_endpgm, .word_count = 1 },
+    };
+    var memory = TestMemory{};
+    var bindings = std.mem.zeroes(shaders.StageBindings);
+    bindings.resource_instruction_budget = instructions.len;
+    for ([_]rdna2.Instruction{
+        instructions[1],
+        .{ .family = .ds, .opcode = .ds_read_b32, .dst = .{ .kind = .vgpr, .reg = 1 } },
+        .{ .family = .vopc, .opcode = .v_cmp_eq_f32 },
+        .{ .family = .vop2, .opcode = .unsupported },
+    }) |operation| {
+        instructions[1] = operation;
+        instructions[1].pc = 4;
+        instructions[1].word_count = 1;
+        var plan = try Plan.init(a, &instructions);
+        defer plan.deinit(a);
+        var dense: scalar.Evaluation = undefined;
+        var indexed: scalar.Evaluation = undefined;
+        scalar.evaluateDecodedResourceStateAtTwoCheckpointsInto(&dense, memory.reader(), &bindings, &instructions, &.{}, &.{}, &.{}, &.{}, null);
+        scalar.evaluateDecodedResourceStateAtTwoCheckpointsInto(&indexed, memory.reader(), &bindings, &instructions, &.{}, &.{}, &.{}, &.{}, plan.scalar_steps);
+        try std.testing.expectEqualDeep(dense.registers, indexed.registers);
+        try std.testing.expectEqual(std.math.maxInt(u64), indexed.address_user_data_mask);
+        try std.testing.expectEqual(dense.address_user_data_mask, indexed.address_user_data_mask);
+        try std.testing.expect(indexed.instruction_count < dense.instruction_count);
+    }
 }

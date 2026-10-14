@@ -842,6 +842,30 @@ pub const Layout = struct {
         return add(try add(slice_base, block_base), local ^ block_xor);
     }
 
+    /// The same base surface expressed for the GPU detiler. Preserve the
+    /// explicit pitch, slice stride and base offset instead of rebuilding a
+    /// texture descriptor that may choose different padding or mip placement.
+    pub fn subresourceView(self: Layout) Error!SubresourceLayout {
+        if (self.subresource) |view| return view;
+        return .{
+            .block = try SwizzleBlock.init(self.block.tile_mode, self.block.bytes_per_element, false, 0),
+            .kind = .array_2d,
+            .width = self.width,
+            .height = self.height,
+            .depth_or_layers = self.layers,
+            .first_slice = self.first_slice,
+            .padded_width = self.row_pitch_elements,
+            .padded_height = self.blocks_per_column * self.block.height,
+            .level_offset = self.source_base_offset,
+            .source_layer_bytes = self.source_slice_bytes,
+            .block_slice_bytes = self.source_slice_bytes,
+            .required_source_bytes = self.required_source_bytes,
+            .tail_x = 0,
+            .tail_y = 0,
+            .in_tail = false,
+        };
+    }
+
     pub fn stagingByteOffset(self: Layout, x: u32, y: u32, layer: u32) Error!u64 {
         if (x >= self.width or y >= self.height or layer >= self.layers) {
             return Error.CoordinateOutOfRange;
@@ -1991,7 +2015,8 @@ pub fn computeDetileSupported(params: ComputeDetileParams) bool {
     return switch (computeFamily(params)) {
         .linear, .standard_256b, .standard_4kb, .standard_64kb, .partially_resident => kind == .array_2d,
         .standard_4kb_3d, .standard_64kb_3d, .partially_resident_3d => kind == .volume_3d,
-        else => false,
+        .depth_64kb => params.block_depth == 1 and bpp <= 8,
+        .render_target_64kb => params.block_depth == 1,
     };
 }
 
@@ -3574,6 +3599,29 @@ test "fromImage stages a non-zero 2D mip from the allocation origin" {
     const view = try texture.subresource(1, 0, 1);
     try testing.expectEqual(view.level_offset, layout.source_base_offset);
     try testing.expectEqual(try view.sourceByteOffset(3, 5, 0, 0), try layout.sourceByteOffset(3, 5, 0));
+}
+
+test "base surface GPU views preserve pitched slice and RB pipe XOR addresses" {
+    for ([_]resources.TileMode{ .linear, .standard_256b, .standard_4kb, .standard_64kb, .partially_resident, .depth, .render_target }) |mode| {
+        for ([_]u8{ 4, 8, 16 }) |bytes| {
+            if (mode == .depth and bytes > 8) continue;
+            var surface = try Layout.init(.{ .tile_mode = mode, .width = 273, .height = 139, .layers = 2, .first_slice = 3, .row_pitch_elements = 401 }, bytes);
+            surface.source_base_offset = 256;
+            surface.required_source_bytes += 256;
+            const view = try surface.subresourceView();
+            const plan = try view.computePlan(0, 32);
+            try testing.expect(computeDetileSupported(plan.params));
+            try testing.expectEqual(surface.required_source_bytes, view.required_source_bytes);
+            try testing.expectEqual(surface.staging_bytes, try view.stagingBytes());
+            for (0..surface.layers) |layer| {
+                for (0..surface.height) |y| {
+                    for (0..surface.width) |x| {
+                        try testing.expectEqual(try surface.sourceByteOffset(@intCast(x), @intCast(y), @intCast(layer)), computeSourceOffset(plan.params, @intCast(x), @intCast(y), @intCast(layer), 0));
+                    }
+                }
+            }
+        }
+    }
 }
 
 test "compute detile admits 8-byte 2D and 4-byte 3D standard families" {

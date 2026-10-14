@@ -198,6 +198,37 @@ pub const Resolver = struct {
         if (register < destination) return null;
         const component: u32 = @intCast(register - destination);
         switch (inst.opcode) {
+            .s_getpc_b64 => {
+                if (component >= 2) return null;
+                const address = self.bindings.program_address +% inst.pc +% 4;
+                return @truncate(address >> @as(u6, @intCast(component * 32)));
+            },
+            .s_add_u32, .s_add_i32, .s_sub_u32, .s_sub_i32 => {
+                if (component != 0) return null;
+                const a = (try self.operand(inst.src0, 0, index, depth + 1)) orelse return null;
+                const b = (try self.operand(inst.src1, 0, index, depth + 1)) orelse return null;
+                return if (inst.opcode == .s_add_u32 or inst.opcode == .s_add_i32) a +% b else a -% b;
+            },
+            .s_addc_u32 => {
+                // Recover a PC-relative descriptor even in a branch omitted
+                // by the representative scalar walk. Carry must be proven:
+                // accept an adjacent unsigned add in this same basic block.
+                // A branch into ADDC can carry an unrelated SCC value.
+                if (component != 0 or index == 0 or self.instructions[index - 1].opcode != .s_add_u32)
+                    return if (known.known and known.producer_pc == inst.pc) known.value else null;
+                const same_block = for (self.graph.blocks.items) |block| {
+                    if (index >= block.first_instruction and index < block.first_instruction + block.instruction_count)
+                        break index > block.first_instruction;
+                } else false;
+                if (!same_block) return null;
+                const low = self.instructions[index - 1];
+                const low_a = (try self.operand(low.src0, 0, index - 1, depth + 1)) orelse return null;
+                const low_b = (try self.operand(low.src1, 0, index - 1, depth + 1)) orelse return null;
+                const carry = @addWithOverflow(low_a, low_b)[1];
+                const a = (try self.operand(inst.src0, 0, index, depth + 1)) orelse return null;
+                const b = (try self.operand(inst.src1, 0, index, depth + 1)) orelse return null;
+                return a +% b +% carry;
+            },
             .s_mov_b32, .s_mov_b64 => return self.operand(inst.src0, component, index, depth + 1),
             .s_bitset0_b32, .s_bitset1_b32 => {
                 if (component != 0) return null;
@@ -281,6 +312,41 @@ pub const Resolver = struct {
         return try self.reader.readU32(byte);
     }
 };
+
+test "PC-relative resource descriptors recover skipped branches with a proven carry" {
+    const M = struct {
+        fn read(_: ?*anyopaque, _: u64, _: []u8) bool {
+            return false;
+        }
+    };
+    const original = [_]rdna2.Instruction{
+        .{ .pc = 0, .opcode = .s_cbranch_execz, .branch_target = 36, .word_count = 1 },
+        .{ .pc = 4, .opcode = .s_getpc_b64, .dst = .{ .kind = .sgpr }, .word_count = 1 },
+        .{ .pc = 8, .opcode = .s_add_u32, .dst = .{ .kind = .sgpr }, .src0 = .{ .kind = .literal_constant, .value = 0x10a8 }, .src1 = .{ .kind = .sgpr }, .word_count = 2 },
+        .{ .pc = 16, .opcode = .s_addc_u32, .dst = .{ .kind = .sgpr, .reg = 1 }, .src0 = .{ .kind = .integer_inline_constant }, .src1 = .{ .kind = .sgpr, .reg = 1 }, .word_count = 1 },
+        .{ .pc = 20, .opcode = .s_mov_b32, .dst = .{ .kind = .sgpr, .reg = 2 }, .src0 = .{ .kind = .integer_inline_constant, .value = 64 }, .word_count = 1 },
+        .{ .pc = 24, .opcode = .s_mov_b32, .dst = .{ .kind = .sgpr, .reg = 3 }, .src0 = .{ .kind = .literal_constant, .value = 0x10005004 }, .word_count = 1 },
+        .{ .pc = 28, .opcode = .s_buffer_load_dwordx4, .src0 = .{ .kind = .sgpr }, .dst = .{ .kind = .sgpr, .reg = 4 }, .word_count = 2 },
+        .{ .pc = 36, .opcode = .s_endpgm, .word_count = 1 },
+    };
+    for (0..5) |variant| {
+        var instructions = original;
+        if (variant == 2) instructions[0].branch_target = 16;
+        if (variant == 3) instructions[2].opcode = .s_and_b32;
+        if (variant == 4) instructions[2].src0 = .{ .kind = .vgpr };
+        var graph = try rdna2.control_flow.buildInstructions(std.testing.allocator, &instructions);
+        defer graph.deinit(std.testing.allocator);
+        var bindings = std.mem.zeroes(shaders.StageBindings);
+        bindings.program_address = if (variant == 1) 0x5fffffff0 else 0x500006e00;
+        var resolver = Resolver{ .bindings = &bindings, .reader = .{ .context = null, .read_fn = M.read }, .instructions = &instructions, .graph = &graph, .snapshot = &unknown_registers };
+        var words: [4]u32 = undefined;
+        try std.testing.expectEqual(variant < 2, try resolver.words(0, 28, &words));
+        if (variant < 2) {
+            const address = bindings.program_address + 8 + 0x10a8;
+            try std.testing.expectEqualSlices(u32, &.{ @truncate(address), @truncate(address >> 32), 64, 0x10005004 }, &words);
+        }
+    }
+}
 
 test "BITSET descriptor recovery uses the previous destination and rejects clobbers" {
     const M = struct {

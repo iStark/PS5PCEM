@@ -1071,7 +1071,7 @@ fn run(init: std.process.Init) !bool {
         });
         try out.print("  scanout channel order uses the registered buffer set\n", .{});
         try out.print("  pipeline compiler worker limit={d} adaptive={any} warmup={s}\n", .{ pipeline_compiler_workers, adaptive_compiler_workers, compute_warmup_directory orelse "disabled" });
-        try out.print("  command processors={d}, bounded lookahead=4 per queue\n", .{if (parallel_commands) @as(u8, 2) else 0});
+        try out.print("  command processors={d}, bounded lookahead={d} per queue\n", .{ if (parallel_commands) @as(u8, 2) else 0, gpu.command_workers.command_lookahead_limit });
         try out.print("  CPU resource preparation worker limit={d} adaptive={any}\n", .{ resource_preparation_workers, adaptive_resource_workers });
         try out.print("  buffer profile quake={d} retain={d} bounded_vertex={d} device_mib={d}\n", .{
             @intFromBool(use_quake_buffer_profile), @intFromBool(retain_storage_buffers), @intFromBool(bound_vertex_fetches), device_storage_mib,

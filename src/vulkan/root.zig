@@ -40,5 +40,7 @@ test {
     _ = @import("pipeline_warmup.zig");
     _ = @import("buffer_write_history.zig");
     _ = @import("buffer_write_ranges.zig");
+    _ = @import("buffer_upload_chunks.zig");
+    _ = @import("cache_budget_recovery.zig");
     _ = @import("spirv_cache.zig");
 }

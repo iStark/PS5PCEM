@@ -778,12 +778,13 @@ pub fn evaluateDecodedResourceStateAtTwoCheckpointsInto(
     first_snapshots: []ScalarRegisters,
     second_pcs: []const u32,
     second_snapshots: []ScalarRegisters,
+    steps: ?[]const u32,
 ) void {
     std.debug.assert(first_pcs.len == first_snapshots.len);
     std.debug.assert(second_pcs.len == second_snapshots.len);
     var second = RegisterCheckpointCollector{ .pcs = second_pcs, .snapshots = second_snapshots };
     var first = RegisterCheckpointCollector{ .pcs = first_pcs, .snapshots = first_snapshots, .secondary = &second };
-    evaluateInto(result, reader, bindings, null, true, instructions, &first, null, true);
+    evaluateInto(result, reader, bindings, null, true, instructions, &first, steps, true);
     first.finish(result);
 }
 
@@ -863,8 +864,12 @@ pub fn evaluatePrefixUntil(
 /// scalar register. Pure vector instructions do not change the checkpoint
 /// walk; an index of these steps replaces visiting every opcode.
 pub fn scalarWalkVisits(inst: rdna2.Instruction) bool {
+    if (inst.opcode == .unsupported) return true;
     switch (inst.family) {
-        .vop1, .vop2, .vop3, .vop3p, .vopc, .vintrp, .mubuf, .mtbuf, .flat, .ds, .mimg, .exp => {},
+        // Memory operations and comparisons also contribute to the address
+        // dependency mask, even when they do not write an SGPR. Keep that
+        // conservative proof identical when retaining specialization history.
+        .vop1, .vop2, .vop3, .vop3p, .vintrp, .exp => {},
         else => return true,
     }
     if (std.mem.startsWith(u8, @tagName(inst.opcode), "v_cmpx_")) return true;
@@ -2043,7 +2048,7 @@ fn testResourceCheckpoints(
         defer std.testing.allocator.free(second);
         trace = .{ .source_reader = reader };
         var shared: Evaluation = undefined;
-        evaluateDecodedResourceStateAtTwoCheckpointsInto(&shared, traced, bindings, instructions, pcs, without_history, pcs, second);
+        evaluateDecodedResourceStateAtTwoCheckpointsInto(&shared, traced, bindings, instructions, pcs, without_history, pcs, second, null);
         try std.testing.expectEqual(read_count, trace.count);
         try std.testing.expectEqual(digest, trace.digest.final());
         try std.testing.expectEqualDeep(snapshots, without_history);

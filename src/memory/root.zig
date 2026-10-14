@@ -774,6 +774,8 @@ const GpuPageTracker = struct {
 /// There must be at most one live instance per process. Creating a second one
 /// correctly fails because the first instance already owns the fixed ranges.
 pub const AddressSpace = struct {
+    const PublicationView = struct { physical: u64, view: SharedView };
+
     allocator: std.mem.Allocator,
     mappings: std.ArrayList(Mapping) = .empty,
     // Indices are hints only: every use rechecks the current interval and its
@@ -796,6 +798,10 @@ pub const AddressSpace = struct {
     // changed. Until destruction, native access checks must then verify the
     // actual host pages instead of relying solely on interval metadata.
     host_mapping_state_uncertain: bool = false,
+    // Independent aliases change no guest VA permissions. Bound the retained
+    // virtual views, and recheck the current guest mapping before every copy.
+    publication_views: [64]?PublicationView = @splat(null),
+    next_publication_view: usize = 0,
 
     pub fn init(allocator: std.mem.Allocator) Error!AddressSpace {
         if (@sizeOf(usize) != @sizeOf(u64)) return Error.UnsupportedHost;
@@ -835,6 +841,10 @@ pub const AddressSpace = struct {
         defer self.mutex.unlock();
 
         self.gpu_tracker.deinit(self.allocator);
+        for (&self.publication_views) |*entry| {
+            if (entry.*) |cached| cached.view.deinit();
+            entry.* = null;
+        }
         self.discardMappingsLocked();
         self.releaseReservations();
         if (self.direct_backing) |*backing| backing.deinit();
@@ -1180,6 +1190,89 @@ pub const AddressSpace = struct {
             return null;
         }
         return view;
+    }
+
+    /// Publish an independent GPU readback through a writable physical alias,
+    /// preserving the guest's CPU-write watches. Returns unchanged bytes, or
+    /// null before modifying anything when the ordinary copy path is needed.
+    /// Only a single readable/writable direct mapping with no guest aliases is
+    /// eligible; private memory, split mappings and uncertain host state fall
+    /// back. Mapping and tracker locks cover both the copy and its generations.
+    pub fn publishGpuBytes(self: *AddressSpace, address: u64, source: []const u8) ?usize {
+        if (builtin.os.tag != .windows or source.len == 0 or source.len > 64 * 1024 * 1024) return null;
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.host_mapping_state_uncertain) return null;
+        const backing = if (self.direct_backing) |*value| value else return null;
+        const index = owner: {
+            var i = self.insertionIndex(address);
+            if (i == self.mappings.items.len or self.mappings.items[i].address != address) {
+                if (i == 0) return null;
+                i -= 1;
+            }
+            const mapping = self.mappings.items[i];
+            // x86/Windows write permission also permits reads, including the
+            // GPU garlic mappings whose guest CPU mask contains only WRITE.
+            if (mapping.kind != .direct_memory or !mapping.protection.write or
+                address < mapping.address or address >= mapping.end() or source.len > mapping.end() - address)
+                return null;
+            break :owner i;
+        };
+        const owner = self.mappings.items[index];
+        const physical = (owner.backing_offset orelse return null) + address - owner.address;
+        for (self.mappings.items, 0..) |mapping, other| {
+            if (other == index or mapping.kind != .direct_memory) continue;
+            const offset = mapping.backing_offset orelse continue;
+            if (physical < offset + mapping.size and offset < physical + source.len) return null;
+        }
+        const destination = alias: {
+            for (self.publication_views) |maybe| if (maybe) |cached| {
+                if (physical >= cached.physical and physical - cached.physical <= cached.view.bytes.len and
+                    source.len <= cached.view.bytes.len - (physical - cached.physical))
+                    break :alias cached.view.bytes[@intCast(physical - cached.physical)..][0..source.len];
+            };
+            // A streaming workload can touch more windows than this bounded
+            // cache holds. Preserve hot aliases and use the ordinary copy for
+            // new ranges instead of mapping/unmapping every publication.
+            if (self.next_publication_view == self.publication_views.len) return null;
+            // Neighbouring render targets/readbacks share one sparse alias.
+            // Mapping a wider SEC_RESERVE view does not commit its unused
+            // pages; only the currently validated request is ever touched.
+            const window = 64 * 1024 * 1024;
+            const first = std.mem.alignBackward(u64, physical, window);
+            const end = @min(backing.size, std.mem.alignForward(u64, physical + source.len, window));
+            const view = backing.mapView(first, @intCast(end - first)) catch return null;
+            const bytes = view.bytes[@intCast(physical - first)..][0..source.len];
+            if (!isHostRangeReadable(@intFromPtr(bytes.ptr), bytes.len)) {
+                view.deinit();
+                return null;
+            }
+            const slot = &self.publication_views[self.next_publication_view];
+            slot.* = .{ .physical = first, .view = view };
+            self.next_publication_view += 1;
+            break :alias bytes;
+        };
+        const tracker = &self.gpu_tracker;
+        tracker.lock.lock();
+        defer tracker.lock.unlock();
+        var cursor: usize = 0;
+        var unchanged: usize = 0;
+        while (cursor < source.len) {
+            const page = (address + cursor) & ~(page_size - 1);
+            const end = cursor + @min(source.len - cursor, page_size - ((address + cursor) - page));
+            if (std.mem.eql(u8, destination[cursor..end], source[cursor..end])) {
+                unchanged += end - cursor;
+            } else {
+                @memcpy(destination[cursor..end], source[cursor..end]);
+                if (tracker.enabled) if (tracker.pages.getPtr(page)) |tracked| {
+                    // Keep armed exactly as it was. A later native CPU write
+                    // still faults and advances the generation a second time.
+                    tracked.generation = tracker.nextGeneration(page);
+                };
+            }
+            cursor = end;
+        }
+        return unchanged;
     }
 
     /// Whether every byte is backed by committed, CPU-readable guest pages.
@@ -3324,6 +3417,106 @@ test "a rejected grouped watch operation falls back without claiming later pages
     try testing.expectEqual(@as(u64, 2), space.gpu_tracker.protection_calls);
     try testing.expect(!isHostRangeWritable(address, page_size));
     try testing.expect(isHostRangeWritable(address + page_size, bytes - page_size));
+}
+
+test "GPU publication aliases keep watches armed and preserve later CPU invalidation" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const size = 3 * windows_allocation_granularity;
+    var space = try AddressSpace.initWithDirectMemory(testing.allocator, size);
+    defer space.deinit();
+    const address = user.start;
+    try space.mapFixed(address, size, .{ .write = true }, .direct_memory, 0);
+    space.enableGpuMemoryTracking();
+    const before = try space.trackGpuRead(address, size);
+    const untouched = space.gpuGeneration(address + 4 * page_size, page_size);
+    const calls = space.gpu_tracker.protection_calls;
+    const source = try testing.allocator.alloc(u8, size - 246);
+    defer testing.allocator.free(source);
+    @memset(source, 0);
+    @memset(source[0..100], 0x3a);
+    @memset(source[page_size + 123 .. 2 * page_size + 123], 0x5a);
+    source[source.len - 1] = 0x5b;
+    const changed_fragments = (page_size - 123) * 2 + 2 * page_size;
+    try testing.expectEqual(source.len - changed_fragments, space.publishGpuBytes(address + 123, source).?);
+    const guest = @as([*]const u8, @ptrFromInt(address))[0..size];
+    try testing.expectEqualSlices(u8, source, guest[123 .. size - 123]);
+    try testing.expectEqual(@as(u8, 0), guest[122]);
+    try testing.expectEqual(@as(u8, 0), guest[size - 123]);
+    const published = space.gpuGeneration(address, size);
+    try testing.expect(published != 0 and published != before);
+    try testing.expectEqual(untouched, space.gpuGeneration(address + 4 * page_size, page_size));
+    try testing.expectEqual(calls, space.gpu_tracker.protection_calls);
+    try testing.expect(!isHostRangeWritable(address, size));
+    try testing.expectEqual(source.len, space.publishGpuBytes(address + 123, source).?);
+    try testing.expectEqual(published, try space.trackGpuRead(address, size));
+    try testing.expectEqual(calls, space.gpu_tracker.protection_calls);
+    try testing.expect(space.handleGpuTrackedWriteFault(address + 4 * page_size));
+    @as(*u8, @ptrFromInt(address + 4 * page_size)).* = 0x73;
+    try testing.expectEqual(@as(u64, 0), space.gpuGeneration(address, size));
+    _ = space.publishGpuBytes(address + 123, source).?;
+    // A GPU copy cannot certify a page whose native CPU watch is disarmed.
+    try testing.expectEqual(@as(u64, 0), space.gpuGeneration(address, size));
+    try testing.expect((try space.trackGpuRead(address, size)) != published);
+}
+
+test "GPU publication aliases revalidate remaps permissions and physical aliases" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const size = windows_allocation_granularity;
+    var space = try AddressSpace.initWithDirectMemory(testing.allocator, 2 * size);
+    defer space.deinit();
+    const address = user.start;
+    const alias = address + 4 * size;
+    const source = try testing.allocator.alloc(u8, size);
+    defer testing.allocator.free(source);
+    @memset(source, 0x4d);
+    try space.mapFixed(address, size, .read_write, .direct_memory, 0);
+    try testing.expectEqual(@as(usize, 0), space.publishGpuBytes(address, source).?);
+    try space.unmap(address, size);
+    try testing.expectEqual(null, space.publishGpuBytes(address, source));
+    try space.mapFixed(address, size, .read_write, .direct_memory, size);
+    @memset(source, 0x62);
+    try testing.expectEqual(@as(usize, 0), space.publishGpuBytes(address, source).?);
+    try space.mapFixed(alias, size, .read_write, .direct_memory, 0);
+    try testing.expectEqual(@as(u8, 0x4d), @as(*const u8, @ptrFromInt(alias)).*);
+    try space.unmap(alias, size);
+    try space.mapFixed(alias, size, .read_write, .direct_memory, size);
+    @memset(source, 0x91);
+    try testing.expectEqual(null, space.publishGpuBytes(address, source));
+    try testing.expectEqual(@as(u8, 0x62), @as(*const u8, @ptrFromInt(alias)).*);
+    try space.unmap(alias, size);
+    try space.protect(address, size, .read_only);
+    try testing.expectEqual(null, space.publishGpuBytes(address, source));
+    try testing.expectEqual(@as(u8, 0x62), @as(*const u8, @ptrFromInt(address)).*);
+    try space.unmap(address, size);
+    try space.mapFixed(address, size, .read_write, .private, null);
+    try testing.expectEqual(null, space.publishGpuBytes(address, source));
+}
+
+test "GPU publication alias saturation retains hot views and falls back without remapping" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const window = 64 * 1024 * 1024;
+    const size = windows_allocation_granularity;
+    const count = 65;
+    var space = try AddressSpace.initWithDirectMemory(testing.allocator, count * window);
+    defer space.deinit();
+    const source = try testing.allocator.alloc(u8, size);
+    defer testing.allocator.free(source);
+    @memset(source, 0x47);
+    for (0..count) |i| {
+        const address = user.start + i * size;
+        // Commit only one small slice of each sparse physical window.
+        try space.mapFixed(address, size, .read_write, .direct_memory, i * window);
+        if (i < space.publication_views.len) {
+            try testing.expectEqual(@as(usize, 0), space.publishGpuBytes(address, source).?);
+        } else {
+            try testing.expectEqual(null, space.publishGpuBytes(address, source));
+            try testing.expectEqual(@as(u8, 0), @as(*const u8, @ptrFromInt(address)).*);
+        }
+    }
+    const first = space.publication_views[0].?.view.bytes.ptr;
+    try testing.expectEqual(source.len, space.publishGpuBytes(user.start, source).?);
+    try testing.expectEqual(first, space.publication_views[0].?.view.bytes.ptr);
+    try testing.expectEqual(space.publication_views.len, space.next_publication_view);
 }
 
 test "GPU page tracker advances generations on HLE and native writes" {

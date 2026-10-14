@@ -28,6 +28,7 @@ pub const tiling = @import("tiling.zig");
 pub const parallel_copy = @import("parallel_copy.zig");
 pub const executor = @import("executor.zig");
 pub const scheduler = @import("scheduler.zig");
+pub const command_workers = @import("command_workers.zig");
 
 pub const State = state.State;
 pub const RenderState = resources.RenderState;

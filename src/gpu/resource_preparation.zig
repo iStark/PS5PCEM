@@ -12,6 +12,8 @@ const checkpoints = @import("resource_checkpoints.zig");
 const shaders = @import("shaders.zig");
 const cpu = @import("cpu_workers.zig");
 
+pub export var share_bounded_scalar_loops: bool = true;
+
 fn io() std.Io {
     return std.Io.Threaded.global_single_threaded.io();
 }
@@ -28,6 +30,15 @@ const Snapshot = struct {
     complete: bool = true,
     missing: bool = false,
     source: shaders.MemoryReader = undefined,
+
+    fn copyFrom(self: *Snapshot, other: *const Snapshot) void {
+        self.count = other.count;
+        self.complete = other.complete;
+        self.missing = false;
+        self.source = undefined;
+        @memcpy(self.reads[0..self.count], other.reads[0..other.count]);
+        // Shared owner walks never replay through the sorted index.
+    }
 
     fn capture(context: ?*anyopaque, address: u64, bytes: []u8) bool {
         const self: *Snapshot = @ptrCast(@alignCast(context.?));
@@ -127,6 +138,133 @@ pub const Stats = struct {
     fallback: u64 = 0,
     worker_ns: u64 = 0,
     wait_ns: u64 = 0,
+    cached_walks: u64 = 0,
+    cache_misses: u64 = 0,
+    shared_loop_walks: u64 = 0,
+    shared_loop_fallbacks: u64 = 0,
+};
+
+/// Reuse the pure scalar interpretation only after re-reading every dependency.
+/// This does not retain Vulkan resources or assume that a guest pointer names
+/// unchanged memory. Results are copied into independent operation-local leases.
+const WalkCache = struct {
+    const maximum_entries = 64;
+    const maximum_bytes = 32 * 1024 * 1024;
+    const Entry = struct {
+        plan_identity: u64,
+        bindings: shaders.StageBindings,
+        snapshot: Snapshot,
+        evaluation: scalar.Evaluation,
+        sampled: []scalar.ScalarRegisters,
+        resource: []scalar.ScalarRegisters,
+        has_sampled: bool,
+        age: u64,
+
+        fn bytes(self: *const Entry) usize {
+            return @sizeOf(Entry) + (self.sampled.len + self.resource.len) * @sizeOf(scalar.ScalarRegisters);
+        }
+
+        fn destroy(self: *Entry) void {
+            const a = std.heap.page_allocator;
+            a.free(self.sampled);
+            a.free(self.resource);
+            a.destroy(self);
+        }
+    };
+    entries: [maximum_entries]?*Entry = @splat(null),
+    bytes: usize = 0,
+    sequence: u64 = 0,
+    enabled: bool = true,
+    /// Admit only inputs seen twice. Streaming per-draw constants must not
+    /// allocate and evict a large snapshot on every single cache miss.
+    admission: [512]u64 = @splat(0),
+
+    fn lookup(self: *WalkCache, plan: *const checkpoints.Plan, bindings: *const shaders.StageBindings, reader: shaders.MemoryReader, needs_sampled: bool) ?*const Entry {
+        if (!self.enabled or plan.identity == 0) return null;
+        for (self.entries) |maybe| {
+            const entry = maybe orelse continue;
+            if (entry.plan_identity != plan.identity or (needs_sampled and !entry.has_sampled) or
+                !std.meta.eql(entry.bindings, bindings.*)) continue;
+            if (!entry.snapshot.matches(reader)) return null;
+            self.sequence +%= 1;
+            entry.age = self.sequence;
+            return entry;
+        }
+        return null;
+    }
+
+    fn remember(self: *WalkCache, plan: *const checkpoints.Plan, bindings: *const shaders.StageBindings, snapshot: *const Snapshot, evaluation: *const scalar.Evaluation, sampled: ?[]const scalar.ScalarRegisters, resource: []const scalar.ScalarRegisters) void {
+        if (!self.enabled or plan.identity == 0 or !snapshot.complete or evaluation.memory_read_failed) return;
+        const sampled_values = sampled orelse &.{};
+        const size = @sizeOf(Entry) + (sampled_values.len + resource.len) * @sizeOf(scalar.ScalarRegisters);
+        if (size > maximum_bytes / 4) return;
+        var hasher = std.hash.Wyhash.init(0);
+        std.hash.autoHash(&hasher, plan.identity);
+        std.hash.autoHash(&hasher, bindings.*);
+        const key = hasher.final() | 1;
+        const admission = &self.admission[key % self.admission.len];
+        if (admission.* != key) {
+            admission.* = key;
+            return;
+        }
+        var slot: ?usize = null;
+        for (self.entries, 0..) |maybe, i| {
+            if (maybe) |entry| {
+                if (entry.plan_identity == plan.identity and std.meta.eql(entry.bindings, bindings.*)) {
+                    if (entry.sampled.len == sampled_values.len and entry.resource.len == resource.len) {
+                        entry.snapshot.copyFrom(snapshot);
+                        entry.evaluation.copyFrom(evaluation);
+                        @memcpy(entry.sampled, sampled_values);
+                        @memcpy(entry.resource, resource);
+                        entry.has_sampled = sampled != null;
+                        self.sequence +%= 1;
+                        entry.age = self.sequence;
+                        return;
+                    }
+                    self.remove(i);
+                    slot = i;
+                    break;
+                }
+            } else slot = i;
+        }
+        while (slot == null or self.bytes + size > maximum_bytes) {
+            var oldest: ?usize = null;
+            for (self.entries, 0..) |maybe, i| if (maybe) |entry| {
+                if (oldest == null or entry.age < self.entries[oldest.?].?.age) oldest = i;
+            };
+            const victim = oldest orelse return;
+            self.remove(victim);
+            slot = victim;
+        }
+        const a = std.heap.page_allocator;
+        const entry = a.create(Entry) catch return;
+        const sampled_copy = a.dupe(scalar.ScalarRegisters, sampled_values) catch {
+            a.destroy(entry);
+            return;
+        };
+        const resource_copy = a.dupe(scalar.ScalarRegisters, resource) catch {
+            a.free(sampled_copy);
+            a.destroy(entry);
+            return;
+        };
+        self.sequence +%= 1;
+        entry.* = .{ .plan_identity = plan.identity, .bindings = bindings.*, .snapshot = .{}, .evaluation = undefined, .sampled = sampled_copy, .resource = resource_copy, .has_sampled = sampled != null, .age = self.sequence };
+        entry.snapshot.copyFrom(snapshot);
+        entry.evaluation.copyFrom(evaluation);
+        self.entries[slot.?] = entry;
+        self.bytes += size;
+    }
+
+    fn remove(self: *WalkCache, index: usize) void {
+        const entry = self.entries[index] orelse return;
+        self.bytes -= entry.bytes();
+        entry.destroy();
+        self.entries[index] = null;
+    }
+
+    fn deinit(self: *WalkCache) void {
+        for (0..self.entries.len) |index| self.remove(index);
+    }
 };
 
 pub const Pool = struct {
@@ -141,12 +279,17 @@ pub const Pool = struct {
     configured_adaptive: bool = false,
     stages: [2]Stage = @splat(.{}),
     stats: Stats = .{},
+    walk_cache: WalkCache = .{},
+    /// Failed bounded-loop proofs are not useful work to repeat per draw.
+    /// Opting out can only miss an optimization if later inputs shorten a loop.
+    loop_declines: [256]struct { identity: u64 = 0, budget: u32 = 0 } = @splat(.{}),
 
     // A stage snapshot is immutable until both jobs complete. Separate jobs
     // allow a long checkpoint walk to overlap the other stage's scalar walk.
     const Stage = struct {
         active: bool = false,
         inline_prepared: bool = false,
+        shared_declined: bool = false,
         bindings_address: ?*const shaders.StageBindings = null,
         bindings: shaders.StageBindings = undefined,
         plan: *const checkpoints.Plan = undefined,
@@ -215,15 +358,40 @@ pub const Pool = struct {
 
     fn availableShared(self: *Pool, slot: usize, instructions: []const rdna2.Instruction, plan: ?*const checkpoints.Plan, bindings: *const shaders.StageBindings) ?*Stage {
         if (!self.share_scalar_walks or slot >= self.stages.len or plan == null or
-            !plan.?.matches(instructions) or !plan.?.forward_only or
+            !plan.?.matches(instructions) or
+            (!plan.?.forward_only and !@atomicLoad(bool, &share_bounded_scalar_loops, .monotonic)) or
             instructions.len > bindings.resource_instruction_budget or
             plan.?.resource.len + plan.?.sampled.len == 0) return null;
+        if (!plan.?.forward_only and plan.?.identity != 0) {
+            const declined = self.loop_declines[plan.?.identity % self.loop_declines.len];
+            if (declined.identity == plan.?.identity and declined.budget == bindings.resource_instruction_budget) return null;
+        }
         const stage = &self.stages[slot];
-        if (stage.active) return null;
+        if (stage.active or stage.shared_declined) return null;
         stage.snapshot.count = 0;
         stage.snapshot.complete = true;
         stage.snapshot.missing = false;
         return stage;
+    }
+
+    fn sharedResultFits(self: *Pool, stage: *Stage, plan: *const checkpoints.Plan, bindings: *const shaders.StageBindings, evaluation: *const scalar.Evaluation) bool {
+        if (plan.forward_only) return true;
+        // The indexed and dense evaluators follow the same scalar/control
+        // steps. Share a completed loop only when even this upper bound on
+        // dense visits fits its original budget. A shorter sparse walk must
+        // never lend results from beyond the dense interpreter's limit.
+        const dense_bound = (@as(u64, evaluation.instruction_count) + 1) * plan.maximum_dense_step_ratio;
+        if (evaluation.stop_reason == .end_program and dense_bound <= bindings.resource_instruction_budget) {
+            self.stats.shared_loop_walks += 1;
+            return true;
+        }
+        stage.shared_declined = true;
+        if (plan.identity != 0) self.loop_declines[plan.identity % self.loop_declines.len] = .{
+            .identity = plan.identity,
+            .budget = bindings.resource_instruction_budget,
+        };
+        self.stats.shared_loop_fallbacks += 1;
+        return false;
     }
 
     fn retainShared(self: *Pool, stage: *Stage, bindings: *const shaders.StageBindings, plan: *const checkpoints.Plan, resource: checkpoints.Pool.Lease) void {
@@ -249,10 +417,23 @@ pub const Pool = struct {
             var sampled = try scratch.acquire(allocator, instructions, plan, .sampled);
             errdefer sampled.release();
             var resource = try stage.resource_job.scratch.acquire(std.heap.page_allocator, instructions, plan, .resource);
+            if (self.walk_cache.lookup(plan.?, bindings, reader, true)) |cached| {
+                @memcpy(sampled.snapshots, cached.sampled);
+                @memcpy(resource.snapshots, cached.resource);
+                stage.scalar_result.copyFrom(&cached.evaluation);
+                stage.snapshot.copyFrom(&cached.snapshot);
+                self.stats.cached_walks += 1;
+                self.retainShared(stage, bindings, plan.?, resource);
+                return sampled;
+            }
+            self.stats.cache_misses += 1;
             stage.snapshot.source = reader;
-            scalar.evaluateDecodedResourceStateAtTwoCheckpointsInto(&stage.scalar_result, .{ .context = &stage.snapshot, .read_fn = Snapshot.capture }, bindings, instructions, sampled.pcs, sampled.snapshots, resource.pcs, resource.snapshots);
+            // Forward walks fit statically. Completed loops additionally prove
+            // their dense visit bound before lending specialization history.
+            scalar.evaluateDecodedResourceStateAtTwoCheckpointsInto(&stage.scalar_result, .{ .context = &stage.snapshot, .read_fn = Snapshot.capture }, bindings, instructions, sampled.pcs, sampled.snapshots, resource.pcs, resource.snapshots, plan.?.scalar_steps);
             sampled.instructions_walked = stage.scalar_result.instruction_count;
-            if (stage.snapshot.complete) {
+            if (stage.snapshot.complete and self.sharedResultFits(stage, plan.?, bindings, &stage.scalar_result)) {
+                self.walk_cache.remember(plan.?, bindings, &stage.snapshot, &stage.scalar_result, sampled.snapshots, resource.snapshots);
                 self.retainShared(stage, bindings, plan.?, resource);
             } else {
                 resource.release();
@@ -269,10 +450,25 @@ pub const Pool = struct {
     pub fn startScalar(self: *Pool, slot: usize, reader: shaders.MemoryReader, bindings: *const shaders.StageBindings, instructions: []const rdna2.Instruction, plan: ?*const checkpoints.Plan, scalar_result: *scalar.Evaluation) bool {
         if (self.availableShared(slot, instructions, plan, bindings)) |stage| {
             var resource = stage.resource_job.scratch.acquire(std.heap.page_allocator, instructions, plan, .resource) catch return false;
+            if (self.walk_cache.lookup(plan.?, bindings, reader, false)) |cached| {
+                @memcpy(resource.snapshots, cached.resource);
+                scalar_result.copyFrom(&cached.evaluation);
+                stage.scalar_result.copyFrom(&cached.evaluation);
+                stage.snapshot.copyFrom(&cached.snapshot);
+                self.stats.cached_walks += 1;
+                self.retainShared(stage, bindings, plan.?, resource);
+                return true;
+            }
+            self.stats.cache_misses += 1;
             stage.snapshot.source = reader;
-            scalar.evaluateDecodedResourceStateAtCheckpointsInto(scalar_result, .{ .context = &stage.snapshot, .read_fn = Snapshot.capture }, bindings, instructions, resource.pcs, resource.snapshots, null);
+            scalar.evaluateDecodedResourceStateAtCheckpointsInto(scalar_result, .{ .context = &stage.snapshot, .read_fn = Snapshot.capture }, bindings, instructions, resource.pcs, resource.snapshots, plan.?.scalar_steps);
+            if (!self.sharedResultFits(stage, plan.?, bindings, scalar_result)) {
+                resource.release();
+                return false;
+            }
             if (stage.snapshot.complete) {
                 stage.scalar_result.copyFrom(scalar_result);
+                self.walk_cache.remember(plan.?, bindings, &stage.snapshot, scalar_result, null, resource.snapshots);
                 self.retainShared(stage, bindings, plan.?, resource);
             } else {
                 resource.release();
@@ -358,6 +554,7 @@ pub const Pool = struct {
     /// Consumers release borrowed checkpoint leases before starting a new draw.
     pub fn finish(self: *Pool) void {
         for (&self.stages) |*stage| {
+            stage.shared_declined = false;
             if (!stage.active) continue;
             self.join(&stage.scalar_job);
             self.join(&stage.resource_job);
@@ -368,6 +565,7 @@ pub const Pool = struct {
     pub fn deinit(self: *Pool) void {
         self.finish();
         self.queue.deinit();
+        self.walk_cache.deinit();
         for (&self.stages) |*stage| {
             stage.scalar_job.scratch.deinit(std.heap.page_allocator);
             stage.resource_job.scratch.deinit(std.heap.page_allocator);
@@ -542,4 +740,225 @@ test "resource snapshots reject missing and inconsistent reads" {
     try std.testing.expect(Snapshot.capture(snapshot, 0x4000, &bytes));
     try std.testing.expect(!snapshot.complete);
     try std.testing.expect(!snapshot.matches(memory.reader()));
+}
+
+test "shared indexed resource walk preserves lane clobbers and branch checkpoints" {
+    const a = std.testing.allocator;
+    var instructions = [_]rdna2.Instruction{
+        .{ .family = .vop1, .opcode = .v_mov_b32, .dst = .{ .kind = .vgpr, .reg = 0 } },
+        .{ .family = .vop3, .opcode = .v_writelane_b32, .dst = .{ .kind = .vgpr, .reg = 18 }, .src0 = .{ .kind = .sgpr }, .src1 = .{ .kind = .integer_inline_constant } },
+        .{ .family = .vop1, .opcode = .v_mov_b32, .dst = .{ .kind = .vgpr, .reg = 18 } },
+        .{ .family = .vop3, .opcode = .v_readlane_b32, .dst = .{ .kind = .sgpr, .reg = 10 }, .src0 = .{ .kind = .vgpr, .reg = 18 }, .src1 = .{ .kind = .integer_inline_constant } },
+        .{ .family = .smem, .opcode = .s_load_dword, .dst = .{ .kind = .sgpr, .reg = 4 }, .src0 = .{ .kind = .sgpr }, .src1 = .{ .kind = .integer_inline_constant }, .data_words = 1 },
+        .{ .family = .sop2, .opcode = .s_and_b32, .dst = .{ .kind = .sgpr, .reg = 5 }, .src0 = .{ .kind = .sgpr, .reg = 4 }, .src1 = .{ .kind = .integer_inline_constant, .value = 1 } },
+        .{ .family = .sopp, .opcode = .s_cbranch_scc0, .branch_target = 36 },
+        .{ .family = .mimg, .opcode = .image_sample, .dst = .{ .kind = .vgpr, .reg = 2 }, .src1 = .{ .kind = .sgpr, .reg = 4 } },
+        .{ .family = .sopp, .opcode = .s_branch, .branch_target = 40 },
+        .{ .family = .mimg, .opcode = .image_sample, .dst = .{ .kind = .vgpr, .reg = 3 }, .src1 = .{ .kind = .sgpr, .reg = 4 } },
+        .{ .family = .vop1, .opcode = .v_mov_b32, .dst = .{ .kind = .vgpr, .reg = 0 } },
+        .{ .family = .sopp, .opcode = .s_endpgm },
+    };
+    for (&instructions, 0..) |*inst, i| {
+        inst.pc = @intCast(i * 4);
+        inst.word_count = 1;
+    }
+    var bindings = std.mem.zeroes(shaders.StageBindings);
+    bindings.resource_instruction_budget = instructions.len;
+    bindings.user_data_count = 2;
+    bindings.user_data[0] = 0x4000;
+    var memory = TestMemory{ .owner = std.Thread.getCurrentId() };
+    var plan = try checkpoints.Plan.init(a, &instructions);
+    defer plan.deinit(a);
+    const pool = try a.create(Pool);
+    defer a.destroy(pool);
+    pool.* = .{ .worker_limit = 0 };
+    defer pool.deinit();
+    pool.walk_cache.enabled = false;
+    var scratch = checkpoints.Pool{};
+    defer scratch.deinit(a);
+    const reference_resource = try a.alloc(scalar.ScalarRegisters, plan.resource.len);
+    defer a.free(reference_resource);
+    const reference_sampled = try a.alloc(scalar.ScalarRegisters, plan.sampled.len);
+    defer a.free(reference_sampled);
+    for (0..2) |branch| {
+        memory.value = @intCast(branch);
+        var expected: scalar.Evaluation = undefined;
+        scalar.evaluateDecodedResourceStateAtTwoCheckpointsInto(&expected, memory.reader(), &bindings, &instructions, plan.sampled, reference_sampled, plan.resource, reference_resource, null);
+        var sampled = (try pool.startSampled(0, memory.reader(), &bindings, &instructions, &plan, &scratch, a)).?;
+        defer sampled.release();
+        var actual: scalar.Evaluation = undefined;
+        try std.testing.expect(pool.takeScalar(0, &bindings, &instructions, memory.reader(), &actual));
+        var resource = pool.take(&instructions, &bindings, .resource, memory.reader()).?;
+        defer resource.release();
+        try std.testing.expectEqualDeep(expected.registers, actual.registers);
+        try std.testing.expect(!actual.registers[10].known);
+        try std.testing.expectEqual(expected.stop_reason, actual.stop_reason);
+        try std.testing.expectEqual(expected.address_user_data_mask, actual.address_user_data_mask);
+        try std.testing.expectEqual(expected.load_count, actual.load_count);
+        try std.testing.expectEqualDeep(reference_sampled, sampled.snapshots);
+        try std.testing.expectEqualDeep(reference_resource, resource.snapshots);
+        try std.testing.expect(actual.instruction_count < expected.instruction_count);
+        pool.finish();
+    }
+}
+
+test "shared loop resource walks preserve dense budgets and checkpoint history" {
+    const a = std.testing.allocator;
+    var instructions = [_]rdna2.Instruction{
+        .{ .family = .sop1, .opcode = .s_mov_b32, .dst = .{ .kind = .sgpr, .reg = 6 }, .src0 = .{ .kind = .integer_inline_constant, .value = 4 } },
+        .{ .family = .smem, .opcode = .s_load_dword, .dst = .{ .kind = .sgpr, .reg = 4 }, .src0 = .{ .kind = .sgpr }, .src1 = .{ .kind = .integer_inline_constant }, .data_words = 1 },
+        .{ .family = .vop1, .opcode = .v_mov_b32, .dst = .{ .kind = .vgpr, .reg = 0 } },
+        .{ .family = .vop1, .opcode = .v_mov_b32, .dst = .{ .kind = .vgpr, .reg = 1 } },
+        .{ .family = .vop1, .opcode = .v_mov_b32, .dst = .{ .kind = .vgpr, .reg = 2 } },
+        .{ .family = .vop1, .opcode = .v_mov_b32, .dst = .{ .kind = .vgpr, .reg = 3 } },
+        .{ .family = .vop1, .opcode = .v_mov_b32, .dst = .{ .kind = .vgpr, .reg = 4 } },
+        .{ .family = .vop1, .opcode = .v_mov_b32, .dst = .{ .kind = .vgpr, .reg = 5 } },
+        .{ .family = .sop2, .opcode = .s_sub_u32, .dst = .{ .kind = .sgpr, .reg = 6 }, .src0 = .{ .kind = .sgpr, .reg = 6 }, .src1 = .{ .kind = .integer_inline_constant, .value = 1 } },
+        .{ .family = .sopc, .opcode = .s_cmp_eq_u32, .src0 = .{ .kind = .sgpr, .reg = 6 }, .src1 = .{ .kind = .integer_inline_constant } },
+        .{ .family = .sopp, .opcode = .s_cbranch_scc0, .branch_target = 4 },
+        .{ .family = .mimg, .opcode = .image_sample, .dst = .{ .kind = .vgpr, .reg = 2 }, .src1 = .{ .kind = .sgpr, .reg = 4 } },
+        .{ .family = .sopp, .opcode = .s_endpgm },
+    };
+    for (&instructions, 0..) |*inst, i| {
+        inst.pc = @intCast(i * 4);
+        inst.word_count = 1;
+        inst.src_count = switch (inst.family) {
+            .sop1, .vop1 => 1,
+            .sop2, .sopc, .smem => 2,
+            else => 0,
+        };
+    }
+    var plan = try checkpoints.Plan.init(a, &instructions);
+    defer plan.deinit(a);
+    try std.testing.expect(!plan.forward_only);
+    var bindings = std.mem.zeroes(shaders.StageBindings);
+    bindings.user_data_count = 2;
+    bindings.user_data[0] = 0x4000;
+    var memory = TestMemory{ .owner = std.Thread.getCurrentId() };
+    const pool = try a.create(Pool);
+    defer a.destroy(pool);
+    pool.* = .{ .worker_limit = 0 };
+    defer pool.deinit();
+    pool.walk_cache.enabled = false;
+    var scratch = checkpoints.Pool{};
+    defer scratch.deinit(a);
+    var serial = checkpoints.Pool{};
+    defer serial.deinit(a);
+    const reference_resource = try a.alloc(scalar.ScalarRegisters, plan.resource.len);
+    defer a.free(reference_resource);
+    const reference_sampled = try a.alloc(scalar.ScalarRegisters, plan.sampled.len);
+    defer a.free(reference_sampled);
+    for ([_]u32{ 256, 30, 13 }) |budget| {
+        bindings.resource_instruction_budget = budget;
+        var expected: scalar.Evaluation = undefined;
+        scalar.evaluateDecodedResourceStateAtTwoCheckpointsInto(&expected, memory.reader(), &bindings, &instructions, plan.sampled, reference_sampled, plan.resource, reference_resource, null);
+        var sampled = (try pool.startSampled(0, memory.reader(), &bindings, &instructions, &plan, &scratch, a)).?;
+        defer sampled.release();
+        var sampled_oracle = try serial.prepare(a, &instructions, &plan, .sampled, memory.reader(), &bindings);
+        defer sampled_oracle.release();
+        try std.testing.expectEqualDeep(sampled_oracle.snapshots, sampled.snapshots);
+        var actual: scalar.Evaluation = undefined;
+        const shared = pool.takeScalar(0, &bindings, &instructions, memory.reader(), &actual);
+        try std.testing.expectEqual(budget == 256, shared);
+        if (shared) {
+            var resource = pool.take(&instructions, &bindings, .resource, memory.reader()).?;
+            defer resource.release();
+            try std.testing.expectEqualDeep(reference_sampled, sampled.snapshots);
+            try std.testing.expectEqualDeep(reference_resource, resource.snapshots);
+            try std.testing.expectEqualDeep(expected.registers, actual.registers);
+            try std.testing.expectEqual(expected.stop_reason, actual.stop_reason);
+            try std.testing.expectEqual(@as(u32, 43), expected.instruction_count);
+            try std.testing.expectEqual(@as(u32, 0), actual.registers[6].value);
+            try std.testing.expectEqual(@as(usize, 1), actual.load_count);
+            try std.testing.expectEqual(expected.load_count, actual.load_count);
+            for (expected.loadSlice(), actual.loadSlice()) |want, got| {
+                try std.testing.expectEqual(want.address, got.address);
+                try std.testing.expectEqual(want.pc, got.pc);
+                try std.testing.expectEqualSlices(u32, want.values[0..want.word_count], got.values[0..got.word_count]);
+            }
+        } else {
+            try std.testing.expectEqual(scalar.StopReason.instruction_limit, expected.stop_reason);
+            try std.testing.expect(pool.stages[0].shared_declined);
+            try std.testing.expect(!pool.startScalar(0, memory.reader(), &bindings, &instructions, &plan, &actual));
+        }
+        pool.finish();
+        try std.testing.expectEqual(budget == 256, pool.startScalar(0, memory.reader(), &bindings, &instructions, &plan, &actual));
+        if (budget == 256) try std.testing.expectEqualDeep(expected.registers, actual.registers);
+        pool.finish();
+    }
+    try std.testing.expectEqual(@as(u64, 2), pool.stats.shared_loop_walks);
+    try std.testing.expectEqual(@as(u64, 2), pool.stats.shared_loop_fallbacks);
+}
+
+test "cached resource walks validate bytes bindings and immutable plan identity" {
+    const a = std.testing.allocator;
+    const code = [_]u32{
+        0xf400_1a80, 125 << 25,
+        0xbefe_04c1, 0xbf8c_007f,
+        0xbf07_6a80, 0xbf84_0002,
+        0xf020_0f28, 0x0002_0400,
+        0xbf81_0000,
+    };
+    var program = try rdna2.decodeProgram(a, &code);
+    defer program.deinit(a);
+    for (program.instructions.items) |*inst| if (inst.family == .mimg) {
+        inst.opcode = .image_sample;
+    };
+    var plan = try checkpoints.Plan.init(a, program.instructions.items);
+    defer plan.deinit(a);
+    // Even exactly the same instruction allocation can belong to a new plan.
+    var replacement = try checkpoints.Plan.init(a, program.instructions.items);
+    defer replacement.deinit(a);
+    const pool = try a.create(Pool);
+    defer a.destroy(pool);
+    pool.* = .{ .worker_limit = 0 };
+    defer pool.deinit();
+    var scratch = checkpoints.Pool{};
+    defer scratch.deinit(a);
+    var serial = checkpoints.Pool{};
+    defer serial.deinit(a);
+    var memory = TestMemory{ .owner = std.Thread.getCurrentId() };
+    var bindings = std.mem.zeroes(shaders.StageBindings);
+    bindings.resource_instruction_budget = 16 * 1024;
+    bindings.user_data_count = 2;
+    bindings.user_data[0] = 0x4000;
+    for (0..7) |iteration| {
+        if (iteration == 3) memory.value = 0; // Changes the branch and skipped sites.
+        if (iteration == 4) bindings.user_data[1] = 0x80000000; // Masks off in the address but is still an input.
+        const active_plan = if (iteration == 5) &replacement else &plan;
+        if (iteration == 6) pool.walk_cache.enabled = false;
+        const previous_hits = pool.stats.cached_walks;
+        var sampled = (try pool.startSampled(0, memory.reader(), &bindings, program.instructions.items, active_plan, &scratch, a)).?;
+        defer sampled.release();
+        var resource = pool.take(program.instructions.items, &bindings, .resource, memory.reader()).?;
+        defer resource.release();
+        for ([_]checkpoints.Kind{ .sampled, .resource }) |kind| {
+            var expected = try serial.prepare(a, program.instructions.items, active_plan, kind, memory.reader(), &bindings);
+            defer expected.release();
+            try std.testing.expectEqualDeep(expected.snapshots, if (kind == .sampled) sampled.snapshots else resource.snapshots);
+        }
+        var evaluation: scalar.Evaluation = undefined;
+        try std.testing.expect(pool.takeScalar(0, &bindings, program.instructions.items, memory.reader(), &evaluation));
+        var expected: scalar.Evaluation = undefined;
+        scalar.evaluateDecodedResourceStateInto(&expected, memory.reader(), &bindings, program.instructions.items);
+        try std.testing.expectEqualDeep(expected.registers, evaluation.registers);
+        try std.testing.expectEqual(expected.load_count, evaluation.load_count);
+        for (expected.loadSlice(), evaluation.loadSlice()) |want, actual| {
+            try std.testing.expectEqual(want.address, actual.address);
+            try std.testing.expectEqual(want.pc, actual.pc);
+            try std.testing.expectEqual(want.word_count, actual.word_count);
+            try std.testing.expectEqualSlices(u32, want.values[0..want.word_count], actual.values[0..actual.word_count]);
+        }
+        try std.testing.expectEqual(previous_hits + @as(u64, if (iteration == 2) 1 else 0), pool.stats.cached_walks);
+        pool.finish();
+    }
+    pool.walk_cache.enabled = true;
+    bindings.user_data[1] = 0;
+    memory.value = null;
+    var failed = (try pool.startSampled(0, memory.reader(), &bindings, program.instructions.items, &plan, &scratch, a)).?;
+    failed.release();
+    try std.testing.expect(!pool.stages[0].active);
+    try std.testing.expectEqual(@as(u64, 1), pool.stats.cached_walks);
+    pool.deinit();
+    try std.testing.expectEqual(@as(usize, 0), pool.walk_cache.bytes);
 }

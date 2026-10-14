@@ -230,6 +230,10 @@ pub const ContextStateOperation = enum(u32) {
 /// Exhaustion must stop the submission; ignoring a push unbalances its pops.
 pub const context_state_depth: usize = 4;
 pub const State = struct {
+    /// Monotonic within one command execution. Draw slots start with a full
+    /// copy, then retain unchanged banks while copying all scalar state.
+    /// Saturation disables reuse instead of wrapping onto an older version.
+    snapshot_versions: [5]u64 = @splat(0),
     config: RegisterFile(config_register_count) = .{},
     context: RegisterFile(context_register_count) = .{},
     /// Saved copies of `context`, innermost last.
@@ -319,7 +323,47 @@ pub const State = struct {
             .shader => try self.shader.write(offset, value),
             .uconfig => try self.uconfig.write(offset, value),
         }
+        const bank: usize = switch (space) {
+            .config => 0,
+            .context => 1,
+            .shader => 2,
+            .uconfig => 3,
+        };
+        self.snapshot_versions[bank] +|= 1;
         self.register_writes += 1;
+    }
+
+    /// `reuse` is valid only for a snapshot of this same uninterrupted
+    /// execution. The caller invalidates every slot at submission boundaries.
+    /// Returns the number of bank bytes copied for performance diagnostics.
+    pub fn copySnapshot(self: *State, source: *const State, reuse: bool) usize {
+        if (!reuse) {
+            self.* = source.*;
+            return @sizeOf(State);
+        }
+        var copied: usize = 0;
+        inline for (.{ "config", "context", "shader", "uconfig", "context_stack" }, 0..) |name, index| {
+            const version = source.snapshot_versions[index];
+            if (version == std.math.maxInt(u64) or self.snapshot_versions[index] != version) {
+                @field(self, name) = @field(source, name);
+                copied += @sizeOf(@TypeOf(@field(source, name)));
+            }
+        }
+        self.copySnapshotScalars(source);
+        return copied;
+    }
+
+    /// Copies the small command state without touching register-bank storage.
+    /// Used with independently retained immutable banks by command workers.
+    pub fn copySnapshotScalars(self: *State, source: *const State) void {
+        inline for (@typeInfo(State).@"struct".fields) |field| {
+            if (comptime !std.mem.eql(u8, field.name, "config") and
+                !std.mem.eql(u8, field.name, "context") and
+                !std.mem.eql(u8, field.name, "shader") and
+                !std.mem.eql(u8, field.name, "uconfig") and
+                !std.mem.eql(u8, field.name, "context_stack"))
+                @field(self, field.name) = @field(source, field.name);
+        }
     }
 
     /// Returns null both for an unwritten register and an offset outside its
@@ -343,6 +387,7 @@ pub const State = struct {
         switch (operation) {
             .clear => {
                 self.context.clear();
+                self.snapshot_versions[1] +|= 1;
                 self.context_state_clear_count += 1;
                 return true;
             },
@@ -352,10 +397,12 @@ pub const State = struct {
                     return false;
                 }
                 self.context_stack[self.context_depth] = self.context;
+                self.snapshot_versions[4] +|= 1;
                 self.context_depth += 1;
                 self.context_state_push_count += 1;
                 if (operation == .push_clear) {
                     self.context.clear();
+                    self.snapshot_versions[1] +|= 1;
                     self.context_state_clear_count += 1;
                 }
                 return true;
@@ -368,6 +415,8 @@ pub const State = struct {
                 self.context_depth -= 1;
                 self.context = self.context_stack[self.context_depth];
                 self.context_stack[self.context_depth] = .{};
+                self.snapshot_versions[1] +|= 1;
+                self.snapshot_versions[4] +|= 1;
                 self.context_state_pop_count += 1;
                 return true;
             },
@@ -378,6 +427,7 @@ pub const State = struct {
         self.context.clear();
         self.shader.clear();
         self.uconfig.clear();
+        for (self.snapshot_versions[0..4]) |*version| version.* +|= 1;
         self.instance_count = 1;
         self.index_base_address = 0;
         self.index_buffer_size = 0;
@@ -422,4 +472,37 @@ test "clearing register state does not erase submission statistics" {
     try testing.expectEqual(@as(u32, 0), gpu_state.index_buffer_size);
     try testing.expectEqual(@as(u64, 0), gpu_state.draw_indirect_args_base_address);
     try testing.expectEqual(@as(u64, 0), gpu_state.dispatch_indirect_args_base_address);
+}
+
+test "incremental draw snapshots preserve all banks context stacks and scalar state" {
+    var source = State{};
+    var snapshot: State = undefined;
+    try testing.expectEqual(@sizeOf(State), snapshot.copySnapshot(&source, false));
+    try testing.expectEqual(@as(usize, 0), snapshot.copySnapshot(&source, true));
+    const spaces = [_]pm4.RegisterSpace{ .config, .context, .shader, .uconfig };
+    for (0..48) |step| {
+        try source.writeRegister(spaces[step % 4], @intCast(step), @intCast(step * 71));
+        source.instance_count = @intCast(step + 2);
+        source.index_base_address = step * 4096;
+        source.predicate_skip = step % 2 != 0;
+        source.predicated_opcode_counts[step] = @intCast(step);
+        if (step % 6 == 0) try testing.expect(source.applyContextStateOperation(.push_clear));
+        if (step % 6 == 1) try testing.expect(source.applyContextStateOperation(.pop));
+        if (step % 9 == 2) source.clearRegisters();
+        const copied = snapshot.copySnapshot(&source, true);
+        try testing.expect(copied < @sizeOf(State));
+        try testing.expectEqualDeep(source, snapshot);
+        try testing.expectEqual(@as(usize, 0), snapshot.copySnapshot(&source, true));
+    }
+    // A saturated version must still copy every later mutation.
+    source.snapshot_versions[3] = std.math.maxInt(u64);
+    _ = snapshot.copySnapshot(&source, true);
+    try source.writeRegister(.uconfig, 3, 0xabcdef);
+    try testing.expect(snapshot.copySnapshot(&source, true) != 0);
+    try testing.expectEqualDeep(source, snapshot);
+    // A new execution may start at the same versions with different bytes.
+    var replacement = State{};
+    try replacement.writeRegister(.uconfig, 3, 0x123456);
+    _ = snapshot.copySnapshot(&replacement, false);
+    try testing.expectEqualDeep(replacement, snapshot);
 }

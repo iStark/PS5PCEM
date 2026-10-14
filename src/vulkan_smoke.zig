@@ -2174,6 +2174,80 @@ fn runPartialRegisterMergeProbe(allocator: std.mem.Allocator) !void {
     std.debug.print("partial register merges passed: correlated GPU predicates preserve both defined paths across uninitialized incoming arms\n", .{});
 }
 
+fn runUnobservedVectorProbe(allocator: std.mem.Allocator) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{ .enable_validation = true });
+    defer renderer.deinit();
+    var guest = GuestMemory{};
+    _ = renderer.dcbBackend(guest.interface());
+    var output_base: usize = 0x8000;
+    for ([_]bool{ false, true }) |cross_lane| for ([_]u64{ 0, 0xffffffff, 0xaaaaaaaa55555555, 0xffffffffffffffff }) |mask| {
+        var code: std.ArrayList(u32) = .empty;
+        defer code.deinit(allocator);
+        try code.appendSlice(allocator, &.{
+            vop1(1, 1, 170), // v1=42, preserve inactive values after restoring EXEC.
+            vop1(1, 32, 147), // v32=19 for the cross-lane observer.
+            sop1(4, 126, 8),
+            vop1(1, 1, 129),
+            vop1(1, 32, 135), // v32=7, used by a masked store before restoration.
+        });
+        if (cross_lane) try code.appendSlice(allocator, &.{ 0xd7600010, (256 + 32) | (191 << 9) }); // s16=readlane(v32,63)
+        try code.appendSlice(allocator, &mubuf(0x1c, 0, 32, 0, 0));
+        try code.append(allocator, sop1(4, 126, 193));
+        try code.appendSlice(allocator, &mubuf(0x1c, 0, 1, 0, 4));
+        if (cross_lane) {
+            try code.append(allocator, vop1(1, 33, 16));
+            try code.appendSlice(allocator, &mubuf(0x1c, 0, 33, 0, 12));
+        }
+        try code.append(allocator, 0xbf810000);
+        for (code.items, 0..) |word, i| guest.word(0x100 + i * 4, word);
+        var analysis = try gpu.shader_analysis.decodeWithOptions(allocator, .{ .context = &guest, .read_fn = GuestMemory.read }, 0x100, code.items.len, .{ .enable_typed_ir = false });
+        defer analysis.deinit(allocator);
+        var baseline: [3][256]u8 = undefined;
+        var baseline_words: usize = 0;
+        for ([_]bool{ false, true }) |optimized| {
+            defer output_base += 0xc00;
+            var module = try analysis.translateSpirv(allocator, .{
+                .stage = .compute,
+                .local_size = .{ 64, 1, 1 },
+                .compute_inputs = .{ .local_invocation_id_components = 1 },
+                .uses_execution_mask = true,
+                .uses_lane_identity = true,
+                .omit_unobserved_exec_selects = optimized,
+                .scalar_registers = &.{ .{ .register = 8, .value = @truncate(mask) }, .{ .register = 9, .value = @truncate(mask >> 32) } },
+                .storage_buffers = &.{
+                    .{ .resource_sgpr = 0, .descriptor_index = 0, .extent_bytes = 256, .stride = 4 },
+                    .{ .resource_sgpr = 4, .descriptor_index = 1, .extent_bytes = 256, .stride = 4 },
+                    .{ .resource_sgpr = 12, .descriptor_index = 2, .extent_bytes = 256, .stride = 4 },
+                },
+            });
+            defer module.deinit(allocator);
+            if (!optimized) baseline_words = module.words.len else if (!cross_lane) try std.testing.expect(module.words.len < baseline_words);
+            for (0..3) |slot| {
+                @memset(guest.bytes[output_base + slot * 0x400 ..][0..256], 0xa5);
+                _ = try renderer.stageGuestStorageBufferAt(@intCast(slot), output_base + slot * 0x400, 256);
+            }
+            _ = try renderer.dispatchSpirv(module.words, .{ 1, 1, 1 });
+            for (0..if (cross_lane) @as(usize, 3) else 2) |slot| {
+                var output: [256]u8 = undefined;
+                try renderer.readbackGuestStorageBuffer(output_base + slot * 0x400, &output);
+                if (optimized) try std.testing.expectEqualSlices(u8, &baseline[slot], &output) else baseline[slot] = output;
+                for (0..64) |lane| {
+                    const active = mask & (@as(u64, 1) << @intCast(lane)) != 0;
+                    const expected: u32 = switch (slot) {
+                        0 => if (active) 7 else 0xa5a5a5a5,
+                        1 => if (active) 1 else 42,
+                        else => if (mask >> 63 != 0) 7 else 19,
+                    };
+                    const actual = std.mem.readInt(u32, output[lane * 4 ..][0..4], .little);
+                    if (expected != actual) std.debug.print("unobserved case optimized={} cross={} mask={x} slot={d} lane={d}\n", .{ optimized, cross_lane, mask, slot, lane });
+                    try std.testing.expectEqual(expected, actual);
+                }
+            }
+        }
+    };
+    std.debug.print("unobserved vector values passed: baseline/optimized outputs, empty/full/sparse masks, restored inactive lanes and lane-63 observers\n", .{});
+}
+
 fn runSaveExecProbe(allocator: std.mem.Allocator) !void {
     const pairs = [_][2]u64{
         .{ 0xaaaa_aaaa_5555_5555, 0xcccc_cccc_3333_3333 },
@@ -4774,7 +4848,13 @@ fn runSampledDccClearProbe(allocator: std.mem.Allocator) !void {
             for (userdata, 0..) |word, i| try state.writeRegister(.shader, compute.userDataBase() + @as(u32, @intCast(i)), word);
             for ([_]u8{ 0x40, 0x80, 0xc0, 0x00, 0x40, 0xff, 0x20 }) |key| {
                 @memset(guest.bytes[metadata..][0..key_bytes], key);
+                const before_upload = renderer.frame_profile.texture_upload_bytes;
+                const before_clear = renderer.sampled_native_clear_count;
                 _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
+                if (key != 0xff and key != 0x20) {
+                    try std.testing.expectEqual(before_upload, renderer.frame_profile.texture_upload_bytes);
+                    try std.testing.expectEqual(before_clear + 1, renderer.sampled_native_clear_count);
+                }
                 var output: [16]u8 = undefined;
                 try renderer.readbackGuestStorageBuffer(0x10000, &output);
                 for (0..4) |channel| {
@@ -4811,6 +4891,7 @@ fn runSampledCacheBudgetProbe(allocator: std.mem.Allocator) !void {
         try runSampledCacheBudgetCase(allocator, .bounded_sync, timeline);
         try runSampledCacheBudgetCase(allocator, .bounded_async, timeline);
         try runSampledCacheBudgetCase(allocator, .replace_sync, timeline);
+        try runSampledCacheBudgetCase(allocator, .replace_reuse, timeline);
         try runSampledCacheBudgetCase(allocator, .bounded_reuse, timeline);
         try runSampledCacheBudgetCase(allocator, .bounded_reuse_revision, timeline);
         try runSampledCacheBudgetCase(allocator, .bounded_reuse_mismatch, timeline);
@@ -4913,15 +4994,15 @@ fn runSampledAllocationPressureProbe(allocator: std.mem.Allocator) !void {
     }
 }
 
-fn runSampledCacheBudgetCase(allocator: std.mem.Allocator, mode: enum { one_byte, bounded_sync, bounded_async, replace_sync, bounded_reuse, bounded_reuse_revision, bounded_reuse_mismatch, allocation_pressure, allocation_pinned }, timeline: bool) !void {
+fn runSampledCacheBudgetCase(allocator: std.mem.Allocator, mode: enum { one_byte, bounded_sync, bounded_async, replace_sync, replace_reuse, bounded_reuse, bounded_reuse_revision, bounded_reuse_mismatch, allocation_pressure, allocation_pinned }, timeline: bool) !void {
     const pressure = mode == .allocation_pressure or mode == .allocation_pinned;
-    const reuse = mode == .bounded_reuse or mode == .bounded_reuse_revision or mode == .bounded_reuse_mismatch;
-    const bounded_case = mode == .bounded_sync or mode == .bounded_async or reuse;
+    const reuse = mode == .bounded_reuse or mode == .bounded_reuse_revision or mode == .bounded_reuse_mismatch or mode == .replace_reuse;
+    const bounded_case = mode == .bounded_sync or mode == .bounded_async or (reuse and mode != .replace_reuse);
     const previous_reuse = vulkan.backend.sampled_backing_reuse;
     defer vulkan.backend.sampled_backing_reuse = previous_reuse;
     vulkan.backend.sampled_backing_reuse = reuse;
     const deferred_retirement = mode == .bounded_async;
-    const replace_contents = mode == .replace_sync;
+    const replace_contents = mode == .replace_sync or mode == .replace_reuse;
     const previous_slack = vulkan.backend.sampled_retirement_slack_bytes;
     defer vulkan.backend.sampled_retirement_slack_bytes = previous_slack;
     vulkan.backend.sampled_retirement_slack_bytes = if (deferred_retirement) 64 * 1024 * 1024 else 0;
@@ -4954,12 +5035,17 @@ fn runSampledCacheBudgetCase(allocator: std.mem.Allocator, mode: enum { one_byte
         renderer: *vulkan.Renderer,
         advance_at: u64 = 0,
         advances: usize = 0,
+        spill_at: u64 = 0,
         fn read(raw: ?*anyopaque, address: u64, bytes: []u8) bool {
             const self: *@This() = @ptrCast(@alignCast(raw.?));
             if (self.advance_at != 0 and address <= self.advance_at and self.advance_at - address < bytes.len) {
                 self.renderer.frame_sequence += 1;
                 self.advance_at = 0;
                 self.advances += 1;
+            }
+            if (self.spill_at != 0 and address <= self.spill_at and self.spill_at - address < bytes.len) {
+                self.renderer.draw_upload_offset = 256 * 1024 * 1024 - 8;
+                self.spill_at = 0;
             }
             return Memory.read(self.guest, address, bytes);
         }
@@ -4993,6 +5079,9 @@ fn runSampledCacheBudgetCase(allocator: std.mem.Allocator, mode: enum { one_byte
     const rounds: usize = if (bounded_case) 12 else 3;
     for (0..rounds) |round| {
         const source: u32 = @intCast(0x20000 + (if (replace_contents) @as(usize, 0) else if (mode == .bounded_reuse_revision) round % 8 else round) * 0x200);
+        // Force a spill while the first texture of this batch is prepared.
+        // Both its ring bytes and earlier sampled revisions must survive.
+        if (mode == .replace_reuse and round == 1) context.spill_at = source + 0x100;
         guest.word(source, 0xff60_4020 + @as(u32, @intCast(round)));
         guest.word(source + 0x100, 0xffc0_a080 + @as(u32, @intCast(round)));
         const width: u16 = if (mode == .bounded_reuse_mismatch and round >= 8) 2 else 1;
@@ -5011,6 +5100,13 @@ fn runSampledCacheBudgetCase(allocator: std.mem.Allocator, mode: enum { one_byte
         const userdata = sampledImageDescriptorWords(source, width, 1) ++
             sampledImageDescriptorWords(source + 0x100, width, 1) ++ [_]u32{ 0, 0, 0, 0, @intCast(0x10000 + round * 0x100), 0, 32, 0 };
         for (userdata, 0..) |word, i| try state.writeRegister(.shader, compute.userDataBase() + @as(u32, @intCast(i)), word);
+        if (mode == .allocation_pressure and round == 2) {
+            // Advance the recovery deadline without sleeping. The allocation
+            // failure must have scheduled it, and a later allocation must grow
+            // the soft budget without discarding the protected descriptors.
+            try std.testing.expect(renderer.sampled_image_budget_recovery.next_recovery_ns != 0);
+            renderer.sampled_image_budget_recovery.next_recovery_ns = 1;
+        }
         if ((mode == .allocation_pressure and round == 1) or (mode == .allocation_pinned and round == 0)) {
             // Fail the second image after the first has been selected for this
             // dispatch. Only freeing an actual older backing ends pressure.
@@ -5027,6 +5123,10 @@ fn runSampledCacheBudgetCase(allocator: std.mem.Allocator, mode: enum { one_byte
             }
         }
         _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
+        if (mode == .allocation_pressure and round == 2) {
+            try std.testing.expect(renderer.sampled_image_cache_budget_bytes > 1024 * 1024);
+            try std.testing.expect(renderer.sampled_image_cache_budget_bytes <= renderer.sampled_image_cache_configured_budget_bytes);
+        }
         if (mode == .bounded_reuse_revision and round >= 8) {
             try std.testing.expect(source_epoch != 0);
             try std.testing.expectEqual(source_epoch, renderer.image_aliases.generationForRange(.{ .address = source, .size = 4 }));
@@ -5046,7 +5146,7 @@ fn runSampledCacheBudgetCase(allocator: std.mem.Allocator, mode: enum { one_byte
         }
         try std.testing.expectEqual(total, renderer.sampled_image_cache_bytes);
         try std.testing.expectEqual(total, renderer.sampled_image_device_bytes);
-        try std.testing.expect(renderer.pending_command_buffers.items.len != 0);
+        try std.testing.expect(renderer.recording_command_buffer != null or renderer.pending_command_buffers.items.len != 0);
         // Size both comparison cases from real allocation requirements: sixteen
         // resident images plus at most two retired images awaiting consumers.
         if (bounded_case and round == 0) renderer.sampled_image_cache_budget_bytes = total * 8;
@@ -5064,16 +5164,17 @@ fn runSampledCacheBudgetCase(allocator: std.mem.Allocator, mode: enum { one_byte
         }
     }
     try std.testing.expectEqual(rounds, context.advances);
-    try std.testing.expectEqual(@as(u64, if (mode == .allocation_pressure) 2 else if (mode == .allocation_pinned or replace_contents) 0 else if (bounded_case) 8 else 4), renderer.frame_profile.texture_evictions);
+    try std.testing.expectEqual(@as(u64, if (mode == .allocation_pressure) 2 else if (mode == .allocation_pinned or replace_contents or mode == .bounded_reuse_revision) 0 else if (bounded_case) 8 else 4), renderer.frame_profile.texture_evictions);
     if (pressure) try std.testing.expect(SampledAllocationFailure.failures != 0);
     // Updating texture contents below the budget never forced retirement waits
     // in the baseline, even when the old images still have queued consumers.
     if (replace_contents) try std.testing.expectEqual(@as(u64, 0), renderer.frame_profile.sampled_retire_wait_calls);
     if (deferred_retirement) try std.testing.expect(renderer.frame_profile.sampled_retire_wait_calls < renderer.frame_profile.texture_evictions);
     if (reuse) {
-        try std.testing.expectEqual(@as(u64, if (mode == .bounded_reuse_mismatch) 0 else 8), renderer.frame_profile.sampled_backing_reuses);
-        try std.testing.expectEqual(@as(u64, if (mode == .bounded_reuse_mismatch) 24 else 16), renderer.frame_profile.sampled_allocate_calls);
+        try std.testing.expectEqual(@as(u64, if (mode == .bounded_reuse_mismatch) 0 else if (mode == .replace_reuse) 4 else 8), renderer.frame_profile.sampled_backing_reuses);
+        try std.testing.expectEqual(@as(u64, if (mode == .bounded_reuse_mismatch) 24 else if (mode == .replace_reuse) 2 else 16), renderer.frame_profile.sampled_allocate_calls);
         try std.testing.expectEqual(@as(u64, if (mode == .bounded_reuse_mismatch) 8 else 0), renderer.frame_profile.sampled_retire_wait_calls);
+        if (mode == .replace_reuse) try std.testing.expect(renderer.frame_profile.draw_upload_spills != 0);
     }
     for (0..rounds) |round| {
         var output: [32]u8 = undefined;
@@ -5206,7 +5307,7 @@ fn runResidentMipChainProbe(allocator: std.mem.Allocator) !void {
         const guest = try allocator.create(Memory);
         defer allocator.destroy(guest);
         guest.* = .{};
-        var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true });
+        var renderer = try vulkan.Renderer.init(allocator, .{ .enable_validation = true, .enable_timeline_scheduler = true, .defer_small_storage_writes = true, .retain_clean_storage_buffers = true });
         defer renderer.deinit();
         var memory = guest.interface();
         memory.fingerprint = Memory.fingerprint;
@@ -5240,6 +5341,8 @@ fn runResidentMipChainProbe(allocator: std.mem.Allocator) !void {
         const texture = try gpu.TextureLayout.fromImage(try gpu.resources.decodeImageDescriptor(&chain));
         var colors = [_][4]f32{ .{ 0.25, 0.5, 0.75, 1 }, .{ 0.5, 0.75, 0.25, 1 }, .{ 0.75, 0.25, 0.5, 1 } };
         const frame = renderer.frame_sequence;
+        var expected_samples: [24][4]f32 = undefined;
+        var backing_images: [2]?u64 = @splat(null);
         for (0..2) |revision| {
             // Rewrite only mip 1 on the second pass, within the SAME frame.
             // A frame-number cache key would keep its old red component.
@@ -5260,36 +5363,45 @@ fn runResidentMipChainProbe(allocator: std.mem.Allocator) !void {
             const uploads = renderer.sampled_image_uploads;
             const published = try allocator.dupe(u8, guest.bytes[0x20000..][0..@intCast(texture.required_source_bytes)]);
             defer allocator.free(published);
-            var first_image: ?u64 = null;
             for (0..3) |lod| for (0..4) |variant| {
                 var image = chain;
                 const swap = variant % 2 != 0;
                 const srgb = variant >= 2;
                 if (swap) image[3] = (image[3] & ~@as(u32, 0xfff)) | 6 | (5 << 3) | (4 << 6) | (7 << 9);
                 const sampler = [_]u32{ if (srgb) 1 << 20 else 0, @as(u32, @intCast(lod * 256)) | (@as(u32, @intCast(lod * 256)) << 12), 0, 0 };
-                const userdata = image ++ sampler ++ [_]u32{ 0x10000, 16 << 16, 1, 0 };
+                const sample_index = revision * 12 + lod * 4 + variant;
+                const output_address: u32 = @intCast(0x10000 + sample_index * 256);
+                const userdata = image ++ sampler ++ [_]u32{ output_address, 16 << 16, 1, 0 };
                 try state.writeRegister(.shader, compute.programRegisterBase(), 2);
                 try state.writeRegister(.shader, 0x213, 16 << 1);
                 for (userdata, 0..) |word, i| try state.writeRegister(.shader, compute.userDataBase() + @as(u32, @intCast(i)), word);
                 _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
-                var output: [16]u8 = undefined;
-                try renderer.readbackGuestStorageBuffer(0x10000, &output);
                 for (0..4) |channel| {
                     var expected = colors[lod][if (swap and channel != 3) 2 - channel else channel];
                     if (srgb and channel != 3) expected = if (expected <= 0.04045) expected / 12.92 else std.math.pow(f32, (expected + 0.055) / 1.055, 2.4);
-                    const actual: f32 = @bitCast(std.mem.readInt(u32, output[channel * 4 ..][0..4], .little));
-                    std.testing.expectApproxEqAbs(expected, actual, 0.008) catch |err| {
-                        std.debug.print("mip chain mismatch extent={d} revision={d} lod={d} variant={d} channel={d}\n", .{ extent, revision, lod, variant, channel });
-                        return err;
-                    };
+                    expected_samples[sample_index][channel] = expected;
                 }
                 try std.testing.expectEqual(uploads, renderer.sampled_image_uploads);
-                const handle = renderer.assembled_mip_chains.items[0].image.handle;
-                if (first_image) |old| try std.testing.expectEqual(old, handle) else first_image = handle;
+                const format: u32 = if (srgb) vulkan.api.format_r8g8b8a8_srgb else vulkan.api.format_r8g8b8a8_unorm;
+                const handle = for (renderer.assembled_mip_chains.items) |cached| {
+                    if (cached.image_format == format) break cached.image.handle;
+                } else return error.ExpectedResidentMipChain;
+                const original = &backing_images[@intFromBool(srgb)];
+                if (original.*) |old| try std.testing.expectEqual(old, handle) else original.* = handle;
             };
             try std.testing.expectEqual(@as(usize, 2), renderer.assembled_mip_chains.items.len);
             try std.testing.expectEqualSlices(u8, published, guest.bytes[0x20000..][0..published.len]);
         }
+        // Read only after both revisions have queued all their consumers.
+        // Reusing the backing must preserve the first revision's samples.
+        for (expected_samples, 0..) |expected, index| {
+            var output: [16]u8 = undefined;
+            try std.testing.expect(backend.vtable.read(backend.context, 0x10000 + index * 256, &output));
+            for (expected, 0..) |value, channel| try std.testing.expectApproxEqAbs(value, @as(f32, @bitCast(std.mem.readInt(u32, output[channel * 4 ..][0..4], .little))), 0.008);
+        }
+        try std.testing.expectEqual(@as(u64, 2), renderer.frame_profile.mip_chain_creates);
+        try std.testing.expectEqual(@as(u64, 2), renderer.frame_profile.mip_chain_reuses);
+        try std.testing.expectEqual(@as(u64, 8), renderer.frame_profile.mip_chain_level_copies);
         try std.testing.expectEqual(frame, renderer.frame_sequence);
         // CPU replacement of one packed-tail mip must not discard the newer
         // GPU output of its neighbours. Padding belongs to the guest too.
@@ -5310,6 +5422,24 @@ fn runResidentMipChainProbe(allocator: std.mem.Allocator) !void {
             colors[1] = @splat(64.0 / 255.0);
         }
         guest.changed();
+        if (tracked) {
+            // Read the mixed CPU/GPU pyramid before publishing it. Only the
+            // edited mip may upload; neighbours must keep their GPU texels.
+            const readbacks = renderer.frame_profile.storage_image_readbacks;
+            const uploads = renderer.sampled_image_uploads;
+            for (0..3) |lod| {
+                const lod_fixed: u32 = @intCast(lod * 256);
+                const userdata = chain ++ [_]u32{ 0, lod_fixed | (lod_fixed << 12), 0, 0, 0x10000, 16 << 16, 1, 0 };
+                for (userdata, 0..) |word, i| try state.writeRegister(.shader, compute.userDataBase() + @as(u32, @intCast(i)), word);
+                _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
+                var output: [16]u8 = undefined;
+                try renderer.readbackGuestStorageBuffer(0x10000, &output);
+                for (0..4) |channel| try std.testing.expectApproxEqAbs(colors[lod][channel], @as(f32, @bitCast(std.mem.readInt(u32, output[channel * 4 ..][0..4], .little))), 0.004);
+            }
+            try std.testing.expectEqual(readbacks, renderer.frame_profile.storage_image_readbacks);
+            try std.testing.expectEqual(uploads, renderer.sampled_image_uploads);
+            try std.testing.expectEqual(@as(u8, 0x5b), allocation[padding]);
+        }
         const before_writes = guest.write_calls;
         try renderer.probeStorageMipPublication(0x20000);
         try std.testing.expectEqual(before_writes + 1, guest.write_calls);
@@ -5493,6 +5623,25 @@ fn runDepth32StorageProbe(allocator: std.mem.Allocator, format: u32) !void {
     const result = try renderer.probeDepthStencilValues();
     try std.testing.expectEqual(@as(f32, 0.5), result.depth);
     try std.testing.expectEqual(@as(u8, 0x23), result.stencil);
+    // A color snapshot of stencil survives a depth-only raster write (and
+    // vice versa). Read-only and empty draws must preserve both snapshots.
+    var center_load = load;
+    center_load[0] = vop1(1, 0, 144);
+    center_load[1] = vop1(1, 1, 144);
+    for (center_load, 0..) |word, index| guest.word(0x600 + index * 4, word);
+    try state.writeRegister(.shader, compute.programRegisterBase(), 6);
+    try renderer.probeDepthStencilClear(0.25, 0x48);
+    _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
+    for (0..4) |mode| {
+        try renderer.probeDepthPlaneDraw(mode == 2, mode == 0, mode == 3);
+        const copies = renderer.frame_profile.depth_storage_copies;
+        _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
+        try std.testing.expectEqual(copies + @as(u64, if (mode == 1 or mode == 2) 1 else 0), renderer.frame_profile.depth_storage_copies);
+        var bytes: [8]u8 = undefined;
+        try renderer.readbackGuestStorageBuffer(0x8000, &bytes);
+        try std.testing.expectEqual(@as(u32, @bitCast(@as(f32, if (mode == 0) 0.25 else 0.5))), std.mem.readInt(u32, bytes[0..4], .little));
+        try std.testing.expectEqual(@as(u32, if (mode < 2) 0x48 else 0x35), std.mem.readInt(u32, bytes[4..8], .little));
+    }
     try renderer.probeIndependentDepthStencilPlanes();
     std.debug.print("depth storage passed: D32 color format={d}/S8 reads, repeated clears and compute writes returned to the attachment\n", .{format});
 }
@@ -5807,6 +5956,41 @@ fn runResetDepthExtentCase(allocator: std.mem.Allocator, fragment_depth: bool, n
     }
 }
 
+fn runStorageColorInitializationProbe(allocator: std.mem.Allocator) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true });
+    defer renderer.deinit();
+    const guest = try allocator.create(SizedGuestMemory(1024 * 1024));
+    defer allocator.destroy(guest);
+    guest.* = .{};
+    _ = renderer.dcbBackend(guest.interface());
+    for ([_]gpu.resources.TileMode{ .linear, .standard_4kb, .render_target }, 0..) |mode, index| {
+        var color = std.mem.zeroes(gpu.resources.ColorTarget);
+        color.address = 0x10000 + index * 0x40000;
+        color.resource_type = 1;
+        color.width = 37;
+        color.height = 23;
+        color.format = 10;
+        color.tile_mode = mode;
+        var descriptor = std.mem.zeroInit(gpu.ImageDescriptor, .{ .image_type = .color_2d });
+        descriptor.address = color.address;
+        descriptor.width = color.width;
+        descriptor.height = color.height;
+        descriptor.depth_or_layers = 1;
+        descriptor.pitch = color.width;
+        descriptor.tile_mode = mode;
+        descriptor.unified_format = 56;
+        descriptor.extended = true;
+        descriptor.dst_select = .{ 4, 5, 6, 7 };
+        var pixels: [37 * 23 * 4]u8 = undefined;
+        for (&pixels, 0..) |*byte, offset| byte.* = @truncate(offset * 37 + index * 13);
+        // Guest bytes remain zero while the compute image owns this pattern.
+        // The probe verifies native pixels and zero upload/readback traffic
+        // during the ownership hand-off, then materializes the final result.
+        try renderer.probeStorageVolumeInitialization(descriptor, color, &pixels);
+    }
+    std.debug.print("storage-to-color initialization passed: exact linear, 4 KiB and R_X views, odd extents and native pixel readback\n", .{});
+}
+
 fn runStorageImageCpuReuseProbe(allocator: std.mem.Allocator) !void {
     for ([_]bool{ false, true }) |fingerprint| try runStorageImageCpuReuseCase(allocator, fingerprint, false);
     try runStorageImageCpuReuseCase(allocator, true, true);
@@ -5943,6 +6127,93 @@ fn runStorageImageCpuClearCase(allocator: std.mem.Allocator) !void {
         const offset: usize = @intCast(try subresource.sourceByteOffset(@intCast(x), @intCast(y), 0, 0));
         try std.testing.expectEqual(@as(u32, 0x40302010), std.mem.readInt(u32, guest.bytes[0x8000 + offset ..][0..4], .little));
     };
+}
+
+fn runStorageFormatAliasProbe(allocator: std.mem.Allocator) !void {
+    const Case = struct { write_format: u32, read_format: u32, value: u32, expected: u32 };
+    const cases = [_]Case{
+        .{ .write_format = 20, .read_format = 36, .value = 0x781e03c0, .expected = 0x3f800000 },
+        .{ .write_format = 36, .read_format = 20, .value = 0x3f800000, .expected = 0x781e03c0 },
+        .{ .write_format = 22, .read_format = 20, .value = 0x3f000000, .expected = 0x3f000000 },
+        .{ .write_format = 20, .read_format = 22, .value = 0x3f000000, .expected = 0x3f000000 },
+        .{ .write_format = 1, .read_format = 5, .value = 0x3f800000, .expected = 255 },
+        .{ .write_format = 5, .read_format = 1, .value = 255, .expected = 0x3f800000 },
+    };
+    for (cases) |case| {
+        var renderer = try vulkan.Renderer.init(allocator, .{ .enable_validation = true, .enable_timeline_scheduler = true, .defer_small_storage_writes = true, .retain_clean_storage_buffers = true });
+        defer renderer.deinit();
+        var guest = GuestMemory{};
+        guest.watch_generation = 1;
+        var memory = guest.interface();
+        memory.track_gpu_read = GuestMemory.track;
+        memory.gpu_generation = GuestMemory.generation;
+        memory.fingerprint = GuestMemory.fingerprint;
+        const backend = renderer.dcbBackend(memory);
+        const store = [_]u32{
+            vop1(1, 0, 128), vop1(1, 1, 128),
+            vop1(1, 2, 8),   vop1(1, 3, 8),
+            vop1(1, 4, 8),   vop1(1, 5, 8),
+            0xf020_0f08,     0x0000_0200,
+            0xbf81_0000,
+        };
+        const load = [_]u32{
+            vop1(1, 0, 128), vop1(1, 1, 128),
+            0xf000_0108,     0x0000_0200,
+            0xe070_0000,     0x8002_0200,
+            0xbf81_0000,
+        };
+        const sample = [_]u32{
+            vop1(1, 0, 255), 0x3f000000,  vop1(1, 1, 255), 0x3f000000,
+            0xf09c_010a,     0x0040_0200, 1,               0xe070_0000,
+            0x8003_0200,     0xbf81_0000,
+        };
+        for (store, 0..) |word, i| guest.word(0x100 + i * 4, word);
+        for (load, 0..) |word, i| guest.word(0x200 + i * 4, word);
+        for (sample, 0..) |word, i| guest.word(0x300 + i * 4, word);
+        var writer = imageDescriptorWords(0x4000, 1, 1);
+        writer[1] = (writer[1] & ~@as(u32, 0x1ff00000)) | (case.write_format << 20);
+        var reader = writer;
+        reader[1] = (reader[1] & ~@as(u32, 0x1ff00000)) | (case.read_format << 20);
+        var state = gpu.State{};
+        const compute = gpu.resources.ShaderStage.compute;
+        try state.writeRegister(.shader, compute.programRegisterBase() + 1, 0);
+        try state.writeRegister(.shader, 0x213, 16 << 1);
+        for (0..3) |phase| {
+            if (phase == 0) {
+                try state.writeRegister(.shader, compute.programRegisterBase(), 1);
+                for (writer ++ [_]u32{case.value}, 0..) |word, i| try state.writeRegister(.shader, compute.userDataBase() + @as(u32, @intCast(i)), word);
+                _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
+            } else if (phase == 1) {
+                try renderer.flushPendingGuestWrites();
+            } else {
+                @memset(guest.bytes[0x4000..0x4100], 0);
+                guest.changed();
+            }
+            const readbacks = renderer.frame_profile.storage_image_readbacks;
+            const uploads = renderer.frame_profile.texture_upload_bytes;
+            const sampled_uploads = renderer.sampled_image_uploads;
+            for ([_]u32{ 2, 3 }) |program| {
+                try state.writeRegister(.shader, compute.programRegisterBase(), program);
+                var userdata: [16]u32 = @splat(0);
+                @memcpy(userdata[0..8], &reader);
+                const output_sgpr: usize = if (program == 2) 8 else 12;
+                @memcpy(userdata[output_sgpr..][0..4], &[_]u32{ 0x8000, 4 << 16, 1, 0 });
+                for (userdata, 0..) |word, i| try state.writeRegister(.shader, compute.userDataBase() + @as(u32, @intCast(i)), word);
+                _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
+                var output: [4]u8 = undefined;
+                try std.testing.expect(backend.vtable.read(backend.context, 0x8000, &output));
+                std.testing.expectEqual(if (phase == 2) @as(u32, 0) else case.expected, std.mem.readInt(u32, &output, .little)) catch |err| {
+                    std.debug.print("storage alias mismatch {d}->{d} phase={d} program={d}\n", .{ case.write_format, case.read_format, phase, program });
+                    return err;
+                };
+            }
+            try std.testing.expectEqual(@as(usize, 1), renderer.storage_image_cache.items.len);
+            try std.testing.expectEqual(readbacks, renderer.frame_profile.storage_image_readbacks);
+            try std.testing.expectEqual(sampled_uploads, renderer.sampled_image_uploads);
+            if (phase != 2) try std.testing.expectEqual(uploads, renderer.frame_profile.texture_upload_bytes);
+        }
+    }
+    std.debug.print("storage format aliases passed: packed/float/integer views, GPU-only handoff, published contents and CPU replacement\n", .{});
 }
 
 fn runStorageImageReuseProbe(allocator: std.mem.Allocator) !void {
@@ -7272,6 +7543,245 @@ fn runQueuedBufferReuseProbe(allocator: std.mem.Allocator, use_waits: bool, reta
     std.debug.print("compute module lifetime passed: cached/uncached translations, eviction, pipeline reuse and changing input bytes\n", .{});
 }
 
+fn runPartialStorageUploadProbe(allocator: std.mem.Allocator, host_backing: bool) !void {
+    const source = 0x10000;
+    const size = 4 * 1024 * 1024;
+    const chunk = 256 * 1024;
+    const Memory = struct {
+        base: SizedGuestMemory(source + size) = .{},
+        generations: [16]u64 = @splat(1),
+        armed: bool = false,
+        race: bool = false,
+
+        fn word(self: *@This(), address: usize, value: u32) void {
+            self.base.word(address, value);
+            if (address >= source) {
+                self.generations[(address - source) / chunk] += 1;
+                self.armed = false;
+            }
+        }
+        fn read(raw: ?*anyopaque, address: u64, bytes: []u8) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            const result = SizedGuestMemory(source + size).read(&self.base, address, bytes);
+            if (self.race and address >= source and bytes.len < size) {
+                self.race = false;
+                self.word(source + 7 * chunk, 0xdead_beef);
+            }
+            return result;
+        }
+        fn write(raw: ?*anyopaque, address: u64, bytes: []const u8) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (!SizedGuestMemory(source + size).write(&self.base, address, bytes)) return false;
+            if (bytes.len != 0 and address + bytes.len > source) {
+                const first = (@max(address, source) - source) / chunk;
+                const last = (address + bytes.len - 1 - source) / chunk;
+                for (self.generations[first .. last + 1]) |*value| value.* += 1;
+                self.armed = false;
+            }
+            return true;
+        }
+        fn fingerprint(raw: ?*anyopaque, address: u64, bytes: usize) ?u64 {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            // Keep the output descriptors resident as well. Untracked inputs
+            // otherwise bind transient draw-upload slices, not their backing.
+            if (address >= source) return null;
+            return SizedGuestMemory(source + size).fingerprint(&self.base, address, bytes);
+        }
+        fn track(raw: ?*anyopaque, address: u64, bytes: usize) u64 {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.armed = true;
+            return generation(raw, address, bytes);
+        }
+        fn generation(raw: ?*anyopaque, address: u64, bytes: usize) u64 {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (address < source or address + bytes > source + size) return 0;
+            if (!self.armed or bytes == 0) return 0;
+            var hash: u64 = 0xcbf29ce484222325;
+            const first = (address - source) / chunk;
+            const last = (address - source + bytes - 1) / chunk;
+            for (self.generations[first .. last + 1]) |value| hash = (hash ^ value) *% 0x100000001b3;
+            return hash;
+        }
+    };
+    const guest = try allocator.create(Memory);
+    defer allocator.destroy(guest);
+    guest.* = .{};
+    @memset(guest.base.bytes[source..], 0x5a);
+    var renderer = try vulkan.Renderer.init(allocator, .{
+        .enable_timeline_scheduler = true,
+        .retain_clean_storage_buffers = true,
+        .device_storage_budget_bytes = if (host_backing) 0 else 8 * 1024 * 1024,
+        .queued_host_storage_uploads = true,
+    });
+    defer renderer.deinit();
+    _ = renderer.dcbBackend(.{ .context = guest, .read = Memory.read, .write = Memory.write, .fingerprint = Memory.fingerprint, .track_gpu_read = Memory.track, .gpu_generation = Memory.generation });
+    renderer.storage_fingerprint_min_bytes = 16;
+    const code = [_]u32{ 0xe030_0000, 0x8002_0000, 0xe070_0000, 0x8003_0000, 0xbf81_0000 };
+    for (code, 0..) |word, i| guest.word(0x100 + i * 4, word);
+    var analysis = try gpu.shader_analysis.decode(allocator, .{ .context = guest, .read_fn = Memory.read }, 0x100, 16);
+    defer analysis.deinit(allocator);
+    var module = try analysis.translateSpirv(allocator, .{
+        .stage = .compute,
+        .storage_buffers = &.{
+            .{ .resource_sgpr = 8, .descriptor_index = 0, .extent_bytes = size },
+            .{ .resource_sgpr = 12, .descriptor_index = 1, .extent_bytes = 16 },
+        },
+    });
+    defer module.deinit(allocator);
+    for (0..8) |i| _ = try renderer.stageGuestStorageBufferAt(@intCast(i + 2), 0x2000 + i * 0x100, 16);
+    const backing = try renderer.stageGuestStorageBufferAt(0, source, size);
+    renderer.draw_uploads_enabled = true;
+    for (0..2) |pass| {
+        renderer.draw_batch_active = true;
+        const submitted = renderer.submitted_tick;
+        const uploaded = renderer.frame_profile.storage_upload_bytes;
+        for (0..8) |i| {
+            renderer.current_descriptor_slot = i;
+            renderer.descriptor_set = renderer.descriptor_sets[i];
+            @memset(&renderer.active_storage_buffers, 0);
+            if (pass == 1 and i == 4) renderer.draw_upload_offset = 256 * 1024 * 1024 - 8;
+            guest.word(source, @intCast(0x12340000 + pass * 16 + i));
+            guest.word(source + size - 4, @intCast(0x98760000 + pass * 16 + i));
+            const staged = try renderer.stageGuestStorageBufferAt(0, source, size);
+            try std.testing.expectEqual(backing.buffer, staged.buffer);
+            _ = try renderer.stageGuestStorageBufferAt(1, 0x2000 + i * 0x100, 16);
+            _ = try renderer.dispatchSpirv(module.words, .{ 1, 1, 1 });
+            try std.testing.expectEqual(submitted, renderer.submitted_tick);
+        }
+        try std.testing.expect(renderer.frame_profile.storage_upload_bytes - uploaded < 5 * 1024 * 1024);
+        for (0..8) |i| {
+            var result: [16]u8 = undefined;
+            try renderer.readbackGuestStorageBuffer(0x2000 + i * 0x100, &result);
+            try std.testing.expectEqual(@as(u32, @intCast(0x12340000 + pass * 16 + i)), std.mem.readInt(u32, result[0..4], .little));
+        }
+    }
+    try std.testing.expectEqual(@as(u64, 16), renderer.frame_profile.partial_storage_uploads);
+    const result = try allocator.alloc(u8, size);
+    defer allocator.free(result);
+    try renderer.readbackGuestStorageBuffer(source, result);
+    try std.testing.expectEqualSlices(u8, guest.base.bytes[source..], result);
+    // Rearm a full baseline after readback, then mutate a previously clean
+    // chunk during the next partial copy. The fallback must include that word.
+    _ = try renderer.stageGuestStorageBufferAt(0, source, size);
+    guest.word(source, 0xabcd1234);
+    guest.race = true;
+    const partial_before = renderer.frame_profile.partial_storage_uploads;
+    _ = try renderer.stageGuestStorageBufferAt(0, source, size);
+    try std.testing.expect(!guest.race);
+    try std.testing.expectEqual(partial_before, renderer.frame_profile.partial_storage_uploads);
+    try renderer.readbackGuestStorageBuffer(source, result);
+    try std.testing.expectEqualSlices(u8, guest.base.bytes[source..], result);
+    // Test actual GPU writes plus a simultaneous CPU edit in a clean chunk.
+    _ = try renderer.stageGuestStorageBufferAt(0, source, size);
+    try renderer.probeSparseUploadPublication(source, size);
+    try renderer.readbackGuestStorageBuffer(source, result);
+    try std.testing.expectEqualSlices(u8, guest.base.bytes[source..], result);
+    renderer.draw_batch_active = false;
+    renderer.current_descriptor_slot = null;
+    std.debug.print("partial storage uploads passed (host_backing={}): 16 ordered snapshots, preserved gaps/tail, ring spill and racing-write fallback\n", .{host_backing});
+}
+
+fn runTransientStorageProbe(allocator: std.mem.Allocator, timeline: bool) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{
+        .enable_validation = true,
+        .enable_timeline_scheduler = timeline,
+        .retain_clean_storage_buffers = true,
+        .defer_small_storage_writes = true,
+    });
+    defer renderer.deinit();
+    renderer.reuse_graphics_resources = true;
+    var guest = GuestMemory{ .watch_generation = 1 };
+    var memory = guest.interface();
+    memory.track_gpu_read = GuestMemory.track;
+    memory.gpu_generation = GuestMemory.generation;
+    _ = renderer.dcbBackend(memory);
+    const source = 0x1007;
+    const code = [_]u32{ 0xe030_0000, 0x8002_0000, 0xe070_0000, 0x8003_0000, 0xbf81_0000 };
+    for (code, 0..) |word, i| guest.word(0x100 + i * 4, word);
+    var analysis = try gpu.shader_analysis.decode(allocator, .{ .context = &guest, .read_fn = GuestMemory.read }, 0x100, 16);
+    defer analysis.deinit(allocator);
+    var module = try analysis.translateSpirv(allocator, .{
+        .stage = .compute,
+        .storage_buffers = &.{
+            .{ .resource_sgpr = 8, .descriptor_index = 0, .extent_bytes = 16 },
+            .{ .resource_sgpr = 12, .descriptor_index = 1, .extent_bytes = 16 },
+        },
+    });
+    defer module.deinit(allocator);
+    const writer_code = [_]u32{ 0xe030_0000, 0x8002_0000, 0xe070_0004, 0x8003_0000, 0xbf81_0000 };
+    for (writer_code, 0..) |word, i| guest.word(0x200 + i * 4, word);
+    var writer_analysis = try gpu.shader_analysis.decode(allocator, .{ .context = &guest, .read_fn = GuestMemory.read }, 0x200, 16);
+    defer writer_analysis.deinit(allocator);
+    var writer_module = try writer_analysis.translateSpirv(allocator, .{
+        .stage = .compute,
+        .storage_buffers = &.{
+            .{ .resource_sgpr = 8, .descriptor_index = 0, .extent_bytes = 16 },
+            .{ .resource_sgpr = 12, .descriptor_index = 1, .extent_bytes = 32 },
+        },
+    });
+    defer writer_module.deinit(allocator);
+    // Cache the old index data before the GPU overwrites an interior view.
+    try renderer.probeVertexIndexBounds(.{ .index_address = source, .index_count = 1, .index_uint32 = true }, .{ 0, 0 });
+    // A GPU-produced input must be published before taking the first snapshot.
+    guest.word(0x1800, 0x98760000);
+    _ = try renderer.stageGuestStorageBufferAt(0, 0x1800, 16);
+    _ = try renderer.stageGuestStorageBufferAt(1, source - 4, 32);
+    _ = try renderer.dispatchSpirv(writer_module.words, .{ 1, 1, 1 });
+    // The raw SPIR-V probe entry point has no guest write metadata. Supply
+    // the same conservative dirty range the normal RDNA2 dispatch records.
+    for (renderer.guest_buffers.items) |*entry| if (entry.guest_address == source - 4) {
+        entry.gpu_dirty = true;
+        entry.pending_writes = .{ .whole = true };
+        entry.last_gpu_use = renderer.submitted_tick;
+    };
+    for (0..8) |i| _ = try renderer.stageGuestStorageBufferAt(@intCast(i + 2), 0x2000 + i * 0x100, 16);
+    const entries = renderer.guest_buffers.items.len;
+    renderer.draw_uploads_enabled = true;
+    renderer.draw_batch_active = true;
+    for (0..8) |i| {
+        renderer.current_descriptor_slot = i;
+        renderer.descriptor_set = renderer.descriptor_sets[i];
+        @memset(&renderer.active_storage_buffers, 0);
+        if (i != 0) guest.word(source, @intCast(0x98760000 + i));
+        if (i == 4) renderer.draw_upload_offset = 256 * 1024 * 1024 - 8;
+        try std.testing.expect(try renderer.tryStageTransientStorageBuffer(0, source, 16));
+        try std.testing.expect(renderer.active_storage_cache_indices[0] == null);
+        const uploaded_hash = renderer.active_storage_source_hashes[0] orelse return error.MissingSnapshotHash;
+        try std.testing.expectEqual(gpu.parallel_copy.fingerprint(guest.bytes[source..][0..16]), uploaded_hash);
+        // A later guest write must not replace the proof of the queued bytes.
+        const saved_word = std.mem.readInt(u32, guest.bytes[source..][0..4], .little);
+        guest.word(source, saved_word ^ 0x101);
+        try std.testing.expect(gpu.parallel_copy.fingerprint(guest.bytes[source..][0..16]) != uploaded_hash);
+        try std.testing.expectEqual(uploaded_hash, renderer.active_storage_source_hashes[0].?);
+        guest.word(source, saved_word);
+        _ = try renderer.stageGuestStorageBufferAt(1, 0x2000 + i * 0x100, 16);
+        _ = try renderer.dispatchSpirv(module.words, .{ 1, 1, 1 });
+        if (i == 0) {
+            try renderer.probeVertexIndexBounds(.{ .index_address = source, .index_count = 1, .index_uint32 = true }, .{ 0x98760000, 0x98760000 });
+            const hits = renderer.frame_profile.index_bounds_hits;
+            try renderer.probeVertexIndexBounds(.{ .index_address = source, .index_count = 1, .index_uint32 = true, .vertex_offset = -9 }, .{ 0x98760000 - 9, 0x98760000 - 9 });
+            try std.testing.expectEqual(hits + 1, renderer.frame_profile.index_bounds_hits);
+            guest.word(source, 17);
+            try renderer.probeVertexIndexBounds(.{ .index_address = source, .index_count = 1, .index_uint32 = true }, .{ 17, 17 });
+            try std.testing.expectEqual(hits + 1, renderer.frame_profile.index_bounds_hits);
+        }
+    }
+    try std.testing.expectEqual(entries, renderer.guest_buffers.items.len);
+    try std.testing.expect(renderer.frame_profile.draw_upload_spills != 0);
+    try std.testing.expectEqual(@as(u64, 8), renderer.frame_profile.transient_buffer_uploads);
+    for (0..8) |i| {
+        var result: [16]u8 = undefined;
+        try renderer.readbackGuestStorageBuffer(0x2000 + i * 0x100, &result);
+        try std.testing.expectEqual(@as(u32, @intCast(0x98760000 + i)), std.mem.readInt(u32, result[0..4], .little));
+    }
+    try std.testing.expect(!try renderer.tryStageTransientStorageBuffer(0, source, 4097));
+    renderer.current_descriptor_slot = null;
+    try std.testing.expect(!try renderer.tryStageTransientStorageBuffer(0, source, 16));
+    renderer.draw_batch_active = false;
+    renderer.descriptor_set = renderer.descriptor_sets[0];
+    std.debug.print("transient storage passed (timeline={any}): GPU input, unaligned address, eight independent queued reads, ring spill, no persistent allocations\n", .{timeline});
+}
+
 fn runQueuedDeviceUploadProbe(allocator: std.mem.Allocator, fingerprint: bool, draw_uploads: bool, large: bool, host_backing: bool) !void {
     var renderer = try vulkan.Renderer.init(allocator, .{
         .enable_timeline_scheduler = true,
@@ -7910,7 +8420,16 @@ fn runGdsOrderedCountWave32(allocator: std.mem.Allocator) !void {
 }
 
 fn runGdsResidentProbe(allocator: std.mem.Allocator) !void {
-    var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true });
+    const previous = @atomicLoad(bool, &vulkan.backend.native_gds_dma, .monotonic);
+    defer @atomicStore(bool, &vulkan.backend.native_gds_dma, previous, .monotonic);
+    for ([_]bool{ false, true }) |native| {
+        @atomicStore(bool, &vulkan.backend.native_gds_dma, native, .monotonic);
+        try runGdsResidentMode(allocator, native);
+    }
+}
+
+fn runGdsResidentMode(allocator: std.mem.Allocator, native: bool) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true, .defer_internal_releases = true });
     defer renderer.deinit();
     var guest = GuestMemory{};
     const backend = renderer.dcbBackend(guest.interface());
@@ -7932,7 +8451,8 @@ fn runGdsResidentProbe(allocator: std.mem.Allocator) !void {
     // workgroup updates the same counter. No CPU reads between dispatches.
     for (0..520) |index| {
         _ = try renderer.dispatchRdna2State(&state, .{ 64, 1, 1 }, .{ 3, 1, 1 });
-        if (index == 9) try std.testing.expect(renderer.pending_command_buffers.items.len >= 10);
+        // Open command batching can hold all ten dispatches in one buffer.
+        if (index == 9) try std.testing.expect(renderer.recording_command_buffer != null or renderer.pending_command_buffers.items.len != 0);
     }
     try std.testing.expect(renderer.gds_gpu_dirty);
     try std.testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, renderer.gds_storage.items[0x108..][0..4], .little));
@@ -7959,7 +8479,20 @@ fn runGdsResidentProbe(allocator: std.mem.Allocator) !void {
     partial.destination = 1;
     partial.destination_address = 0x10c;
     partial.byte_count = 4;
+    var unrelated = std.mem.zeroes(gpu.state.ReleaseMem);
+    unrelated.address = 0x1a000;
+    unrelated.data_selection = 1;
+    unrelated.data = 0xaabbccdd;
+    try std.testing.expect(backend.vtable.release.?(backend.context, unrelated));
+    const before_fill = renderer.submitted_tick;
     try std.testing.expect(backend.vtable.dma_data.?(backend.context, partial));
+    if (native) {
+        try std.testing.expectEqual(before_fill, renderer.submitted_tick);
+        try std.testing.expectEqual(@as(u64, 1), renderer.gds_dma_fills);
+        try std.testing.expect(renderer.gds_gpu_dirty and !renderer.gds_host_dirty);
+        try std.testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, guest.bytes[0x1a000..][0..4], .little));
+        try std.testing.expect(renderer.deferred_internal_release_count != 0);
+    }
     try state.writeRegister(.shader, compute.userDataBase() + 1, 3);
     _ = try renderer.dispatchRdna2State(&state, .{ 64, 1, 1 }, .{ 3, 1, 1 });
     try std.testing.expect(backend.vtable.dma_data.?(backend.context, dma));
@@ -7978,7 +8511,26 @@ fn runGdsResidentProbe(allocator: std.mem.Allocator) !void {
     _ = try renderer.dispatchRdna2State(&state, .{ 64, 1, 1 }, .{ 3, 1, 1 });
     try std.testing.expect(!renderer.gds_gpu_dirty);
     try std.testing.expectEqual(@as(u32, 37), std.mem.readInt(u32, (try renderer.readbackGdsStorage())[0x108..][0..4], .little));
-    std.debug.print("resident GDS passed: 520 queued producers, descriptor reuse, DMA reads, partial CPU writes, resumed GPU atomics and synchronous mode\n", .{});
+    // Byte-granular packets retain the host path and preserve adjacent bytes.
+    partial.source = 2;
+    partial.source_address = 0x12121212;
+    partial.destination_address = 0x10d;
+    partial.byte_count = 2;
+    try std.testing.expect(backend.vtable.dma_data.?(backend.context, partial));
+    try std.testing.expect(backend.vtable.dma_data.?(backend.context, dma));
+    try std.testing.expectEqual(@as(u32, 0x00121207), std.mem.readInt(u32, guest.bytes[0x18004..][0..4], .little));
+    // A following GPU fill must upload this newer CPU shadow first.
+    partial.destination_address = 0x110;
+    partial.byte_count = 8;
+    try std.testing.expect(backend.vtable.dma_data.?(backend.context, partial));
+    const final_gds = try renderer.readbackGdsStorage();
+    try std.testing.expectEqual(@as(u32, 37), std.mem.readInt(u32, final_gds[0x108..][0..4], .little));
+    try std.testing.expectEqual(@as(u32, 0x00121207), std.mem.readInt(u32, final_gds[0x10c..][0..4], .little));
+    try std.testing.expectEqual(@as(u32, 0x12121212), std.mem.readInt(u32, final_gds[0x110..][0..4], .little));
+    try std.testing.expectEqual(@as(u32, 0x12121212), std.mem.readInt(u32, final_gds[0x114..][0..4], .little));
+    try std.testing.expect(backend.vtable.drain_releases.?(backend.context));
+    try std.testing.expectEqual(@as(u32, 0xaabbccdd), std.mem.readInt(u32, guest.bytes[0x1a000..][0..4], .little));
+    std.debug.print("resident GDS passed (native DMA={}): 520 queued producers, partial fills, unrelated release ordering, unaligned writes and resumed atomics\n", .{native});
 }
 
 fn runGdsMemoryProbe(allocator: std.mem.Allocator) !void {
@@ -12424,21 +12976,24 @@ fn runQueuedDetileProbe(allocator: std.mem.Allocator) !void {
     @memcpy(userdata[8..12], &[_]u32{ 0x10000, 32 << 16, count, 0 });
     @memcpy(userdata[12..16], &[_]u32{ 0x20000, 4 << 16, count + 1, 0 });
     for (userdata, 0..) |word, index| try state.writeRegister(.shader, compute.userDataBase() + @as(u32, @intCast(index)), word);
-    for (0..12) |round| {
+    for (0..18) |round| {
         // Compare both shaders with host/device input and direct/CPU outputs.
+        const single_level = round >= 12;
+        const mode: gpu.resources.TileMode = if (single_level) (if (round % 2 == 0) .render_target else .depth) else .standard_4kb;
+        const last_level: u32 = if (single_level) 0 else 3;
         renderer.specialize_detile = round >= 6;
         renderer.device_detile_sources = round % 6 >= 3;
         renderer.direct_detile_uploads = round % 3 != 2;
-        const base_level: u32 = if (round % 3 == 1) 1 else 0;
+        const base_level: u32 = if (!single_level and round % 3 == 1) 1 else 0;
         for (0..count) |index| {
             const address: u32 = @intCast(textures + index * texture_stride);
             var image = sampledImageDescriptorWords(address, 256, 256);
-            image[3] |= (base_level << 12) | (3 << 16) | (@as(u32, @intFromEnum(gpu.resources.TileMode.standard_4kb)) << 20);
-            image[5] = 3 << 4;
+            image[3] |= (base_level << 12) | (last_level << 16) | (@as(u32, @intFromEnum(mode)) << 20);
+            image[5] = last_level << 4;
             for (image, 0..) |word, component| guest.word(0x10000 + index * 32 + component * 4, word);
             const texture = try gpu.TextureLayout.fromImage(try gpu.resources.decodeImageDescriptor(&image));
             try std.testing.expect(texture.required_source_bytes <= texture_stride);
-            for (0..4) |level| {
+            for (0..last_level + 1) |level| {
                 const view = try texture.subresource(@intCast(level), 0, 1);
                 const value: u32 = @intCast(1 + index + level * 40 + (round % 6) * 7);
                 for (0..view.height) |y| for (0..view.width) |x| {
@@ -12465,7 +13020,7 @@ fn runQueuedDetileProbe(allocator: std.mem.Allocator) !void {
         }
         try std.testing.expectEqual(before + @as(u64, if (round % 3 == 2) 0 else count), renderer.direct_detile_upload_count);
     }
-    std.debug.print("queued detile uploads passed: 70 distinct textures, descriptor reuse, four mip levels, rebased views, updates, OOB and CPU-path agreement\n", .{});
+    std.debug.print("queued detile uploads passed: 70 distinct textures, descriptor reuse, four mip levels, rebased views, single-level R_X/Z_X, updates, OOB and CPU-path agreement\n", .{});
 }
 
 fn runIndirectImageProbe(allocator: std.mem.Allocator) !void {
@@ -13320,6 +13875,14 @@ pub fn main(init: std.process.Init) !void {
         try runSaveExecProbe(allocator);
         return;
     }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--unobserved-vector")) {
+        try runUnobservedVectorProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--storage-color-initialization")) {
+        try runStorageColorInitializationProbe(allocator);
+        return;
+    }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--storage-raster-replacement")) {
         for ([_]bool{ false, true }) |timeline| for ([_]bool{ false, true }) |published| {
             var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = timeline });
@@ -13469,11 +14032,13 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--tracked-buffer-writes")) {
-        var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true, .device_storage_budget_bytes = 1024 * 1024 });
-        defer renderer.deinit();
-        var guest = GuestMemory{};
-        _ = renderer.dcbBackend(guest.interface());
-        try renderer.probeTrackedBufferWrites(0x1000);
+        for ([_]bool{ false, true }) |timeline| {
+            var renderer = try vulkan.Renderer.init(allocator, .{ .enable_validation = true, .enable_timeline_scheduler = timeline, .device_storage_budget_bytes = 1024 * 1024 });
+            defer renderer.deinit();
+            var guest = GuestMemory{};
+            _ = renderer.dcbBackend(guest.interface());
+            try renderer.probeTrackedBufferWrites(0x1000);
+        }
         std.debug.print("tracked buffer writes passed: cumulative stores, EXEC masks, OOB lanes, counter reset, prefix retirement and untouched CPU tail\n", .{});
         return;
     }
@@ -13738,6 +14303,10 @@ pub fn main(init: std.process.Init) !void {
         try runStorageImageReuseProbe(allocator);
         return;
     }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--storage-format-alias")) {
+        try runStorageFormatAliasProbe(allocator);
+        return;
+    }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--packed-unorm")) {
         try runPackedUnormStorageProbe(allocator, false);
         try runPackedUnormStorageProbe(allocator, true);
@@ -13972,10 +14541,11 @@ pub fn main(init: std.process.Init) !void {
             }
             _ = renderer.dcbBackend(memory);
             try renderer.probeColorInitializationAlias();
+            try renderer.probeColorDccNativeClears();
             try renderer.probeColorInitializationPadded();
             try renderer.probeColorZeroFills();
         };
-        std.debug.print("colour initialization passed: alias publication, padded-pitch GPU producers, retained pixels, CPU replacement and zero DCC initialization with tracked/untracked pages and synchronous/timeline submissions\n", .{});
+        std.debug.print("colour initialization passed: alias publication, padded-pitch GPU producers, retained pixels, CPU replacement and exact RGBA8/FP16 DCC clears with tracked/untracked pages and synchronous/timeline submissions\n", .{});
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--buffer-target-coherence")) {
@@ -14011,6 +14581,15 @@ pub fn main(init: std.process.Init) !void {
         }
         for ([_]usize{ 1, 4 * 1024 * 1024 }) |budget|
             try runQueuedBufferReuseProbe(allocator, true, false, 0, budget);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--partial-storage-uploads")) {
+        try runPartialStorageUploadProbe(allocator, false);
+        try runPartialStorageUploadProbe(allocator, true);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--transient-storage")) {
+        for ([_]bool{ false, true }) |timeline| try runTransientStorageProbe(allocator, timeline);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--queued-device-uploads")) {

@@ -469,6 +469,9 @@ pub const Options = struct {
     private_memory_size_bytes: u32 = 0,
     /// Replace a fully proven graphics spill allocation with scalar variables.
     scalarize_private_spills: bool = true,
+    /// Elide only EXEC selects whose inactive destination values are proven
+    /// unobservable. Cross-lane reads, mask expansion and exports retain them.
+    omit_unobserved_exec_selects: bool = true,
     /// Experimental lowering of forward selections inside disjoint loops.
     /// GPU probes pass, but a large native fragment still causes DeviceLost;
     /// retain the established dispatcher until that regression is isolated.
@@ -1171,6 +1174,8 @@ const Builder = struct {
     sampled_check_match: ?u32 = null,
     sampled_dimension_override: ?SampledImageDimension = null,
     dpp_write_predicate: ?u32 = null,
+    unobserved_vector_pcs: []const u32 = &.{},
+    unobserved_vector_destination: ?u32 = null,
     /// SPIR-V splits arbitrary-lane and relative-lane subgroup shuffles into
     /// separate capabilities. NVIDIA may accept a module that omits these and
     /// only report the mistake as DEVICE_LOST when a large compute kernel runs,
@@ -2312,12 +2317,12 @@ const Builder = struct {
                 try self.emit(&self.body, 169, &.{ self.bits_type, selected, enabled, bits, previous });
                 bits = selected;
             }
-            if (try self.laneEnabled()) |enabled| {
+            if (self.unobserved_vector_destination != op.reg or self.dispatch_active != null) if (try self.laneEnabled()) |enabled| {
                 const previous = try self.registerBits(index, 0);
                 const selected = self.id();
                 try self.emit(&self.body, 169, &.{ self.bits_type, selected, enabled, bits, previous });
                 bits = selected;
-            }
+            };
         }
         // Ordinary VGPR writes already include dispatch_active in laneEnabled.
         // Scalar writes and WRITELANE bypass EXEC and still need the separate
@@ -11397,6 +11402,12 @@ const Builder = struct {
     }
 
     fn lower(self: *Builder, source_inst: instruction.Instruction) Error!void {
+        self.unobserved_vector_destination = if (std.sort.binarySearch(u32, self.unobserved_vector_pcs, source_inst.pc, struct {
+            fn order(key: u32, value: u32) std.math.Order {
+                return std.math.order(key, value);
+            }
+        }.order) != null) source_inst.dst.reg else null;
+        defer self.unobserved_vector_destination = null;
         if (source_inst.family == .ds) try self.snapshotNggLdsWrites(source_inst.pc);
         for (self.fragment_min_pcs) |reduction| {
             if (reduction.start_pc != source_inst.pc) continue;
@@ -13634,6 +13645,15 @@ fn translateInstructions(
         try allocator.alloc(u32, 0);
     defer allocator.free(local_vcc_pcs);
     builder.local_vcc_pcs = local_vcc_pcs;
+    // NGG exports can consume synthetic register operands absent from this
+    // instruction stream. Keep their masks until the proof includes those
+    // implicit observers as well as the decoded instructions.
+    const unobserved_vector_pcs = if (effective.omit_unobserved_exec_selects and !builder.converged_workgroup_dispatch and effective.ngg_lds_exports.len == 0)
+        try @import("inactive_vector_values.zig").scanPcs(allocator, instructions, &graph)
+    else
+        try allocator.alloc(u32, 0);
+    defer allocator.free(unobserved_vector_pcs);
+    builder.unobserved_vector_pcs = unobserved_vector_pcs;
     if (builder.converged_workgroup_dispatch or has_calls) {
         try translateDispatcher(&builder, instructions, &graph);
     } else if (graph.blocks.items.len == 1) {
@@ -13679,6 +13699,7 @@ fn translateInstructions(
             builder.lane_mask_scan_pcs = lane_mask_scans;
             builder.fragment_min_pcs = fragment_min_pcs;
             builder.local_vcc_pcs = local_vcc_pcs;
+            builder.unobserved_vector_pcs = unobserved_vector_pcs;
             try builder.configureLaneSpills(instructions);
             if (effective.scalarize_private_spills) try builder.configurePrivateSpills(instructions, &graph);
             translateDispatcher(&builder, instructions, &graph) catch |dispatch_err| {

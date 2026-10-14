@@ -80,5 +80,6 @@ test {
     _ = control_flow;
     _ = ir;
     _ = spirv;
+    _ = @import("inactive_vector_values.zig");
     _ = cache_key;
 }
