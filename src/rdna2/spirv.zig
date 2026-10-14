@@ -10436,13 +10436,18 @@ const Builder = struct {
         if (self.flat_memory_bindings.len == 0 or inst.src1.kind != .sgpr or inst.memory_offset < 0 or count > 16)
             return Error.UnsupportedBufferAddressing;
         const zero = try self.constant(.bits32, 0);
-        var descriptor: [4]u32 = undefined;
-        for (&descriptor, 0..) |*word, component| word.* = try self.source(try consecutiveRegister(inst.src1, @intCast(component)), .bits32);
+        var descriptor: [4]u32 = @splat(zero);
+        // SMEM consumes only BASE, STRIDE and NUM_RECORDS, including when a
+        // runtime V# is resolved through the checked memory snapshots.
+        for (descriptor[0..@as(usize, if (inst.family == .smem) 3 else 4)], 0..) |*word, component|
+            word.* = try self.source(try consecutiveRegister(inst.src1, @intCast(component)), .bits32);
         const stride = try self.andBits(try self.shiftRightBits(descriptor[1], 16), 0x3fff);
         const size = try self.bvhSelect(self.bits_type, try self.isNonZero(stride), try self.multiplyBits(stride, descriptor[2]), descriptor[2]);
-        var valid_format = try self.bvhBinary(170, self.bool_type, try self.andBits(descriptor[1], 0x8000_0000), zero);
-        valid_format = try self.logicalAndValue(valid_format, try self.bvhBinary(170, self.bool_type, try self.andBits(descriptor[3], 0xc080_0000), zero));
-        valid_format = try self.logicalAndValue(valid_format, try self.bvhBinary(170, self.bool_type, try self.multiplyHighUnsignedBits(stride, descriptor[2]), zero));
+        var valid_format = try self.bvhBinary(170, self.bool_type, try self.multiplyHighUnsignedBits(stride, descriptor[2]), zero);
+        if (inst.family != .smem) {
+            valid_format = try self.logicalAndValue(valid_format, try self.bvhBinary(170, self.bool_type, try self.andBits(descriptor[1], 0x8000_0000), zero));
+            valid_format = try self.logicalAndValue(valid_format, try self.bvhBinary(170, self.bool_type, try self.andBits(descriptor[3], 0xc080_0000), zero));
+        }
         const index = if (inst.index_enable) try self.source(inst.src0, .bits32) else zero;
         var offset = try self.constant(.bits32, @intCast(inst.memory_offset));
         if (inst.offset_enable) offset = try self.addBits(offset, try self.source(if (inst.index_enable) try consecutiveRegister(inst.src0, 1) else inst.src0, .bits32));

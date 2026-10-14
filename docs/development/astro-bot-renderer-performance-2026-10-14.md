@@ -5,6 +5,15 @@ Output is 1920×1080; the game still controls its internal surface dimensions.
 Existing shader caches were retained. The 25–30 FPS target is **not reached**.
 Rendering defects remain, and controllable gameplay is not established.
 
+## Follow-up: AnyPS5 descriptor review
+
+The new warmed title run measures **14.97 FPS** over 660 frames. Scalar
+buffer reads now ignore unused vector fields on both host and GPU paths, and
+bounded texture records can span multiple scalar loads. The command-interval
+comparison retains the 250 µs default. The 25 FPS target and character control
+remain unverified. [Implementation, source review, capture, measurements and
+test limitations](anyps5-descriptor-review-2026-10-14.md).
+
 ## Follow-up: avoid unusable draw capture
 
 The balanced title comparison measures **15.33 versus 15.22 FPS**, with 660

@@ -512,6 +512,30 @@ pub fn decodeBufferDescriptor(words: []const u32) Error!BufferDescriptor {
     };
 }
 
+/// RDNA 2 ISA 7.1: SMEM buffer loads consume BASE, STRIDE and NUM_RECORDS.
+/// The vector format, swizzle, lane-index and type fields are not operands of
+/// these loads. In particular, the fourth SGPR need not have a known value.
+pub fn decodeScalarBufferDescriptor(words: []const u32) Error!BufferDescriptor {
+    if (words.len < 3) return Error.IncompleteDescriptor;
+    return decodeBufferDescriptor(&.{ words[0], words[1] & 0x3fff_ffff, words[2], 0 });
+}
+
+test "scalar buffer descriptors ignore unused vector fields but retain bounds" {
+    const words = [_]u32{ 0x1000, 0xc004_0001, 3, 0xffff_ffff };
+    const descriptor = try decodeScalarBufferDescriptor(&words);
+    try testing.expectEqual(@as(u64, 0x1_0000_1000), descriptor.address);
+    try testing.expectEqual(@as(u16, 4), descriptor.stride);
+    try testing.expectEqual(@as(u64, 12), descriptor.size_bytes);
+    try testing.expect(!descriptor.swizzle_enabled and !descriptor.add_thread_id);
+    try testing.expectEqual(@as(u8, 0), descriptor.unified_format);
+    try testing.expectEqualDeep(descriptor, try decodeScalarBufferDescriptor(words[0..3]));
+    try testing.expectError(Error.IncompleteDescriptor, decodeScalarBufferDescriptor(words[0..2]));
+    try testing.expectError(Error.InvalidDescriptor, decodeBufferDescriptor(&words));
+    const byte_buffer = try decodeScalarBufferDescriptor(&.{ 0x1000, 0xc000_0000, 10 });
+    try testing.expectEqual(@as(u64, 10), byte_buffer.size_bytes);
+    try testing.expectEqual(@as(u64, 0), (try decodeScalarBufferDescriptor(&.{ 0x1000, 0, 0 })).size_bytes);
+}
+
 pub fn decodeImageDescriptor(words: []const u32) Error!ImageDescriptor {
     if (words.len < 4) return Error.IncompleteDescriptor;
     const word1 = words[1];

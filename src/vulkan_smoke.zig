@@ -11033,11 +11033,14 @@ fn runUnboundSnapshotProbe(allocator: std.mem.Allocator) !void {
     var guest = GuestMemory{};
     _ = renderer.dcbBackend(guest.interface());
     const regions = [_]@import("rdna2").spirv.FlatMemoryBinding{ .{ .descriptor_index = 1, .fault_record_word = 132 }, .{ .descriptor_index = 2 }, .{ .descriptor_index = 3 }, .{ .descriptor_index = 4 } } ** 4;
-    for ([_]bool{ false, true }) |repeat| {
+    for ([_]bool{ false, true }) |repeat| for ([_]bool{ false, true }) |unused_fields| {
         const body = [_]u32{
             sop1(3, 0, 255), 0x1000, sop1(3, 1, 255), 0x20,
             0xf408_0200,                0xfa00_0000, // runtime V# s8 <- pointer s0
             mubuf(0x0d, 0, 2, 0, 8)[0], mubuf(0x0d, 0, 2, 0, 8)[1],
+            // Keep MUBUF's valid descriptor, then poison fields SMEM ignores.
+            sop1(3, 9, 255),            if (unused_fields) 0xc0080020 else 0x00080020,
+            sop1(3, 11, 255),           if (unused_fields) 0xffffffff else 0x16204,
             sop1(3, 106, 134), // VCC is a scalar byte offset of 6, aligned to 4 by SMEM
             0xf424_0504,                 106 << 25, // s_buffer_load_dwordx2 s20, V#s8, VCC
             vop1(1, 4, 20),              vop1(1, 5, 21),
@@ -11102,8 +11105,8 @@ fn runUnboundSnapshotProbe(allocator: std.mem.Allocator) !void {
                 try std.testing.expectEqual(@as(u32, if (missing == 0) 0 else if (repeat) 64 else 32), std.mem.readInt(u32, header[8..12], .little));
             }
         }
-    }
-    std.debug.print("Unbound snapshot reads passed: runtime SMEM descriptor, indexed MUBUF, scalar VCC offsets, bounds and missing-pointer faults\n", .{});
+    };
+    std.debug.print("Unbound snapshot reads passed: runtime SMEM descriptor, unused vector fields, indexed MUBUF, scalar VCC offsets, bounds and missing-pointer faults\n", .{});
 }
 
 fn runBvhIntersectionProbe(allocator: std.mem.Allocator) !void {
@@ -11624,6 +11627,62 @@ fn runBufferTableProbe(allocator: std.mem.Allocator) !void {
     try runBufferTableCase(allocator, false);
     try runBufferTableCase(allocator, true);
     try runScalarBufferTableProbe(allocator);
+}
+
+fn runScalarBufferFieldsProbe(allocator: std.mem.Allocator) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true });
+    defer renderer.deinit();
+    var guest = GuestMemory{};
+    _ = renderer.dcbBackend(guest.interface());
+    var cases: usize = 0;
+    for ([_]u32{ 1, 4 }) |width| {
+        for ([_]u32{ 0, 4 }) |stride| {
+            for ([_]u32{ 0, 0xffff_ffff }) |unused| {
+                for ([_]bool{ false, true }) |unknown_fourth| {
+                    const program: u32 = 0x100 + @as(u32, @intCast(cases)) * 0x100;
+                    var code: std.ArrayList(u32) = .empty;
+                    defer code.deinit(allocator);
+                    try code.appendSlice(allocator, &.{
+                        vop1(1, 0, 8), // Workgroup index; source offset cannot be folded on the CPU.
+                        sop2(0x1e, 9, 8, 130), // s9 = workgroup * 4 bytes
+                    });
+                    if (unknown_fourth) try code.append(allocator, vop1(2, 3, 256));
+                    try code.appendSlice(allocator, &.{
+                        (if (width == 1) @as(u32, 0xf420_0000) else @as(u32, 0xf428_0000)) | (12 << 6),
+                        9 << 25,
+                    });
+                    for (0..width) |i| try code.append(allocator, vop1(1, @intCast(4 + i), @intCast(12 + i)));
+                    try code.appendSlice(allocator, &mubuf(if (width == 1) 0x1c else 0x1e, 0, 4, 0, 4));
+                    try code.append(allocator, 0xbf81_0000);
+                    for (code.items, 0..) |word, i| guest.word(program + i * 4, word);
+                    for (0..16) |i| guest.word(0x10000 + i * 4, @as(u32, 0x7654_3200) + @as(u32, @intCast(i)));
+                    for (0..32) |i| guest.word(0x11000 + i * 4, 0xcccc_cccc);
+                    var state = gpu.State{};
+                    try state.writeRegister(.shader, 0x20c, program >> 8);
+                    try state.writeRegister(.shader, 0x20d, 0);
+                    try state.writeRegister(.shader, 0x213, (8 << 1) | (1 << 7));
+                    // The source ends with an incomplete dword in byte mode.
+                    const source_bytes: u32 = if (stride == 0) 10 else 12;
+                    const userdata = [_]u32{ 0x10000, (stride << 16) | (if (unused != 0) @as(u32, 0xc000_0000) else 0), if (stride == 0) source_bytes else 3, unused, 0x11000, (width * 4) << 16, 8, 0x5204 };
+                    for (userdata, 0..) |word, i| try state.writeRegister(.shader, 0x240 + @as(u32, @intCast(i)), word);
+                    const unresolved = renderer.frame_profile.unresolved_storage_resources;
+                    const report = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 8, 1, 1 });
+                    try std.testing.expectEqual(unresolved, renderer.frame_profile.unresolved_storage_resources);
+                    try std.testing.expect(report.spirv_words != 0);
+                    var output: [128]u8 = undefined;
+                    try renderer.readbackGuestStorageBuffer(0x11000, output[0 .. 8 * width * 4]);
+                    for (0..8) |group| for (0..width) |component| {
+                        const offset = (group + component) * 4;
+                        const expected: u32 = if (offset + 4 <= source_bytes) 0x7654_3200 + @as(u32, @intCast(group + component)) else 0;
+                        const at = (group * width + component) * 4;
+                        try std.testing.expectEqual(expected, std.mem.readInt(u32, output[at..][0..4], .little));
+                    };
+                    cases += 1;
+                }
+            }
+        }
+    }
+    std.debug.print("scalar buffer fields passed: {d} dispatches, unused vector fields, unknown fourth SGPR, runtime offsets and partial-dword bounds\n", .{cases});
 }
 
 fn runScalarBufferTableProbe(allocator: std.mem.Allocator) !void {
@@ -13938,6 +13997,57 @@ fn runUnsupportedTextureContinuationProbe(allocator: std.mem.Allocator) !void {
     std.debug.print("unsupported texture continuation passed: release retained, output untouched, following compute verified\n", .{});
 }
 
+fn runSplitImageTableProbe(allocator: std.mem.Allocator) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{});
+    defer renderer.deinit();
+    var guest = GuestMemory{};
+    _ = renderer.dcbBackend(guest.interface());
+    const store = mubuf(0x1e, 0, 4, 2, 4);
+    const program = [_]u32{
+        vop1(1, 2, 8), // Retain the workgroup ID for the output.
+        sop2(0x0e, 12, 8, 129), // Two material records selected at runtime.
+        sop2(0x26, 14, 12, 255),
+        136,
+        0xf430_0800, 14 << 25, // Load a 16-dword record prefix into s32:s47.
+        sop2(0, 15, 14, 176), // The second load uses the same record + 48.
+        0xf428_0b00,      15 << 25, // Replace s44:s47 with the final four T# words.
+        sop1(4, 24, 128), sop1(4, 26, 128),
+        vop1(1, 0, 240),  vop1(1, 1, 240),
+        0xf09c_0f08, 0x00ca_0400, // T#s40:s47 / S#s24:s27.
+        store[0],    store[1],
+        0xbf81_0000,
+    };
+    for (program, 0..) |word, index| guest.word(0x800 + index * 4, word);
+    var state = gpu.State{};
+    try state.writeRegister(.shader, 0x20c, 8);
+    try state.writeRegister(.shader, 0x20d, 0);
+    try state.writeRegister(.shader, 0x213, (8 << 1) | (1 << 7));
+    for (0..2) |pass| {
+        const table: u32 = @intCast(0x2000 + pass * 0x1000);
+        for ([_]u32{ table, 136 << 16, 2, 0xffff_ffff, 0x11000, 16 << 16, 4, 0 }, 0..) |word, index|
+            try state.writeRegister(.shader, 0x240 + @as(u32, @intCast(index)), word);
+        for (0..2) |record| {
+            const address: u32 = @intCast(0x14000 + pass * 0x1000 + record * 256);
+            const tuple = sampledImageDescriptorWords(address, 1, 1);
+            for (tuple, 0..) |word, index| guest.word(table + record * 136 + 32 + index * 4, word);
+            guest.word(address, if ((record + pass) % 2 == 0) 0xff00_00ff else 0xffff_0000);
+        }
+        for (0..16) |word| guest.word(0x11000 + word * 4, 0xcccc_cccc);
+        const unresolved = renderer.frame_profile.unresolved_storage_resources;
+        const report = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 4, 1, 1 });
+        try std.testing.expect(report.spirv_words != 0);
+        try std.testing.expectEqual(unresolved, renderer.frame_profile.unresolved_storage_resources);
+        var output: [64]u8 = undefined;
+        try renderer.readbackGuestStorageBuffer(0x11000, &output);
+        for (0..4) |group| for (0..4) |channel| {
+            const color: usize = if ((group + pass) % 2 == 0) 0 else 2;
+            const expected: u32 = if (channel == 3 or channel == color) 0x3f80_0000 else 0;
+            try std.testing.expectEqual(expected, std.mem.readInt(u32, output[(group * 4 + channel) * 4 ..][0..4], .little));
+        };
+    }
+    std.debug.print("split image tables passed: runtime record selection, two SMEM loads, immediate addend, relocated tables and changed colors\n", .{});
+}
+
 fn runWorkgroupImageTableProbe(allocator: std.mem.Allocator) !void {
     var renderer = try vulkan.Renderer.init(allocator, .{});
     defer renderer.deinit();
@@ -14239,6 +14349,10 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--spilled-lds")) {
         try runSpilledLdsProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--split-image-table")) {
+        try runSplitImageTableProbe(allocator);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--workgroup-image-table")) {
@@ -14985,6 +15099,10 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--scalar-buffer-tables")) {
         try runScalarBufferTableProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--scalar-buffer-fields")) {
+        try runScalarBufferFieldsProbe(allocator);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--pipeline-cache")) {
