@@ -13160,6 +13160,71 @@ noinline fn runRendererProbe(allocator: std.mem.Allocator, comptime probe: fn (*
     try probe(renderer);
 }
 
+noinline fn runGpuStorageDetileProbe(allocator: std.mem.Allocator, gpu_layout: bool) !void {
+    const StorageMemory = SizedGuestMemory(8 * 1024 * 1024);
+    for ([_]bool{ false, true }) |batch| {
+        const renderer = try allocator.create(vulkan.Renderer);
+        defer allocator.destroy(renderer);
+        renderer.* = try vulkan.Renderer.init(allocator, .{ .enable_validation = true, .enable_timeline_scheduler = true });
+        defer renderer.deinit();
+        const guest = try allocator.create(StorageMemory);
+        defer allocator.destroy(guest);
+        guest.* = .{};
+        guest.watch_generation = 1;
+        var memory = guest.interface();
+        memory.track_gpu_read = StorageMemory.track;
+        memory.gpu_generation = StorageMemory.generation;
+        memory.fingerprint = StorageMemory.fingerprint;
+        _ = renderer.dcbBackend(memory);
+        renderer.draw_batch_active = batch;
+        const arm = struct {
+            fn arm(context: ?*anyopaque, address: u64) void {
+                const fixture: *StorageMemory = @ptrCast(@alignCast(context.?));
+                fixture.write_on_generation = @intCast(address);
+                fixture.generation_reads_before_write = 1;
+            }
+        }.arm;
+        if (gpu_layout) try renderer.probeGpuStorageDetile(arm) else try renderer.probeCpuStorageTexelHashes(arm);
+        std.debug.print("storage coherence passed: gpu_layout={}, batch={}, queued uploads, byte-exact publication, padding races, CPU replacement and baseline retirement\n", .{ gpu_layout, batch });
+    }
+}
+
+noinline fn runBufferReadbackProbe(allocator: std.mem.Allocator, comptime probe: fn (*vulkan.Renderer, u64) anyerror!void, comptime label: []const u8) !void {
+    for ([_]bool{ false, true }) |batch| {
+        const renderer = try allocator.create(vulkan.Renderer);
+        defer allocator.destroy(renderer);
+        renderer.* = try vulkan.Renderer.init(allocator, .{ .enable_validation = true, .enable_timeline_scheduler = true, .device_storage_budget_bytes = 1024 * 1024, .retain_clean_storage_buffers = true });
+        defer renderer.deinit();
+        var guest = SizedGuestMemory(1024 * 1024){};
+        _ = renderer.dcbBackend(guest.interface());
+        renderer.draw_batch_active = batch;
+        try probe(renderer, 0x1000);
+        std.debug.print("{s} buffer readbacks passed: batch={}\n", .{ label, batch });
+    }
+}
+
+noinline fn runColorStorageLayoutProbe(allocator: std.mem.Allocator) !void {
+    const LayoutMemory = SizedGuestMemory(1024 * 1024);
+    for ([_]bool{ false, true }) |batch| {
+        const renderer = try allocator.create(vulkan.Renderer);
+        defer allocator.destroy(renderer);
+        renderer.* = try vulkan.Renderer.init(allocator, .{ .enable_validation = true, .enable_timeline_scheduler = true, .defer_internal_releases = true });
+        defer renderer.deinit();
+        var guest = LayoutMemory{};
+        guest.watch_generation = 1;
+        var memory = guest.interface();
+        memory.track_gpu_read = LayoutMemory.track;
+        memory.gpu_generation = LayoutMemory.generation;
+        memory.fingerprint = LayoutMemory.fingerprint;
+        _ = renderer.dcbBackend(memory);
+        // These transfers use their own descriptor sets. Also exercise an
+        // open batch without an intervening submission between conversions.
+        renderer.draw_batch_active = batch;
+        try renderer.probeColorStorageLayout();
+        std.debug.print("color/storage layout batch={} passed\n", .{batch});
+    }
+}
+
 noinline fn runStorageSrgbProbe(allocator: std.mem.Allocator) !void {
     const renderer = try allocator.create(vulkan.Renderer);
     defer allocator.destroy(renderer);
@@ -14609,6 +14674,30 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--specialized-detile")) {
         try runRendererProbe(allocator, vulkan.Renderer.probeSpecializedDetile);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--gpu-storage-detile")) {
+        try runGpuStorageDetileProbe(allocator, true);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--cpu-storage-texel-hashes")) {
+        try runGpuStorageDetileProbe(allocator, false);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--prefetched-buffer-readbacks")) {
+        try runBufferReadbackProbe(allocator, vulkan.Renderer.probePrefetchedBufferReadbacks, "prefetched");
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--interior-buffer-readbacks")) {
+        try runBufferReadbackProbe(allocator, vulkan.Renderer.probeInteriorBufferReadbacks, "interior");
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--gpu-retile")) {
+        try runRendererProbe(allocator, vulkan.Renderer.probeGpuRetile);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--color-storage-layout")) {
+        try runColorStorageLayoutProbe(allocator);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--typed-indices")) {

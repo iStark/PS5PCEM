@@ -59,6 +59,43 @@ pub const Ranges = struct {
         return output[0..count];
     }
 
+    pub fn intersection(self: *const Ranges, first: usize, end: usize, output: *[capacity]Span) []const Span {
+        if (first >= end) return output[0..0];
+        if (self.whole) {
+            output[0] = .{ .first = first, .end = end };
+            return output[0..1];
+        }
+        var count: usize = 0;
+        for (self.spans[0..self.count]) |span| {
+            if (span.first >= end) break;
+            if (span.end <= first) continue;
+            output[count] = .{ .first = @max(first, span.first), .end = @min(end, span.end) };
+            count += 1;
+        }
+        return output[0..count];
+    }
+
+    /// Removing an interior publication may split a span. Refuse an exhausted
+    /// budget without changing the set: replacing it with `whole` would allow
+    /// old GPU bytes to overwrite later CPU edits to an already published gap.
+    pub fn consumeRange(self: *Ranges, first: usize, end: usize, total: usize) bool {
+        if (first >= end) return true;
+        var remaining = Ranges{};
+        const full = [_]Span{.{ .first = 0, .end = total }};
+        const source = if (self.whole) &full else self.spans[0..self.count];
+        for (source) |span| {
+            if (span.end <= first or span.first >= end) {
+                remaining.include(span);
+            } else {
+                if (span.first < first) remaining.include(.{ .first = span.first, .end = first });
+                if (span.end > end) remaining.include(.{ .first = end, .end = span.end });
+            }
+            if (remaining.whole) return false;
+        }
+        self.* = remaining;
+        return true;
+    }
+
     /// Retire only bytes already published (or protected by a newer writer).
     /// Further GPU writes are merged back through include/merge as usual.
     pub fn consumePrefix(self: *Ranges, size: usize, total: usize) void {
@@ -143,4 +180,31 @@ test "prefix publication retires sparse writes without adding their gaps" {
     try std.testing.expectEqual(Span{ .first = 20, .end = 24 }, ranges.spans[0]);
     ranges.consumePrefix(24, 64);
     try std.testing.expectEqual(@as(usize, 0), ranges.count);
+}
+
+test "interior publication preserves both sides and never republishes its gap" {
+    var ranges = Ranges{ .whole = true };
+    var clipped: [capacity]Span = undefined;
+    try std.testing.expectEqual(Span{ .first = 19, .end = 23 }, ranges.intersection(19, 23, &clipped)[0]);
+    try std.testing.expect(ranges.consumeRange(19, 23, 64));
+    try std.testing.expectEqualSlices(Span, &.{ .{ .first = 0, .end = 19 }, .{ .first = 23, .end = 64 } }, ranges.spans[0..ranges.count]);
+    try std.testing.expectEqual(@as(usize, 0), ranges.intersection(19, 23, &clipped).len);
+    try std.testing.expect(ranges.consumeRange(16, 32, 64));
+    try std.testing.expectEqualSlices(Span, &.{ .{ .first = 0, .end = 16 }, .{ .first = 32, .end = 64 } }, ranges.spans[0..ranges.count]);
+    ranges.include(.{ .first = 20, .end = 24 });
+    try std.testing.expectEqual(Span{ .first = 20, .end = 24 }, ranges.intersection(19, 25, &clipped)[0]);
+    try std.testing.expect(ranges.consumeRange(0, 128, 64));
+    try std.testing.expectEqual(@as(usize, 0), ranges.count);
+}
+
+test "interior publication refuses a ninth remaining span without losing prior gaps" {
+    var ranges = Ranges{};
+    for (0..capacity) |i| ranges.include(.{ .first = i * 16, .end = i * 16 + 8 });
+    const before = ranges;
+    try std.testing.expect(!ranges.consumeRange(3, 5, 128));
+    try std.testing.expect(!ranges.whole);
+    try std.testing.expectEqualSlices(Span, before.spans[0..before.count], ranges.spans[0..ranges.count]);
+    try std.testing.expect(ranges.consumeRange(0, 5, 128));
+    try std.testing.expectEqual(@as(usize, capacity), ranges.count);
+    try std.testing.expectEqual(Span{ .first = 5, .end = 8 }, ranges.spans[0]);
 }

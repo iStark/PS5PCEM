@@ -101,9 +101,21 @@ pub const Specialization = struct {
     block_width: u32,
     block_height: u32,
     block_depth: u32,
+    retile: bool = false,
 };
 
 pub fn buildSpecialized(gpa: std.mem.Allocator, specialization: ?Specialization) std.mem.Allocator.Error![]u32 {
+    return buildModule(gpa, specialization, if (specialization) |key| key.retile else false);
+}
+
+/// The inverse transfer uses the same address equation. Binding 0 contains
+/// packed linear texels; binding 1 retains tiled padding and untouched mips.
+/// Params keep their tiled/linear offset meanings in both directions.
+pub fn buildRetile(gpa: std.mem.Allocator) std.mem.Allocator.Error![]u32 {
+    return buildModule(gpa, null, true);
+}
+
+fn buildModule(gpa: std.mem.Allocator, specialization: ?Specialization, retile: bool) std.mem.Allocator.Error![]u32 {
     var b = Builder{ .gpa = gpa };
     errdefer b.deinit();
     try b.words.appendSlice(gpa, &.{ 0x0723_0203, 0x0001_0000, 0, 0, 0 });
@@ -271,9 +283,25 @@ pub fn buildSpecialized(gpa: std.mem.Allocator, specialization: ?Specialization)
     const src_byte = try b.bin(128, uint_ty, try b.bin(128, uint_ty, src_lo, slice_term), rel);
     const dest_texel = try b.bin(128, uint_ty, try b.bin(132, uint_ty, try b.bin(128, uint_ty, try b.bin(132, uint_ty, z, height), y), width), x);
     const dest_byte = try b.bin(128, uint_ty, dst_lo, try b.bin(132, uint_ty, dest_texel, bpp));
-    const src_word = try b.bin(134, uint_ty, src_byte, c4);
-    const dst_word = try b.bin(134, uint_ty, dest_byte, c4);
+    const tiled_word = try b.bin(134, uint_ty, src_byte, c4);
+    const linear_word = try b.bin(134, uint_ty, dest_byte, c4);
+    const src_word = if (retile) linear_word else tiled_word;
+    const dst_word = if (retile) tiled_word else linear_word;
 
+    // Adjacent 16-bit texels can occupy opposite halves of one dword.
+    // Atomic masks retain the other texel and untouched edge padding.
+    const half_merge = if (retile) b.id() else 0;
+    if (retile) {
+        const half = try b.bin(170, bool_ty, bpp_log, c1);
+        const half_body = b.id();
+        const word_body = b.id();
+        try b.emit(247, &.{ half_merge, 0 });
+        try b.emit(250, &.{ half, half_body, word_body });
+        try b.emit(248, &.{half_body});
+        try storeHalf(&b, uint_ty, ptr_uni_uint, src_var, dst_var, dest_byte, src_byte);
+        try b.emit(249, &.{half_merge});
+        try b.emit(248, &.{word_body});
+    }
     try storeLoaded(&b, uint_ty, ptr_uni_uint, src_var, dst_var, src_word, dst_word, c0);
     const need8 = try b.bin(174, bool_ty, bpp_log, c3); // UGreaterThanEqual 3 => 8-byte elements
     const merge8 = b.id();
@@ -294,6 +322,10 @@ pub fn buildSpecialized(gpa: std.mem.Allocator, specialization: ?Specialization)
     try b.emit(248, &.{merge16});
     try b.emit(249, &.{merge8});
     try b.emit(248, &.{merge8});
+    if (retile) {
+        try b.emit(249, &.{half_merge});
+        try b.emit(248, &.{half_merge});
+    }
 
     try b.emit(249, &.{merge});
     try b.emit(248, &.{merge});
@@ -337,10 +369,12 @@ fn xorRbBytes(b: *Builder, uint_ty: u32, mode: gpu.resources.TileMode, bytes: u8
 }
 
 fn xorRb(b: *Builder, uint_ty: u32, bool_ty: u32, bpp_log: u32, mode: gpu.resources.TileMode, x: u32, y: u32, z: u32) std.mem.Allocator.Error!u32 {
+    const v2 = try xorRbBytes(b, uint_ty, mode, 2, x, y, z);
     const v4 = try xorRbBytes(b, uint_ty, mode, 4, x, y, z);
     const v8 = try xorRbBytes(b, uint_ty, mode, 8, x, y, z);
     const v16 = if (mode == .depth) v8 else try xorRbBytes(b, uint_ty, mode, 16, x, y, z);
-    return pickBpp(b, uint_ty, bool_ty, bpp_log, v4, v8, v16);
+    const wide = try pickBpp(b, uint_ty, bool_ty, bpp_log, v4, v8, v16);
+    return b.sel(uint_ty, try b.bin(170, bool_ty, bpp_log, try b.constant(uint_ty, 1)), v2, wide);
 }
 
 fn storeLoaded(
@@ -365,6 +399,29 @@ fn storeLoaded(
     const dst_ptr = b.id();
     try b.emit(65, &.{ ptr_ty, dst_ptr, dst_var, c0, dst_index });
     try b.emit(62, &.{ dst_ptr, value });
+}
+
+fn storeHalf(b: *Builder, uint_ty: u32, ptr_ty: u32, src_var: u32, dst_var: u32, src_byte: u32, dst_byte: u32) std.mem.Allocator.Error!void {
+    const zero = try b.constant(uint_ty, 0);
+    const one = try b.constant(uint_ty, 1); // Device scope
+    const two = try b.constant(uint_ty, 2);
+    const three = try b.constant(uint_ty, 3);
+    const mask = try b.constant(uint_ty, 0xffff);
+    const src_index = try b.bin(194, uint_ty, src_byte, two);
+    const dst_index = try b.bin(194, uint_ty, dst_byte, two);
+    const src_shift = try b.bin(196, uint_ty, try b.bin(199, uint_ty, src_byte, three), three);
+    const dst_shift = try b.bin(196, uint_ty, try b.bin(199, uint_ty, dst_byte, three), three);
+    const src_ptr = b.id();
+    try b.emit(65, &.{ ptr_ty, src_ptr, src_var, zero, src_index });
+    const word = b.id();
+    try b.emit(61, &.{ uint_ty, word, src_ptr });
+    const value = try b.bin(199, uint_ty, try b.bin(194, uint_ty, word, src_shift), mask);
+    const keep = try b.bin(198, uint_ty, try b.bin(196, uint_ty, mask, dst_shift), try b.constant(uint_ty, 0xffffffff));
+    const inserted = try b.bin(196, uint_ty, value, dst_shift);
+    const dst_ptr = b.id();
+    try b.emit(65, &.{ ptr_ty, dst_ptr, dst_var, zero, dst_index });
+    try b.emit(240, &.{ uint_ty, b.id(), dst_ptr, one, zero, keep }); // OpAtomicAnd
+    try b.emit(241, &.{ uint_ty, b.id(), dst_ptr, one, zero, inserted }); // OpAtomicOr
 }
 
 fn xor4k4(b: *Builder, uint_ty: u32, x: u32, y: u32) std.mem.Allocator.Error!u32 {

@@ -5,6 +5,113 @@ Output is 1920×1080; the game still controls its internal surface dimensions.
 Existing shader caches were retained. The 25–30 FPS target is **not reached**.
 Rendering defects remain, and controllable gameplay is not established.
 
+## Follow-up: native image layout transfers
+
+Native GPU retiling now uses the same address equations as detiling. Byte-for-byte
+probes cover 165 views, including 16-bit texels, packed halfword writes, odd
+extents, arrays, volume slices, mip tails and unchanged allocation padding.
+Color-to-storage conversion can combine contained overlapping raster producers
+in content-write order. A retained native backing preserves pixels outside the
+storage view; an interior-address consumer also publishes that backing.
+
+Native composition tests pass with immediate and batched commands, including
+opposite producer orders, CPU allocation replacement and interior-address reads.
+Vulkan synchronization validation reports no hazards in these probes. This is
+not evidence that every game image interpretation is supported.
+
+Candidate 38's warmed title interval presented 187 frames in 20.0004 seconds
+(**9.35 FPS**). It performed **zero layout conversions in that interval**.
+Tracing found another raster producer extending outside the destination's
+allocation, which correctly retains the fallback. Thus this implementation has
+no demonstrated speed benefit in the measured title scene. The 25 FPS objective
+remains unmet; no new visual-quality or gameplay claim accompanies these probes.
+
+Candidate 43 additionally handles a raster producer that starts inside the
+storage allocation and extends past its end. It retains the complete native
+backing and publishes the outer bytes before transferring ownership. Tests
+verify preservation of that tail, subsequent CPU edits, rejection of another
+outer GPU writer, and CPU replacement during the transfer. Immediate and
+batched cases pass synchronization validation. A 20-second title interval
+measured 9.65 FPS; the balanced 660-frame comparisons measured **9.60 FPS with
+the path enabled and 9.60 FPS disabled**. Neither interval used the conversion
+path. The passing memory tests therefore do not establish a game speedup.
+
+## Follow-up: bounded buffer readback prefetch
+
+A native-tested comparison path can copy recently requested buffer prefixes
+before the next CPU consumer arrives. It records the content epoch, exact sparse
+coverage and GPU completion tick; later writes invalidate the snapshot. Per-frame
+transfer limits and temporary suppression of repeatedly unused copies bound the
+extra work. Tests cover queued and immediate commands, partial publication, CPU
+edits to a published prefix, a newer GPU writer, and a raw read spanning gaps
+that the prefetch did not copy. Vulkan synchronization validation passes.
+
+Candidate 39's initial 20-second title interval measured 9.70 FPS. A subsequent
+comparison alternated 22 blocks of 60 frames, covering each of the 11 animation
+phases once per setting: enabled **9.65 FPS**, disabled **9.78 FPS**, 660 frames
+per setting. The extra transfers did not improve this scene. The switch
+`prefetch_storage_readbacks` therefore remains **disabled by default**.
+
+Candidate 46 also publishes exact interior buffer spans instead of always
+downloading the prefix before them. Published holes remain excluded from later
+GPU publication, preserving CPU edits. If the fixed range list cannot represent
+another hole, publication falls back to the prefix before making any changes.
+Native probes cover unaligned reads, sparse ranges, overlapping newer writers
+and both immediate and batched transfers. Vulkan Debug tests pass 259/259.
+Balanced title observations measured **9.46 FPS enabled versus 9.37 FPS disabled**,
+but recorded **zero uses** of the new path in either interval. This difference
+does not establish a benefit from exact interior publication in this scene.
+
+Candidate 47 retains a valid prefetched mirror when several buffer outputs
+retire together. Previously that completion batch recorded a duplicate copy.
+Native tests verify zero additional transfer bytes for two covered mirrors,
+and the required replacement transfer for a partial mirror or a newer GPU
+writer. Preparing a mirror still does not publish guest bytes prematurely.
+Both immediate and batched tests pass Vulkan synchronization validation.
+The initial title interval measured **9.55 FPS**. Balanced 660-frame samples
+measured **9.50 FPS enabled versus 9.55 FPS disabled**. Of 3,300 prefetched
+copies, 1,980 were consumed and 1,320 were invalidated before use. Completion
+reuse avoids duplicate transfers, but the remaining speculative work still
+does not improve this scene; prefetch remains disabled by default.
+
+## Follow-up: storage image uploads and native publication
+
+Three GPU-detile candidates were slower than the CPU path in balanced title
+comparisons. Each setting covered 660 presented frames across the same 11
+animation phases, alternating 60-frame blocks:
+
+| Candidate | GPU detile enabled | GPU detile disabled |
+| --- | ---: | ---: |
+| 40: temporary upload and layout buffers | 8.75 FPS | 9.55 FPS |
+| 41: reusable device buffers and upload-ring slices | 9.07 FPS | 9.56 FPS |
+| 42: native texel comparisons and GPU-retiled publication | 9.42 FPS | 9.55 FPS |
+
+Buffer reuse reduced the regression, but did not establish a speed improvement.
+A separate CPU profile still found repeated texel detiling during replacement
+checks, allocation copies, and synchronous buffer/image readbacks.
+
+Candidate 42 compares exact native texel spans against a bounded CPU
+baseline. Padding changes can retain the image without uploading it again.
+Storage-image publication can also retile on the GPU, then copy only the
+covered texel spans into a current guest-memory snapshot. Native tests verify
+queued independent uploads, exact output bytes, padding-only edits, CPU texel
+replacement, baseline retirement, and CPU writes during the GPU wait. Both
+immediate and batched cases pass Vulkan synchronization validation. These
+checks establish memory behavior, not visual quality or controllable gameplay.
+Candidate 42's first 20-second interval measured 9.40 FPS. Its balanced
+comparison reduced the regression but still did not beat the CPU path, so
+`gpu_storage_detile` and `gpu_storage_retile` remain **disabled by default**.
+
+Candidate 45 tested native-order texel digests independently of GPU uploads.
+Coverage omits padding, and each digest is paired with its linear baseline so
+replacing that baseline invalidates the proof. The same native tests exercise
+CPU uploads, padding-only changes, first/last texel edits, stale-proof fallback
+and CPU writes during publication. A GPU-to-CPU upload transition also now
+releases the previous native snapshot instead of retaining an obsolete guard.
+The first title interval measured 9.50 FPS; balanced comparisons measured
+**9.46 FPS enabled versus 9.52 FPS disabled**, 660 frames per setting.
+`native_storage_texel_hashing` therefore remains **disabled by default**.
+
 ## Measurements
 
 The latest warmed title sequence measures approximately **9–10 FPS**. A
