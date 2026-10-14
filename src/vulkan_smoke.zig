@@ -3917,77 +3917,82 @@ fn runDeferredShaderMetadataProbe(allocator: std.mem.Allocator) !void {
 /// graphics consumer must see compute results only after the release label,
 /// and lookahead must retain each dispatch's changing register contents.
 fn runParallelCommandsProbe(allocator: std.mem.Allocator) !void {
-    for ([_]bool{ false, true }) |parallel| {
-        var renderer = try vulkan.Renderer.init(allocator, .{
-            .enable_timeline_scheduler = true,
-            .defer_small_storage_writes = true,
-        });
-        defer renderer.deinit();
-        var guest = GuestMemory{};
-        const producer = [_]u32{ vop1(1, 0, 4), 0xe0700000, 0x80000000, 0xbf810000 };
-        const consumer = [_]u32{ 0xe0300000, 0x80000000, 0xe0700000, 0x80010000, 0xbf810000 };
-        for (producer, 0..) |word, index| guest.word(0x100 + index * 4, word);
-        for (consumer, 0..) |word, index| guest.word(0x200 + index * 4, word);
-        var scheduler = gpu.QueueScheduler.init(allocator, renderer.dcbBackend(guest.interface()));
-        defer scheduler.deinit();
-        scheduler.parallel_commands = parallel;
-        const compute = gpu.resources.ShaderStage.compute;
-        for ([_]gpu.QueueKind{ .graphics, .compute }) |queue| {
-            const registers = scheduler.state(queue);
-            try registers.writeRegister(.shader, compute.programRegisterBase(), if (queue == .compute) 1 else 2);
-            try registers.writeRegister(.shader, compute.programRegisterBase() + 1, 0);
-            try registers.writeRegister(.shader, 0x213, (if (queue == .compute) @as(u32, 5) else 8) << 1);
-            for (0..3) |axis| try registers.writeRegister(.shader, 0x207 + @as(u32, @intCast(axis)), 1);
-        }
-        for (1..5) |round| {
-            var graphics: std.ArrayList(u32) = .empty;
-            defer graphics.deinit(allocator);
-            var compute_words: std.ArrayList(u32) = .empty;
-            defer compute_words.deinit(allocator);
-            const label: u32 = @intCast(round);
-            try graphics.appendSlice(allocator, &.{
-                command(gpu.pm4.wait_reg_mem, 6), 0x13, 0x8000, 0, label, 0xffffffff, 1,
+    const saved_waits = gpu.command_workers.queued_satisfied_waits;
+    defer gpu.command_workers.queued_satisfied_waits = saved_waits;
+    for ([_]bool{ false, true }) |queued_waits| {
+        gpu.command_workers.queued_satisfied_waits = queued_waits;
+        for ([_]bool{ false, true }) |parallel| {
+            var renderer = try vulkan.Renderer.init(allocator, .{
+                .enable_timeline_scheduler = true,
+                .defer_small_storage_writes = true,
             });
-            for (0..12) |index| {
-                const source: u32 = @intCast(0x2000 + index * 16);
-                const destination: u32 = @intCast(0x4000 + index * 16);
-                const expected: u32 = @intCast(round * 100 + index);
-                try compute_words.appendSlice(allocator, &.{
-                    command(gpu.pm4.set_sh_reg, 6),      compute.userDataBase(), source, 4 << 16, 1,    0, expected,
-                    command(gpu.pm4.dispatch_direct, 4), 1,                      1,      1,       0x41,
-                });
+            defer renderer.deinit();
+            var guest = GuestMemory{};
+            const producer = [_]u32{ vop1(1, 0, 4), 0xe0700000, 0x80000000, 0xbf810000 };
+            const consumer = [_]u32{ 0xe0300000, 0x80000000, 0xe0700000, 0x80010000, 0xbf810000 };
+            for (producer, 0..) |word, index| guest.word(0x100 + index * 4, word);
+            for (consumer, 0..) |word, index| guest.word(0x200 + index * 4, word);
+            var scheduler = gpu.QueueScheduler.init(allocator, renderer.dcbBackend(guest.interface()));
+            defer scheduler.deinit();
+            scheduler.parallel_commands = parallel;
+            const compute = gpu.resources.ShaderStage.compute;
+            for ([_]gpu.QueueKind{ .graphics, .compute }) |queue| {
+                const registers = scheduler.state(queue);
+                try registers.writeRegister(.shader, compute.programRegisterBase(), if (queue == .compute) 1 else 2);
+                try registers.writeRegister(.shader, compute.programRegisterBase() + 1, 0);
+                try registers.writeRegister(.shader, 0x213, (if (queue == .compute) @as(u32, 5) else 8) << 1);
+                for (0..3) |axis| try registers.writeRegister(.shader, 0x207 + @as(u32, @intCast(axis)), 1);
+            }
+            for (1..5) |round| {
+                var graphics: std.ArrayList(u32) = .empty;
+                defer graphics.deinit(allocator);
+                var compute_words: std.ArrayList(u32) = .empty;
+                defer compute_words.deinit(allocator);
+                const label: u32 = @intCast(round);
                 try graphics.appendSlice(allocator, &.{
-                    command(gpu.pm4.set_sh_reg, 9),      compute.userDataBase(), source, 4 << 16, 1,    0,                             destination,  4 << 16,     1, 0,
-                    command(gpu.pm4.dispatch_direct, 4), 1,                      1,      1,       0x41, command(gpu.pm4.copy_data, 5), 1 | (5 << 8), destination, 0, destination + 4,
-                    0,
+                    command(gpu.pm4.wait_reg_mem, 6), 0x13, 0x8000, 0, label, 0xffffffff, 1,
                 });
+                for (0..12) |index| {
+                    const source: u32 = @intCast(0x2000 + index * 16);
+                    const destination: u32 = @intCast(0x4000 + index * 16);
+                    const expected: u32 = @intCast(round * 100 + index);
+                    try compute_words.appendSlice(allocator, &.{
+                        command(gpu.pm4.set_sh_reg, 6),      compute.userDataBase(), source, 4 << 16, 1,    0, expected,
+                        command(gpu.pm4.dispatch_direct, 4), 1,                      1,      1,       0x41,
+                    });
+                    try graphics.appendSlice(allocator, &.{
+                        command(gpu.pm4.set_sh_reg, 9),      compute.userDataBase(), source, 4 << 16, 1,    0,                             destination,  4 << 16,     1, 0,
+                        command(gpu.pm4.dispatch_direct, 4), 1,                      1,      1,       0x41, command(gpu.pm4.copy_data, 5), 1 | (5 << 8), destination, 0, destination + 4,
+                        0,
+                    });
+                }
+                try compute_words.appendSlice(allocator, &.{
+                    command(gpu.pm4.release_mem, 7), 0x28 | (5 << 8) | (0x200 << 12),
+                    (1 << 16) | (1 << 29),           0x8000,
+                    0,                               label,
+                    0,                               0,
+                });
+                _ = try scheduler.submit(.graphics, graphics.items);
+                try std.testing.expect(scheduler.isBlocked(.graphics));
+                const released = try scheduler.submit(.compute, compute_words.items);
+                try std.testing.expectEqual(@as(usize, 2), released.completed_submissions);
+                try std.testing.expect(!scheduler.isBlocked(.graphics));
+                for (0..12) |index| {
+                    const destination = 0x4000 + index * 16;
+                    const expected: u32 = @intCast(round * 100 + index);
+                    var bytes: [4]u8 = undefined;
+                    try std.testing.expect(scheduler.backend.vtable.read(scheduler.backend.context, destination, &bytes));
+                    try std.testing.expectEqual(expected, std.mem.readInt(u32, &bytes, .little));
+                    try std.testing.expectEqual(expected, std.mem.readInt(u32, guest.bytes[destination + 4 ..][0..4], .little));
+                }
             }
-            try compute_words.appendSlice(allocator, &.{
-                command(gpu.pm4.release_mem, 7), 0x28 | (5 << 8) | (0x200 << 12),
-                (1 << 16) | (1 << 29),           0x8000,
-                0,                               label,
-                0,                               0,
-            });
-            _ = try scheduler.submit(.graphics, graphics.items);
-            try std.testing.expect(scheduler.isBlocked(.graphics));
-            const released = try scheduler.submit(.compute, compute_words.items);
-            try std.testing.expectEqual(@as(usize, 2), released.completed_submissions);
-            try std.testing.expect(!scheduler.isBlocked(.graphics));
-            for (0..12) |index| {
-                const destination = 0x4000 + index * 16;
-                const expected: u32 = @intCast(round * 100 + index);
-                var bytes: [4]u8 = undefined;
-                try std.testing.expect(scheduler.backend.vtable.read(scheduler.backend.context, destination, &bytes));
-                try std.testing.expectEqual(expected, std.mem.readInt(u32, &bytes, .little));
-                try std.testing.expectEqual(expected, std.mem.readInt(u32, guest.bytes[destination + 4 ..][0..4], .little));
+            if (parallel) {
+                try std.testing.expect(scheduler.command_pool.paired_batches >= 4);
+                try std.testing.expectEqual(@as(u64, 96), scheduler.command_pool.prepared_draws);
             }
-        }
-        if (parallel) {
-            try std.testing.expect(scheduler.command_pool.paired_batches >= 4);
-            try std.testing.expectEqual(@as(u64, 96), scheduler.command_pool.prepared_draws);
         }
     }
-    std.debug.print("Parallel command processors passed: serial/parallel agreement, 96 dispatches each, changing snapshots, cross-queue release/wait and GPU-produced COPY_DATA\n", .{});
+    std.debug.print("Parallel command processors passed: serial/parallel agreement with synchronous/queued satisfied waits, 96 dispatches each, changing snapshots, cross-queue release/wait and GPU-produced COPY_DATA\n", .{});
 }
 
 fn runInternalReleaseQueueProbe(allocator: std.mem.Allocator) !void {
@@ -4160,7 +4165,12 @@ fn runInternalReleaseQueueProbe(allocator: std.mem.Allocator) !void {
 }
 
 fn runDeferredReleaseProbe(allocator: std.mem.Allocator) !void {
-    for ([_]bool{ false, true }) |device_backing| try runDeferredReleaseCase(allocator, device_backing);
+    const saved_index = vulkan.backend.indexed_completion_buffers;
+    defer vulkan.backend.indexed_completion_buffers = saved_index;
+    for ([_]bool{ false, true }) |indexed| {
+        vulkan.backend.indexed_completion_buffers = indexed;
+        for ([_]bool{ false, true }) |device_backing| try runDeferredReleaseCase(allocator, device_backing);
+    }
     std.debug.print("Deferred releases passed: host/device buffers precede interrupt labels, internal labels retain large outputs, failed writes withhold completion, CPU reuse survives later cache drains\n", .{});
 }
 

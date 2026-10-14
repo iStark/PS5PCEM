@@ -5,6 +5,62 @@ Output is 1920×1080; the game still controls its internal surface dimensions.
 Existing shader caches were retained. The 25–30 FPS target is **not reached**.
 Rendering defects remain, and controllable gameplay is not established.
 
+## Follow-up: scalar analysis and queued completion
+
+The latest warmed title comparison measures **13.79 FPS**, versus
+**13.43 FPS** with the three new scalar-analysis optimizations disabled.
+Each setting covers 660 frames, distributed across the same eleven animation
+phases. These are title-screen results, not gameplay results.
+
+| Setting | Frames | Seconds | FPS |
+| --- | ---: | ---: | ---: |
+| Previous scalar analysis | 660 | 49.145 | 13.43 |
+| Stop dependency collection after saturation | 660 | 48.457 | 13.62 |
+| Also index scalar-value merges | 660 | 48.085 | 13.73 |
+| Also retain immutable graphics interfaces | 660 | 47.856 | 13.79 |
+
+The dependency optimization stops collecting an already-complete bit mask;
+scalar execution and memory reads still run. Indexed merges preserve the first
+matching SGPR/producer-PC pair, duplicate handling, ordering and full-capacity
+updates. Graphics interfaces are reused only for the exact immutable instruction
+allocation; modified programs retain the ordinary analysis.
+
+Earlier changes in this checkpoint reduce completion scans to dirty buffer
+slots, queue already-satisfied waits in FIFO order, and use the x86 string-copy
+engine for large disjoint host transfers. The same-build completion-index
+comparison inspected 255,024 candidates instead of 1,975,222,272. Its disabled
+diagnostic path also constructs a selection bitset, so its timing is not a
+direct comparison with the previous released implementation.
+
+The separate wait/copy comparison measured:
+
+| Setting | Frames | Seconds | FPS |
+| --- | ---: | ---: | ---: |
+| Synchronous satisfied waits, ordinary copies | 660 | 53.527 | 12.33 |
+| Queued satisfied waits | 660 | 52.408 | 12.59 |
+| Queued waits and large string copies | 660 | 51.394 | 12.84 |
+
+GPU color-to-storage conversion can now preserve a producer beginning before
+the destination. It validates CPU baselines and publishes only the outer
+prefix, retaining a GPU backing cropped to the destination. Producers extending
+past both ends still use the checked fallback. This path had **zero hits** in
+its title comparison (13.41 versus 13.31 FPS); no title gain is attributed to it.
+
+Validation: **542/542 GPU/Vulkan tests** and **12/12 ReleaseFast build steps**.
+Native probes cover queued/blocked waits and rejection ordering, GPU/CPU
+publication, prefix and partial image writes, descriptor batching, scalar loops,
+scalar calls, distinct scalar loads, resource workers and draw-upload rollover.
+The 64 full-image overwrite configurations also pass. Vulkan synchronization
+validation reports no errors in these probes. This is not a claim that all
+rendering defects are fixed.
+
+![ASTRO BOT title screen after scalar-analysis optimizations](../images/astro-bot-title-scalar-merges-2026-10-14.png)
+
+The screenshot is an actual renderer capture of the game-owned 3840×2160
+scanout; host output remains 1920×1080. Builds, tests, profiling and capture ran
+outside the FPS comparisons. **25 FPS is not reached; character control and
+later-scene correctness remain unverified.**
+
 ## Follow-up: bounded recording and storage proofs
 
 ASTRO BOT now limits CPU command recording to **250 microseconds** before an

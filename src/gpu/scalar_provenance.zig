@@ -12,6 +12,7 @@ const std = @import("std");
 const rdna2 = @import("rdna2");
 const shaders = @import("shaders.zig");
 const bit_sets = @import("bit_sets.zig");
+pub export var saturated_resource_dependencies: bool = true;
 
 pub const maximum_scalar_registers = 128;
 // Dense lighting shaders contain more than 250 distinct scalar loads. Keep
@@ -1463,6 +1464,10 @@ fn recordUserDataOperand(result: *Evaluation, operand: rdna2.Operand, count: usi
 }
 
 fn recordResourceUserData(result: *Evaluation, inst: *const rdna2.Instruction) void {
+    // This mask only accumulates dependencies. Once every entry word is
+    // included, later operands cannot refine it or alter other evaluator state.
+    if (result.address_user_data_mask == std.math.maxInt(u64) and
+        @atomicLoad(bool, &saturated_resource_dependencies, .monotonic)) return;
     switch (inst.family) {
         // Pin comparisons and carry producers as well as the eventual pointer.
         // A selected pointer's value alone omits the condition that chose it.
@@ -2189,6 +2194,42 @@ fn testBindings(program: u64, srt: u64) shaders.StageBindings {
         .srt_address = srt,
         .direct_pointers = .{},
     };
+}
+
+test "saturated resource dependencies preserve later scalar execution and memory reads" {
+    const saved = saturated_resource_dependencies;
+    defer saturated_resource_dependencies = saved;
+    var bytes: [4]u8 = undefined;
+    std.mem.writeInt(u32, &bytes, 0xdecafbad, .little);
+    var memory = TestMemory{ .base = 0x1000, .bytes = &bytes };
+    const bindings = testBindings(0x8000, memory.base);
+    const instructions = [_]rdna2.Instruction{
+        .{ .pc = 0, .word_count = 1, .family = .sop1, .opcode = .s_mov_b32, .dst = .{ .kind = .sgpr, .reg = 4 }, .src0 = .{ .kind = .sgpr, .reg = 0 }, .src_count = 1 },
+        .{ .pc = 4, .word_count = 1, .family = .vop1, .opcode = .v_readfirstlane_b32, .dst = .{ .kind = .sgpr, .reg = 5 }, .src0 = .{ .kind = .vgpr, .reg = 0 }, .src_count = 1 },
+        .{ .pc = 8, .word_count = 1, .family = .sop2, .opcode = .s_add_u32, .dst = .{ .kind = .sgpr, .reg = 6 }, .src0 = .{ .kind = .sgpr, .reg = 4 }, .src1 = .{ .kind = .integer_inline_constant, .value = 7 }, .src_count = 2 },
+        .{ .pc = 12, .word_count = 2, .family = .smem, .opcode = .s_load_dword, .dst = .{ .kind = .sgpr, .reg = 8 }, .src0 = .{ .kind = .sgpr, .reg = 0 }, .src1 = .{ .kind = .integer_inline_constant, .value = 0 }, .src_count = 2, .data_words = 1 },
+        .{ .pc = 20, .word_count = 1, .family = .sopp, .opcode = .s_endpgm },
+    };
+    const previous = try std.testing.allocator.create(Evaluation);
+    defer std.testing.allocator.destroy(previous);
+    const current = try std.testing.allocator.create(Evaluation);
+    defer std.testing.allocator.destroy(current);
+    saturated_resource_dependencies = false;
+    evaluateDecodedResourceStateInto(previous, memory.reader(), &bindings, &instructions);
+    const reads = memory.read_count;
+    memory.read_count = 0;
+    saturated_resource_dependencies = true;
+    evaluateDecodedResourceStateInto(current, memory.reader(), &bindings, &instructions);
+    try std.testing.expectEqual(reads, memory.read_count);
+    try std.testing.expect(reads != 0);
+    try std.testing.expectEqual(@as(u64, std.math.maxInt(u64)), current.address_user_data_mask);
+    try std.testing.expectEqual(@as(u32, 0x1007), current.registers[6].value);
+    try std.testing.expectEqual(@as(u32, 0xdecafbad), current.registers[8].value);
+    try std.testing.expectEqualDeep(previous.registers, current.registers);
+    try std.testing.expectEqualDeep(previous.user_data_dependencies, current.user_data_dependencies);
+    try std.testing.expectEqualDeep(previous.loadSlice(), current.loadSlice());
+    try std.testing.expectEqual(previous.address_user_data_mask, current.address_user_data_mask);
+    try std.testing.expectEqual(previous.stop_reason, current.stop_reason);
 }
 
 test "vector scalar fast path preserves loads, dependency masks and scalar clobbers" {

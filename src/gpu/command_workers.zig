@@ -13,6 +13,7 @@ const allocator = std.heap.page_allocator;
 pub export var incremental_command_snapshots: bool = true;
 pub export var shared_command_banks: bool = true;
 pub export var queued_ordering_commands: bool = true;
+pub export var queued_satisfied_waits: bool = true;
 pub export var command_lookahead_limit: u32 = 64;
 const maximum_lookahead = 64;
 const bank_names = .{ "config", "context", "shader", "uconfig", "context_stack" };
@@ -306,9 +307,12 @@ pub const Execution = struct {
 
     fn prepareControl(self: *Execution, operation: Operation) bool {
         // These packets contain values only. Reads, borrowed write payloads,
-        // waits and frame boundaries retain their synchronous FIFO requests.
+        // unsatisfied waits and frame boundaries retain synchronous requests.
+        // A satisfied wait has already read its condition through the FIFO;
+        // its notification can precede subsequent callbacks in the same queue.
         switch (operation) {
             .acquire, .release, .dma_data, .event => {},
+            .wait => |value| std.debug.assert(value.satisfied),
             else => unreachable,
         }
         if (!@atomicLoad(bool, &queued_ordering_commands, .monotonic)) return self.request(operation);
@@ -344,7 +348,10 @@ pub const Execution = struct {
         return from(raw).prepareControl(.{ .release = value });
     }
     fn wait(raw: ?*anyopaque, value: state.WaitRegMem, satisfied: bool) bool {
-        return from(raw).request(.{ .wait = .{ .value = value, .satisfied = satisfied } });
+        const self = from(raw);
+        const operation: Operation = .{ .wait = .{ .value = value, .satisfied = satisfied } };
+        if (satisfied and @atomicLoad(bool, &queued_satisfied_waits, .monotonic)) return self.prepareControl(operation);
+        return self.request(operation);
     }
     fn writeData(raw: ?*anyopaque, value: state.WriteData, words: []const u32) bool {
         return from(raw).request(.{ .write_data = .{ .value = value, .words = words } });
@@ -604,8 +611,9 @@ test "queued ordering packets preserve serial effects rejection state and frame 
         count: usize = 0,
         label: u32 = 0,
         reject: u32 = 0,
+        reject_wait: u32 = 0,
         wrong_thread: bool = false,
-        const vtable = executor.Backend.VTable{ .read = read, .write = write, .acquire = acquire, .release = release, .event = event, .draw = draw, .flip = flip };
+        const vtable = executor.Backend.VTable{ .read = read, .write = write, .acquire = acquire, .release = release, .event = event, .draw = draw, .flip = flip, .wait = wait };
         fn from(raw: ?*anyopaque) *@This() {
             return @ptrCast(@alignCast(raw.?));
         }
@@ -636,6 +644,11 @@ test "queued ordering packets preserve serial effects rejection state and frame 
         }
         fn event(raw: ?*anyopaque, value: state.EventWrite) bool {
             return from(raw).record(4, value.event_type);
+        }
+        fn wait(raw: ?*anyopaque, value: state.WaitRegMem, satisfied: bool) bool {
+            const self = from(raw);
+            _ = self.record(if (satisfied) 7 else 8, value.reference);
+            return self.reject_wait == 0 or value.reference != self.reject_wait;
         }
         fn draw(raw: ?*anyopaque, registers: *const state.State, packet: pm4.Packet) bool {
             const value = registers.readRegister(.context, 0x318) orelse return false;
@@ -678,52 +691,63 @@ test "queued ordering packets preserve serial effects rejection state and frame 
         });
         if (n % 23 == 0) try stream.appendSlice(a, &.{ command(pm4.wait_reg_mem, 6), 0x13, 0x1000, 0, n, 0xffffffff, 1 });
     }
+    const finish_offset = stream.items.len;
     try stream.appendSlice(a, &.{ command(pm4.nop, 5) | (@as(u32, pm4.custom.flip) << 2), 1, 0, 0, 0, 0 });
     var pool = Pool{};
     defer pool.deinit();
+    const saved_waits = queued_satisfied_waits;
     const saved_shared = shared_command_banks;
     const saved_limit = command_lookahead_limit;
     defer {
+        queued_satisfied_waits = saved_waits;
         shared_command_banks = saved_shared;
         command_lookahead_limit = saved_limit;
     }
-    for ([_]bool{ false, true }) |shared| {
-        shared_command_banks = shared;
-        for ([_]u32{ 4, 64 }) |limit| {
-            command_lookahead_limit = limit;
-            for ([_]u32{ 0, 2, 67, 0 }) |reject| {
-                var serial_host = Host{ .owner = std.Thread.getCurrentId(), .reject = reject };
-                var parallel_host = Host{ .owner = std.Thread.getCurrentId(), .reject = reject };
-                const serial_state = try a.create(state.State);
-                defer a.destroy(serial_state);
-                serial_state.* = .{};
-                const parallel_state = try a.create(state.State);
-                defer a.destroy(parallel_state);
-                parallel_state.* = .{};
-                var serial = executor.DcbExecutor{ .state = serial_state, .backend = serial_host.interface(), .allocator = a };
-                const serial_result = serial.execute(stream.items);
-                var task = Execution{ .registers = parallel_state, .stream = stream.items, .backend = parallel_host.interface() };
-                defer task.deinit();
-                try std.testing.expect(pool.run(.{ &task, null }));
-                if (reject == 0) {
-                    try std.testing.expectEqual(executor.Status.complete, (try serial_result).status);
-                    try std.testing.expectEqual(@as(?executor.Error, null), task.failure);
-                    try std.testing.expectEqual(executor.Status.complete, task.result.?.status);
-                    try std.testing.expectEqual(@as(u8, 6), parallel_host.items[parallel_host.count - 1].kind);
-                    try std.testing.expectEqual(@as(u64, 100), parallel_host.items[parallel_host.count - 1].value);
-                    try std.testing.expectEqual(@as(u64, 300), task.prepared_controls);
-                } else {
-                    try std.testing.expectError(error.BackendRejected, serial_result);
-                    try std.testing.expectEqual(@as(?executor.Error, error.BackendRejected), task.failure);
+    for ([_]bool{ false, true }) |queued_waits| {
+        queued_satisfied_waits = queued_waits;
+        for ([_]bool{ false, true }) |blocked| {
+            stream.shrinkRetainingCapacity(finish_offset);
+            if (blocked) try stream.appendSlice(a, &.{ command(pm4.wait_reg_mem, 6), 0x13, 0x1000, 0, 101, 0xffffffff, 1 });
+            try stream.appendSlice(a, &.{ command(pm4.nop, 5) | (@as(u32, pm4.custom.flip) << 2), 1, 0, 0, 0, 0 });
+            for ([_]bool{ false, true }) |shared| {
+                shared_command_banks = shared;
+                for ([_]u32{ 4, 64 }) |limit| {
+                    command_lookahead_limit = limit;
+                    for ([_]u32{ 0, 2, 67, 0x10000 + 23, 0x10000 + 69 }) |reject| {
+                        var serial_host = Host{ .owner = std.Thread.getCurrentId(), .reject = if (reject < 0x10000) reject else 0, .reject_wait = if (reject >= 0x10000) reject - 0x10000 else 0 };
+                        var parallel_host = Host{ .owner = std.Thread.getCurrentId(), .reject = if (reject < 0x10000) reject else 0, .reject_wait = if (reject >= 0x10000) reject - 0x10000 else 0 };
+                        const serial_state = try a.create(state.State);
+                        defer a.destroy(serial_state);
+                        serial_state.* = .{};
+                        const parallel_state = try a.create(state.State);
+                        defer a.destroy(parallel_state);
+                        parallel_state.* = .{};
+                        var serial = executor.DcbExecutor{ .state = serial_state, .backend = serial_host.interface(), .allocator = a };
+                        const serial_result = serial.execute(stream.items);
+                        var task = Execution{ .registers = parallel_state, .stream = stream.items, .backend = parallel_host.interface() };
+                        defer task.deinit();
+                        try std.testing.expect(pool.run(.{ &task, null }));
+                        if (reject == 0) {
+                            try std.testing.expectEqual(if (blocked) executor.Status.blocked else executor.Status.complete, (try serial_result).status);
+                            try std.testing.expectEqual(@as(?executor.Error, null), task.failure);
+                            try std.testing.expectEqual(if (blocked) executor.Status.blocked else executor.Status.complete, task.result.?.status);
+                            try std.testing.expectEqual(@as(u8, if (blocked) 8 else 6), parallel_host.items[parallel_host.count - 1].kind);
+                            try std.testing.expectEqual(@as(u64, if (blocked) 101 else 100), parallel_host.items[parallel_host.count - 1].value);
+                            try std.testing.expectEqual(@as(u64, if (queued_waits) 304 else 300), task.prepared_controls);
+                        } else {
+                            try std.testing.expectError(error.BackendRejected, serial_result);
+                            try std.testing.expectEqual(@as(?executor.Error, error.BackendRejected), task.failure);
+                        }
+                        try std.testing.expectEqualDeep(serial_host.items[0..serial_host.count], parallel_host.items[0..parallel_host.count]);
+                        try std.testing.expectEqualDeep(serial_state.*, parallel_state.*);
+                        try std.testing.expect(!parallel_host.wrong_thread);
+                        try std.testing.expectEqual(@as(usize, 0), pool.pending);
+                        try std.testing.expect(pool.peak_pending <= maximum_lookahead + 1);
+                        for (&pool.workers) |*worker| for (&worker.bank_store.records) |*records| for (records) |bank| {
+                            try std.testing.expectEqual(@as(usize, 0), bank.references);
+                        };
+                    }
                 }
-                try std.testing.expectEqualDeep(serial_host.items[0..serial_host.count], parallel_host.items[0..parallel_host.count]);
-                try std.testing.expectEqualDeep(serial_state.*, parallel_state.*);
-                try std.testing.expect(!parallel_host.wrong_thread);
-                try std.testing.expectEqual(@as(usize, 0), pool.pending);
-                try std.testing.expect(pool.peak_pending <= maximum_lookahead + 1);
-                for (&pool.workers) |*worker| for (&worker.bank_store.records) |*records| for (records) |bank| {
-                    try std.testing.expectEqual(@as(usize, 0), bank.references);
-                };
             }
         }
     }

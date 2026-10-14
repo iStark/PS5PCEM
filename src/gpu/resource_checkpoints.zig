@@ -8,6 +8,49 @@ const scalar = @import("scalar_provenance.zig");
 const shaders = @import("shaders.zig");
 
 pub const Kind = enum { resource, sampled };
+pub export var cached_graphics_interfaces: bool = true;
+
+pub const GraphicsInterface = struct {
+    exports: u64 = 0,
+    parameters: u32 = 0,
+    attributes: u32 = 0,
+    components: [32]u4 = @splat(0),
+    color_attachments: u32 = 0,
+
+    fn collect(instructions: []const rdna2.Instruction) GraphicsInterface {
+        var result = GraphicsInterface{};
+        for (instructions) |inst| {
+            if (inst.opcode == .exp) {
+                result.exports |= @as(u64, 1) << inst.export_target;
+                if (inst.export_target >= 0x20) result.parameters |= @as(u32, 1) << @intCast(inst.export_target - 0x20);
+                if (inst.export_target < @import("resources.zig").color_target_count)
+                    result.color_attachments = @max(result.color_attachments, @as(u32, inst.export_target) + 1);
+            }
+            switch (inst.opcode) {
+                .v_interp_p1_f32, .v_interp_p2_f32, .v_interp_mov_f32 => {
+                    if (inst.src1.kind == .integer_inline_constant and inst.src1.value < 32) {
+                        const attribute: usize = @intCast(inst.src1.value);
+                        result.attributes |= @as(u32, 1) << @intCast(attribute);
+                        if (inst.src2.value < 4) result.components[attribute] |= @as(u4, 1) << @intCast(inst.src2.value);
+                    }
+                },
+                else => {},
+            }
+        }
+        return result;
+    }
+};
+
+/// Interface declarations belong to the exact immutable decoded allocation.
+/// Inlined fetch programs and uncached specializations collect their own data.
+pub fn graphicsInterface(instructions: []const rdna2.Instruction, plan: ?*const Plan) GraphicsInterface {
+    if (@atomicLoad(bool, &cached_graphics_interfaces, .monotonic)) {
+        if (plan) |retained| if (retained.matches(instructions)) {
+            if (retained.graphics_interface) |interface| return interface;
+        };
+    }
+    return GraphicsInterface.collect(instructions);
+}
 
 var next_plan_identity: std.atomic.Value(u64) = .init(1);
 
@@ -35,6 +78,7 @@ pub const Plan = struct {
     /// Conservative ratio between dense visits and indexed visits, including
     /// a branch landing inside a skipped vector run. Manual plans opt out.
     maximum_dense_step_ratio: u32 = std.math.maxInt(u32),
+    graphics_interface: ?GraphicsInterface = null,
 
     pub fn init(allocator: std.mem.Allocator, instructions: []const rdna2.Instruction) !Plan {
         const resource = try collect(allocator, instructions, .resource);
@@ -60,6 +104,7 @@ pub const Plan = struct {
             .reads_only_resources = readsOnlyResources(instructions),
             .forward_only = walksForward(instructions),
             .maximum_dense_step_ratio = maximumDenseStepRatio(instructions.len, scalar_steps),
+            .graphics_interface = GraphicsInterface.collect(instructions),
         };
     }
 
@@ -98,6 +143,44 @@ fn maximumDenseStepRatio(instruction_count: usize, steps: []const u32) u32 {
     var maximum: usize = steps[0] + 1;
     for (steps[1..], steps[0 .. steps.len - 1]) |next, previous| maximum = @max(maximum, next - previous);
     return @intCast(@max(maximum, instruction_count - steps[steps.len - 1]));
+}
+
+test "retained graphics interfaces distinguish reconstructed programs and absent plans" {
+    const a = std.testing.allocator;
+    const saved = cached_graphics_interfaces;
+    defer cached_graphics_interfaces = saved;
+    const first = [_]rdna2.Instruction{
+        .{ .pc = 0, .family = .exp, .opcode = .exp, .export_target = 0x20 },
+        .{ .pc = 8, .family = .exp, .opcode = .exp, .export_target = 0x27 },
+        .{ .pc = 16, .family = .exp, .opcode = .exp, .export_target = 5 },
+        .{ .pc = 24, .family = .vintrp, .opcode = .v_interp_p1_f32, .src1 = .{ .kind = .integer_inline_constant, .value = 2 }, .src2 = .{ .kind = .integer_inline_constant, .value = 0 } },
+        .{ .pc = 28, .family = .vintrp, .opcode = .v_interp_p2_f32, .src1 = .{ .kind = .integer_inline_constant, .value = 2 }, .src2 = .{ .kind = .integer_inline_constant, .value = 3 } },
+    };
+    const second = [_]rdna2.Instruction{
+        .{ .pc = 0, .family = .exp, .opcode = .exp, .export_target = 0x2f },
+        .{ .pc = 8, .family = .exp, .opcode = .exp, .export_target = 1 },
+    };
+    var retained = try Plan.init(a, &first);
+    defer retained.deinit(a);
+    for ([_]bool{ false, true }) |enabled| {
+        cached_graphics_interfaces = enabled;
+        const original = graphicsInterface(&first, &retained);
+        try std.testing.expectEqual(@as(u32, 0x81), original.parameters);
+        try std.testing.expectEqual(@as(u32, 4), original.attributes);
+        try std.testing.expectEqual(@as(u4, 9), original.components[2]);
+        try std.testing.expectEqual(@as(u32, 6), original.color_attachments);
+        try std.testing.expectEqualDeep(original, graphicsInterface(&first, null));
+        const replaced = graphicsInterface(&second, &retained);
+        try std.testing.expectEqual(@as(u32, 1 << 15), replaced.parameters);
+        try std.testing.expectEqual(@as(u32, 0), replaced.attributes);
+        try std.testing.expectEqual(@as(u32, 2), replaced.color_attachments);
+        try std.testing.expectEqualDeep(replaced, graphicsInterface(&second, null));
+        // A manual plan has no retained interface even if its slice matches.
+        const interface = retained.graphics_interface;
+        retained.graphics_interface = null;
+        try std.testing.expectEqualDeep(original, graphicsInterface(&first, &retained));
+        retained.graphics_interface = interface;
+    }
 }
 
 fn walksForward(instructions: []const rdna2.Instruction) bool {

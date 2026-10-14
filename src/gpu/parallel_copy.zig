@@ -5,6 +5,31 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 pub var guest_copy_pool = Pool{};
+pub export var rep_large_copies: bool = true;
+
+/// Keep the ordinary inline copy for short spans. Long host transfers benefit
+/// from the x86 string-copy engine without requiring AVX or aligned addresses.
+/// The caller must provide disjoint ranges of equal length, as for @memcpy.
+fn copyBytes(destination: []u8, source: []const u8) void {
+    std.debug.assert(destination.len == source.len);
+    if (builtin.os.tag == .windows and builtin.cpu.arch == .x86_64) {
+        if (destination.len >= 2 * 1024 * 1024 and @atomicLoad(bool, &rep_large_copies, .monotonic)) {
+            var dst = destination.ptr;
+            var src = source.ptr;
+            var remaining = destination.len;
+            asm volatile ("rep movsb"
+                : [dst] "={rdi}" (dst),
+                  [src] "={rsi}" (src),
+                  [remaining] "={rcx}" (remaining),
+                : [destination] "0" (dst),
+                  [source] "1" (src),
+                  [length] "2" (remaining),
+                : .{ .memory = true });
+            return;
+        }
+    }
+    @memcpy(destination, source);
+}
 
 /// Fingerprint every byte using the same partitioning regardless of the pool's
 /// worker count. Embeddings use this for both guest memory and copied snapshots.
@@ -57,7 +82,7 @@ pub const Pool = struct {
                 } else if (self.hashes) |hashes| {
                     hashPartitions(self.source, hashes, self.first_hash, self.end_hash);
                 } else {
-                    @memcpy(self.destination, self.source);
+                    copyBytes(self.destination, self.source);
                 }
                 self.complete.set(io);
             }
@@ -72,7 +97,7 @@ pub const Pool = struct {
         if (builtin.single_threaded or participants <= 1 or
             destination.len < minimum_bytes or !self.lock.tryLock())
         {
-            @memcpy(destination, source);
+            copyBytes(destination, source);
             return;
         }
         defer self.lock.unlock();
@@ -91,7 +116,7 @@ pub const Pool = struct {
             worker.ready.set(io);
             offset = end;
         }
-        @memcpy(destination[offset..], source[offset..]);
+        copyBytes(destination[offset..], source[offset..]);
         self.joinWorkers(count);
     }
 
@@ -208,6 +233,36 @@ pub const Pool = struct {
         self.start_failed = false;
     }
 };
+
+test "long host copies preserve exact boundaries for each worker count" {
+    const saved = rep_large_copies;
+    defer rep_large_copies = saved;
+    const a = std.testing.allocator;
+    const maximum = 12 * 1024 * 1024 + 7;
+    const source = try a.alloc(u8, maximum + 128);
+    defer a.free(source);
+    const destination = try a.alloc(u8, maximum + 128);
+    defer a.free(destination);
+    for (source, 0..) |*byte, index| byte.* = @truncate(index *% 17 +% 3);
+    var pool = Pool{};
+    defer pool.deinit();
+    for ([_]bool{ false, true }) |enabled| {
+        rep_large_copies = enabled;
+        for (1..5) |participants| {
+            pool.participants.store(@intCast(participants), .release);
+            for ([_]usize{ 0, 1, 15, 31, 63 }) |alignment| {
+                for ([_]usize{ 0, 31, 2 * 1024 * 1024 - 1, 2 * 1024 * 1024, 2 * 1024 * 1024 + 1, maximum }) |length| {
+                    const source_offset = 63 - alignment;
+                    @memset(destination[0 .. alignment + length + 64], 0x7d);
+                    pool.copy(destination[alignment..][0..length], source[source_offset..][0..length]);
+                    try std.testing.expectEqualSlices(u8, source[source_offset..][0..length], destination[alignment..][0..length]);
+                    try std.testing.expect(std.mem.allEqual(u8, destination[0..alignment], 0x7d));
+                    try std.testing.expect(std.mem.allEqual(u8, destination[alignment + length ..][0..64], 0x7d));
+                }
+            }
+        }
+    }
+}
 
 test "parallel copies join before return and preserve unaligned boundaries" {
     var pool = Pool{ .participants = .init(4) };
