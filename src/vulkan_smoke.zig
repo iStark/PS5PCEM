@@ -5995,7 +5995,66 @@ fn runStorageImageCpuReuseProbe(allocator: std.mem.Allocator) !void {
     for ([_]bool{ false, true }) |fingerprint| try runStorageImageCpuReuseCase(allocator, fingerprint, false);
     try runStorageImageCpuReuseCase(allocator, true, true);
     try runStorageImageCpuClearCase(allocator);
+    for ([_]bool{ false, true }) |discard| {
+        for ([_]bool{ false, true }) |pending| {
+            try runStorageImageOverwriteCase(allocator, discard, false, pending);
+            try runStorageImageOverwriteCase(allocator, discard, true, pending);
+        }
+    }
     std.debug.print("storage CPU reuse passed: deferred writes, CPU replacement, padding, and rebind\n", .{});
+}
+
+fn runStorageImageOverwriteCase(allocator: std.mem.Allocator, discard: bool, partial: bool, pending: bool) !void {
+    const previous = @atomicLoad(bool, &vulkan.backend.discard_overwritten_storage_images, .monotonic);
+    defer @atomicStore(bool, &vulkan.backend.discard_overwritten_storage_images, previous, .monotonic);
+    @atomicStore(bool, &vulkan.backend.discard_overwritten_storage_images, discard, .monotonic);
+    var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true });
+    defer renderer.deinit();
+    var guest = GuestMemory{};
+    const backend = renderer.dcbBackend(guest.interface());
+    // Write one texel outside a half-allocation clear. R32_UINT deliberately
+    // takes the generic packed fill path, not the native color-clear shortcut.
+    const store = [_]u32{ vop1(1, 0, 128), vop1(1, 1, 136), vop1(1, 2, 8), 0xf020_0108, 0x0000_0200, 0xbf81_0000 };
+    const clear = [_]u32{ 0xd746_0004, 0x0401_0c08, vop1(1, 0, 4), vop1(1, 1, 5), vop1(1, 2, 6), vop1(1, 3, 7), 0xe01c_2000, 0x8000_0004, 0xbf81_0000 };
+    for (store, 0..) |word, i| guest.word(0x100 + i * 4, word);
+    for (clear, 0..) |word, i| guest.word(0x200 + i * 4, word);
+    var state = gpu.State{};
+    const compute = gpu.resources.ShaderStage.compute;
+    var descriptor = imageDescriptorWords(0x8000, 64, 16);
+    descriptor[1] = (descriptor[1] & ~(@as(u32, 0xff) << 20)) | (@as(u32, 20) << 20);
+    const texture = try gpu.TextureLayout.fromImage(try gpu.resources.decodeImageDescriptor(&descriptor));
+    try std.testing.expectEqual(@as(u64, 4096), texture.required_source_bytes);
+    try state.writeRegister(.shader, compute.programRegisterBase(), 1);
+    try state.writeRegister(.shader, compute.programRegisterBase() + 1, 0);
+    try state.writeRegister(.shader, 0x213, 9 << 1);
+    for (descriptor, 0..) |word, i| try state.writeRegister(.shader, compute.userDataBase() + @as(u32, @intCast(i)), word);
+    try state.writeRegister(.shader, compute.userDataBase() + 8, 42);
+    _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
+    if (!pending) try std.testing.expect(backend.vtable.release.?(backend.context, std.mem.zeroes(gpu.state.ReleaseMem)));
+    try std.testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, guest.bytes[0x8800..][0..4], .little));
+    const before = renderer.frame_profile.storage_image_readbacks;
+    const records: u32 = if (partial) 128 else 256;
+    try state.writeRegister(.shader, compute.programRegisterBase(), 2);
+    try state.writeRegister(.shader, 0x213, (8 << 1) | (1 << 7));
+    for ([_]u32{ 0x8000, 16 << 16, records, (75 << 12) | 0xfac, 0x12345678, 0x12345678, 0x12345678, 0x12345678 }, 0..) |word, i|
+        try state.writeRegister(.shader, compute.userDataBase() + @as(u32, @intCast(i)), word);
+    _ = try renderer.dispatchRdna2State(&state, .{ 64, 1, 1 }, .{ records / 64, 1, 1 });
+    try std.testing.expectEqual(before + @as(u64, if (discard and !partial and !pending) 0 else 1), renderer.frame_profile.storage_image_readbacks);
+    for (0..records * 4) |i| try std.testing.expectEqual(@as(u32, 0x12345678), std.mem.readInt(u32, guest.bytes[0x8000 + i * 4 ..][0..4], .little));
+    if (partial) try std.testing.expectEqual(@as(u32, 42), std.mem.readInt(u32, guest.bytes[0x8800..][0..4], .little));
+    // A subsequent GPU write must reload the cleared backing, including texels
+    // untouched by this shader. Invalidating only the dirty flag would fail.
+    try state.writeRegister(.shader, compute.programRegisterBase(), 1);
+    try state.writeRegister(.shader, 0x213, 9 << 1);
+    for (descriptor, 0..) |word, i| try state.writeRegister(.shader, compute.userDataBase() + @as(u32, @intCast(i)), word);
+    try state.writeRegister(.shader, compute.userDataBase() + 8, 43);
+    _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
+    try renderer.flushPendingGuestWrites();
+    try std.testing.expectEqual(@as(u32, 43), std.mem.readInt(u32, guest.bytes[0x8800..][0..4], .little));
+    for (0..records * 4) |i| {
+        const expected: u32 = if (i == 512) 43 else 0x12345678;
+        try std.testing.expectEqual(expected, std.mem.readInt(u32, guest.bytes[0x8000 + i * 4 ..][0..4], .little));
+    }
 }
 
 fn runStorageImageCpuReuseCase(allocator: std.mem.Allocator, fingerprint: bool, tracked: bool) !void {
@@ -8422,10 +8481,120 @@ fn runGdsOrderedCountWave32(allocator: std.mem.Allocator) !void {
 fn runGdsResidentProbe(allocator: std.mem.Allocator) !void {
     const previous = @atomicLoad(bool, &vulkan.backend.native_gds_dma, .monotonic);
     defer @atomicStore(bool, &vulkan.backend.native_gds_dma, previous, .monotonic);
+    const previous_snapshots = @atomicLoad(bool, &vulkan.backend.deferred_gds_snapshots, .monotonic);
+    defer @atomicStore(bool, &vulkan.backend.deferred_gds_snapshots, previous_snapshots, .monotonic);
+    @atomicStore(bool, &vulkan.backend.deferred_gds_snapshots, true, .monotonic);
     for ([_]bool{ false, true }) |native| {
         @atomicStore(bool, &vulkan.backend.native_gds_dma, native, .monotonic);
         try runGdsResidentMode(allocator, native);
     }
+    const previous_batch = @atomicLoad(bool, &vulkan.backend.batch_gds_transfers, .monotonic);
+    defer @atomicStore(bool, &vulkan.backend.batch_gds_transfers, previous_batch, .monotonic);
+    for ([_]bool{ false, true }) |batch| {
+        @atomicStore(bool, &vulkan.backend.batch_gds_transfers, batch, .monotonic);
+        try runStandaloneGdsTransfers(allocator, batch);
+    }
+    try runGdsSnapshotRecordingFailure(allocator);
+}
+
+fn runGdsSnapshotRecordingFailure(allocator: std.mem.Allocator) !void {
+    const vk = vulkan.api;
+    const Failure = struct {
+        fn end(_: vk.CommandBuffer) callconv(vk.call) vk.Result {
+            return vk.error_out_of_host_memory;
+        }
+    };
+    const previous_batch = @atomicLoad(bool, &vulkan.backend.batch_gds_transfers, .monotonic);
+    defer @atomicStore(bool, &vulkan.backend.batch_gds_transfers, previous_batch, .monotonic);
+    @atomicStore(bool, &vulkan.backend.batch_gds_transfers, false, .monotonic);
+    const previous_ready = @atomicLoad(bool, &vulkan.backend.avoid_completed_gds_snapshots, .monotonic);
+    defer @atomicStore(bool, &vulkan.backend.avoid_completed_gds_snapshots, previous_ready, .monotonic);
+    @atomicStore(bool, &vulkan.backend.avoid_completed_gds_snapshots, false, .monotonic);
+    var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true, .defer_internal_releases = true });
+    defer renderer.deinit();
+    var guest = GuestMemory{};
+    const backend = renderer.dcbBackend(guest.interface());
+    var dma = std.mem.zeroes(gpu.state.DmaData);
+    dma.source = 2;
+    dma.source_address = 0x12345678;
+    dma.destination = 1;
+    dma.destination_address = 0x100;
+    dma.byte_count = 8;
+    try std.testing.expect(backend.vtable.dma_data.?(backend.context, dma));
+    dma.source = 1;
+    dma.source_address = 0x100;
+    dma.destination = 0;
+    dma.destination_address = 0x18000;
+    {
+        const original = renderer.device_functions.end_command_buffer;
+        defer renderer.device_functions.end_command_buffer = original;
+        renderer.device_functions.end_command_buffer = Failure.end;
+        try std.testing.expect(!backend.vtable.dma_data.?(backend.context, dma));
+    }
+    try std.testing.expectEqual(@as(usize, 0), renderer.deferred_internal_release_count);
+    try std.testing.expect(renderer.recording_command_buffer == null);
+    try std.testing.expectEqual(@as(u64, 0), renderer.gds_dma_snapshots);
+    try std.testing.expectEqual(@as(u64, 0), std.mem.readInt(u64, guest.bytes[0x18000..][0..8], .little));
+    try std.testing.expect(backend.vtable.dma_data.?(backend.context, dma));
+    var observed: [8]u8 = undefined;
+    try std.testing.expect(backend.vtable.read_wait.?(backend.context, dma.destination_address, &observed));
+    try std.testing.expectEqual(@as(u64, 0x1234567812345678), std.mem.readInt(u64, &observed, .little));
+    std.debug.print("GDS snapshot recording failure passed: no orphan publication; retry preserves the value\n", .{});
+}
+
+fn runStandaloneGdsTransfers(allocator: std.mem.Allocator, batch: bool) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true, .defer_internal_releases = true });
+    defer renderer.deinit();
+    var guest = GuestMemory{};
+    const backend = renderer.dcbBackend(guest.interface());
+    var fill = std.mem.zeroes(gpu.state.DmaData);
+    fill.source = 2;
+    fill.source_address = 0x12345678;
+    fill.destination = 1;
+    fill.destination_address = 0x100;
+    fill.byte_count = 8;
+    var copy = fill;
+    copy.source = 1;
+    copy.source_address = 0x100;
+    copy.destination = 0;
+    copy.destination_address = 0x18000;
+    const before = renderer.submitted_tick;
+    try std.testing.expect(backend.vtable.dma_data.?(backend.context, fill));
+    try std.testing.expect(backend.vtable.dma_data.?(backend.context, copy));
+    fill.source_address = 0xaabbccdd;
+    try std.testing.expect(backend.vtable.dma_data.?(backend.context, fill));
+    try std.testing.expect(!renderer.draw_batch_active);
+    if (batch) {
+        try std.testing.expectEqual(before, renderer.submitted_tick);
+        try std.testing.expect(renderer.open_batch_commands);
+    } else try std.testing.expect(renderer.submitted_tick >= before + 2);
+    var observed: [8]u8 = undefined;
+    try std.testing.expect(backend.vtable.read_wait.?(backend.context, copy.destination_address, &observed));
+    try std.testing.expectEqual(@as(u64, 0x1234567812345678), std.mem.readInt(u64, &observed, .little));
+    const gds = try renderer.readbackGdsStorage();
+    try std.testing.expectEqual(@as(u64, 0xaabbccddaabbccdd), std.mem.readInt(u64, gds[0x100..][0..8], .little));
+    // Submission sealing also flushes a transfer-only batch with no label read.
+    fill.source_address = 9;
+    try std.testing.expect(backend.vtable.dma_data.?(backend.context, fill));
+    try std.testing.expect(backend.vtable.dma_data.?(backend.context, copy));
+    var ticket: u64 = 0;
+    try std.testing.expect(backend.vtable.seal_submission.?(backend.context, &ticket));
+    try std.testing.expect(ticket != 0 and !renderer.open_batch_commands);
+    try std.testing.expectEqual(gpu.DcbBackend.CompletionStatus.complete, backend.vtable.poll_submission.?(backend.context, ticket, true));
+    try std.testing.expectEqual(@as(u64, 0x0000000900000009), std.mem.readInt(u64, guest.bytes[0x18000..][0..8], .little));
+    try std.testing.expect(backend.vtable.dma_data.?(backend.context, fill));
+    try std.testing.expect(backend.vtable.seal_submission.?(backend.context, &ticket));
+    try std.testing.expectEqual(gpu.DcbBackend.CompletionStatus.complete, backend.vtable.poll_submission.?(backend.context, ticket, true));
+    const snapshots_before_ready = renderer.gds_dma_snapshots;
+    const ready_before = renderer.gds_snapshot_ready_reads;
+    const submitted_before_ready = renderer.submitted_tick;
+    copy.destination_address = 0x19000;
+    try std.testing.expect(backend.vtable.dma_data.?(backend.context, copy));
+    try std.testing.expectEqual(snapshots_before_ready, renderer.gds_dma_snapshots);
+    try std.testing.expectEqual(ready_before + 1, renderer.gds_snapshot_ready_reads);
+    try std.testing.expectEqual(submitted_before_ready, renderer.submitted_tick);
+    try std.testing.expectEqual(@as(u64, 0x0000000900000009), std.mem.readInt(u64, guest.bytes[0x19000..][0..8], .little));
+    std.debug.print("standalone GDS transfers passed (batch={}): ordered snapshots, CPU reads and submission completion\n", .{batch});
 }
 
 fn runGdsResidentMode(allocator: std.mem.Allocator, native: bool) !void {
@@ -8433,6 +8602,10 @@ fn runGdsResidentMode(allocator: std.mem.Allocator, native: bool) !void {
     defer renderer.deinit();
     var guest = GuestMemory{};
     const backend = renderer.dcbBackend(guest.interface());
+    // Registered images bracket the label allocations but do not overlap them.
+    // Treating the registry's coarse bounds as an exact hit disables every copy.
+    _ = try renderer.image_aliases.register(allocator, .sampled_image, .{ .address = 0x10000, .size = 16 }, .{ .format = 1, .width = 2, .height = 2 });
+    _ = try renderer.image_aliases.register(allocator, .sampled_image, .{ .address = 0x1f000, .size = 16 }, .{ .format = 1, .width = 2, .height = 2 });
     const code = [_]u32{
         0xbefc_0300, vop1(1, 1, 1), vop1(1, 2, 4),
         0xbefe_0402, 0xd802_0004,   0x0000_0102,
@@ -8469,7 +8642,9 @@ fn runGdsResidentMode(allocator: std.mem.Allocator, native: bool) !void {
         .write_confirm = true,
         .block_engine = true,
     };
+    var dma_result: [8]u8 = undefined;
     try std.testing.expect(backend.vtable.dma_data.?(backend.context, dma));
+    try std.testing.expect(backend.vtable.read(backend.context, dma.destination_address, &dma_result));
     try std.testing.expectEqual(@as(u32, 1560), std.mem.readInt(u32, guest.bytes[0x18000..][0..4], .little));
     try state.writeRegister(.shader, compute.userDataBase() + 1, 2);
     for (0..8) |_| _ = try renderer.dispatchRdna2State(&state, .{ 64, 1, 1 }, .{ 3, 1, 1 });
@@ -8496,6 +8671,7 @@ fn runGdsResidentMode(allocator: std.mem.Allocator, native: bool) !void {
     try state.writeRegister(.shader, compute.userDataBase() + 1, 3);
     _ = try renderer.dispatchRdna2State(&state, .{ 64, 1, 1 }, .{ 3, 1, 1 });
     try std.testing.expect(backend.vtable.dma_data.?(backend.context, dma));
+    try std.testing.expect(backend.vtable.read(backend.context, dma.destination_address, &dma_result));
     try std.testing.expectEqual(@as(u32, 1617), std.mem.readInt(u32, guest.bytes[0x18000..][0..4], .little));
     try std.testing.expectEqual(@as(u32, 7), std.mem.readInt(u32, guest.bytes[0x18004..][0..4], .little));
     guest.word(0x19000, 19);
@@ -8505,6 +8681,7 @@ fn runGdsResidentMode(allocator: std.mem.Allocator, native: bool) !void {
     try std.testing.expect(backend.vtable.dma_data.?(backend.context, partial));
     _ = try renderer.dispatchRdna2State(&state, .{ 64, 1, 1 }, .{ 3, 1, 1 });
     try std.testing.expect(backend.vtable.dma_data.?(backend.context, dma));
+    try std.testing.expect(backend.vtable.read(backend.context, dma.destination_address, &dma_result));
     try std.testing.expectEqual(@as(u32, 28), std.mem.readInt(u32, guest.bytes[0x18000..][0..4], .little));
     try std.testing.expectEqual(@as(u32, 7), std.mem.readInt(u32, guest.bytes[0x18004..][0..4], .little));
     renderer.retain_gds_on_gpu = false;
@@ -8517,7 +8694,10 @@ fn runGdsResidentMode(allocator: std.mem.Allocator, native: bool) !void {
     partial.destination_address = 0x10d;
     partial.byte_count = 2;
     try std.testing.expect(backend.vtable.dma_data.?(backend.context, partial));
+    const before_host_copy = renderer.gds_dma_snapshots;
     try std.testing.expect(backend.vtable.dma_data.?(backend.context, dma));
+    try std.testing.expectEqual(before_host_copy, renderer.gds_dma_snapshots);
+    try std.testing.expect(backend.vtable.read(backend.context, dma.destination_address, &dma_result));
     try std.testing.expectEqual(@as(u32, 0x00121207), std.mem.readInt(u32, guest.bytes[0x18004..][0..4], .little));
     // A following GPU fill must upload this newer CPU shadow first.
     partial.destination_address = 0x110;
@@ -8530,6 +8710,50 @@ fn runGdsResidentMode(allocator: std.mem.Allocator, native: bool) !void {
     try std.testing.expectEqual(@as(u32, 0x12121212), std.mem.readInt(u32, final_gds[0x114..][0..4], .little));
     try std.testing.expect(backend.vtable.drain_releases.?(backend.context));
     try std.testing.expectEqual(@as(u32, 0xaabbccdd), std.mem.readInt(u32, guest.bytes[0x1a000..][0..4], .little));
+    if (native) {
+        // Capture a value, reset GDS, then read the old copy through WAIT.
+        // Projecting a release's zero payload or rereading current GDS fails.
+        partial.source_address = 41;
+        partial.destination_address = 0x108;
+        partial.byte_count = 8;
+        try std.testing.expect(backend.vtable.dma_data.?(backend.context, partial));
+        const before_copy = renderer.submitted_tick;
+        try std.testing.expect(backend.vtable.dma_data.?(backend.context, dma));
+        try std.testing.expectEqual(before_copy, renderer.submitted_tick);
+        try std.testing.expectEqual(@as(u32, 37), std.mem.readInt(u32, guest.bytes[0x18000..][0..4], .little));
+        partial.source_address = 0x52525252;
+        try std.testing.expect(backend.vtable.dma_data.?(backend.context, partial));
+        try std.testing.expect(backend.vtable.read_wait.?(backend.context, dma.destination_address, &dma_result));
+        try std.testing.expectEqual(@as(u64, 0x0000002900000029), std.mem.readInt(u64, &dma_result, .little));
+        // A byte-sized CPU GDS mutation must wait for the earlier copy's read.
+        var later = dma;
+        later.destination_address = 0x19000;
+        try std.testing.expect(backend.vtable.dma_data.?(backend.context, later));
+        partial.source_address = 0xaa;
+        partial.byte_count = 1;
+        try std.testing.expect(backend.vtable.dma_data.?(backend.context, partial));
+        try std.testing.expect(backend.vtable.read(backend.context, later.destination_address, &dma_result));
+        try std.testing.expectEqual(@as(u64, 0x5252525252525252), std.mem.readInt(u64, &dma_result, .little));
+        const host_modified = try renderer.readbackGdsStorage();
+        try std.testing.expectEqual(@as(u32, 0x525252aa), std.mem.readInt(u32, host_modified[0x108..][0..4], .little));
+        // Cross the deferred FIFO capacity, verifying every independent copy.
+        for (0..270) |i| {
+            partial.source_address = @intCast(i + 1);
+            partial.byte_count = 8;
+            try std.testing.expect(backend.vtable.dma_data.?(backend.context, partial));
+            later.destination_address = 0x1b000 + i * 8;
+            try std.testing.expect(backend.vtable.dma_data.?(backend.context, later));
+        }
+        try std.testing.expect(backend.vtable.drain_releases.?(backend.context));
+        for (0..270) |i| {
+            const pair = guest.bytes[0x1b000 + i * 8 ..][0..8];
+            const expected: u64 = @intCast(i + 1);
+            try std.testing.expectEqual(expected | (expected << 32), std.mem.readInt(u64, pair, .little));
+        }
+        // Earlier copies may already be CPU-ready. The 270 queued fill/copy
+        // pairs above still require independent snapshots across FIFO reuse.
+        try std.testing.expect(renderer.gds_dma_snapshots >= 270);
+    }
     std.debug.print("resident GDS passed (native DMA={}): 520 queued producers, partial fills, unrelated release ordering, unaligned writes and resumed atomics\n", .{native});
 }
 

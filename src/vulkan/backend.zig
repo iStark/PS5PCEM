@@ -65,6 +65,10 @@ pub export var command_batch_max_ns: u64 = 0;
 pub export var reuse_larger_buffers: bool = true;
 /// Keep immediate GDS clears in queue order without a host round trip.
 pub export var native_gds_dma: bool = true;
+pub export var deferred_gds_snapshots: bool = true;
+pub export var batch_gds_transfers: bool = true;
+pub export var avoid_completed_gds_snapshots: bool = true;
+pub export var discard_overwritten_storage_images: bool = true;
 pub export var native_storage_color_initialization: bool = true;
 pub export var transient_read_only_buffers: bool = true;
 pub export var cache_vertex_index_bounds: bool = true;
@@ -1505,13 +1509,16 @@ const DeferredRelease = struct {
     /// Ordered CP bytes (DMA overwrites or conservative query counters).
     fixed: ?[8]u8 = null,
     fixed_size: u8 = 0,
+    /// A GPU copy captures the GDS value at this command, independently of
+    /// subsequent GDS resets. Owned until successful publication or teardown.
+    gds_snapshot: ?OwnedBuffer = null,
     /// Sixteen query counters share one value, with the opposite endpoint
     /// between them. Preserve those intervening words at publication time.
     query_counters: bool = false,
 
     fn size(self: DeferredRelease) usize {
         if (self.query_counters) return 16 * 16 - 8;
-        if (self.fixed != null) return self.fixed_size;
+        if (self.fixed != null or self.gds_snapshot != null) return self.fixed_size;
         return switch (self.release.data_selection) {
             1 => 4,
             2, 3, 4 => 8,
@@ -5855,7 +5862,10 @@ pub const Renderer = struct {
     gds_host_dirty: bool = true,
     gds_gpu_dirty: bool = false,
     gds_dma_fills: u64 = 0,
+    gds_dma_snapshots: u64 = 0,
+    gds_snapshot_ready_reads: u64 = 0,
     storage_color_initializations: u64 = 0,
+    storage_overwrite_discards: u64 = 0,
     retain_gds_on_gpu: bool = true,
     compute_pipelines: std.ArrayList(ComputePipelineEntry) = .empty,
     compute_pipeline_sequence: u64 = 0,
@@ -6914,7 +6924,7 @@ pub const Renderer = struct {
         @memset(renderer.gds_storage.items, 0);
         renderer.gds_buffer = try renderer.createBufferWithMemoryPreference(
             gds_slot_bytes,
-            vk.buffer_usage_storage_buffer_bit | vk.buffer_usage_transfer_dst_bit,
+            vk.buffer_usage_storage_buffer_bit | vk.buffer_usage_transfer_dst_bit | vk.buffer_usage_transfer_src_bit,
             vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit,
             vk.memory_property_host_cached_bit,
         );
@@ -6950,6 +6960,10 @@ pub const Renderer = struct {
         self.finishDrawBatch() catch {};
         _ = self.device_functions.device_wait_idle(self.device);
         self.completed_tick = self.submitted_tick;
+        for (self.deferred_internal_releases[0..self.deferred_internal_release_count]) |pending| {
+            if (pending.gds_snapshot) |buffer| self.destroyBuffer(buffer);
+        }
+        self.deferred_internal_release_count = 0;
         if (self.gpu_timestamp_pool != 0) self.device_functions.destroy_query_pool(self.device, self.gpu_timestamp_pool, null);
         self.destroyDeferredVulkanObjects();
         self.destroyResourcePools();
@@ -8924,10 +8938,10 @@ pub const Renderer = struct {
             var before: [32]u8 = @splat(0);
             _ = memory.read(memory.context, entry.guest_address, &before);
             std.debug.print("[gpu buffer publication] flip={d} address=0x{x} bytes={d} program=0x{x} pc=0x{x} reason={s} gpu_seq={d} used_seq={d} tick={d} whole={any} before={x} after={x} consumer=0x{x}/0x{x} flush=0x{x}\n", .{
-                self.flip_callbacks,   entry.guest_address,                 bytes.len,                     entry.last_writer_program,
-                entry.write_origin.pc, @tagName(entry.write_origin.reason), entry.last_gpu_write_sequence, entry.last_used_sequence,
-                entry.last_gpu_use,    entry.pending_writes.whole,          before,                        bytes[0..@min(bytes.len, before.len)],
-                self.trace_gpu_programs[0], self.trace_gpu_programs[1], self.last_flush_caller,
+                self.flip_callbacks,        entry.guest_address,                 bytes.len,                     entry.last_writer_program,
+                entry.write_origin.pc,      @tagName(entry.write_origin.reason), entry.last_gpu_write_sequence, entry.last_used_sequence,
+                entry.last_gpu_use,         entry.pending_writes.whole,          before,                        bytes[0..@min(bytes.len, before.len)],
+                self.trace_gpu_programs[0], self.trace_gpu_programs[1],          self.last_flush_caller,
             });
         }
         const end = entry.guest_address + bytes.len;
@@ -11256,10 +11270,19 @@ pub const Renderer = struct {
             entry.completion_readback_ready = false;
             self.deferred_shader_metadata_slots.unset(index);
         }
-        // Storage images can also be snapshots of a live depth/stencil plane.
-        // Covering their guest allocation does not retire that representation;
-        // retain normal publication and the source relationship until the
-        // following consumer resolves the current attachment contents.
+        // A full byte overwrite supersedes an ordinary image's texels and
+        // padding. Do not read its old result back just to overwrite it. Pinned
+        // bindings and live depth/stencil representations retain their normal
+        // publication path; their source/lifetime relationship is stronger.
+        if (@atomicLoad(bool, &discard_overwritten_storage_images, .monotonic)) {
+            for (self.storage_image_cache.items, 0..) |cached, index| {
+                if (!cached.valid or !cached.gpu_dirty or cached.pin_count != 0 or
+                    !byteRangeContains(address, size, cached.descriptor.address, cached.allocation_bytes) or
+                    cached.depth_snapshot != null or self.storageDepthSource(cached.descriptor) != null) continue;
+                self.invalidateStorageGuestContents(index);
+                self.storage_overwrite_discards +|= 1;
+            }
+        }
         for (self.render_targets.items) |*cached| {
             if (!cached.initialized or cached.gpu_generation == cached.host_generation) continue;
             const range = colorTargetBackingRange(cached.target);
@@ -11542,6 +11565,8 @@ pub const Renderer = struct {
             const byte_count = std.math.cast(usize, descriptor.size_bytes) orelse
                 return Error.GuestBufferTooLarge;
             if (byte_count == 0 or byte_count > maximum_frame_bytes or byte_count & 0xf != 0) return null;
+            try self.drainInternalReleasesForRange(descriptor.address, byte_count);
+            self.discardFullyOverwrittenOutputs(descriptor.address, byte_count);
             try self.flushPendingGuestWrite(descriptor.address, byte_count);
             var pattern: [16]u8 = undefined;
             inline for (0..4) |index| {
@@ -26628,6 +26653,25 @@ pub const Renderer = struct {
         self.gds_host_dirty = true;
     }
 
+    /// These transfers use only the renderer-owned GDS allocation and retained
+    /// snapshot buffers. They need no descriptor lease and can stay in stream
+    /// order until a consumer, release, or submission boundary flushes them.
+    fn submitGdsTransfer(self: *Renderer, command: vk.CommandBuffer) (Error || std.mem.Allocator.Error)!void {
+        const trace_completion = if (self.trace_gpu_completion_from_frame) |first|
+            self.flip_callbacks + 1 >= first
+        else
+            false;
+        if (@atomicLoad(bool, &batch_gds_transfers, .monotonic) and self.timeline_scheduler_enabled and
+            self.defer_internal_releases and self.imported_allocations.items.len == 0 and
+            !self.draw_batch_active and !trace_completion)
+        {
+            if (self.recording_command_buffer != command) return Error.CommandBufferEndFailed;
+            self.open_batch_commands = true;
+            return;
+        }
+        try self.submitOneShot(command);
+    }
+
     fn tryFillGdsDma(self: *Renderer, dma: gpu.state.DmaData) (Error || std.mem.Allocator.Error)!bool {
         if (dma.source != 2 or dma.destination != 1 or dma.byte_count == 0 or
             dma.destination_address & 3 != 0 or dma.byte_count & 3 != 0) return false;
@@ -26658,11 +26702,100 @@ pub const Renderer = struct {
             .size = dma.byte_count,
         };
         self.device_functions.cmd_pipeline_barrier(command, vk.pipeline_stage_transfer_bit, vk.pipeline_stage_all_commands_bit | vk.pipeline_stage_host_bit, 0, 0, null, 1, @ptrCast(&after), 0, null);
-        try self.submitOneShot(command);
+        try self.submitGdsTransfer(command);
         // Even a partial fill invalidates the host shadow. Its next reader
         // waits for this transfer, preserving neighboring shader-written words.
         self.gds_gpu_dirty = true;
         self.gds_dma_fills +|= 1;
+        return true;
+    }
+
+    fn trySnapshotGdsDma(self: *Renderer, dma: gpu.state.DmaData) (Error || std.mem.Allocator.Error)!bool {
+        if (!@atomicLoad(bool, &deferred_gds_snapshots, .monotonic) or
+            !self.timeline_scheduler_enabled or !self.defer_internal_releases or
+            self.imported_allocations.items.len != 0 or self.publishing_internal_release or
+            dma.source != 1 or (dma.destination != 0 and dma.destination != 3) or
+            (dma.byte_count != 4 and dma.byte_count != 8) or dma.source_address & 3 != 0 or
+            dma.destination_address < 0x1_0000 or dma.destination_address > @as(u64, std.math.maxInt(u64)) - dma.byte_count) return false;
+        // A current CPU shadow already supplies the value. If every recorded
+        // GPU operation has retired, the ordinary mapped read also needs no
+        // fence: copying it back through the GPU would add work, not overlap it.
+        if (!self.gds_gpu_dirty) return false;
+        if (@atomicLoad(bool, &avoid_completed_gds_snapshots, .monotonic) and
+            self.recording_command_buffer == null and self.pending_command_buffers.items.len == 0)
+        {
+            try self.refreshGpuProgress();
+            if (self.completed_tick >= self.submitted_tick) {
+                self.gds_snapshot_ready_reads +|= 1;
+                return false;
+            }
+        }
+        const buffer = self.gds_buffer orelse return false;
+        if (dma.source_address > buffer.size or dma.byte_count > buffer.size - dma.source_address) return false;
+        // Restrict deferred publication to ordinary label/argument memory.
+        // Image aliases and GPU-owned destinations retain immediate coherence.
+        if (self.image_aliases.overlapsAny(aliasRange(dma.destination_address, dma.byte_count))) return false;
+        var candidates = self.guest_buffer_overlap_index.candidates(self.guest_buffers.items, dma.destination_address, dma.byte_count);
+        while (candidates.next()) |index| {
+            const entry = self.guest_buffers.items[index];
+            if (entry.gpu_dirty and byteRangesOverlap(dma.destination_address, dma.byte_count, entry.guest_address, entry.size)) return false;
+        }
+        if (self.deferred_internal_release_count == self.deferred_internal_releases.len)
+            try self.drainInternalReleases(self.deferred_internal_release_count);
+        const snapshot = try self.createBufferWithMemoryPreference(dma.byte_count, vk.buffer_usage_transfer_dst_bit, vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit, vk.memory_property_host_cached_bit);
+        var transferred = false;
+        errdefer if (!transferred) self.destroyBuffer(snapshot);
+        const descriptor = self.active_descriptor_set;
+        defer self.active_descriptor_set = descriptor;
+        try self.uploadGdsStorage();
+        const command = try self.beginOneShot();
+        defer self.releaseOneShot(command);
+        const before = vk.BufferMemoryBarrier{
+            .source_access_mask = vk.access_memory_write_bit,
+            .destination_access_mask = vk.access_transfer_read_bit,
+            .buffer = buffer.handle,
+            .offset = dma.source_address,
+            .size = dma.byte_count,
+        };
+        self.device_functions.cmd_pipeline_barrier(command, vk.pipeline_stage_all_commands_bit | vk.pipeline_stage_host_bit, vk.pipeline_stage_transfer_bit, 0, 0, null, 1, @ptrCast(&before), 0, null);
+        const copy = vk.BufferCopy{ .source_offset = dma.source_address, .destination_offset = 0, .size = dma.byte_count };
+        self.device_functions.cmd_copy_buffer(command, buffer.handle, snapshot.handle, 1, @ptrCast(&copy));
+        const after = [_]vk.BufferMemoryBarrier{
+            .{ .source_access_mask = vk.access_transfer_read_bit, .destination_access_mask = vk.access_memory_write_bit, .buffer = buffer.handle, .offset = dma.source_address, .size = dma.byte_count },
+            .{ .source_access_mask = vk.access_transfer_write_bit, .destination_access_mask = vk.access_host_read_bit, .buffer = snapshot.handle, .offset = 0, .size = dma.byte_count },
+        };
+        self.device_functions.cmd_pipeline_barrier(command, vk.pipeline_stage_transfer_bit, vk.pipeline_stage_all_commands_bit | vk.pipeline_stage_host_bit, 0, 0, null, after.len, &after, 0, null);
+        // Transfer ownership before submission: even an error after queueing
+        // must retain the copy destination until device-idle teardown.
+        const release_index = self.deferred_internal_release_count;
+        self.deferred_internal_releases[release_index] = .{
+            .tick = command_buffer_pending_tick,
+            .release = std.mem.zeroInit(gpu.state.ReleaseMem, .{ .address = dma.destination_address }),
+            .fixed_size = @intCast(dma.byte_count),
+            .gds_snapshot = snapshot,
+        };
+        self.deferred_internal_release_count += 1;
+        transferred = true;
+        // A later CPU write must also wait for this outstanding GDS reader.
+        self.gds_gpu_dirty = true;
+        self.submitGdsTransfer(command) catch |err| {
+            // Ending/retaining the command buffer can fail before it enters
+            // the submission queue. releaseOneShot then resets it, so its
+            // publication must not wait forever for an unassigned tick.
+            // A queued or submitted copy still owns its destination.
+            const queued = for (self.pending_command_buffers.items) |pending| {
+                if (pending == command) break true;
+            } else false;
+            if (!queued and !self.open_batch_commands and
+                self.deferred_internal_release_count == release_index + 1 and
+                self.deferred_internal_releases[release_index].tick == command_buffer_pending_tick)
+            {
+                self.deferred_internal_release_count = release_index;
+                transferred = false;
+            }
+            return err;
+        };
+        self.gds_dma_snapshots +|= 1;
         return true;
     }
 
@@ -32993,6 +33126,7 @@ pub const Renderer = struct {
         var covered = false;
         for (pending) |entry| {
             if (!byteRangesOverlap(address, bytes.len, entry.release.address, entry.size())) continue;
+            if (entry.gds_snapshot != null) return false;
             if (entry.fixed == null and entry.release.data_selection != 1 and entry.release.data_selection != 2) return false;
             covered = true;
         }
@@ -33348,7 +33482,13 @@ pub const Renderer = struct {
                 continue;
             }
             var bytes: [8]u8 = undefined;
-            if (pending.fixed) |fixed| {
+            if (pending.gds_snapshot) |snapshot| {
+                // The FIFO-prefix wait above retires this exact copy. Do not
+                // readMapped here: it would also wait for unrelated later work.
+                const mapping = try self.mapBufferRange(snapshot, 0, size);
+                defer mapping.release(self);
+                @memcpy(bytes[0..size], mapping.bytes);
+            } else if (pending.fixed) |fixed| {
                 bytes = fixed;
             } else switch (release.data_selection) {
                 1 => std.mem.writeInt(u32, bytes[0..4], @truncate(release.data), .little),
@@ -33356,7 +33496,8 @@ pub const Renderer = struct {
                 else => std.mem.writeInt(u64, &bytes, release.data, .little),
             }
             if (!dcbWrite(self, release.address, bytes[0..size])) return Error.GuestMemoryWriteFailed;
-            if (pending.fixed == null) if (self.deferred_release_observer) |observe| observe(release);
+            if (pending.gds_snapshot) |snapshot| self.destroyBuffer(snapshot);
+            if (pending.fixed == null and pending.gds_snapshot == null) if (self.deferred_release_observer) |observe| observe(release);
         }
     }
 
@@ -33761,6 +33902,7 @@ pub const Renderer = struct {
         if (self.flat_memory_fault_failed or self.sampled_fault_failed) return false;
         const native_gds = @atomicLoad(bool, &native_gds_dma, .monotonic);
         if (native_gds and (self.tryFillGdsDma(dma) catch return false)) return true;
+        if (native_gds and (self.trySnapshotGdsDma(dma) catch return false)) return true;
         // Recorded shaders already own their input snapshots. As with
         // WRITE_DATA, CPU copies need only publish the actual source/writers;
         // an unrelated DMA must not submit every queued draw. Imported pages
@@ -43501,6 +43643,12 @@ test "wait projection handles 64-bit release halves and ordered overwrites witho
     renderer.deferred_internal_releases[1].fixed_size = 2;
     try std.testing.expect(renderer.readProjectedReleases(0x1000, &bytes));
     try std.testing.expectEqual(@as(u64, 0x1122929155667788), std.mem.readInt(u64, bytes[8..16], .little));
+    // GPU snapshots are not known until their own copy retires, even if an
+    // older immediate label at the same address could be projected.
+    renderer.deferred_internal_releases[1].gds_snapshot = .{ .handle = 0, .memory = 0, .size = 8 };
+    try std.testing.expect(!renderer.readProjectedReleases(0x1000, &bytes));
+    try std.testing.expectEqual(@as(usize, 2), renderer.deferred_internal_releases[1].size());
+    renderer.deferred_internal_releases[1].gds_snapshot = null;
     try std.testing.expect(std.mem.allEqual(u8, &memory.bytes, 0xcc));
     try std.testing.expectEqual(@as(usize, 2), renderer.deferred_internal_release_count);
     try std.testing.expect(!renderer.readProjectedReleases(0x1000, bytes[0..4]));

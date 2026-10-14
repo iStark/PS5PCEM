@@ -139,6 +139,16 @@ pub const Manager = struct {
         return range.valid() and self.lowest_address < range.end() and range.address < self.highest_end;
     }
 
+    /// Check registrations after the broad bound. Holes between unrelated
+    /// images do not make ordinary command-processor label memory an image.
+    pub fn overlapsAny(self: *const Manager, range: Range) bool {
+        if (!self.mayOverlap(range)) return false;
+        for (self.entries.items) |candidate| {
+            if (candidate.range.overlaps(range)) return true;
+        }
+        return false;
+    }
+
     pub fn unregister(self: *Manager, token: Token) void {
         for (self.entries.items, 0..) |candidate, index| {
             if (candidate.token != token) continue;
