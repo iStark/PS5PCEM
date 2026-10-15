@@ -38,6 +38,7 @@ test {
     _ = image_state;
     _ = pipeline_compiler;
     _ = @import("pipeline_warmup.zig");
+    _ = @import("guest_fingerprints.zig");
     _ = @import("buffer_write_history.zig");
     _ = @import("buffer_write_ranges.zig");
     _ = @import("buffer_upload_chunks.zig");

@@ -16,6 +16,38 @@ pub export var saturated_resource_dependencies: bool = true;
 pub export var cached_scalar_call_analysis: bool = true;
 pub export var skip_unused_uniform_loads: bool = true;
 pub export var unused_uniform_loads_skipped: u64 = 0;
+pub export var static_scalar_opcode_flags: bool = true;
+pub export var compact_scalar_walks: bool = true;
+pub export var disjoint_checkpoint_copies: bool = true;
+pub export var lean_uniform_state_init: bool = true;
+pub export var uniform_state_value_bytes_avoided: u64 = 0;
+pub export var lean_scalar_scratch_init: bool = true;
+pub export var scalar_scratch_bytes_avoided: u64 = 0;
+
+const OpcodeNameFlag = enum { wide, cmpx, exec, movrel };
+const opcode_name_flags = blk: {
+    @setEvalBranchQuota(200000);
+    const fields = @typeInfo(rdna2.Opcode).@"enum".fields;
+    var flags: [fields.len]u8 = @splat(0);
+    for (fields) |field| {
+        if (std.mem.indexOf(u8, field.name, "64") != null) flags[field.value] |= 1;
+        if (std.mem.startsWith(u8, field.name, "v_cmpx_")) flags[field.value] |= 2;
+        if (std.mem.indexOf(u8, field.name, "exec") != null) flags[field.value] |= 4;
+        if (std.mem.startsWith(u8, field.name, "s_movrel")) flags[field.value] |= 8;
+    }
+    break :blk flags;
+};
+
+fn opcodeNameHas(opcode: rdna2.Opcode, comptime flag: OpcodeNameFlag) bool {
+    if (@atomicLoad(bool, &static_scalar_opcode_flags, .monotonic))
+        return opcode_name_flags[@intFromEnum(opcode)] & (@as(u8, 1) << @intFromEnum(flag)) != 0;
+    return switch (flag) {
+        .wide => std.mem.indexOf(u8, @tagName(opcode), "64") != null,
+        .cmpx => std.mem.startsWith(u8, @tagName(opcode), "v_cmpx_"),
+        .exec => std.mem.indexOf(u8, @tagName(opcode), "exec") != null,
+        .movrel => std.mem.startsWith(u8, @tagName(opcode), "s_movrel"),
+    };
+}
 
 /// Over-approximate every scalar source used by the uniform CFG proof, across
 /// all blocks and loop iterations. Vector arithmetic is not interpreted by
@@ -187,8 +219,7 @@ const LaneSpills = struct {
             self.invalidate(0, 256);
             return;
         }
-        const name = @tagName(inst.opcode);
-        const wide = std.mem.indexOf(u8, name, "64") != null;
+        const wide = opcodeNameHas(inst.opcode, .wide);
         const count: u32 = @max(inst.data_words, if (inst.family == .ds) @as(u8, 4) else if (wide) @as(u8, 2) else 1);
         if (inst.dst.kind == .vgpr) self.invalidate(inst.dst.reg, count);
         if (inst.dst2.kind == .vgpr) self.invalidate(inst.dst2.reg, count);
@@ -217,6 +248,66 @@ const BranchSites = struct {
         self.bits.set(index);
     }
 };
+
+fn initializeWalkScratch(spills: *LaneSpills, unknown_exits: *BranchSites, revisited_edges: *BranchSites) void {
+    if (@atomicLoad(bool, &lean_scalar_scratch_init, .monotonic)) {
+        // Whole-struct defaults cause LLVM to clear the undefined backing
+        // arrays too (20 KiB per walk in the native runner). Each record is
+        // initialized before its occupancy/initialized marker permits a read.
+        spills.occupied = 0;
+        unknown_exits.initialized = false;
+        revisited_edges.initialized = false;
+        _ = @atomicRmw(u64, &scalar_scratch_bytes_avoided, .Add, @sizeOf(@TypeOf(spills.slots)) + 2 * @sizeOf(@TypeOf(unknown_exits.bits)), .monotonic);
+    } else {
+        spills.* = .{};
+        unknown_exits.* = .{};
+        revisited_edges.* = .{};
+    }
+}
+
+test "scalar scratch initialization discards poisoned spills and stale loop edges" {
+    const saved = lean_scalar_scratch_init;
+    defer lean_scalar_scratch_init = saved;
+    var spills: LaneSpills = undefined;
+    var unknown: BranchSites = undefined;
+    var revisited: BranchSites = undefined;
+    @memset(std.mem.asBytes(&spills), 0xa5);
+    @memset(std.mem.asBytes(&unknown), 0xa5);
+    @memset(std.mem.asBytes(&revisited), 0xa5);
+    var evaluation = Evaluation{};
+    const write_lane = rdna2.Instruction{
+        .opcode = .v_writelane_b32,
+        .dst = .{ .kind = .vgpr, .reg = 7 },
+        .src0 = .{ .kind = .sgpr, .reg = 1 },
+        .src1 = .{ .kind = .integer_inline_constant, .value = 63 },
+    };
+    const read_lane = rdna2.Instruction{
+        .opcode = .v_readlane_b32,
+        .dst = .{ .kind = .sgpr, .reg = 2 },
+        .src0 = .{ .kind = .vgpr, .reg = 7 },
+        .src1 = .{ .kind = .integer_inline_constant, .value = 63 },
+    };
+    for ([_]bool{ true, false, true, true }, 0..) |enabled, pass| {
+        lean_scalar_scratch_init = enabled;
+        initializeWalkScratch(&spills, &unknown, &revisited);
+        spills.restore(&evaluation, read_lane);
+        try std.testing.expect(!evaluation.registers[2].known);
+        for ([_]usize{ 0, 31, 32, 65535 }) |edge| {
+            try std.testing.expect(!unknown.isSet(edge));
+            try std.testing.expect(!revisited.isSet(edge));
+        }
+        evaluation.registers[1] = .{ .known = true, .value = @intCast(123 + pass) };
+        spills.store(&evaluation, write_lane);
+        spills.restore(&evaluation, read_lane);
+        try std.testing.expectEqual(@as(u32, @intCast(123 + pass)), evaluation.registers[2].value);
+        unknown.set(65535);
+        revisited.set(31);
+        try std.testing.expect(unknown.isSet(65535));
+        try std.testing.expect(revisited.isSet(31));
+        try std.testing.expect(!unknown.isSet(31));
+        try std.testing.expect(!revisited.isSet(65535));
+    }
+}
 
 test "relative VGPR destinations invalidate scalar lane spills" {
     for ([_]rdna2.Opcode{ .v_movreld_b32, .v_movrelsd_b32, .v_movrelsd_2_b32 }) |opcode| {
@@ -447,7 +538,7 @@ pub fn canPruneUniformBranches(
             .s_cbranch_cdbgsys, .s_cbranch_cdbguser, .s_cbranch_cdbgsys_or_user, .s_cbranch_cdbgsys_and_user, .s_setreg_b32 => return false,
             else => {},
         }
-        if (std.mem.startsWith(u8, @tagName(inst.opcode), "s_movrel")) return false;
+        if (opcodeNameHas(inst.opcode, .movrel)) return false;
         has_guard = has_guard or switch (inst.opcode) {
             .s_cbranch_scc0, .s_cbranch_scc1, .s_cbranch_execz, .s_cbranch_execnz, .s_cbranch_vccz, .s_cbranch_vccnz => true,
             else => false,
@@ -501,6 +592,60 @@ pub const UniformBranchProof = struct {
     }
 };
 
+pub export var index_uniform_cfg_edges: bool = true;
+
+fn uniformEdgesOrdered(edges: []const rdna2.control_flow.Edge) bool {
+    if (edges.len == 0) return true;
+    for (1..edges.len) |i| if (edges[i].from < edges[i - 1].from) return false;
+    return true;
+}
+
+fn uniformOutgoingEdges(edges: []const rdna2.control_flow.Edge, block: u32, ordered: bool) []const rdna2.control_flow.Edge {
+    if (!ordered) return edges;
+    var low: usize = 0;
+    var high = edges.len;
+    while (low < high) {
+        const middle = low + (high - low) / 2;
+        if (edges[middle].from < block) low = middle + 1 else high = middle;
+    }
+    const first = low;
+    while (low < edges.len and edges[low].from == block) low += 1;
+    return edges[first..low];
+}
+
+test "uniform CFG successors preserve duplicate edges absent blocks and unsorted manual graphs" {
+    const Edge = rdna2.control_flow.Edge;
+    var edges = [_]Edge{
+        .{ .from = 0, .to = 2, .kind = .branch },
+        .{ .from = 0, .to = 1, .kind = .fallthrough },
+        .{ .from = 2, .to = 2, .kind = .branch },
+        .{ .from = 2, .to = 2, .kind = .branch },
+        .{ .from = 5, .to = 0, .kind = .branch },
+    };
+    try std.testing.expect(uniformEdgesOrdered(&edges));
+    for (0..2) |pass| {
+        if (pass == 1) std.mem.reverse(Edge, &edges);
+        const ordered = uniformEdgesOrdered(&edges);
+        try std.testing.expectEqual(pass == 0, ordered);
+        for (0..7) |block| {
+            var expected: [5]Edge = undefined;
+            var actual: [5]Edge = undefined;
+            var expected_len: usize = 0;
+            var actual_len: usize = 0;
+            for (edges) |edge| if (edge.from == block) {
+                expected[expected_len] = edge;
+                expected_len += 1;
+            };
+            for (uniformOutgoingEdges(&edges, @intCast(block), ordered)) |edge| if (edge.from == block) {
+                actual[actual_len] = edge;
+                actual_len += 1;
+            };
+            try std.testing.expectEqualSlices(Edge, expected[0..expected_len], actual[0..actual_len]);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), uniformOutgoingEdges(&.{}, 0, true).len);
+}
+
 pub fn proveUniformBranchesWithPlan(
     allocator: std.mem.Allocator,
     reader: shaders.MemoryReader,
@@ -551,7 +696,14 @@ pub fn proveUniformBranchesWithPlan(
     };
     const states = try allocator.alloc(State, graph.blocks.items.len);
     defer allocator.free(states);
-    for (states) |*state| state.* = .{};
+    if (@atomicLoad(bool, &lean_uniform_state_init, .monotonic)) {
+        // Only capture() makes a block dirty/reachable, and it initializes
+        // knownness, SCC and every known value before those fields are read.
+        // Clear the visitation marker alone. A whole-struct default caused
+        // LLVM to zero even the 512 bytes of undefined values per block.
+        for (states) |*state| state.seen = false;
+        _ = @atomicRmw(u64, &uniform_state_value_bytes_avoided, .Add, states.len * maximum_scalar_registers * @sizeOf(u32), .monotonic);
+    } else for (states) |*state| state.* = .{};
     states[0].capture(&invariant.registers, null);
     const dirty = try allocator.alloc(bool, states.len);
     defer allocator.free(dirty);
@@ -561,6 +713,10 @@ pub fn proveUniformBranchesWithPlan(
     defer allocator.free(decisions);
     @memset(decisions, null);
     const steps: ?[]const u32 = if (plan != null and plan.?.matches(instructions)) plan.?.scalar_steps else null;
+    // Decoded graphs group outgoing edges by source. Verify the ordering
+    // once for manual graphs, then avoid scanning every edge for each block.
+    const ordered_edges = @atomicLoad(bool, &index_uniform_cfg_edges, .monotonic) and
+        (graph.edges.items.len == 0 or uniformEdgesOrdered(graph.edges.items));
     var pending = true;
     var budget: usize = maximum_resource_instructions * 256;
     while (pending) {
@@ -677,7 +833,7 @@ pub fn proveUniformBranchesWithPlan(
                                 // or readlane result written by that setup.
                                 // CMPX also writes EXEC, which need not appear
                                 // as an explicit destination in the decoder.
-                                if (std.mem.startsWith(u8, @tagName(inst.opcode), "v_cmpx_")) {
+                                if (opcodeNameHas(inst.opcode, .cmpx)) {
                                     local.registers[126] = .{};
                                     local.registers[127] = .{};
                                 }
@@ -685,7 +841,7 @@ pub fn proveUniformBranchesWithPlan(
                             else => {
                                 // Unknown scalar semantics may overwrite SCC or
                                 // address registers indirectly.
-                                if (std.mem.indexOf(u8, @tagName(inst.opcode), "exec") != null) {
+                                if (opcodeNameHas(inst.opcode, .exec)) {
                                     local.registers[126] = .{};
                                     local.registers[127] = .{};
                                 }
@@ -695,7 +851,7 @@ pub fn proveUniformBranchesWithPlan(
                     },
                 }
             }
-            for (graph.edges.items) |edge| {
+            for (uniformOutgoingEdges(graph.edges.items, block.index, ordered_edges)) |edge| {
                 if (edge.from != block.index) continue;
                 if (decisions[block.index]) |taken| {
                     if (taken != (edge.kind == .branch)) continue;
@@ -846,7 +1002,7 @@ const RegisterCheckpointCollector = struct {
         // whichever unrelated scalar values preceded the branch.
         if (low == self.pcs.len or self.pcs[low] != pc or low >= self.seen.capacity()) return;
         if (!bit_sets.contains(&self.seen, low)) {
-            self.snapshots[low] = evaluation.registers;
+            copyCheckpoint(&self.snapshots[low], &evaluation.registers);
             self.seen.set(low);
         } else {
             for (&self.snapshots[low], evaluation.registers) |*saved, current| {
@@ -865,13 +1021,50 @@ const RegisterCheckpointCollector = struct {
         // only the remaining sites, avoiding a redundant full-array write.
         for (self.pcs, self.snapshots, 0..) |pc, *snapshot, index| {
             if (evaluation.stop_reason == .end_program and pc > evaluation.stop_pc) {
-                snapshot.* = evaluation.registers;
+                copyCheckpoint(snapshot, &evaluation.registers);
             } else if (index >= self.seen.capacity() or !bit_sets.contains(&self.seen, index)) {
                 snapshot.* = @splat(.{});
             }
         }
     }
 };
+
+fn copyCheckpoint(destination: *ScalarRegisters, source_: *const ScalarRegisters) void {
+    const target_address = @intFromPtr(destination);
+    const source_address = @intFromPtr(source_);
+    const distance = @max(target_address, source_address) - @min(target_address, source_address);
+    if (@atomicLoad(bool, &disjoint_checkpoint_copies, .monotonic) and distance >= @sizeOf(ScalarRegisters)) {
+        // Pool leases and Evaluation own separate storage. Preserve the
+        // assignment's overlap semantics for independent API callers too.
+        @memcpy(destination, source_);
+    } else destination.* = source_.*;
+}
+
+test "checkpoint copies preserve every register and overlapping assignment semantics" {
+    const saved = disjoint_checkpoint_copies;
+    defer disjoint_checkpoint_copies = saved;
+    for ([_]bool{ false, true }) |enabled| {
+        disjoint_checkpoint_copies = enabled;
+        var registers: [maximum_scalar_registers + 1]RegisterValue = undefined;
+        for (&registers, 0..) |*value, index| value.* = .{
+            .known = index % 2 == 0,
+            .value = @intCast(index * 73),
+            .sources = .{ .memory = index % 3 == 0, .user_data = index % 5 == 0 },
+            .producer_pc = @intCast(index * 28),
+        };
+        const before = registers;
+        var separate: ScalarRegisters = undefined;
+        copyCheckpoint(&separate, registers[0..maximum_scalar_registers]);
+        try std.testing.expectEqualDeep(before[0..maximum_scalar_registers].*, separate);
+        copyCheckpoint(&separate, &separate);
+        try std.testing.expectEqualDeep(before[0..maximum_scalar_registers].*, separate);
+        copyCheckpoint(registers[1..][0..maximum_scalar_registers], registers[0..maximum_scalar_registers]);
+        try std.testing.expectEqualDeep(before[0..maximum_scalar_registers].*, registers[1..][0..maximum_scalar_registers].*);
+        registers = before;
+        copyCheckpoint(registers[0..maximum_scalar_registers], registers[1..][0..maximum_scalar_registers]);
+        try std.testing.expectEqualDeep(before[1..][0..maximum_scalar_registers].*, registers[0..maximum_scalar_registers].*);
+    }
+}
 
 /// Evaluates one decoded scalar program and captures its register state before
 /// every requested resource instruction. `checkpoint_pcs` must be sorted.
@@ -1000,6 +1193,14 @@ pub fn evaluatePrefixUntil(
 /// scalar register. Pure vector instructions do not change the checkpoint
 /// walk; an index of these steps replaces visiting every opcode.
 pub fn scalarWalkVisits(inst: rdna2.Instruction) bool {
+    return scalarWalkVisitsImpl(inst);
+}
+
+fn scalarWalkVisitsRef(inst: *const rdna2.Instruction) bool {
+    return scalarWalkVisitsImpl(inst);
+}
+
+fn scalarWalkVisitsImpl(inst: anytype) bool {
     if (inst.opcode == .unsupported) return true;
     switch (inst.family) {
         // Memory operations and comparisons also contribute to the address
@@ -1008,10 +1209,34 @@ pub fn scalarWalkVisits(inst: rdna2.Instruction) bool {
         .vop1, .vop2, .vop3, .vop3p, .vintrp, .exp => {},
         else => return true,
     }
-    if (std.mem.startsWith(u8, @tagName(inst.opcode), "v_cmpx_")) return true;
+    if (opcodeNameHas(inst.opcode, .cmpx)) return true;
     if (inst.opcode == .v_readlane_b32 or inst.opcode == .v_writelane_b32) return true;
     if (scalarRegisterIndex(inst.dst) != null or scalarRegisterIndex(inst.dst2) != null) return true;
     return false;
+}
+
+pub export var advance_sparse_scalar_cursor: bool = true;
+
+fn nextStepIndex(instructions: []const rdna2.Instruction, steps: []const u32, current: usize, pc: u32) usize {
+    if (current < steps.len) {
+        const previous = instructions[steps[current]].pc;
+        if (previous == pc) return current;
+        // Ordinary fallthrough lands at the next retained operation or in
+        // the vector-only gap before it. Backward/wider jumps still search.
+        if (pc > previous and (current + 1 == steps.len or pc <= instructions[steps[current + 1]].pc)) return current + 1;
+    }
+    return stepIndexAtOrAfter(instructions, steps, pc);
+}
+
+test "sparse scalar cursor matches search across gaps backward edges and exhausted cursors" {
+    const instructions = [_]rdna2.Instruction{
+        .{ .pc = 0 }, .{ .pc = 4 }, .{ .pc = 12 }, .{ .pc = 20 }, .{ .pc = 32 }, .{ .pc = 44 }, .{ .pc = 48 },
+    };
+    for ([_][]const u32{ &.{}, &.{0}, &.{ 0, 2, 4, 6 }, &.{ 2, 3, 5 } }) |steps| {
+        for (0..steps.len + 2) |current| {
+            for (0..56) |pc| try std.testing.expectEqual(stepIndexAtOrAfter(&instructions, steps, @intCast(pc)), nextStepIndex(&instructions, steps, current, @intCast(pc)));
+        }
+    }
 }
 
 fn stepIndexAtOrAfter(instructions: []const rdna2.Instruction, steps: []const u32, pc: u32) usize {
@@ -1067,16 +1292,18 @@ fn evaluateInto(
     var scc: ?bool = null;
     var pc: u32 = 0;
     var decoded_cursor: usize = 0;
-    var lane_spills = LaneSpills{};
+    var lane_spills: LaneSpills = undefined;
+    var unknown_scalar_exits: BranchSites = undefined;
+    var revisited_loop_edges: BranchSites = undefined;
+    initializeWalkScratch(&lane_spills, &unknown_scalar_exits, &revisited_loop_edges);
     var setpc_follows: u8 = 0;
     // Most walks never reach the indirect-jump limit. Scan the immutable
     // program for static calls only if that distinction can change execution.
     var has_static_calls: ?bool = if (@atomicLoad(bool, &cached_scalar_call_analysis, .monotonic)) null else if (decoded_instructions) |instructions| rdna2.scalar_calls.present(instructions) else false;
-    var unknown_scalar_exits = BranchSites{};
-    var revisited_loop_edges = BranchSites{};
     var dense_walk = steps == null;
     var current_step: usize = 0;
     var skipped_instructions: u64 = 0;
+    const compact_walk = @atomicLoad(bool, &compact_scalar_walks, .monotonic);
     const instruction_limit: u32 = if (follow_lane_mask_fallthrough) bindings.resource_instruction_budget else maximum_instructions;
     while (result.instruction_count < instruction_limit) {
         if (steps) |list| {
@@ -1089,7 +1316,9 @@ fn evaluateInto(
             // resume the index. Backward branches binary-search it.
             if (dense_walk and lane_spills.occupied == 0) dense_walk = false;
             if (!dense_walk) {
-                const index = if (current_step < list.len and instructions[list[current_step]].pc == pc)
+                const index = if (@atomicLoad(bool, &advance_sparse_scalar_cursor, .monotonic))
+                    nextStepIndex(instructions, list, current_step, pc)
+                else if (current_step < list.len and instructions[list[current_step]].pc == pc)
                     current_step
                 else
                     stepIndexAtOrAfter(instructions, list, pc);
@@ -1260,7 +1489,7 @@ fn evaluateInto(
             => {
                 if (follow_lane_mask_fallthrough) {
                     if (decoded_instructions) |instructions| {
-                        if (inst.opcode == .s_branch and resourceLoopHasUnresolvedExit(instructions, inst.branch_target, inst.pc, &unknown_scalar_exits)) {
+                        if (inst.opcode == .s_branch and resourceLoopHasUnresolvedExit(instructions, inst.branch_target, inst.pc, &unknown_scalar_exits, if (compact_walk) steps else null)) {
                             // A scalar walk cannot advance a VGPR induction
                             // variable or a scalar mask obtained by readlane.
                             // Forget every loop-carried write, then revisit
@@ -1268,9 +1497,11 @@ fn evaluateInto(
                             // preserves loads rebuilt from invariant inputs
                             // while merging away first-iteration constants
                             // from resource checkpoints inside the loop.
-                            const loop_begin = decodedInstructionIndexAtOrAfter(instructions, inst.branch_target);
-                            for (instructions[loop_begin..]) |*loop_inst| {
-                                if (loop_inst.pc >= inst.pc) break;
+                            // The scalar index contains every SGPR writer and
+                            // branch. Vector destinations matter here only if
+                            // a live lane spill can be overwritten by them.
+                            var loop = LoopInstructions.init(instructions, inst.branch_target, inst.pc, if (compact_walk and lane_spills.occupied == 0) steps else null);
+                            while (loop.next()) |loop_inst| {
                                 invalidateDestination(result, loop_inst.dst, @max(loop_inst.data_words, destinationWords(loop_inst.opcode)));
                                 lane_spills.invalidateInstruction(loop_inst);
                             }
@@ -1329,7 +1560,7 @@ fn evaluateInto(
             // Dependency recording and spill invalidation still happen above;
             // retain the normal path for scalar destinations, VCC/EXEC aliases,
             // lane transfers and unknown instruction families.
-            else => if (inst.family == .unknown or scalarWalkVisits(inst.*))
+            else => if (inst.family == .unknown or (if (compact_walk) scalarWalkVisitsRef(inst) else scalarWalkVisits(inst.*)))
                 executeScalar(result, bindings.program_address, inst, &scc),
         }
         if (steps != null and !dense_walk) {
@@ -1358,11 +1589,31 @@ fn evaluateInto(
     return;
 }
 
-fn resourceLoopHasUnresolvedExit(instructions: []const rdna2.Instruction, loop_start: u32, back_edge: u32, unknown_scalar_exits: *const BranchSites) bool {
+const LoopInstructions = struct {
+    instructions: []const rdna2.Instruction,
+    steps: ?[]const u32,
+    cursor: usize,
+    end: u32,
+
+    fn init(instructions: []const rdna2.Instruction, first: u32, end: u32, steps: ?[]const u32) LoopInstructions {
+        return .{ .instructions = instructions, .steps = steps, .cursor = if (steps) |list| stepIndexAtOrAfter(instructions, list, first) else decodedInstructionIndexAtOrAfter(instructions, first), .end = end };
+    }
+
+    fn next(self: *LoopInstructions) ?*const rdna2.Instruction {
+        const count = if (self.steps) |list| list.len else self.instructions.len;
+        if (self.cursor >= count) return null;
+        const index = if (self.steps) |list| list[self.cursor] else self.cursor;
+        const inst = &self.instructions[index];
+        if (inst.pc >= self.end) return null;
+        self.cursor += 1;
+        return inst;
+    }
+};
+
+fn resourceLoopHasUnresolvedExit(instructions: []const rdna2.Instruction, loop_start: u32, back_edge: u32, unknown_scalar_exits: *const BranchSites, steps: ?[]const u32) bool {
     if (loop_start >= back_edge) return false;
-    const loop_begin = decodedInstructionIndexAtOrAfter(instructions, loop_start);
-    for (instructions[loop_begin..]) |inst| {
-        if (inst.pc >= back_edge) break;
+    var loop = LoopInstructions.init(instructions, loop_start, back_edge, steps);
+    while (loop.next()) |inst| {
         if (inst.branch_target <= back_edge) continue;
         switch (inst.opcode) {
             .s_cbranch_execz, .s_cbranch_execnz, .s_cbranch_vccz, .s_cbranch_vccnz => return true,
@@ -2520,6 +2771,48 @@ test "uniform resource guard is specialized independently for each dispatch" {
     try std.testing.expect((try pruneUniformBranches(std.testing.allocator, memory.reader(), &bindings, program.instructions.items, &graph)) == null);
 }
 
+test "lean uniform states preserve joins loops and failed reads in poisoned scratch" {
+    const original = lean_uniform_state_init;
+    defer lean_uniform_state_init = original;
+    var storage = [_]u8{0} ** 16;
+    var memory = TestMemory{ .base = 0x1000, .bytes = &storage };
+    const bindings = testBindings(0x2000, 0x1000);
+    var instructions = [_]rdna2.Instruction{
+        .{ .pc = 0, .opcode = .s_cbranch_execz, .branch_target = 16 },
+        .{ .pc = 4, .opcode = .s_load_dword, .dst = .{ .kind = .sgpr, .reg = 8 }, .src0 = .{ .kind = .sgpr, .reg = 0 }, .src1 = .{ .kind = .integer_inline_constant }, .data_words = 1 },
+        .{ .pc = 8, .opcode = .s_cmp_lg_u32, .src0 = .{ .kind = .sgpr, .reg = 8 }, .src1 = .{ .kind = .integer_inline_constant }, .src_count = 2 },
+        .{ .pc = 12, .opcode = .s_cbranch_scc0, .branch_target = 20 },
+        .{ .pc = 16, .opcode = .image_store },
+        .{ .pc = 20, .opcode = .s_endpgm },
+    };
+    var scratch = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer scratch.deinit();
+    for ([_]bool{ false, true }) |loop| {
+        if (loop) {
+            instructions[4] = .{ .pc = 16, .opcode = .s_mov_b64, .dst = .{ .kind = .sgpr, .reg = 0 } };
+            instructions[5] = .{ .pc = 20, .opcode = .s_branch, .branch_target = 4 };
+        }
+        var graph = try rdna2.control_flow.buildInstructions(std.testing.allocator, &instructions);
+        defer graph.deinit(std.testing.allocator);
+        for ([_]?u32{ 0, 1, null, 0, null, 1 }) |flag| {
+            memory.base = 0x1000;
+            if (flag) |value| memory.write(0x1000, value) else memory.base = 0x3000;
+            lean_uniform_state_init = false;
+            var expected = try proveUniformBranchesWithPlan(std.testing.allocator, memory.reader(), &bindings, &instructions, &graph, null, null);
+            defer if (expected) |*proof| proof.deinit(std.testing.allocator);
+            _ = scratch.reset(.retain_capacity);
+            const stale = try scratch.allocator().alloc(u8, 64 * 1024);
+            @memset(stale, 0xff);
+            _ = scratch.reset(.retain_capacity);
+            lean_uniform_state_init = true;
+            var actual = try proveUniformBranchesWithPlan(scratch.allocator(), memory.reader(), &bindings, &instructions, &graph, null, null);
+            defer if (actual) |*proof| proof.deinit(scratch.allocator());
+            try std.testing.expectEqual(expected == null, actual == null);
+            if (expected) |proof| try std.testing.expectEqualSlices(UniformBlockAction, proof.actions, actual.?.actions);
+        }
+    }
+}
+
 test "uniform buffer guards follow live bounded read-only constants" {
     var storage = [_]u8{0} ** 16;
     var memory = TestMemory{ .base = 0x1000, .bytes = &storage };
@@ -3115,6 +3408,44 @@ test "resource checkpoints invalidate values that vary between loop iterations" 
     try std.testing.expect(!snapshots[0][8].known);
     try std.testing.expect(snapshots[0][0].known);
     try std.testing.expectEqual(@as(u32, 2), snapshots[1][8].value);
+}
+
+test "indexed loop clobbers retain scalar state and live vector spill invalidation" {
+    const previous = compact_scalar_walks;
+    defer compact_scalar_walks = previous;
+    var bytes: [4]u8 = @splat(0);
+    var memory = TestMemory{ .base = 0x4000, .bytes = &bytes };
+    const bindings = testBindings(0x3000, 0x4000);
+    for ([_]u8{ 10, 11 }) |vector_destination| {
+        const instructions = [_]rdna2.Instruction{
+            .{ .pc = 0, .word_count = 1, .family = .sop1, .opcode = .s_mov_b32, .dst = .{ .kind = .sgpr, .reg = 8 }, .src0 = .{ .kind = .integer_inline_constant, .value = 1 }, .src_count = 1 },
+            .{ .pc = 4, .word_count = 1, .family = .sop1, .opcode = .s_mov_b32, .dst = .{ .kind = .sgpr, .reg = 9 }, .src0 = .{ .kind = .integer_inline_constant, .value = 10 }, .src_count = 1 },
+            .{ .pc = 8, .word_count = 1, .family = .vop2, .opcode = .v_writelane_b32, .dst = .{ .kind = .vgpr, .reg = 10 }, .src0 = .{ .kind = .sgpr, .reg = 9 }, .src1 = .{ .kind = .integer_inline_constant, .value = 3 }, .src_count = 2 },
+            .{ .pc = 12, .word_count = 1, .family = .sopp, .opcode = .s_cbranch_vccz, .branch_target = 40 },
+            .{ .pc = 16, .word_count = 1, .family = .vop1, .opcode = .v_mov_b32, .dst = .{ .kind = .vgpr, .reg = vector_destination }, .src0 = .{ .kind = .integer_inline_constant, .value = 70 }, .src_count = 1 },
+            .{ .pc = 20, .word_count = 1, .family = .vop2, .opcode = .v_readlane_b32, .dst = .{ .kind = .sgpr, .reg = 12 }, .src0 = .{ .kind = .vgpr, .reg = 10 }, .src1 = .{ .kind = .integer_inline_constant, .value = 3 }, .src_count = 2 },
+            .{ .pc = 24, .word_count = 1, .family = .sop2, .opcode = .s_add_u32, .dst = .{ .kind = .sgpr, .reg = 8 }, .src0 = .{ .kind = .sgpr, .reg = 8 }, .src1 = .{ .kind = .integer_inline_constant, .value = 1 }, .src_count = 2 },
+            .{ .pc = 28, .word_count = 1, .family = .sopp, .opcode = .s_branch, .branch_target = 12 },
+            .{ .pc = 40, .word_count = 1, .family = .sopp, .opcode = .s_endpgm },
+        };
+        const steps = [_]u32{ 0, 1, 2, 3, 5, 6, 7, 8 };
+        var before: [2]ScalarRegisters = undefined;
+        var after: [2]ScalarRegisters = undefined;
+        compact_scalar_walks = false;
+        const baseline = evaluateDecodedResourceStateAtCheckpoints(memory.reader(), &bindings, &instructions, &.{ 24, 40 }, &before, &steps);
+        compact_scalar_walks = true;
+        const indexed = evaluateDecodedResourceStateAtCheckpoints(memory.reader(), &bindings, &instructions, &.{ 24, 40 }, &after, &steps);
+        try std.testing.expectEqualDeep(baseline.registers, indexed.registers);
+        try std.testing.expectEqualDeep(baseline.user_data_dependencies, indexed.user_data_dependencies);
+        try std.testing.expectEqualDeep(baseline.loadSlice(), indexed.loadSlice());
+        try std.testing.expectEqual(baseline.instruction_count, indexed.instruction_count);
+        try std.testing.expectEqual(baseline.dense_instruction_count, indexed.dense_instruction_count);
+        try std.testing.expectEqual(baseline.stop_reason, indexed.stop_reason);
+        try std.testing.expectEqual(baseline.stop_pc, indexed.stop_pc);
+        try std.testing.expectEqual(baseline.address_user_data_mask, indexed.address_user_data_mask);
+        try std.testing.expectEqualDeep(before, after);
+        try std.testing.expectEqual(vector_destination == 11, after[0][12].known);
+    }
 }
 
 test "masked loop checkpoints and load constants forget the first iteration" {

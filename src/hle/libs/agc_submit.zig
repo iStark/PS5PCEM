@@ -1425,6 +1425,16 @@ fn exerciseEqualGpuPublications(kind: guest_address_space.MappingKind) !void {
 }
 
 pub fn writeGuestMemory(context: ?*anyopaque, address: u64, bytes: []const u8) bool {
+    return writeGuestMemoryWithPattern(context, address, bytes, null);
+}
+
+/// A trusted renderer clear, with the same guards and label notifications as
+/// every other GPU write. bytes must be exactly the repeated u32 value.
+pub fn writeUniformGuestMemory(context: ?*anyopaque, address: u64, bytes: []const u8, value: u32) bool {
+    return writeGuestMemoryWithPattern(context, address, bytes, value);
+}
+
+fn writeGuestMemoryWithPattern(context: ?*anyopaque, address: u64, bytes: []const u8, pattern: ?u32) bool {
     if (video_out.writeLabelMemory(address, bytes)) return true;
     // Fence/write-data packets only publish one or two words. Reject those
     // narrow writes when descriptor data has been mistaken for PM4. A real
@@ -1463,7 +1473,11 @@ pub fn writeGuestMemory(context: ?*anyopaque, address: u64, bytes: []const u8) b
         const unchanged = publication: {
             if (@atomicLoad(bool, &alias_guest_publications, .monotonic)) {
                 if (addressSpaceFromContext(context)) |space| {
-                    if (space.publishGpuBytes(resolved, bytes)) |equal| {
+                    const published = if (pattern) |value|
+                        space.publishGpuUniform32(resolved, bytes, value)
+                    else
+                        space.publishGpuBytes(resolved, bytes);
+                    if (published) |equal| {
                         _ = @atomicRmw(u64, &guest_write_alias_bytes, .Add, bytes.len, .monotonic);
                         break :publication equal;
                     }
@@ -2421,6 +2435,9 @@ const executor_backend = gpu.DcbBackend{
 };
 
 var submission_scheduler = gpu.QueueScheduler.init(submission_allocator, executor_backend);
+// Accessed only under execution_lock. A suspend point can yield immediately
+// after useful queue work while retaining a timed backoff for an idle poll.
+var suspend_progress_generation: u64 = 0;
 var parallel_command_execution: bool = false;
 
 pub fn setParallelCommandExecution(enabled: bool) void {
@@ -2474,6 +2491,7 @@ pub fn reset() void {
     next_deferred_release_id = 0;
     submission_scheduler.deinit();
     submission_scheduler = gpu.QueueScheduler.init(submission_allocator, executor_backend);
+    suspend_progress_generation = 0;
     submission_scheduler.parallel_commands = parallel_command_execution;
     traced_draw_states = 0;
     traced_shader_program_count = 0;
@@ -3185,7 +3203,7 @@ pub fn submitDeviceComputeStream(stream: []const u32, event_id: u32) SubmitOutco
 
 /// Advance both queues and soft-satisfy any permanent WAIT_REG_MEM heads.
 /// Called from SuspendPoint so the driver observes GPU progress between frames.
-pub fn pumpQueues() void {
+pub fn pumpQueues() u64 {
     drainQuietBuilderArenas();
     execution_lock.lock();
     beginCompletionBatch();
@@ -3199,15 +3217,21 @@ pub fn pumpQueues() void {
             if (!forceSatisfyWait(kind, wait)) continue;
             progressed = true;
         }
-        _ = submission_scheduler.pump() catch break;
+        const report = submission_scheduler.pump() catch break;
+        // A blocked WAIT alone is a poll, not progress. Labels, completed
+        // submissions and actual commands can release the guest producer.
+        if (report.completed_submissions != 0 or report.packets > report.blocked_checks)
+            suspend_progress_generation +%= 1;
         if (!progressed and
             !submission_scheduler.isBlocked(.graphics) and
             !submission_scheduler.isBlocked(.compute)) break;
     }
     host_time.end();
     finishCompletionBatch();
+    const progress_generation = suspend_progress_generation;
     execution_lock.unlock();
     drainCompletionNotifications();
+    return progress_generation;
 }
 
 /// Queues one submitted buffer and advances both command processors. A blocked
@@ -3298,7 +3322,10 @@ fn executeSubmittedLockedForQueueWithRecovery(label: []const u8, stream: []const
             // queue is waiting on, not how often it waits.
             if (soft_wait_batch_reports < 16) {
                 var current: [8]u8 = @splat(0);
-                const readable = readGuestMemory(null, wait.address, current[0..8]);
+                // Register indices are not guest pointers. Memory waits also
+                // need only their declared width, which can end at a mapping.
+                const width: usize = if (wait.width == .bits_32) 4 else 8;
+                const readable = wait.memory_space and readGuestMemory(null, wait.address, current[0..width]);
                 std.debug.print(
                     "[{s}] suspended on WAIT_REG_MEM 0x{x} ref=0x{x} mask=0x{x} op={d} have={s}0x{x}; {d} queued\n",
                     .{
@@ -3345,6 +3372,7 @@ fn executeSubmittedLockedForQueueWithRecovery(label: []const u8, stream: []const
         submission_reports += 1;
     }
     const final_state = submission_scheduler.state(kind);
+    suspend_progress_generation +%= 1;
     return .{
         .accepted = true,
         .completed = completed,
@@ -3699,9 +3727,9 @@ const Sdk11AcbQueue = struct {
 /// owner, so a wrong pointer is rejected by structure rather than by trust in
 /// whichever register happened to survive the guest's call.
 fn sdk11AcbQueueAt(queue_address: u64, owner: u32) ?Sdk11AcbQueue {
-    if (queue_address == 0 or !memory.isGuestRangeAccessible(queue_address, 0xe8)) return null;
+    if (queue_address == 0) return null;
     var fields: [0xe8]u8 = undefined;
-    if (!readGuestMemory(null, queue_address, &fields)) return null;
+    if (!readSdk11CpuMemory(queue_address, &fields)) return null;
     const self_link = std.mem.readInt(u64, fields[0x28..0x30], .little);
     const self_head = std.mem.readInt(u64, fields[0x80..0x88], .little);
     const self_tail = std.mem.readInt(u64, fields[0x88..0x90], .little);
@@ -3812,6 +3840,50 @@ fn rememberedSdk11AcbQueue(owner: u32) u64 {
     return 0;
 }
 
+pub export var compact_sdk11_queue_reads: bool = true;
+pub export var sdk11_stack_windows: u64 = 0;
+pub export var sdk11_stack_words_reused: u64 = 0;
+
+/// Queue objects contain CPU self-pointers, not compact GPU addresses. Borrow
+/// the exact CPU mapping once instead of validating and then validating again
+/// in the generic guest reader. No allocation or content survives this call.
+fn readSdk11CpuMemory(address: u64, bytes: []u8) bool {
+    if (@atomicLoad(bool, &compact_sdk11_queue_reads, .monotonic)) {
+        if (memory.attachedAddressSpace()) |space| {
+            var lease = space.borrowReadable(address, bytes.len) orelse return false;
+            defer lease.release();
+            @memcpy(bytes, lease.bytes);
+            return true;
+        }
+    }
+    return memory.isGuestRangeAccessible(address, bytes.len) and readGuestMemory(null, address, bytes);
+}
+
+const Sdk11StackWindow = struct {
+    bytes: [0x400]u8 = undefined,
+    first: u64 = 0,
+    complete: bool = false,
+
+    fn capture(self: *Sdk11StackWindow, base: u64) void {
+        self.complete = false;
+        if (!@atomicLoad(bool, &compact_sdk11_queue_reads, .monotonic) or base < 0x200) return;
+        self.first = base - 0x200;
+        self.complete = readSdk11CpuMemory(self.first, &self.bytes);
+        if (self.complete) _ = @atomicRmw(u64, &sdk11_stack_windows, .Add, 1, .monotonic);
+    }
+
+    fn word(self: *const Sdk11StackWindow, address: u64) ?u64 {
+        if (self.complete and address >= self.first and address - self.first <= self.bytes.len - 8) {
+            _ = @atomicRmw(u64, &sdk11_stack_words_reused, .Add, 1, .monotonic);
+            const offset: usize = @intCast(address - self.first);
+            return std.mem.readInt(u64, self.bytes[offset..][0..8], .little);
+        }
+        var bytes: [8]u8 = undefined;
+        if (!readSdk11CpuMemory(address, &bytes)) return null;
+        return std.mem.readInt(u64, &bytes, .little);
+    }
+};
+
 fn publishSdk11AcbDriverGeneration(
     owner: u32,
     submission: Submission,
@@ -3848,15 +3920,16 @@ fn publishSdk11AcbDriverGeneration(
         const stack_bases = [_]u64{ trace.currentGuestRbp(), trace.currentGuestRsp() };
         for (stack_bases) |base| {
             if (base == 0) continue;
+            var window: Sdk11StackWindow = .{};
+            window.capture(base);
             var offset: i64 = -0x200;
             while (offset < 0x200 and found == null) : (offset += 8) {
-                const address = @as(i64, @bitCast(base)) + offset;
-                if (address <= 0) continue;
-                const spill: u64 = @bitCast(address);
-                if (!memory.isGuestRangeAccessible(spill, 8)) continue;
-                var bytes: [8]u8 = undefined;
-                if (!readGuestMemory(null, spill, &bytes)) continue;
-                const candidate = std.mem.readInt(u64, &bytes, .little);
+                const spill = if (offset < 0)
+                    std.math.sub(u64, base, @intCast(-offset)) catch continue
+                else
+                    std.math.add(u64, base, @intCast(offset)) catch continue;
+                if (spill == 0) continue;
+                const candidate = window.word(spill) orelse continue;
                 const q = sdk11AcbQueueAt(candidate, owner);
                 if (q) |queue| {
                     if (release == null and !sdk11AcbContainsSubmission(queue, stream_address, submission.word_count)) continue;
@@ -4707,6 +4780,39 @@ test "submitted DCB trims an unreadable indirect register list" {
     try testing.expectEqual(@as(usize, 2), submittedCommandPrefix(&stream).len);
 }
 
+test "suspend progress changes for accepted and resumed work but not idle waits" {
+    reset();
+    defer reset();
+    const initial = pumpQueues();
+    try testing.expectEqual(initial, pumpQueues());
+    const nop = [_]u32{ command(gpu.pm4.nop, 1), 0 };
+    const accepted = submitDeviceStream(&nop);
+    try testing.expect(accepted.accepted and accepted.completed);
+    const submitted = pumpQueues();
+    try testing.expect(submitted != initial);
+    try testing.expectEqual(submitted, pumpQueues());
+
+    // Register waits cannot be soft-satisfied by the native-memory fallback.
+    // Polling one repeatedly must not masquerade as newly executed work.
+    const waiting = [_]u32{
+        command(gpu.pm4.set_context_reg, 2), 0x10, 0,
+        command(gpu.pm4.wait_reg_mem, 6),    3,    0xa010,
+        0,                                   0x55, 0xffff_ffff,
+        1,
+    };
+    const blocked = submitDeviceStream(&waiting);
+    try testing.expect(blocked.accepted and !blocked.completed);
+    const parked = pumpQueues();
+    try testing.expect(parked != submitted);
+    try testing.expectEqual(parked, pumpQueues());
+    try testing.expect(submission_scheduler.isBlocked(.graphics));
+    try submission_scheduler.state(.graphics).writeRegister(.context, 0x10, 0x55);
+    const resumed = pumpQueues();
+    try testing.expect(resumed != parked);
+    try testing.expect(!submission_scheduler.isBlocked(.graphics));
+    try testing.expectEqual(resumed, pumpQueues());
+}
+
 test "wait recovery chooses a value matching every comparison family" {
     var wait = gpu.state.WaitRegMem{
         .width = .bits_32,
@@ -4935,6 +5041,9 @@ test "GPU writes cannot overwrite a submitted allocation header" {
     ));
     try testing.expectEqual(@as(u32, 0xfeed_beef), allocation[2]);
     try testing.expectEqual(@as(u32, 0), allocation[3]);
+    const uniform_value: u32 = 0x1234_5678;
+    try testing.expect(!writeUniformGuestMemory(null, @intFromPtr(&allocation[2]), std.mem.asBytes(&uniform_value), uniform_value));
+    try testing.expectEqual(@as(u32, 0xfeed_beef), allocation[2]);
 }
 
 test "non-command and truncated submissions do not invent protected headers" {
@@ -5534,6 +5643,43 @@ test "synchronous AGC completion advances a paired CPU retirement label" {
         84,
         0,
     ) == null);
+}
+
+test "SDK11 stack windows preserve boundary fallback and refresh CPU bytes" {
+    const previous = compact_sdk11_queue_reads;
+    defer compact_sdk11_queue_reads = previous;
+    var space = try guest_address_space.AddressSpace.init(testing.allocator);
+    defer space.deinit();
+    memory.attachAddressSpace(&space);
+    defer memory.attachAddressSpace(null);
+    const address = guest_address_space.user.start;
+    const size = guest_address_space.page_size;
+    try space.mapFixed(address, size, .read_write, .private, null);
+    try space.writeInt(u64, address, 0x1234);
+    try space.writeInt(u64, address + size - 8, 0xabcd);
+    for ([_]bool{ false, true }) |enabled| {
+        compact_sdk11_queue_reads = enabled;
+        var window: Sdk11StackWindow = .{};
+        window.capture(address + 0x200);
+        try testing.expectEqual(enabled, window.complete);
+        try testing.expectEqual(@as(?u64, 0x1234), window.word(address));
+        // A whole-window read can fail even though individual stack words
+        // are mapped. It must still find a queue at either edge of the stack.
+        window.capture(address);
+        try testing.expect(!window.complete);
+        try testing.expectEqual(@as(?u64, null), window.word(address - 8));
+        try testing.expectEqual(@as(?u64, 0x1234), window.word(address));
+        window.capture(address + size - 8);
+        try testing.expect(!window.complete);
+        try testing.expectEqual(@as(?u64, 0xabcd), window.word(address + size - 8));
+        try testing.expectEqual(@as(?u64, null), window.word(address + size));
+        try space.writeInt(u64, address + 16, 17);
+        window.capture(address + 0x200);
+        try testing.expectEqual(@as(?u64, 17), window.word(address + 16));
+        try space.writeInt(u64, address + 16, 23);
+        window.capture(address + 0x200);
+        try testing.expectEqual(@as(?u64, 23), window.word(address + 16));
+    }
 }
 
 test "SDK11 ACB discovers zero-initialized label tables from independent queue completions" {

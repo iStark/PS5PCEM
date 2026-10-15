@@ -4166,9 +4166,13 @@ fn agcPatch(_: u64, _: u64, _: u64, _: u64, _: u64, _: u64) callconv(abi.guest) 
     return errno.ok;
 }
 
-/// Guest libSceAgc's SuspendPoint busy-waits and prints TRC R5089 forever when
-/// the real GPU is not there. Prefer the HLE entry (see preferHleImportId) and
-/// yield so other threads can submit frames.
+pub export var adaptive_agc_suspend_pause: bool = true;
+pub export var agc_suspend_progress_yields: u64 = 0;
+pub export var agc_suspend_idle_sleeps: u64 = 0;
+threadlocal var last_agc_suspend_progress: u64 = 0;
+
+/// Drain submitted work and yield to other guest threads. Retain the timed
+/// idle backoff for native-driver polling without further queue progress.
 fn agcSuspendPoint() callconv(abi.guest) i32 {
     if (kernel_runtime.guestStopRequested()) {
         kernel_threading.scePthreadExit(null);
@@ -4177,9 +4181,19 @@ fn agcSuspendPoint() callconv(abi.guest) i32 {
     // sees GPU "progress" between frames. Without this the title can park
     // mid-encode after ACQUIRE_MEM while SuspendPoint spins on a stale view.
     kernel_ioctl.drainPendingTailsPublic();
-    agc_submit.pumpQueues();
-    // ~1 ms: enough to free a core without under-pacing a 60 Hz flip loop.
-    _ = kernel_threading.sceKernelUsleep(1_000);
+    const generation = agc_submit.pumpQueues();
+    const progressed = generation != last_agc_suspend_progress;
+    last_agc_suspend_progress = generation;
+    if (@atomicLoad(bool, &adaptive_agc_suspend_pause, .monotonic) and progressed) {
+        // Submissions have already advanced since this producer's last suspend.
+        // Yield to other guest threads without adding an unconditional timer.
+        _ = @atomicRmw(u64, &agc_suspend_progress_yields, .Add, 1, .monotonic);
+        kernel_threading.scePthreadYield();
+    } else {
+        // Repeated idle polls still sleep; they must not consume a CPU core.
+        _ = @atomicRmw(u64, &agc_suspend_idle_sleeps, .Add, 1, .monotonic);
+        _ = kernel_threading.sceKernelUsleep(1_000);
+    }
     return errno.ok;
 }
 

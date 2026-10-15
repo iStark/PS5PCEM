@@ -12,6 +12,11 @@ const maximum_blocks = 1024;
 /// descriptor contents remain dispatch-local. Also permits a native A/B run.
 pub var static_query_cache_enabled = std.atomic.Value(bool).init(true);
 
+/// Exact-key front caches for immutable queries only. The existing bounded
+/// maps remain authoritative, including allocation-failure behavior.
+pub export var scalar_query_front_cache: bool = true;
+pub export var wide_scalar_query_front_cache: bool = true;
+
 const Location = struct { register: u32, lane: ?u32 = null };
 pub const Definition = struct { instruction: usize, component: u32 };
 
@@ -286,6 +291,8 @@ fn uniqueScalarDefinition(definitions: ReachingDefinitions) ?ScalarDefinition {
 /// Only static writers (including ambiguity) are retained, never guest data.
 pub const ScalarDefinitionCache = struct {
     const Key = struct { before: usize, register: u32 };
+    const FrontDefinition = struct { key: Key, value: ?ScalarDefinition };
+    const FrontPosition = struct { pc: u32, position: usize };
     const LaneKey = struct { before: usize, register: u32, scalar: bool };
     pub const maximum_entries = 4096;
     pub const maximum_index_queries = 1024;
@@ -295,6 +302,10 @@ pub const ScalarDefinitionCache = struct {
     entries: std.AutoHashMapUnmanaged(Key, ?ScalarDefinition) = .empty,
     saved_origins: std.AutoHashMapUnmanaged(Key, ?ScalarOrigin) = .empty,
     instruction_positions: std.AutoHashMapUnmanaged(u32, usize) = .empty,
+    front_definitions: [1024]FrontDefinition = undefined,
+    front_definition_valid: [16]u64 = @splat(0),
+    front_positions: [64]FrontPosition = undefined,
+    front_position_valid: u64 = 0,
     reachable: ?[maximum_blocks]bool = undefined,
     reachability_ready: bool = false,
     allocation_failed: bool = false,
@@ -319,13 +330,30 @@ pub const ScalarDefinitionCache = struct {
     /// Resource recovery repeatedly asks for the same instruction boundary.
     /// Cache positions only, never scalar values or guest memory contents.
     pub fn instructionBefore(self: *ScalarDefinitionCache, pc: u32) usize {
-        if (self.instruction_positions.get(pc)) |position| return position;
+        const slot: u6 = @truncate(pc >> 2);
+        const bit = @as(u64, 1) << slot;
+        if (scalar_query_front_cache and self.front_position_valid & bit != 0) {
+            const entry = self.front_positions[slot];
+            if (entry.pc == pc) return entry.position;
+        }
+        if (self.instruction_positions.get(pc)) |position| {
+            if (scalar_query_front_cache) {
+                self.front_positions[slot] = .{ .pc = pc, .position = position };
+                self.front_position_valid |= bit;
+            }
+            return position;
+        }
         var position: usize = 0;
         while (position < self.instructions.len and self.instructions[position].pc < pc) : (position += 1) {}
         if (!self.allocation_failed and self.instruction_positions.count() < maximum_entries) {
             self.instruction_positions.put(self.allocator, pc, position) catch {
                 self.allocation_failed = true;
+                return position;
             };
+            if (scalar_query_front_cache) {
+                self.front_positions[slot] = .{ .pc = pc, .position = position };
+                self.front_position_valid |= bit;
+            }
         }
         return position;
     }
@@ -401,7 +429,21 @@ pub const ScalarDefinitionCache = struct {
 
     fn lookup(self: *ScalarDefinitionCache, before: usize, register: u32) struct { value: ?ScalarDefinition, hit: bool } {
         const key = Key{ .before = before, .register = register };
-        if (self.entries.get(key)) |value| return .{ .value = value, .hit = true };
+        const slot: u10 = @intCast((before *% 37 +% register) & @as(usize, if (wide_scalar_query_front_cache) 1023 else 127));
+        const word = slot / 64;
+        const bit = @as(u64, 1) << @as(u6, @truncate(slot));
+        if (scalar_query_front_cache and self.front_definition_valid[word] & bit != 0) {
+            const entry = self.front_definitions[slot];
+            if (entry.key.before == before and entry.key.register == register)
+                return .{ .value = entry.value, .hit = true };
+        }
+        if (self.entries.get(key)) |value| {
+            if (scalar_query_front_cache) {
+                self.front_definitions[slot] = .{ .key = key, .value = value };
+                self.front_definition_valid[word] |= bit;
+            }
+            return .{ .value = value, .hit = true };
+        }
         if (!self.reachability_ready) {
             self.reachable = reachableBlocks(&self.graph);
             self.reachability_ready = true;
@@ -415,11 +457,56 @@ pub const ScalarDefinitionCache = struct {
         if (!self.allocation_failed and self.entries.count() < maximum_entries) {
             self.entries.put(self.allocator, key, value) catch {
                 self.allocation_failed = true;
+                return .{ .value = value, .hit = false };
             };
+            if (scalar_query_front_cache) {
+                self.front_definitions[slot] = .{ .key = key, .value = value };
+                self.front_definition_valid[word] |= bit;
+            }
         }
         return .{ .value = value, .hit = false };
     }
 };
+
+test "scalar query front caches preserve colliding keys and ambiguous definitions" {
+    const previous = scalar_query_front_cache;
+    defer scalar_query_front_cache = previous;
+    const previous_width = wide_scalar_query_front_cache;
+    defer wide_scalar_query_front_cache = previous_width;
+    const instructions = [_]Instruction{
+        .{ .pc = 0, .opcode = .s_cbranch_execz, .branch_target = 256 },
+        .{ .pc = 4, .opcode = .s_mov_b32, .dst = .{ .kind = .sgpr, .reg = 0 } },
+        .{ .pc = 256, .opcode = .s_endpgm },
+    };
+    var graph = try rdna2.control_flow.buildInstructions(std.testing.allocator, &instructions);
+    defer graph.deinit(std.testing.allocator);
+    var cache = ScalarDefinitionCache.init(std.testing.allocator, &instructions, &graph);
+    defer cache.deinit();
+    for ([_]bool{ true, false, true }) |wide| {
+        wide_scalar_query_front_cache = wide;
+        for ([_]bool{ true, false, true }) |enabled| {
+            scalar_query_front_cache = enabled;
+            for (0..3) |_| {
+                // Register 0 has a written/entry join; out-of-range registers are
+                // unchanged. Force collisions in both widths and switch widths
+                // without clearing retained entries: full keys stay authoritative.
+                for ([_]u32{ 0, 128, 512, 1024, 0, 1, 129, 1025 }) |register| {
+                    const want = scalarDefinition(&instructions, &graph, 2, register);
+                    try std.testing.expectEqualDeep(want, cache.lookup(2, register).value);
+                    try std.testing.expect(cache.lookup(2, register).hit);
+                }
+                for ([_]u32{ 0, 256, 1, 257, 0xffffffff }) |pc| {
+                    var want: usize = 0;
+                    while (want < instructions.len and instructions[want].pc < pc) : (want += 1) {}
+                    try std.testing.expectEqual(want, cache.instructionBefore(pc));
+                    try std.testing.expectEqual(want, cache.instructionBefore(pc));
+                }
+            }
+        }
+    }
+    try std.testing.expect(cache.front_position_valid != 0);
+    try std.testing.expect(cache.front_definition_valid[0] != 0 or cache.front_definition_valid[1] != 0);
+}
 
 test "cached resource boundaries preserve gaps and exhausted-cache fallbacks" {
     const instructions = [_]Instruction{

@@ -15,6 +15,7 @@ const cpu = @import("cpu_workers.zig");
 pub export var share_bounded_scalar_loops: bool = true;
 pub export var exact_scalar_walk_budget: bool = true;
 pub export var indexed_resource_snapshot_capture: bool = true;
+pub export var collapse_contained_scalar_reads: bool = true;
 pub export var resource_walk_cache_entries: u32 = 64;
 pub export var resource_walk_cache_bytes: u64 = 32 * 1024 * 1024;
 
@@ -95,6 +96,17 @@ const Snapshot = struct {
         if (read.address == address and read.size == bytes.len) {
             if (!std.mem.eql(u8, read.bytes[0..read.size], bytes)) self.complete = false;
             return true;
+        }
+        if (@atomicLoad(bool, &collapse_contained_scalar_reads, .monotonic) and bytes.len != 0 and
+            address >= read.address and address - read.address <= read.size)
+        {
+            const offset: usize = @intCast(address - read.address);
+            if (bytes.len <= read.size - offset) {
+                // The covering read already validates every byte of this
+                // dependency. A changed subrange still invalidates the walk.
+                if (!std.mem.eql(u8, bytes, read.bytes[offset..][0..bytes.len])) self.complete = false;
+                return true;
+            }
         }
         const first = @max(address, read.address);
         const end = @min(address + bytes.len, read.address + read.size);
@@ -1207,4 +1219,53 @@ test "cached resource walks validate bytes bindings and immutable plan identity"
     try std.testing.expectEqual(@as(u64, 1), pool.stats.cached_walks);
     pool.deinit();
     try std.testing.expectEqual(@as(usize, 0), pool.walk_cache.bytes);
+}
+
+test "contained scalar reads reuse covering observations and detect replacements" {
+    const a = std.testing.allocator;
+    const Memory = struct {
+        bytes: [128]u8 = @splat(0x37),
+        calls: usize = 0,
+        fn read(raw: ?*anyopaque, address: u64, out: []u8) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            if (address > self.bytes.len or out.len > self.bytes.len - address) return false;
+            @memcpy(out, self.bytes[@intCast(address)..][0..out.len]);
+            return true;
+        }
+    };
+    const saved = collapse_contained_scalar_reads;
+    defer collapse_contained_scalar_reads = saved;
+    const saved_indexed = indexed_resource_snapshot_capture;
+    defer indexed_resource_snapshot_capture = saved_indexed;
+    for ([_]bool{ false, true }) |indexed| for ([_]bool{ false, true }) |enabled| {
+        collapse_contained_scalar_reads = enabled;
+        indexed_resource_snapshot_capture = indexed;
+        var memory = Memory{};
+        const reader = shaders.MemoryReader{ .context = &memory, .read_fn = Memory.read };
+        const snapshot = try a.create(Snapshot);
+        defer a.destroy(snapshot);
+        snapshot.* = .{ .source = reader };
+        var bytes: [64]u8 = undefined;
+        try std.testing.expect(Snapshot.capture(snapshot, 16, &bytes));
+        for ([_]u64{ 16, 32, 76 }) |address| try std.testing.expect(Snapshot.capture(snapshot, address, bytes[0..4]));
+        try std.testing.expectEqual(@as(usize, if (enabled) 1 else 4), snapshot.count);
+        memory.calls = 0;
+        try std.testing.expect(snapshot.matches(reader));
+        try std.testing.expectEqual(snapshot.count, memory.calls);
+        snapshot.sort();
+        try std.testing.expect(Snapshot.replay(snapshot, 31, bytes[0..17]));
+        try std.testing.expect(std.mem.allEqual(u8, bytes[0..17], 0x37));
+        memory.bytes[35] = 0x91;
+        try std.testing.expect(!snapshot.matches(reader));
+        try std.testing.expect(Snapshot.capture(snapshot, 32, bytes[0..4]));
+        try std.testing.expect(!snapshot.complete);
+        // A read that crosses the old boundary remains a separate dependency.
+        snapshot.* = .{ .source = reader };
+        try std.testing.expect(Snapshot.capture(snapshot, 16, bytes[0..16]));
+        try std.testing.expect(Snapshot.capture(snapshot, 28, bytes[0..16]));
+        try std.testing.expectEqual(@as(usize, 2), snapshot.count);
+        memory.bytes[40] ^= 1;
+        try std.testing.expect(!snapshot.matches(reader));
+    };
 }

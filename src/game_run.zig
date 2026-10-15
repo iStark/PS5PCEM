@@ -698,13 +698,13 @@ fn run(init: std.process.Init) !bool {
         adaptive_compiler_workers = false;
         break :workers std.math.clamp(std.fmt.parseInt(usize, std.mem.trim(u8, text, " \t\r\n"), 10) catch 2, 1, 4);
     } else |_| if (adaptive_cpu_workers) cpu_worker_limits.compilers else 2;
-    // GTA III and Big Helmet Heroes spend more on ordering callbacks than
+    // GTA III, Big Helmet Heroes and ASTRO BOT spend more on ordering callbacks than
     // they gain from command lookahead in the measured scenes.
     // Retain the environment override for comparisons and other titles.
     const parallel_commands = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_PARALLEL_COMMANDS")) |text| enabled: {
         defer allocator.free(text);
         break :enabled !std.mem.eql(u8, std.mem.trim(u8, text, " \t\r\n"), "0");
-    } else |_| !std.ascii.eqlIgnoreCase(title_identifier, gta_iii_title_id) and !use_big_helmet_gpu_profile;
+    } else |_| !std.ascii.eqlIgnoreCase(title_identifier, gta_iii_title_id) and !use_big_helmet_gpu_profile and !use_astro_bot_gpu_profile;
     var adaptive_resource_workers = adaptive_cpu_workers;
     const resource_preparation_workers = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_RESOURCE_WORKERS")) |text| workers: {
         defer allocator.free(text);
@@ -1031,6 +1031,7 @@ fn run(init: std.process.Init) !bool {
             .context = address_space,
             .read = runtime.firmware.libs.agc_submit.readGuestMemory,
             .write = runtime.firmware.libs.agc_submit.writeGuestMemory,
+            .write_uniform32 = runtime.firmware.libs.agc_submit.writeUniformGuestMemory,
             .range_accessible = runtime.firmware.libs.agc_submit.guestRangeAccessible,
             .mapping_identity = runtime.firmware.libs.agc_submit.guestMappingIdentity,
             .can_batch_copy = runtime.firmware.libs.agc_submit.canBatchGuestCopy,

@@ -9,6 +9,47 @@ const shaders = @import("shaders.zig");
 
 pub const Kind = enum { resource, sampled };
 pub export var cached_graphics_interfaces: bool = true;
+pub export var cached_pointer_preparation: bool = true;
+
+pub fn hasFlatMemoryReads(instructions: []const rdna2.Instruction, plan: ?*const Plan) bool {
+    if (@atomicLoad(bool, &cached_pointer_preparation, .monotonic)) {
+        if (plan) |retained| if (retained.matches(instructions)) {
+            if (retained.flat_memory_reads) |found| return found;
+        };
+    }
+    return collectFlatMemoryReads(instructions);
+}
+
+fn collectFlatMemoryReads(instructions: []const rdna2.Instruction) bool {
+    for (instructions) |*inst| {
+        if (inst.memory_segment == 0 or inst.memory_segment == 2) switch (inst.opcode) {
+            .flat_load_dword, .flat_load_dwordx2, .flat_load_dwordx3, .flat_load_dwordx4 => return true,
+            else => {},
+        };
+    }
+    return false;
+}
+
+test "flat read summaries retain segment checks and reject a different instruction allocation" {
+    const a = std.testing.allocator;
+    const instructions = [_]rdna2.Instruction{
+        .{ .pc = 0, .opcode = .flat_load_dword, .memory_segment = 1 },
+        .{ .pc = 8, .opcode = .flat_store_dword, .memory_segment = 0 },
+        .{ .pc = 16, .opcode = .s_endpgm },
+    };
+    var plan = try Plan.init(a, &instructions);
+    defer plan.deinit(a);
+    try std.testing.expect(!hasFlatMemoryReads(&instructions, &plan));
+    var different = instructions;
+    different[0].memory_segment = 2;
+    try std.testing.expect(hasFlatMemoryReads(&different, &plan));
+    try std.testing.expect(hasFlatMemoryReads(&different, null));
+    var changed = try Plan.init(a, &different);
+    defer changed.deinit(a);
+    try std.testing.expect(hasFlatMemoryReads(&different, &changed));
+    changed.flat_memory_reads = null;
+    try std.testing.expect(hasFlatMemoryReads(&different, &changed));
+}
 
 pub const GraphicsInterface = struct {
     exports: u64 = 0,
@@ -86,6 +127,7 @@ pub const Plan = struct {
     /// Scalar inputs consumed by uniform control-flow interpretation. Manual
     /// plans opt out; this summary belongs to the exact decoded allocation.
     uniform_scalar_reads: ?u128 = null,
+    flat_memory_reads: ?bool = null,
 
     pub fn init(allocator: std.mem.Allocator, instructions: []const rdna2.Instruction) !Plan {
         const resource = try collect(allocator, instructions, .resource);
@@ -115,6 +157,7 @@ pub const Plan = struct {
             .static_calls = rdna2.scalar_calls.present(instructions),
             .entry_block_end = entryBlockEnd(instructions),
             .uniform_scalar_reads = scalar.uniformScalarReadMask(instructions),
+            .flat_memory_reads = collectFlatMemoryReads(instructions),
         };
     }
 

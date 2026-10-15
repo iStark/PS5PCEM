@@ -72,6 +72,13 @@ pub export var batch_gds_transfers: bool = true;
 pub export var avoid_completed_gds_snapshots: bool = true;
 pub export var discard_overwritten_storage_images: bool = true;
 pub export var native_storage_color_initialization: bool = true;
+pub export var cached_guest_fingerprints: bool = true;
+pub export var watched_storage_readbacks: bool = true;
+pub export var storage_readback_guard_bytes: u64 = 0;
+pub export var parallel_host_uploads: bool = true;
+pub export var parallel_host_upload_bytes: u64 = 0;
+pub export var parallel_host_readbacks: bool = true;
+pub export var parallel_host_readback_bytes: u64 = 0;
 pub export var native_color_storage_layout: bool = true;
 /// Native backing starts with the CPU bytes, so a producer need not begin
 /// at the destination base. Uncovered bytes retain their original contents.
@@ -582,6 +589,9 @@ pub const GuestMemory = struct {
     context: ?*anyopaque,
     read: *const fn (?*anyopaque, u64, []u8) bool,
     write: *const fn (?*anyopaque, u64, []const u8) bool,
+    /// Optional equivalent of write for an exactly repeated little-endian u32.
+    /// Includes the same publication, synchronization and notification effects.
+    write_uniform32: ?*const fn (?*anyopaque, u64, []const u8, u32) bool = null,
     /// Full-range residency check, independent of content and write tracking.
     /// Used to retire deferred image output after its guest backing is unmapped.
     range_accessible: ?*const fn (?*anyopaque, u64, usize) bool = null,
@@ -610,6 +620,77 @@ pub const GuestMemory = struct {
     shader_header: ?*const fn (?*anyopaque, u64) ?u64 = null,
     host_source: ?HostSource = null,
 };
+
+fn copyHostUpload(destination: []u8, source: []const u8) void {
+    // Keep small writes inline. The pool joins all helpers before returning,
+    // so the caller retains the mapping until every byte is ready for submit.
+    if (source.len >= 2 * 1024 * 1024 and @atomicLoad(bool, &parallel_host_uploads, .monotonic)) {
+        gpu.parallel_copy.guest_copy_pool.copy(destination, source);
+        _ = @atomicRmw(u64, &parallel_host_upload_bytes, .Add, source.len, .monotonic);
+    } else @memcpy(destination, source);
+}
+
+/// Read padding and the CPU replacement baseline once. A queued image can
+/// still own an unchanged watched allocation: its pin count governs GPU
+/// lifetime, not whether the CPU bytes changed. Validate both sides of the
+/// read so a write during the copy retains the ordinary content comparison.
+fn readStorageGuestAllocation(memory: GuestMemory, address: u64, bytes: []u8, expected: u64) Error!u64 {
+    const before = if (@atomicLoad(bool, &watched_storage_readbacks, .monotonic) and expected != 0)
+        if (memory.gpu_generation) |generation| generation(memory.context, address, bytes.len) else 0
+    else
+        0;
+    if (!memory.read(memory.context, address, bytes)) return Error.GuestMemoryReadFailed;
+    if (before != 0 and before == expected and memory.gpu_generation.?(memory.context, address, bytes.len) == before) {
+        _ = @atomicRmw(u64, &storage_readback_guard_bytes, .Add, bytes.len, .monotonic);
+        return before;
+    }
+    return 0;
+}
+
+test "storage readback guards require an unchanged watch across the CPU snapshot" {
+    const previous = watched_storage_readbacks;
+    defer watched_storage_readbacks = previous;
+    const Fixture = struct {
+        epoch: u64 = 7,
+        reads: usize = 0,
+        race: bool = false,
+        fail: bool = false,
+        fn read(raw: ?*anyopaque, _: u64, bytes: []u8) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.reads += 1;
+            @memset(bytes, 0x39);
+            if (self.race) self.epoch += 1;
+            return !self.fail;
+        }
+        fn write(_: ?*anyopaque, _: u64, _: []const u8) bool {
+            return false;
+        }
+        fn generation(raw: ?*anyopaque, _: u64, _: usize) u64 {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            return self.epoch;
+        }
+    };
+    for ([_]bool{ false, true }) |enabled| {
+        watched_storage_readbacks = enabled;
+        var fixture = Fixture{};
+        var memory = GuestMemory{ .context = &fixture, .read = Fixture.read, .write = Fixture.write, .gpu_generation = Fixture.generation };
+        var bytes: [8]u8 = undefined;
+        try std.testing.expectEqual(@as(u64, if (enabled) 7 else 0), try readStorageGuestAllocation(memory, 0x1000, &bytes, 7));
+        try std.testing.expect(std.mem.allEqual(u8, &bytes, 0x39));
+        try std.testing.expectEqual(@as(u64, 0), try readStorageGuestAllocation(memory, 0x1000, &bytes, 6));
+        fixture.race = true;
+        try std.testing.expectEqual(@as(u64, 0), try readStorageGuestAllocation(memory, 0x1000, &bytes, 7));
+        fixture.race = false;
+        fixture.epoch = 0;
+        try std.testing.expectEqual(@as(u64, 0), try readStorageGuestAllocation(memory, 0x1000, &bytes, 0));
+        fixture.epoch = 7;
+        memory.gpu_generation = null;
+        try std.testing.expectEqual(@as(u64, 0), try readStorageGuestAllocation(memory, 0x1000, &bytes, 7));
+        fixture.fail = true;
+        try std.testing.expectError(Error.GuestMemoryReadFailed, readStorageGuestAllocation(memory, 0x1000, &bytes, 7));
+        try std.testing.expectEqual(@as(usize, 6), fixture.reads);
+    }
+}
 
 const WindowsLibrary = struct {
     handle: *anyopaque,
@@ -1594,6 +1675,7 @@ const BufferPageObservation = struct {
 };
 
 const buffer_write_ranges = @import("buffer_write_ranges.zig");
+const guest_fingerprints = @import("guest_fingerprints.zig");
 const buffer_upload_chunks = @import("buffer_upload_chunks.zig");
 
 /// A guest index range kept in its own buffer while its pages stay unchanged.
@@ -4004,6 +4086,11 @@ const WindowPresentation = struct {
     needs_recreate: bool = false,
 };
 
+pub export var reuse_published_color_clears: bool = true;
+pub export var published_color_clear_hits: u64 = 0;
+
+const PublishedColorClear = struct { address: u64, size: usize, value: u32 };
+
 const PackedClearStaging = struct {
     // Clear passes alternate black, white, finite-half maxima and several
     // packed mask values. Keep that small palette instead of refilling the
@@ -4011,6 +4098,18 @@ const PackedClearStaging = struct {
     buffers: [8]std.ArrayList(u32) = @splat(.empty),
     values: [8]?u32 = @splat(null),
     next_slot: usize = 0,
+    hashes: [32]?struct { value: u32, count: usize, hash: u64 } = @splat(null),
+    next_hash: usize = 0,
+
+    fn fingerprint(self: *PackedClearStaging, value: u32, bytes_value: []const u8) u64 {
+        for (self.hashes) |maybe| if (maybe) |cached| {
+            if (cached.value == value and cached.count == bytes_value.len) return cached.hash;
+        };
+        const hash = gpu.parallel_copy.fingerprint(bytes_value);
+        self.hashes[self.next_hash] = .{ .value = value, .count = bytes_value.len, .hash = hash };
+        self.next_hash = (self.next_hash + 1) % self.hashes.len;
+        return hash;
+    }
 
     fn deinit(self: *PackedClearStaging, allocator: std.mem.Allocator) void {
         for (&self.buffers) |*buffer| buffer.deinit(allocator);
@@ -5996,11 +6095,14 @@ pub const Renderer = struct {
     depth_transfer_enabled: bool,
     image_state_optimization_enabled: bool,
     guest_memory: ?GuestMemory = null,
+    guest_fingerprint_cache: guest_fingerprints.Cache = .{},
     /// Holds a display buffer read straight out of guest memory, for a flip
     /// that names a buffer nothing was rendered into.
     guest_frame_scratch: std.ArrayList(u8) = .empty,
     scalar_pointer_pages_scratch: ?*[maximum_storage_descriptors][4096]u8 = null,
     packed_clear_staging: PackedClearStaging = .{},
+    published_color_clears: [32]?PublishedColorClear = @splat(null),
+    next_published_color_clear: usize = 0,
     // A movie converts a new frame every time one is presented, and its three
     // working buffers are large and identically sized from one frame to the
     // next. Holding them costs the size of one frame and saves faulting in
@@ -7349,6 +7451,9 @@ pub const Renderer = struct {
     /// when a draw has no guest graphics programs.
     pub fn dcbBackend(self: *Renderer, memory: GuestMemory) gpu.DcbBackend {
         self.guest_memory = memory;
+        // A reattached address space can reuse the same host pointer while
+        // starting a new generation domain.
+        self.guest_fingerprint_cache = .{};
         self.startComputeWarmup();
         return .{ .context = self, .vtable = &dcb_vtable };
     }
@@ -11890,11 +11995,19 @@ pub const Renderer = struct {
             const value = std.mem.readInt(u32, pattern[0..4], .little);
             const bytes = try self.packed_clear_staging.bytes(self.allocator, value, byte_count);
             self.prepareHtileWrite(descriptor.address, byte_count);
-            if (!memory.write(memory.context, descriptor.address, bytes)) return Error.GuestMemoryWriteFailed;
+            const written = if (memory.write_uniform32) |write_uniform|
+                write_uniform(memory.context, descriptor.address, bytes, value)
+            else
+                memory.write(memory.context, descriptor.address, bytes);
+            if (!written) return Error.GuestMemoryWriteFailed;
             self.invalidateDmaDestination(descriptor.address, byte_count);
             try self.applyUniformDepthWrite(descriptor.address, bytes);
             try self.applyUniformHtileWrite(descriptor.address, bytes);
             try self.applyUniformDccWrite(descriptor.address, bytes);
+            // Keep the complete native write, including padding. A later
+            // attachment may avoid staging only after proving these bytes
+            // still contain the same repeated pattern.
+            self.rememberPublishedColorClear(descriptor.address, byte_count, value);
             self.emulated_buffer_clear_dispatches += 1;
             self.noteComputeWrite("emulated-packed-buffer", descriptor.address, 0, 0, 0);
             if (log_verbose_gpu or self.emulated_buffer_clear_dispatches <= 4) {
@@ -12535,12 +12648,7 @@ pub const Renderer = struct {
         // Expose only captured pages; an active read outside them reports a
         // shader fault through the existing deferred readback path.
         const flat_reads = bindings.stage == .pixel and self.fragment_stores_and_atomics and
-            for (instructions) |inst| {
-                if (inst.memory_segment == 0 or inst.memory_segment == 2) switch (inst.opcode) {
-                    .flat_load_dword, .flat_load_dwordx2, .flat_load_dwordx3, .flat_load_dwordx4 => break true,
-                    else => {},
-                };
-            } else false;
+            gpu.resource_checkpoints.hasFlatMemoryReads(instructions, if (analysis.resource_checkpoints) |*plan| plan else null);
         var pointer_instructions = gpu.resource_checkpoints.Iterator.init(instructions, if (analysis.resource_checkpoints) |*plan| plan else null, .resource);
         while (pointer_instructions.next()) |instruction_index| {
             const candidate = &instructions[instruction_index];
@@ -16240,6 +16348,47 @@ pub const Renderer = struct {
     /// all MRT seeds prepared before recording the draw. Ring spill handling
     /// preserves these slices across wraps. Outside a batch use an independently
     /// owned transfer buffer; no attachment needs a permanent host mirror.
+    fn rememberPublishedColorClear(self: *Renderer, address: u64, size: usize, value: u32) void {
+        for (&self.published_color_clears) |*entry| if (entry.*) |previous| {
+            if (previous.address == address) {
+                entry.* = .{ .address = address, .size = size, .value = value };
+                return;
+            }
+        };
+        self.published_color_clears[self.next_published_color_clear] = .{ .address = address, .size = size, .value = value };
+        self.next_published_color_clear = (self.next_published_color_clear + 1) % self.published_color_clears.len;
+    }
+
+    fn publishedColorClear(self: *Renderer, index: usize) ?vk.ClearColorValue {
+        if (!@atomicLoad(bool, &reuse_published_color_clears, .monotonic)) return null;
+        const entry = &self.render_targets.items[index];
+        const target = entry.target;
+        if (target.descriptor.dcc_enabled or target.descriptor.cmask_fast_clear or target.descriptor.fmask_compression or
+            target.descriptor.samples_log2 != 0 or target.descriptor.fragments_log2 != 0) return null;
+        const memory = self.guest_memory orelse return null;
+        const backing = entry.backing_snapshot;
+        const observed_hash = backing.hash orelse return null;
+        const address = std.math.add(u64, target.descriptor.address, backing.range.offset) catch return null;
+        const size = backing.range.size;
+        if (size == 0 or size % 4 != 0) return null;
+        for (self.published_color_clears) |maybe| if (maybe) |clear| {
+            if (address < clear.address or address - clear.address > clear.size) continue;
+            const offset = address - clear.address;
+            if (offset % 4 != 0 or size > clear.size - offset) continue;
+            const color = packedBufferClearColor(target.format.vulkan, @splat(clear.value)) orelse continue;
+            const bytes = self.packed_clear_staging.bytes(self.allocator, clear.value, size) catch return null;
+            if (self.packed_clear_staging.fingerprint(clear.value, bytes) != observed_hash) continue;
+            // refresh armed this observation before hashing. Never accept a
+            // native write that raced with the fingerprint as a new baseline.
+            if (backing.generation != 0) if (memory.gpu_generation) |query| {
+                if (query(memory.context, address, size) != backing.generation) return null;
+            };
+            _ = @atomicRmw(u64, &published_color_clear_hits, .Add, 1, .monotonic);
+            return color;
+        };
+        return null;
+    }
+
     fn stageInitialColorUpload(self: *Renderer, index: usize) anyerror!ColorTargetUpload {
         const snapshot = self.render_targets.items[index];
         const target = snapshot.target;
@@ -16257,6 +16406,7 @@ pub const Renderer = struct {
         // them before staging so a racing native write still invalidates the
         // baseline, and the next draw retains the newly rendered attachment.
         self.render_targets.items[index].backing_snapshot.refresh(memory, target);
+        if (self.publishedColorClear(index)) |clear| return .{ .clear_color = clear };
         const reader = gpu.ShaderMemoryReader{ .context = memory.context, .read_fn = memory.read };
         const fast_clear = try self.colorTargetFastClearTexel(target);
         if (fast_clear) |texel| {
@@ -21449,6 +21599,64 @@ pub const Renderer = struct {
                 try std.testing.expect(std.mem.allEqual(u8, frame.pixels.items, 0));
             };
         }
+    }
+
+    pub fn probePublishedColorClears(self: *Renderer) anyerror!void {
+        const memory = self.guest_memory.?;
+        const saved = reuse_published_color_clears;
+        defer reuse_published_color_clears = saved;
+        for ([_]bool{ false, true }) |enabled| for ([_]u8{ 3, 10, 12 }) |format| {
+            reuse_published_color_clears = enabled;
+            var color = std.mem.zeroes(gpu.resources.ColorTarget);
+            color.address = 0x10000;
+            color.width = 31;
+            color.height = 17;
+            color.pitch = 32;
+            color.format = format;
+            color.number_type = if (format == 12) 7 else 0;
+            color.tile_mode = .linear;
+            color.write_mask = 0xf;
+            const target = try guestColorTarget(color);
+            const size: usize = @intCast(target.layout.required_source_bytes);
+            for ([_]u32{ 0, if (format == 12) 0xb4003800 else 0x73457345 }) |word| {
+                const expected = try self.packed_clear_staging.bytes(self.allocator, word, size);
+                // A buffer clear publishes padding as well as visible texels.
+                try std.testing.expect(memory.write(memory.context, color.address, expected));
+                self.invalidateDmaDestination(color.address, size);
+                self.rememberPublishedColorClear(color.address, size, word);
+                const index = try self.acquireRenderTarget(target);
+                invalidateResidentTarget(&self.render_targets.items[index]);
+                const before = self.frame_profile.target_upload_bytes;
+                const upload = try self.stageInitialColorUpload(index);
+                defer upload.deinit(self);
+                try std.testing.expectEqual(enabled, upload.clear_color != null);
+                if (enabled) try std.testing.expectEqual(before, self.frame_profile.target_upload_bytes);
+                const command = try self.beginOneShot();
+                defer self.releaseOneShot(command);
+                const image = self.render_targets.items[index].image.handle;
+                const range = vk.ImageSubresourceRange{ .aspect_mask = vk.image_aspect_color_bit };
+                try self.transitionTrackedImage(command, image, range, image_state.transfer_destination_usage);
+                try self.recordColorInitialization(command, image, target, upload);
+                try self.transitionTrackedImage(command, image, range, image_state.color_attachment_usage);
+                try self.submitOneShot(command);
+                self.render_targets.items[index].initialized = true;
+                self.markRenderTargetWritten(&self.render_targets.items[index]);
+                try self.readbackRenderTarget(index, true);
+                const actual = for (self.completed_frames.items) |frame| {
+                    if (frame.target) |view| if (sameRenderTarget(view, target)) break frame.pixels.items;
+                } else return error.MissingPresentedFrame;
+                var pattern: [4]u8 = undefined;
+                std.mem.writeInt(u32, &pattern, word, .little);
+                for (actual, 0..) |value, offset| try std.testing.expectEqual(pattern[offset % 4], value);
+                // A stale remembered pattern must not hide a later CPU update.
+                const replacement: [4]u8 = .{ 7, 13, 19, 23 };
+                try std.testing.expect(memory.write(memory.context, color.address, &replacement));
+                invalidateResidentTarget(&self.render_targets.items[index]);
+                const changed = try self.stageInitialColorUpload(index);
+                defer changed.deinit(self);
+                try std.testing.expect(changed.clear_color == null and !changed.clear_zero);
+            }
+        };
     }
 
     pub fn probeColorDccNativeClears(self: *Renderer) anyerror!void {
@@ -27878,7 +28086,7 @@ pub const Renderer = struct {
         // proof must never rearm a sibling mip's generation.
         if (@atomicLoad(bool, &lean_storage_overwrite_baselines, .monotonic) and !cached.strict_guest_backing) {
             if (cached.guest_native_baseline_digest) |baseline| {
-                if (storageOverwriteGuestDigest(memory, cached.descriptor.address, cached.guest_native_coverage.?)) |current| {
+                if (self.storageOverwriteGuestDigest(memory, cached.descriptor.address, cached.guest_native_coverage.?)) |current| {
                     self.storage_native_hash_comparisons +|= 1;
                     if (current != baseline) return true;
                     cached.guest_page_generation = page_generation;
@@ -27891,10 +28099,7 @@ pub const Renderer = struct {
         // Native memory can fingerprint the backing without copying or detiling
         // it. Only a changed allocation needs the more expensive texel check.
         self.frame_profile.storage_guest_hash_bytes +|= cached.allocation_bytes;
-        const current_hash = if (memory.fingerprint) |fingerprint|
-            fingerprint(memory.context, cached.descriptor.address, cached.allocation_bytes)
-        else
-            null;
+        const current_hash = self.fingerprintGuestRange(memory, cached.descriptor.address, cached.allocation_bytes);
         if (current_hash != null and current_hash == cached.guest_backing_hash) {
             self.observeStorageBackingGeneration(cache_index, current_hash.?, page_generation);
             return false;
@@ -27988,11 +28193,17 @@ pub const Renderer = struct {
         return hash.final();
     }
 
-    fn storageOverwriteGuestDigest(memory: GuestMemory, address: u64, spans: []const StorageTexelSpan) ?u64 {
+    fn fingerprintGuestRange(self: *Renderer, memory: GuestMemory, address: u64, size: usize) ?u64 {
         const fingerprint = memory.fingerprint orelse return null;
+        if (@atomicLoad(bool, &cached_guest_fingerprints, .monotonic))
+            return self.guest_fingerprint_cache.read(memory.context, address, size, fingerprint, memory.gpu_generation);
+        return fingerprint(memory.context, address, size);
+    }
+
+    fn storageOverwriteGuestDigest(self: *Renderer, memory: GuestMemory, address: u64, spans: []const StorageTexelSpan) ?u64 {
         var hash = std.hash.Wyhash.init(0);
         for (spans) |span| {
-            const value = fingerprint(memory.context, std.math.add(u64, address, span.offset) catch return null, span.size) orelse return null;
+            const value = self.fingerprintGuestRange(memory, std.math.add(u64, address, span.offset) catch return null, span.size) orelse return null;
             hash.update(std.mem.asBytes(&value));
         }
         return hash.final();
@@ -28185,8 +28396,8 @@ pub const Renderer = struct {
         const copy_still_current = observed_generation != 0 and
             memory.gpu_generation.?(memory.context, snapshot.descriptor.address, snapshot.allocation_bytes) == observed_generation;
         if (!copy_still_current) {
-            if (!memory.read(memory.context, snapshot.descriptor.address, allocation)) return Error.GuestMemoryReadFailed;
-            if (try self.storageGuestAllocationChanged(snapshot, allocation, 0)) {
+            const generation = try readStorageGuestAllocation(memory, snapshot.descriptor.address, allocation, snapshot.guest_page_generation);
+            if (try self.storageGuestAllocationChanged(snapshot, allocation, generation)) {
                 // The guest has written new contents since this GPU image was
                 // staged. Publishing its old output now would corrupt those
                 // contents (which may already be descriptors for another use).
@@ -28491,8 +28702,8 @@ pub const Renderer = struct {
         try self.waitForSubmittedWork();
         const unchanged = generation != 0 and memory.gpu_generation.?(memory.context, snapshot.descriptor.address, snapshot.allocation_bytes) == generation;
         if (!unchanged) {
-            if (!memory.read(memory.context, snapshot.descriptor.address, allocation.bytes)) return Error.GuestMemoryReadFailed;
-            if (try self.storageGuestAllocationChanged(snapshot, allocation.bytes, 0)) {
+            const current_generation = try readStorageGuestAllocation(memory, snapshot.descriptor.address, allocation.bytes, snapshot.guest_page_generation);
+            if (try self.storageGuestAllocationChanged(snapshot, allocation.bytes, current_generation)) {
                 self.invalidateStorageGuestContents(index);
                 return;
             }
@@ -28638,7 +28849,7 @@ pub const Renderer = struct {
         if (upload) |slice| {
             const mapping = try self.mapDrawUpload(slice);
             defer mapping.release(self);
-            @memcpy(mapping.bytes, linear);
+            copyHostUpload(mapping.bytes, linear);
         } else {
             try self.waitForSubmittedWork();
             try self.writeMapped(transfer.?, linear);
@@ -29426,7 +29637,7 @@ pub const Renderer = struct {
         try self.prepareStorageNativeCoverage(index);
         const spans = self.storage_image_cache.items[index].guest_native_coverage;
         const digest = if (@atomicLoad(bool, &digest_storage_overwrite_baseline, .monotonic) and spans != null)
-            if (allocation) |bytes| storageOverwriteDigest(spans.?, bytes) else storageOverwriteGuestDigest(self.guest_memory.?, descriptor.address, spans.?)
+            if (allocation) |bytes| storageOverwriteDigest(spans.?, bytes) else self.storageOverwriteGuestDigest(self.guest_memory.?, descriptor.address, spans.?)
         else
             null;
         if (allocation == null and digest == null) return null;
@@ -29434,7 +29645,7 @@ pub const Renderer = struct {
         const backing_hash: ?u64 = if (lean) null else if (allocation) |bytes|
             if (guest_page_generation == 0) guest_content_hash else gpu.parallel_copy.fingerprint(bytes)
         else
-            self.guest_memory.?.fingerprint.?(self.guest_memory.?.context, descriptor.address, allocation_bytes) orelse return null;
+            self.fingerprintGuestRange(self.guest_memory.?, descriptor.address, allocation_bytes) orelse return null;
         const content_hash = if (allocation == null and guest_page_generation == 0) backing_hash orelse 0 else guest_content_hash;
         const baseline: ?[]u8 = if (digest == null) blk: {
             if (!try self.reserveStorageNativeBaseline(allocation_bytes, index)) return null;
@@ -33471,7 +33682,7 @@ pub const Renderer = struct {
         if (ring_upload) |slice| {
             const mapping = try self.mapDrawUpload(slice);
             defer mapping.release(self);
-            @memcpy(mapping.bytes, linear);
+            copyHostUpload(mapping.bytes, linear);
         } else if (owned_upload) |buffer| try self.writeMapped(buffer, linear);
         // Fresh ring slices retain every queued texture snapshot, including
         // spills, without creating a host allocation for each streamed image.
@@ -34050,14 +34261,23 @@ pub const Renderer = struct {
         const Wait = struct {
             renderer: *Renderer,
             info: *const vk.SemaphoreWaitInfo,
+            target: u64,
             pub fn now(_: *@This()) u64 {
                 return hostTimestampNs();
             }
             pub fn call(waiter: *@This(), timeout: u64) vk.Result {
                 return waiter.renderer.device_functions.wait_semaphores(waiter.renderer.device, waiter.info, timeout);
             }
+            pub fn query(waiter: *@This()) vk.Result {
+                const renderer = waiter.renderer;
+                var completed: u64 = 0;
+                const result = renderer.device_functions.get_semaphore_counter_value(renderer.device, renderer.timeline_semaphore, &completed);
+                if (result != vk.success) return result;
+                if (completed > renderer.submitted_tick) return vk.error_device_lost;
+                return if (completed >= waiter.target) vk.success else vk.timeout;
+            }
         };
-        var waiter = Wait{ .renderer = self, .info = &wait_info };
+        var waiter = Wait{ .renderer = self, .info = &wait_info, .target = tick };
         const timeline = @import("timeline_wait.zig");
         const result = timeline.wait(&waiter, @atomicLoad(u64, &timeline.timeline_poll_budget_ns, .monotonic));
         if (result == vk.error_device_lost) {
@@ -35262,7 +35482,49 @@ pub const Renderer = struct {
     fn writeMappedAt(self: *Renderer, buffer: OwnedBuffer, offset: vk.DeviceSize, bytes: []const u8) Error!void {
         const mapping = try self.mapBufferRange(buffer, offset, bytes.len);
         defer mapping.release(self);
-        @memcpy(mapping.bytes, bytes);
+        copyHostUpload(mapping.bytes, bytes);
+    }
+
+    /// Exercise the same host copy used by sampled-image ring uploads and
+    /// mapped buffers, then consume it with a real GPU transfer. Every byte,
+    /// including both unaligned subrange guards, must survive the round trip.
+    pub fn probeParallelHostUploads(self: *Renderer) anyerror!void {
+        const original = parallel_host_uploads;
+        defer parallel_host_uploads = original;
+        const original_readbacks = parallel_host_readbacks;
+        defer parallel_host_readbacks = original_readbacks;
+        const participants = gpu.parallel_copy.guest_copy_pool.participants.swap(4, .acq_rel);
+        defer gpu.parallel_copy.guest_copy_pool.participants.store(participants, .release);
+        const length = 12 * 1024 * 1024 + 4;
+        const source = try self.allocator.alloc(u8, length);
+        defer self.allocator.free(source);
+        for (source, 0..) |*byte, index| byte.* = @truncate(index *% 17 +% 3);
+        const expected = try self.allocator.alloc(u8, length + 128);
+        defer self.allocator.free(expected);
+        const copied = try self.allocator.alloc(u8, expected.len);
+        defer self.allocator.free(copied);
+        const upload = try self.createBuffer(expected.len, vk.buffer_usage_transfer_src_bit, vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit);
+        defer self.destroyBuffer(upload);
+        const readback = try self.createBuffer(expected.len, vk.buffer_usage_transfer_dst_bit, vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit);
+        defer self.destroyBuffer(readback);
+        for ([_]bool{ false, true }) |enabled| {
+            parallel_host_uploads = enabled;
+            parallel_host_readbacks = enabled;
+            for ([_]usize{ 2 * 1024 * 1024 - 4, 2 * 1024 * 1024, 1920 * 1080 * 2, 8 * 1024 * 1024, length }) |copy_length| for ([_]usize{ 0, 63 }) |offset| {
+                @memset(expected, 0x5d);
+                try self.writeMapped(upload, expected);
+                @memcpy(expected[offset..][0..copy_length], source[0..copy_length]);
+                try self.writeMappedAt(upload, offset, source[0..copy_length]);
+                const command = try self.beginOneShot();
+                defer self.releaseOneShot(command);
+                const region = vk.BufferCopy{ .source_offset = 0, .destination_offset = 0, .size = expected.len };
+                self.device_functions.cmd_copy_buffer(command, upload.handle, readback.handle, 1, &.{region});
+                try self.submitOneShot(command);
+                try self.expectMapped(readback, expected);
+                try self.readMapped(readback, copied);
+                try std.testing.expectEqualSlices(u8, expected, copied);
+            };
+        }
     }
 
     fn writeGraphicsScalarValues(
@@ -35304,7 +35566,10 @@ pub const Renderer = struct {
         try self.waitForSubmittedWork();
         const mapping = try self.mapBufferRange(buffer, offset, destination.len);
         defer mapping.release(self);
-        @memcpy(destination, mapping.bytes);
+        if (destination.len >= 2 * 1024 * 1024 and @atomicLoad(bool, &parallel_host_readbacks, .monotonic)) {
+            gpu.parallel_copy.guest_copy_pool.copy(destination, mapping.bytes);
+            _ = @atomicRmw(u64, &parallel_host_readback_bytes, .Add, destination.len, .monotonic);
+        } else @memcpy(destination, mapping.bytes);
     }
 
     fn createSmokeShader(self: *Renderer) Error!vk.ShaderModule {
@@ -41838,13 +42103,14 @@ fn packedBufferClearColor(image_format: u32, words: [4]u32) ?vk.ClearColorValue 
     }
     // sRGB render targets have a UNORM backing image: these raw buffer
     // patterns are already encoded and must not pass through sRGB again.
-    if (image_format != vk.format_r8_unorm and image_format != vk.format_r8g8b8a8_unorm and image_format != vk.format_r8g8b8a8_srgb and image_format != vk.format_r8g8b8a8_snorm) return null;
+    if (image_format != vk.format_r8_unorm and image_format != vk.format_r8g8_unorm and image_format != vk.format_r8g8b8a8_unorm and image_format != vk.format_r8g8b8a8_srgb and image_format != vk.format_r8g8b8a8_snorm) return null;
     for (words[1..]) |word| if (word != words[0]) return null;
     var bytes: [4]u8 = undefined;
     std.mem.writeInt(u32, &bytes, words[0], .little);
     if (image_format == vk.format_r8_unorm) {
         for (bytes[1..]) |byte| if (byte != bytes[0]) return null;
     }
+    if (image_format == vk.format_r8g8_unorm and (bytes[0] != bytes[2] or bytes[1] != bytes[3])) return null;
     var values: [4]f32 = undefined;
     for (&values, bytes) |*value, byte| {
         if (image_format == vk.format_r8g8b8a8_snorm) {
@@ -43663,8 +43929,13 @@ fn scalarPointerTablePlan(
     if (pointer_register + 1 >= 128) return null;
     const offset_register = gpu.scalar_provenance.scalarRegisterIndex(load.src1) orelse return null;
     const instructions = analysis.program.instructions.items;
-    var load_index: usize = 0;
-    while (load_index < instructions.len and instructions[load_index].pc < load.pc) : (load_index += 1) {}
+    const load_index = if (@atomicLoad(bool, &gpu.resource_checkpoints.cached_pointer_preparation, .monotonic))
+        analysis.instructionBefore(load.pc)
+    else scan: {
+        var index: usize = 0;
+        while (index < instructions.len and instructions[index].pc < load.pc) : (index += 1) {}
+        break :scan index;
+    };
     const definition = analysis.scalarDefinition(load_index, @intCast(offset_register)) orelse return null;
     const multiply_index = switch (definition) {
         .entry => return null,

@@ -16,6 +16,10 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+pub export var reuse_armed_gpu_pages: bool = true;
+pub export var armed_gpu_page_reuses: u64 = 0;
+pub export var fine_gpu_range_guards: bool = true;
+pub export var fine_gpu_range_pages_avoided: u64 = 0;
 
 pub const SharedBacking = @import("backing_store.zig").SharedBacking;
 pub const SharedView = @import("backing_store.zig").SharedView;
@@ -676,8 +680,13 @@ pub const Error = error{
 /// park during long host commits/protection changes without requiring std.Io.
 const Lock = HostMutex;
 
+pub export var known_uniform_publications: bool = true;
+pub export var uniform_publication_compares_avoided: u64 = 0;
+
 const TrackedGpuPage = struct {
     generation: u64,
+    uniform_generation: u64 = 0,
+    uniform_value: u32 = 0,
     restore_protection: Protection,
     armed: bool = false,
     /// A hint only: every grouped protection still checks the native region.
@@ -689,11 +698,13 @@ const TrackedGpuPage = struct {
 /// granularity instead of hashing whole textures and buffers every draw.
 const GpuPageTracker = struct {
     const region_shift = 21;
+    const fine_region_shift = 18;
     const RangeGeneration = struct {
         first: u64 = 0,
         end: u64 = 0,
         epoch: u64 = 0,
         region_epoch: u64 = 0,
+        fine_region_epoch: u64 = 0,
         fingerprint: u64 = 0,
     };
     pages: std.AutoHashMapUnmanaged(u64, TrackedGpuPage) = .empty,
@@ -704,6 +715,7 @@ const GpuPageTracker = struct {
     // allocations. Hash collisions only cause extra page walks. The fault
     // handler updates this fixed table without allocating or scanning ranges.
     region_epochs: [4096]u64 = @splat(0),
+    fine_region_epochs: [8192]u64 = @splat(0),
     lock: Lock = .{},
     generation_counter: u64 = 1,
     enabled: bool = false,
@@ -724,8 +736,41 @@ const GpuPageTracker = struct {
 
     fn rememberRangeGeneration(self: *GpuPageTracker, first: u64, end: u64, fingerprint: u64) u64 {
         const value = if (fingerprint == 0) 1 else fingerprint;
-        self.rangeGenerationSlot(first, end).* = .{ .first = first, .end = end, .epoch = self.generation_counter, .region_epoch = self.rangeRegionEpoch(first, end), .fingerprint = value };
+        self.rangeGenerationSlot(first, end).* = .{
+            .first = first,
+            .end = end,
+            .epoch = self.generation_counter,
+            .region_epoch = self.rangeRegionEpoch(first, end),
+            .fine_region_epoch = if (@atomicLoad(bool, &fine_gpu_range_guards, .monotonic)) self.rangeFineRegionEpoch(first, end) else 0,
+            .fingerprint = value,
+        };
         return value;
+    }
+
+    fn cachedRangeGeneration(self: *GpuPageTracker, first: u64, end: u64) ?u64 {
+        const cached = self.rangeGenerationSlot(first, end);
+        if (cached.first != first or cached.end != end) return null;
+        if (cached.epoch != self.generation_counter and cached.region_epoch != self.rangeRegionEpoch(first, end)) {
+            // A neighboring 256 KiB block can invalidate the coarse 2 MiB
+            // guard without changing any page in this query. Every mutation
+            // updates both tables under the tracker lock; collisions cause
+            // extra misses, never endorsement of an older page generation.
+            if (!@atomicLoad(bool, &fine_gpu_range_guards, .monotonic) or cached.fine_region_epoch == 0 or
+                cached.fine_region_epoch != self.rangeFineRegionEpoch(first, end)) return null;
+            _ = @atomicRmw(u64, &fine_gpu_range_pages_avoided, .Add, (end - first) / page_size, .monotonic);
+        }
+        cached.epoch = self.generation_counter;
+        return cached.fingerprint;
+    }
+
+    fn rangeFineRegionEpoch(self: *const GpuPageTracker, first: u64, end: u64) u64 {
+        var region = first >> fine_region_shift;
+        const last = (end - 1) >> fine_region_shift;
+        if (last - region >= self.fine_region_epochs.len) return self.generation_counter;
+        var newest: u64 = 0;
+        while (region <= last) : (region += 1)
+            newest = @max(newest, self.fine_region_epochs[region & (self.fine_region_epochs.len - 1)]);
+        return newest;
     }
 
     fn rangeRegionEpoch(self: *const GpuPageTracker, first: u64, end: u64) u64 {
@@ -758,8 +803,10 @@ const GpuPageTracker = struct {
         if (next == 0) {
             @memset(&self.range_generations, .{});
             @memset(&self.region_epochs, 0);
+            @memset(&self.fine_region_epochs, 0);
         }
         self.region_epochs[(page >> region_shift) & (self.region_epochs.len - 1)] = value;
+        self.fine_region_epochs[(page >> fine_region_shift) & (self.fine_region_epochs.len - 1)] = value;
         return value;
     }
 
@@ -1199,6 +1246,20 @@ pub const AddressSpace = struct {
     /// eligible; private memory, split mappings and uncertain host state fall
     /// back. Mapping and tracker locks cover both the copy and its generations.
     pub fn publishGpuBytes(self: *AddressSpace, address: u64, source: []const u8) ?usize {
+        return self.publishGpuBytesWithPattern(address, source, null);
+    }
+
+    /// The renderer must supply exactly the repeated little-endian word in
+    /// source. Full watched pages can then remember that value until a CPU or
+    /// GPU publication changes their generation. Partial writes cannot certify
+    /// an entire page. Unaligned ranges retain the ordinary byte comparison.
+    pub fn publishGpuUniform32(self: *AddressSpace, address: u64, source: []const u8, value: u32) ?usize {
+        const pattern: ?u32 = if (address & 3 == 0 and source.len & 3 == 0 and
+            @atomicLoad(bool, &known_uniform_publications, .monotonic)) value else null;
+        return self.publishGpuBytesWithPattern(address, source, pattern);
+    }
+
+    fn publishGpuBytesWithPattern(self: *AddressSpace, address: u64, source: []const u8, pattern: ?u32) ?usize {
         if (builtin.os.tag != .windows or source.len == 0 or source.len > 64 * 1024 * 1024) return null;
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -1257,10 +1318,18 @@ pub const AddressSpace = struct {
         defer tracker.lock.unlock();
         var cursor: usize = 0;
         var unchanged: usize = 0;
+        var avoided: usize = 0;
         while (cursor < source.len) {
             const page = (address + cursor) & ~(page_size - 1);
             const end = cursor + @min(source.len - cursor, page_size - ((address + cursor) - page));
-            if (std.mem.eql(u8, destination[cursor..end], source[cursor..end])) {
+            const uniform_page = if (pattern != null and tracker.enabled) tracker.pages.getPtr(page) else null;
+            const known_equal = if (uniform_page) |tracked| tracked.armed and
+                tracked.uniform_generation != 0 and tracked.uniform_generation == tracked.generation and
+                tracked.uniform_value == pattern.? else false;
+            if (known_equal) {
+                unchanged += end - cursor;
+                avoided += end - cursor;
+            } else if (std.mem.eql(u8, destination[cursor..end], source[cursor..end])) {
                 unchanged += end - cursor;
             } else {
                 @memcpy(destination[cursor..end], source[cursor..end]);
@@ -1270,8 +1339,15 @@ pub const AddressSpace = struct {
                     tracked.generation = tracker.nextGeneration(page);
                 };
             }
+            if (uniform_page) |tracked| {
+                if (tracked.armed and address + cursor == page and end - cursor == page_size) {
+                    tracked.uniform_generation = tracked.generation;
+                    tracked.uniform_value = pattern.?;
+                }
+            }
             cursor = end;
         }
+        if (avoided != 0) _ = @atomicRmw(u64, &uniform_publication_compares_avoided, .Add, avoided, .monotonic);
         return unchanged;
     }
 
@@ -1501,17 +1577,29 @@ pub const AddressSpace = struct {
 
         // A positive observation already proves that every writable page is
         // armed. Unrelated writes need not walk and recheck this whole range.
-        const cached = tracker.rangeGenerationSlot(first_page, end_page);
-        if (cached.first == first_page and cached.end == end_page and
-            (cached.epoch == tracker.generation_counter or cached.region_epoch == tracker.rangeRegionEpoch(first_page, end_page)))
-        {
-            cached.epoch = tracker.generation_counter;
-            return cached.fingerprint;
-        }
+        if (tracker.cachedRangeGeneration(first_page, end_page)) |generation| return generation;
 
         var fingerprint: u64 = 0xcbf2_9ce4_8422_2325;
         var page = first_page;
+        const reuse_armed = @atomicLoad(bool, &reuse_armed_gpu_pages, .monotonic);
+        var reused_pages: u64 = 0;
+        defer if (reused_pages != 0) {
+            _ = @atomicRmw(u64, &armed_gpu_page_reuses, .Add, reused_pages, .monotonic);
+        };
         while (page < end_page) {
+            // The mapping mutex excludes unmap/protect; those operations
+            // remove tracked entries before changing a mapping. An armed
+            // page (or a logically read-only page) therefore already carries
+            // the current mapping permissions. A write fault disarms it and
+            // takes the original registration/protection path below.
+            if (reuse_armed) if (tracker.pages.getPtr(page)) |tracked| {
+                if (tracked.armed or !tracked.restore_protection.write) {
+                    fingerprintGpuPage(&fingerprint, page, tracked.generation);
+                    reused_pages += 1;
+                    page += page_size;
+                    continue;
+                }
+            };
             const mapping = self.mappingForPageLocked(page) orelse return Error.RangeNotMapped;
             const can_batch = builtin.os.tag == .windows and
                 hostMappingViewSize(mapping.kind, mapping.address, mapping.size, mapping.backing_offset) > page_size;
@@ -1582,13 +1670,7 @@ pub const AddressSpace = struct {
         tracker.lock.lock();
         defer tracker.lock.unlock();
         if (!tracker.enabled) return 0;
-        const cached = tracker.rangeGenerationSlot(first_page, end_page);
-        if (cached.first == first_page and cached.end == end_page and
-            (cached.epoch == tracker.generation_counter or cached.region_epoch == tracker.rangeRegionEpoch(first_page, end_page)))
-        {
-            cached.epoch = tracker.generation_counter;
-            return cached.fingerprint;
-        }
+        if (tracker.cachedRangeGeneration(first_page, end_page)) |generation| return generation;
 
         var fingerprint: u64 = 0xcbf2_9ce4_8422_2325;
         var page = first_page;
@@ -3331,6 +3413,114 @@ test "GPU page mapping lookup selects the containing range and its protection" {
     try testing.expectEqual(null, space.mappingForPageLocked(8 * page_size));
 }
 
+test "fine GPU range guards reject changed pages boundaries collisions and missing proofs" {
+    const saved = fine_gpu_range_guards;
+    defer fine_gpu_range_guards = saved;
+    fine_gpu_range_guards = true;
+    var tracker = GpuPageTracker{};
+    const first = 0x1000000;
+    const end = first + 2 * page_size;
+    _ = tracker.nextGeneration(first);
+    _ = tracker.rememberRangeGeneration(first, end, 123);
+    _ = tracker.nextGeneration(first + 512 * 1024);
+    fine_gpu_range_guards = false;
+    try testing.expectEqual(null, tracker.cachedRangeGeneration(first, end));
+    fine_gpu_range_guards = true;
+    const avoided = fine_gpu_range_pages_avoided;
+    try testing.expectEqual(@as(?u64, 123), tracker.cachedRangeGeneration(first, end));
+    try testing.expectEqual(avoided + 2, fine_gpu_range_pages_avoided);
+    _ = tracker.nextGeneration(end - page_size);
+    try testing.expectEqual(null, tracker.cachedRangeGeneration(first, end));
+    fine_gpu_range_guards = false;
+    _ = tracker.rememberRangeGeneration(first, end, 234);
+    fine_gpu_range_guards = true;
+    _ = tracker.nextGeneration(first + 512 * 1024);
+    try testing.expectEqual(null, tracker.cachedRangeGeneration(first, end));
+    _ = tracker.rememberRangeGeneration(first, end, 345);
+    _ = tracker.nextGeneration(first + 512 * 1024);
+    _ = tracker.nextGeneration(first + (@as(u64, tracker.fine_region_epochs.len) << GpuPageTracker.fine_region_shift));
+    try testing.expectEqual(null, tracker.cachedRangeGeneration(first, end));
+    const boundary_first = first + 256 * 1024 - page_size;
+    const boundary_end = boundary_first + 2 * page_size;
+    _ = tracker.rememberRangeGeneration(boundary_first, boundary_end, 456);
+    _ = tracker.nextGeneration(boundary_end - page_size);
+    try testing.expectEqual(null, tracker.cachedRangeGeneration(boundary_first, boundary_end));
+    _ = tracker.rememberRangeGeneration(first, end, 567);
+    tracker.generation_counter = std.math.maxInt(u64);
+    _ = tracker.nextGeneration(first + 512 * 1024);
+    try testing.expectEqual(null, tracker.cachedRangeGeneration(first, end));
+}
+
+test "fine range guards preserve native write invalidation outside and inside a queried view" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const saved = fine_gpu_range_guards;
+    defer fine_gpu_range_guards = saved;
+    fine_gpu_range_guards = true;
+    const bytes = 1024 * 1024;
+    var space = try AddressSpace.initWithDirectMemory(testing.allocator, bytes);
+    defer space.deinit();
+    const address = user.start;
+    try space.mapFixed(address, bytes, .read_write, .direct_memory, 0);
+    space.enableGpuMemoryTracking();
+    _ = try space.trackGpuRead(address, bytes);
+    const first = try space.trackGpuRead(address, windows_allocation_granularity);
+    try testing.expect(space.handleGpuTrackedWriteFault(address + 512 * 1024));
+    const avoided = fine_gpu_range_pages_avoided;
+    try testing.expectEqual(first, space.gpuGeneration(address, windows_allocation_granularity));
+    try testing.expectEqual(avoided + windows_allocation_granularity / page_size, fine_gpu_range_pages_avoided);
+    try testing.expectEqual(@as(u64, 0), space.gpuGeneration(address, bytes));
+    try testing.expectEqual(@as(u64, 0), space.gpuGeneration(address + 512 * 1024, page_size));
+    try testing.expect(space.handleGpuTrackedWriteFault(address + page_size));
+    try testing.expectEqual(@as(u64, 0), space.gpuGeneration(address, windows_allocation_granularity));
+    const changed = try space.trackGpuRead(address, windows_allocation_granularity);
+    try testing.expect(changed != first);
+    try space.protect(address, page_size, .none);
+    try testing.expectEqual(@as(u64, 0), space.gpuGeneration(address, windows_allocation_granularity));
+    try testing.expectError(Error.ProtectionDenied, space.trackGpuRead(address, windows_allocation_granularity));
+}
+
+test "armed GPU page reuse preserves faults protection changes and remapping" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const saved = reuse_armed_gpu_pages;
+    defer reuse_armed_gpu_pages = saved;
+    var baseline: [5]u64 = undefined;
+    for ([_]bool{ false, true }) |enabled| {
+        reuse_armed_gpu_pages = enabled;
+        const bytes = 2 * windows_allocation_granularity;
+        var space = try AddressSpace.initWithDirectMemory(testing.allocator, bytes);
+        defer space.deinit();
+        const address = user.start;
+        try space.mapFixed(address, bytes, .read_write, .direct_memory, 0);
+        space.enableGpuMemoryTracking();
+        var generations: [5]u64 = undefined;
+        generations[0] = try space.trackGpuRead(address, bytes);
+        const calls = space.gpu_tracker.protection_calls;
+        try testing.expect(space.handleGpuTrackedWriteFault(address + 2 * page_size));
+        const reused_before = armed_gpu_page_reuses;
+        generations[1] = try space.trackGpuRead(address, bytes);
+        try testing.expectEqual(enabled, armed_gpu_page_reuses > reused_before);
+        try testing.expectEqual(calls + 2, space.gpu_tracker.protection_calls);
+        try testing.expectEqual(generations[1], space.gpuGeneration(address, bytes));
+        try testing.expect(!isHostRangeWritable(address, bytes));
+        try space.protect(address + page_size, page_size, .read_only);
+        generations[2] = try space.trackGpuRead(address, bytes);
+        try testing.expect(!space.handleGpuTrackedWriteFault(address + page_size));
+        space.notifyGuestWrite(address + 4 * page_size, page_size);
+        _ = try space.trackGpuRead(address, bytes);
+        try testing.expect(!isHostRangeWritable(address + page_size, page_size));
+        try space.protect(address + page_size, page_size, .none);
+        try testing.expectError(Error.ProtectionDenied, space.trackGpuRead(address, bytes));
+        try space.protect(address + page_size, page_size, .read_write);
+        generations[3] = try space.trackGpuRead(address, bytes);
+        try testing.expect(space.handleGpuTrackedWriteFault(address + page_size));
+        try space.unmap(address, windows_allocation_granularity);
+        try space.mapFixed(address, windows_allocation_granularity, .read_write, .direct_memory, 0);
+        generations[4] = try space.trackGpuRead(address, bytes);
+        for (generations[1..], generations[0..4]) |current, previous| try testing.expect(current != previous);
+        if (enabled) try testing.expectEqualDeep(baseline, generations) else baseline = generations;
+    }
+}
+
 test "GPU watches batch within native views and retain per-page write epochs" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
     const bytes = 2 * windows_allocation_granularity;
@@ -3457,6 +3647,83 @@ test "GPU publication aliases keep watches armed and preserve later CPU invalida
     // A GPU copy cannot certify a page whose native CPU watch is disarmed.
     try testing.expectEqual(@as(u64, 0), space.gpuGeneration(address, size));
     try testing.expect((try space.trackGpuRead(address, size)) != published);
+}
+
+test "uniform GPU publications reuse only complete unchanged watched pages" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const enabled = known_uniform_publications;
+    defer known_uniform_publications = enabled;
+    known_uniform_publications = true;
+    const size = windows_allocation_granularity;
+    var space = try AddressSpace.initWithDirectMemory(testing.allocator, 2 * size);
+    defer space.deinit();
+    const address = user.start;
+    try space.mapFixed(address, size, .read_write, .direct_memory, 0);
+    space.enableGpuMemoryTracking();
+    _ = try space.trackGpuRead(address, size);
+    const source = try testing.allocator.alloc(u8, size);
+    defer testing.allocator.free(source);
+    const value: u32 = 0x7531_ba92;
+    var offset: usize = 0;
+    while (offset < source.len) : (offset += 4) std.mem.writeInt(u32, source[offset..][0..4], value, .little);
+    const start = uniform_publication_compares_avoided;
+    try testing.expectEqual(@as(usize, 0), space.publishGpuUniform32(address, source, value).?);
+    const generation = space.gpuGeneration(address, size);
+    const guest = @as([*]const u8, @ptrFromInt(address))[0..size];
+    try testing.expectEqualSlices(u8, source, guest);
+    try testing.expectEqual(start, uniform_publication_compares_avoided);
+    try testing.expectEqual(source.len, space.publishGpuUniform32(address, source, value).?);
+    try testing.expectEqual(start + size, uniform_publication_compares_avoided);
+    try testing.expectEqual(generation, space.gpuGeneration(address, size));
+    try testing.expectEqual(@as(usize, 4), space.publishGpuUniform32(address + 4, source[0..4], value).?);
+    try testing.expectEqual(start + size + 4, uniform_publication_compares_avoided);
+
+    // Native CPU invalidation must defeat the saved uniform value, even after
+    // rearming the same virtual page. Restore only the word actually cleared.
+    try testing.expect(space.handleGpuTrackedWriteFault(address));
+    @as(*u8, @ptrFromInt(address)).* = 0;
+    @as(*u8, @ptrFromInt(address + 8)).* = 0;
+    _ = try space.trackGpuRead(address, size);
+    const before_partial = uniform_publication_compares_avoided;
+    try testing.expectEqual(@as(usize, 0), space.publishGpuUniform32(address, source[0..4], value).?);
+    try testing.expectEqual(before_partial, uniform_publication_compares_avoided);
+    try testing.expectEqual(@as(u8, 0), guest[8]);
+    try testing.expectEqual(@as(usize, 0), space.publishGpuUniform32(address + 8, source[0..4], value).?);
+    // Two partial writes do not certify the complete page.
+    try testing.expectEqual(@as(usize, 4), space.publishGpuUniform32(address + 8, source[0..4], value).?);
+    try testing.expectEqual(before_partial, uniform_publication_compares_avoided);
+
+    // A generic publication changes the generation while keeping watches armed.
+    _ = space.publishGpuUniform32(address, source, value).?;
+    const changed = [_]u8{ 1, 2, 3, 4 };
+    // A different uniform value must not reuse the previous certificate.
+    const different = std.mem.readInt(u32, &changed, .little);
+    try testing.expectEqual(@as(usize, 0), space.publishGpuUniform32(address + 12, &changed, different).?);
+    try testing.expectEqual(@as(usize, 0), space.publishGpuUniform32(address + 12, source[0..4], value).?);
+    try testing.expectEqualSlices(u8, source, guest);
+    _ = space.publishGpuUniform32(address, source, value).?;
+    try testing.expectEqual(@as(usize, 0), space.publishGpuBytes(address + 12, &changed).?);
+    try testing.expectEqual(@as(usize, 0), space.publishGpuUniform32(address + 12, source[0..4], value).?);
+    try testing.expectEqualSlices(u8, source, guest);
+    _ = space.publishGpuUniform32(address, source, value).?;
+    const before_disabled = uniform_publication_compares_avoided;
+    known_uniform_publications = false;
+    _ = space.publishGpuUniform32(address, source, value).?;
+    try testing.expectEqual(before_disabled, uniform_publication_compares_avoided);
+    known_uniform_publications = true;
+
+    // Removing/remapping the same VA cannot retain the old value certificate.
+    try space.unmap(address, size);
+    try space.mapFixed(address, size, .read_write, .direct_memory, size);
+    _ = try space.trackGpuRead(address, size);
+    const before_remap = uniform_publication_compares_avoided;
+    try testing.expectEqual(@as(usize, 0), space.publishGpuUniform32(address, source, value).?);
+    try testing.expectEqual(before_remap, uniform_publication_compares_avoided);
+    try testing.expectEqualSlices(u8, source, guest);
+    // An independently writable guest alias prevents the optimization entirely.
+    const alias = address + 4 * size;
+    try space.mapFixed(alias, size, .read_write, .direct_memory, size);
+    try testing.expectEqual(null, space.publishGpuUniform32(address, source, value));
 }
 
 test "GPU publication aliases revalidate remaps permissions and physical aliases" {

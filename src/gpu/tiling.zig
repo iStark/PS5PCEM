@@ -13,6 +13,9 @@ const std = @import("std");
 const resources = @import("resources.zig");
 const shaders = @import("shaders.zig");
 const parallel_copy = @import("parallel_copy.zig");
+pub export var contiguous_linear_staging: bool = true;
+pub export var contiguous_linear_staging_bytes: u64 = 0;
+pub export var contiguous_linear_staging_fallbacks: u64 = 0;
 
 pub const Error = error{
     InvalidExtent,
@@ -1070,6 +1073,23 @@ pub const Layout = struct {
             const row_bytes: usize = @intCast(try multiply(self.width, bytes));
             for (0..self.layers) |layer_index| {
                 const layer: u32 = @intCast(layer_index);
+                if (@atomicLoad(bool, &contiguous_linear_staging, .monotonic) and
+                    self.row_pitch_elements == self.width and self.height > 1)
+                {
+                    // Packed rows occupy exactly this layer's staging bytes.
+                    // Keep slice stride/base offsets, and never include row
+                    // padding or neighboring layers in the checked read.
+                    const src = try add(address, try self.sourceByteOffset(0, 0, layer));
+                    const dst: usize = @intCast(try self.stagingByteOffset(0, 0, layer));
+                    const length: usize = @intCast(self.staging_slice_bytes);
+                    if (reader.read_fn(reader.context, src, destination[dst..][0..length])) {
+                        _ = @atomicRmw(u64, &contiguous_linear_staging_bytes, .Add, length, .monotonic);
+                        continue;
+                    }
+                    // A reader may only lease individual mappings. Retry the
+                    // original rows so an otherwise readable image still works.
+                    _ = @atomicRmw(u64, &contiguous_linear_staging_fallbacks, .Add, 1, .monotonic);
+                }
                 for (0..self.height) |y_index| {
                     const y: u32 = @intCast(y_index);
                     const src = try add(address, try self.sourceByteOffset(0, y, layer));
@@ -2855,6 +2875,72 @@ test "checked memory staging shares the CPU detile address map" {
         layout.stage(memory.reader(), memory.base, staged[0 .. staged.len - 1]),
     );
     try testing.expectError(Error.ArithmeticOverflow, layout.sourceRange(std.math.maxInt(u64)));
+}
+
+test "packed linear staging preserves rows slices padding and failed reads" {
+    const saved = contiguous_linear_staging;
+    defer contiguous_linear_staging = saved;
+    const Memory = struct {
+        bytes: []const u8,
+        maximum_read: usize = std.math.maxInt(usize),
+        fail_at: ?u64 = null,
+        calls: usize = 0,
+        fn read(context: ?*anyopaque, address: u64, output: []u8) bool {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.calls += 1;
+            if (output.len > self.maximum_read or address > self.bytes.len or
+                output.len > self.bytes.len - address) return false;
+            if (self.fail_at) |fault| if (address <= fault and address + output.len > fault) return false;
+            @memcpy(output, self.bytes[@intCast(address)..][0..output.len]);
+            return true;
+        }
+        fn reader(self: *@This()) shaders.MemoryReader {
+            return .{ .context = self, .read_fn = read };
+        }
+    };
+    for ([_]u32{ 13, 17 }) |pitch| {
+        var layout = try Layout.init(.{
+            .tile_mode = .linear,
+            .width = 13,
+            .height = 7,
+            .layers = 2,
+            .first_slice = 1,
+            .row_pitch_elements = pitch,
+        }, 4);
+        layout.source_base_offset = 32;
+        layout.required_source_bytes += 32;
+        const source = try testing.allocator.alloc(u8, @intCast(layout.required_source_bytes));
+        defer testing.allocator.free(source);
+        for (source, 0..) |*value, index| value.* = @truncate(index * 17 + 3);
+        const expected = try testing.allocator.alloc(u8, @intCast(layout.staging_bytes));
+        defer testing.allocator.free(expected);
+        const guarded = try testing.allocator.alloc(u8, expected.len + 2);
+        defer testing.allocator.free(guarded);
+        @memset(guarded, 0xa5);
+        const actual = guarded[1 .. guarded.len - 1];
+        var memory = Memory{ .bytes = source };
+        contiguous_linear_staging = false;
+        try layout.stage(memory.reader(), 0, expected);
+        try testing.expectEqual(@as(usize, 14), memory.calls);
+        contiguous_linear_staging = true;
+        memory.calls = 0;
+        try layout.stage(memory.reader(), 0, actual);
+        try testing.expectEqualSlices(u8, expected, actual);
+        try testing.expectEqual(@as(usize, if (pitch == 13) 2 else 14), memory.calls);
+        try testing.expectEqual(@as(u8, 0xa5), guarded[0]);
+        try testing.expectEqual(@as(u8, 0xa5), guarded[guarded.len - 1]);
+        // Readable rows in separate leases retain the old fallback behavior.
+        memory.maximum_read = 13 * 4;
+        memory.calls = 0;
+        @memset(actual, 0);
+        try layout.stage(memory.reader(), 0, actual);
+        try testing.expectEqualSlices(u8, expected, actual);
+        try testing.expectEqual(@as(usize, if (pitch == 13) 16 else 14), memory.calls);
+        memory.fail_at = try layout.sourceByteOffset(0, 3, 0);
+        try testing.expectError(error.MemoryReadFailed, layout.stage(memory.reader(), 0, actual));
+        try testing.expectError(Error.DestinationTooSmall, layout.stage(memory.reader(), 0, actual[1..]));
+        try testing.expectError(Error.ArithmeticOverflow, layout.stage(memory.reader(), std.math.maxInt(u64), actual));
+    }
 }
 
 test "metadata surface decoding turns raw metadata bytes into RGBA pixels" {

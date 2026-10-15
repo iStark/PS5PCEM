@@ -15113,6 +15113,10 @@ pub fn main(init: std.process.Init) !void {
         try runGpuStorageDetileProbe(allocator, false);
         return;
     }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--parallel-host-uploads")) {
+        try runRendererProbe(allocator, vulkan.Renderer.probeParallelHostUploads);
+        return;
+    }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--prefetched-buffer-readbacks")) {
         try runBufferReadbackProbe(allocator, vulkan.Renderer.probePrefetchedBufferReadbacks, "prefetched");
         return;
@@ -15309,6 +15313,7 @@ pub fn main(init: std.process.Init) !void {
             _ = renderer.dcbBackend(memory);
             try renderer.probeColorInitializationAlias();
             try renderer.probeColorDccNativeClears();
+            try renderer.probePublishedColorClears();
             try renderer.probeColorInitializationPadded();
             try renderer.probeColorZeroFills();
         };
