@@ -1,0 +1,6 @@
+#!/bin/sh
+set -eu
+APPDIR=${APPDIR:-$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)}
+# Also select persistent XDG storage when running an extracted AppImage.
+export APPIMAGE=${APPIMAGE:-"$APPDIR/PS5PCEM.AppImage"}
+exec "$APPDIR/usr/lib/ps5pcem/ps5pcem" "$@"

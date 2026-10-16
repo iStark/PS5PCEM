@@ -17,10 +17,23 @@ $portable = Join-Path $distRoot "PS5PCEM-$Version-windows-x64-portable.zip"
 $installer = Join-Path $distRoot "PS5PCEM-$Version-windows-x64-setup.exe"
 $checksums = Join-Path $distRoot "SHA256SUMS.txt"
 $notes = Join-Path $repoRoot "docs\release-notes\$tag.md"
+$linuxPackages = @("deb", "rpm", "pacman", "AppImage") | ForEach-Object {
+    Join-Path $distRoot "PS5PCEM-$Version-linux-x64.$_"
+}
+$packages = @($portable, $installer) + $linuxPackages
 
-foreach ($path in @($portable, $installer, $checksums, $notes)) {
+foreach ($path in ($packages + @($checksums, $notes))) {
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
         throw "Release input is missing: $path"
+    }
+}
+
+$hashLines = Get-Content -LiteralPath $checksums
+foreach ($path in $packages) {
+    $hash = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
+    $expected = "$hash *$(Split-Path $path -Leaf)"
+    if ($hashLines -cnotcontains $expected) {
+        throw "Missing or mismatched release checksum: $path"
     }
 }
 
@@ -70,7 +83,9 @@ try {
 
     $arguments = @(
         "release", "create", $tag,
-        $portable, $installer, $checksums,
+        $portable, $installer
+    ) + $linuxPackages + @(
+        $checksums,
         "--verify-tag",
         "--title", "PS5PCEM $Version",
         "--notes-file", $notes

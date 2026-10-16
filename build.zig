@@ -770,7 +770,15 @@ pub fn build(b: *std.Build) void {
     if (launcher) |native_launcher| check_step.dependOn(&native_launcher.step);
     // The launcher's own tests cover its pure helpers, such as release-tag
     // comparison; they link the same libraries as the executable.
-    if (launcher) |native_launcher| test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = native_launcher.root_module })).step);
+    if (launcher) |native_launcher| {
+        const launcher_tests = b.addTest(.{ .name = "ps5pcem-launcher-tests", .root_module = native_launcher.root_module });
+        const run_launcher_tests = b.addRunArtifact(launcher_tests);
+        test_step.dependOn(&run_launcher_tests.step);
+        b.step("test-launcher", "Run native launcher tests").dependOn(&run_launcher_tests.step);
+        // Cross-build the test executable for validation on a Linux host.
+        const install_launcher_tests = b.addInstallArtifact(launcher_tests, .{});
+        b.step("build-launcher-tests", "Build launcher tests without running them").dependOn(&install_launcher_tests.step);
+    }
     check_step.dependOn(&pkgextractor.step);
     for ([_]*std.Build.Module{
         memory,

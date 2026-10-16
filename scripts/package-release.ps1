@@ -192,7 +192,14 @@ are not included. This prototype is incomplete and many titles will not work yet
     Sign-ReleaseFile $installer
 
     $checksums = Join-Path $distRoot "SHA256SUMS.txt"
-    $hashLines = foreach ($artifact in @($portableZip, $installer)) {
+    $releaseArtifacts = @($portableZip, $installer)
+    foreach ($extension in @("deb", "rpm", "pacman", "AppImage")) {
+        $linuxPackage = Join-Path $distRoot "PS5PCEM-$Version-linux-x64.$extension"
+        if (Test-Path -LiteralPath $linuxPackage -PathType Leaf) {
+            $releaseArtifacts += $linuxPackage
+        }
+    }
+    $hashLines = foreach ($artifact in $releaseArtifacts) {
         $hash = Get-FileHash -LiteralPath $artifact -Algorithm SHA256
         "{0} *{1}" -f $hash.Hash.ToLowerInvariant(), (Split-Path $artifact -Leaf)
     }

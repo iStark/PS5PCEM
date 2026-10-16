@@ -38,7 +38,7 @@ const usage =
     \\
     \\Loads and relocates the adjacent PRX graph, runs its initializers, then
     \\enters the title process. --app0 supplies full game content when eboot.bin
-    \\comes from a sparse patch directory. Direct execution requires Windows x86-64.
+    \\comes from a sparse patch directory. Direct execution requires Windows or Linux x86-64.
     \\
 ;
 

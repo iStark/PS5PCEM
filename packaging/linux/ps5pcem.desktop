@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=PS5PCEM
+Comment=Experimental PlayStation 5 emulator
+Exec=ps5pcem
+Icon=ps5pcem
+Terminal=false
+Categories=Game;Emulator;
+StartupWMClass=PS5PCEM

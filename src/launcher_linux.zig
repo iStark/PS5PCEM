@@ -263,6 +263,8 @@ const Native = struct {
     g_filename_to_uri: *const fn ([*:0]const u8, ?[*:0]const u8, ?*?*GError) callconv(.c) ?[*:0]u8,
     g_utf8_strdown: *const fn ([*]const u8, isize) callconv(.c) ?[*:0]u8,
     g_get_user_config_dir: *const fn () callconv(.c) [*:0]const u8,
+    g_get_user_data_dir: *const fn () callconv(.c) [*:0]const u8,
+    g_getenv: *const fn ([*:0]const u8) callconv(.c) ?[*:0]const u8,
     g_spawn_async: *const fn (?[*:0]const u8, Argv, ?Argv, c_int, ?ChildSetup, ?*anyopaque, ?*c_int, ?*?*GError) callconv(.c) c_int,
     g_spawn_async_with_pipes: *const fn (?[*:0]const u8, Argv, ?Argv, c_int, ?ChildSetup, ?*anyopaque, ?*c_int, ?*c_int, ?*c_int, ?*c_int, ?*?*GError) callconv(.c) c_int,
 
@@ -383,9 +385,26 @@ fn connect(instance: *anyopaque, signal: [*:0]const u8, handler: *const anyopaqu
 pub fn main(init: std.process.Init) !void {
     if (builtin.os.tag != .linux) return error.UnsupportedPlatform;
     app_io = init.io;
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--version")) {
+        std.debug.print("PS5PCEM {s}\n", .{build_options.release_version});
+        return;
+    }
     if (!loadNative()) {
         std.debug.print("PS5PCEM launcher: GTK 3 (libgtk-3.so.0) is required to show the launcher.\n", .{});
         return error.GtkUnavailable;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--check-install")) {
+        initializeIniPath();
+        var home: [1100]u8 = undefined;
+        const directory = emulatorHomeDirectory(&home) orelse return error.DataDirectoryUnavailable;
+        for ([_][]const u8{ "game-run", "pkgextractor" }) |name| {
+            var path: [1100]u8 = undefined;
+            const executable = siblingExecutable(name, &path) orelse return error.ExecutableNotFound;
+            if (!pathExists(executable)) return error.ExecutableNotFound;
+        }
+        std.debug.print("PS5PCEM {s}: GTK 3 and companion executables available\nSettings: {s}\nData: {s}\n", .{ build_options.release_version, ini_path[0..ini_path_length], directory });
+        return;
     }
     if (native.gtk_init_check(null, null) == 0) {
         std.debug.print("PS5PCEM launcher: no display to open the window on.\n", .{});
@@ -1917,17 +1936,26 @@ fn invalidateSaves() void {
 }
 
 /// The directory game-run is started in: the launcher's own, or the
-/// repository root for a development build in `zig-out/bin`. It owns
-/// `savedata`, logs and the Vulkan pipeline cache.
+/// repository root for a development build in `zig-out/bin`. Installed packages
+/// and AppImages use writable XDG data storage for saves, logs and caches.
 fn emulatorHomeDirectory(output: []u8) ?[]const u8 {
     var executable: [1024]u8 = undefined;
     const length = std.process.executablePath(app_io, &executable) catch return null;
     var directory = executable[0..baseNameStart(executable[0..length])];
     const development_tail = "zig-out/bin/";
     if (std.mem.endsWith(u8, directory, development_tail)) directory = directory[0 .. directory.len - development_tail.len];
+    if (native.g_getenv("APPIMAGE") != null) return userDataDirectory(output);
+    std.Io.Dir.cwd().access(app_io, directory, .{ .write = true }) catch return userDataDirectory(output);
     if (directory.len == 0 or directory.len > output.len) return null;
     @memcpy(output[0..directory.len], directory);
     return output[0..directory.len];
+}
+
+fn userDataDirectory(output: []u8) ?[]const u8 {
+    const base = std.mem.span(native.g_get_user_data_dir());
+    const directory = std.fmt.bufPrint(output, "{s}/ps5pcem/", .{base}) catch return null;
+    std.Io.Dir.cwd().createDirPath(app_io, directory) catch return null;
+    return directory;
 }
 
 fn saveRootDirectory(output: []u8) ?[:0]const u8 {
@@ -2403,6 +2431,7 @@ fn probeVulkan() void {
 /// Beside the executable, as on Windows, unless that directory is not the
 /// user's to write, as for a system-wide install; then the XDG config home.
 fn initializeIniPath() void {
+    if (native.g_getenv("APPIMAGE") != null) return initializeConfigIniPath();
     var executable: [1024]u8 = undefined;
     if (std.process.executablePath(app_io, &executable)) |length| {
         const directory = executable[0..baseNameStart(executable[0..length])];

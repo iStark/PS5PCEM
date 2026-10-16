@@ -44,6 +44,10 @@ The portable archive and installer contain only `ps5pcem.exe`, `game-run.exe`,
 `pkgextractor.exe`, documentation, licensing, version, and branding files. Generated settings,
 caches, and savedata are intentionally not packaged.
 
+Linux builds and the DEB/RPM/Pacman/AppImage packaging workflow are documented
+in the [Linux guide](linux.md). Build both platforms before publishing 0.3.5:
+the publishing script requires all six packages and matching SHA-256 entries.
+
 ## Usage
 
 The input is a raw shader binary: a sequence of little-endian 32-bit words, with

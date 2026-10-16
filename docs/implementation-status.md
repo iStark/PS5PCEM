@@ -10,8 +10,11 @@ behind them.
 ## Subsystems
 
 
-- Native guest execution is available on Windows x86-64; inspection, decoding,
-  and HLE components also build on Linux and macOS.
+- Native guest execution is available on Windows and Linux x86-64. Linux adds
+  guest fibers, X11 presentation, PulseAudio and a GTK 3 launcher, packaged
+  as DEB, RPM, Pacman and AppImage in 0.3.5. See [Linux limits](linux.md).
+  Controller feedback and Media Foundation video decoding remain Windows-only.
+  Inspection, decoding and HLE components also build on macOS.
 - The six libkernel MemoryPool exports now reserve virtual arenas, expand
   physical capacity, commit/decommit shared backing, execute ordered batches,
   and report block statistics. Donated blocks cannot be mapped as ordinary
