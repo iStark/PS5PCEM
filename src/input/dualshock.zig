@@ -246,11 +246,15 @@ pub const Output = struct {
     rumble_strong: u8 = 0,
     /// The small, high-frequency motor.
     rumble_weak: u8 = 0,
+    /// Light-only updates must not change motor or audio-haptics ownership.
+    set_motors: bool = true,
     red: u8 = 0,
     green: u8 = 0,
     blue: u8 = 0,
     /// Motor-only updates must leave the game's/current light-bar state alone.
     set_light_bar: bool = true,
+    /// End DualSense's Bluetooth connection LED animation before setting RGB.
+    reset_light_bar: bool = false,
     sequence: u4 = 0,
 };
 
@@ -287,8 +291,8 @@ pub fn buildOutput(
             // Ask for the plain motors rather than the haptic actuators, and
             // for control of the light bar. A pad ignores every field whose
             // enable bit is clear, so these are what make the rest take effect.
-            buffer[base] = 0x03;
-            buffer[base + 1] = if (output.set_light_bar) 0x04 else 0;
+            buffer[base] = if (output.set_motors) 0x03 else 0;
+            buffer[base + 1] = @as(u8, if (output.set_light_bar) 0x04 else 0) | @as(u8, if (output.reset_light_bar) 0x08 else 0);
             buffer[base + 2] = output.rumble_weak;
             buffer[base + 3] = output.rumble_strong;
             buffer[base + 44] = output.red;
@@ -303,7 +307,7 @@ pub fn buildOutput(
                 buffer[2] = 0xa0;
             }
             // Enable the motors, the light bar and its blink timers together.
-            buffer[base] = if (output.set_light_bar) 0xf7 else 0x01;
+            buffer[base] = @as(u8, if (output.set_light_bar) 0xf6 else 0) | @as(u8, if (output.set_motors) 0x01 else 0);
             buffer[base + 3] = output.rumble_weak;
             buffer[base + 4] = output.rumble_strong;
             buffer[base + 5] = output.red;
@@ -322,6 +326,48 @@ fn appendChecksum(report: []u8) void {
     crc.update(&[_]u8{bluetooth_checksum_seed});
     crc.update(body);
     std.mem.writeInt(u32, report[report.len - 4 ..][0..4], crc.final(), .little);
+}
+
+/// DualSense's enhanced Bluetooth packet contains a 3 MHz connection timer.
+/// SDL waits for this threshold before resetting the connection LED animation.
+pub fn bluetoothLightBarReady(report: []const u8) bool {
+    return report.len >= 33 and report[0] == 0x31 and std.mem.readInt(u32, report[29..33], .little) >= 10_200_000;
+}
+
+test "light-only reports never enable motors and encode every RGB byte" {
+    for ([_]Family{ .dual_sense, .dual_shock_4 }) |family| {
+        for ([_]Transport{ .usb, .bluetooth }) |transport| {
+            var buffer: [maximum_output_bytes]u8 = undefined;
+            const base: usize = if (transport == .usb) 1 else 3;
+            for ([_][3]u8{ .{ 17, 99, 231 }, .{ 0, 0, 0 } }) |rgb| {
+                _ = buildOutput(family, transport, .{ .set_motors = false, .red = rgb[0], .green = rgb[1], .blue = rgb[2] }, &buffer);
+                if (family == .dual_sense) {
+                    try std.testing.expectEqual(@as(u8, 0), buffer[base]);
+                    try std.testing.expectEqual(@as(u8, 4), buffer[base + 1]);
+                    try std.testing.expectEqualSlices(u8, &rgb, buffer[base + 44 ..][0..3]);
+                } else {
+                    try std.testing.expectEqual(@as(u8, 0xf6), buffer[base]);
+                    try std.testing.expectEqualSlices(u8, &rgb, buffer[base + 5 ..][0..3]);
+                }
+            }
+        }
+    }
+    var report: [maximum_output_bytes]u8 = undefined;
+    _ = buildOutput(.dual_sense, .bluetooth, .{ .set_motors = false, .set_light_bar = false, .reset_light_bar = true }, &report);
+    try std.testing.expectEqual(@as(u8, 0), report[3]);
+    try std.testing.expectEqual(@as(u8, 8), report[4]);
+}
+
+test "Bluetooth light bar waits for the connection animation" {
+    var report = [_]u8{0} ** 78;
+    report[0] = 0x31;
+    std.mem.writeInt(u32, report[29..33], 10_199_999, .little);
+    try std.testing.expect(!bluetoothLightBarReady(&report));
+    std.mem.writeInt(u32, report[29..33], 10_200_000, .little);
+    try std.testing.expect(bluetoothLightBarReady(&report));
+    try std.testing.expect(!bluetoothLightBarReady(report[0..32]));
+    report[0] = 1;
+    try std.testing.expect(!bluetoothLightBarReady(&report));
 }
 
 test "the transport is recovered from the declared output report length" {

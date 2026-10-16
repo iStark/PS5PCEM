@@ -75,6 +75,22 @@ const OutputQueue = struct {
     }
 };
 
+const LightBarSetup = struct {
+    first_ms: ?u64 = null,
+    ready: bool = false,
+    complete: bool = false,
+
+    fn prepare(self: *LightBarSetup, output: dualshock.Output, now_ms: u64) dualshock.Output {
+        if (!output.set_light_bar or self.complete) return output;
+        if (self.first_ms == null) self.first_ms = now_ms;
+        var next = output;
+        next.set_light_bar = false;
+        // A bounded fallback also permits LEDs if no enhanced input arrives.
+        next.reset_light_bar = self.ready or now_ms -| self.first_ms.? >= 3500;
+        return next;
+    }
+};
+
 const Device = struct {
     handle: ?*anyopaque = null,
     event: ?*anyopaque = null,
@@ -99,6 +115,7 @@ const Device = struct {
     write_pending: bool = false,
     in_flight_output: dualshock.Output = .{},
     sequence: u4 = 0,
+    light_bar_setup: LightBarSetup = .{},
 
     fn isOpen(self: Device) bool {
         return self.handle != null;
@@ -231,11 +248,17 @@ pub fn stopTest() void {
 
 /// Called by the feedback worker, never waiting on USB/Bluetooth completion.
 pub fn setVibration(large: u8, small: u8) bool {
+    return setFeedback(.{ .rumble_strong = large, .rumble_weak = small, .set_light_bar = false });
+}
+
+/// A complete snapshot prevents independent RGB and motor requests from
+/// replacing one another while an older report is still in flight.
+pub fn setFeedback(output: dualshock.Output) bool {
     if (comptime !supported) return false;
     mutex.lock();
     defer mutex.unlock();
     _ = pollLocked();
-    return send(.{ .rumble_strong = large, .rumble_weak = small, .set_light_bar = false });
+    return send(output);
 }
 
 pub fn pumpOutput() bool {
@@ -268,10 +291,16 @@ fn pumpOutputLocked() bool {
             return false;
         }
         device.output.applied = device.in_flight_output;
+        if (device.in_flight_output.reset_light_bar) device.light_bar_setup.complete = true;
         completed_reports +%= 1;
     }
     var output = device.output.next() orelse return false;
     const transport = device.transport orelse return false;
+    if (device.family == .dual_sense and transport == .bluetooth) {
+        output = device.light_bar_setup.prepare(output, Win32.GetTickCount64());
+        // Waiting for the LED animation must not resend unchanged motor data.
+        if (device.output.applied) |applied| if (std.meta.eql(output, applied)) return true;
+    }
     device.in_flight_output = output;
     output.sequence = device.sequence;
     const length = dualshock.buildOutput(device.family, transport, output, &device.write_buffer) orelse return false;
@@ -283,9 +312,10 @@ fn pumpOutputLocked() bool {
     if (Win32.WriteFile(handle, &device.write_buffer, device.write_size, &written, &device.write_overlapped) != 0) {
         if (written == device.write_size) {
             device.output.applied = device.in_flight_output;
+            if (device.in_flight_output.reset_light_bar) device.light_bar_setup.complete = true;
             completed_reports +%= 1;
         } else refuseOutput();
-        return false;
+        return device.output.next() != null;
     }
     if (Win32.GetLastError() == Win32.error_io_pending) {
         device.write_pending = true;
@@ -335,7 +365,7 @@ pub fn close() void {
     defer mutex.unlock();
     // Do not discover or write a controller which this process never used.
     if (device.output.wanted != null) {
-        _ = send(.{ .set_light_bar = false });
+        _ = send(.{ .set_light_bar = false, .set_motors = device.output.wanted.?.set_motors });
         finishOutputLocked();
     }
     closeDevice();
@@ -397,6 +427,7 @@ fn drain() void {
 fn accept(transferred: u32) void {
     if (transferred == 0) return;
     const report = device.buffer[0..transferred];
+    if (device.family == .dual_sense and dualshock.bluetoothLightBarReady(report)) device.light_bar_setup.ready = true;
     if (dualshock.parse(device.family, report)) |pad| latest = pad;
 }
 
@@ -641,6 +672,40 @@ test "an in-flight rumble cannot replace a newer stop or repeated request" {
     try std.testing.expect(queue.next() == null);
     queue.applied = null; // reconnect must send the current state again
     try std.testing.expectEqual(rumble, queue.next().?);
+}
+
+test "Bluetooth RGB follows completed LED reset and retains motors" {
+    var setup = LightBarSetup{};
+    const wanted = dualshock.Output{ .red = 25, .green = 80, .blue = 195, .rumble_strong = 70, .rumble_weak = 30 };
+    const waiting = setup.prepare(wanted, 100);
+    try std.testing.expect(!waiting.set_light_bar and !waiting.reset_light_bar);
+    try std.testing.expectEqual(wanted.rumble_strong, waiting.rumble_strong);
+    try std.testing.expect(!setup.prepare(wanted, 3599).reset_light_bar);
+    const fallback = setup.prepare(wanted, 3600);
+    try std.testing.expect(fallback.reset_light_bar and !fallback.set_light_bar);
+    setup.complete = true;
+    try std.testing.expectEqual(wanted, setup.prepare(wanted, 3601));
+    setup = .{ .ready = true };
+    try std.testing.expect(setup.prepare(wanted, 0).reset_light_bar);
+}
+
+test "a pending report cannot erase a newer combined RGB and motor state" {
+    var queue = OutputQueue{};
+    const first = dualshock.Output{ .set_light_bar = false, .rumble_strong = 90 };
+    queue.wanted = first;
+    const pending = queue.next().?;
+    const color = dualshock.Output{ .red = 123, .green = 45, .blue = 67, .rumble_strong = 90 };
+    queue.wanted = color;
+    queue.applied = pending;
+    try std.testing.expectEqual(color, queue.next().?);
+    const pending_color = queue.next().?;
+    var stop = color;
+    stop.rumble_strong = 0;
+    queue.wanted = stop;
+    queue.applied = pending_color;
+    try std.testing.expectEqual(stop, queue.next().?);
+    queue.applied = stop;
+    try std.testing.expect(queue.next() == null);
 }
 
 test "a wireless report is padded to the declared length with its checksum intact" {

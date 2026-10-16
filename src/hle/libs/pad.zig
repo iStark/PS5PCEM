@@ -113,16 +113,23 @@ comptime {
 var initialized: std.atomic.Value(u8) = .init(0);
 var open: std.atomic.Value(u8) = .init(0);
 var motion_sensor_enabled: std.atomic.Value(u8) = .init(0);
-var vibration_lock: @import("memory").HostMutex = .{};
+var feedback_lock: @import("memory").HostMutex = .{};
 
 const VibrationParam = extern struct {
     large_motor: u8,
     small_motor: u8,
 };
 
+const LightBarParam = extern struct {
+    red: u8,
+    green: u8,
+    blue: u8,
+    reserved: u8 = 0,
+};
+
 pub fn reset() void {
-    vibration_lock.lock();
-    defer vibration_lock.unlock();
+    feedback_lock.lock();
+    defer feedback_lock.unlock();
     initialized.store(0, .release);
     open.store(0, .release);
     motion_sensor_enabled.store(0, .release);
@@ -201,11 +208,11 @@ fn padOpen(user_id: i32, port_type: i32, index: i32, parameter: ?*const anyopaqu
 }
 
 fn padClose(handle: i32) callconv(abi.guest) i32 {
-    vibration_lock.lock();
-    defer vibration_lock.unlock();
+    feedback_lock.lock();
+    defer feedback_lock.unlock();
     if (!validHandle(handle)) return error_invalid_handle;
     open.store(0, .release);
-    host_input.stopVibration();
+    host_input.stopFeedback();
     return errno.ok;
 }
 
@@ -372,11 +379,28 @@ fn setVibrationMode(handle: i32, _: i32) callconv(abi.guest) i32 {
 }
 
 fn setVibration(handle: i32, parameter: ?*const VibrationParam) callconv(abi.guest) i32 {
-    vibration_lock.lock();
-    defer vibration_lock.unlock();
+    feedback_lock.lock();
+    defer feedback_lock.unlock();
     if (!validHandle(handle)) return error_invalid_handle;
     const motors = parameter orelse return error_invalid_argument;
     host_input.setVibration(motors.large_motor, motors.small_motor);
+    return errno.ok;
+}
+
+fn setLightBar(handle: i32, parameter: ?*const LightBarParam) callconv(abi.guest) i32 {
+    feedback_lock.lock();
+    defer feedback_lock.unlock();
+    if (!validHandle(handle)) return error_invalid_handle;
+    const color = parameter orelse return error_invalid_argument;
+    host_input.setLightBar(color.red, color.green, color.blue);
+    return errno.ok;
+}
+
+fn resetLightBar(handle: i32) callconv(abi.guest) i32 {
+    feedback_lock.lock();
+    defer feedback_lock.unlock();
+    if (!validHandle(handle)) return error_invalid_handle;
+    host_input.resetLightBar();
     return errno.ok;
 }
 
@@ -408,8 +432,8 @@ pub const exports = [_]symbols.Export{
     .{ .name = "scePadResetOrientation", .function = trace.wrap("scePadResetOrientation", &resetOrientation), .expect_id = "rIZnR6eSpvk" },
     .{ .name = "scePadSetTriggerEffect", .function = trace.wrap("scePadSetTriggerEffect", &acceptPointerState), .expect_id = "2JgFB2n9oUM" },
     .{ .name = "scePadSetVibration", .function = trace.wrap("scePadSetVibration", &setVibration), .expect_id = "yFVnOdGxvZY" },
-    .{ .name = "scePadSetLightBar", .function = trace.wrap("scePadSetLightBar", &acceptPointerState), .expect_id = "RR4novUEENY" },
-    .{ .name = "scePadResetLightBar", .function = trace.wrap("scePadResetLightBar", &resetOrientation), .expect_id = "DscD1i9HX1w" },
+    .{ .name = "scePadSetLightBar", .function = trace.wrap("scePadSetLightBar", &setLightBar), .expect_id = "RR4novUEENY" },
+    .{ .name = "scePadResetLightBar", .function = trace.wrap("scePadResetLightBar", &resetLightBar), .expect_id = "DscD1i9HX1w" },
     .{ .name = "scePadSetVibrationMode", .function = trace.wrap("scePadSetVibrationMode", &setVibrationMode), .expect_id = "W2G-yoyMF5U" },
     .{ .name = "scePadGetTriggerEffectState", .function = trace.wrap("scePadGetTriggerEffectState", &getTriggerEffectState), .expect_id = "znaWI0gpuo8" },
     .{ .name = "scePadIsRemoteController", .function = trace.wrap("scePadIsRemoteController", &isRemoteController), .expect_id = "fCWdlnmB1Ks" },
@@ -476,6 +500,44 @@ test "pad vibration forwards both bytes and close reset and invalid arguments ca
     try std.testing.expectEqual(errno.ok, setVibration(handle, &motors));
     reset();
     try std.testing.expectEqual(host_input.feedback.Motors{}, host_input.feedback.current());
+}
+
+test "pad light bar validates ABI and preserves vibration through reset and close" {
+    reset();
+    defer reset();
+    try std.testing.expectEqual(@as(usize, 4), @sizeOf(LightBarParam));
+    try std.testing.expectEqual(@as(usize, 3), @offsetOf(LightBarParam, "reserved"));
+    const rgb = LightBarParam{ .red = 209, .green = 53, .blue = 17, .reserved = 255 };
+    try std.testing.expectEqual(error_invalid_handle, setLightBar(primary_handle, &rgb));
+    try std.testing.expectEqual(error_invalid_handle, resetLightBar(primary_handle));
+    _ = padInit();
+    const handle = padOpen(user_service.primary_user_id, 0, 0, null);
+    try std.testing.expectEqual(error_invalid_argument, setLightBar(handle, null));
+    try std.testing.expectEqual(errno.ok, setVibration(handle, &.{ .large_motor = 91, .small_motor = 187 }));
+    const motors = host_input.feedback.current();
+    const selected = host_input.mode();
+    const enabled = selected != .keyboard and selected != .scripted;
+    try std.testing.expectEqual(errno.ok, setLightBar(handle, &rgb));
+    const expected: host_input.feedback.LightBar = if (enabled) .{ .red = 209, .green = 53, .blue = 17, .active = true } else .{};
+    try std.testing.expectEqual(expected, host_input.feedback.currentOutput().light_bar);
+    try std.testing.expectEqual(motors, host_input.feedback.current());
+    const saved = host_input.feedback.currentOutput();
+    try std.testing.expectEqual(error_invalid_handle, setLightBar(-1, &rgb));
+    try std.testing.expectEqual(error_invalid_handle, resetLightBar(99));
+    try std.testing.expectEqual(saved, host_input.feedback.currentOutput());
+    try std.testing.expectEqual(errno.ok, setLightBar(handle, &.{ .red = 0, .green = 0, .blue = 0 }));
+    try std.testing.expectEqual(host_input.feedback.LightBar{ .active = enabled }, host_input.feedback.currentOutput().light_bar);
+    try std.testing.expectEqual(errno.ok, resetLightBar(handle));
+    const default_color: host_input.feedback.LightBar = if (enabled) host_input.feedback.default_light_bar else .{};
+    try std.testing.expectEqual(default_color, host_input.feedback.currentOutput().light_bar);
+    try std.testing.expectEqual(motors, host_input.feedback.current());
+    try std.testing.expectEqual(errno.ok, setLightBar(handle, &rgb));
+    try std.testing.expectEqual(errno.ok, padClose(handle));
+    try std.testing.expectEqual(default_color, host_input.feedback.currentOutput().light_bar);
+    try std.testing.expectEqual(host_input.feedback.Motors{}, host_input.feedback.current());
+    try std.testing.expectEqual(error_invalid_handle, setLightBar(handle, &rgb));
+    reset();
+    try std.testing.expectEqual(host_input.feedback.Output{}, host_input.feedback.currentOutput());
 }
 
 test "pad get handle exposes the system-managed primary controller" {

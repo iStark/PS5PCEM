@@ -80,6 +80,12 @@ behind them.
   haptics remain unimplemented. See the
   [controller vibration report](development/controller-vibration-2026-10-16.md)
   and its [Bluetooth follow-up](development/controller-bluetooth-output-2026-10-16.md).
+- Game-controlled LightBar now forwards RGB and reset requests to Sony HID
+  output. Color and motors share a coalesced state without overwriting each
+  other; light-only reports leave motor control untouched. Reset and pad close
+  restore the primary-player blue default. DualSense Bluetooth color waits for
+  connection-animation reset before applying RGB. See the
+  [LightBar implementation and validation report](development/controller-lightbar-2026-10-16.md).
 - Guest vertex and pixel shaders can render sampled textures using AGC vertex
   tables, per-instruction V# mappings, `VertexIndex`, PARAM exports, and
   fragment interpolation.

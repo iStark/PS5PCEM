@@ -226,6 +226,24 @@ pub fn stopVibration() void {
     feedback.submit(.{}, controllerIndex());
 }
 
+pub fn setLightBar(red: u8, green: u8, blue: u8) void {
+    switch (mode()) {
+        .keyboard, .scripted => {},
+        .automatic, .controller, .hybrid => feedback.setLightBar(red, green, blue, controllerIndex()),
+    }
+}
+
+pub fn resetLightBar() void {
+    switch (mode()) {
+        .keyboard, .scripted => {},
+        .automatic, .controller, .hybrid => feedback.resetLightBar(controllerIndex()),
+    }
+}
+
+pub fn stopFeedback() void {
+    feedback.stop(controllerIndex());
+}
+
 pub fn mode() Mode {
     if (cached_mode) |value| return value;
     var value: Mode = .automatic;
@@ -566,13 +584,22 @@ test "keyboard and scripted sessions do not drive a physical controller" {
         cached_mode = saved;
     }
     for ([_]Mode{ .automatic, .controller, .hybrid }) |selected| {
+        feedback.reset();
         cached_mode = selected;
         setVibration(17, 255);
         try std.testing.expectEqual(feedback.Motors{ .large = 17, .small = 255 }, feedback.current());
+        setLightBar(1, 2, 3);
+        try std.testing.expectEqual(feedback.LightBar{ .red = 1, .green = 2, .blue = 3, .active = true }, feedback.currentOutput().light_bar);
+        resetLightBar();
+        try std.testing.expectEqual(feedback.default_light_bar, feedback.currentOutput().light_bar);
     }
     for ([_]Mode{ .keyboard, .scripted }) |selected| {
+        feedback.reset();
         cached_mode = selected;
         setVibration(255, 255);
         try std.testing.expectEqual(feedback.Motors{}, feedback.current());
+        setLightBar(255, 255, 255);
+        resetLightBar();
+        try std.testing.expect(!feedback.currentOutput().light_bar.active);
     }
 }
