@@ -12,6 +12,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 pub const dualshock = @import("dualshock.zig");
 pub const hid = @import("hid.zig");
+pub const feedback = @import("feedback.zig");
 
 pub const Mode = enum {
     /// Preserve the old unattended bring-up behaviour when game-run is invoked
@@ -206,10 +207,23 @@ pub fn clearKeyboardPresses() void {
 }
 
 pub fn reset() void {
+    feedback.reset();
+    if (!builtin.is_test) hid.close();
     clearKeyboardPresses();
     cached_mode = null;
     cached_mapping = null;
     cached_controller_index = null;
+}
+
+pub fn setVibration(large: u8, small: u8) void {
+    switch (mode()) {
+        .keyboard, .scripted => feedback.submit(.{}, controllerIndex()),
+        .automatic, .controller, .hybrid => feedback.submit(.{ .large = large, .small = small }, controllerIndex()),
+    }
+}
+
+pub fn stopVibration() void {
+    feedback.submit(.{}, controllerIndex());
 }
 
 pub fn mode() Mode {
@@ -542,4 +556,23 @@ test "keyboard focus loss clears pending presses" {
 test {
     _ = dualshock;
     _ = hid;
+    _ = feedback;
+}
+
+test "keyboard and scripted sessions do not drive a physical controller" {
+    const saved = cached_mode;
+    defer {
+        feedback.reset();
+        cached_mode = saved;
+    }
+    for ([_]Mode{ .automatic, .controller, .hybrid }) |selected| {
+        cached_mode = selected;
+        setVibration(17, 255);
+        try std.testing.expectEqual(feedback.Motors{ .large = 17, .small = 255 }, feedback.current());
+    }
+    for ([_]Mode{ .keyboard, .scripted }) |selected| {
+        cached_mode = selected;
+        setVibration(255, 255);
+        try std.testing.expectEqual(feedback.Motors{}, feedback.current());
+    }
 }

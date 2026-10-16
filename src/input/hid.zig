@@ -3,8 +3,8 @@
 
 //! Finding and reading a Sony controller over the host's HID stack.
 //!
-//! The device is opened for reading only and shared, so a pad another process
-//! is already listening to still reports here instead of failing to open.
+//! Shared read/write access drives gameplay feedback; read-only fallback still
+//! accepts input when another application owns output access.
 //!
 //! Reads are overlapped and never block. A poll drains whatever the driver has
 //! queued and keeps the newest report: the queue holds several samples once a
@@ -14,12 +14,15 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const dualshock = @import("dualshock.zig");
+const Mutex = @import("memory").HostMutex;
+var mutex: Mutex = .{};
 
 pub const supported = builtin.os.tag == .windows;
 
 pub const Presence = struct {
     connected: bool = false,
     family: ?dualshock.Family = null,
+    transport: ?dualshock.Transport = null,
     /// Whether the pad can also be driven, not only read.
     writable: bool = false,
 };
@@ -38,6 +41,34 @@ var device: Device = .{};
 var polls_since_search: u32 = rediscovery_interval;
 var latest: ?dualshock.Pad = null;
 var write_event: ?*anyopaque = null;
+var completed_reports: u64 = 0;
+
+pub const OutputStatus = struct {
+    completed_reports: u64,
+    applied: ?dualshock.Output,
+    pending: bool,
+};
+
+/// Diagnostic completion state; a successful queue operation alone does not
+/// prove the OS completed a controller report.
+pub fn outputStatus() OutputStatus {
+    mutex.lock();
+    defer mutex.unlock();
+    return .{ .completed_reports = completed_reports, .applied = device.output.applied, .pending = device.write_pending };
+}
+
+/// Keep the newest requested state while an older HID report is in flight.
+/// Completing an older write must never erase a later stop request.
+const OutputQueue = struct {
+    wanted: ?dualshock.Output = null,
+    applied: ?dualshock.Output = null,
+
+    fn next(self: *const OutputQueue) ?dualshock.Output {
+        const wanted = self.wanted orelse return null;
+        if (self.applied) |applied| if (std.meta.eql(wanted, applied)) return null;
+        return wanted;
+    }
+};
 
 const Device = struct {
     handle: ?*anyopaque = null,
@@ -49,9 +80,16 @@ const Device = struct {
     /// False when the device could only be opened for reading, which happens
     /// when another process holds it for writing.
     writable: bool = false,
-    overlapped: Win32.Overlapped = .{},
+    overlapped: Overlapped = .{},
     buffer: [256]u8 = @splat(0),
     read_pending: bool = false,
+    output: OutputQueue = .{},
+    write_overlapped: Overlapped = .{},
+    write_buffer: [dualshock.maximum_output_bytes]u8 = undefined,
+    write_size: u32 = 0,
+    write_pending: bool = false,
+    in_flight_output: dualshock.Output = .{},
+    sequence: u4 = 0,
 
     fn isOpen(self: Device) bool {
         return self.handle != null;
@@ -61,21 +99,30 @@ const Device = struct {
 /// The newest controller state, or null when no supported pad is attached.
 pub fn poll() ?dualshock.Pad {
     if (comptime !supported) return null;
+    mutex.lock();
+    defer mutex.unlock();
+    return pollLocked();
+}
+
+fn pollLocked() ?dualshock.Pad {
     ensureOpen();
     if (!device.isOpen()) {
         latest = null;
         return null;
     }
     drain();
+    _ = pumpOutputLocked();
     return latest;
 }
 
 /// Whether a supported pad is attached, for callers that only want to show it.
 pub fn presence() Presence {
     if (comptime !supported) return .{};
-    _ = poll();
+    mutex.lock();
+    defer mutex.unlock();
+    _ = pollLocked();
     if (!device.isOpen()) return .{};
-    return .{ .connected = true, .family = device.family, .writable = device.writable };
+    return .{ .connected = true, .family = device.family, .transport = device.transport, .writable = device.writable };
 }
 
 /// The colours the self-test walks through, in order.
@@ -103,17 +150,25 @@ var test_running = false;
 /// a working pad feeling like half of it is broken.
 pub fn startTest() bool {
     if (comptime !supported) return false;
-    _ = poll();
+    mutex.lock();
+    defer mutex.unlock();
+    _ = pollLocked();
     if (!device.isOpen() or !device.writable) return false;
     test_elapsed_ms = 0;
     test_running = true;
-    return advanceTest(0);
+    return advanceTestLocked(0);
 }
 
 /// Drives the next slice of the self-test. Returns false once it has finished,
 /// having already returned the pad to rest.
 pub fn advanceTest(elapsed_ms: u32) bool {
     if (comptime !supported) return false;
+    mutex.lock();
+    defer mutex.unlock();
+    return advanceTestLocked(elapsed_ms);
+}
+
+fn advanceTestLocked(elapsed_ms: u32) bool {
     if (!test_running) return false;
     test_elapsed_ms +|= elapsed_ms;
     if (!device.isOpen() or !device.writable) {
@@ -125,6 +180,7 @@ pub fn advanceTest(elapsed_ms: u32) bool {
         // Silence the motors and clear the light bar; a pad left buzzing
         // because the window closed mid-test is worse than no test at all.
         _ = send(.{});
+        finishOutputLocked();
         return false;
     }
     const step = @min(test_elapsed_ms / test_step_ms, test_colours.len - 1);
@@ -139,11 +195,15 @@ pub fn advanceTest(elapsed_ms: u32) bool {
 }
 
 pub fn testRunning() bool {
+    mutex.lock();
+    defer mutex.unlock();
     return test_running;
 }
 
 /// The colour the light bar is showing right now, so a caller can mirror it.
 pub fn testColour() ?[3]u8 {
+    mutex.lock();
+    defer mutex.unlock();
     if (!test_running) return null;
     const step = @min(test_elapsed_ms / test_step_ms, test_colours.len - 1);
     return test_colours[step];
@@ -152,26 +212,83 @@ pub fn testColour() ?[3]u8 {
 /// Stops the self-test wherever it is and leaves the pad at rest.
 pub fn stopTest() void {
     if (comptime !supported) return;
+    mutex.lock();
+    defer mutex.unlock();
     if (!test_running) return;
     test_running = false;
     _ = send(.{});
+    finishOutputLocked();
+}
+
+/// Called by the feedback worker, never waiting on USB/Bluetooth completion.
+pub fn setVibration(large: u8, small: u8) bool {
+    if (comptime !supported) return false;
+    mutex.lock();
+    defer mutex.unlock();
+    _ = pollLocked();
+    return send(.{ .rumble_strong = large, .rumble_weak = small, .set_light_bar = false });
+}
+
+pub fn pumpOutput() bool {
+    if (comptime !supported) return false;
+    mutex.lock();
+    defer mutex.unlock();
+    return pumpOutputLocked();
 }
 
 fn send(output: dualshock.Output) bool {
-    const handle = device.handle orelse return false;
-    const transport = device.transport orelse return false;
-    var buffer: [dualshock.maximum_output_bytes]u8 = undefined;
-    const length = dualshock.buildOutput(device.family, transport, output, &buffer) orelse return false;
+    if (!device.isOpen() or !device.writable or device.transport == null) return false;
+    device.output.wanted = output;
+    _ = pumpOutputLocked();
+    return device.isOpen();
+}
 
-    // A separate overlapped structure and event: an output report must not
-    // disturb the read that is already in flight.
-    var overlapped = Win32.Overlapped{ .event = write_event };
+fn pumpOutputLocked() bool {
+    const handle = device.handle orelse return false;
+    if (device.write_pending) {
+        var written: u32 = 0;
+        if (Win32.GetOverlappedResult(handle, &device.write_overlapped, &written, 0) == 0) {
+            if (Win32.GetLastError() == Win32.error_io_incomplete) return true;
+            device.write_pending = false;
+            closeDevice();
+            return false;
+        }
+        device.write_pending = false;
+        if (written != device.write_size) {
+            closeDevice();
+            return false;
+        }
+        device.output.applied = device.in_flight_output;
+        completed_reports +%= 1;
+    }
+    var output = device.output.next() orelse return false;
+    const transport = device.transport orelse return false;
+    device.in_flight_output = output;
+    output.sequence = device.sequence;
+    const length = dualshock.buildOutput(device.family, transport, output, &device.write_buffer) orelse return false;
+    device.sequence +%= 1;
+    device.write_size = @intCast(length);
+    device.write_overlapped = .{ .event = write_event };
+    _ = Win32.ResetEvent(write_event);
     var written: u32 = 0;
-    if (Win32.WriteFile(handle, &buffer, @intCast(length), &written, &overlapped) != 0) return true;
-    if (Win32.GetLastError() != Win32.error_io_pending) return false;
-    // Reports are small and the pad consumes them promptly, so waiting here
-    // costs a fraction of a frame and keeps the buffer alive until it is sent.
-    return Win32.GetOverlappedResult(handle, &overlapped, &written, 1) != 0;
+    if (Win32.WriteFile(handle, &device.write_buffer, device.write_size, &written, &device.write_overlapped) != 0) {
+        if (written == device.write_size) {
+            device.output.applied = device.in_flight_output;
+            completed_reports +%= 1;
+        } else closeDevice();
+        return false;
+    }
+    if (Win32.GetLastError() == Win32.error_io_pending) {
+        device.write_pending = true;
+        return true;
+    }
+    closeDevice();
+    return false;
+}
+
+fn finishOutputLocked() void {
+    const until = Win32.GetTickCount64() + 250;
+    while (pumpOutputLocked() and Win32.GetTickCount64() < until) Win32.Sleep(1);
 }
 
 /// Forces the next poll to search again. The launcher calls this when Windows
@@ -179,11 +296,20 @@ fn send(output: dualshock.Output) bool {
 /// rather than at the end of the rediscovery interval.
 pub fn invalidate() void {
     if (comptime !supported) return;
+    mutex.lock();
+    defer mutex.unlock();
     polls_since_search = rediscovery_interval;
 }
 
 pub fn close() void {
     if (comptime !supported) return;
+    mutex.lock();
+    defer mutex.unlock();
+    // Do not discover or write a controller which this process never used.
+    if (device.output.wanted != null) {
+        _ = send(.{ .set_light_bar = false });
+        finishOutputLocked();
+    }
     closeDevice();
     latest = null;
 }
@@ -198,16 +324,29 @@ fn ensureOpen() void {
 
 fn closeDevice() void {
     test_running = false;
+    if (device.handle) |handle| {
+        // Reads and writes may originate on different host threads. CancelIo
+        // cancels only the calling thread's I/O; retain storage until completion.
+        var transferred: u32 = 0;
+        if (device.read_pending) {
+            _ = Win32.CancelIoEx(handle, &device.overlapped);
+            _ = Win32.GetOverlappedResult(handle, &device.overlapped, &transferred, 1);
+        }
+        if (device.write_pending) {
+            _ = Win32.CancelIoEx(handle, &device.write_overlapped);
+            _ = Win32.GetOverlappedResult(handle, &device.write_overlapped, &transferred, 1);
+        }
+    }
     if (write_event) |event| {
         _ = Win32.CloseHandle(event);
         write_event = null;
     }
     if (device.handle) |handle| {
-        if (device.read_pending) _ = Win32.CancelIo(handle);
         _ = Win32.CloseHandle(handle);
     }
     if (device.event) |event| _ = Win32.CloseHandle(event);
     device = .{};
+    latest = null;
 }
 
 /// Consumes every report the driver has ready, keeping the last one.
@@ -290,8 +429,6 @@ fn openFirstController() void {
 }
 
 fn tryOpen(path: [*:0]const u16) bool {
-    // Read access only, and shared: a pad that another process is already
-    // reading must still be readable here.
     // Writing is what drives the motors and the light bar, but another process
     // may already hold the pad for output. Losing the read as well would be the
     // worse trade, so a refused write access falls back to reading only.
@@ -331,10 +468,18 @@ fn tryOpen(path: [*:0]const u16) bool {
     if (event == null) return false;
 
     write_event = Win32.CreateEventW(null, 1, 0, null);
-    device = .{ .handle = handle, .event = event, .family = family, .writable = writable };
+    device = .{ .handle = handle, .event = event, .family = family, .writable = writable and write_event != null };
     keep = true;
     return true;
 }
+
+const Overlapped = extern struct {
+    internal: usize = 0,
+    internal_high: usize = 0,
+    offset: u32 = 0,
+    offset_high: u32 = 0,
+    event: ?*anyopaque = null,
+};
 
 const Win32 = if (builtin.os.tag == .windows) struct {
     const Guid = extern struct {
@@ -378,14 +523,6 @@ const Win32 = if (builtin.os.tag == .windows) struct {
         version: u16 = 0,
     };
 
-    const Overlapped = extern struct {
-        internal: usize = 0,
-        internal_high: usize = 0,
-        offset: u32 = 0,
-        offset_high: u32 = 0,
-        event: ?*anyopaque = null,
-    };
-
     const digcf_present: u32 = 0x0000_0002;
     const digcf_device_interface: u32 = 0x0000_0010;
     const generic_read: u32 = 0x8000_0000;
@@ -408,10 +545,31 @@ const Win32 = if (builtin.os.tag == .windows) struct {
     extern "kernel32" fn ReadFile(*anyopaque, [*]u8, u32, ?*u32, ?*Overlapped) callconv(.winapi) i32;
     extern "kernel32" fn WriteFile(*anyopaque, [*]const u8, u32, ?*u32, ?*Overlapped) callconv(.winapi) i32;
     extern "kernel32" fn GetOverlappedResult(*anyopaque, *Overlapped, *u32, i32) callconv(.winapi) i32;
-    extern "kernel32" fn CancelIo(*anyopaque) callconv(.winapi) i32;
+    extern "kernel32" fn CancelIoEx(*anyopaque, ?*Overlapped) callconv(.winapi) i32;
+    extern "kernel32" fn ResetEvent(?*anyopaque) callconv(.winapi) i32;
+    extern "kernel32" fn GetTickCount64() callconv(.winapi) u64;
+    extern "kernel32" fn Sleep(u32) callconv(.winapi) void;
     extern "kernel32" fn CloseHandle(*anyopaque) callconv(.winapi) i32;
     extern "kernel32" fn GetLastError() callconv(.winapi) u32;
 } else struct {};
+
+test "an in-flight rumble cannot replace a newer stop or repeated request" {
+    var queue = OutputQueue{};
+    const rumble = dualshock.Output{ .rumble_strong = 170, .rumble_weak = 85, .set_light_bar = false };
+    queue.wanted = rumble;
+    const pending = queue.next().?;
+    queue.wanted = .{ .set_light_bar = false };
+    queue.applied = pending;
+    try std.testing.expectEqual(@as(u8, 0), queue.next().?.rumble_strong);
+    queue.applied = queue.next();
+    try std.testing.expect(queue.next() == null);
+    queue.wanted = rumble;
+    queue.applied = queue.next();
+    queue.wanted = rumble;
+    try std.testing.expect(queue.next() == null);
+    queue.applied = null; // reconnect must send the current state again
+    try std.testing.expectEqual(rumble, queue.next().?);
+}
 
 test "an unsupported host reports no controller" {
     if (comptime supported) return error.SkipZigTest;

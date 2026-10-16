@@ -80,9 +80,9 @@ const Layout = struct {
     fn minimumLength(self: Layout) usize {
         var highest = self.buttons_system;
         for ([_]usize{
-            self.left_x,     self.left_y,          self.right_x,
-            self.right_y,    self.buttons_face,    self.buttons_shoulder,
-            self.analog_l2,  self.analog_r2,
+            self.left_x,    self.left_y,       self.right_x,
+            self.right_y,   self.buttons_face, self.buttons_shoulder,
+            self.analog_l2, self.analog_r2,
         }) |offset| {
             if (offset > highest) highest = offset;
         }
@@ -251,6 +251,9 @@ pub const Output = struct {
     red: u8 = 0,
     green: u8 = 0,
     blue: u8 = 0,
+    /// Motor-only updates must leave the game's/current light-bar state alone.
+    set_light_bar: bool = true,
+    sequence: u4 = 0,
 };
 
 /// The longest report any of these forms needs.
@@ -276,15 +279,18 @@ pub fn buildOutput(
 
     switch (family) {
         .dual_sense => {
-            const base: usize = if (transport == .usb) 1 else 2;
+            const base: usize = if (transport == .usb) 1 else 3;
             buffer[0] = if (transport == .usb) 0x02 else 0x31;
             // Bluetooth carries a sequence tag ahead of the payload.
-            if (transport == .bluetooth) buffer[1] = 0x02;
+            if (transport == .bluetooth) {
+                buffer[1] = @as(u8, output.sequence) << 4;
+                buffer[2] = 0x10;
+            }
             // Ask for the plain motors rather than the haptic actuators, and
             // for control of the light bar. A pad ignores every field whose
             // enable bit is clear, so these are what make the rest take effect.
             buffer[base] = 0x03;
-            buffer[base + 1] = 0x04;
+            buffer[base + 1] = if (output.set_light_bar) 0x04 else 0;
             buffer[base + 2] = output.rumble_weak;
             buffer[base + 3] = output.rumble_strong;
             buffer[base + 44] = output.red;
@@ -299,7 +305,7 @@ pub fn buildOutput(
                 buffer[2] = 0xa0;
             }
             // Enable the motors, the light bar and its blink timers together.
-            buffer[base] = 0xf7;
+            buffer[base] = if (output.set_light_bar) 0xf7 else 0x01;
             buffer[base + 3] = output.rumble_weak;
             buffer[base + 4] = output.rumble_strong;
             buffer[base + 5] = output.red;
@@ -367,8 +373,11 @@ test "a wireless report shifts its payload and ends in a checksum" {
     ) orelse return error.TestFailed;
     try std.testing.expectEqual(@as(usize, 78), length);
     try std.testing.expectEqual(@as(u8, 0x31), buffer[0]);
-    try std.testing.expectEqual(@as(u8, 0x11), buffer[5]);
-    try std.testing.expectEqual(@as(u8, 0xaa), buffer[46]);
+    try std.testing.expectEqual(@as(u8, 0), buffer[1]);
+    try std.testing.expectEqual(@as(u8, 0x10), buffer[2]);
+    try std.testing.expectEqual(@as(u8, 0x03), buffer[3]);
+    try std.testing.expectEqual(@as(u8, 0x11), buffer[6]);
+    try std.testing.expectEqual(@as(u8, 0xaa), buffer[47]);
 
     var expected = std.hash.Crc32.init();
     expected.update(&[_]u8{bluetooth_checksum_seed});
@@ -400,6 +409,32 @@ test "a DualShock 4 puts its light bar right after the motors" {
 test "a buffer too small for the report is refused" {
     var small: [16]u8 = undefined;
     try std.testing.expect(buildOutput(.dual_sense, .usb, .{}, &small) == null);
+}
+
+test "motor updates preserve the light bar and Bluetooth sequence and checksum" {
+    for ([_]Family{ .dual_sense, .dual_shock_4 }) |family| {
+        for ([_]Transport{ .usb, .bluetooth }) |transport| {
+            var bytes: [maximum_output_bytes]u8 = undefined;
+            const length = buildOutput(family, transport, .{ .rumble_strong = 255, .rumble_weak = 127, .set_light_bar = false, .sequence = 13 }, &bytes).?;
+            const base: usize = if (transport == .usb) 1 else 3;
+            if (family == .dual_sense) {
+                try std.testing.expectEqual(@as(u8, 0), bytes[base + 1]);
+                try std.testing.expectEqual(@as(u8, 127), bytes[base + 2]);
+                try std.testing.expectEqual(@as(u8, 255), bytes[base + 3]);
+                if (transport == .bluetooth) try std.testing.expectEqual(@as(u8, 0xd0), bytes[1]);
+            } else {
+                try std.testing.expectEqual(@as(u8, 1), bytes[base]);
+                try std.testing.expectEqual(@as(u8, 127), bytes[base + 3]);
+                try std.testing.expectEqual(@as(u8, 255), bytes[base + 4]);
+            }
+            if (transport == .bluetooth) {
+                var checksum = std.hash.Crc32.init();
+                checksum.update(&.{0xa2});
+                checksum.update(bytes[0 .. length - 4]);
+                try std.testing.expectEqual(checksum.final(), std.mem.readInt(u32, bytes[length - 4 ..][0..4], .little));
+            }
+        }
+    }
 }
 
 test "only Sony's own products are claimed" {

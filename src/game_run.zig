@@ -1239,6 +1239,8 @@ fn run(init: std.process.Init) !bool {
         // while burning every core. After the report is on the host terminal the
         // process has nothing left to do for this title run — exit immediately
         // so the OS reclaims the workers instead of waiting on them.
+        // A physical controller otherwise retains its last motor command.
+        runtime.firmware.libs.pad.reset();
         std.process.exit(1);
     };
 

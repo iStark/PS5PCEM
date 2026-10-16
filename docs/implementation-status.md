@@ -67,6 +67,15 @@ behind them.
   Sony's own pads are read directly over HID, so a DualSense or DualShock 4
   works without a translation layer; the launcher reports which one it found and
   can drive its motors and light bar as a check.
+- `scePadSetVibration` now forwards the game's two motor intensities to native
+  Sony HID output or the selected XInput controller. A background worker
+  coalesces duplicate requests and retains output buffers until completion;
+  zero requests, pad close, runtime reset, and the runner's contained guest-fault
+  exit stop the motors. DualSense USB vibration and stopping were physically
+  confirmed. Bluetooth reports and XInput intensity mapping have automated
+  coverage, but no physical verification in this pass. Adaptive triggers and
+  audio-driven DualSense haptics remain unimplemented. See the
+  [controller vibration report](development/controller-vibration-2026-10-16.md).
 - Guest vertex and pixel shaders can render sampled textures using AGC vertex
   tables, per-instruction V# mappings, `VertexIndex`, PARAM exports, and
   fragment interpolation.

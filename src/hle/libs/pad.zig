@@ -113,8 +113,16 @@ comptime {
 var initialized: std.atomic.Value(u8) = .init(0);
 var open: std.atomic.Value(u8) = .init(0);
 var motion_sensor_enabled: std.atomic.Value(u8) = .init(0);
+var vibration_lock: @import("memory").HostMutex = .{};
+
+const VibrationParam = extern struct {
+    large_motor: u8,
+    small_motor: u8,
+};
 
 pub fn reset() void {
+    vibration_lock.lock();
+    defer vibration_lock.unlock();
     initialized.store(0, .release);
     open.store(0, .release);
     motion_sensor_enabled.store(0, .release);
@@ -193,8 +201,11 @@ fn padOpen(user_id: i32, port_type: i32, index: i32, parameter: ?*const anyopaqu
 }
 
 fn padClose(handle: i32) callconv(abi.guest) i32 {
+    vibration_lock.lock();
+    defer vibration_lock.unlock();
     if (!validHandle(handle)) return error_invalid_handle;
     open.store(0, .release);
+    host_input.stopVibration();
     return errno.ok;
 }
 
@@ -360,6 +371,15 @@ fn setVibrationMode(handle: i32, _: i32) callconv(abi.guest) i32 {
     return if (handle == -1 or validHandle(handle)) errno.ok else error_invalid_handle;
 }
 
+fn setVibration(handle: i32, parameter: ?*const VibrationParam) callconv(abi.guest) i32 {
+    vibration_lock.lock();
+    defer vibration_lock.unlock();
+    if (!validHandle(handle)) return error_invalid_handle;
+    const motors = parameter orelse return error_invalid_argument;
+    host_input.setVibration(motors.large_motor, motors.small_motor);
+    return errno.ok;
+}
+
 fn getTriggerEffectState(handle: i32, output: ?*[8]u8) callconv(abi.guest) i32 {
     if (!validHandle(handle)) return error_invalid_handle;
     const state = output orelse return error_invalid_argument;
@@ -387,7 +407,7 @@ pub const exports = [_]symbols.Export{
     .{ .name = "scePadSetTiltCorrectionState", .function = trace.wrap("scePadSetTiltCorrectionState", &acceptHandleState), .expect_id = "vDLMoJLde8I" },
     .{ .name = "scePadResetOrientation", .function = trace.wrap("scePadResetOrientation", &resetOrientation), .expect_id = "rIZnR6eSpvk" },
     .{ .name = "scePadSetTriggerEffect", .function = trace.wrap("scePadSetTriggerEffect", &acceptPointerState), .expect_id = "2JgFB2n9oUM" },
-    .{ .name = "scePadSetVibration", .function = trace.wrap("scePadSetVibration", &acceptPointerState), .expect_id = "yFVnOdGxvZY" },
+    .{ .name = "scePadSetVibration", .function = trace.wrap("scePadSetVibration", &setVibration), .expect_id = "yFVnOdGxvZY" },
     .{ .name = "scePadSetLightBar", .function = trace.wrap("scePadSetLightBar", &acceptPointerState), .expect_id = "RR4novUEENY" },
     .{ .name = "scePadResetLightBar", .function = trace.wrap("scePadResetLightBar", &resetOrientation), .expect_id = "DscD1i9HX1w" },
     .{ .name = "scePadSetVibrationMode", .function = trace.wrap("scePadSetVibrationMode", &setVibrationMode), .expect_id = "W2G-yoyMF5U" },
@@ -429,6 +449,33 @@ test "vibration mode accepts the global sentinel handle" {
     reset();
     try std.testing.expectEqual(errno.ok, setVibrationMode(-1, 1));
     try std.testing.expectEqual(error_invalid_handle, setVibrationMode(99, 1));
+}
+
+test "pad vibration forwards both bytes and close reset and invalid arguments cannot leave rumble" {
+    reset();
+    defer reset();
+    try std.testing.expectEqual(@as(usize, 2), @sizeOf(VibrationParam));
+    const motors = VibrationParam{ .large_motor = 201, .small_motor = 47 };
+    try std.testing.expectEqual(error_invalid_handle, setVibration(primary_handle, &motors));
+    try std.testing.expectEqual(errno.ok, padInit());
+    const handle = padOpen(user_service.primary_user_id, 0, 0, null);
+    try std.testing.expectEqual(error_invalid_argument, setVibration(handle, null));
+    try std.testing.expectEqual(errno.ok, setVibration(handle, &motors));
+    const selected = host_input.mode();
+    const expected = if (selected == .keyboard or selected == .scripted) host_input.feedback.Motors{} else host_input.feedback.Motors{ .large = 201, .small = 47 };
+    try std.testing.expectEqual(expected, host_input.feedback.current());
+    try std.testing.expectEqual(error_invalid_handle, setVibration(-1, &.{ .large_motor = 0, .small_motor = 0 }));
+    try std.testing.expectEqual(expected, host_input.feedback.current());
+    try std.testing.expectEqual(errno.ok, setVibration(handle, &.{ .large_motor = 0, .small_motor = 0 }));
+    try std.testing.expectEqual(host_input.feedback.Motors{}, host_input.feedback.current());
+    try std.testing.expectEqual(errno.ok, setVibration(handle, &motors));
+    try std.testing.expectEqual(errno.ok, padClose(handle));
+    try std.testing.expectEqual(host_input.feedback.Motors{}, host_input.feedback.current());
+    try std.testing.expectEqual(error_invalid_handle, setVibration(handle, &motors));
+    _ = padGetHandle(user_service.primary_user_id, 0, 0);
+    try std.testing.expectEqual(errno.ok, setVibration(handle, &motors));
+    reset();
+    try std.testing.expectEqual(host_input.feedback.Motors{}, host_input.feedback.current());
 }
 
 test "pad get handle exposes the system-managed primary controller" {

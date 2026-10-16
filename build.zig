@@ -93,6 +93,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    input.addImport("memory", memory);
     window.addImport("input", input);
 
     // Guest module images: ELF64 parsing and the dynamic linking tables.
