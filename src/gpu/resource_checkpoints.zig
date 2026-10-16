@@ -10,6 +10,8 @@ const shaders = @import("shaders.zig");
 pub const Kind = enum { resource, sampled };
 pub export var cached_graphics_interfaces: bool = true;
 pub export var cached_pointer_preparation: bool = true;
+pub export var omit_inert_scalar_steps: bool = true;
+pub export var scalar_noop_plan_hits: u64 = 0;
 
 pub fn hasFlatMemoryReads(instructions: []const rdna2.Instruction, plan: ?*const Plan) bool {
     if (@atomicLoad(bool, &cached_pointer_preparation, .monotonic)) {
@@ -128,6 +130,8 @@ pub const Plan = struct {
     /// plans opt out; this summary belongs to the exact decoded allocation.
     uniform_scalar_reads: ?u128 = null,
     flat_memory_reads: ?bool = null,
+    loop_writes: ?scalar.LoopWritePlan = null,
+    effect_steps: ?[]const u32 = null,
 
     pub fn init(allocator: std.mem.Allocator, instructions: []const rdna2.Instruction) !Plan {
         const resource = try collect(allocator, instructions, .resource);
@@ -141,6 +145,10 @@ pub const Plan = struct {
         const storage_images = try collectStorageImages(allocator, instructions);
         errdefer allocator.free(storage_images);
         const scalar_steps = try collectScalarSteps(allocator, instructions, resource, sampled);
+        errdefer allocator.free(scalar_steps);
+        var loop_writes = try scalar.LoopWritePlan.init(allocator, instructions);
+        errdefer loop_writes.deinit(allocator);
+        const effect_steps = try collectEffectSteps(allocator, instructions, scalar_steps);
         return .{
             .identity = next_plan_identity.fetchAdd(1, .monotonic),
             .instructions = instructions,
@@ -152,12 +160,14 @@ pub const Plan = struct {
             .scalar_steps = scalar_steps,
             .reads_only_resources = readsOnlyResources(instructions),
             .forward_only = walksForward(instructions),
-            .maximum_dense_step_ratio = maximumDenseStepRatio(instructions.len, scalar_steps),
+            .maximum_dense_step_ratio = @max(maximumDenseStepRatio(instructions.len, scalar_steps), maximumDenseStepRatio(instructions.len, effect_steps)),
             .graphics_interface = GraphicsInterface.collect(instructions),
             .static_calls = rdna2.scalar_calls.present(instructions),
             .entry_block_end = entryBlockEnd(instructions),
             .uniform_scalar_reads = scalar.uniformScalarReadMask(instructions),
             .flat_memory_reads = collectFlatMemoryReads(instructions),
+            .loop_writes = loop_writes,
+            .effect_steps = effect_steps,
         };
     }
 
@@ -168,6 +178,8 @@ pub const Plan = struct {
         allocator.free(self.sampled_indices);
         allocator.free(self.storage_images);
         allocator.free(self.scalar_steps);
+        if (self.loop_writes) |*plan| plan.deinit(allocator);
+        if (self.effect_steps) |steps| allocator.free(steps);
         self.* = undefined;
     }
 
@@ -177,6 +189,12 @@ pub const Plan = struct {
     /// allocation must do.
     pub fn storageImageIndices(self: *const Plan, instructions: []const rdna2.Instruction) ?[]const u32 {
         return if (self.matches(instructions)) self.storage_images else null;
+    }
+
+    pub fn walk(self: *const Plan) scalar.WalkPlan {
+        const steps = if (@atomicLoad(bool, &omit_inert_scalar_steps, .monotonic)) self.effect_steps orelse self.scalar_steps else self.scalar_steps;
+        if (steps.len < self.scalar_steps.len) _ = @atomicRmw(u64, &scalar_noop_plan_hits, .Add, 1, .monotonic);
+        return .{ .steps = steps, .loop_writes = if (self.loop_writes) |*plan| plan else null };
     }
 
     pub fn matches(self: *const Plan, instructions: []const rdna2.Instruction) bool {
@@ -190,6 +208,31 @@ pub const Plan = struct {
         };
     }
 };
+
+/// These operations do nothing in the CPU resource evaluator. They remain in
+/// the translated GPU program. Unknown families retain their dependency taint;
+/// a live lane spill also forces the existing dense walk around vector writes.
+fn inertScalarStep(inst: *const rdna2.Instruction) bool {
+    if (inst.family != .sopp) return false;
+    return switch (inst.opcode) {
+        .s_nop, .s_waitcnt, .s_barrier, .s_sleep, .s_sendmsg, .s_ttrace_data, .s_inst_prefetch => true,
+        else => false,
+    };
+}
+
+fn collectEffectSteps(allocator: std.mem.Allocator, instructions: []const rdna2.Instruction, steps: []const u32) ![]const u32 {
+    var count: usize = 0;
+    for (steps) |index| if (!inertScalarStep(&instructions[index])) {
+        count += 1;
+    };
+    const result = try allocator.alloc(u32, count);
+    var cursor: usize = 0;
+    for (steps) |index| if (!inertScalarStep(&instructions[index])) {
+        result[cursor] = index;
+        cursor += 1;
+    };
+    return result;
+}
 
 fn maximumDenseStepRatio(instruction_count: usize, steps: []const u32) u32 {
     if (steps.len == 0) return std.math.maxInt(u32);
@@ -517,7 +560,7 @@ pub const Pool = struct {
         if (lease.pcs.len != 0) {
             // The evaluator overwrites visited snapshots and clears skipped
             // blocks before returning, including early stops and failed reads.
-            const steps = if (lease.plan_reused) plan.?.scalar_steps else null;
+            const steps: ?scalar.WalkPlan = if (lease.plan_reused) plan.?.walk() else null;
             const evaluation = self.evaluation orelse try allocator.create(scalar.Evaluation);
             self.evaluation = null;
             defer {
@@ -697,6 +740,55 @@ const TestMemory = struct {
         return .{ .context = self, .read_fn = read };
     }
 };
+
+test "inert scalar steps preserve counted loops memory reads and dense budget accounting" {
+    const instructions = [_]rdna2.Instruction{
+        .{ .pc = 0, .family = .sop1, .opcode = .s_mov_b32, .dst = .{ .kind = .sgpr, .reg = 2 }, .src0 = .{ .kind = .integer_inline_constant, .value = 0 }, .src_count = 1 },
+        .{ .pc = 4, .family = .sop2, .opcode = .s_add_u32, .dst = .{ .kind = .sgpr, .reg = 2 }, .src0 = .{ .kind = .sgpr, .reg = 2 }, .src1 = .{ .kind = .integer_inline_constant, .value = 1 }, .src_count = 2 },
+        .{ .pc = 8, .family = .sopp, .opcode = .s_nop },
+        .{ .pc = 12, .family = .sopp, .opcode = .s_waitcnt },
+        .{ .pc = 16, .family = .sopc, .opcode = .s_cmp_lt_u32, .src0 = .{ .kind = .sgpr, .reg = 2 }, .src1 = .{ .kind = .integer_inline_constant, .value = 3 }, .src_count = 2 },
+        .{ .pc = 20, .family = .sopp, .opcode = .s_cbranch_scc1, .branch_target = 4 },
+        .{ .pc = 24, .family = .smem, .opcode = .s_load_dword, .word_count = 2, .dst = .{ .kind = .sgpr, .reg = 4 }, .src0 = .{ .kind = .sgpr, .reg = 0 }, .src1 = .{ .kind = .integer_inline_constant }, .data_words = 1 },
+        .{ .pc = 32, .family = .sopp, .opcode = .s_endpgm },
+    };
+    const a = std.testing.allocator;
+    var plan = try Plan.init(a, &instructions);
+    defer plan.deinit(a);
+    try std.testing.expectEqual(@as(usize, 6), plan.effect_steps.?.len);
+    var bindings = std.mem.zeroes(shaders.StageBindings);
+    bindings.resource_instruction_budget = 16 * 1024;
+    bindings.user_data_count = 2;
+    bindings.user_data[0] = 0x4000;
+    var memory = TestMemory{ .value = 37 };
+    var before: [1]scalar.ScalarRegisters = undefined;
+    var after: [1]scalar.ScalarRegisters = undefined;
+    var old: scalar.Evaluation = undefined;
+    var fresh: scalar.Evaluation = undefined;
+    const saved = omit_inert_scalar_steps;
+    defer omit_inert_scalar_steps = saved;
+    omit_inert_scalar_steps = false;
+    scalar.evaluateDecodedResourceStateAtCheckpointsInto(&old, memory.reader(), &bindings, &instructions, &.{24}, &before, plan.walk());
+    const reads = memory.reads;
+    memory.reads = 0;
+    omit_inert_scalar_steps = true;
+    scalar.evaluateDecodedResourceStateAtCheckpointsInto(&fresh, memory.reader(), &bindings, &instructions, &.{24}, &after, plan.walk());
+    try std.testing.expectEqual(reads, memory.reads);
+    try std.testing.expectEqualDeep(before, after);
+    try std.testing.expectEqualDeep(old.registers, fresh.registers);
+    try std.testing.expectEqualDeep(old.loadSlice(), fresh.loadSlice());
+    try std.testing.expectEqual(old.dense_instruction_count, fresh.dense_instruction_count);
+    try std.testing.expect(fresh.instruction_count < old.instruction_count);
+    try std.testing.expectEqual(old.stop_reason, fresh.stop_reason);
+    try std.testing.expectEqual(old.stop_pc, fresh.stop_pc);
+    try std.testing.expectEqual(@as(u32, 3), after[0][2].value);
+    for ([_]rdna2.Opcode{ .s_nop, .s_waitcnt, .s_barrier, .s_sleep, .s_sendmsg, .s_ttrace_data, .s_inst_prefetch }) |opcode| {
+        try std.testing.expect(inertScalarStep(&.{ .family = .sopp, .opcode = opcode }));
+        try std.testing.expect(!inertScalarStep(&.{ .family = .unknown, .opcode = opcode }));
+    }
+    try std.testing.expect(!inertScalarStep(&.{ .family = .sopp, .opcode = .s_branch }));
+    try std.testing.expect(!inertScalarStep(&.{ .family = .sopp, .opcode = .s_endpgm }));
+}
 
 test "resource iterators preserve program order and reject a replaced allocation" {
     const a = std.testing.allocator;
@@ -960,7 +1052,7 @@ test "indexed scalar history retains dependencies of vector memory operations" {
         var dense: scalar.Evaluation = undefined;
         var indexed: scalar.Evaluation = undefined;
         scalar.evaluateDecodedResourceStateAtTwoCheckpointsInto(&dense, memory.reader(), &bindings, &instructions, &.{}, &.{}, &.{}, &.{}, null);
-        scalar.evaluateDecodedResourceStateAtTwoCheckpointsInto(&indexed, memory.reader(), &bindings, &instructions, &.{}, &.{}, &.{}, &.{}, plan.scalar_steps);
+        scalar.evaluateDecodedResourceStateAtTwoCheckpointsInto(&indexed, memory.reader(), &bindings, &instructions, &.{}, &.{}, &.{}, &.{}, plan.walk());
         try std.testing.expectEqualDeep(dense.registers, indexed.registers);
         try std.testing.expectEqual(std.math.maxInt(u64), indexed.address_user_data_mask);
         try std.testing.expectEqual(dense.address_user_data_mask, indexed.address_user_data_mask);

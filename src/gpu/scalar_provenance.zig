@@ -1076,7 +1076,7 @@ pub fn evaluateDecodedResourceStateAtCheckpoints(
     instructions: []const rdna2.Instruction,
     checkpoint_pcs: []const u32,
     snapshots: []ScalarRegisters,
-    steps: ?[]const u32,
+    steps: ?WalkPlan,
 ) Evaluation {
     var result: Evaluation = undefined;
     evaluateDecodedResourceStateAtCheckpointsInto(&result, reader, bindings, instructions, checkpoint_pcs, snapshots, steps);
@@ -1090,7 +1090,7 @@ pub fn evaluateDecodedResourceStateAtCheckpointsInto(
     instructions: []const rdna2.Instruction,
     checkpoint_pcs: []const u32,
     snapshots: []ScalarRegisters,
-    steps: ?[]const u32,
+    steps: ?WalkPlan,
 ) void {
     evaluateResourceCheckpointsInto(result, reader, bindings, instructions, checkpoint_pcs, snapshots, steps, true);
 }
@@ -1107,7 +1107,7 @@ pub fn evaluateDecodedResourceStateAtTwoCheckpointsInto(
     first_snapshots: []ScalarRegisters,
     second_pcs: []const u32,
     second_snapshots: []ScalarRegisters,
-    steps: ?[]const u32,
+    steps: ?WalkPlan,
 ) void {
     std.debug.assert(first_pcs.len == first_snapshots.len);
     std.debug.assert(second_pcs.len == second_snapshots.len);
@@ -1126,7 +1126,7 @@ pub fn evaluateDecodedResourceSnapshotsInto(
     instructions: []const rdna2.Instruction,
     checkpoint_pcs: []const u32,
     snapshots: []ScalarRegisters,
-    steps: ?[]const u32,
+    steps: ?WalkPlan,
 ) void {
     evaluateResourceCheckpointsInto(result, reader, bindings, instructions, checkpoint_pcs, snapshots, steps, false);
 }
@@ -1138,7 +1138,7 @@ fn evaluateResourceCheckpointsInto(
     instructions: []const rdna2.Instruction,
     checkpoint_pcs: []const u32,
     snapshots: []ScalarRegisters,
-    steps: ?[]const u32,
+    steps: ?WalkPlan,
     retain_load_history: bool,
 ) void {
     std.debug.assert(checkpoint_pcs.len == snapshots.len);
@@ -1216,6 +1216,69 @@ fn scalarWalkVisitsImpl(inst: anytype) bool {
 }
 
 pub export var advance_sparse_scalar_cursor: bool = true;
+pub export var cached_loop_write_masks: bool = true;
+pub export var cached_loop_write_hits: u64 = 0;
+
+pub const WalkPlan = struct {
+    steps: ?[]const u32 = null,
+    loop_writes: ?*const LoopWritePlan = null,
+};
+
+/// Loop-carried scalar writes depend only on the immutable decoded program.
+/// Live lane spills still use the original walk, which also visits vector
+/// destinations and relative writes. No runtime branch decisions are cached.
+pub const LoopWritePlan = struct {
+    const Entry = struct { edge: u32, first: u32, writes: u128 };
+    instructions: []const rdna2.Instruction,
+    entries: []Entry,
+
+    pub fn init(allocator: std.mem.Allocator, instructions: []const rdna2.Instruction) !LoopWritePlan {
+        var count: usize = 0;
+        for (instructions) |*inst| if (inst.opcode == .s_branch and inst.branch_target < inst.pc) {
+            count += 1;
+        };
+        const entries = try allocator.alloc(Entry, count);
+        var cursor: usize = 0;
+        for (instructions) |*edge| if (edge.opcode == .s_branch and edge.branch_target < edge.pc) {
+            var mask: u128 = 0;
+            var loop = LoopInstructions.init(instructions, edge.branch_target, edge.pc, null);
+            while (loop.next()) |inst| {
+                const first = scalarRegisterIndex(inst.dst) orelse continue;
+                const end = @min(maximum_scalar_registers, first + @max(inst.data_words, destinationWords(inst.opcode)));
+                if (end > first) mask |= (@as(u128, std.math.maxInt(u128)) >> @as(u7, @intCast(128 - (end - first)))) << @as(u7, @intCast(first));
+            }
+            entries[cursor] = .{ .edge = edge.pc, .first = edge.branch_target, .writes = mask };
+            cursor += 1;
+        };
+        return .{ .instructions = instructions, .entries = entries };
+    }
+
+    pub fn deinit(self: *LoopWritePlan, allocator: std.mem.Allocator) void {
+        allocator.free(self.entries);
+        self.* = undefined;
+    }
+
+    fn apply(self: *const LoopWritePlan, result: *Evaluation, instructions: []const rdna2.Instruction, first: u32, edge: u32) bool {
+        if (!@atomicLoad(bool, &cached_loop_write_masks, .monotonic) or
+            self.instructions.ptr != instructions.ptr or self.instructions.len != instructions.len) return false;
+        var low: usize = 0;
+        var high = self.entries.len;
+        while (low < high) {
+            const middle = low + (high - low) / 2;
+            if (self.entries[middle].edge < edge) low = middle + 1 else high = middle;
+        }
+        if (low == self.entries.len or self.entries[low].edge != edge or self.entries[low].first != first) return false;
+        var remaining = self.entries[low].writes;
+        while (remaining != 0) {
+            const index: usize = @intCast(@ctz(remaining));
+            remaining &= remaining - 1;
+            result.registers[index] = .{};
+            result.user_data_dependencies[index] = 0;
+        }
+        _ = @atomicRmw(u64, &cached_loop_write_hits, .Add, 1, .monotonic);
+        return true;
+    }
+};
 
 fn nextStepIndex(instructions: []const rdna2.Instruction, steps: []const u32, current: usize, pc: u32) usize {
     if (current < steps.len) {
@@ -1256,7 +1319,7 @@ fn evaluate(
     follow_lane_mask_fallthrough: bool,
     decoded_instructions: ?[]const rdna2.Instruction,
     checkpoint_collector: ?*RegisterCheckpointCollector,
-    steps: ?[]const u32,
+    steps: ?WalkPlan,
 ) Evaluation {
     var result: Evaluation = undefined;
     evaluateInto(&result, reader, bindings, end_pc, follow_lane_mask_fallthrough, decoded_instructions, checkpoint_collector, steps, true);
@@ -1271,9 +1334,10 @@ fn evaluateInto(
     follow_lane_mask_fallthrough: bool,
     decoded_instructions: ?[]const rdna2.Instruction,
     checkpoint_collector: ?*RegisterCheckpointCollector,
-    steps: ?[]const u32,
+    walk: ?WalkPlan,
     retain_load_history: bool,
 ) void {
+    const steps = if (walk) |plan| plan.steps else null;
     result.reset();
     const scalar_base: usize = bindings.scalar_user_data_base;
     const available = @min(
@@ -1500,10 +1564,14 @@ fn evaluateInto(
                             // The scalar index contains every SGPR writer and
                             // branch. Vector destinations matter here only if
                             // a live lane spill can be overwritten by them.
-                            var loop = LoopInstructions.init(instructions, inst.branch_target, inst.pc, if (compact_walk and lane_spills.occupied == 0) steps else null);
-                            while (loop.next()) |loop_inst| {
-                                invalidateDestination(result, loop_inst.dst, @max(loop_inst.data_words, destinationWords(loop_inst.opcode)));
-                                lane_spills.invalidateInstruction(loop_inst);
+                            const retained_writes = if (walk) |plan| plan.loop_writes else null;
+                            const reused = lane_spills.occupied == 0 and if (retained_writes) |plan| plan.apply(result, instructions, inst.branch_target, inst.pc) else false;
+                            if (!reused) {
+                                var loop = LoopInstructions.init(instructions, inst.branch_target, inst.pc, if (compact_walk and lane_spills.occupied == 0) steps else null);
+                                while (loop.next()) |loop_inst| {
+                                    invalidateDestination(result, loop_inst.dst, @max(loop_inst.data_words, destinationWords(loop_inst.opcode)));
+                                    lane_spills.invalidateInstruction(loop_inst);
+                                }
                             }
                             scc = null;
                             if (inst.pc / 4 < revisited_loop_edges.capacity() and !revisited_loop_edges.isSet(inst.pc / 4)) {
@@ -1609,6 +1677,44 @@ const LoopInstructions = struct {
         return inst;
     }
 };
+
+test "loop write masks preserve scalar aliases widths and immutable program ownership" {
+    const instructions = [_]rdna2.Instruction{
+        .{ .pc = 0, .opcode = .s_mov_b64, .dst = .{ .kind = .sgpr, .reg = 3 } },
+        .{ .pc = 4, .opcode = .s_load_dwordx16, .data_words = 16, .dst = .{ .kind = .sgpr, .reg = 4 } },
+        .{ .pc = 12, .opcode = .s_mov_b64, .dst = .{ .kind = .vcc_lo } },
+        .{ .pc = 16, .opcode = .s_load_dwordx4, .data_words = 4, .dst = .{ .kind = .exec_hi } },
+        .{ .pc = 24, .opcode = .v_mov_b32, .dst = .{ .kind = .vgpr, .reg = 20 } },
+        .{ .pc = 28, .opcode = .s_branch, .branch_target = 0 },
+        .{ .pc = 32, .opcode = .s_mov_b32, .dst = .{ .kind = .m0 } },
+        .{ .pc = 36, .opcode = .s_branch, .branch_target = 32 },
+    };
+    var plan = try LoopWritePlan.init(std.testing.allocator, &instructions);
+    defer plan.deinit(std.testing.allocator);
+    const saved = cached_loop_write_masks;
+    defer cached_loop_write_masks = saved;
+    cached_loop_write_masks = true;
+    for ([_][2]u32{ .{ 0, 28 }, .{ 32, 36 } }) |bounds| {
+        var expected = Evaluation{};
+        for (&expected.registers, 0..) |*value, index| value.* = .{ .known = true, .value = @intCast(index * 31), .producer_pc = 71 };
+        expected.user_data_dependencies = @splat(0xffff);
+        var actual: Evaluation = undefined;
+        actual.copyFrom(&expected);
+        var loop = LoopInstructions.init(&instructions, bounds[0], bounds[1], null);
+        while (loop.next()) |inst| invalidateDestination(&expected, inst.dst, @max(inst.data_words, destinationWords(inst.opcode)));
+        try std.testing.expect(plan.apply(&actual, &instructions, bounds[0], bounds[1]));
+        try std.testing.expectEqualDeep(expected.registers, actual.registers);
+        try std.testing.expectEqualDeep(expected.user_data_dependencies, actual.user_data_dependencies);
+    }
+    var evaluation = Evaluation{};
+    var replaced = instructions;
+    replaced[0].dst.reg = 50;
+    try std.testing.expect(!plan.apply(&evaluation, &replaced, 0, 28));
+    try std.testing.expect(!plan.apply(&evaluation, &instructions, 4, 28));
+    try std.testing.expect(!plan.apply(&evaluation, &instructions, 0, 24));
+    cached_loop_write_masks = false;
+    try std.testing.expect(!plan.apply(&evaluation, &instructions, 0, 28));
+}
 
 fn resourceLoopHasUnresolvedExit(instructions: []const rdna2.Instruction, loop_start: u32, back_edge: u32, unknown_scalar_exits: *const BranchSites, steps: ?[]const u32) bool {
     if (loop_start >= back_edge) return false;
@@ -2443,9 +2549,10 @@ fn testResourceCheckpoints(
             return true;
         }
     };
+    const walk: ?WalkPlan = if (steps) |indices| .{ .steps = indices } else null;
     var trace = Trace{ .source_reader = reader };
     const traced = shaders.MemoryReader{ .context = &trace, .read_fn = Trace.read };
-    const complete = evaluateDecodedResourceStateAtCheckpoints(traced, bindings, instructions, pcs, snapshots, steps);
+    const complete = evaluateDecodedResourceStateAtCheckpoints(traced, bindings, instructions, pcs, snapshots, walk);
     const read_count = trace.count;
     const digest = trace.digest.final();
     trace = .{ .source_reader = reader };
@@ -2453,7 +2560,7 @@ fn testResourceCheckpoints(
     defer std.testing.allocator.free(without_history);
     @memset(without_history, @splat(.{ .known = true, .value = 0xdeadbeef }));
     var lightweight: Evaluation = undefined;
-    evaluateDecodedResourceSnapshotsInto(&lightweight, traced, bindings, instructions, pcs, without_history, steps);
+    evaluateDecodedResourceSnapshotsInto(&lightweight, traced, bindings, instructions, pcs, without_history, walk);
     try std.testing.expectEqual(read_count, trace.count);
     try std.testing.expectEqual(digest, trace.digest.final());
     try std.testing.expectEqualDeep(snapshots, without_history);
@@ -2465,6 +2572,21 @@ fn testResourceCheckpoints(
     try std.testing.expectEqual(complete.address_user_data_mask, lightweight.address_user_data_mask);
     try std.testing.expectEqual(@as(usize, 0), lightweight.load_count);
     if (steps == null) {
+        var loop_writes = try LoopWritePlan.init(std.testing.allocator, instructions);
+        defer loop_writes.deinit(std.testing.allocator);
+        // The existing loop/checkpoint regressions also compare the retained
+        // masks against the original walk, including live lane-spill fallbacks.
+        trace = .{ .source_reader = reader };
+        var planned: Evaluation = undefined;
+        evaluateDecodedResourceStateAtCheckpointsInto(&planned, traced, bindings, instructions, pcs, without_history, .{ .loop_writes = &loop_writes });
+        try std.testing.expectEqual(read_count, trace.count);
+        try std.testing.expectEqual(digest, trace.digest.final());
+        try std.testing.expectEqualDeep(snapshots, without_history);
+        try std.testing.expectEqualDeep(complete.registers, planned.registers);
+        try std.testing.expectEqualDeep(complete.user_data_dependencies, planned.user_data_dependencies);
+        try std.testing.expectEqual(complete.stop_reason, planned.stop_reason);
+        try std.testing.expectEqual(complete.instruction_count, planned.instruction_count);
+        try std.testing.expectEqualDeep(complete.loadSlice(), planned.loadSlice());
         // Two consumers may overlap and independently skip checkpoint sites.
         // Reuse the regression cases for branches, loops and failed loads.
         const second = try std.testing.allocator.alloc(ScalarRegisters, snapshots.len);
@@ -3432,9 +3554,9 @@ test "indexed loop clobbers retain scalar state and live vector spill invalidati
         var before: [2]ScalarRegisters = undefined;
         var after: [2]ScalarRegisters = undefined;
         compact_scalar_walks = false;
-        const baseline = evaluateDecodedResourceStateAtCheckpoints(memory.reader(), &bindings, &instructions, &.{ 24, 40 }, &before, &steps);
+        const baseline = evaluateDecodedResourceStateAtCheckpoints(memory.reader(), &bindings, &instructions, &.{ 24, 40 }, &before, .{ .steps = &steps });
         compact_scalar_walks = true;
-        const indexed = evaluateDecodedResourceStateAtCheckpoints(memory.reader(), &bindings, &instructions, &.{ 24, 40 }, &after, &steps);
+        const indexed = evaluateDecodedResourceStateAtCheckpoints(memory.reader(), &bindings, &instructions, &.{ 24, 40 }, &after, .{ .steps = &steps });
         try std.testing.expectEqualDeep(baseline.registers, indexed.registers);
         try std.testing.expectEqualDeep(baseline.user_data_dependencies, indexed.user_data_dependencies);
         try std.testing.expectEqualDeep(baseline.loadSlice(), indexed.loadSlice());

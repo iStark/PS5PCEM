@@ -73,6 +73,9 @@ pub export var avoid_completed_gds_snapshots: bool = true;
 pub export var discard_overwritten_storage_images: bool = true;
 pub export var native_storage_color_initialization: bool = true;
 pub export var cached_guest_fingerprints: bool = true;
+pub export var borrow_resource_instructions: bool = true;
+pub export var compact_sampled_key_hash: bool = true;
+pub export var borrow_sampled_view_plans: bool = true;
 pub export var watched_storage_readbacks: bool = true;
 pub export var storage_readback_guard_bytes: u64 = 0;
 pub export var parallel_host_uploads: bool = true;
@@ -620,6 +623,14 @@ pub const GuestMemory = struct {
     shader_header: ?*const fn (?*anyopaque, u64) ?u64 = null,
     host_source: ?HostSource = null,
 };
+
+// Decoded programs are immutable for the lifetime of a resource lease.
+// Keep the old copied path available for differential measurements.
+fn resourceInstruction(scratch: *gpu.ShaderInstruction, instruction: *const gpu.ShaderInstruction) *const gpu.ShaderInstruction {
+    if (@atomicLoad(bool, &borrow_resource_instructions, .monotonic)) return instruction;
+    scratch.* = instruction.*;
+    return scratch;
+}
 
 fn copyHostUpload(destination: []u8, source: []const u8) void {
     // Keep small writes inline. The pool joins all helpers before returning,
@@ -4326,15 +4337,16 @@ const SampledViewPlan = struct {
         };
     }
 
-    fn view(self: SampledViewPlan, level_index: u8) gpu.tiling.Error!gpu.TextureSubresourceLayout {
-        return self.texture.subresource(
-            self.base_level + level_index,
-            self.first_layer,
-            if (self.volume) 1 else self.layer_count,
-        );
+    fn view(self: *const SampledViewPlan, level_index: u8) gpu.tiling.Error!gpu.TextureSubresourceLayout {
+        var legacy: gpu.TextureLayout = undefined;
+        const texture = if (@atomicLoad(bool, &borrow_sampled_view_plans, .monotonic)) &self.texture else copied: {
+            legacy = self.texture;
+            break :copied &legacy;
+        };
+        return texture.subresource(self.base_level + level_index, self.first_layer, if (self.volume) 1 else self.layer_count);
     }
 
-    fn stagingBytes(self: SampledViewPlan) gpu.tiling.Error!u64 {
+    fn stagingBytes(self: *const SampledViewPlan) gpu.tiling.Error!u64 {
         var total: u64 = 0;
         var index: u8 = 0;
         while (index < self.level_count) : (index += 1) {
@@ -4344,7 +4356,7 @@ const SampledViewPlan = struct {
         return total;
     }
 
-    fn requiredSourceBytes(self: SampledViewPlan) gpu.tiling.Error!u64 {
+    fn requiredSourceBytes(self: *const SampledViewPlan) gpu.tiling.Error!u64 {
         var total: u64 = 0;
         for (0..self.level_count) |index| {
             total = @max(total, (try self.view(@intCast(index))).required_source_bytes);
@@ -4352,7 +4364,7 @@ const SampledViewPlan = struct {
         return total;
     }
 
-    fn readSource(self: SampledViewPlan, memory: GuestMemory, address: u64, destination: []u8) bool {
+    fn readSource(self: *const SampledViewPlan, memory: GuestMemory, address: u64, destination: []u8) bool {
         if (memory.read(memory.context, address, destination)) return true;
         if (self.volume) return false;
         // Array slices retain the full resource stride even when their high
@@ -4372,7 +4384,7 @@ const SampledViewPlan = struct {
         return true;
     }
 
-    fn mipTexels(self: SampledViewPlan, level_index: u8) struct { u32, u32, u32 } {
+    fn mipTexels(self: *const SampledViewPlan, level_index: u8) struct { u32, u32, u32 } {
         return .{
             shiftTexels(self.texel_width, level_index),
             shiftTexels(self.texel_height, level_index),
@@ -4565,13 +4577,31 @@ const SampledImageKey = struct {
     multi_texel_format: ?rdna2.spirv.StorageImageFormat = null,
 
     const Context = struct {
-        pub fn hash(_: @This(), key: SampledImageKey) u64 {
+        // A table keeps one hash policy until it is cleared. Benchmark toggles
+        // must never change how already-inserted entries are looked up.
+        compact: bool = false,
+
+        pub fn hash(context: @This(), key: SampledImageKey) u64 {
             var sampler = key.sampler;
             // Equality treats both signed zeros alike.
             if (sampler.minimum_lod == 0) sampler.minimum_lod = 0;
             if (sampler.maximum_lod == 0) sampler.maximum_lod = 0;
             if (sampler.lod_bias == 0) sampler.lod_bias = 0;
-            var hasher = std.hash.Wyhash.init(sampledImageStateHash(key.image, sampler));
+            const state = sampledImageStateHash(key.image, sampler);
+            if (context.compact) {
+                // This is only a bucket selector: eql still compares every
+                // image and sampler field, including fields omitted here.
+                const words = [_]u64{
+                    key.image.address,
+                    (@as(u64, key.image.width) << 32) | key.image.height,
+                    (@as(u64, key.image.depth_or_layers) << 32) | key.image.pitch,
+                    state,
+                    @intFromEnum(key.dimension),
+                    if (key.multi_texel_format) |format| @as(u64, @intFromEnum(format)) + 1 else 0,
+                };
+                return std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(&words));
+            }
+            var hasher = std.hash.Wyhash.init(state);
             std.hash.autoHash(&hasher, key.image);
             std.hash.autoHash(&hasher, key.dimension);
             std.hash.autoHash(&hasher, key.multi_texel_format);
@@ -4584,6 +4614,67 @@ const SampledImageKey = struct {
     };
 };
 
+test "sampled key buckets retain signed zero equality and colliding descriptor distinctions" {
+    const descriptor = gpu.resources.ImageDescriptor{
+        .address = 0x2000_0000,
+        .width = 64,
+        .height = 64,
+        .depth_or_layers = 1,
+        .pitch = 64,
+        .unified_format = 1,
+        .tile_mode = .linear,
+        .image_type = .color_2d,
+        .dst_select = .{ 4, 5, 6, 7 },
+        .base_level = 0,
+        .last_level = 0,
+        .base_array = 0,
+        .array_pitch = 0,
+        .max_mip = 0,
+        .min_lod = 0,
+        .min_lod_warning = 0,
+        .bc_swizzle = 0,
+        .metadata_address = 0,
+        .dcc_enabled = false,
+        .cmask_fast_clear = false,
+        .fmask_compression = false,
+        .cmask_address = 0,
+        .fmask_address = 0,
+        .dcc_address = 0,
+        .descriptor_flags = 0,
+        .extended = true,
+    };
+    const key = SampledImageKey{ .image = descriptor, .sampler = std.mem.zeroes(gpu.resources.SamplerDescriptor), .dimension = .two_d };
+    for ([_]bool{ false, true }) |compact| {
+        const context = SampledImageKey.Context{ .compact = compact };
+        var table: std.HashMapUnmanaged(SampledImageKey, u32, SampledImageKey.Context, 80) = .empty;
+        defer table.deinit(std.testing.allocator);
+        try table.putContext(std.testing.allocator, key, 3, context);
+        var negative_zero = key;
+        negative_zero.sampler.minimum_lod = -0.0;
+        negative_zero.sampler.maximum_lod = -0.0;
+        negative_zero.sampler.lod_bias = -0.0;
+        try std.testing.expect(context.eql(key, negative_zero));
+        try std.testing.expectEqual(context.hash(key), context.hash(negative_zero));
+        try std.testing.expectEqual(@as(?u32, 3), table.getContext(negative_zero, context));
+        var collision = key;
+        collision.sampler.maximum_anisotropy = 4;
+        collision.image.min_lod_warning = 7;
+        if (compact) try std.testing.expectEqual(context.hash(key), context.hash(collision));
+        try table.putContext(std.testing.allocator, collision, 9, context);
+        var elsewhere = key;
+        elsewhere.image.address += 0x10000;
+        try table.putContext(std.testing.allocator, elsewhere, 11, context);
+        try std.testing.expectEqual(@as(?u32, 3), table.getContext(key, context));
+        try std.testing.expectEqual(@as(?u32, 9), table.getContext(collision, context));
+        try std.testing.expectEqual(@as(?u32, 11), table.getContext(elsewhere, context));
+        try std.testing.expectEqual(@as(u32, 3), table.count());
+        table.clearRetainingCapacity();
+        const changed = SampledImageKey.Context{ .compact = !compact };
+        try table.putContext(std.testing.allocator, key, 17, changed);
+        try std.testing.expectEqual(@as(?u32, 17), table.getContext(key, changed));
+    }
+}
+
 const GraphicsResources = struct {
     scalar_reuse_safe: bool = true,
     images: [maximum_sampled_images]PreparedSampledImage = undefined,
@@ -4594,6 +4685,7 @@ const GraphicsResources = struct {
     mappings: [maximum_compute_sampled_mappings]gpu.ShaderSpirvSampledImageBinding = undefined,
     mapping_count: usize = 0,
     image_lookup: std.HashMapUnmanaged(SampledImageKey, u32, SampledImageKey.Context, 80) = .empty,
+    image_context: SampledImageKey.Context = .{},
 
     fn destroy(self: *GraphicsResources, allocator: std.mem.Allocator) void {
         self.image_lookup.deinit(allocator);
@@ -4602,7 +4694,7 @@ const GraphicsResources = struct {
 
     fn init(allocator: std.mem.Allocator) !*GraphicsResources {
         const result = try allocator.create(GraphicsResources);
-        result.* = .{};
+        result.* = .{ .image_context = .{ .compact = @atomicLoad(bool, &compact_sampled_key_hash, .monotonic) } };
         return result;
     }
 
@@ -4614,6 +4706,7 @@ const GraphicsResources = struct {
         result.image_count = 0;
         result.mapping_count = 0;
         result.image_lookup.clearRetainingCapacity();
+        result.image_context = .{ .compact = @atomicLoad(bool, &compact_sampled_key_hash, .monotonic) };
         return result;
     }
 
@@ -13514,7 +13607,7 @@ pub const Renderer = struct {
         var buffer_instructions = gpu.resource_checkpoints.Iterator.init(instructions, if (analysis.resource_checkpoints) |*plan| plan else null, .resource);
         while (buffer_instructions.next()) |instruction_index| {
             const candidate = &instructions[instruction_index];
-            if (result.entry_scalar_snapshot_end != 0 and gpu.scalar_snapshots.complete(candidate.*, result.scalar_registers[0..result.scalar_count])) {
+            if (result.entry_scalar_snapshot_end != 0 and gpu.scalar_snapshots.complete(candidate, result.scalar_registers[0..result.scalar_count])) {
                 // Keep exact draw reuse, but pin all USER_DATA for scalar-only
                 // replay: these snapshots depend on the full read capture.
                 result.scalar_reuse_safe = false;
@@ -13605,7 +13698,8 @@ pub const Renderer = struct {
                     result.incomplete_store_origin = BufferWriteOrigin.instruction(bindings.program_address, candidate.*, .incomplete_preparation);
                 result.store_preparation_incomplete = true;
             };
-            const inst = candidate.*;
+            var instruction_copy: gpu.ShaderInstruction = undefined;
+            const inst = resourceInstruction(&instruction_copy, candidate);
             const resource_operand = if (inst.family == .smem) inst.src0 else inst.src1;
             if (resource_operand.kind != .sgpr) {
                 if (log_verbose_gpu) std.debug.print(
@@ -13676,11 +13770,11 @@ pub const Renderer = struct {
                 takePlausibleBufferDescriptor(attribute.buffer)
             else
                 null) orelse {
-                if (try self.prepareBufferTableCandidates(result, bindings, reader, analysis, instruction_scalar, inst, is_store, read_only_snapshots)) {
+                if (try self.prepareBufferTableCandidates(result, bindings, reader, analysis, instruction_scalar, inst.*, is_store, read_only_snapshots)) {
                     store_prepared = true;
                     continue;
                 }
-                self.traceSkippedStorage(bindings, inst, "unresolved descriptor", null);
+                self.traceSkippedStorage(bindings, inst.*, "unresolved descriptor", null);
                 if (log_verbose_gpu) {
                     const full = gpu.scalar_provenance.evaluatePrefix(reader, bindings);
                     std.debug.print(
@@ -13702,7 +13796,7 @@ pub const Renderer = struct {
                 continue;
             };
             if (descriptor.isNull() or descriptor.size_bytes == 0) {
-                self.traceSkippedStorage(bindings, inst, "null descriptor", descriptor);
+                self.traceSkippedStorage(bindings, inst.*, "null descriptor", descriptor);
                 if (log_verbose_gpu) std.debug.print(
                     "[vulkan dcb] MissingStorageDescriptor: pc=0x{x} {s} V# s{d} null/empty (addr=0x{x} size={d}); soft-skip\n",
                     .{
@@ -13715,7 +13809,7 @@ pub const Renderer = struct {
                 );
                 continue;
             }
-            var staged_extent = constantBufferFetchExtent(descriptor, inst, instruction_scalar);
+            var staged_extent = constantBufferFetchExtent(descriptor, inst.*, instruction_scalar);
             if (draw_bounds) |bounds| {
                 if (formatted_vertex_fetch and descriptor.stride != 0 and inst.index_enable and inst.src0.kind == .vgpr and !inst.src0.dpp and !inst.src0.dpp8 and
                     !inst.src0.negate and !inst.src0.negate_hi and !inst.src0.absolute and inst.src0.sdwa_sel == 6 and
@@ -13729,7 +13823,7 @@ pub const Renderer = struct {
                         break :origins gpu.index_bounds.vectorOrigins(instructions, &analysis.graph, instruction_index, inst.src0.reg, 0);
                     };
                     if (origins) |proven| {
-                        staged_extent = vertexStagingPrefix(descriptor.size_bytes, vertexBufferFetchExtent(descriptor, inst, if (vertex_attribute) |attribute| attribute.offset_bytes else vertexFetchScalarOffset(inst.src2, instruction_scalar), bounds.fetchLimit(proven, vertex_attribute != null)));
+                        staged_extent = vertexStagingPrefix(descriptor.size_bytes, vertexBufferFetchExtent(descriptor, inst.*, if (vertex_attribute) |attribute| attribute.offset_bytes else vertexFetchScalarOffset(inst.src2, instruction_scalar), bounds.fetchLimit(proven, vertex_attribute != null)));
                     }
                 }
             }
@@ -13738,7 +13832,7 @@ pub const Renderer = struct {
                 self.frame_profile.bounded_vertex_fetches +|= 1;
             }
             const size = std.math.cast(usize, staged_extent) orelse {
-                self.traceSkippedStorage(bindings, inst, "descriptor size", descriptor);
+                self.traceSkippedStorage(bindings, inst.*, "descriptor size", descriptor);
                 if (log_verbose_gpu) std.debug.print(
                     "[vulkan dcb] GuestBufferTooLarge: V# s{d} size_bytes=0x{x}; soft-skip\n",
                     .{ resource_sgpr, descriptor.size_bytes },
@@ -13747,7 +13841,7 @@ pub const Renderer = struct {
             };
             const descriptor_index = result.descriptorForRange(descriptor.address, size) orelse blk: {
                 const free = result.freeDescriptor() orelse {
-                    self.traceSkippedStorage(bindings, inst, "descriptor capacity", descriptor);
+                    self.traceSkippedStorage(bindings, inst.*, "descriptor capacity", descriptor);
                     if (log_verbose_gpu) std.debug.print("[vulkan dcb] no free storage slot for V# s{d}; soft-skip\n", .{resource_sgpr});
                     continue;
                 };
@@ -13761,7 +13855,7 @@ pub const Renderer = struct {
                     _ = self.stageGuestStorageBufferAt(free, descriptor.address, size) catch |err| break :stage err;
                 };
                 staged catch |err| {
-                    self.traceSkippedStorage(bindings, inst, @errorName(err), descriptor);
+                    self.traceSkippedStorage(bindings, inst.*, @errorName(err), descriptor);
                     if (log_verbose_gpu) std.debug.print(
                         "[vulkan dcb] stage V# s{d} failed: {s} addr=0x{x} size=0x{x} stride={d} records={d}; soft-skip\n",
                         .{
@@ -13816,7 +13910,7 @@ pub const Renderer = struct {
                 .extent_bytes = std.math.cast(u32, staged_extent),
             };
             if (canReuseStorageMapping(vertex_attribute != null, previous_mapping, mapping)) {
-                if (is_store) result.noteBufferStore(descriptor_index, inst);
+                if (is_store) result.noteBufferStore(descriptor_index, inst.*);
                 store_prepared = true;
                 continue;
             }
@@ -13829,7 +13923,7 @@ pub const Renderer = struct {
             }
             result.mappings[result.mapping_count] = mapping;
             result.mapping_count += 1;
-            if (is_store) result.noteBufferStore(descriptor_index, inst);
+            if (is_store) result.noteBufferStore(descriptor_index, inst.*);
             store_prepared = true;
         }
 
@@ -26953,7 +27047,8 @@ pub const Renderer = struct {
         defer self.frame_profile.graphics_sampled_scan_ns +|= elapsedHostNanoseconds(sampled_scan_started);
         var sampled_instructions = gpu.resource_checkpoints.Iterator.init(instructions, if (analysis.resource_checkpoints) |*plan| plan else null, .sampled);
         while (sampled_instructions.next()) |instruction_index| {
-            const inst = instructions[instruction_index];
+            var instruction_copy: gpu.ShaderInstruction = undefined;
+            const inst = resourceInstruction(&instruction_copy, &instructions[instruction_index]);
             const image_fetch = inst.opcode == .image_load or inst.opcode == .image_load_mip;
             if (inst.src1.kind != .sgpr or inst.src2.kind != .sgpr) {
                 if (log_verbose_gpu) std.debug.print(
@@ -27006,15 +27101,15 @@ pub const Renderer = struct {
                 image_slot,
                 inst.imageResourceWords(),
             )) orelse {
-                if (try self.appendIndirectGraphicsImages(result, bindings, reader, analysis, sampled_scalar, inst, sampler_slot, render_target_write, extra_colors)) continue;
-                self.reportResourceFailure(bindings, inst, sampled_scalar);
+                if (try self.appendIndirectGraphicsImages(result, bindings, reader, analysis, sampled_scalar, inst.*, sampler_slot, render_target_write, extra_colors)) continue;
+                self.reportResourceFailure(bindings, inst.*, sampled_scalar);
                 std.debug.print(
                     "[vulkan dcb] sampled image missing for s{d} (user_data={d} srt={any} stage={s} program=0x{x} pc=0x{x})\n",
                     .{ inst.src1.reg, bindings.user_data_count, bindings.srt_address != null, @tagName(bindings.stage), bindings.program_address, inst.pc },
                 );
                 return Error.UnsupportedSampledImage;
             };
-            const multi_format = try multiTexelBindingFormat(inst, image_descriptor);
+            const multi_format = try multiTexelBindingFormat(inst.*, image_descriptor);
             var sampler_descriptor: gpu.resources.SamplerDescriptor = if (image_fetch)
                 std.mem.zeroes(gpu.resources.SamplerDescriptor)
             else
@@ -27027,7 +27122,7 @@ pub const Renderer = struct {
                     inst.pc,
                     sampler_slot,
                 )) orelse {
-                    self.reportResourceFailure(bindings, inst, sampled_scalar);
+                    self.reportResourceFailure(bindings, inst.*, sampled_scalar);
                     std.debug.print(
                         "[vulkan dcb] sampler missing for s{d}\n",
                         .{inst.src2.reg},
@@ -27036,7 +27131,7 @@ pub const Renderer = struct {
                 };
             if (inst.image_sample_flags.gather_horizontal and (sampler_descriptor.unnormalized_coordinates or sampler_descriptor.force_srgb)) return Error.UnsupportedSampledImage;
             if (inst.opcode == .image_gather4) sampler_descriptor = pointGatherSampler(sampler_descriptor);
-            sampler_descriptor.compare_sample = comparesThroughSampler(inst);
+            sampler_descriptor.compare_sample = comparesThroughSampler(inst.*);
             const sampled_dimension = sampledImageDimensionForInstruction(
                 inst.image_dimension,
                 image_descriptor.image_type,
@@ -27051,7 +27146,7 @@ pub const Renderer = struct {
             // Resolve every instruction, sharing physical slots only when the
             // complete image, sampler and Vulkan view dimension still match.
             const image_key = SampledImageKey{ .image = image_descriptor, .sampler = sampler_descriptor, .dimension = sampled_dimension, .multi_texel_format = multi_format };
-            var descriptor_index = result.image_lookup.get(image_key);
+            var descriptor_index = result.image_lookup.getContext(image_key, result.image_context);
             if (descriptor_index == null) {
                 if (result.image_count >= self.device_info.sampled_image_capacity) return Error.UnsupportedSampledImage;
                 const physical_index: u32 = @intCast(result.image_count);
@@ -27100,7 +27195,7 @@ pub const Renderer = struct {
                 result.samplers[physical_index] = sampler_descriptor;
                 result.dimensions[physical_index] = sampled_dimension;
                 result.image_count += 1;
-                try result.image_lookup.put(self.allocator, image_key, physical_index);
+                try result.image_lookup.putContext(self.allocator, image_key, physical_index, result.image_context);
                 descriptor_index = physical_index;
             }
             result.mappings[result.mapping_count] = .{
@@ -27167,7 +27262,7 @@ pub const Renderer = struct {
             _ = try multiTexelBindingFormat(inst, descriptor);
             const dimension = sampledImageDimensionForInstruction(inst.image_dimension, descriptor.image_type) orelse return false;
             const image_key = SampledImageKey{ .image = descriptor, .sampler = sampler, .dimension = dimension };
-            var slot = result.image_lookup.get(image_key);
+            var slot = result.image_lookup.getContext(image_key, result.image_context);
             if (slot == null) {
                 if (result.image_count >= self.device_info.sampled_image_capacity) return Error.UnsupportedSampledImage;
                 slot = @intCast(result.image_count);
@@ -27183,7 +27278,7 @@ pub const Renderer = struct {
                 result.samplers[result.image_count] = sampler;
                 result.dimensions[result.image_count] = dimension;
                 result.image_count += 1;
-                try result.image_lookup.put(self.allocator, image_key, slot.?);
+                try result.image_lookup.putContext(self.allocator, image_key, slot.?, result.image_context);
             }
             if (result.mapping_count == result.mappings.len) return Error.UnsupportedSampledImage;
             result.mappings[result.mapping_count] = .{
@@ -28177,7 +28272,7 @@ pub const Renderer = struct {
 
     fn nativeStorageTexelHash(snapshot: CachedStorageImage, allocation: []const u8) ?u64 {
         const spans = snapshot.guest_native_coverage orelse return null;
-        var hash = std.hash.Wyhash.init(0);
+        var hash = std.hash.XxHash3.init(0);
         for (spans) |span| hash.update(allocation[span.offset..][0..span.size]);
         return hash.final();
     }
@@ -34969,7 +35064,11 @@ pub const Renderer = struct {
                 if (fingerprint(memory.context, read.address, read.size) != read.hash) return false;
                 continue;
             }
-            var hash = std.hash.Wyhash.init(0);
+            // Capture bounds this fallback to 256 KiB, below the partitioned
+            // fingerprint threshold. Chunking must retain the same digest as
+            // the complete upload and the checked guest callback.
+            std.debug.assert(read.size < gpu.parallel_copy.Pool.minimum_bytes);
+            var hash = gpu.parallel_copy.SpanHasher.init(read.size);
             var offset: usize = 0;
             while (offset < read.size) {
                 const length = @min(scratch.len, read.size - offset);
@@ -41302,6 +41401,36 @@ test "draw reuse batches adjacent scalar reads and ignores unrelated bytes" {
     source.bytes[16] = 0;
     loads[1].address = 0x4020;
     try std.testing.expect(!scalarLoadsMatch(memory, &loads));
+}
+
+test "draw reuse chunked fallback matches large upload fingerprints and detects writes" {
+    const Source = struct {
+        bytes: [65537]u8 = undefined,
+        fn read(context: ?*anyopaque, address: u64, out: []u8) bool {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            if (out.len > 4096 or address < 0x4000 or address - 0x4000 + out.len > self.bytes.len) return false;
+            @memcpy(out, self.bytes[@intCast(address - 0x4000)..][0..out.len]);
+            return true;
+        }
+        fn write(_: ?*anyopaque, _: u64, _: []const u8) bool {
+            return false;
+        }
+    };
+    var source = Source{};
+    for (&source.bytes, 0..) |*byte, i| byte.* = @truncate(i *% 37 +% (i >> 5));
+    const renderer = try std.testing.allocator.create(Renderer);
+    defer std.testing.allocator.destroy(renderer);
+    renderer.draw_reuse_buffer_read_count = 1;
+    const memory = GuestMemory{ .context = &source, .read = Source.read, .write = Source.write };
+    for ([_]usize{ 1023, 1024, 4097, 65537 }) |length| {
+        renderer.draw_reuse_buffer_reads[0] = .{ .address = 0x4000, .size = length, .hash = gpu.parallel_copy.fingerprint(source.bytes[0..length]) };
+        try std.testing.expect(renderer.drawReuseBufferReadsMatch(memory));
+        for ([_]usize{ 0, length / 2, length - 1 }) |offset| {
+            source.bytes[offset] ^= 0x80;
+            try std.testing.expect(!renderer.drawReuseBufferReadsMatch(memory));
+            source.bytes[offset] ^= 0x80;
+        }
+    }
 }
 
 test "draw reuse fingerprints exactly the uploaded bytes without reading the GPU mapping" {

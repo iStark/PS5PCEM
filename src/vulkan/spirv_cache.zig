@@ -6,6 +6,8 @@ const std = @import("std");
 const rdna2 = @import("rdna2");
 
 pub var reuse_program_hash_state = std.atomic.Value(bool).init(true);
+pub export var reuse_prefix_identity_aliases: bool = true;
+pub export var prefix_identity_alias_hits: u64 = 0;
 
 /// A dynamic scalar's array index is also its uniform-buffer word. Call this
 /// before both translation and upload, never only while constructing a key.
@@ -101,13 +103,30 @@ pub const Lease = struct {
 const ProgramPrefix = struct {
     bytes: []u8,
     identity: u64,
+    aliases: [8]u64 = @splat(0),
+    next_alias: u3 = 0,
     references: usize = 1,
 
     fn matches(self: *ProgramPrefix, bytes: []const u8, identity: u64) bool {
         if (self.bytes.len != bytes.len) return false;
         if (identity != 0 and self.identity == identity) return true;
+        const aliases = @atomicLoad(bool, &reuse_prefix_identity_aliases, .monotonic);
+        if (identity != 0 and aliases) for (self.aliases) |known| {
+            if (known == identity) {
+                _ = @atomicRmw(u64, &prefix_identity_alias_hits, .Add, 1, .monotonic);
+                return true;
+            }
+        };
         if (!std.mem.eql(u8, self.bytes, bytes)) return false;
-        if (identity != 0) self.identity = identity;
+        if (identity != 0) {
+            if (aliases) {
+                // ProgramKey IDs are unique for immutable owners and never
+                // wrap. Retain several byte-verified identities so alternating
+                // owners do not repeatedly compare the whole shader prefix.
+                self.aliases[self.next_alias] = identity;
+                self.next_alias +%= 1;
+            } else self.identity = identity;
+        }
         return true;
     }
 };
@@ -863,4 +882,27 @@ test "compute cache matches fresh translation across runtime values wave modes a
     }
     try std.testing.expectEqual(@as(u64, 2), cache.hits);
     try std.testing.expectEqual(@as(u64, 5), cache.misses);
+}
+
+test "shared prefix identity aliases require byte proof and survive bounded replacement" {
+    const previous = reuse_prefix_identity_aliases;
+    defer reuse_prefix_identity_aliases = previous;
+    var bytes = [_]u8{ 1, 2, 3, 4 };
+    for ([_]bool{ false, true }) |enabled| {
+        reuse_prefix_identity_aliases = enabled;
+        var prefix = ProgramPrefix{ .bytes = &bytes, .identity = 1 };
+        for (2..32) |identity| {
+            try std.testing.expect(!prefix.matches(&.{ 1, 2, 3, 5 }, identity));
+            try std.testing.expect(!prefix.matches(&.{ 1, 2, 3 }, identity));
+            try std.testing.expect(prefix.matches(&.{ 1, 2, 3, 4 }, identity));
+            try std.testing.expect(prefix.matches(&bytes, identity));
+            try std.testing.expect(prefix.matches(&bytes, 1));
+        }
+        // Anonymous inputs always require a full comparison, even after many
+        // successful equal owners. Reusing an evicted ID rechecks its bytes.
+        try std.testing.expect(!prefix.matches(&.{ 1, 2, 3, 5 }, 0));
+        try std.testing.expect(prefix.matches(&.{ 1, 2, 3, 4 }, 0));
+        try std.testing.expect(prefix.matches(&.{ 1, 2, 3, 4 }, 2));
+        try std.testing.expect(!prefix.matches(&.{ 1, 2, 3, 5 }, 99));
+    }
 }

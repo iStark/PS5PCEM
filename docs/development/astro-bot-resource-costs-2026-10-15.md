@@ -167,10 +167,13 @@ the sampled title intervals. Cinematic rendering defects and character control
 remain unverified in this run. A clean title capture does not resolve those
 limitations or establish that all shaders work.
 
-`zig-out/bin/game-run.exe` and its PDB now contain candidate 113. The executable
+The runner installed for this report and its PDB contained candidate 113. The executable
 was signed with the existing PS5PCEM certificate and a DigiCert timestamp.
 The local self-signed chain reports `UnknownError`; the expected signer and
 timestamp are present. No new release number was assigned.
+
+The [16 October follow-up](astro-bot-resource-walks-2026-10-16.md) records the
+subsequent resource-walk changes and replacement local runner.
 
 ## Local reference review
 

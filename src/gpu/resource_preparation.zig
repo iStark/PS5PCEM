@@ -517,7 +517,7 @@ pub const Pool = struct {
             stage.snapshot.source = reader;
             // Forward walks fit statically. Completed loops additionally prove
             // their dense visit bound before lending specialization history.
-            scalar.evaluateDecodedResourceStateAtTwoCheckpointsInto(&stage.scalar_result, .{ .context = &stage.snapshot, .read_fn = Snapshot.capture }, bindings, instructions, sampled.pcs, sampled.snapshots, resource.pcs, resource.snapshots, plan.?.scalar_steps);
+            scalar.evaluateDecodedResourceStateAtTwoCheckpointsInto(&stage.scalar_result, .{ .context = &stage.snapshot, .read_fn = Snapshot.capture }, bindings, instructions, sampled.pcs, sampled.snapshots, resource.pcs, resource.snapshots, plan.?.walk());
             sampled.instructions_walked = stage.scalar_result.instruction_count;
             if (stage.snapshot.complete and self.sharedResultFits(stage, plan.?, bindings, &stage.scalar_result)) {
                 self.walk_cache.remember(plan.?, bindings, &stage.snapshot, &stage.scalar_result, sampled.snapshots, resource.snapshots);
@@ -548,7 +548,7 @@ pub const Pool = struct {
             }
             self.stats.cache_misses += 1;
             stage.snapshot.source = reader;
-            scalar.evaluateDecodedResourceStateAtCheckpointsInto(scalar_result, .{ .context = &stage.snapshot, .read_fn = Snapshot.capture }, bindings, instructions, resource.pcs, resource.snapshots, plan.?.scalar_steps);
+            scalar.evaluateDecodedResourceStateAtCheckpointsInto(scalar_result, .{ .context = &stage.snapshot, .read_fn = Snapshot.capture }, bindings, instructions, resource.pcs, resource.snapshots, plan.?.walk());
             if (!self.sharedResultFits(stage, plan.?, bindings, scalar_result)) {
                 resource.release();
                 return false;
@@ -1089,7 +1089,7 @@ test "indexed dense visit counts include branch gaps and reject malformed destin
         var dense: scalar.Evaluation = undefined;
         var indexed: scalar.Evaluation = undefined;
         scalar.evaluateDecodedResourceStateInto(&dense, memory.reader(), &bindings, &instructions);
-        scalar.evaluateDecodedResourceStateAtCheckpointsInto(&indexed, memory.reader(), &bindings, &instructions, &.{}, &.{}, plan.scalar_steps);
+        scalar.evaluateDecodedResourceStateAtCheckpointsInto(&indexed, memory.reader(), &bindings, &instructions, &.{}, &.{}, plan.walk());
         try std.testing.expectEqualDeep(dense.registers, indexed.registers);
         if (variant == 2) {
             try std.testing.expectEqual(@as(?u64, std.math.maxInt(u64)), indexed.dense_instruction_count);

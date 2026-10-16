@@ -1297,7 +1297,7 @@ pub const TextureLayout = struct {
     }
 
     pub fn subresource(
-        self: TextureLayout,
+        self: *const TextureLayout,
         level: u8,
         first_layer: u32,
         layer_count: u32,
@@ -1341,7 +1341,7 @@ pub const TextureLayout = struct {
         };
     }
 
-    pub fn base(self: TextureLayout) Error!SubresourceLayout {
+    pub fn base(self: *const TextureLayout) Error!SubresourceLayout {
         return self.subresource(0, 0, self.layers);
     }
 

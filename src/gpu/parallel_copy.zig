@@ -6,6 +6,7 @@ const builtin = @import("builtin");
 
 pub var guest_copy_pool = Pool{};
 pub export var rep_large_copies: bool = true;
+pub export var rep_copy_min_bytes: usize = 256 * 1024;
 
 /// Keep the ordinary inline copy for short spans. Long host transfers benefit
 /// from the x86 string-copy engine without requiring AVX or aligned addresses.
@@ -13,7 +14,7 @@ pub export var rep_large_copies: bool = true;
 fn copyBytes(destination: []u8, source: []const u8) void {
     std.debug.assert(destination.len == source.len);
     if (builtin.os.tag == .windows and builtin.cpu.arch == .x86_64) {
-        if (destination.len >= 2 * 1024 * 1024 and @atomicLoad(bool, &rep_large_copies, .monotonic)) {
+        if (destination.len >= @max(64, @atomicLoad(usize, &rep_copy_min_bytes, .monotonic)) and @atomicLoad(bool, &rep_large_copies, .monotonic)) {
             var dst = destination.ptr;
             var src = source.ptr;
             var remaining = destination.len;
@@ -35,6 +36,59 @@ fn copyBytes(destination: []u8, source: []const u8) void {
 /// worker count. Embeddings use this for both guest memory and copied snapshots.
 pub fn fingerprint(source: []const u8) u64 {
     return guest_copy_pool.fingerprint(source);
+}
+
+// These digests compare live guest storage with copied snapshots, not files on
+// disk. Keep one immutable policy for every caller and helper: changing it while
+// resources are resident would make unchanged content appear modified.
+pub const vector_hash_minimum_bytes = 1024;
+
+fn contentHash(source: []const u8) u64 {
+    // XXH3's vectorized long-input path amortizes its setup on larger ranges.
+    // Short descriptors retain Wyhash; both paths inspect the complete span.
+    return if (source.len < vector_hash_minimum_bytes) std.hash.Wyhash.hash(0, source) else std.hash.XxHash3.hash(0, source);
+}
+
+/// Streaming digest for one contiguous span, using its complete length to choose
+/// the algorithm. Matches fingerprint below Pool.minimum_bytes; larger pooled
+/// fingerprints combine four independently hashed spans instead.
+pub const SpanHasher = union(enum) {
+    short: std.hash.Wyhash,
+    long: std.hash.XxHash3,
+
+    pub fn init(total_bytes: usize) SpanHasher {
+        return if (total_bytes < vector_hash_minimum_bytes) .{ .short = .init(0) } else .{ .long = .init(0) };
+    }
+
+    pub fn update(self: *SpanHasher, bytes: []const u8) void {
+        switch (self.*) {
+            inline else => |*hasher| hasher.update(bytes),
+        }
+    }
+
+    pub fn final(self: *SpanHasher) u64 {
+        return switch (self.*) {
+            inline else => |*hasher| hasher.final(),
+        };
+    }
+};
+
+test "streamed span hashes match complete content across chunk and algorithm boundaries" {
+    var bytes: [16385]u8 = undefined;
+    for (&bytes, 0..) |*byte, i| byte.* = @truncate(i *% 31 +% (i >> 4));
+    for ([_]usize{ 0, 63, 1023, 1024, 1025, 4097, bytes.len }) |length| {
+        for ([_]usize{ 1, 63, 256, 1023, 4096 }) |chunk| {
+            var hash = SpanHasher.init(length);
+            hash.update(&.{});
+            var offset: usize = 0;
+            while (offset < length) {
+                const end = @min(length, offset + chunk);
+                hash.update(bytes[offset..end]);
+                offset = end;
+            }
+            try std.testing.expectEqual(contentHash(bytes[0..length]), hash.final());
+        }
+    }
 }
 
 /// Synchronous copies with a bounded set of sleeping helper threads. The caller
@@ -124,7 +178,7 @@ pub const Pool = struct {
     /// Worker count, address alignment and a busy/unavailable pool cannot change
     /// the digest. No source bytes or snapshot allocations survive the call.
     pub fn fingerprint(self: *Pool, source: []const u8) u64 {
-        if (source.len < minimum_bytes) return std.hash.Wyhash.hash(0, source);
+        if (source.len < minimum_bytes) return contentHash(source);
         var hashes: [maximum_participants]u64 = undefined;
         const participants = self.participants.load(.acquire);
         if (builtin.single_threaded or participants <= 1 or !self.lock.tryLock()) {
@@ -182,7 +236,7 @@ pub const Pool = struct {
         const stride = std.mem.alignBackward(usize, source.len / maximum_participants, 64);
         for (first..end) |index| {
             const limit = if (index + 1 == maximum_participants) source.len else stride * (index + 1);
-            hashes[index] = std.hash.Wyhash.hash(0, source[stride * index .. limit]);
+            hashes[index] = contentHash(source[stride * index .. limit]);
         }
     }
 
@@ -233,6 +287,31 @@ pub const Pool = struct {
         self.start_failed = false;
     }
 };
+
+test "host string copies preserve unaligned short and threshold boundaries" {
+    const saved = rep_copy_min_bytes;
+    const enabled = rep_large_copies;
+    defer {
+        rep_copy_min_bytes = saved;
+        rep_large_copies = enabled;
+    }
+    rep_large_copies = true;
+    var source: [8192 + 128]u8 = undefined;
+    var destination: [8192 + 128]u8 = undefined;
+    for (&source, 0..) |*byte, i| byte.* = @truncate(i *% 31 +% (i >> 7));
+    for ([_]usize{ 0, 64, 256, 4096, std.math.maxInt(usize) }) |minimum| {
+        rep_copy_min_bytes = minimum;
+        for ([_]usize{ 0, 1, 15, 31, 63 }) |alignment| {
+            for ([_]usize{ 0, 1, 63, 64, 65, 255, 256, 257, 4095, 4096, 4097, 8192 }) |length| {
+                @memset(&destination, 0x7d);
+                copyBytes(destination[alignment..][0..length], source[63 - alignment ..][0..length]);
+                try std.testing.expectEqualSlices(u8, source[63 - alignment ..][0..length], destination[alignment..][0..length]);
+                try std.testing.expect(std.mem.allEqual(u8, destination[0..alignment], 0x7d));
+                try std.testing.expect(std.mem.allEqual(u8, destination[alignment + length ..], 0x7d));
+            }
+        }
+    }
+}
 
 test "long host copies preserve exact boundaries for each worker count" {
     const saved = rep_large_copies;
@@ -374,12 +453,12 @@ test "buffer fingerprints cover partitions and ignore alignment worker count and
     const storage = try std.testing.allocator.alloc(u8, Pool.minimum_bytes * 2 + 2048);
     defer std.testing.allocator.free(storage);
     for (storage, 0..) |*byte, i| byte.* = @truncate(i *% 31 +% (i >> 13));
-    const lengths = [_]usize{ 0, 63, Pool.minimum_bytes - 1, Pool.minimum_bytes, Pool.minimum_bytes + 513 };
+    const lengths = [_]usize{ 0, 63, 1023, 1024, 1025, Pool.minimum_bytes - 1, Pool.minimum_bytes, Pool.minimum_bytes + 513 };
     for (lengths) |length| {
         const source = storage[3..][0..length];
         pool.participants.store(1, .release);
         const expected = pool.fingerprint(source);
-        if (length < Pool.minimum_bytes) try std.testing.expectEqual(std.hash.Wyhash.hash(0, source), expected);
+        if (length < Pool.minimum_bytes) try std.testing.expectEqual(if (length < 1024) std.hash.Wyhash.hash(0, source) else std.hash.XxHash3.hash(0, source), expected);
         for ([_]u8{ 2, 4, 3, 1 }) |count| {
             pool.participants.store(count, .release);
             try std.testing.expectEqual(expected, pool.fingerprint(source));
@@ -406,6 +485,25 @@ test "buffer fingerprints cover partitions and ignore alignment worker count and
         try std.testing.expectEqual(expected, pool.fingerprint(source));
         pool.deinit();
         try std.testing.expectEqual(expected, pool.fingerprint(source));
+    }
+}
+
+test "content fingerprints cover every byte across the vector threshold and alignments" {
+    var bytes: [4097 + 64]u8 = undefined;
+    var relocated: [4097 + 64]u8 = undefined;
+    for (&bytes, 0..) |*byte, i| byte.* = @truncate(i *% 73 +% (i >> 3));
+    for ([_]usize{ 1, 63, 1023, 1024, 1025, 4097 }) |length| {
+        const source = bytes[3..][0..length];
+        const expected = contentHash(source);
+        for (source) |*byte| {
+            byte.* ^= 0x80;
+            try std.testing.expect(contentHash(source) != expected);
+            byte.* ^= 0x80;
+        }
+        for (0..64) |alignment| {
+            @memcpy(relocated[alignment..][0..length], source);
+            try std.testing.expectEqual(expected, contentHash(relocated[alignment..][0..length]));
+        }
     }
 }
 
