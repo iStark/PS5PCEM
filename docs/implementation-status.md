@@ -72,10 +72,14 @@ behind them.
   coalesces duplicate requests and retains output buffers until completion;
   zero requests, pad close, runtime reset, and the runner's contained guest-fault
   exit stop the motors. DualSense USB vibration and stopping were physically
-  confirmed. Bluetooth reports and XInput intensity mapping have automated
-  coverage, but no physical verification in this pass. Adaptive triggers and
-  audio-driven DualSense haptics remain unimplemented. See the
-  [controller vibration report](development/controller-vibration-2026-10-16.md).
+  confirmed. Output follows the report lengths each pad's HID descriptor
+  declares, which Windows requires over Bluetooth; a refused report no longer
+  drops input, and a Sony pad that cannot be driven falls back to XInput.
+  Bluetooth, DualShock 4 and XInput output have automated coverage only, with
+  no physical verification. Adaptive triggers and audio-driven DualSense
+  haptics remain unimplemented. See the
+  [controller vibration report](development/controller-vibration-2026-10-16.md)
+  and its [Bluetooth follow-up](development/controller-bluetooth-output-2026-10-16.md).
 - Guest vertex and pixel shaders can render sampled textures using AGC vertex
   tables, per-instruction V# mappings, `VertexIndex`, PARAM exports, and
   fragment interpolation.

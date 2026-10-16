@@ -60,6 +60,10 @@ This verifies the HLE forwarding and native output separately. It is not a
 new gameplay run or an FPS measurement. Bluetooth, DualShock 4 and XInput
 hardware were not physically tested in this pass.
 
+The [16 October follow-up](controller-bluetooth-output-2026-10-16.md) sizes
+Bluetooth output by the HID descriptor, keeps input when a report is refused,
+and falls back to XInput when a Sony pad cannot be driven.
+
 ## Remaining scope
 
 This is ordinary two-channel rumble. Adaptive triggers, guest light-bar APIs,

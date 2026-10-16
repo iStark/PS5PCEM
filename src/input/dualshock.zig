@@ -224,22 +224,20 @@ fn applyHat(pad: *Pad, hat: u8) void {
 /// the cable is silently ignored over the air.
 pub const Transport = enum { usb, bluetooth };
 
-/// Reads the transport back from an input report. The pad announces it by which
-/// report it sends, so nothing has to be tracked separately.
-pub fn transportOf(family: Family, report: []const u8) ?Transport {
-    if (report.len == 0) return null;
-    return switch (family) {
-        .dual_sense => switch (report[0]) {
-            0x01 => if (report.len >= dual_sense_extended_length) .usb else .bluetooth,
-            0x31 => .bluetooth,
-            else => null,
-        },
-        .dual_shock_4 => switch (report[0]) {
-            0x01 => .usb,
-            0x11 => .bluetooth,
-            else => null,
-        },
-    };
+/// The shortest output report either pad accepts over Bluetooth.
+pub const bluetooth_output_bytes = 78;
+
+/// Recovers the transport from the longest output report the host's HID stack
+/// declares for the pad.
+///
+/// The input reports cannot tell: a DualShock 4 on Bluetooth sends the same
+/// report id one as on the cable until it receives its first output report, and
+/// Windows pads every input report to the longest one the descriptor declares,
+/// so length does not separate the compact form either. The output side does:
+/// the cable descriptors stop at 32 (DualShock 4) and 48 (DualSense) bytes,
+/// while every Bluetooth descriptor carries at least the 78-byte effects report.
+pub fn transportFromOutputLength(output_length: usize) Transport {
+    return if (output_length >= bluetooth_output_bytes) .bluetooth else .usb;
 }
 
 /// What a host can drive on these pads without touching the advanced haptics.
@@ -326,21 +324,22 @@ fn appendChecksum(report: []u8) void {
     std.mem.writeInt(u32, report[report.len - 4 ..][0..4], crc.final(), .little);
 }
 
-test "the transport is recovered from the report the pad sends" {
-    var wired = [_]u8{0} ** dual_sense_extended_length;
-    wired[0] = 0x01;
-    try std.testing.expectEqual(Transport.usb, transportOf(.dual_sense, &wired).?);
-
-    var wireless = [_]u8{0} ** 78;
-    wireless[0] = 0x31;
-    try std.testing.expectEqual(Transport.bluetooth, transportOf(.dual_sense, &wireless).?);
-
-    // Report id one is wired on a DualShock 4 but the compact wireless form on
-    // a DualSense, which is why the length matters only for the latter.
-    var compact = [_]u8{0} ** 10;
-    compact[0] = 0x01;
-    try std.testing.expectEqual(Transport.bluetooth, transportOf(.dual_sense, &compact).?);
-    try std.testing.expectEqual(Transport.usb, transportOf(.dual_shock_4, &compact).?);
+test "the transport is recovered from the declared output report length" {
+    // The cable descriptors: one 32-byte (DualShock 4) or 48-byte (DualSense)
+    // output report, which is exactly what buildOutput sends over USB.
+    try std.testing.expectEqual(Transport.usb, transportFromOutputLength(32));
+    try std.testing.expectEqual(Transport.usb, transportFromOutputLength(48));
+    // Bluetooth descriptors declare the effects report and longer siblings;
+    // Windows reports the longest of them.
+    try std.testing.expectEqual(Transport.bluetooth, transportFromOutputLength(78));
+    try std.testing.expectEqual(Transport.bluetooth, transportFromOutputLength(548));
+    var buffer: [maximum_output_bytes]u8 = undefined;
+    for ([_]Family{ .dual_sense, .dual_shock_4 }) |family| {
+        const wired = buildOutput(family, .usb, .{}, &buffer).?;
+        try std.testing.expectEqual(Transport.usb, transportFromOutputLength(wired));
+        const wireless = buildOutput(family, .bluetooth, .{}, &buffer).?;
+        try std.testing.expectEqual(Transport.bluetooth, transportFromOutputLength(wireless));
+    }
 }
 
 test "a wired DualSense output report carries the motors and the light bar" {

@@ -37,6 +37,11 @@ const maximum_drained_reports = 32;
 /// the search on every frame.
 const rediscovery_interval = 240;
 
+/// Room for one report of any size these pads declare. Their Bluetooth
+/// descriptors declare reports of several hundred bytes, and Windows sizes
+/// every read and write by the longest one.
+const maximum_report_bytes = 1024;
+
 var device: Device = .{};
 var polls_since_search: u32 = rediscovery_interval;
 var latest: ?dualshock.Pad = null;
@@ -74,18 +79,22 @@ const Device = struct {
     handle: ?*anyopaque = null,
     event: ?*anyopaque = null,
     family: dualshock.Family = .dual_sense,
-    /// Learned from the first report the pad sends, because an outgoing report
-    /// has to match the transport it will travel over.
+    /// Read from the declared report lengths when the pad is opened, because an
+    /// outgoing report has to match the transport it will travel over.
     transport: ?dualshock.Transport = null,
+    /// The longest input and output reports the descriptor declares. Windows
+    /// accepts a ReadFile or WriteFile on the pad only at these sizes.
+    input_length: u32 = 0,
+    output_length: u32 = 0,
     /// False when the device could only be opened for reading, which happens
     /// when another process holds it for writing.
     writable: bool = false,
     overlapped: Overlapped = .{},
-    buffer: [256]u8 = @splat(0),
+    buffer: [maximum_report_bytes]u8 = @splat(0),
     read_pending: bool = false,
     output: OutputQueue = .{},
     write_overlapped: Overlapped = .{},
-    write_buffer: [dualshock.maximum_output_bytes]u8 = undefined,
+    write_buffer: [maximum_report_bytes]u8 = undefined,
     write_size: u32 = 0,
     write_pending: bool = false,
     in_flight_output: dualshock.Output = .{},
@@ -250,12 +259,12 @@ fn pumpOutputLocked() bool {
         if (Win32.GetOverlappedResult(handle, &device.write_overlapped, &written, 0) == 0) {
             if (Win32.GetLastError() == Win32.error_io_incomplete) return true;
             device.write_pending = false;
-            closeDevice();
+            refuseOutput();
             return false;
         }
         device.write_pending = false;
         if (written != device.write_size) {
-            closeDevice();
+            refuseOutput();
             return false;
         }
         device.output.applied = device.in_flight_output;
@@ -267,7 +276,7 @@ fn pumpOutputLocked() bool {
     output.sequence = device.sequence;
     const length = dualshock.buildOutput(device.family, transport, output, &device.write_buffer) orelse return false;
     device.sequence +%= 1;
-    device.write_size = @intCast(length);
+    device.write_size = @intCast(padToDeclared(&device.write_buffer, length, device.output_length));
     device.write_overlapped = .{ .event = write_event };
     _ = Win32.ResetEvent(write_event);
     var written: u32 = 0;
@@ -275,15 +284,34 @@ fn pumpOutputLocked() bool {
         if (written == device.write_size) {
             device.output.applied = device.in_flight_output;
             completed_reports +%= 1;
-        } else closeDevice();
+        } else refuseOutput();
         return false;
     }
     if (Win32.GetLastError() == Win32.error_io_pending) {
         device.write_pending = true;
         return true;
     }
-    closeDevice();
+    refuseOutput();
     return false;
+}
+
+/// Zero-pads a built report to the longest output report the pad declares.
+/// Windows refuses a WriteFile of any other size; the pad acts on its own report
+/// and ignores the tail, which is exactly what hidapi sends as well.
+fn padToDeclared(buffer: []u8, length: usize, declared: usize) usize {
+    const size = @min(@max(length, declared), buffer.len);
+    @memset(buffer[length..size], 0);
+    return size;
+}
+
+/// Stops driving a pad that rejected an output report, but keeps reading it.
+/// An unplugged pad is noticed by the read side; any other refusal (a report
+/// the stack does not accept, a driver holding the output) used to close the
+/// device and drop the player's input on every rumble. Feedback then goes to
+/// the XInput slot instead.
+fn refuseOutput() void {
+    device.writable = false;
+    device.output = .{};
 }
 
 fn finishOutputLocked() void {
@@ -369,7 +397,6 @@ fn drain() void {
 fn accept(transferred: u32) void {
     if (transferred == 0) return;
     const report = device.buffer[0..transferred];
-    if (device.transport == null) device.transport = dualshock.transportOf(device.family, report);
     if (dualshock.parse(device.family, report)) |pad| latest = pad;
 }
 
@@ -378,7 +405,7 @@ fn beginRead() bool {
     const handle = device.handle orelse return false;
     device.overlapped = .{ .event = device.event };
     var transferred: u32 = 0;
-    if (Win32.ReadFile(handle, &device.buffer, device.buffer.len, &transferred, &device.overlapped) != 0) {
+    if (Win32.ReadFile(handle, &device.buffer, device.input_length, &transferred, &device.overlapped) != 0) {
         // Completed without queuing; the payload is already in the buffer.
         accept(transferred);
         return true;
@@ -463,14 +490,37 @@ fn tryOpen(path: [*:0]const u16) bool {
     var attributes = Win32.HidAttributes{};
     if (Win32.HidD_GetAttributes(handle, &attributes) == 0) return false;
     const family = dualshock.identify(attributes.vendor, attributes.product) orelse return false;
+    const lengths = reportLengths(handle) orelse return false;
+    if (lengths.input == 0 or lengths.input > maximum_report_bytes) return false;
+    const drivable = lengths.output != 0 and lengths.output <= maximum_report_bytes;
 
     const event = Win32.CreateEventW(null, 1, 0, null);
     if (event == null) return false;
 
     write_event = Win32.CreateEventW(null, 1, 0, null);
-    device = .{ .handle = handle, .event = event, .family = family, .writable = writable and write_event != null };
+    device = .{
+        .handle = handle,
+        .event = event,
+        .family = family,
+        .transport = dualshock.transportFromOutputLength(lengths.output),
+        .input_length = lengths.input,
+        .output_length = lengths.output,
+        .writable = writable and drivable and write_event != null,
+    };
     keep = true;
     return true;
+}
+
+const ReportLengths = struct { input: u32, output: u32 };
+
+fn reportLengths(handle: *anyopaque) ?ReportLengths {
+    var preparsed: ?*anyopaque = null;
+    if (Win32.HidD_GetPreparsedData(handle, &preparsed) == 0) return null;
+    const data = preparsed orelse return null;
+    defer _ = Win32.HidD_FreePreparsedData(data);
+    var caps = Win32.HidpCaps{};
+    if (Win32.HidP_GetCaps(data, &caps) != Win32.hidp_status_success) return null;
+    return .{ .input = caps.input_report_byte_length, .output = caps.output_report_byte_length };
 }
 
 const Overlapped = extern struct {
@@ -523,6 +573,25 @@ const Win32 = if (builtin.os.tag == .windows) struct {
         version: u16 = 0,
     };
 
+    /// HIDP_CAPS: the three report lengths, then reserved words and the
+    /// capability counts this module does not use.
+    const HidpCaps = extern struct {
+        usage: u16 = 0,
+        usage_page: u16 = 0,
+        input_report_byte_length: u16 = 0,
+        output_report_byte_length: u16 = 0,
+        feature_report_byte_length: u16 = 0,
+        reserved: [17]u16 = @splat(0),
+        counts: [10]u16 = @splat(0),
+    };
+
+    comptime {
+        if (@sizeOf(HidpCaps) != 64) @compileError("HIDP_CAPS ABI size must be 64 bytes");
+    }
+
+    /// HIDP_STATUS_SUCCESS.
+    const hidp_status_success: i32 = 0x0011_0000;
+
     const digcf_present: u32 = 0x0000_0002;
     const digcf_device_interface: u32 = 0x0000_0010;
     const generic_read: u32 = 0x8000_0000;
@@ -540,6 +609,9 @@ const Win32 = if (builtin.os.tag == .windows) struct {
     extern "setupapi" fn SetupDiEnumDeviceInterfaces(*anyopaque, ?*anyopaque, *const Guid, u32, *DeviceInterfaceData) callconv(.winapi) i32;
     extern "setupapi" fn SetupDiGetDeviceInterfaceDetailW(*anyopaque, *DeviceInterfaceData, ?*DeviceInterfaceDetail, u32, ?*u32, ?*anyopaque) callconv(.winapi) i32;
     extern "hid" fn HidD_GetAttributes(*anyopaque, *HidAttributes) callconv(.winapi) u8;
+    extern "hid" fn HidD_GetPreparsedData(*anyopaque, *?*anyopaque) callconv(.winapi) u8;
+    extern "hid" fn HidD_FreePreparsedData(*anyopaque) callconv(.winapi) u8;
+    extern "hid" fn HidP_GetCaps(*anyopaque, *HidpCaps) callconv(.winapi) i32;
     extern "kernel32" fn CreateFileW([*:0]const u16, u32, u32, ?*anyopaque, u32, u32, ?*anyopaque) callconv(.winapi) *anyopaque;
     extern "kernel32" fn CreateEventW(?*anyopaque, i32, i32, ?[*:0]const u16) callconv(.winapi) ?*anyopaque;
     extern "kernel32" fn ReadFile(*anyopaque, [*]u8, u32, ?*u32, ?*Overlapped) callconv(.winapi) i32;
@@ -569,6 +641,24 @@ test "an in-flight rumble cannot replace a newer stop or repeated request" {
     try std.testing.expect(queue.next() == null);
     queue.applied = null; // reconnect must send the current state again
     try std.testing.expectEqual(rumble, queue.next().?);
+}
+
+test "a wireless report is padded to the declared length with its checksum intact" {
+    var buffer: [maximum_report_bytes]u8 = @splat(0xee);
+    const length = dualshock.buildOutput(.dual_shock_4, .bluetooth, .{ .rumble_strong = 200, .set_light_bar = false }, &buffer).?;
+    try std.testing.expectEqual(@as(usize, dualshock.bluetooth_output_bytes), length);
+    var report: [dualshock.bluetooth_output_bytes]u8 = undefined;
+    @memcpy(&report, buffer[0..length]);
+    // A Bluetooth descriptor declares longer output reports than the one sent.
+    const size = padToDeclared(&buffer, length, 548);
+    try std.testing.expectEqual(@as(usize, 548), size);
+    try std.testing.expectEqualSlices(u8, &report, buffer[0..length]);
+    for (buffer[length..size]) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
+    // The cable form already has the declared size and is sent unchanged.
+    const wired = dualshock.buildOutput(.dual_sense, .usb, .{}, &buffer).?;
+    try std.testing.expectEqual(wired, padToDeclared(&buffer, wired, 48));
+    // A descriptor that declares nothing never truncates the report.
+    try std.testing.expectEqual(wired, padToDeclared(&buffer, wired, 0));
 }
 
 test "an unsupported host reports no controller" {

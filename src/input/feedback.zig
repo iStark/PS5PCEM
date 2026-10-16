@@ -68,17 +68,19 @@ fn run(index: u32) void {
     var used_xinput = false;
     while (!stopping.load(.acquire)) {
         const motors = current();
-        var awaiting_transport = false;
         // Follow the same preference as input: a native Sony controller first,
         // otherwise the configured XInput slot. Never vibrate both at once.
+        // A Sony pad this process cannot drive (another program owns its
+        // output, or it refused a report) is still read directly; its rumble
+        // goes to the XInput pad such a program usually presents for it.
         const sony = hid.presence();
-        if (sony.connected) {
+        if (sony.connected and sony.writable) {
             if (used_xinput) {
                 _ = Win32.XInputSetState(index, &.{});
                 used_xinput = false;
             }
             using_sony = true;
-            awaiting_transport = !hid.setVibration(motors.large, motors.small) and sony.writable and sony.transport == null;
+            _ = hid.setVibration(motors.large, motors.small);
         } else {
             using_sony = false;
             // A periodic write also restores feedback after reconnecting the
@@ -89,7 +91,7 @@ fn run(index: u32) void {
         // Finish pending writes even if the guest stops reading input. While
         // rumbling, recheck disconnect/reconnect; idle workers sleep entirely.
         const pending = hid.pumpOutput();
-        const timeout: u32 = if (pending or awaiting_transport) 4 else if (motors.large != 0 or motors.small != 0) 500 else 0xffff_ffff;
+        const timeout: u32 = if (pending) 4 else if (motors.large != 0 or motors.small != 0) 500 else 0xffff_ffff;
         _ = Win32.WaitForSingleObject(event.?, timeout);
     }
     if (using_sony) {
