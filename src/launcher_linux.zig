@@ -532,15 +532,21 @@ const input_mode_rects = [_]Rect{
     .{ .left = 814, .top = 170, .right = 1086, .bottom = 246 },
 };
 
+// Six narrower cards a row rather than four keep twelve languages in the
+// same two rows: a third would push the settings page past the window.
 const language_rects = [_]Rect{
-    .{ .left = 282, .top = 190, .right = 472, .bottom = 246 },
-    .{ .left = 486, .top = 190, .right = 676, .bottom = 246 },
-    .{ .left = 690, .top = 190, .right = 880, .bottom = 246 },
-    .{ .left = 894, .top = 190, .right = 1086, .bottom = 246 },
-    .{ .left = 282, .top = 258, .right = 472, .bottom = 314 },
-    .{ .left = 486, .top = 258, .right = 676, .bottom = 314 },
-    .{ .left = 690, .top = 258, .right = 880, .bottom = 314 },
-    .{ .left = 894, .top = 258, .right = 1086, .bottom = 314 },
+    .{ .left = 282, .top = 190, .right = 406, .bottom = 246 },
+    .{ .left = 418, .top = 190, .right = 542, .bottom = 246 },
+    .{ .left = 554, .top = 190, .right = 678, .bottom = 246 },
+    .{ .left = 690, .top = 190, .right = 814, .bottom = 246 },
+    .{ .left = 826, .top = 190, .right = 950, .bottom = 246 },
+    .{ .left = 962, .top = 190, .right = 1086, .bottom = 246 },
+    .{ .left = 282, .top = 258, .right = 406, .bottom = 314 },
+    .{ .left = 418, .top = 258, .right = 542, .bottom = 314 },
+    .{ .left = 554, .top = 258, .right = 678, .bottom = 314 },
+    .{ .left = 690, .top = 258, .right = 814, .bottom = 314 },
+    .{ .left = 826, .top = 258, .right = 950, .bottom = 314 },
+    .{ .left = 962, .top = 258, .right = 1086, .bottom = 314 },
 };
 
 const settings_toggle_rects = [_]Rect{
@@ -1546,8 +1552,8 @@ fn drawModeCard(cr: *anyopaque, mode: InputMode, rectangle: Rect, heading: Phras
 fn drawLanguageCard(cr: *anyopaque, value: Language, rectangle: Rect, label: []const u8) void {
     const selected = language == value;
     roundFill(cr, rectangle, 10, if (selected) 0x0042362e else 0x00251f1b);
-    if (selected) roundFill(cr, .{ .left = rectangle.left + 14, .top = rectangle.top + 23, .right = rectangle.left + 24, .bottom = rectangle.top + 33 }, 5, 0x00ffac64);
-    text(cr, label, .{ .left = rectangle.left + 36, .top = rectangle.top + 18, .right = rectangle.right - 12, .bottom = rectangle.bottom - 10 }, 0x00f4f0ea, .medium, .{});
+    if (selected) roundFill(cr, .{ .left = rectangle.left + 12, .top = rectangle.top + 23, .right = rectangle.left + 22, .bottom = rectangle.top + 33 }, 5, 0x00ffac64);
+    text(cr, label, .{ .left = rectangle.left + 30, .top = rectangle.top + 18, .right = rectangle.right - 8, .bottom = rectangle.bottom - 10 }, 0x00f4f0ea, .medium, .{});
 }
 
 fn card(cr: *anyopaque, rectangle: Rect) void {
