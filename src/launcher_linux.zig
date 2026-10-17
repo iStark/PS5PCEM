@@ -1197,11 +1197,18 @@ fn drawLibrary(cr: *anyopaque) void {
     }
 
     card(cr, .{ .left = 282, .top = 536, .right = 1086, .bottom = 622 });
+    localizedText(cr, .graphics_api, .{ .left = 730, .top = 546, .right = 886, .bottom = 566 }, 0x009b9088, .small, .{});
+    text(cr, "Windows", .{ .left = 888, .top = 546, .right = 1066, .bottom = 566 }, 0x007e746d, .small, .{ .alignment = .right });
+    roundFill(cr, .{ .left = 730, .top = 571, .right = 876, .bottom = 611 }, 8, 0x0042362e);
+    roundFill(cr, .{ .left = 742, .top = 586, .right = 752, .bottom = 596 }, 5, 0x00ffac64);
+    text(cr, "Vulkan", .{ .left = 762, .top = 581, .right = 868, .bottom = 606 }, 0x00f4f0ea, .medium, .{});
+    roundFill(cr, .{ .left = 888, .top = 571, .right = 1066, .bottom = 611 }, 8, 0x00251f1b);
+    text(cr, "DirectX 12", .{ .left = 920, .top = 581, .right = 1058, .bottom = 606 }, 0x007e746d, .medium, .{});
     localizedText(cr, .folder_label, .{ .left = 306, .top = 552, .right = 520, .bottom = 572 }, 0x009b9088, .small, .{});
     if (game_folder_length == 0) {
-        localizedText(cr, .folder_empty, .{ .left = 306, .top = 582, .right = 1058, .bottom = 607 }, 0x007e746d, .regular, .{});
+        localizedText(cr, .folder_empty, .{ .left = 306, .top = 582, .right = 706, .bottom = 607 }, 0x007e746d, .regular, .{});
     } else {
-        text(cr, game_folder[0..game_folder_length], .{ .left = 306, .top = 580, .right = 1058, .bottom = 607 }, 0x00d8d0c9, .regular, .{});
+        text(cr, game_folder[0..game_folder_length], .{ .left = 306, .top = 580, .right = 706, .bottom = 607 }, 0x00d8d0c9, .regular, .{});
     }
 
     button(cr, library_browse_rect, .choose_folder, false);

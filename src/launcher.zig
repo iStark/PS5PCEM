@@ -857,6 +857,7 @@ fn clickableAt(x: i32, y: i32) bool {
     if (update_rect.contains(x, y)) return update_state != .checking;
     return switch (current_page) {
         .library => recentGameAt(x, y) != null or
+            indexOfRect(&library_graphics_api_rects, x, y) != null or
             libraryViewAt(x, y) != null or
             libraryArrowAt(x, y) != null or
             libraryDotAt(x, y) != null or
@@ -878,6 +879,7 @@ fn clickableAt(x: i32, y: i32) bool {
         },
         .saves => saves_open_rect.contains(x, y),
         .settings => indexOfRect(&language_rects, x, y) != null or
+            indexOfRect(&graphics_api_rects, x, y) != null or
             indexOfRect(&resolution_rects, x, y) != null or
             indexOfRect(&preset_rects, x, y) != null or
             indexOfRect(&settings_toggle_rects, x, y) != null,
@@ -911,6 +913,10 @@ fn handleClick(window: Win32.Window, x: i32, y: i32) void {
 }
 
 fn handleLibraryClick(window: Win32.Window, x: i32, y: i32) void {
+    if (indexOfRect(&library_graphics_api_rects, x, y)) |index| {
+        selectGraphicsApi(index);
+        return;
+    }
     if (extract_state != .idle and extract_copy_rect.contains(x, y)) {
         copyExtractLog(window);
         return;
@@ -994,11 +1000,20 @@ const graphics_api_rects = [_]Rect{
     .{ .left = 462, .top = 592, .right = 640, .bottom = 632 },
 };
 
+const library_graphics_api_rects = [_]Rect{
+    .{ .left = 730, .top = 571, .right = 876, .bottom = 611 },
+    .{ .left = 888, .top = 571, .right = 1066, .bottom = 611 },
+};
+
+fn selectGraphicsApi(index: usize) void {
+    selected_graphics_api = graphics_api.choices[index];
+    saveSettings();
+    setStatusPhrase(.status_graphics_api_saved, false);
+}
+
 fn handleSettingsClick(x: i32, y: i32) void {
     if (indexOfRect(&graphics_api_rects, x, y)) |index| {
-        selected_graphics_api = graphics_api.choices[index];
-        saveSettings();
-        setStatusPhrase(.status_graphics_api_saved, false);
+        selectGraphicsApi(index);
         return;
     }
     if (indexOfRect(&resolution_rects, x, y)) |index| {
@@ -1166,11 +1181,14 @@ fn drawLibrary(dc: Win32.DeviceContext) void {
     }
 
     card(dc, .{ .left = 282, .top = 536, .right = 1086, .bottom = 622 });
+    localizedText(dc, .graphics_api, .{ .left = 730, .top = 546, .right = 886, .bottom = 566 }, 0x009b9088, small_font, Win32.dt_left | Win32.dt_end_ellipsis);
+    if (selected_graphics_api == .d3d12) localizedText(dc, .graphics_api_experimental, .{ .left = 890, .top = 546, .right = 1066, .bottom = 566 }, 0x006f8cff, small_font, Win32.dt_right | Win32.dt_end_ellipsis);
+    drawGraphicsApiButtons(dc, &library_graphics_api_rects);
     localizedText(dc, .folder_label, .{ .left = 306, .top = 552, .right = 520, .bottom = 572 }, 0x009b9088, small_font, Win32.dt_left | Win32.dt_end_ellipsis);
     if (game_folder_length == 0) {
-        localizedText(dc, .folder_empty, .{ .left = 306, .top = 582, .right = 1058, .bottom = 607 }, 0x007e746d, regular_font, Win32.dt_left | Win32.dt_end_ellipsis);
+        localizedText(dc, .folder_empty, .{ .left = 306, .top = 582, .right = 706, .bottom = 607 }, 0x007e746d, regular_font, Win32.dt_left | Win32.dt_end_ellipsis);
     } else {
-        text(dc, &game_folder, @intCast(game_folder_length), .{ .left = 306, .top = 580, .right = 1058, .bottom = 607 }, 0x00d8d0c9, regular_font, Win32.dt_left | Win32.dt_end_ellipsis);
+        text(dc, &game_folder, @intCast(game_folder_length), .{ .left = 306, .top = 580, .right = 706, .bottom = 607 }, 0x00d8d0c9, regular_font, Win32.dt_left | Win32.dt_end_ellipsis);
     }
 
     button(dc, library_browse_rect, .choose_folder, false);
@@ -2079,18 +2097,22 @@ fn drawSettings(dc: Win32.DeviceContext) void {
 
     card(dc, .{ .left = 282, .top = 560, .right = 1086, .bottom = 640 });
     localizedText(dc, .graphics_api, .{ .left = 302, .top = 567, .right = 640, .bottom = 591 }, 0x009b9088, small_font, Win32.dt_left | Win32.dt_end_ellipsis);
-    for (graphics_api_rects, graphics_api.choices) |rectangle, api| {
-        const selected = selected_graphics_api == api;
-        roundFill(dc, rectangle, 8, if (selected) 0x0042362e else 0x00251f1b);
-        if (selected) roundFill(dc, .{ .left = rectangle.left + 12, .top = rectangle.top + 15, .right = rectangle.left + 22, .bottom = rectangle.top + 25 }, 5, 0x00ffac64);
-        textUtf8(dc, api.label(), .{ .left = rectangle.left + 32, .top = rectangle.top + 10, .right = rectangle.right - 8, .bottom = rectangle.bottom - 5 }, 0x00f4f0ea, medium_font, Win32.dt_left);
-    }
+    drawGraphicsApiButtons(dc, &graphics_api_rects);
     localizedText(dc, .graphics_api_description, .{ .left = 660, .top = 572, .right = 1066, .bottom = 637 }, 0x00aaa098, small_font, Win32.dt_left | Win32.dt_word_break);
 
     card(dc, .{ .left = 282, .top = 650, .right = 1086, .bottom = 714 });
     text(dc, w("PS5PCEM"), -1, .{ .left = 310, .top = 654, .right = 500, .bottom = 680 }, 0x00f4f0ea, medium_font, Win32.dt_left);
     localizedText(dc, .author, .{ .left = 310, .top = 684, .right = 840, .bottom = 708 }, 0x00ffac64, regular_font, Win32.dt_left | Win32.dt_end_ellipsis);
     text(dc, w("GPL-3.0-or-later"), -1, .{ .left = 860, .top = 684, .right = 1048, .bottom = 708 }, 0x008b817a, regular_font, Win32.dt_right);
+}
+
+fn drawGraphicsApiButtons(dc: Win32.DeviceContext, rectangles: *const [2]Rect) void {
+    for (rectangles, graphics_api.choices) |rectangle, api| {
+        const selected = selected_graphics_api == api;
+        roundFill(dc, rectangle, 8, if (selected) 0x0042362e else 0x00251f1b);
+        if (selected) roundFill(dc, .{ .left = rectangle.left + 12, .top = rectangle.top + 15, .right = rectangle.left + 22, .bottom = rectangle.top + 25 }, 5, 0x00ffac64);
+        textUtf8(dc, api.label(), .{ .left = rectangle.left + 32, .top = rectangle.top + 10, .right = rectangle.right - 8, .bottom = rectangle.bottom - 5 }, 0x00f4f0ea, medium_font, Win32.dt_left);
+    }
 }
 
 fn pageHeading(dc: Win32.DeviceContext, heading: Phrase, subtitle: Phrase) void {

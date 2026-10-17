@@ -41,7 +41,7 @@ whether the host can run Vulkan before a title is started, naming the device it
 found, can invoke the package extractor on a debug package directly, and asks
 GitHub Releases whether a newer version is available.
 
-Development builds also offer **Vulkan / DirectX 12** in Windows Settings.
+Development builds also offer **Vulkan / DirectX 12** in the Windows library and Settings.
 DirectX 12 is an experimental native backend with limited PM4 and shader support;
 it is not ready for normal gameplay. Vulkan remains the default. See the
 [D3D12 implementation and validation notes](docs/architecture/d3d12.md).
