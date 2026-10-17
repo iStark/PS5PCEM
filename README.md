@@ -8,6 +8,7 @@
     <img src="https://img.shields.io/badge/platform-Windows%20%2F%20Linux%20x64-3b95ff?style=flat-square" alt="Windows / Linux x64">
     <img src="https://img.shields.io/badge/Zig-0.16-f7a41d?style=flat-square" alt="Zig 0.16">
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-GPL--3.0--or--later-6f7782?style=flat-square" alt="GPL-3.0-or-later"></a>
+    <a href="https://discord.gg/2D7qrXV9QU"><img src="https://img.shields.io/badge/Discord-Join%20the%20community-5865F2?style=flat-square&logo=discord&logoColor=white" alt="Join the PS5PCEM Discord"></a>
     <img src="https://img.shields.io/badge/status-early%20prototype-e6a23c?style=flat-square" alt="Early prototype">
   </p>
   <p>
@@ -15,6 +16,7 @@
     · <a href="docs/README.md">Documentation</a>
     · <a href="docs/project-status.md">Compatibility status</a>
     · <a href="https://github.com/iStark/PS5PCEM/issues">Report an issue</a>
+    · <a href="https://discord.gg/2D7qrXV9QU">Discord community</a>
   </p>
 </div>
 
@@ -175,6 +177,21 @@ Architecture reference:
 [`cpu`](docs/architecture/cpu.md) ·
 [`diag`](docs/architecture/diagnostics.md) ·
 [`runtime`](docs/architecture/runtime.md)
+
+## Community
+
+Join the [PS5PCEM Discord](https://discord.gg/2D7qrXV9QU) for discussion,
+setup help, game compatibility reports, screenshots and development.
+Start with `#start-here` for project links and server guidelines. English is the
+main server language in `#general`; the **Languages** category has chats in
+Russian, German, French, Simplified Chinese, Spanish, Arabic, Portuguese,
+Turkish, Japanese, Hindi and Korean.
+
+Use `#support` for troubleshooting, `#game-reports` for test results and
+`#development` for technical discussion. Include the emulator version or commit,
+game title and PPSA ID, OS, CPU/GPU, graphics API and relevant logs when reporting
+a problem. Track reproducible bugs in
+[GitHub Issues](https://github.com/iStark/PS5PCEM/issues).
 
 ## Support
 
