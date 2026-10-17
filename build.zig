@@ -78,6 +78,26 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    const d3d12 = b.addModule("d3d12", .{
+        .root_source_file = b.path("src/d3d12/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    if (target.result.os.tag == .windows) {
+        const spirv_cross = b.dependency("spirv_cross", .{});
+        d3d12.link_libc = true;
+        d3d12.link_libcpp = true;
+        d3d12.addIncludePath(spirv_cross.path(""));
+        d3d12.addCSourceFile(.{ .file = b.path("src/d3d12/native.c"), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" } });
+        d3d12.addCSourceFiles(.{
+            .root = spirv_cross.path(""),
+            .files = &.{ "spirv_cross.cpp", "spirv_parser.cpp", "spirv_cross_parsed_ir.cpp", "spirv_cfg.cpp", "spirv_glsl.cpp", "spirv_hlsl.cpp", "spirv_cross_c.cpp" },
+            .flags = &.{ "-std=c++17", "-DSPIRV_CROSS_C_API_GLSL=1", "-DSPIRV_CROSS_C_API_HLSL=1" },
+        });
+    }
+    d3d12.addImport("rdna2", mod);
+    d3d12.addImport("gpu", gpu);
+
     // Native host-window ownership. Kept separate from Vulkan so the renderer
     // continues to support headless diagnostics and non-Windows builds.
     const window = b.addModule("window", .{
@@ -569,6 +589,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "gpu", .module = gpu },
                 .{ .name = "vulkan", .module = vulkan },
                 .{ .name = "window", .module = window },
+                .{ .name = "d3d12", .module = d3d12 },
             },
         }),
     });
@@ -764,6 +785,36 @@ pub fn build(b: *std.Build) void {
     const vulkan_window_smoke_step = b.step("vulkan-window-smoke", "Present a diagnostic frame to a Win32 Vulkan window");
     vulkan_window_smoke_step.dependOn(&vulkan_window_smoke_cmd.step);
 
+    const d3d12_smoke = b.addExecutable(.{
+        .name = "d3d12-smoke",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/d3d12_smoke.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{ .{ .name = "d3d12", .module = d3d12 }, .{ .name = "rdna2", .module = mod }, .{ .name = "gpu", .module = gpu } },
+        }),
+    });
+    const install_d3d12_smoke = b.addInstallArtifact(d3d12_smoke, .{});
+    d3d12_smoke.stack_size = 16 * 1024 * 1024;
+    b.step("build-d3d12-smoke", "Build the native Direct3D 12 hardware probe").dependOn(&install_d3d12_smoke.step);
+    const run_d3d12_smoke = b.addRunArtifact(d3d12_smoke);
+    if (b.args) |args| run_d3d12_smoke.addArgs(args);
+    b.step("d3d12-smoke", "Verify native D3D12 shaders and GPU readback on Windows").dependOn(&run_d3d12_smoke.step);
+
+    const d3d12_window_smoke = b.addExecutable(.{
+        .name = "d3d12-window-smoke",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/d3d12_window_smoke.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{ .{ .name = "d3d12", .module = d3d12 }, .{ .name = "window", .module = window } },
+        }),
+    });
+    b.step("build-d3d12-window-smoke", "Build the native D3D12 presentation probe").dependOn(&b.addInstallArtifact(d3d12_window_smoke, .{}).step);
+    const run_d3d12_window = b.addRunArtifact(d3d12_window_smoke);
+    if (b.args) |args| run_d3d12_window.addArgs(args);
+    b.step("d3d12-window-smoke", "Verify native D3D12 swapchain presentation").dependOn(&run_d3d12_window.step);
+
     const test_step = b.step("test", "Run the test suite");
     const check_step = b.step("check", "Compile every module without running tests");
     check_step.dependOn(&vulkan_smoke.step);
@@ -785,6 +836,7 @@ pub fn build(b: *std.Build) void {
         mod,
         gpu,
         vulkan,
+        d3d12,
         window,
         input,
         pkg,
@@ -825,4 +877,6 @@ pub fn build(b: *std.Build) void {
     b.step("test-gpu", "Run GPU state and shader resource analysis tests").dependOn(&b.addRunArtifact(gpu_tests).step);
     const vulkan_tests = b.addTest(.{ .root_module = vulkan, .filters = if (test_filter) |filter| &.{filter} else &.{} });
     b.step("test-vulkan", "Run Vulkan backend tests").dependOn(&b.addRunArtifact(vulkan_tests).step);
+    const d3d12_tests = b.addTest(.{ .root_module = d3d12 });
+    b.step("test-d3d12", "Run portable Direct3D 12 boundary tests").dependOn(&b.addRunArtifact(d3d12_tests).step);
 }

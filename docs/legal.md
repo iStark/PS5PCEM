@@ -31,6 +31,10 @@ Font rendering links FreeType under the FreeType License and embeds Noto Sans
 Regular under the SIL Open Font License 1.1. Their attribution and full license
 texts are also included in [licenses](licenses/README.md).
 
+The experimental Windows D3D12 backend links SPIRV-Cross under Apache-2.0
+to translate the shared SPIR-V shader representation to HLSL. Its pinned
+source and notices are listed in [licenses](licenses/README.md).
+
 ## Legal note
 
 This project emulates firmware interfaces. It ships no console firmware, no

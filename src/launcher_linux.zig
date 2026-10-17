@@ -17,6 +17,7 @@ const build_options = @import("build_options");
 const common = @import("launcher_common.zig");
 const display_mode = @import("display_mode.zig");
 const performance_mode = @import("performance_mode.zig");
+const graphics_api = @import("graphics_api.zig");
 
 const Language = common.Language;
 const language_labels = common.language_labels;
@@ -1492,8 +1493,9 @@ fn drawSettings(cr: *anyopaque) void {
     }
 
     card(cr, .{ .left = 282, .top = 560, .right = 1086, .bottom = 640 });
-    localizedText(cr, .compatibility, .{ .left = 302, .top = 570, .right = 1066, .bottom = 595 }, 0x00f4f0ea, .medium, .{});
-    localizedText(cr, .compatibility_text, .{ .left = 302, .top = 601, .right = 1066, .bottom = 637 }, 0x00aaa098, .small, .{ .wrap = true });
+    localizedText(cr, .graphics_api, .{ .left = 302, .top = 570, .right = 640, .bottom = 595 }, 0x009b9088, .small, .{});
+    text(cr, "Vulkan", .{ .left = 310, .top = 603, .right = 640, .bottom = 632 }, 0x00f4f0ea, .medium, .{});
+    localizedText(cr, .graphics_api_linux_description, .{ .left = 660, .top = 572, .right = 1066, .bottom = 637 }, 0x00aaa098, .small, .{ .wrap = true });
 
     card(cr, .{ .left = 282, .top = 650, .right = 1086, .bottom = 714 });
     text(cr, "PS5PCEM", .{ .left = 310, .top = 654, .right = 500, .bottom = 680 }, 0x00f4f0ea, .medium, .{});
@@ -2121,6 +2123,7 @@ fn launchGame() void {
     setEnvironment("PS5_SHOW_FPS", if (show_fps) "1" else null);
     setEnvironment(display_mode.environment_name, output_mode.value());
     setEnvironment(performance_mode.environment_name, render_preset.value());
+    setEnvironment(graphics_api.environment_name, graphics_api.Api.vulkan.value());
     setEnvironment("PS5_GAME_PRESET", if (game_performance) "performance" else "default");
     setEnvironment("PS5_INPUT_MODE", switch (input_mode) {
         .controller => "controller",
@@ -2548,6 +2551,7 @@ fn writeSettings(stream: *std.Io.Writer) !void {
     try stream.print("sound={d}\n", .{@intFromBool(sound_enabled)});
     try stream.print("show_fps={d}\n", .{@intFromBool(show_fps)});
     try stream.print("output_resolution={d}\n", .{output_mode.height()});
+    try stream.writeAll("graphics_api=vulkan\n");
     try stream.print("render_preset={d}\n", .{@intFromEnum(render_preset)});
     try stream.print("game_performance={d}\n", .{@intFromBool(game_performance)});
     try stream.print("input_mode={d}\n", .{@intFromEnum(input_mode)});

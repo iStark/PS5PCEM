@@ -13,6 +13,7 @@ const build_options = @import("build_options");
 const builtin = @import("builtin");
 const display_mode = @import("display_mode.zig");
 const performance_mode = @import("performance_mode.zig");
+const graphics_api = @import("graphics_api.zig");
 
 comptime {
     // The interface contains a fair amount of Cyrillic text converted to
@@ -82,6 +83,7 @@ var sound_enabled = true;
 var show_fps = false;
 var output_mode = display_mode.default;
 var render_preset = performance_mode.default;
+var selected_graphics_api = graphics_api.default;
 var game_performance = true;
 var mapping = mapping_defaults;
 var capture_mapping: ?usize = null;
@@ -987,7 +989,18 @@ fn handleInputClick(x: i32, y: i32) void {
     }
 }
 
+const graphics_api_rects = [_]Rect{
+    .{ .left = 294, .top = 592, .right = 450, .bottom = 632 },
+    .{ .left = 462, .top = 592, .right = 640, .bottom = 632 },
+};
+
 fn handleSettingsClick(x: i32, y: i32) void {
+    if (indexOfRect(&graphics_api_rects, x, y)) |index| {
+        selected_graphics_api = graphics_api.choices[index];
+        saveSettings();
+        setStatusPhrase(.status_graphics_api_saved, false);
+        return;
+    }
     if (indexOfRect(&resolution_rects, x, y)) |index| {
         output_mode = display_mode.choices[index];
         saveSettings();
@@ -1093,6 +1106,11 @@ fn drawVulkanStatus(dc: Win32.DeviceContext) void {
     const dim: u32 = 0x007c716a;
     const warn: u32 = 0x006f8cff;
     const flags = Win32.dt_left | Win32.dt_end_ellipsis;
+    if (selected_graphics_api == .d3d12) {
+        drawAscii(dc, "DirectX 12", area, warn, small_font, flags);
+        localizedText(dc, .graphics_api_experimental, second, warn, small_font, flags);
+        return;
+    }
     switch (vulkan_report.state) {
         .ready => {
             var line: [64]u8 = undefined;
@@ -2060,8 +2078,14 @@ fn drawSettings(dc: Win32.DeviceContext) void {
     }
 
     card(dc, .{ .left = 282, .top = 560, .right = 1086, .bottom = 640 });
-    localizedText(dc, .compatibility, .{ .left = 302, .top = 570, .right = 1066, .bottom = 595 }, 0x00f4f0ea, medium_font, Win32.dt_left | Win32.dt_end_ellipsis);
-    localizedText(dc, .compatibility_text, .{ .left = 302, .top = 601, .right = 1066, .bottom = 637 }, 0x00aaa098, small_font, Win32.dt_left | Win32.dt_word_break);
+    localizedText(dc, .graphics_api, .{ .left = 302, .top = 567, .right = 640, .bottom = 591 }, 0x009b9088, small_font, Win32.dt_left | Win32.dt_end_ellipsis);
+    for (graphics_api_rects, graphics_api.choices) |rectangle, api| {
+        const selected = selected_graphics_api == api;
+        roundFill(dc, rectangle, 8, if (selected) 0x0042362e else 0x00251f1b);
+        if (selected) roundFill(dc, .{ .left = rectangle.left + 12, .top = rectangle.top + 15, .right = rectangle.left + 22, .bottom = rectangle.top + 25 }, 5, 0x00ffac64);
+        textUtf8(dc, api.label(), .{ .left = rectangle.left + 32, .top = rectangle.top + 10, .right = rectangle.right - 8, .bottom = rectangle.bottom - 5 }, 0x00f4f0ea, medium_font, Win32.dt_left);
+    }
+    localizedText(dc, .graphics_api_description, .{ .left = 660, .top = 572, .right = 1066, .bottom = 637 }, 0x00aaa098, small_font, Win32.dt_left | Win32.dt_word_break);
 
     card(dc, .{ .left = 282, .top = 650, .right = 1086, .bottom = 714 });
     text(dc, w("PS5PCEM"), -1, .{ .left = 310, .top = 654, .right = 500, .bottom = 680 }, 0x00f4f0ea, medium_font, Win32.dt_left);
@@ -2529,6 +2553,7 @@ fn launchGame(owner: Win32.Window) void {
     resolution_value[resolution_length] = 0;
     _ = Win32.SetEnvironmentVariableW(w(display_mode.environment_name), @ptrCast(&resolution_value));
     _ = Win32.SetEnvironmentVariableW(w(performance_mode.environment_name), presetEnvironment());
+    _ = Win32.SetEnvironmentVariableW(w(graphics_api.environment_name), if (selected_graphics_api == .d3d12) w("d3d12") else w("vulkan"));
     _ = Win32.SetEnvironmentVariableW(w("PS5_GAME_PRESET"), if (game_performance) w("performance") else w("default"));
     _ = Win32.SetEnvironmentVariableW(w("PS5_INPUT_MODE"), inputModeEnvironment());
     var controller_value = [_:0]u16{@as(u16, '0') + controller_index};
@@ -2840,6 +2865,11 @@ fn loadSettings() void {
     show_fps = Win32.GetPrivateProfileIntW(w("launcher"), w("show_fps"), 0, @ptrCast(&ini_path)) != 0;
     output_mode = display_mode.Mode.fromHeight(Win32.GetPrivateProfileIntW(w("launcher"), w("output_resolution"), display_mode.default.height(), @ptrCast(&ini_path))) orelse display_mode.default;
     render_preset = performance_mode.Mode.fromIndex(Win32.GetPrivateProfileIntW(w("launcher"), w("render_preset"), @intFromEnum(performance_mode.default), @ptrCast(&ini_path))) orelse performance_mode.default;
+    var api_value: [32]u16 = @splat(0);
+    const api_length = Win32.GetPrivateProfileStringW(w("launcher"), w("graphics_api"), w("vulkan"), &api_value, api_value.len, @ptrCast(&ini_path));
+    var api_utf8: [96]u8 = undefined;
+    const api_utf8_length = std.unicode.utf16LeToUtf8(&api_utf8, api_value[0..api_length]) catch 0;
+    selected_graphics_api = graphics_api.Api.parse(api_utf8[0..api_utf8_length]) orelse graphics_api.default;
     game_performance = Win32.GetPrivateProfileIntW(w("launcher"), w("game_performance"), 1, @ptrCast(&ini_path)) != 0;
     const mode_value = Win32.GetPrivateProfileIntW(w("launcher"), w("input_mode"), 2, @ptrCast(&ini_path));
     if (mode_value <= 2) input_mode = @enumFromInt(mode_value);
@@ -2864,6 +2894,7 @@ fn saveSettings() void {
     writeIniInt(w("launcher"), w("show_fps"), @intFromBool(show_fps));
     writeIniInt(w("launcher"), w("output_resolution"), output_mode.height());
     writeIniInt(w("launcher"), w("render_preset"), @intFromEnum(render_preset));
+    _ = Win32.WritePrivateProfileStringW(w("launcher"), w("graphics_api"), if (selected_graphics_api == .d3d12) w("d3d12") else w("vulkan"), @ptrCast(&ini_path));
     writeIniInt(w("launcher"), w("game_performance"), @intFromBool(game_performance));
     writeIniInt(w("launcher"), w("input_mode"), @intFromEnum(input_mode));
     writeIniInt(w("launcher"), w("language"), @intFromEnum(language));

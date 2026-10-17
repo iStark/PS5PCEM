@@ -23,6 +23,7 @@ short and visual; implementation details live here.
 | AGC/PM4 command streams, retained state, scheduling, and execution | [`gpu`](architecture/gpu.md) |
 | Parallel graphics/compute command decoding and ordered backend execution | [Command processors](architecture/command-processors.md) |
 | Host device, resources, synchronization, caches, and presentation | [`vulkan`](architecture/vulkan.md) |
+| Experimental native Windows renderer, supported commands, and hardware probes | [`d3d12`](architecture/d3d12.md) |
 | Fixed guest ranges, sparse mappings, protection, and page tracking | [`memory`](architecture/memory.md) |
 | ELF64/SELF parsing, imports, mapping, relocation, and TLS | [`loader`](architecture/loader.md) |
 | Firmware interfaces, files, media, savedata, networking, and synchronization | [`hle`](architecture/hle.md) |

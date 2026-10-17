@@ -6,6 +6,10 @@
     .fingerprint = 0x70cc9aa6f444796,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
+        .spirv_cross = .{
+            .url = "https://github.com/KhronosGroup/SPIRV-Cross/archive/a0fba56c34a6700f1724bf9b751da5b488a3775c.tar.gz",
+            .hash = "N-V-__8AAHmjuACJQQj6LAdUGiH_9UXgzBdEV3OZYRBHlemv",
+        },
         .freetype = .{
             .url = "https://github.com/freetype/freetype/archive/refs/tags/VER-2-14-3.tar.gz",
             .hash = "N-V-__8AAGJsqgDtM-7hGxs3GiSanZStnUfFiuHmioYRK3hN",

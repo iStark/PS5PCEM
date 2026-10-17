@@ -52,10 +52,16 @@ pub const HostWindow = struct {
     window: std.atomic.Value(usize) = .init(0),
     width: u32 = 1280,
     height: u32 = 720,
+    renderer_label: []const u8 = "Vulkan",
     /// Set by `requestClose` on Linux; the X11 event thread polls it.
     close_requested: std.atomic.Value(bool) = .init(false),
 
     pub fn init(self: *HostWindow, width: u32, height: u32) Error!void {
+        return self.initWithRenderer(width, height, "Vulkan");
+    }
+
+    /// The label must outlive the window thread (normally a static API name).
+    pub fn initWithRenderer(self: *HostWindow, width: u32, height: u32, renderer_label: []const u8) Error!void {
         if (builtin.os.tag != .windows and builtin.os.tag != .linux) return error.UnsupportedPlatform;
         if (width == 0 or height == 0) return error.WindowCreationFailed;
         self.* = .{
@@ -64,6 +70,7 @@ pub const HostWindow = struct {
             .window = .init(0),
             .width = width,
             .height = height,
+            .renderer_label = renderer_label,
         };
         self.thread = std.Thread.spawn(.{}, threadMain, .{self}) catch
             return error.ThreadCreationFailed;
@@ -75,6 +82,9 @@ pub const HostWindow = struct {
             self.thread = null;
             return error.WindowCreationFailed;
         }
+        var title: [96]u8 = undefined;
+        const title_z = std.fmt.bufPrintZ(&title, "PS5PCEM - {s} guest output", .{self.renderer_label}) catch return;
+        self.setTitle(title_z);
     }
 
     pub fn deinit(self: *HostWindow) void {
@@ -113,17 +123,21 @@ pub const HostWindow = struct {
 
     /// Updates the native title at the renderer's low-frequency sampling rate.
     /// SetWindowText is safe across threads within the same process and avoids
-    /// touching the Vulkan client area or adding work to every presented frame.
+    /// touching the rendered client area or adding work to every presented frame.
     pub fn updateFps(self: *HostWindow, fps_tenths: u32) void {
         if (builtin.os.tag != .windows and builtin.os.tag != .linux) return;
-        const value = self.window.load(.acquire);
-        if (value == 0) return;
         var title: [96]u8 = undefined;
         const title_z = std.fmt.bufPrintZ(
             &title,
-            "PS5PCEM - Vulkan guest output - {d}.{d} FPS",
-            .{ fps_tenths / 10, fps_tenths % 10 },
+            "PS5PCEM - {s} guest output - {d}.{d} FPS",
+            .{ self.renderer_label, fps_tenths / 10, fps_tenths % 10 },
         ) catch return;
+        self.setTitle(title_z);
+    }
+
+    fn setTitle(self: *HostWindow, title_z: [:0]const u8) void {
+        const value = self.window.load(.acquire);
+        if (value == 0) return;
         if (builtin.os.tag == .linux) {
             // Xlib was initialised for threads, so the title can be set from
             // the renderer's thread like SetWindowText on Windows.

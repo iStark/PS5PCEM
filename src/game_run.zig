@@ -10,6 +10,8 @@ const gpu = @import("gpu");
 const runtime = @import("runtime");
 const loader = @import("loader");
 const vulkan = @import("vulkan");
+const d3d12 = @import("d3d12");
+const graphics_api = @import("graphics_api.zig");
 const window = @import("window");
 const display_mode = @import("display_mode.zig");
 const performance_mode = @import("performance_mode.zig");
@@ -39,6 +41,7 @@ const usage =
     \\Loads and relocates the adjacent PRX graph, runs its initializers, then
     \\enters the title process. --app0 supplies full game content when eboot.bin
     \\comes from a sparse patch directory. Direct execution requires Windows or Linux x86-64.
+    \\PS5_GRAPHICS_API=vulkan|d3d12 selects the renderer. D3D12 is experimental and Windows-only.
     \\
 ;
 
@@ -146,6 +149,19 @@ fn resolveVideoOutBuffer(_: ?*anyopaque, flip: gpu.state.Flip) ?vulkan.DisplayBu
         .tiling_mode = registration.attribute.tiling_mode,
         .pixel_format = registration.attribute.pixel_format,
     };
+}
+
+fn resolveD3D12VideoOutBuffer(flip: gpu.state.Flip) ?d3d12.backend.DisplayBuffer {
+    const buffer = resolveVideoOutBuffer(null, flip) orelse return null;
+    return .{ .address = buffer.address, .width = buffer.width, .height = buffer.height, .pitch_in_pixels = buffer.pitch_in_pixels, .tiling_mode = buffer.tiling_mode, .pixel_format = buffer.pixel_format };
+}
+
+fn stopUnsupportedD3D12(_: anyerror) void {
+    // Do not let the title wait forever for labels belonging to rejected GPU
+    // work. Match the contained guest-fault shutdown, including pad feedback.
+    std.debug.print("The experimental DirectX 12 backend cannot execute this submission yet. Select Vulkan to run this title.\n", .{});
+    runtime.firmware.libs.pad.reset();
+    std.process.exit(1);
 }
 
 fn listVideoOutAddresses(_: ?*anyopaque, out: []u64) usize {
@@ -312,6 +328,19 @@ fn run(init: std.process.Init) !bool {
         return false;
     }
     const executable_path = if (has_app0_override) args[3] else args[1];
+    const selected_api = if (init.minimal.environ.getAlloc(allocator, graphics_api.environment_name)) |value| api: {
+        defer allocator.free(value);
+        break :api graphics_api.Api.parse(value) orelse {
+            try stderr.print("Invalid {s}='{s}'; expected vulkan or d3d12\n", .{ graphics_api.environment_name, value });
+            try stderr.flush();
+            return false;
+        };
+    } else |_| graphics_api.default;
+    if (!selected_api.supportsPlatform(builtin.os.tag)) {
+        try stderr.print("{s} is unavailable on {s}; select Vulkan\n", .{ selected_api.label(), @tagName(builtin.os.tag) });
+        try stderr.flush();
+        return false;
+    }
     const title_root = if (has_app0_override)
         args[2]
     else
@@ -357,6 +386,7 @@ fn run(init: std.process.Init) !bool {
         output_mode.width(), output_mode.height(), runtime.firmware.video_out.outputResolutionClass(),
     });
     try out.print("  Preset  {s}\n", .{render_preset.label()});
+    try out.print("  Renderer  {s}{s}\n", .{ selected_api.label(), if (selected_api == .d3d12) " (experimental; incomplete guest graphics support)" else "" });
     try out.print("  Game preference  {s}; applied by titles that read system game presets\n", .{game_preset.label()});
     try out.flush();
 
@@ -578,6 +608,7 @@ fn run(init: std.process.Init) !bool {
     var window_initialized = false;
     var renderer: vulkan.Renderer = undefined;
     var renderer_initialized = false;
+    var directx_renderer: ?d3d12.Renderer = null;
     defer {
         // Stop every guest worker before taking away callbacks it may still be
         // executing, then release Vulkan before destroying the HWND surface.
@@ -585,10 +616,16 @@ fn run(init: std.process.Init) !bool {
         runtime.firmware.libs.videodec2.attachVideoFrameSink(null);
         runtime.firmware.libs.agc_submit.attachBackend(null);
         if (renderer_initialized) renderer.deinit();
+        if (directx_renderer) |*directx| directx.deinit();
         if (window_initialized) host_window.deinit();
     }
 
     const force_headless = init.minimal.environ.containsUnempty(allocator, "PS5_HEADLESS") catch false;
+    if (selected_api == .d3d12 and force_headless) {
+        try stderr.writeAll("DirectX 12 headless game execution is not implemented; unset PS5_HEADLESS or select Vulkan.\n");
+        try stderr.flush();
+        return false;
+    }
     const show_fps = init.minimal.environ.containsUnempty(allocator, "PS5_SHOW_FPS") catch false;
     const enable_cpu_wait_diagnostics = init.minimal.environ.containsUnempty(
         allocator,
@@ -925,7 +962,30 @@ fn run(init: std.process.Init) !bool {
         break :parse @min(std.fmt.parseInt(u64, text, 10) catch default_retirement_slack_mib, 1024);
     } else |_| default_retirement_slack_mib) * 1024 * 1024;
     // Linux presents to an X11 window through VK_KHR_xlib_surface.
-    if ((builtin.os.tag == .windows or builtin.os.tag == .linux) and !force_headless) live_gpu: {
+    if (selected_api == .d3d12) {
+        directx_renderer = try d3d12.Renderer.init(allocator, .{
+            .context = &emu.address_space.?,
+            .read = runtime.firmware.libs.agc_submit.readGuestMemory,
+            .write = runtime.firmware.libs.agc_submit.writeGuestMemory,
+        }, init.minimal.environ.containsUnempty(allocator, "PS5_D3D12_VALIDATION") catch false);
+        const directx = &directx_renderer.?;
+        directx.on_failure = stopUnsupportedD3D12;
+        directx.display_resolver = resolveD3D12VideoOutBuffer;
+        if (!force_headless) {
+            try host_window.initWithRenderer(output_mode.width(), output_mode.height(), "DirectX 12 (experimental)");
+            window_initialized = true;
+            const native = host_window.nativeHandle() orelse return error.WindowCreationFailed;
+            try directx.device.attachWindow(native.window, native.width, native.height);
+        }
+        if (show_fps) {
+            directx.fps_context = &host_window;
+            directx.fps_update = updateHostWindowFps;
+        }
+        runtime.firmware.libs.agc_submit.setParallelCommandExecution(false);
+        runtime.firmware.libs.agc_submit.attachBackend(directx.dcbBackend());
+        try out.print("  DirectX 12  {s}\n", .{directx.device.info.name()});
+        try out.flush();
+    } else if ((builtin.os.tag == .windows or builtin.os.tag == .linux) and !force_headless) live_gpu: {
         host_window.init(output_mode.width(), output_mode.height()) catch |err| {
             try stderr.print("live Vulkan window unavailable: {s}; continuing headless\n", .{@errorName(err)});
             try stderr.flush();
@@ -1271,7 +1331,7 @@ fn run(init: std.process.Init) !bool {
         }
         try out.flush();
     }
-    if (renderer_initialized and window_initialized and live_threads != 0 and has_non_audio_thread) {
+    if ((renderer_initialized or directx_renderer != null) and window_initialized and live_threads != 0 and has_non_audio_thread) {
         while (host_window.isOpen() and emu.liveGuestThreadCount() != 0) {
             try io.sleep(.fromMilliseconds(10), .awake);
         }
