@@ -94,6 +94,10 @@ pub const Renderer = struct {
             render.color_count,                   render.depth_control.test_enabled, render.depth_control.write_enabled,
             render.depth_control.stencil_enabled, render.blends[0].enabled,
         });
+        if (render.blends[0].enabled) std.debug.print("[d3d12 blend] control=0x{x} constants={any}\n", .{
+            state.readRegister(.context, 0x1e0) orelse 0,
+            native.blending.decode(state, render.blends[0]) catch null,
+        });
         if (render.color_targets[0]) |target| std.debug.print("[d3d12 target] {d}x{d} pitch={d} format={d}/{d} tile={f} samples={d} fragments={d}\n", .{
             target.width, target.height, target.pitch, target.format, target.number_type, target.tile_mode, target.samples_log2, target.fragments_log2,
         });
@@ -220,12 +224,13 @@ pub const Renderer = struct {
         const routing = try graphics.routing(state);
         const render = gpu.resources.decodeRenderState(state);
         const target = render.color_targets[0] orelse return error.MissingColorTarget;
-        if (render.color_count != 1 or render.depth_control.test_enabled or render.depth_control.write_enabled or render.depth_control.stencil_enabled or render.depth_control.clear_enabled or render.depth_control.stencil_clear_enabled or render.blends[0].enabled) return error.DepthBlendAndMultipleTargetsNotImplemented;
+        if (render.color_count != 1 or render.depth_control.test_enabled or render.depth_control.write_enabled or render.depth_control.stencil_enabled or render.depth_control.clear_enabled or render.depth_control.stencil_clear_enabled) return error.DepthAndMultipleTargetsNotImplemented;
         const target_layout = try surfaces.colorLayout(target);
         if (render.color_control.isMetadataOperation() or (state.readRegister(.context, 0x202) != null and !render.color_control.allowsAttachmentWrites(render.target_mask)) or render.color_control.logic_operation != 0xcc) return error.ColorMetadataAndLogicOpsNotImplemented;
         if (render.raster.rasterizer_discard or render.raster.polygon_mode != 0 or render.raster.depth_bias_front or render.raster.depth_bias_back or (render.raster.cull_front and render.raster.cull_back)) return error.UnsupportedRasterState;
         if (render.primitive_type != 4 and render.primitive_type != 5) return error.UnsupportedPrimitive;
         var draw_state = try native.Draw.fullTarget(target.width, target.height);
+        draw_state.blend = try native.blending.decode(state, render.blends[0]);
         draw_state.vertex_count = if (args.index_bytes == 0) args.count else 0;
         draw_state.instance_count = state.instance_count;
         draw_state.first_vertex = state.readRegister(.uconfig, 0x24a) orelse 0;
@@ -321,16 +326,20 @@ pub const Renderer = struct {
     pub fn present(self: *Renderer, flip: gpu.state.Flip) !void {
         const resolve = self.display_resolver orelse return error.DisplayResolverUnavailable;
         const display = resolve(flip) orelse return error.DisplayBufferUnavailable;
-        if (display.pixel_format != 0 and display.pixel_format != 0x8000000000000000) return error.UnsupportedScanoutLayout;
+        errdefer std.debug.print("[d3d12 scanout] rejected buffer={any}\n", .{display});
+        const swap_red_blue = try surfaces.scanoutSwapsRedBlue(display.pixel_format);
         const layout = try surfaces.scanoutLayout(display.width, display.height, display.pitch_in_pixels, display.tiling_mode);
         var surface = try surfaces.Staged.read(self.allocator, self.memory, display.address, layout);
         defer surface.deinit();
         const pixels = surface.pixels;
-        if (display.pixel_format == 0x8000000000000000) {
+        if (swap_red_blue) {
             var offset: usize = 0;
             while (offset < pixels.len) : (offset += 4) std.mem.swap(u8, &pixels[offset], &pixels[offset + 2]);
         }
         try self.device.presentRgba(pixels, display.width, display.height);
+        if (self.frame_started_ns == 0) std.debug.print("[d3d12] first frame presented: {d}x{d} format=0x{x} tile={d}\n", .{
+            display.width, display.height, display.pixel_format, display.tiling_mode,
+        });
         const now = gpu.frame_timing.timestampNs();
         if (self.frame_started_ns == 0) self.frame_started_ns = now;
         self.frames +|= 1;

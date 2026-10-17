@@ -355,6 +355,138 @@ fn guestGraphicsProbe(allocator: std.mem.Allocator, device: *d3d12.Device) !void
     try guestSurfaceProbe(allocator, &vertex_words, &pixel_words);
     try guestVaryingProbe(allocator, &vertex_words);
     try guestResourcesProbe(allocator);
+    try guestBlendingProbe(allocator, &vertex_words);
+}
+
+fn guestBlendingProbe(allocator: std.mem.Allocator, vertex: []const u32) !void {
+    const source = [4]f32{ 0.25, 0.5, 0.75, 0.5 };
+    const destination = [4]u8{ 51, 102, 153, 204 };
+    const fragment = [_]u32{
+        vop1(1, 0, 255), @bitCast(source[0]), vop1(1, 1, 255), @bitCast(source[1]),
+        vop1(1, 2, 255), @bitCast(source[2]), vop1(1, 3, 255), @bitCast(source[3]),
+        0xf800080f,      0x03020100,          0xbf810000,
+    };
+    const Case = struct {
+        blend: gpu.resources.BlendControl,
+        constants: [4]f32 = .{ 0.125, 0.375, 0.625, 0.875 },
+        mask: u4 = 15,
+    };
+    var cases: std.ArrayList(Case) = .empty;
+    defer cases.deinit(allocator);
+    // Exercise each factor on both sides, including its alpha interpretation.
+    for ([_]u5{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 13, 14, 19, 20 }) |factor| {
+        try cases.append(allocator, .{ .blend = .{ .enabled = true, .color_source = factor, .color_destination = 0 } });
+        try cases.append(allocator, .{ .blend = .{ .enabled = true, .color_source = 0, .color_destination = factor } });
+    }
+    for (0..5) |color_op| for (0..5) |alpha_op| {
+        try cases.append(allocator, .{ .blend = .{
+            .enabled = true,
+            .color_source = 4,
+            .color_destination = 5,
+            .color_operation = @intCast(color_op),
+            .separate_alpha = true,
+            .alpha_source = 1,
+            .alpha_destination = 1,
+            .alpha_operation = @intCast(alpha_op),
+        } });
+    };
+    for ([_]u4{ 0, 5, 8, 15 }) |mask| try cases.append(allocator, .{
+        .blend = .{ .enabled = true, .color_source = 13, .color_destination = 14, .separate_alpha = true, .alpha_source = 19, .alpha_destination = 20 },
+        .constants = .{ 0.75, 0.25, 0.5, 0.125 },
+        .mask = mask,
+    });
+    // MIN/MAX ignore factors, even if stale fields name unsupported factors.
+    try cases.append(allocator, .{ .blend = .{ .enabled = true, .color_source = 31, .color_destination = 15, .color_operation = 2 } });
+    try cases.append(allocator, .{ .blend = .{ .enabled = true, .color_source = 19, .color_destination = 14 } });
+    try cases.append(allocator, .{ .blend = .{ .enabled = true, .color_source = 13, .color_destination = 20 } });
+    try cases.append(allocator, .{ .blend = .{ .color_source = 31, .color_operation = 7 } });
+    var memory = try allocator.create(GraphicsMemory);
+    defer allocator.destroy(memory);
+    memory.* = .{};
+    @memcpy(memory.data[0x200..][0 .. vertex.len * 4], std.mem.sliceAsBytes(vertex));
+    @memcpy(memory.data[0x400..][0 .. fragment.len * 4], std.mem.sliceAsBytes(&fragment));
+    var renderer = try d3d12.Renderer.init(allocator, memory.access(), false);
+    defer renderer.deinit();
+    var state = try graphicsState(65, 37, 72);
+    var executor = gpu.DcbExecutor{ .state = &state, .backend = renderer.dcbBackend(), .allocator = allocator };
+    const target = gpu.resources.decodeColorTarget(&state, 0, 15).?;
+    const layout = try d3d12.surfaces.colorLayout(target);
+    var initial: [65 * 37 * 4]u8 = undefined;
+    for (&initial, 0..) |*v, i| v.* = destination[i % 4];
+    const allocation = memory.data[0x2000..][0..@intCast(layout.required_source_bytes)];
+    for (cases.items, 0..) |case, case_index| {
+        const b = case.blend;
+        const raw = (@as(u32, @intFromBool(b.enabled)) << 30) | (@as(u32, @intFromBool(b.separate_alpha)) << 29) |
+            @as(u32, b.color_source) | (@as(u32, b.color_operation) << 5) | (@as(u32, b.color_destination) << 8) |
+            (@as(u32, b.alpha_source) << 16) | (@as(u32, b.alpha_operation) << 21) | (@as(u32, b.alpha_destination) << 24);
+        try state.writeRegister(.context, 0x1e0, raw);
+        try state.writeRegister(.context, 0x08e, case.mask);
+        for (case.constants, 0..) |v, i| try state.writeRegister(.context, 0x105 + @as(u32, @intCast(i)), @bitCast(v));
+        @memset(allocation, 0xa7);
+        try layout.tile(&initial, allocation);
+        _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 2 });
+        var staged = try d3d12.surfaces.Staged.read(allocator, memory.access(), target.address, layout);
+        defer staged.deinit();
+        if (!std.mem.eql(u8, staged.pixels[0..4], &destination)) return error.BlendingModifiedOutsideTriangle;
+        const actual = staged.pixels[(18 * 65 + 32) * 4 ..][0..4];
+        for (0..4) |i| {
+            var expected: f32 = source[i];
+            if (b.enabled) {
+                const separate = i == 3 and b.separate_alpha;
+                const op = if (separate) b.alpha_operation else b.color_operation;
+                const dst = @as(f32, @floatFromInt(destination[i])) / 255;
+                if (op == 2 or op == 3) {
+                    expected = if (op == 2) @min(source[i], dst) else @max(source[i], dst);
+                } else {
+                    const a = source[i] * blendReferenceFactor(if (separate) b.alpha_source else b.color_source, i, source, destination, case.constants);
+                    const d = dst * blendReferenceFactor(if (separate) b.alpha_destination else b.color_destination, i, source, destination, case.constants);
+                    expected = switch (op) {
+                        0 => a + d,
+                        1 => a - d,
+                        4 => d - a,
+                        else => unreachable,
+                    };
+                }
+            }
+            const byte: i32 = if (case.mask & (@as(u4, 1) << @intCast(i)) == 0) destination[i] else @intFromFloat(@round(std.math.clamp(expected, 0, 1) * 255));
+            if (@abs(@as(i32, actual[i]) - byte) > 1) {
+                std.debug.print("blend case={d} channel={d} expected={d} actual={d}\n", .{ case_index, i, byte, actual[i] });
+                return error.GuestBlendingMismatch;
+            }
+        }
+    }
+    // Unsupported dual-source exports must reject without touching the target
+    // or publishing a subsequent release label.
+    const before = memory.data;
+    try state.writeRegister(.context, 0x1e0, (1 << 30) | 15);
+    if (executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 2 })) |_| return error.InvalidBlendAccepted else |err| if (err != error.BackendRejected) return err;
+    if ((renderer.failure orelse return error.InvalidBlendFailure) != error.DualSourceBlendingNotImplemented or !std.mem.eql(u8, &before, &memory.data)) return error.InvalidBlendModifiedTarget;
+    const backend = renderer.dcbBackend();
+    if (backend.vtable.write(backend.context, 0x1200, &.{ 1, 2, 3, 4 })) return error.FailedBlendPublishedLabel;
+    std.debug.print("PASS {d} guest blend cases: factors, independent RGB/alpha equations, constants, masks, disable and fail-closed dual-source\n", .{cases.items.len});
+}
+
+fn blendReferenceFactor(factor: u5, channel: usize, source: [4]f32, destination: [4]u8, constants: [4]f32) f32 {
+    const dst = @as(f32, @floatFromInt(destination[channel])) / 255;
+    const dst_alpha = @as(f32, @floatFromInt(destination[3])) / 255;
+    return switch (factor) {
+        0 => 0,
+        1 => 1,
+        2 => source[channel],
+        3 => 1 - source[channel],
+        4 => source[3],
+        5 => 1 - source[3],
+        6 => dst_alpha,
+        7 => 1 - dst_alpha,
+        8 => dst,
+        9 => 1 - dst,
+        10 => if (channel == 3) 1 else @min(source[3], 1 - dst_alpha),
+        13 => constants[channel],
+        14 => 1 - constants[channel],
+        19 => constants[3],
+        20 => 1 - constants[3],
+        else => unreachable,
+    };
 }
 
 const GraphicsMemory = struct {
@@ -564,6 +696,7 @@ fn guestResourcesProbe(allocator: std.mem.Allocator) !void {
     if (renderer.draw(&state, packet)) |_| return error.ObservableDepthAccepted else |err| if (err != error.UnrestrictedViewportDepthNotImplemented) return err;
     try state.writeRegister(.context, 0x1b3, 0);
     try state.writeRegister(.context, 0x1b4, 0);
+    try guestCompressedImageProbe(allocator, memory, &state, &executor);
     // A missing input must fail before touching the output attachment.
     const before = memory.data[0x2000..0x5000].*;
     try state.writeRegister(.shader, 0x04c, memory.data.len + 256);
@@ -572,4 +705,61 @@ fn guestResourcesProbe(allocator: std.mem.Allocator) !void {
     if (!std.mem.eql(u8, &before, memory.data[0x2000..0x5000])) return error.RejectedDrawModifiedTarget;
     std.debug.print("PASS guest vertex fetch, SMEM pointer and constant buffers, texture arrays, sampler filtering, sRGB, swizzles and failed-read isolation\n", .{});
     std.debug.print("PASS unobserved -1..1 viewport depth preserves the full color image; position-Z consumers remain rejected\n", .{});
+}
+
+fn guestCompressedImageProbe(allocator: std.mem.Allocator, memory: *GraphicsMemory, state: *gpu.State, executor: *gpu.DcbExecutor) !void {
+    const scale: [4]f32 = @splat(1);
+    @memcpy(memory.data[0x1900..][0..16], std.mem.asBytes(&scale));
+    try state.writeRegister(.shader, 0x014, 2 | (2 << 3) | (2 << 6));
+    try state.writeRegister(.shader, 0x016, 0);
+    const colors = [_]u16{ 0xf800, 0x07e0, 0x001f, 0x8410 };
+    const decoded = [_][3]u8{ .{ 255, 0, 0 }, .{ 0, 255, 0 }, .{ 0, 0, 255 }, .{ 132, 130, 132 } };
+    for ([_]u16{ 169, 170, 171, 172, 173, 174 }) |format| {
+        for ([_]gpu.resources.TileMode{ .linear, .standard_4kb }) |mode| {
+            // Linear rows are deliberately not aligned to D3D12's upload pitch;
+            // the tiled case matches Raiden's actual 128x128 BC3 resource.
+            const width: u32 = if (mode == .linear) 20 else 128;
+            const height: u32 = if (mode == .linear) 12 else 128;
+            const words = [_]u32{ 0x100, (@as(u32, format) << 20) | (((width - 1) & 3) << 30), ((width - 1) >> 2) | ((height - 1) << 14), 0x90000fac | (@as(u32, @intFromEnum(mode)) << 20), 0, 0, 0, 0 };
+            for (words, 0..) |word, i| try state.writeRegister(.shader, 0x00c + @as(u32, @intCast(i)), word);
+            const descriptor = try gpu.resources.decodeImageDescriptor(&words);
+            const layout = try gpu.SurfaceLayout.fromImage(descriptor);
+            const blocks = try allocator.alloc(u8, @intCast(layout.staging_bytes));
+            defer allocator.free(blocks);
+            @memset(blocks, 0);
+            const bytes: usize = if (format <= 170) 8 else 16;
+            for (0..height / 4) |y| for (0..width / 4) |x| {
+                const block = blocks[(y * (width / 4) + x) * bytes ..][0..bytes];
+                const color = colors[(y % 2) * 2 + x % 2];
+                if (format == 171 or format == 172) @memset(block[0..8], 0x88);
+                if (format >= 173) block[0] = 128; // Alpha endpoint 0, selector 0.
+                std.mem.writeInt(u16, block[bytes - 8 ..][0..2], color, .little);
+            };
+            const backing = memory.data[0x10000..][0..@intCast(layout.required_source_bytes)];
+            @memset(backing, 0xa7);
+            try layout.tile(blocks, backing);
+            const before = try allocator.dupe(u8, backing);
+            defer allocator.free(before);
+            @memset(memory.data[0x2000..0x5000], 0);
+            _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 2 });
+            if (!std.mem.eql(u8, before, backing)) return error.CompressedSourceModified;
+            for ([_][2]usize{ .{ 30, 23 }, .{ 34, 23 }, .{ 30, 15 }, .{ 34, 15 } }) |point| {
+                const tx: usize = @intFromFloat((@as(f32, @floatFromInt(point[0])) + 0.5) / 65 * @as(f32, @floatFromInt(width)));
+                const ty: usize = @intFromFloat((1 - (@as(f32, @floatFromInt(point[1])) + 0.5) / 37) * @as(f32, @floatFromInt(height)));
+                const rgb = decoded[((ty / 4) % 2) * 2 + (tx / 4) % 2];
+                var expected: [4]u8 = .{ rgb[0], rgb[1], rgb[2], if (format <= 170) 255 else if (format <= 172) 136 else 128 };
+                if (format % 2 == 0) for (expected[0..3]) |*v| {
+                    const c = @as(f32, @floatFromInt(v.*)) / 255;
+                    const linear = if (c <= 0.04045) c / 12.92 else std.math.pow(f32, (c + 0.055) / 1.055, 2.4);
+                    v.* = @intFromFloat(@round(linear * 255));
+                };
+                const actual = memory.data[0x2000 + (point[1] * 72 + point[0]) * 4 ..][0..4];
+                for (actual, expected) |a, e| if (@abs(@as(i16, a) - e) > 1) {
+                    std.debug.print("BC format={d} tile={f} pixel={any} actual={any} expected={any}\n", .{ format, mode, point, actual, expected });
+                    return error.CompressedTextureMismatch;
+                };
+            }
+        }
+    }
+    std.debug.print("PASS 12 guest BC1/BC2/BC3 texture cases: tiled/linear blocks, native row pitch, alpha and sRGB decoding, source preservation\n", .{});
 }

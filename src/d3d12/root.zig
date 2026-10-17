@@ -10,10 +10,12 @@ pub const backend = @import("backend.zig");
 pub const Renderer = backend.Renderer;
 pub const graphics = @import("graphics.zig");
 pub const surfaces = @import("surfaces.zig");
+pub const blending = @import("blending.zig");
 
 test {
     _ = graphics;
     _ = surfaces;
+    _ = blending;
 }
 
 const Handle = opaque {};
@@ -30,6 +32,7 @@ pub const SampledImage = extern struct {
     size: usize,
     width: u32,
     height: u32,
+    format: u32 = 28,
     srgb: u32 = 0,
     components: u32 = 5768,
     filter: u32 = 0,
@@ -56,6 +59,7 @@ pub const Draw = extern struct {
     index_element_bytes: u32 = 0,
     primitive_restart: u32 = 0,
     base_vertex: i32 = 0,
+    blend: blending.State = .{},
     viewport: [6]f32,
     scissor: [4]i32,
 
@@ -157,10 +161,11 @@ pub const Device = struct {
     }
 
     pub fn drawResourcesSpirv(self: *Device, vertex: []const u32, fragment: []const u32, draw: Draw, indices: []const u8, buffers: []const Buffer, images: []const SampledImage, rgba: []u8) Error!void {
+        if (!draw.blend.valid()) return error.InvalidArgument;
         if (buffers.len > 64 or images.len > 32) return error.InvalidArgument;
         for (buffers) |buffer| if (buffer.size == 0 or buffer.size % 4 != 0 or buffer.size > 256 * 1024 * 1024) return error.InvalidArgument;
         for (images) |image| {
-            if (image.size != try rgbaSize(image.width, image.height) or image.srgb > 1 or
+            if (image.size != try sampledImageSize(image.width, image.height, image.format) or image.srgb > 1 or
                 image.address_u < 1 or image.address_u > 4 or image.address_v < 1 or image.address_v > 4 or
                 image.address_w < 1 or image.address_w > 4 or image.filter & ~@as(u32, 0x15) != 0 or
                 !std.math.isFinite(image.min_lod) or !std.math.isFinite(image.max_lod) or !std.math.isFinite(image.lod_bias) or
@@ -193,6 +198,20 @@ pub fn rgbaSize(width: u32, height: u32) Error!usize {
     return @as(usize, width) * height * 4;
 }
 
+pub fn sampledImageSize(width: u32, height: u32, format: u32) Error!usize {
+    const rgba = try rgbaSize(width, height);
+    if (format == 28) return rgba;
+    // Native BC base dimensions must be whole 4x4 blocks. Smaller mip levels
+    // will need a separate subresource path; never pad and change guest UVs.
+    if (width % 4 != 0 or height % 4 != 0) return error.InvalidArgument;
+    const bytes: usize = switch (format) {
+        71 => 8, // BC1_UNORM
+        74, 77 => 16, // BC2_UNORM / BC3_UNORM
+        else => return error.InvalidArgument,
+    };
+    return @as(usize, width / 4) * (height / 4) * bytes;
+}
+
 extern fn ps5_d3d12_create(*?*Handle, *DeviceInfo, c_int, [*]u8, usize) i32;
 extern fn ps5_d3d12_destroy(*Handle) void;
 extern fn ps5_d3d12_error(*Handle) [*:0]const u8;
@@ -212,4 +231,14 @@ test "readback sizes reject empty and excessive textures before native allocatio
     try std.testing.expectError(error.InvalidArgument, rgbaSize(1, 0));
     try std.testing.expectError(error.InvalidArgument, rgbaSize(16385, 1));
     try std.testing.expectError(error.InvalidArgument, rgbaSize(1, std.math.maxInt(u32)));
+}
+
+test "sampled BC footprints count blocks and reject unsupported native extents" {
+    try std.testing.expectEqual(@as(usize, 8192), try sampledImageSize(128, 128, 71));
+    try std.testing.expectEqual(@as(usize, 16384), try sampledImageSize(128, 128, 77));
+    try std.testing.expectEqual(@as(usize, 32), try sampledImageSize(8, 4, 74));
+    try std.testing.expectEqual(@as(usize, 3 * 7 * 4), try sampledImageSize(3, 7, 28));
+    try std.testing.expectError(error.InvalidArgument, sampledImageSize(127, 128, 77));
+    try std.testing.expectError(error.InvalidArgument, sampledImageSize(4, 4, 98));
+    try std.testing.expectError(error.InvalidArgument, sampledImageSize(16388, 4, 71));
 }

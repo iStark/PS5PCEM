@@ -22,15 +22,22 @@ typedef struct Ps5D3D12Buffer {
 typedef struct Ps5D3D12Image {
     const uint8_t *pixels;
     size_t size;
-    uint32_t width, height, srgb, components, filter, address_u, address_v, address_w;
+    uint32_t width, height, format, srgb, components, filter, address_u, address_v, address_w;
     float min_lod, max_lod, lod_bias, border[4];
 } Ps5D3D12Image;
+
+typedef struct Ps5D3D12Blend {
+    uint32_t enabled, source_color, destination_color, color_operation;
+    uint32_t source_alpha, destination_alpha, alpha_operation;
+    float constants[4];
+} Ps5D3D12Blend;
 
 typedef struct Ps5D3D12Draw {
     uint32_t width, height, vertex_count, instance_count, first_vertex, first_instance;
     uint32_t topology, cull_mode, front_ccw, write_mask;
     uint32_t index_count, index_element_bytes, primitive_restart;
     int32_t base_vertex;
+    Ps5D3D12Blend blend;
     float viewport[6];
     int32_t scissor[4];
 } Ps5D3D12Draw;

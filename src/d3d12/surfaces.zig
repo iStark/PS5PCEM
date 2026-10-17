@@ -35,6 +35,21 @@ pub fn scanoutLayout(width: u32, height: u32, pitch: u32, tiling_mode: u32) !gpu
     return layout;
 }
 
+pub fn scanoutSwapsRedBlue(pixel_format: u64) !bool {
+    return switch (pixel_format) {
+        0, 0x8000_0000_2200_0000 => false, // RGBA8 (zero retains the legacy internal default).
+        0x8000_0000_0000_0000 => true, // BGRA8.
+        else => error.UnsupportedScanoutFormat,
+    };
+}
+
+test "VideoOut RGBA8 and BGRA8 select the correct byte order without accepting HDR" {
+    try std.testing.expect(!try scanoutSwapsRedBlue(0x8000_0000_2200_0000));
+    try std.testing.expect(try scanoutSwapsRedBlue(0x8000_0000_0000_0000));
+    try std.testing.expect(!try scanoutSwapsRedBlue(0));
+    try std.testing.expectError(error.UnsupportedScanoutFormat, scanoutSwapsRedBlue(0x8100_0000_2200_0000));
+}
+
 fn validate(layout: gpu.SurfaceLayout, address: u64) !void {
     if (layout.width == 0 or layout.height == 0 or layout.width > 16384 or layout.height > 16384 or
         layout.layers != 1 or layout.block.bytes_per_element != 4 or

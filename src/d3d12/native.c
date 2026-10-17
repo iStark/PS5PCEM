@@ -16,6 +16,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <limits.h>
+#include <math.h>
 #include <spirv_cross_c.h>
 #include "native.h"
 
@@ -755,17 +756,19 @@ static HRESULT prepare_graphics_resources(Ps5D3D12 *c, GraphicsResources *r,
         D3D12_RESOURCE_DESC desc = {0};
         desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
         desc.Width = image->width; desc.Height = image->height; desc.MipLevels = desc.DepthOrArraySize = 1;
-        desc.SampleDesc.Count = 1; desc.Format = image->srgb ? DXGI_FORMAT_R8G8B8A8_UNORM_SRGB : DXGI_FORMAT_R8G8B8A8_UNORM;
+        desc.SampleDesc.Count = 1; desc.Format = image->format + (image->srgb ? 1 : 0);
         D3D12_HEAP_PROPERTIES heap = {0}; heap.Type = D3D12_HEAP_TYPE_DEFAULT;
         TRY(ID3D12Device_CreateCommittedResource(c->device, &heap, 0, &desc, D3D12_RESOURCE_STATE_COPY_DEST, NULL, &IID_ID3D12Resource, (void **)&r->images[i]));
-        UINT64 size;
-        ID3D12Device_GetCopyableFootprints(c->device, &desc, 0, 1, 0, &r->footprints[i], NULL, NULL, &size);
+        UINT64 size, row_bytes;
+        UINT rows;
+        ID3D12Device_GetCopyableFootprints(c->device, &desc, 0, 1, 0, &r->footprints[i], &rows, &row_bytes, &size);
+        if (row_bytes * rows != image->size) { hr = failure(c, E_INVALIDARG, "sampled texture upload footprint"); goto done; }
         TRY(buffer(c, size, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, 0, &r->image_uploads[i]));
         void *mapped;
         TRY(ID3D12Resource_Map(r->image_uploads[i], 0, &empty, &mapped));
-        for (UINT y = 0; y < image->height; ++y)
+        for (UINT y = 0; y < rows; ++y)
             memcpy((uint8_t *)mapped + r->footprints[i].Offset + (size_t)y * r->footprints[i].Footprint.RowPitch,
-                image->pixels + (size_t)y * image->width * 4, (size_t)image->width * 4);
+                image->pixels + (size_t)y * row_bytes, (size_t)row_bytes);
         D3D12_RANGE written = {0, (SIZE_T)size};
         ID3D12Resource_Unmap(r->image_uploads[i], 0, &written);
         D3D12_SHADER_RESOURCE_VIEW_DESC srv = {0};
@@ -811,6 +814,27 @@ static void bind_graphics_resources(Ps5D3D12 *c, GraphicsResources *r, const Ps5
     }
 }
 
+static int valid_blend_factor(uint32_t factor, int alpha) {
+    switch (factor) {
+    case 1: case 2: case 5: case 6: case 7: case 8: case 14: case 15: return 1;
+    case 3: case 4: case 9: case 10: case 11: case 20: case 21: return !alpha;
+    default: return 0;
+    }
+}
+
+static int valid_sampled_image(const Ps5D3D12Image *image) {
+    if (!image->pixels || !image->width || !image->height || image->width > 16384 || image->height > 16384 || image->srgb > 1) return 0;
+    if (image->format == DXGI_FORMAT_R8G8B8A8_UNORM) return (uint64_t)image->width * image->height * 4 == image->size;
+    if (image->width % 4 || image->height % 4) return 0;
+    UINT block_bytes;
+    switch (image->format) {
+    case DXGI_FORMAT_BC1_UNORM: block_bytes = 8; break;
+    case DXGI_FORMAT_BC2_UNORM: case DXGI_FORMAT_BC3_UNORM: block_bytes = 16; break;
+    default: return 0;
+    }
+    return (uint64_t)(image->width / 4) * (image->height / 4) * block_bytes == image->size;
+}
+
 int32_t ps5_d3d12_draw_spirv(Ps5D3D12 *c, const uint32_t *vertex, size_t vertex_count,
     const uint32_t *fragment, size_t fragment_count, const Ps5D3D12Draw *d, const uint8_t *indices, size_t index_bytes,
     const Ps5D3D12Buffer *buffers, uint32_t buffer_count, const Ps5D3D12Image *images, uint32_t image_count, uint8_t *rgba) {
@@ -818,6 +842,16 @@ int32_t ps5_d3d12_draw_spirv(Ps5D3D12 *c, const uint32_t *vertex, size_t vertex_
         !d->width || !d->height || d->width > 16384 || d->height > 16384 || (!d->vertex_count && !d->index_count) || !d->instance_count ||
         (d->topology != D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST && d->topology != D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP) ||
         d->cull_mode < D3D12_CULL_MODE_NONE || d->cull_mode > D3D12_CULL_MODE_BACK || d->write_mask > 15) return E_INVALIDARG;
+    const Ps5D3D12Blend *blend = &d->blend;
+    if (blend->enabled > 1 || !valid_blend_factor(blend->source_color, 0) || !valid_blend_factor(blend->destination_color, 0) ||
+        !valid_blend_factor(blend->source_alpha, 1) || !valid_blend_factor(blend->destination_alpha, 1) ||
+        blend->color_operation < 1 || blend->color_operation > 5 || blend->alpha_operation < 1 || blend->alpha_operation > 5) return E_INVALIDARG;
+    for (UINT i = 0; i < 4; ++i) if (!isfinite(blend->constants[i])) return E_INVALIDARG;
+    if (blend->enabled && (blend->source_color >= 20 || blend->destination_color >= 20)) {
+        D3D12_FEATURE_DATA_D3D12_OPTIONS13 options = {0};
+        if (FAILED(ID3D12Device_CheckFeatureSupport(c->device, D3D12_FEATURE_D3D12_OPTIONS13, &options, sizeof(options))) || !options.AlphaBlendFactorSupported)
+            return failure(c, E_NOTIMPL, "mixed RGB/alpha blend constants require D3D12 OPTIONS13 AlphaBlendFactorSupported");
+    }
     if (d->index_count) {
         if (!indices || (d->index_element_bytes != 2 && d->index_element_bytes != 4) ||
             (uint64_t)d->index_count * d->index_element_bytes != index_bytes || index_bytes > 64u * 1024u * 1024u) return E_INVALIDARG;
@@ -825,8 +859,7 @@ int32_t ps5_d3d12_draw_spirv(Ps5D3D12 *c, const uint32_t *vertex, size_t vertex_
     if (d->primitive_restart > 1 || (d->primitive_restart && d->topology != D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP)) return E_INVALIDARG;
     if (buffer_count > 64 || image_count > 32 || (buffer_count && !buffers) || (image_count && !images)) return E_INVALIDARG;
     for (UINT i = 0; i < buffer_count; ++i) if (!buffers[i].bytes || !buffers[i].size || buffers[i].size % 4 || buffers[i].size > 256u * 1024u * 1024u) return E_INVALIDARG;
-    for (UINT i = 0; i < image_count; ++i) if (!images[i].pixels || !images[i].width || !images[i].height || images[i].width > 16384 || images[i].height > 16384 ||
-        (uint64_t)images[i].width * images[i].height * 4 != images[i].size) return E_INVALIDARG;
+    for (UINT i = 0; i < image_count; ++i) if (!valid_sampled_image(&images[i])) return E_INVALIDARG;
     HRESULT hr;
     GraphicsResources resources = {0};
     ID3DBlob *vs = NULL, *ps = NULL;
@@ -841,6 +874,13 @@ int32_t ps5_d3d12_draw_spirv(Ps5D3D12 *c, const uint32_t *vertex, size_t vertex_
     pipeline_desc.RasterizerState.CullMode = d->cull_mode;
     pipeline_desc.RasterizerState.FrontCounterClockwise = d->front_ccw != 0;
     pipeline_desc.BlendState.RenderTarget[0].RenderTargetWriteMask = (UINT8)d->write_mask;
+    pipeline_desc.BlendState.RenderTarget[0].BlendEnable = blend->enabled != 0;
+    pipeline_desc.BlendState.RenderTarget[0].SrcBlend = blend->source_color;
+    pipeline_desc.BlendState.RenderTarget[0].DestBlend = blend->destination_color;
+    pipeline_desc.BlendState.RenderTarget[0].BlendOp = blend->color_operation;
+    pipeline_desc.BlendState.RenderTarget[0].SrcBlendAlpha = blend->source_alpha;
+    pipeline_desc.BlendState.RenderTarget[0].DestBlendAlpha = blend->destination_alpha;
+    pipeline_desc.BlendState.RenderTarget[0].BlendOpAlpha = blend->alpha_operation;
     pipeline_desc.IBStripCutValue = !d->primitive_restart ? D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED :
         d->index_element_bytes == 2 ? D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFF : D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFFFFFF;
     TRY(ID3D12Device_CreateGraphicsPipelineState(c->device, &pipeline_desc, &IID_ID3D12PipelineState, (void **)&pipeline));
@@ -883,6 +923,7 @@ int32_t ps5_d3d12_draw_spirv(Ps5D3D12 *c, const uint32_t *vertex, size_t vertex_
     const uint32_t base_values[2] = {d->index_count ? (uint32_t)d->base_vertex : d->first_vertex, d->first_instance};
     ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(c->commands, 0, 2, base_values, 0);
     bind_graphics_resources(c, &resources, buffers, buffer_count, image_count);
+    ID3D12GraphicsCommandList_OMSetBlendFactor(c->commands, blend->constants);
     ID3D12GraphicsCommandList_OMSetRenderTargets(c->commands, 1, &view, FALSE, NULL);
     D3D12_VIEWPORT viewport = {d->viewport[0], d->viewport[1], d->viewport[2], d->viewport[3], d->viewport[4], d->viewport[5]};
     D3D12_RECT scissor = {d->scissor[0], d->scissor[1], d->scissor[2], d->scissor[3]};

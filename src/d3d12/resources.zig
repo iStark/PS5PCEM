@@ -132,15 +132,28 @@ pub const DrawResources = struct {
             return error.DynamicGraphicsImageNotImplemented;
         const descriptor = try gpu.resources.decodeImageDescriptor(&words);
         const sampler = try gpu.resources.decodeSamplerDescriptor(&sampler_words);
-        if (descriptor.image_type != .color_2d or descriptor.unified_format != 56 or descriptor.viewBaseLevel() != 0 or
+        const format: u32 = switch (descriptor.unified_format) {
+            56 => 28,
+            169, 170 => 71,
+            171, 172 => 74,
+            173, 174 => 77,
+            else => 0,
+        };
+        if (descriptor.image_type != .color_2d or format == 0 or descriptor.viewBaseLevel() != 0 or
             descriptor.viewMipLevels() != 1 or descriptor.max_mip != 0 or descriptor.base_array != 0 or
-            descriptor.min_lod != 0 or descriptor.dccMetadataAddress() != null or gpu.MetadataSurface.fromImage(descriptor).hasAny())
+            descriptor.min_lod != 0 or (format != 28 and descriptor.bc_swizzle != 0) or
+            descriptor.dccMetadataAddress() != null or gpu.MetadataSurface.fromImage(descriptor).hasAny())
+        {
+            std.debug.print("[d3d12 image] program=0x{x} pc=0x{x} descriptor={any}\n", .{ resolver.bindings.program_address, inst.pc, descriptor });
             return error.GraphicsTextureFormatOrMipNotImplemented;
+        }
+        const expected_bytes = try native.sampledImageSize(descriptor.width, descriptor.height, format);
         if (sampler.unnormalized_coordinates or sampler.trunc_coordinates or sampler.filter_mode != 0 or
             sampler.maximum_anisotropy != 0 or sampler.minification_filter > 1 or sampler.magnification_filter > 1 or
             sampler.mip_filter > 2 or sampler.border_color_type == 3)
             return error.GraphicsSamplerModeNotImplemented;
         const layout = try gpu.SurfaceLayout.fromImage(descriptor);
+        if (layout.staging_bytes != expected_bytes) return error.GraphicsImageFootprintMismatch;
         if (self.images.items.len >= 32 or layout.required_source_bytes > 256 * 1024 * 1024 or
             self.total + layout.staging_bytes > 256 * 1024 * 1024) return error.GraphicsSnapshotBudgetExceeded;
         _ = try layout.sourceRange(descriptor.address);
@@ -167,7 +180,8 @@ pub const DrawResources = struct {
             .size = pixels.len,
             .width = descriptor.width,
             .height = descriptor.height,
-            .srgb = @intFromBool(sampler.force_srgb),
+            .format = format,
+            .srgb = @intFromBool(sampler.force_srgb or (format != 28 and descriptor.unified_format % 2 == 0)),
             .components = components,
             .filter = (@as(u32, sampler.minification_filter) << 4) | (@as(u32, sampler.magnification_filter) << 2) | @intFromBool(sampler.mip_filter == 2),
             .address_u = try addressMode(sampler.clamp_x),
