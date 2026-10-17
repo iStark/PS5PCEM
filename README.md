@@ -2,10 +2,10 @@
   <img src="assets/branding/ps5pcem-icon-256.png" width="148" height="148" alt="PS5PCEM application icon">
   <h1>PS5PCEM</h1>
   <p><strong>Experimental PlayStation 5 emulation and interoperability research in Zig</strong></p>
-  <p>Native guest execution · RDNA2 shader translation · Vulkan rendering · Windows launcher</p>
+  <p>Native guest execution · RDNA2 shader translation · Vulkan / DirectX 12 rendering · Windows / Linux launchers</p>
   <p>
     <a href="https://github.com/iStark/PS5PCEM/releases/tag/v0.3.5"><img src="https://img.shields.io/github/v/release/iStark/PS5PCEM?include_prereleases&style=flat-square&color=3b95ff" alt="Latest release"></a>
-    <img src="https://img.shields.io/badge/platform-Windows%20x64-3b95ff?style=flat-square" alt="Windows x64">
+    <img src="https://img.shields.io/badge/platform-Windows%20%2F%20Linux%20x64-3b95ff?style=flat-square" alt="Windows / Linux x64">
     <img src="https://img.shields.io/badge/Zig-0.16-f7a41d?style=flat-square" alt="Zig 0.16">
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-GPL--3.0--or--later-6f7782?style=flat-square" alt="GPL-3.0-or-later"></a>
     <img src="https://img.shields.io/badge/status-early%20prototype-e6a23c?style=flat-square" alt="Early prototype">
