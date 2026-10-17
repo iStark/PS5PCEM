@@ -25,6 +25,22 @@ pub const Buffer = extern struct {
         return .{ .bytes = bytes.ptr, .size = bytes.len };
     }
 };
+pub const SampledImage = extern struct {
+    pixels: [*]const u8,
+    size: usize,
+    width: u32,
+    height: u32,
+    srgb: u32 = 0,
+    components: u32 = 5768,
+    filter: u32 = 0,
+    address_u: u32 = 3,
+    address_v: u32 = 3,
+    address_w: u32 = 3,
+    min_lod: f32 = 0,
+    max_lod: f32 = 16,
+    lod_bias: f32 = 0,
+    border: [4]f32 = @splat(0),
+};
 pub const Draw = extern struct {
     width: u32,
     height: u32,
@@ -137,6 +153,19 @@ pub const Device = struct {
     }
 
     pub fn drawIndexedSpirv(self: *Device, vertex: []const u32, fragment: []const u32, draw: Draw, indices: []const u8, rgba: []u8) Error!void {
+        return self.drawResourcesSpirv(vertex, fragment, draw, indices, &.{}, &.{}, rgba);
+    }
+
+    pub fn drawResourcesSpirv(self: *Device, vertex: []const u32, fragment: []const u32, draw: Draw, indices: []const u8, buffers: []const Buffer, images: []const SampledImage, rgba: []u8) Error!void {
+        if (buffers.len > 64 or images.len > 32) return error.InvalidArgument;
+        for (buffers) |buffer| if (buffer.size == 0 or buffer.size % 4 != 0 or buffer.size > 256 * 1024 * 1024) return error.InvalidArgument;
+        for (images) |image| {
+            if (image.size != try rgbaSize(image.width, image.height) or image.srgb > 1 or
+                image.address_u < 1 or image.address_u > 4 or image.address_v < 1 or image.address_v > 4 or
+                image.address_w < 1 or image.address_w > 4 or image.filter & ~@as(u32, 0x15) != 0 or
+                !std.math.isFinite(image.min_lod) or !std.math.isFinite(image.max_lod) or !std.math.isFinite(image.lod_bias) or
+                image.min_lod > image.max_lod) return error.InvalidArgument;
+        }
         if (draw.index_count != 0) {
             if ((draw.index_element_bytes != 2 and draw.index_element_bytes != 4) or
                 @as(u64, draw.index_count) * draw.index_element_bytes != indices.len or indices.len > 64 * 1024 * 1024) return error.InvalidArgument;
@@ -149,7 +178,7 @@ pub const Device = struct {
         if (draw.viewport[2] <= 0 or draw.viewport[3] <= 0 or draw.viewport[4] < 0 or draw.viewport[5] > 1 or draw.viewport[4] > draw.viewport[5] or
             draw.scissor[0] < 0 or draw.scissor[1] < 0 or draw.scissor[2] < draw.scissor[0] or draw.scissor[3] < draw.scissor[1]) return error.InvalidArgument;
         if (builtin.os.tag != .windows) return error.UnsupportedPlatform;
-        try self.check(ps5_d3d12_draw_spirv(self.handle, vertex.ptr, vertex.len, fragment.ptr, fragment.len, &draw, indices.ptr, indices.len, rgba.ptr));
+        try self.check(ps5_d3d12_draw_spirv(self.handle, vertex.ptr, vertex.len, fragment.ptr, fragment.len, &draw, indices.ptr, indices.len, buffers.ptr, @intCast(buffers.len), images.ptr, @intCast(images.len), rgba.ptr));
     }
 
     pub fn presentRgba(self: *Device, rgba: []const u8, width: u32, height: u32) Error!void {
@@ -174,7 +203,7 @@ extern fn ps5_d3d12_attach_window(*Handle, *anyopaque, u32, u32) i32;
 extern fn ps5_d3d12_present(*Handle, *const [4]f32) i32;
 extern fn ps5_d3d12_validation_errors(*Handle) u64;
 extern fn ps5_d3d12_dispatch_spirv(*Handle, [*]const u32, usize, [*]const Buffer, u32, *const [3]u32) i32;
-extern fn ps5_d3d12_draw_spirv(*Handle, [*]const u32, usize, [*]const u32, usize, *const Draw, [*]const u8, usize, [*]u8) i32;
+extern fn ps5_d3d12_draw_spirv(*Handle, [*]const u32, usize, [*]const u32, usize, *const Draw, [*]const u8, usize, [*]const Buffer, u32, [*]const SampledImage, u32, [*]u8) i32;
 extern fn ps5_d3d12_present_rgba(*Handle, [*]const u8, u32, u32) i32;
 
 test "readback sizes reject empty and excessive textures before native allocation" {

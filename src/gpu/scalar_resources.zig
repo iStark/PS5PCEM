@@ -144,7 +144,8 @@ pub const Resolver = struct {
         if (scalar.scalarRegisterIndex(op)) |register| return self.word(@as(u32, @intCast(register)) + component, before, depth);
         return switch (op.kind) {
             .null => 0,
-            .integer_inline_constant, .literal_constant => if (component == 0) op.value else if (op.value & 0x8000_0000 != 0) std.math.maxInt(u32) else 0,
+            .integer_inline_constant => if (component == 0) op.value else if (op.value & 0x8000_0000 != 0) std.math.maxInt(u32) else 0,
+            .literal_constant => if (component == 0) op.value else 0,
             else => null,
         };
     }
@@ -198,6 +199,8 @@ pub const Resolver = struct {
         if (register < destination) return null;
         const component: u32 = @intCast(register - destination);
         switch (inst.opcode) {
+            .s_or_b32, .s_bfe_u32, .s_bfe_u64, .s_lshl4_add_u32, .s_cselect_b32, .s_cselect_b64 => return (try self.descriptorExpression(inst, index, component, depth)) orelse
+                if (known.known and known.producer_pc == inst.pc) known.value else null,
             .s_getpc_b64 => {
                 if (component >= 2) return null;
                 const address = self.bindings.program_address +% inst.pc +% 4;
@@ -311,7 +314,172 @@ pub const Resolver = struct {
         if (byte > 0xffff_ffff_fffc) return null;
         return try self.reader.readU32(byte);
     }
+
+    /// Vertex fetch shaders assemble format fields from a packed attribute
+    /// table. Recover inputs at their producers, not from a later SGPR reuse.
+    fn descriptorExpression(self: *Resolver, inst: rdna2.Instruction, index: usize, component: u32, depth: u8) !?u32 {
+        if (inst.opcode == .s_cselect_b32 or inst.opcode == .s_cselect_b64) {
+            if (component >= @as(u32, if (inst.opcode == .s_cselect_b64) 2 else 1)) return null;
+            const condition = (try self.comparisonBefore(index, depth)) orelse return null;
+            return self.operand(if (condition) inst.src0 else inst.src1, component, index, depth + 1);
+        }
+        if (component != 0 and (inst.opcode != .s_bfe_u64 or component >= 2)) return null;
+        const a = (try self.operand(inst.src0, 0, index, depth + 1)) orelse return null;
+        const b = (try self.operand(inst.src1, 0, index, depth + 1)) orelse return null;
+        return switch (inst.opcode) {
+            .s_or_b32 => a | b,
+            .s_lshl4_add_u32 => (a << 4) +% b,
+            .s_bfe_u32 => extract: {
+                const offset: u5 = @truncate(b);
+                const width = @min((b >> 16) & 0x7f, 32 - @as(u32, offset));
+                if (width == 0) break :extract 0;
+                if (width == 32) break :extract a;
+                break :extract (a >> offset) & ((@as(u32, 1) << @as(u5, @intCast(width))) - 1);
+            },
+            .s_bfe_u64 => extract: {
+                const high = (try self.operand(inst.src0, 1, index, depth + 1)) orelse return null;
+                const offset: u6 = @truncate(b);
+                const width = @min((b >> 16) & 0x7f, 64 - @as(u32, offset));
+                if (width == 0) break :extract 0;
+                const shifted = (@as(u64, a) | (@as(u64, high) << 32)) >> offset;
+                const value = if (width == 64) shifted else shifted & ((@as(u64, 1) << @as(u6, @intCast(width))) - 1);
+                break :extract @truncate(value >> @as(u6, @intCast(component * 32)));
+            },
+            else => unreachable,
+        };
+    }
+
+    /// Only a proven comparison in the same basic block can drive CSELECT.
+    /// Stop at every instruction not known to preserve SCC; never borrow a
+    /// comparison from across a branch or an intervening scalar ALU write.
+    fn comparisonBefore(self: *Resolver, before: usize, depth: u8) !?bool {
+        const first = for (self.graph.blocks.items) |block| {
+            if (before >= block.first_instruction and before < block.first_instruction + block.instruction_count)
+                break block.first_instruction;
+        } else return null;
+        var index = before;
+        while (index > first) {
+            index -= 1;
+            const inst = self.instructions[index];
+            switch (inst.opcode) {
+                .s_nop,
+                .s_waitcnt,
+                .s_load_dword,
+                .s_load_dwordx2,
+                .s_load_dwordx4,
+                .s_load_dwordx8,
+                .s_load_dwordx16,
+                .s_buffer_load_dword,
+                .s_buffer_load_dwordx2,
+                .s_buffer_load_dwordx4,
+                .s_buffer_load_dwordx8,
+                .s_buffer_load_dwordx16,
+                => continue,
+                .s_cmp_eq_i32,
+                .s_cmp_eq_u32,
+                .s_cmp_lg_i32,
+                .s_cmp_lg_u32,
+                .s_cmp_gt_i32,
+                .s_cmp_ge_i32,
+                .s_cmp_lt_i32,
+                .s_cmp_le_i32,
+                .s_cmp_gt_u32,
+                .s_cmp_ge_u32,
+                .s_cmp_lt_u32,
+                .s_cmp_le_u32,
+                => {},
+                else => return null,
+            }
+            const a = (try self.operand(inst.src0, 0, index, depth + 1)) orelse return null;
+            const b = (try self.operand(inst.src1, 0, index, depth + 1)) orelse return null;
+            const ai: i32 = @bitCast(a);
+            const bi: i32 = @bitCast(b);
+            return switch (inst.opcode) {
+                .s_cmp_eq_i32, .s_cmp_eq_u32 => a == b,
+                .s_cmp_lg_i32, .s_cmp_lg_u32 => a != b,
+                .s_cmp_gt_i32 => ai > bi,
+                .s_cmp_ge_i32 => ai >= bi,
+                .s_cmp_lt_i32 => ai < bi,
+                .s_cmp_le_i32 => ai <= bi,
+                .s_cmp_gt_u32 => a > b,
+                .s_cmp_ge_u32 => a >= b,
+                .s_cmp_lt_u32 => a < b,
+                .s_cmp_le_u32 => a <= b,
+                else => unreachable,
+            };
+        }
+        return null;
+    }
 };
+
+test "packed vertex format recovery proves CSELECT and refuses unknown or clobbered SCC" {
+    const M = struct {
+        fn read(_: ?*anyopaque, _: u64, _: []u8) bool {
+            return false;
+        }
+        fn reg(index: u32) rdna2.Operand {
+            return .{ .kind = .sgpr, .reg = index };
+        }
+        fn imm(value: u32) rdna2.Operand {
+            return .{ .kind = .literal_constant, .value = value };
+        }
+    };
+    const original = [_]rdna2.Instruction{
+        .{ .pc = 0, .opcode = .s_bfe_u32, .dst = M.reg(4), .src0 = M.reg(0), .src1 = M.imm(0x70007) },
+        .{ .pc = 4, .opcode = .s_lshl_b32, .dst = M.reg(5), .src0 = M.reg(4), .src1 = M.imm(12) },
+        .{ .pc = 8, .opcode = .s_bfe_u32, .dst = M.reg(6), .src0 = M.reg(0), .src1 = M.imm(0x20005) },
+        .{ .pc = 12, .opcode = .s_lshl4_add_u32, .dst = M.reg(6), .src0 = M.reg(6), .src1 = M.imm(0xc0000) },
+        .{ .pc = 16, .opcode = .s_bfe_u64, .dst = M.reg(8), .src0 = M.reg(2), .src1 = M.reg(6) },
+        .{ .pc = 20, .opcode = .s_or_b32, .dst = M.reg(10), .src0 = M.reg(5), .src1 = M.reg(8) },
+        .{ .pc = 24, .opcode = .s_cmp_eq_u32, .dst = .{ .kind = .scc }, .src0 = M.reg(4), .src1 = M.imm(0) },
+        .{ .pc = 28, .opcode = .s_nop },
+        .{ .pc = 32, .opcode = .s_cselect_b32, .dst = M.reg(11), .src0 = M.imm(0xfac), .src1 = M.reg(10) },
+        .{ .pc = 36, .opcode = .s_endpgm },
+    };
+    var bindings = std.mem.zeroes(shaders.StageBindings);
+    bindings.user_data_count = 4;
+    bindings.user_data[2] = 0x022c0204;
+    bindings.user_data[3] = 0x0fac03ac;
+    for (0..6) |variant| {
+        var instructions = original;
+        bindings.user_data[0] = if (variant == 0) 0 else if (variant == 2) 0xa0 else 0x80;
+        if (variant == 3) instructions[7] = .{ .pc = 28, .opcode = .s_and_b32, .dst = M.reg(30), .src0 = M.imm(0), .src1 = M.imm(0) };
+        if (variant == 4) instructions[7] = .{ .pc = 28, .opcode = .s_branch, .branch_target = 32 };
+        if (variant == 5) instructions[6].src0 = M.reg(60);
+        var graph = try rdna2.control_flow.buildInstructions(std.testing.allocator, &instructions);
+        defer graph.deinit(std.testing.allocator);
+        var resolver = Resolver{ .bindings = &bindings, .reader = .{ .context = null, .read_fn = M.read }, .instructions = &instructions, .graph = &graph, .snapshot = &unknown_registers };
+        var words: [1]u32 = undefined;
+        try std.testing.expectEqual(variant < 3, try resolver.words(11, 36, &words));
+        if (variant < 3) try std.testing.expectEqual(([_]u32{ 0xfac, 0x1204, 0x122c })[variant], words[0]);
+    }
+}
+
+test "descriptor BFE64 preserves cross-word fields, zero widths and literal widening" {
+    const M = struct {
+        fn read(_: ?*anyopaque, _: u64, _: []u8) bool {
+            return false;
+        }
+    };
+    var bindings = std.mem.zeroes(shaders.StageBindings);
+    bindings.user_data_count = 2;
+    bindings.user_data[0] = 0x89abcdef;
+    bindings.user_data[1] = 0x01234567;
+    for ([_]u32{ 0, 64 << 16, (8 << 16) | 28, (127 << 16) | 60, 64 << 16 }, 0..) |control, variant| {
+        const source: rdna2.Operand = if (variant == 4) .{ .kind = .literal_constant, .value = 0x80000000 } else .{ .kind = .sgpr };
+        const instructions = [_]rdna2.Instruction{
+            .{ .pc = 0, .opcode = .s_bfe_u64, .dst = .{ .kind = .sgpr, .reg = 4 }, .src0 = source, .src1 = .{ .kind = .literal_constant, .value = control } },
+            .{ .pc = 4, .opcode = .s_endpgm },
+        };
+        var graph = try rdna2.control_flow.buildInstructions(std.testing.allocator, &instructions);
+        defer graph.deinit(std.testing.allocator);
+        var resolver = Resolver{ .bindings = &bindings, .reader = .{ .context = null, .read_fn = M.read }, .instructions = &instructions, .graph = &graph, .snapshot = &unknown_registers };
+        var words: [2]u32 = undefined;
+        try std.testing.expect(try resolver.words(4, 4, &words));
+        const expected: [2]u32 = ([_][2]u32{ .{ 0, 0 }, .{ 0x89abcdef, 0x01234567 }, .{ 0x78, 0 }, .{ 0, 0 }, .{ 0x80000000, 0 } })[variant];
+        try std.testing.expectEqualSlices(u32, &expected, &words);
+    }
+}
 
 test "PC-relative resource descriptors recover skipped branches with a proven carry" {
     const M = struct {

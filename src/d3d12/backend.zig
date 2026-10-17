@@ -10,6 +10,7 @@ const rdna2 = @import("rdna2");
 const native = @import("root.zig");
 const graphics = @import("graphics.zig");
 const surfaces = @import("surfaces.zig");
+const resources = @import("resources.zig");
 
 pub const Memory = struct {
     context: ?*anyopaque,
@@ -93,8 +94,8 @@ pub const Renderer = struct {
             render.color_count,                   render.depth_control.test_enabled, render.depth_control.write_enabled,
             render.depth_control.stencil_enabled, render.blends[0].enabled,
         });
-        if (render.color_targets[0]) |target| std.debug.print("[d3d12 target] {d}x{d} pitch={d} format={d}/{d} tile={s} samples={d} fragments={d}\n", .{
-            target.width, target.height, target.pitch, target.format, target.number_type, @tagName(target.tile_mode), target.samples_log2, target.fragments_log2,
+        if (render.color_targets[0]) |target| std.debug.print("[d3d12 target] {d}x{d} pitch={d} format={d}/{d} tile={f} samples={d} fragments={d}\n", .{
+            target.width, target.height, target.pitch, target.format, target.number_type, target.tile_mode, target.samples_log2, target.fragments_log2,
         });
         const active = graphics.routing(state) catch null;
         for ([_]gpu.resources.ShaderStage{ .vertex, .export_shader, .geometry, .hull, .pixel }) |stage| {
@@ -236,7 +237,10 @@ pub const Renderer = struct {
         draw_state.write_mask = target.write_mask & (render.shader_mask & 0xf);
         if (render.viewport) |vp| {
             if (vp.x_scale <= 0 or vp.y_scale >= 0) return error.PositiveYOrMirroredViewportNotImplemented;
-            draw_state.viewport = .{ vp.x_offset - vp.x_scale, vp.y_offset + vp.y_scale, vp.x_scale * 2, -vp.y_scale * 2, if (render.raster.zero_to_one_depth) vp.z_offset else vp.z_offset - vp.z_scale, vp.z_offset + vp.z_scale };
+            const position_z_enabled = ((state.readRegister(.context, 0x1b4) orelse 0) & (state.readRegister(.context, 0x1b3) orelse 0)) & (1 << 10) != 0;
+            // The depth/stencil rejection above is required for this proof.
+            const depth = try graphics.viewportDepthRange(if (render.raster.zero_to_one_depth) vp.z_offset else vp.z_offset - vp.z_scale, vp.z_offset + vp.z_scale, position_z_enabled);
+            draw_state.viewport = .{ vp.x_offset - vp.x_scale, vp.y_offset + vp.y_scale, vp.x_scale * 2, -vp.y_scale * 2, depth[0], depth[1] };
         }
         if (render.scissor) |scissor| draw_state.scissor = .{ scissor.left, scissor.top, scissor.right, scissor.bottom };
         const vs_bindings = try gpu.ShaderBindings.capture(state, routing.stage, null, self.reader());
@@ -246,13 +250,13 @@ pub const Renderer = struct {
         var ps = try gpu.shader_analysis.decode(self.allocator, self.reader(), ps_bindings.program_address, 4096);
         defer ps.deinit(self.allocator);
         const interface = try graphics.linkInterface(state, vs.program.instructions.items, ps.program.instructions.items);
-        // Stage resources need a shared descriptor layout and are the next
-        // porting step. Reject them before GPU submission or target writes.
-        for ([_]*const gpu.ShaderAnalysis{ &vs, &ps }) |analysis| for (analysis.program.instructions.items) |inst| switch (inst.family) {
-            .mimg, .mubuf, .mtbuf, .flat, .smem, .ds => return error.GraphicsResourceBindingsNotImplemented,
-            else => {},
-        };
-        var vs_scalar: [64]rdna2.spirv.ScalarRegister = undefined;
+        var draw_resources = resources.DrawResources{ .allocator = self.allocator, .reader = self.reader() };
+        defer draw_resources.deinit();
+        var vs_resources = try draw_resources.capture(&vs_bindings, &vs);
+        defer vs_resources.deinit(self.allocator);
+        var ps_resources = try draw_resources.capture(&ps_bindings, &ps);
+        defer ps_resources.deinit(self.allocator);
+        var vs_scalar: [65]rdna2.spirv.ScalarRegister = undefined;
         var ps_scalar: [64]rdna2.spirv.ScalarRegister = undefined;
         var vs_scalar_count = entryScalars(vs_bindings, &vs_scalar);
         if (routing.stage == .export_shader) {
@@ -273,6 +277,11 @@ pub const Renderer = struct {
             .allow_control_flow_fallback = false,
             .parameter_mask = interface.mask,
             .vertex_parameter_sources = &interface.controls,
+            .storage_buffers = vs_resources.buffers.items,
+            .scalar_memories = vs_resources.pointers.items,
+            .sampled_images = vs_resources.images.items,
+            .descriptor_array_length = @intCast(@max(1, draw_resources.buffers.items.len)),
+            .sampled_image_array_length = @intCast(@max(1, draw_resources.images.items.len)),
         });
         defer vertex.deinit(self.allocator);
         var fragment = try ps.translateSpirv(self.allocator, .{
@@ -286,6 +295,11 @@ pub const Renderer = struct {
             .fragment_input_controls = &interface.controls,
             .fragment_input_locations = &interface.locations,
             .infer_fragment_parameter_mask = false,
+            .storage_buffers = ps_resources.buffers.items,
+            .scalar_memories = ps_resources.pointers.items,
+            .sampled_images = ps_resources.images.items,
+            .descriptor_array_length = @intCast(@max(1, draw_resources.buffers.items.len)),
+            .sampled_image_array_length = @intCast(@max(1, draw_resources.images.items.len)),
             .fragment_inputs = .{
                 .allocated = @truncate(state.readRegister(.context, 0x1b4) orelse 0),
                 .enabled = @truncate(state.readRegister(.context, 0x1b3) orelse 0),
@@ -296,7 +310,11 @@ pub const Renderer = struct {
         if (vertex.used_dispatcher or fragment.used_dispatcher) return error.UnboundedControlFlowNotImplemented;
         var surface = try surfaces.Staged.read(self.allocator, self.memory, target.address, target_layout);
         defer surface.deinit();
-        try self.device.drawIndexedSpirv(vertex.words, fragment.words, draw_state, indices, surface.pixels);
+        self.device.drawResourcesSpirv(vertex.words, fragment.words, draw_state, indices, draw_resources.buffers.items, draw_resources.images.items, surface.pixels) catch |err| {
+            std.debug.print("[d3d12 native draw] viewport={any} scissor={any} indices={d}/{d} mask={d} rgba={d} buffers={d} images={d}\n", .{ draw_state.viewport, draw_state.scissor, draw_state.index_count, indices.len, draw_state.write_mask, surface.pixels.len, draw_resources.buffers.items.len, draw_resources.images.items.len });
+            for (draw_resources.images.items) |image| std.debug.print("[d3d12 sampled image] {d}x{d} bytes={d} filter=0x{x} lod={d}..{d} bias={d} address={d}/{d}/{d}\n", .{ image.width, image.height, image.size, image.filter, image.min_lod, image.max_lod, image.lod_bias, image.address_u, image.address_v, image.address_w });
+            return err;
+        };
         try surface.write(self.memory);
     }
 
@@ -417,7 +435,7 @@ const DrawArguments = struct {
     }
 };
 
-fn entryScalars(bindings: gpu.ShaderBindings, output: *[64]rdna2.spirv.ScalarRegister) usize {
+fn entryScalars(bindings: gpu.ShaderBindings, output: []rdna2.spirv.ScalarRegister) usize {
     for (bindings.user_data[0..bindings.user_data_count], 0..) |value, index| output[index] = .{ .register = @as(u32, @intCast(index)) + bindings.scalar_user_data_base, .value = value };
     return bindings.user_data_count;
 }

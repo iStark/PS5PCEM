@@ -354,6 +354,7 @@ fn guestGraphicsProbe(allocator: std.mem.Allocator, device: *d3d12.Device) !void
     try guestCommandProbe(allocator, &vertex_words, &pixel_words);
     try guestSurfaceProbe(allocator, &vertex_words, &pixel_words);
     try guestVaryingProbe(allocator, &vertex_words);
+    try guestResourcesProbe(allocator);
 }
 
 const GraphicsMemory = struct {
@@ -474,4 +475,101 @@ fn guestVaryingProbe(allocator: std.mem.Allocator, vertex: []const u32) !void {
         };
     }
     std.debug.print("PASS native interpolated RDNA2 PARAM values and two ATTR inputs remapped to PARAM3\n", .{});
+}
+
+fn guestResourcesProbe(allocator: std.mem.Allocator) !void {
+    var memory = try allocator.create(GraphicsMemory);
+    defer allocator.destroy(memory);
+    memory.* = .{};
+    const vs = [_]u32{
+        0xf4080200, 0xfa000000, // s_load_dwordx4 s8, [s0:s1]
+        0xe0382000, 0x80020005, // buffer_load_dwordx4 v0, v5, s8, 0 idxen
+        0xf80000cf,          0x03020100, // POS0
+        vop1(0x01, 4, 255),  0x3f000000,
+        vop2(0x03, 6, 0, 3), vop2(0x03, 7, 1, 3),
+        vop2(0x08, 6, 6, 4), vop2(0x08, 7, 7, 4),
+        0xf8000a0f, 0x03020706, 0xbf810000, // PARAM0 normalized x/y
+    };
+    const ps = [_]u32{
+        0xf4280406, 0xfa000000, // s_buffer_load_dwordx4 s16, s12, 0
+        0xc8000000, 0xc8010001,
+        0xc8040100, 0xc8050101,
+        0xf0800f08,                               0x00400400, // sample T=s0 S=s8 -> v4
+        // A second sampling instruction forces a two-element descriptor
+        // array; the complete draw also shares three SSBO slots across VS/PS.
+        0xf0800f08,                               0x00400400,
+        (0x08 << 25) | (0 << 17) | (4 << 9) | 16, (0x08 << 25) | (1 << 17) | (5 << 9) | 17,
+        (0x08 << 25) | (2 << 17) | (6 << 9) | 18, (0x08 << 25) | (3 << 17) | (7 << 9) | 19,
+        0xf800080f,                               0x03020100,
+        0xbf810000,
+    };
+    @memcpy(memory.data[0x200..][0..@sizeOf(@TypeOf(vs))], std.mem.asBytes(&vs));
+    @memcpy(memory.data[0x400..][0..@sizeOf(@TypeOf(ps))], std.mem.asBytes(&ps));
+    const positions = [_]f32{ -0.75, -0.75, 0, 1, 0, 0.75, 0, 1, 0.75, -0.75, 0, 1 };
+    @memcpy(memory.data[0x1000..][0..@sizeOf(@TypeOf(positions))], std.mem.asBytes(&positions));
+    const descriptor = [_]u32{ 0x1000, 16 << 16, 3, 0xfac };
+    @memcpy(memory.data[0x1800..][0..16], std.mem.asBytes(&descriptor));
+    var state = try graphicsState(65, 37, 72);
+    try state.writeRegister(.shader, 0x04b, 4);
+    try state.writeRegister(.shader, 0x04c, 0x1800);
+    try state.writeRegister(.shader, 0x04d, 0);
+    try state.writeRegister(.shader, 0x00b, 16 << 1);
+    const user = [_]u32{
+        0x100,                   (56 << 20) | (1 << 30), 1 << 14, 0x90000fac, 0,      0, 0,  0,
+        2 | (2 << 3) | (2 << 6), 0xfff000,               0,       0,          0x1900, 0, 16, 0,
+    };
+    for (user, 0..) |word, i| try state.writeRegister(.shader, 0x00c + @as(u32, @intCast(i)), word);
+    var renderer = try d3d12.Renderer.init(allocator, memory.access(), false);
+    defer renderer.deinit();
+    var executor = gpu.DcbExecutor{ .state = &state, .backend = renderer.dcbBackend(), .allocator = allocator };
+    for (0..5) |variant| {
+        const scale: [4]f32 = if (variant == 1) .{ 0.5, 0.25, 1, 1 } else .{ 1, 1, 1, 1 };
+        @memcpy(memory.data[0x1900..][0..16], std.mem.asBytes(&scale));
+        const top: [8]u8 = if (variant == 2) .{ 128, 64, 32, 255, 128, 64, 32, 255 } else .{ 255, 0, 0, 255, 0, 255, 0, 255 };
+        const bottom: [8]u8 = if (variant == 2) top else .{ 0, 0, 255, 255, 255, 255, 255, 255 };
+        @memcpy(memory.data[0x10000..][0..8], &top);
+        @memcpy(memory.data[0x10100..][0..8], &bottom);
+        try state.writeRegister(.shader, 0x014, user[8] | @as(u32, if (variant == 2) 1 << 20 else 0));
+        try state.writeRegister(.shader, 0x016, if (variant == 4) (1 << 20) | (1 << 22) else 0);
+        try state.writeRegister(.shader, 0x00f, if (variant == 3) 0x9000032e else user[3]); // B,G,R,1
+        @memset(memory.data[0x2000..0x5000], 0);
+        _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 2 });
+        if (variant == 4) {
+            const center = memory.data[0x2000 + (18 * 72 + 32) * 4 ..][0..4];
+            for (center, [_]u8{ 128, 128, 128, 255 }) |a, e| if (@abs(@as(i16, a) - e) > 1) return error.LinearSamplerMismatch;
+        } else for ([_][2]usize{ .{ 30, 23 }, .{ 34, 23 }, .{ 30, 15 }, .{ 34, 15 } }, 0..) |point, i| {
+            var expected = ([_][4]u8{ .{ 255, 0, 0, 255 }, .{ 0, 255, 0, 255 }, .{ 0, 0, 255, 255 }, .{ 255, 255, 255, 255 } })[i];
+            if (variant == 1) {
+                expected[0] = if (expected[0] != 0) 128 else 0;
+                expected[1] = if (expected[1] != 0) 64 else 0;
+            }
+            if (variant == 2) expected = .{ 55, 13, 4, 255 };
+            if (variant == 3) std.mem.swap(u8, &expected[0], &expected[2]);
+            const actual = memory.data[0x2000 + (point[1] * 72 + point[0]) * 4 ..][0..4];
+            for (actual, expected) |a, e| if (@abs(@as(i16, a) - e) > 1) {
+                std.debug.print("Resource variant {d} pixel {any}: {any}, expected {any}\n", .{ variant, point, actual, expected });
+                return error.GraphicsResourceReadbackMismatch;
+            };
+        }
+    }
+    if (!std.mem.eql(u8, memory.data[0x1000..][0..@sizeOf(@TypeOf(positions))], std.mem.asBytes(&positions))) return error.ReadOnlyVertexDataModified;
+    const baseline = memory.data[0x2000..0x5000].*;
+    for ([_]f32{ 32.5, 32.5, -18.5, 18.5, 1, 0 }, 0..) |value, i| try state.writeRegister(.context, 0x10f + @as(u32, @intCast(i)), @bitCast(value));
+    @memset(memory.data[0x2000..0x5000], 0);
+    _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 2 });
+    if (!std.mem.eql(u8, &baseline, memory.data[0x2000..0x5000])) return error.UnobservedDepthChangedColor;
+    try state.writeRegister(.context, 0x1b3, 1 << 10);
+    try state.writeRegister(.context, 0x1b4, 1 << 10);
+    const packet: gpu.pm4.Packet = .{ .kind = .command, .header = command(gpu.pm4.draw_index_auto, 2), .opcode = gpu.pm4.draw_index_auto, .body = &.{ 3, 2 } };
+    if (renderer.draw(&state, packet)) |_| return error.ObservableDepthAccepted else |err| if (err != error.UnrestrictedViewportDepthNotImplemented) return err;
+    try state.writeRegister(.context, 0x1b3, 0);
+    try state.writeRegister(.context, 0x1b4, 0);
+    // A missing input must fail before touching the output attachment.
+    const before = memory.data[0x2000..0x5000].*;
+    try state.writeRegister(.shader, 0x04c, memory.data.len + 256);
+    const rejected = renderer.draw(&state, .{ .kind = .command, .header = command(gpu.pm4.draw_index_auto, 2), .opcode = gpu.pm4.draw_index_auto, .body = &.{ 3, 2 } });
+    if (rejected) |_| return error.InvalidGraphicsPointerAccepted else |_| {}
+    if (!std.mem.eql(u8, &before, memory.data[0x2000..0x5000])) return error.RejectedDrawModifiedTarget;
+    std.debug.print("PASS guest vertex fetch, SMEM pointer and constant buffers, texture arrays, sampler filtering, sRGB, swizzles and failed-read isolation\n", .{});
+    std.debug.print("PASS unobserved -1..1 viewport depth preserves the full color image; position-Z consumers remain rejected\n", .{});
 }

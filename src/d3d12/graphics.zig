@@ -18,6 +18,26 @@ pub const Interface = struct {
     locations: [32]u8 = undefined,
 };
 
+/// With depth/stencil already disabled by the draw boundary, viewport depth
+/// only remains observable through the pixel shader's position-Z input.
+/// Replacing an unobserved depth mapping preserves clipping (performed before
+/// the viewport), coverage, perspective interpolation and all color outputs.
+pub fn viewportDepthRange(minimum: f32, maximum: f32, position_z_enabled: bool) ![2]f32 {
+    if (!std.math.isFinite(minimum) or !std.math.isFinite(maximum)) return error.InvalidViewportDepth;
+    if (minimum >= 0 and maximum <= 1 and minimum <= maximum) return .{ minimum, maximum };
+    if (position_z_enabled) return error.UnrestrictedViewportDepthNotImplemented;
+    return .{ 0, 1 };
+}
+
+test "only unobserved viewport depth can be normalized into the native range" {
+    try std.testing.expectEqual([2]f32{ 0.25, 0.75 }, try viewportDepthRange(0.25, 0.75, true));
+    try std.testing.expectEqual([2]f32{ 0, 1 }, try viewportDepthRange(-1, 1, false));
+    try std.testing.expectEqual([2]f32{ 0, 1 }, try viewportDepthRange(1, 0, false));
+    try std.testing.expectError(error.UnrestrictedViewportDepthNotImplemented, viewportDepthRange(-1, 1, true));
+    try std.testing.expectError(error.UnrestrictedViewportDepthNotImplemented, viewportDepthRange(1, 0, true));
+    try std.testing.expectError(error.InvalidViewportDepth, viewportDepthRange(std.math.nan(f32), 1, false));
+}
+
 pub fn linkInterface(state: *const gpu.State, vertex: []const gpu.ShaderInstruction, fragment: []const gpu.ShaderInstruction) !Interface {
     const outputs = gpu.resource_checkpoints.graphicsInterface(vertex, null);
     const inputs = gpu.resource_checkpoints.graphicsInterface(fragment, null);

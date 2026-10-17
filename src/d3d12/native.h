@@ -19,6 +19,13 @@ typedef struct Ps5D3D12Buffer {
     size_t size;
 } Ps5D3D12Buffer;
 
+typedef struct Ps5D3D12Image {
+    const uint8_t *pixels;
+    size_t size;
+    uint32_t width, height, srgb, components, filter, address_u, address_v, address_w;
+    float min_lod, max_lod, lod_bias, border[4];
+} Ps5D3D12Image;
+
 typedef struct Ps5D3D12Draw {
     uint32_t width, height, vertex_count, instance_count, first_vertex, first_instance;
     uint32_t topology, cull_mode, front_ccw, write_mask;
@@ -42,6 +49,7 @@ uint64_t ps5_d3d12_validation_errors(Ps5D3D12 *context);
 int32_t ps5_d3d12_dispatch_spirv(Ps5D3D12 *context, const uint32_t *words, size_t word_count,
     const Ps5D3D12Buffer *buffers, uint32_t buffer_count, const uint32_t groups[3]);
 int32_t ps5_d3d12_draw_spirv(Ps5D3D12 *context, const uint32_t *vs, size_t vs_count,
-    const uint32_t *ps, size_t ps_count, const Ps5D3D12Draw *draw, const uint8_t *indices, size_t index_bytes, uint8_t *rgba);
+    const uint32_t *ps, size_t ps_count, const Ps5D3D12Draw *draw, const uint8_t *indices, size_t index_bytes,
+    const Ps5D3D12Buffer *buffers, uint32_t buffer_count, const Ps5D3D12Image *images, uint32_t image_count, uint8_t *rgba);
 int32_t ps5_d3d12_present_rgba(Ps5D3D12 *context, const uint8_t *rgba, uint32_t width, uint32_t height);
 #endif

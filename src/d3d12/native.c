@@ -310,7 +310,7 @@ static HRESULT root_signature(Ps5D3D12 *c, int compute, ID3D12RootSignature **ou
  * emits HLSL, which the Windows compiler turns into native D3D bytecode.
  * Reflection rejects resources not yet bound by this backend. */
 static HRESULT compile_spirv(Ps5D3D12 *c, const uint32_t *words, size_t word_count,
-    SpvExecutionModel stage, uint32_t buffer_count, ID3DBlob **code) {
+    SpvExecutionModel stage, uint32_t buffer_count, uint32_t image_count, ID3DBlob **code) {
     spvc_context context = NULL;
     spvc_parsed_ir ir = NULL;
     spvc_compiler compiler = NULL;
@@ -326,7 +326,7 @@ static HRESULT compile_spirv(Ps5D3D12 *c, const uint32_t *words, size_t word_cou
     CROSS(spvc_compiler_set_entry_point(compiler, "main", stage));
     CROSS(spvc_compiler_create_compiler_options(compiler, &options));
     CROSS(spvc_compiler_options_set_uint(options, SPVC_COMPILER_OPTION_HLSL_SHADER_MODEL, 51));
-    CROSS(spvc_compiler_options_set_bool(options, SPVC_COMPILER_OPTION_HLSL_FORCE_STORAGE_BUFFER_AS_UAV, SPVC_TRUE));
+    CROSS(spvc_compiler_options_set_bool(options, SPVC_COMPILER_OPTION_HLSL_FORCE_STORAGE_BUFFER_AS_UAV, stage == SpvExecutionModelGLCompute));
     if (stage == SpvExecutionModelVertex)
         CROSS(spvc_compiler_options_set_bool(options, SPVC_COMPILER_OPTION_HLSL_SUPPORT_NONZERO_BASE_VERTEX_BASE_INSTANCE, SPVC_TRUE));
     CROSS(spvc_compiler_install_compiler_options(compiler, options));
@@ -339,18 +339,38 @@ static HRESULT compile_spirv(Ps5D3D12 *c, const uint32_t *words, size_t word_cou
         size_t count = 0;
         CROSS(spvc_resources_get_resource_list_for_type(resources, kind, &list, &count));
         if (!count) continue;
-        if (kind != SPVC_RESOURCE_TYPE_STORAGE_BUFFER || count != 1 || !buffer_count) {
+        const int storage = kind == SPVC_RESOURCE_TYPE_STORAGE_BUFFER;
+        const int sampled = kind == SPVC_RESOURCE_TYPE_SAMPLED_IMAGE;
+        const uint32_t expected_count = storage ? buffer_count : sampled ? image_count : 0;
+        if ((!storage && !sampled) || count != 1 || !expected_count) {
             snprintf(c->error, sizeof(c->error), "D3D12 shader resource kind %u/count %zu is not supported by this pipeline", kind, count);
             goto done;
         }
         const unsigned set = spvc_compiler_get_decoration(compiler, list[0].id, SpvDecorationDescriptorSet);
         const unsigned binding = spvc_compiler_get_decoration(compiler, list[0].id, SpvDecorationBinding);
         spvc_type type = spvc_compiler_get_type_handle(compiler, list[0].type_id);
-        if (set != 0 || binding != 0 || spvc_type_get_num_array_dimensions(type) != 1 ||
-            !spvc_type_array_dimension_is_literal(type, 0) || spvc_type_get_array_dimension(type, 0) != buffer_count) {
-            snprintf(c->error, sizeof(c->error), "D3D12 storage descriptors require set 0/binding 0 and exactly %u buffers", buffer_count);
+        if (set != 0 || binding != (storage ? 0u : 1u) || spvc_type_get_num_array_dimensions(type) != 1 ||
+            !spvc_type_array_dimension_is_literal(type, 0) || spvc_type_get_array_dimension(type, 0) != expected_count) {
+            snprintf(c->error, sizeof(c->error), "D3D12 descriptor array mismatch: kind %u, binding %u, expected %u elements", kind, binding, expected_count);
             goto done;
         }
+        if (sampled && (spvc_type_get_image_dimension(type) != SpvDim2D || spvc_type_get_image_arrayed(type) ||
+            spvc_type_get_image_multisampled(type) || spvc_type_get_image_is_depth(type))) {
+            snprintf(c->error, sizeof(c->error), "D3D12 sampled image requires a non-depth, single-sample 2D view");
+            goto done;
+        }
+        spvc_hlsl_resource_binding remap;
+        spvc_hlsl_resource_binding_init(&remap);
+        remap.stage = stage; remap.desc_set = set; remap.binding = binding;
+        remap.uav.register_space = remap.srv.register_space = remap.sampler.register_space = 0;
+        remap.uav.register_binding = remap.srv.register_binding = remap.sampler.register_binding = 0;
+        // Graphics capture rejects writes before translation. Expose those
+        // snapshots as read-only raw SRVs, including in the vertex stage.
+        // Compute retains writable UAVs and its existing writeback path.
+        if (storage && stage != SpvExecutionModelGLCompute)
+            spvc_compiler_set_decoration(compiler, list[0].id, SpvDecorationNonWritable, 0);
+        if (sampled) remap.srv.register_binding = buffer_count;
+        CROSS(spvc_compiler_hlsl_add_resource_binding(compiler, &remap));
     }
     CROSS(spvc_compiler_compile(compiler, &source));
     hr = compile(c, source, "main", stage == SpvExecutionModelGLCompute ? "cs_5_1" : stage == SpvExecutionModelVertex ? "vs_5_1" : "ps_5_1", code);
@@ -378,18 +398,30 @@ static HRESULT storage_root(Ps5D3D12 *c, uint32_t count, ID3D12RootSignature **r
     return hr;
 }
 
-static HRESULT guest_graphics_root(Ps5D3D12 *c, ID3D12RootSignature **root) {
-    // Guest graphics resources are still rejected. SPIRV-Cross's auxiliary
-    // VertexInfo is therefore the sole cbuffer, assigned b0 by D3DCompiler.
+static HRESULT guest_graphics_root(Ps5D3D12 *c, uint32_t buffers, uint32_t images, ID3D12RootSignature **root) {
+    // VertexInfo occupies b0. Guest snapshots start at t0, followed by
+    // sampled images; samplers start at s0. Both stages share these indices.
     // D3D's SV_VertexID/InstanceID exclude the draw's base values; Vulkan's
     // VertexIndex/InstanceIndex (used by the shared translator) include them.
-    D3D12_ROOT_PARAMETER parameter = {0};
-    parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-    parameter.Constants.Num32BitValues = 2;
-    parameter.ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+    D3D12_ROOT_PARAMETER parameters[4] = {0};
+    D3D12_DESCRIPTOR_RANGE ranges[3] = {0};
+    parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    parameters[0].Constants.Num32BitValues = 2;
+    parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+    const UINT counts[3] = {buffers, images, images};
+    const D3D12_DESCRIPTOR_RANGE_TYPE kinds[3] = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, D3D12_DESCRIPTOR_RANGE_TYPE_SRV, D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER};
+    UINT parameter_count = 1;
+    for (UINT i = 0; i < 3; ++i) if (counts[i]) {
+        ranges[i].RangeType = kinds[i]; ranges[i].NumDescriptors = counts[i];
+        ranges[i].BaseShaderRegister = i == 1 ? buffers : 0;
+        parameters[parameter_count].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        parameters[parameter_count].DescriptorTable.NumDescriptorRanges = 1;
+        parameters[parameter_count].DescriptorTable.pDescriptorRanges = &ranges[i];
+        ++parameter_count;
+    }
     D3D12_ROOT_SIGNATURE_DESC desc = {0};
-    desc.NumParameters = 1;
-    desc.pParameters = &parameter;
+    desc.NumParameters = parameter_count;
+    desc.pParameters = parameters;
     ID3DBlob *blob = NULL, *errors = NULL;
     HRESULT hr = c->serialize(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &errors);
     if (SUCCEEDED(hr)) hr = ID3D12Device_CreateRootSignature(c->device, 0, ID3D10Blob_GetBufferPointer(blob), ID3D10Blob_GetBufferSize(blob), &IID_ID3D12RootSignature, (void **)root);
@@ -408,7 +440,7 @@ int32_t ps5_d3d12_dispatch_spirv(Ps5D3D12 *c, const uint32_t *words, size_t word
     ID3D12PipelineState *pipeline = NULL;
     ID3D12DescriptorHeap *heap = NULL;
     ID3D12Resource *gpu[64] = {0}, *upload[64] = {0}, *readback[64] = {0};
-    TRY(compile_spirv(c, words, word_count, SpvExecutionModelGLCompute, count, &code));
+    TRY(compile_spirv(c, words, word_count, SpvExecutionModelGLCompute, count, 0, &code));
     TRY(storage_root(c, count, &root));
     D3D12_COMPUTE_PIPELINE_STATE_DESC desc = {0};
     desc.pRootSignature = root;
@@ -678,8 +710,110 @@ done:
     return hr;
 }
 
+typedef struct GraphicsResources {
+    ID3D12DescriptorHeap *views, *samplers;
+    ID3D12Resource *buffers[64], *buffer_uploads[64], *images[32], *image_uploads[32];
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprints[32];
+} GraphicsResources;
+
+static HRESULT prepare_graphics_resources(Ps5D3D12 *c, GraphicsResources *r,
+    const Ps5D3D12Buffer *buffers, UINT buffer_count, const Ps5D3D12Image *images, UINT image_count) {
+    HRESULT hr = S_OK;
+    D3D12_DESCRIPTOR_HEAP_DESC heap_desc = {0};
+    heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    heap_desc.NumDescriptors = buffer_count + image_count;
+    heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    if (heap_desc.NumDescriptors) TRY(ID3D12Device_CreateDescriptorHeap(c->device, &heap_desc, &IID_ID3D12DescriptorHeap, (void **)&r->views));
+    if (image_count) {
+        heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER;
+        heap_desc.NumDescriptors = image_count;
+        TRY(ID3D12Device_CreateDescriptorHeap(c->device, &heap_desc, &IID_ID3D12DescriptorHeap, (void **)&r->samplers));
+    }
+    D3D12_CPU_DESCRIPTOR_HANDLE view = {0}, sampler_handle = {0};
+    if (r->views) view = ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(r->views);
+    if (r->samplers) sampler_handle = ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(r->samplers);
+    const UINT view_stride = ID3D12Device_GetDescriptorHandleIncrementSize(c->device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    const UINT sampler_stride = ID3D12Device_GetDescriptorHandleIncrementSize(c->device, D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
+    D3D12_RANGE empty = {0, 0};
+    for (UINT i = 0; i < buffer_count; ++i) {
+        TRY(buffer(c, buffers[i].size, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST, 0, &r->buffers[i]));
+        TRY(buffer(c, buffers[i].size, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, 0, &r->buffer_uploads[i]));
+        void *mapped;
+        TRY(ID3D12Resource_Map(r->buffer_uploads[i], 0, &empty, &mapped));
+        memcpy(mapped, buffers[i].bytes, buffers[i].size);
+        D3D12_RANGE written = {0, buffers[i].size};
+        ID3D12Resource_Unmap(r->buffer_uploads[i], 0, &written);
+        D3D12_SHADER_RESOURCE_VIEW_DESC desc = {0};
+        desc.Format = DXGI_FORMAT_R32_TYPELESS; desc.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+        desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        desc.Buffer.NumElements = (UINT)(buffers[i].size / 4); desc.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+        ID3D12Device_CreateShaderResourceView(c->device, r->buffers[i], &desc, view);
+        view.ptr += view_stride;
+    }
+    for (UINT i = 0; i < image_count; ++i) {
+        const Ps5D3D12Image *image = &images[i];
+        D3D12_RESOURCE_DESC desc = {0};
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        desc.Width = image->width; desc.Height = image->height; desc.MipLevels = desc.DepthOrArraySize = 1;
+        desc.SampleDesc.Count = 1; desc.Format = image->srgb ? DXGI_FORMAT_R8G8B8A8_UNORM_SRGB : DXGI_FORMAT_R8G8B8A8_UNORM;
+        D3D12_HEAP_PROPERTIES heap = {0}; heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+        TRY(ID3D12Device_CreateCommittedResource(c->device, &heap, 0, &desc, D3D12_RESOURCE_STATE_COPY_DEST, NULL, &IID_ID3D12Resource, (void **)&r->images[i]));
+        UINT64 size;
+        ID3D12Device_GetCopyableFootprints(c->device, &desc, 0, 1, 0, &r->footprints[i], NULL, NULL, &size);
+        TRY(buffer(c, size, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, 0, &r->image_uploads[i]));
+        void *mapped;
+        TRY(ID3D12Resource_Map(r->image_uploads[i], 0, &empty, &mapped));
+        for (UINT y = 0; y < image->height; ++y)
+            memcpy((uint8_t *)mapped + r->footprints[i].Offset + (size_t)y * r->footprints[i].Footprint.RowPitch,
+                image->pixels + (size_t)y * image->width * 4, (size_t)image->width * 4);
+        D3D12_RANGE written = {0, (SIZE_T)size};
+        ID3D12Resource_Unmap(r->image_uploads[i], 0, &written);
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv = {0};
+        srv.Format = desc.Format; srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        srv.Shader4ComponentMapping = image->components; srv.Texture2D.MipLevels = 1;
+        ID3D12Device_CreateShaderResourceView(c->device, r->images[i], &srv, view);
+        view.ptr += view_stride;
+        D3D12_SAMPLER_DESC sampler = {0};
+        sampler.Filter = image->filter; sampler.AddressU = image->address_u; sampler.AddressV = image->address_v; sampler.AddressW = image->address_w;
+        sampler.MinLOD = image->min_lod; sampler.MaxLOD = image->max_lod; sampler.MipLODBias = image->lod_bias;
+        sampler.MaxAnisotropy = 1; sampler.ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+        memcpy(sampler.BorderColor, image->border, sizeof(sampler.BorderColor));
+        ID3D12Device_CreateSampler(c->device, &sampler, sampler_handle);
+        sampler_handle.ptr += sampler_stride;
+    }
+done:
+    return hr;
+}
+
+static void bind_graphics_resources(Ps5D3D12 *c, GraphicsResources *r, const Ps5D3D12Buffer *buffers, UINT buffer_count, UINT image_count) {
+    for (UINT i = 0; i < buffer_count; ++i) {
+        ID3D12GraphicsCommandList_CopyBufferRegion(c->commands, r->buffers[i], 0, r->buffer_uploads[i], 0, buffers[i].size);
+        transition(c, r->buffers[i], D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    }
+    for (UINT i = 0; i < image_count; ++i) {
+        D3D12_TEXTURE_COPY_LOCATION source = {0}, destination = {0};
+        source.pResource = r->image_uploads[i]; source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; source.PlacedFootprint = r->footprints[i];
+        destination.pResource = r->images[i]; destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        ID3D12GraphicsCommandList_CopyTextureRegion(c->commands, &destination, 0, 0, 0, &source, NULL);
+        transition(c, r->images[i], D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    }
+    if (r->views) {
+        ID3D12DescriptorHeap *heaps[2] = {r->views, r->samplers};
+        ID3D12GraphicsCommandList_SetDescriptorHeaps(c->commands, image_count ? 2 : 1, heaps);
+        D3D12_GPU_DESCRIPTOR_HANDLE view = ID3D12DescriptorHeap_GetGPUDescriptorHandleForHeapStart(r->views);
+        UINT parameter = 1;
+        if (buffer_count) ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(c->commands, parameter++, view);
+        view.ptr += (UINT64)buffer_count * ID3D12Device_GetDescriptorHandleIncrementSize(c->device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        if (image_count) {
+            ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(c->commands, parameter++, view);
+            ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(c->commands, parameter, ID3D12DescriptorHeap_GetGPUDescriptorHandleForHeapStart(r->samplers));
+        }
+    }
+}
+
 int32_t ps5_d3d12_draw_spirv(Ps5D3D12 *c, const uint32_t *vertex, size_t vertex_count,
-    const uint32_t *fragment, size_t fragment_count, const Ps5D3D12Draw *d, const uint8_t *indices, size_t index_bytes, uint8_t *rgba) {
+    const uint32_t *fragment, size_t fragment_count, const Ps5D3D12Draw *d, const uint8_t *indices, size_t index_bytes,
+    const Ps5D3D12Buffer *buffers, uint32_t buffer_count, const Ps5D3D12Image *images, uint32_t image_count, uint8_t *rgba) {
     if (!c || !vertex || !fragment || vertex_count < 5 || fragment_count < 5 || !d || !rgba ||
         !d->width || !d->height || d->width > 16384 || d->height > 16384 || (!d->vertex_count && !d->index_count) || !d->instance_count ||
         (d->topology != D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST && d->topology != D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP) ||
@@ -689,14 +823,20 @@ int32_t ps5_d3d12_draw_spirv(Ps5D3D12 *c, const uint32_t *vertex, size_t vertex_
             (uint64_t)d->index_count * d->index_element_bytes != index_bytes || index_bytes > 64u * 1024u * 1024u) return E_INVALIDARG;
     } else if (index_bytes || d->index_element_bytes || d->primitive_restart) return E_INVALIDARG;
     if (d->primitive_restart > 1 || (d->primitive_restart && d->topology != D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP)) return E_INVALIDARG;
+    if (buffer_count > 64 || image_count > 32 || (buffer_count && !buffers) || (image_count && !images)) return E_INVALIDARG;
+    for (UINT i = 0; i < buffer_count; ++i) if (!buffers[i].bytes || !buffers[i].size || buffers[i].size % 4 || buffers[i].size > 256u * 1024u * 1024u) return E_INVALIDARG;
+    for (UINT i = 0; i < image_count; ++i) if (!images[i].pixels || !images[i].width || !images[i].height || images[i].width > 16384 || images[i].height > 16384 ||
+        (uint64_t)images[i].width * images[i].height * 4 != images[i].size) return E_INVALIDARG;
     HRESULT hr;
+    GraphicsResources resources = {0};
     ID3DBlob *vs = NULL, *ps = NULL;
     ID3D12RootSignature *root = NULL;
     ID3D12PipelineState *pipeline = NULL;
     ID3D12Resource *color = NULL, *upload = NULL, *readback = NULL, *index_upload = NULL;
-    TRY(compile_spirv(c, vertex, vertex_count, SpvExecutionModelVertex, 0, &vs));
-    TRY(compile_spirv(c, fragment, fragment_count, SpvExecutionModelFragment, 0, &ps));
-    TRY(guest_graphics_root(c, &root));
+    TRY(compile_spirv(c, vertex, vertex_count, SpvExecutionModelVertex, buffer_count, image_count, &vs));
+    TRY(compile_spirv(c, fragment, fragment_count, SpvExecutionModelFragment, buffer_count, image_count, &ps));
+    TRY(guest_graphics_root(c, buffer_count, image_count, &root));
+    TRY(prepare_graphics_resources(c, &resources, buffers, buffer_count, images, image_count));
     D3D12_GRAPHICS_PIPELINE_STATE_DESC pipeline_desc = graphics_desc(root, vs, ps, 0);
     pipeline_desc.RasterizerState.CullMode = d->cull_mode;
     pipeline_desc.RasterizerState.FrontCounterClockwise = d->front_ccw != 0;
@@ -742,6 +882,7 @@ int32_t ps5_d3d12_draw_spirv(Ps5D3D12 *c, const uint32_t *vertex, size_t vertex_
     ID3D12GraphicsCommandList_SetGraphicsRootSignature(c->commands, root);
     const uint32_t base_values[2] = {d->index_count ? (uint32_t)d->base_vertex : d->first_vertex, d->first_instance};
     ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(c->commands, 0, 2, base_values, 0);
+    bind_graphics_resources(c, &resources, buffers, buffer_count, image_count);
     ID3D12GraphicsCommandList_OMSetRenderTargets(c->commands, 1, &view, FALSE, NULL);
     D3D12_VIEWPORT viewport = {d->viewport[0], d->viewport[1], d->viewport[2], d->viewport[3], d->viewport[4], d->viewport[5]};
     D3D12_RECT scissor = {d->scissor[0], d->scissor[1], d->scissor[2], d->scissor[3]};
@@ -763,6 +904,9 @@ int32_t ps5_d3d12_draw_spirv(Ps5D3D12 *c, const uint32_t *vertex, size_t vertex_
     for (UINT y = 0; y < d->height; ++y) memcpy(rgba + (size_t)y * d->width * 4, (uint8_t *)mapped + footprint.Offset + (size_t)y * footprint.Footprint.RowPitch, (size_t)d->width * 4);
     ID3D12Resource_Unmap(readback, 0, &empty);
 done:
+    for (UINT i = 0; i < buffer_count; ++i) { retire(c, resources.buffer_uploads[i]); retire(c, resources.buffers[i]); }
+    for (UINT i = 0; i < image_count; ++i) { retire(c, resources.image_uploads[i]); retire(c, resources.images[i]); }
+    retire(c, resources.samplers); retire(c, resources.views);
     retire(c, index_upload); retire(c, readback); retire(c, upload); retire(c, color); retire(c, pipeline); retire(c, root); release(ps); release(vs);
     return hr;
 }
