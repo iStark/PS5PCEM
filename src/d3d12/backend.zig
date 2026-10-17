@@ -8,6 +8,7 @@ const std = @import("std");
 const gpu = @import("gpu");
 const rdna2 = @import("rdna2");
 const native = @import("root.zig");
+const graphics = @import("graphics.zig");
 
 pub const Memory = struct {
     context: ?*anyopaque,
@@ -75,8 +76,47 @@ pub const Renderer = struct {
     fn drawCallback(context: ?*anyopaque, state: *const gpu.State, packet: gpu.pm4.Packet) bool {
         const self = from(context);
         if (self.failure != null) return false;
-        self.draw(state, packet) catch |err| return self.rejected("draw", err);
+        self.draw(state, packet) catch |err| {
+            self.reportDraw(state, packet);
+            return self.rejected("draw", err);
+        };
         return true;
+    }
+    fn reportDraw(self: *Renderer, state: *const gpu.State, packet: gpu.pm4.Packet) void {
+        std.debug.print("[d3d12 draw] op=0x{x} body={any} stages=0x{x} gs_mode=0x{x} primitive={d}\n", .{
+            packet.opcode,                                packet.body,                                  state.readRegister(.context, 0x2d5) orelse 0,
+            state.readRegister(.context, 0x290) orelse 0, state.readRegister(.uconfig, 0x242) orelse 4,
+        });
+        const render = gpu.resources.decodeRenderState(state);
+        std.debug.print("[d3d12 render] colors={d} depth_test={any} depth_write={any} stencil={any} blend={any}\n", .{
+            render.color_count,                   render.depth_control.test_enabled, render.depth_control.write_enabled,
+            render.depth_control.stencil_enabled, render.blends[0].enabled,
+        });
+        if (render.color_targets[0]) |target| std.debug.print("[d3d12 target] {d}x{d} pitch={d} format={d}/{d} tile={s} samples={d} fragments={d}\n", .{
+            target.width, target.height, target.pitch, target.format, target.number_type, @tagName(target.tile_mode), target.samples_log2, target.fragments_log2,
+        });
+        const active = graphics.routing(state) catch null;
+        for ([_]gpu.resources.ShaderStage{ .vertex, .export_shader, .geometry, .hull, .pixel }) |stage| {
+            if (active) |routing| if (stage != routing.stage and stage != .pixel) continue;
+            const address = stage.programAddress(state) orelse continue;
+            const bindings = gpu.ShaderBindings.capture(state, stage, null, self.reader()) catch continue;
+            const bank = bindings.user_data_stage;
+            std.debug.print("[d3d12 shader] stage={s} user_bank={s} address=0x{x} rsrc1=0x{x} rsrc2=0x{x}\n", .{
+                @tagName(stage),                                               @tagName(bank), address, state.readRegister(.shader, bank.userDataBase() - 2) orelse 0,
+                state.readRegister(.shader, bank.userDataBase() - 1) orelse 0,
+            });
+            var analysis = gpu.shader_analysis.decode(self.allocator, self.reader(), address, 4096) catch |err| {
+                std.debug.print("[d3d12 shader] decode failed: {s}\n", .{@errorName(err)});
+                continue;
+            };
+            defer analysis.deinit(self.allocator);
+            for (analysis.program.instructions.items[0..@min(32, analysis.program.instructions.items.len)]) |inst| {
+                std.debug.print("  0x{x}: {s} dst={s}{d} src={s}{d},{s}{d}\n", .{
+                    inst.pc,                  @tagName(inst.opcode), @tagName(inst.dst.kind),  inst.dst.reg,
+                    @tagName(inst.src0.kind), inst.src0.reg,         @tagName(inst.src1.kind), inst.src1.reg,
+                });
+            }
+        }
     }
     fn flipCallback(context: ?*anyopaque, flip: gpu.state.Flip) bool {
         const self = from(context);
@@ -175,9 +215,7 @@ pub const Renderer = struct {
     pub fn draw(self: *Renderer, state: *const gpu.State, packet: gpu.pm4.Packet) !void {
         const args = try DrawArguments.decode(state, packet);
         if (args.count == 0 or state.instance_count == 0) return;
-        for ([_]gpu.resources.ShaderStage{ .export_shader, .geometry, .hull }) |stage| {
-            if (stage.programAddress(state) != null) return error.AdvancedGraphicsStagesNotImplemented;
-        }
+        const routing = try graphics.routing(state);
         const render = gpu.resources.decodeRenderState(state);
         const target = render.color_targets[0] orelse return error.MissingColorTarget;
         if (render.color_count != 1 or render.depth_control.test_enabled or render.depth_control.write_enabled or render.depth_control.stencil_enabled or render.depth_control.clear_enabled or render.depth_control.stencil_clear_enabled or render.blends[0].enabled) return error.DepthBlendAndMultipleTargetsNotImplemented;
@@ -200,7 +238,7 @@ pub const Renderer = struct {
             draw_state.viewport = .{ vp.x_offset - vp.x_scale, vp.y_offset + vp.y_scale, vp.x_scale * 2, -vp.y_scale * 2, if (render.raster.zero_to_one_depth) vp.z_offset else vp.z_offset - vp.z_scale, vp.z_offset + vp.z_scale };
         }
         if (render.scissor) |scissor| draw_state.scissor = .{ scissor.left, scissor.top, scissor.right, scissor.bottom };
-        const vs_bindings = try gpu.ShaderBindings.capture(state, .vertex, null, self.reader());
+        const vs_bindings = try gpu.ShaderBindings.capture(state, routing.stage, null, self.reader());
         const ps_bindings = try gpu.ShaderBindings.capture(state, .pixel, null, self.reader());
         var vs = try gpu.shader_analysis.decode(self.allocator, self.reader(), vs_bindings.program_address, 4096);
         defer vs.deinit(self.allocator);
@@ -215,9 +253,18 @@ pub const Renderer = struct {
         };
         var vs_scalar: [64]rdna2.spirv.ScalarRegister = undefined;
         var ps_scalar: [64]rdna2.spirv.ScalarRegister = undefined;
-        var vertex = try vs.translateSpirv(self.allocator, .{ .stage = .vertex, .program_address = vs_bindings.program_address, .vertex_index_vgpr = 5, .convert_negative_one_to_one_depth = !render.raster.zero_to_one_depth, .scalar_registers = vs_scalar[0..entryScalars(vs_bindings, &vs_scalar)], .allow_control_flow_fallback = false });
+        var vs_scalar_count = entryScalars(vs_bindings, &vs_scalar);
+        if (routing.stage == .export_shader) {
+            // NGG USER_DATA comes from the GS bank at s8. s3 contains the
+            // live ES/GS counts; it must not receive USER_DATA[3] or zero.
+            // The shared vertex lowering handles one live vertex per host
+            // invocation and uses full-wave counts for the merged prologue.
+            vs_scalar[vs_scalar_count] = .{ .register = 3, .value = if (routing.vertex_wave32) 0x2020 else 0x4040 };
+            vs_scalar_count += 1;
+        }
+        var vertex = try vs.translateSpirv(self.allocator, .{ .stage = .vertex, .wave32 = routing.vertex_wave32, .program_address = vs_bindings.program_address, .vertex_index_vgpr = 5, .convert_negative_one_to_one_depth = !render.raster.zero_to_one_depth, .scalar_registers = vs_scalar[0..vs_scalar_count], .allow_control_flow_fallback = false });
         defer vertex.deinit(self.allocator);
-        var fragment = try ps.translateSpirv(self.allocator, .{ .stage = .fragment, .program_address = ps_bindings.program_address, .fragment_extent = .{ target.width, target.height }, .scalar_registers = ps_scalar[0..entryScalars(ps_bindings, &ps_scalar)], .allow_control_flow_fallback = false });
+        var fragment = try ps.translateSpirv(self.allocator, .{ .stage = .fragment, .wave32 = routing.fragment_wave32, .program_address = ps_bindings.program_address, .fragment_extent = .{ target.width, target.height }, .scalar_registers = ps_scalar[0..entryScalars(ps_bindings, &ps_scalar)], .allow_control_flow_fallback = false });
         defer fragment.deinit(self.allocator);
         if (vertex.used_dispatcher or fragment.used_dispatcher) return error.UnboundedControlFlowNotImplemented;
         const pixels = try self.readLinear(target.address, target.width, target.height, target.pitch);

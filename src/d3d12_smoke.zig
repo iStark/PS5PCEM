@@ -150,6 +150,48 @@ fn guestCommandProbe(allocator: std.mem.Allocator, vertex_words: []const u32, pi
         }
     }
     const before = memory.data;
+    // Use the actual Raiden routing (ES program / GS USER_DATA / NGG
+    // passthrough), with a deliberately stale legacy VS bank. The shader
+    // consumes USER_DATA[0] at s8 and merged wave info at s3; either wrong bank
+    // or missing ABI seed changes the complete raster image.
+    for ([_]bool{ false, true }) |wave32| {
+        const wave_info: f32 = if (wave32) 0x2020 else 0x4040;
+        var merged: std.ArrayList(u32) = .empty;
+        defer merged.deinit(allocator);
+        // Same merged-wave prologue shape as the failed Raiden draw: unpack
+        // s3, allocate primitives, narrow EXEC for primitive/vertex exports.
+        try merged.appendSlice(allocator, &.{
+            sop2(0x27, 107, 3, 255),   0x80008,
+            sop2(0x0e, 0, 3, 255),     0xff,
+            sop2(0x1e, 106, 107, 136), sop2(0x10, 124, 0, 106),
+            0xbf900009,                sop2(0x03, 106, 128, 107),
+            sop2(0x21, 126, 193, 106), 0xf8000141,
+            0,                         sop2(0x03, 106, 128, 0),
+            sop2(0x21, 126, 193, 106),
+        });
+        try merged.appendSlice(allocator, &.{
+            vop1(0x05, 9, 3),          vop1(0x01, 10, 255),
+            @bitCast(1.0 / wave_info), vop2(0x08, 9, 9, 10),
+        });
+        try merged.appendSlice(allocator, vertex_words[0..4]);
+        try merged.appendSlice(allocator, &.{ vop1(0x01, 4, 8), vop2(0x08, 4, 4, 9) });
+        try merged.appendSlice(allocator, vertex_words[6..]);
+        @memcpy(memory.data[0x800..][0 .. merged.items.len * 4], std.mem.sliceAsBytes(merged.items));
+        @memcpy(memory.data[0x2000..], initial[0x2000..]);
+        try state.writeRegister(.shader, 0x0c8, 8);
+        try state.writeRegister(.shader, 0x0c9, 0);
+        try state.writeRegister(.shader, 0x08b, 2); // One GS user SGPR.
+        try state.writeRegister(.shader, 0x08c, @bitCast(@as(f32, 0.75)));
+        try state.writeRegister(.shader, 0x0cb, 2);
+        try state.writeRegister(.shader, 0x0cc, 0); // Wrong bank yields a degenerate triangle.
+        try state.writeRegister(.shader, 0x048, 0x70); // Wrong program bank cannot decode.
+        try state.writeRegister(.context, 0x2d5, 0x02002000 | @as(u32, if (wave32) 1 << 22 else 0));
+        _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 2 });
+        if (!std.mem.eql(u8, memory.data[0x2000..], before[0x2000..])) return error.Pm4MergedVertexAbiMismatch;
+    }
+    try state.writeRegister(.context, 0x2d5, 0);
+    try state.writeRegister(.shader, 0x048, 2);
+    // ES remains populated: switching back to legacy VS must ignore it.
     // Each indexed path must reproduce the complete auto-index image, including
     // untouched row padding. Large 32-bit values exercise signed base-vertex
     // addition; prefix values exercise INDEX_BASE + DRAW_INDEX_OFFSET_2.
@@ -219,6 +261,7 @@ fn guestCommandProbe(allocator: std.mem.Allocator, vertex_words: []const u32, pi
     const backend = renderer.dcbBackend();
     if (backend.vtable.write(backend.context, 0x1200, &.{ 1, 2, 3, 4 })) return error.FailedSubmissionPublishedLabel;
     std.debug.print("PASS PM4 compute/draw -> D3D12 -> guest memory, pitched target and shader mask\nPASS indexed 8/16/32-bit draws, base vertex, index offsets, strip restart and zero count; invalid bounds stop the queue\n", .{});
+    std.debug.print("PASS NGG passthrough vertex routing, GS USER_DATA, wave32/wave64 system registers and stale-bank isolation\n", .{});
 }
 
 fn command(opcode: u8, body_words: u14) u32 {
@@ -227,6 +270,9 @@ fn command(opcode: u8, body_words: u14) u32 {
 
 fn vop1(op: u8, dst: u8, src: u16) u32 {
     return (@as(u32, 0x3f) << 25) | (@as(u32, dst) << 17) | (@as(u32, op) << 9) | src;
+}
+fn sop2(op: u7, dst: u7, src0: u8, src1: u8) u32 {
+    return 0x80000000 | (@as(u32, op) << 23) | (@as(u32, dst) << 16) | (@as(u32, src1) << 8) | src0;
 }
 fn vop2(op: u8, dst: u8, src0: u8, src1: u8) u32 {
     return (@as(u32, op) << 25) | (@as(u32, dst) << 17) | (@as(u32, src1) << 9) | (@as(u32, src0) + 256);

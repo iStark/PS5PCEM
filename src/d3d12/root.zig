@@ -8,6 +8,11 @@ const std = @import("std");
 const builtin = @import("builtin");
 pub const backend = @import("backend.zig");
 pub const Renderer = backend.Renderer;
+pub const graphics = @import("graphics.zig");
+
+test {
+    _ = graphics;
+}
 
 const Handle = opaque {};
 pub const Buffer = extern struct {
