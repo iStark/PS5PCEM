@@ -157,6 +157,8 @@ fn traceColorPublication(target: GuestColorTarget) bool {
 // the frame. Naming them is the only way to tell an unavoidable one from a
 // surface the sampler could have read in place.
 pub export var trace_materialized_targets: bool = false;
+pub export var preflight_storage_overwrite_readbacks: bool = true;
+pub export var storage_readback_copies_avoided: u64 = 0;
 pub export var share_compute_resource_walks: bool = true;
 pub export var single_level_compute_detile: bool = true;
 pub export var native_color_initialization_clear: bool = true;
@@ -275,6 +277,7 @@ pub const NativeWindow = struct {
 };
 
 pub const Options = struct {
+    sampled_update_after_bind: bool = true,
     enable_validation: bool = builtin.mode == .Debug,
     /// Diagnostic-only fixed shaders used to prove the DCB graphics submission
     /// and color-target path before guest vertex/pixel lowering is connected.
@@ -586,6 +589,7 @@ pub const DispatchReport = struct {
 };
 
 const external_host = @import("external_host.zig");
+const descriptor_indexing = @import("descriptor_indexing.zig");
 pub const GuestMemory = struct {
     pub const HostMapping = external_host.Mapping;
     pub const HostSource = external_host.Source;
@@ -1181,6 +1185,8 @@ const dynamic_scalar_buffer_bytes = dynamic_scalar_buffer_words * @sizeOf(u32);
 /// Larger frames are split only when this ring wraps. Keep enough slots for
 /// draw-heavy 2D titles such as Jets 'n' Guns 2, which regularly exceeds 256
 /// draws in one guest frame.
+pub export var retain_compatible_render_passes: bool = true;
+pub export var retained_render_pass_draws: u64 = 0;
 const maximum_frame_descriptor_sets = 512;
 const descriptor_scalar_stride = std.mem.alignForward(usize, dynamic_scalar_buffer_bytes, 256);
 const descriptor_scalar_ring_bytes = descriptor_scalar_stride * maximum_frame_descriptor_sets;
@@ -6036,6 +6042,7 @@ pub const Renderer = struct {
     pending_command_buffers: std.ArrayList(vk.CommandBuffer) = .empty,
     pending_command_slots: std.ArrayList(usize) = .empty,
     recording_command_buffer: ?vk.CommandBuffer = null,
+    recording_render_pass: ?struct { pass: vk.RenderPass, framebuffer: vk.Framebuffer, width: u32, height: u32 } = null,
     recording_graphics_pipeline: vk.Pipeline = 0,
     recording_graphics_state: ?GraphicsPipelineState = null,
     recording_started_ns: u64 = 0,
@@ -6809,6 +6816,14 @@ pub const Renderer = struct {
         instance_functions.get_physical_device_features_2(candidate.physical_device, &supported_features_2);
         if (timeline_support.timeline_semaphore == 0) return Error.TimelineSemaphoreUnavailable;
         const descriptor_partially_bound = descriptor_indexing_support.descriptor_binding_partially_bound != 0;
+        var descriptor_limits = descriptor_indexing.Properties{};
+        {
+            const get_properties = try loader.instance(instance_handle, external_host.GetProperties2, "vkGetPhysicalDeviceProperties2");
+            var properties = external_host.Properties2{ .p_next = &descriptor_limits };
+            get_properties(candidate.physical_device, &properties);
+        }
+        const sampled_update_after_bind = options.sampled_update_after_bind and descriptor_indexing_support.descriptor_binding_sampled_image_update_after_bind != 0 and
+            descriptor_limits.fits(@as(u64, candidate.info.sampled_image_capacity) * rdna2.spirv.sampled_image_bank_count, maximum_storage_descriptors + 3, maximum_storage_images, maximum_frame_descriptor_sets);
         const sampled_image_nonuniform_indexing = descriptor_indexing_support.shader_sampled_image_array_non_uniform_indexing != 0;
         const storage_buffer_nonuniform_indexing = descriptor_indexing_support.shader_storage_buffer_array_non_uniform_indexing != 0;
         const image_float32_atomic_min_max = shader_atomic_float2_extension and
@@ -6868,11 +6883,12 @@ pub const Renderer = struct {
         var descriptor_indexing_enable = vk.PhysicalDeviceDescriptorIndexingFeatures{
             .p_next = if (image_float32_atomic_min_max) &shader_atomic_float2_enable else if (fragment_barycentric) &barycentric_enable else null,
             .descriptor_binding_partially_bound = if (descriptor_partially_bound) vk.true_value else 0,
+            .descriptor_binding_sampled_image_update_after_bind = if (sampled_update_after_bind) vk.true_value else 0,
             .shader_sampled_image_array_non_uniform_indexing = if (sampled_image_nonuniform_indexing) vk.true_value else 0,
             .shader_storage_buffer_array_non_uniform_indexing = if (storage_buffer_nonuniform_indexing) vk.true_value else 0,
         };
         var timeline_enable = vk.PhysicalDeviceTimelineSemaphoreFeatures{
-            .p_next = if (descriptor_partially_bound or sampled_image_nonuniform_indexing or storage_buffer_nonuniform_indexing)
+            .p_next = if (descriptor_partially_bound or sampled_image_nonuniform_indexing or storage_buffer_nonuniform_indexing or sampled_update_after_bind)
                 &descriptor_indexing_enable
             else if (image_float32_atomic_min_max)
                 &shader_atomic_float2_enable
@@ -7078,6 +7094,12 @@ pub const Renderer = struct {
         if (descriptor_partially_bound) {
             @memset(&descriptor_binding_flags, vk.descriptor_binding_partially_bound_bit);
         }
+        // Large typed image banks need not be copied by the driver on every
+        // vkCmdBindDescriptorSets. Their slots remain immutable until the
+        // owning submission completes, including on the update-after-bind path.
+        if (sampled_update_after_bind) for (descriptor_bindings, &descriptor_binding_flags) |binding, *flags| {
+            if (binding.descriptor_type == vk.descriptor_type_combined_image_sampler) flags.* |= vk.descriptor_binding_update_after_bind_bit;
+        };
         if (tessellation_shaders) {
             for (&descriptor_bindings) |*binding| {
                 if (binding.stage_flags & vk.shader_stage_vertex_bit != 0)
@@ -7090,7 +7112,8 @@ pub const Renderer = struct {
             .binding_flags = &descriptor_binding_flags,
         };
         const descriptor_layout_info = vk.DescriptorSetLayoutCreateInfo{
-            .p_next = if (descriptor_partially_bound) &descriptor_binding_flags_info else null,
+            .p_next = if (descriptor_partially_bound or sampled_update_after_bind) &descriptor_binding_flags_info else null,
+            .flags = if (sampled_update_after_bind) vk.descriptor_set_layout_create_update_after_bind_pool_bit else 0,
             .binding_count = descriptor_bindings.len,
             .bindings = &descriptor_bindings,
         };
@@ -7114,6 +7137,7 @@ pub const Renderer = struct {
         };
         const pool_sizes = [_]vk.DescriptorPoolSize{ pool_size, image_pool_size, storage_image_pool_size };
         const descriptor_pool_info = vk.DescriptorPoolCreateInfo{
+            .flags = if (sampled_update_after_bind) vk.descriptor_pool_create_update_after_bind_bit else 0,
             .max_sets = maximum_frame_descriptor_sets,
             .pool_size_count = pool_sizes.len,
             .pool_sizes = &pool_sizes,
@@ -12094,7 +12118,7 @@ pub const Renderer = struct {
                 memory.write(memory.context, descriptor.address, bytes);
             if (!written) return Error.GuestMemoryWriteFailed;
             self.invalidateDmaDestination(descriptor.address, byte_count);
-            try self.applyUniformDepthWrite(descriptor.address, bytes);
+            try self.applyKnownUniformDepthWrite(descriptor.address, byte_count, value);
             try self.applyUniformHtileWrite(descriptor.address, bytes);
             try self.applyUniformDccWrite(descriptor.address, bytes);
             // Keep the complete native write, including padding. A later
@@ -18263,6 +18287,16 @@ pub const Renderer = struct {
         return true;
     }
 
+    fn applyKnownUniformDepthWrite(self: *Renderer, address: u64, bytes: usize, word: u32) anyerror!void {
+        const depth: f32 = @bitCast(word);
+        if (!std.math.isFinite(depth) or depth < 0 or depth > 1) return;
+        for (self.depth_targets.items, 0..) |cached, index| {
+            const size = rawDepthFillBytes(cached.target) orelse continue;
+            if (!byteRangeContains(address, bytes, cached.target.address, size)) continue;
+            try self.clearResidentDepth(index, depth);
+        }
+    }
+
     fn applyUniformDepthWrite(self: *Renderer, address: u64, bytes: []const u8) anyerror!void {
         for (self.depth_targets.items, 0..) |cached, index| {
             const size = rawDepthFillBytes(cached.target) orelse continue;
@@ -19268,7 +19302,18 @@ pub const Renderer = struct {
         self.frame_profile.graphics_scalar_upload_ns +|= elapsedHostNanoseconds(scalar_upload_started);
         if (report_checkpoints) std.debug.print("[vulkan dcb] first graphics draw: pipeline ready\n", .{});
         const record_started = self.resourceTimestampNs();
-        const command_buffer = try self.beginOneShot();
+        const keep_pass = @atomicLoad(bool, &retain_compatible_render_passes, .monotonic) and self.draw_batch_active and pipeline_state.programmable_blend == 0;
+        const has_extra_upload = for (extra_uploads[0..extra_colors.len]) |upload| {
+            if (upload != null) break true;
+        } else false;
+        const reuse_pass = if (self.recording_render_pass) |active|
+            keep_pass and active.pass == pass_handle and active.framebuffer == framebuffer_handle and
+                active.width == pipeline_state.width and active.height == pipeline_state.height and
+                initial_upload == null and !has_extra_upload and !depth_clear_requested
+        else
+            false;
+        if (!reuse_pass) self.endRetainedRenderPass();
+        const command_buffer = try self.beginGraphicsCommands();
         defer self.releaseOneShot(command_buffer);
 
         if (initial_upload) |upload| {
@@ -19320,9 +19365,9 @@ pub const Renderer = struct {
             }
         }
 
-        if (depth_index) |index| {
+        if (!reuse_pass) if (depth_index) |index| {
             try self.prepareDepthAttachment(command_buffer, index, depth_clear_requested);
-        }
+        };
         if (pipeline_state.programmable_blend != 0) {
             try self.copyPackedUnormFeedback(
                 command_buffer,
@@ -19343,7 +19388,10 @@ pub const Renderer = struct {
             .clear_value_count = 0,
             .clear_values = undefined,
         };
-        self.device_functions.cmd_begin_render_pass(command_buffer, &begin_info, vk.subpass_contents_inline);
+        if (!reuse_pass) {
+            self.device_functions.cmd_begin_render_pass(command_buffer, &begin_info, vk.subpass_contents_inline);
+            self.recording_render_pass = .{ .pass = pass_handle, .framebuffer = framebuffer_handle, .width = pipeline_state.width, .height = pipeline_state.height };
+        } else retained_render_pass_draws +%= 1;
         self.bindGraphicsPipeline(command_buffer, pipeline);
         self.setGraphicsDynamicState(command_buffer, pipeline_state);
         if (bind_graphics_descriptors or vertex_scalars.len != 0 or fragment_scalars.len != 0 or pipeline_state.programmable_blend != 0) {
@@ -19387,7 +19435,7 @@ pub const Renderer = struct {
                 draw.first_instance,
             );
         }
-        self.device_functions.cmd_end_render_pass(command_buffer);
+        if (!keep_pass) self.endRetainedRenderPass();
         try self.submitOneShot(command_buffer);
         if (initial_upload) |upload| upload.commit(self);
         for (extra_uploads[0..extra_colors.len]) |maybe_upload| if (maybe_upload) |upload| upload.commit(self);
@@ -22576,6 +22624,60 @@ pub const Renderer = struct {
                 try std.testing.expectEqual(@as(u8, 0), pixels[center]);
             }
         }
+    }
+
+    pub fn probeRetainedGraphicsPass(self: *Renderer) anyerror!u64 {
+        var color = std.mem.zeroes(gpu.resources.ColorTarget);
+        color.address = 0x2000;
+        color.width = 32;
+        color.height = 32;
+        color.pitch = 32;
+        color.format = 10;
+        color.tile_mode = .linear;
+        color.write_mask = 15;
+        const target = try guestColorTarget(color);
+        const color_index = try self.acquireRenderTarget(target);
+        const depth = GuestDepthTarget{
+            .address = 0x10000,
+            .allocation_bytes = 4096,
+            .width = 32,
+            .height = 32,
+            .guest_format = 3,
+            .format = vk.format_d32_sfloat,
+            .tile_mode = .linear,
+            .base_array_slice = 0,
+            .mip_level = 0,
+            .clear_depth = 1,
+        };
+        const depth_index = try self.acquireDepthTarget(depth);
+        var state = GraphicsPipelineState.default(32, 32);
+        state.depth_attachment_format = depth.format;
+        state.depth_test_enable = 1;
+        state.depth_write_enable = 1;
+        state.depth_compare_operation = 1;
+        const before = retained_render_pass_draws;
+        for ([_]f32{ 0.5, 0.75, 0.25, 0.75 }, 0..) |z, pass| {
+            state.viewport_min_depth_bits = @bitCast(z);
+            state.viewport_max_depth_bits = @bitCast(z);
+            try self.beginFrameDraw();
+            try self.drawGraphicsShaders(&graphics_probe_vertex_spirv, &graphics_probe_fragment_spirv, &.{}, &.{}, state, target, &.{}, depth, pass == 2, false, false, .{ .vertex_count = 3 });
+        }
+        if (retain_compatible_render_passes) try std.testing.expect(retained_render_pass_draws >= before + 2);
+        // Readback closes the pass and observes every preceding depth test.
+        try std.testing.expectEqual([2]f32{ 1, 0.25 }, try self.readDepthProbeValues(depth_index, false));
+        try std.testing.expect(self.recording_render_pass == null);
+        // Reopening with a smaller render area must preserve untouched pixels.
+        state.width = 16;
+        state.height = 16;
+        state.scissor_width = 16;
+        state.scissor_height = 16;
+        try self.beginFrameDraw();
+        try self.drawGraphicsShaders(&graphics_probe_vertex_spirv, &graphics_probe_fragment_spirv, &.{}, &.{}, state, target, &.{}, depth, false, false, false, .{ .vertex_count = 0 });
+        try self.readbackRenderTarget(color_index, true);
+        for (self.completed_frames.items) |frame| if (frame.target) |view| {
+            if (sameRenderTarget(view, target)) return std.hash.Wyhash.hash(0, frame.pixels.items);
+        };
+        return error.TestFailed;
     }
 
     pub fn probeDepthPassCache(self: *Renderer) anyerror!void {
@@ -28401,9 +28503,6 @@ pub const Renderer = struct {
         if (snapshot.retile_backing != null) return self.flushRetiledStorageImage(memory, cache_index);
         if (@atomicLoad(bool, &gpu_storage_retile, .monotonic) and snapshot.guest_native_baseline != null and snapshot.guest_native_coverage != null)
             return self.flushNativeStorageImage(memory, cache_index);
-        var allocation_scratch = try self.image_scratch.acquire(self.allocator, snapshot.allocation_bytes);
-        defer allocation_scratch.release();
-        const allocation = allocation_scratch.bytes;
         // A retired image can already have been replaced by the CPU. Detect
         // that before copying bytes we would discard. The page watch lets the
         // same host copy preserve padding after the wait; without that proof,
@@ -28412,6 +28511,31 @@ pub const Renderer = struct {
             if (memory.gpu_generation) |generation| generation(memory.context, snapshot.descriptor.address, snapshot.allocation_bytes) else 0
         else
             0;
+        // Full-overwrite baselines already describe every texel this image
+        // owns. Check those bytes through the native fingerprint callback
+        // before copying a backing allocation which a CPU replacement makes
+        // obsolete. Padding remains excluded by the existing coverage proof;
+        // unavailable fingerprints retain the copied observation below.
+        if (@atomicLoad(bool, &preflight_storage_overwrite_readbacks, .monotonic) and
+            observed_generation != 0 and observed_generation != snapshot.guest_page_generation and
+            !snapshot.strict_guest_backing)
+        {
+            if (snapshot.guest_native_baseline_digest) |baseline| {
+                if (self.storageOverwriteGuestDigest(memory, snapshot.descriptor.address, snapshot.guest_native_coverage.?)) |current| {
+                    self.storage_native_hash_comparisons +|= 1;
+                    if (current != baseline) {
+                        self.invalidateStorageGuestContents(cache_index);
+                        self.frame_profile.storage_discarded_readbacks +|= 1;
+                        self.frame_profile.storage_discarded_readback_bytes +|= snapshot.staging_bytes;
+                        _ = @atomicRmw(u64, &storage_readback_copies_avoided, .Add, snapshot.allocation_bytes, .monotonic);
+                        return;
+                    }
+                }
+            }
+        }
+        var allocation_scratch = try self.image_scratch.acquire(self.allocator, snapshot.allocation_bytes);
+        defer allocation_scratch.release();
+        const allocation = allocation_scratch.bytes;
         if (observed_generation != 0) {
             if (!memory.read(memory.context, snapshot.descriptor.address, allocation)) return Error.GuestMemoryReadFailed;
             if (try self.storageGuestAllocationChanged(snapshot, allocation, observed_generation)) {
@@ -29785,7 +29909,7 @@ pub const Renderer = struct {
         const memory = self.guest_memory.?;
         const use_digest = digest_storage_overwrite_baseline;
         defer digest_storage_overwrite_baseline = use_digest;
-        for (0..6) |phase| {
+        for (0..7) |phase| {
             digest_storage_overwrite_baseline = use_digest;
             const coverage_bytes = self.storage_native_coverage_bytes;
             if (phase == 5) self.storage_native_coverage_bytes = 8 * 1024 * 1024;
@@ -29870,7 +29994,7 @@ pub const Renderer = struct {
             try self.commitStorageImages(memory, resources);
             try std.testing.expect(!self.storage_image_cache.items[index].initialization_pending);
             try self.waitForSubmittedWork();
-            if (phase == 1) {
+            if (phase == 1 or phase == 6) {
                 const texel: usize = @intCast(try view.sourceByteOffset(64, 64, 0, 0));
                 expected[texel] ^= 0x7f;
                 try std.testing.expect(memory.write(memory.context, descriptor.address + texel, expected[texel..][0..1]));
@@ -29882,7 +30006,22 @@ pub const Renderer = struct {
                 for (0..linear.len / 4) |i| @memcpy(linear[i * 4 ..][0..4], &[_]u8{ 255, 0, 0, 255 });
                 try view.tile(linear, expected);
             }
+            // Retired full-overwrite output can be rejected before copying
+            // its CPU replacement. The pinned case above still exercises the
+            // post-completion observation, and padding-only writes retain GPU
+            // output in phase 2.
+            if (phase == 6) {
+                self.releaseStorageImage(index);
+                resources.storage_image_count = 0;
+            }
+            const avoided_before = storage_readback_copies_avoided;
+            const generation = if (memory.gpu_generation) |query| query(memory.context, descriptor.address, expected.len) else 0;
+            const preflight_expected = phase == 6 and expect_digest and generation != 0 and
+                generation != self.storage_image_cache.items[index].guest_page_generation and
+                preflight_storage_overwrite_readbacks and
+                (self.storageOverwriteGuestDigest(memory, descriptor.address, self.storage_image_cache.items[index].guest_native_coverage.?) != null);
             try self.flushCachedStorageImage(memory, index);
+            try std.testing.expectEqual(avoided_before + @as(u64, if (preflight_expected) expected.len else 0), storage_readback_copies_avoided);
             const actual = try self.allocator.alloc(u8, expected.len);
             defer self.allocator.free(actual);
             try std.testing.expect(memory.read(memory.context, descriptor.address, actual));
@@ -34636,7 +34775,20 @@ pub const Renderer = struct {
         return first;
     }
 
+    fn endRetainedRenderPass(self: *Renderer) void {
+        if (self.recording_render_pass == null) return;
+        self.device_functions.cmd_end_render_pass(self.recording_command_buffer.?);
+        self.recording_render_pass = null;
+    }
+
     fn beginOneShot(self: *Renderer) (Error || std.mem.Allocator.Error)!vk.CommandBuffer {
+        // Transfers, compute, image barriers and readbacks must be outside a
+        // render pass. Only the graphics path may retain a compatible pass.
+        self.endRetainedRenderPass();
+        return self.beginGraphicsCommands();
+    }
+
+    fn beginGraphicsCommands(self: *Renderer) (Error || std.mem.Allocator.Error)!vk.CommandBuffer {
         if (self.open_batch_commands) {
             if (self.recording_command_buffer) |command_buffer| return command_buffer;
         }
@@ -34675,6 +34827,7 @@ pub const Renderer = struct {
             self.recording_command_buffer.? == command_buffer)
         {
             _ = self.device_functions.reset_command_buffer(command_buffer, 0);
+            self.recording_render_pass = null;
             if (self.recording_command_slot) |slot| {
                 self.command_buffer_ticks.items[slot] = 0;
                 self.gpu_timestamp_slots[slot].active = false;
@@ -34694,6 +34847,7 @@ pub const Renderer = struct {
             return;
         };
         const slot = self.recording_command_slot orelse return Error.CommandBufferEndFailed;
+        self.endRetainedRenderPass();
         if (self.cmd_set_checkpoint) |checkpoint| checkpoint(command_buffer, @ptrFromInt((self.recording_checkpoint_program & ~@as(u64, 3)) | 2));
         if (self.gpu_timestamp_slots[slot].active) self.device_functions.cmd_write_timestamp(command_buffer, vk.pipeline_stage_bottom_of_pipe_bit, self.gpu_timestamp_pool, @intCast(slot * 2 + 1));
         if (self.device_functions.end_command_buffer(command_buffer) != vk.success) return Error.CommandBufferEndFailed;
@@ -47294,6 +47448,7 @@ test "retiring an older storage image binding preserves the current pass pin" {
     defer renderer.storage_image_cache.deinit(std.testing.allocator);
     renderer.pending_command_buffers = .empty;
     renderer.recording_command_buffer = null;
+    renderer.recording_render_pass = null;
     renderer.submitted_tick = 1;
     renderer.completed_tick = 0;
     renderer.deferred_vulkan_objects = .empty;
@@ -47632,6 +47787,7 @@ test "a descriptor reused after an intermediate flush remains reserved by queued
     defer renderer.command_buffer_ticks.deinit(std.testing.allocator);
     try renderer.command_buffer_ticks.append(std.testing.allocator, command_buffer_pending_tick);
     renderer.recording_command_buffer = @ptrFromInt(1);
+    renderer.recording_render_pass = null;
     renderer.recording_command_slot = 0;
     renderer.gpu_timestamp_slots = @splat(.{});
     renderer.cmd_set_checkpoint = null;

@@ -3843,6 +3843,37 @@ fn rememberedSdk11AcbQueue(owner: u32) u64 {
 pub export var compact_sdk11_queue_reads: bool = true;
 pub export var sdk11_stack_windows: u64 = 0;
 pub export var sdk11_stack_words_reused: u64 = 0;
+pub export var deduplicate_sdk11_queue_probes: bool = true;
+pub export var sdk11_queue_probes_avoided: u64 = 0;
+
+/// Registers and overlapping stack windows often contain the same non-queue
+/// pointers. Observe a failed candidate once per publication, for this owner
+/// only. No negative result survives the search. Successful queue reads remain
+/// live because their generation and command range can advance independently.
+const Sdk11QueueProbe = struct {
+    owner: u32,
+    enabled: bool,
+    failed: [64]u64 = @splat(0),
+    repeats: u64 = 0,
+
+    fn slot(address: u64) usize {
+        return @intCast(((address ^ (address >> 17)) *% 0x9e3779b97f4a7c15) >> 58);
+    }
+
+    fn read(self: *Sdk11QueueProbe, address: u64) ?Sdk11AcbQueue {
+        if (address == 0) return null;
+        const index = slot(address);
+        if (self.enabled and self.failed[index] == address) {
+            self.repeats += 1;
+            return null;
+        }
+        const queue = sdk11AcbQueueAt(address, self.owner);
+        // Exact address tags make collisions cost a new checked read rather
+        // than suppress a different, potentially valid queue object.
+        if (self.enabled and queue == null) self.failed[index] = address;
+        return queue;
+    }
+};
 
 /// Queue objects contain CPU self-pointers, not compact GPU addresses. Borrow
 /// the exact CPU mapping once instead of validating and then validating again
@@ -3906,9 +3937,13 @@ fn publishSdk11AcbDriverGeneration(
     };
     var found: ?Sdk11AcbQueue = null;
     var queue_address: u64 = 0;
+    var probe = Sdk11QueueProbe{ .owner = owner, .enabled = @atomicLoad(bool, &deduplicate_sdk11_queue_probes, .monotonic) };
+    defer if (probe.repeats != 0) {
+        _ = @atomicRmw(u64, &sdk11_queue_probes_avoided, .Add, probe.repeats, .monotonic);
+    };
     for (candidates) |candidate| {
         if (candidate == 0) continue;
-        const q = sdk11AcbQueueAt(candidate, owner);
+        const q = probe.read(candidate);
         if (q) |queue| {
             if (release == null and !sdk11AcbContainsSubmission(queue, stream_address, submission.word_count)) continue;
             found = queue;
@@ -3930,7 +3965,7 @@ fn publishSdk11AcbDriverGeneration(
                     std.math.add(u64, base, @intCast(offset)) catch continue;
                 if (spill == 0) continue;
                 const candidate = window.word(spill) orelse continue;
-                const q = sdk11AcbQueueAt(candidate, owner);
+                const q = probe.read(candidate);
                 if (q) |queue| {
                     if (release == null and !sdk11AcbContainsSubmission(queue, stream_address, submission.word_count)) continue;
                     found = queue;
@@ -5643,6 +5678,47 @@ test "synchronous AGC completion advances a paired CPU retirement label" {
         84,
         0,
     ) == null);
+}
+
+test "SDK11 queue probes retain collisions, live queues and fresh publication reads" {
+    var space = try guest_address_space.AddressSpace.init(testing.allocator);
+    defer space.deinit();
+    memory.attachAddressSpace(&space);
+    defer memory.attachAddressSpace(null);
+    const address = guest_address_space.user.start;
+    try space.mapFixed(address, guest_address_space.page_size * 2, .read_write, .private, null);
+    var other = address + 0x100;
+    while (Sdk11QueueProbe.slot(other) != Sdk11QueueProbe.slot(address)) : (other += 0x100) {}
+    try testing.expect(other + 0xe8 <= address + guest_address_space.page_size * 2);
+    for ([_]bool{ false, true }) |enabled| {
+        var invalid: [0xe8]u8 = @splat(0);
+        try space.write(address, &invalid);
+        var bytes: [0xe8]u8 = @splat(0);
+        for ([_]usize{ 0x28, 0x80, 0x88 }) |offset|
+            std.mem.writeInt(u64, bytes[offset..][0..8], other, .little);
+        std.mem.writeInt(u32, bytes[0xd0..0xd4], 1, .little);
+        std.mem.writeInt(u32, bytes[0xd4..0xd8], 3, .little);
+        try space.write(other, &bytes);
+        var probe = Sdk11QueueProbe{ .owner = 0x20, .enabled = enabled };
+        try testing.expect(probe.read(0) == null);
+        try testing.expect(probe.read(address) == null);
+        try testing.expect(probe.read(address) == null);
+        try testing.expectEqual(@as(u64, if (enabled) 1 else 0), probe.repeats);
+        // A colliding positive candidate must be fully checked, and its live
+        // generation must still be refreshed on subsequent reads.
+        try testing.expectEqual(@as(u32, 1), probe.read(other).?.generation);
+        try space.writeInt(u32, other + 0xd0, 7);
+        try testing.expectEqual(@as(u32, 7), probe.read(other).?.generation);
+        // Reusing a failed pointer in a later publication must discover the
+        // new queue, with no stale negative entry inherited from this search.
+        for ([_]usize{ 0x28, 0x80, 0x88 }) |offset|
+            std.mem.writeInt(u64, bytes[offset..][0..8], address, .little);
+        try space.write(address, &bytes);
+        var next = Sdk11QueueProbe{ .owner = 0x20, .enabled = enabled };
+        try testing.expectEqual(@as(u32, 1), next.read(address).?.generation);
+        var different_owner = Sdk11QueueProbe{ .owner = 0x28, .enabled = enabled };
+        try testing.expect(different_owner.read(address) == null);
+    }
 }
 
 test "SDK11 stack windows preserve boundary fallback and refresh CPU bytes" {

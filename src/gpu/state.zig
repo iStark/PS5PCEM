@@ -23,10 +23,12 @@ fn RegisterFile(comptime count: usize) type {
         values: [count]u32 = [_]u32{0} ** count,
         written: [count]bool = [_]bool{false} ** count,
 
-        fn write(self: *@This(), offset: u32, value: u32) Error!void {
+        fn write(self: *@This(), offset: u32, value: u32) Error!bool {
             if (offset >= count) return Error.RegisterOutOfRange;
+            const changed = !self.written[offset] or self.values[offset] != value;
             self.values[offset] = value;
             self.written[offset] = true;
+            return changed;
         }
 
         fn read(self: *const @This(), offset: u32) ?u32 {
@@ -317,19 +319,21 @@ pub const State = struct {
     rewind_abandoned_count: u64 = 0,
 
     pub fn writeRegister(self: *State, space: pm4.RegisterSpace, offset: u32, value: u32) Error!void {
-        switch (space) {
+        const changed = switch (space) {
             .config => try self.config.write(offset, value),
             .context => try self.context.write(offset, value),
             .shader => try self.shader.write(offset, value),
             .uconfig => try self.uconfig.write(offset, value),
-        }
+        };
         const bank: usize = switch (space) {
             .config => 0,
             .context => 1,
             .shader => 2,
             .uconfig => 3,
         };
-        self.snapshot_versions[bank] +|= 1;
+        // Register writes still count, but immutable draw snapshots only need
+        // a new bank when its observable value (including written-zero) changed.
+        if (changed) self.snapshot_versions[bank] +|= 1;
         self.register_writes += 1;
     }
 
@@ -472,6 +476,32 @@ test "clearing register state does not erase submission statistics" {
     try testing.expectEqual(@as(u32, 0), gpu_state.index_buffer_size);
     try testing.expectEqual(@as(u64, 0), gpu_state.draw_indirect_args_base_address);
     try testing.expectEqual(@as(u64, 0), gpu_state.dispatch_indirect_args_base_address);
+}
+
+test "identical register writes retain snapshots while first zero and clear remain observable" {
+    var source = State{};
+    var snapshot: State = undefined;
+    _ = snapshot.copySnapshot(&source, false);
+    const spaces = [_]pm4.RegisterSpace{ .config, .context, .shader, .uconfig };
+    for (spaces, 0..) |space, bank| {
+        try source.writeRegister(space, 2, 0);
+        try testing.expectEqual(@as(u64, 1), source.snapshot_versions[bank]);
+        try testing.expect(snapshot.copySnapshot(&source, true) != 0);
+        try testing.expectEqual(@as(?u32, 0), snapshot.readRegister(space, 2));
+        try source.writeRegister(space, 2, 0);
+        try testing.expectEqual(@as(usize, 0), snapshot.copySnapshot(&source, true));
+        try testing.expectEqualDeep(source, snapshot);
+        try source.writeRegister(space, 2, 17);
+        try testing.expect(snapshot.copySnapshot(&source, true) != 0);
+        try testing.expectEqual(@as(?u32, 17), snapshot.readRegister(space, 2));
+    }
+    try testing.expectEqual(@as(u64, 12), source.register_writes);
+    source.clearRegisters();
+    try testing.expect(snapshot.copySnapshot(&source, true) != 0);
+    try testing.expectEqual(@as(?u32, null), snapshot.readRegister(.uconfig, 2));
+    try source.writeRegister(.uconfig, 2, 0);
+    try testing.expect(snapshot.copySnapshot(&source, true) != 0);
+    try testing.expectEqualDeep(source, snapshot);
 }
 
 test "incremental draw snapshots preserve all banks context stacks and scalar state" {

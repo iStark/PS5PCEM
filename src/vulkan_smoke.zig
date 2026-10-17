@@ -13873,12 +13873,12 @@ fn runMaskedPointerImageProbe(allocator: std.mem.Allocator) !void {
 }
 
 fn runGraphicsDescriptorReuseProbe(allocator: std.mem.Allocator) !void {
-    for (0..7) |case_index| {
+    for ([_]bool{ false, true }) |update_after_bind| for (0..7) |case_index| {
         const array_first = case_index == 1;
         const query_lod = case_index == 2 or case_index == 3;
         const null_first = case_index == 4 or case_index == 6;
         const null_second = case_index >= 5;
-        var renderer = try vulkan.Renderer.init(allocator, .{});
+        var renderer = try vulkan.Renderer.init(allocator, .{ .sampled_update_after_bind = update_after_bind, .enable_validation = true });
         defer renderer.deinit();
         if (case_index >= 4) renderer.sampled_image_nonuniform_indexing = false;
         var guest = GuestMemory{};
@@ -13950,7 +13950,7 @@ fn runGraphicsDescriptorReuseProbe(allocator: std.mem.Allocator) !void {
         try std.testing.expectEqual(expected_color, std.mem.readInt(u32, guest.bytes[center..][0..4], .little));
         const expected_images: u64 = @intFromBool(!null_first) + @as(u64, @intFromBool(!query_lod and !null_second));
         try std.testing.expectEqual(expected_images, renderer.texture_cache_misses);
-    }
+    };
     std.debug.print("graphics descriptor reuse passed: 2D/array sample followed by 2D gather, distinct images, repeated physical binding, query-only LOD masks and uniform null sample/gather without nonuniform indexing\n", .{});
 }
 
@@ -14773,6 +14773,22 @@ pub fn main(init: std.process.Init) !void {
             const elapsed = try renderer.probeBufferMappings();
             std.debug.print("buffer mapping passed: persistent={any} 512 subrange writes={d} us, GPU copy and readback verified\n", .{ persistent, elapsed / 1000 });
         }
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--retained-render-pass")) {
+        const original = vulkan.backend.retain_compatible_render_passes;
+        defer vulkan.backend.retain_compatible_render_passes = original;
+        var expected: ?u64 = null;
+        for ([_]bool{ false, true }) |timeline| for ([_]bool{ false, true }) |retained| for ([_]bool{ false, true }) |update_after_bind| {
+            vulkan.backend.retain_compatible_render_passes = retained;
+            var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = timeline, .enable_validation = true, .sampled_update_after_bind = update_after_bind });
+            defer renderer.deinit();
+            var guest = GuestMemory{};
+            _ = renderer.dcbBackend(guest.interface());
+            const actual = try renderer.probeRetainedGraphicsPass();
+            if (expected) |hash| try std.testing.expectEqual(hash, actual) else expected = actual;
+            std.debug.print("retained render pass passed: timeline={any} retained={any} update_after_bind={any}, depth ordering, explicit clear, smaller area and color readback agree\n", .{ timeline, retained, update_after_bind });
+        };
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--depth-pass-cache")) {

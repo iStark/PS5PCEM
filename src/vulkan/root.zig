@@ -46,4 +46,5 @@ test {
     _ = @import("spirv_cache.zig");
     _ = @import("release_clock.zig");
     _ = @import("timeline_wait.zig");
+    _ = @import("descriptor_indexing.zig");
 }

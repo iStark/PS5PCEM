@@ -23,6 +23,7 @@ const kernel_memory = @import("kernel_memory.zig");
 const audio_device = @import("../audio_device.zig");
 const audio_fs = @import("../audio_fs.zig");
 const ngs2_pcm = @import("../ngs2_pcm.zig");
+const ngs2_atrac9 = @import("../ngs2_atrac9.zig");
 const ngs2_waveform = @import("../ngs2_waveform.zig");
 const ngs2_geom = @import("../ngs2_geom.zig");
 const ajm_codec = @import("../ajm_codec.zig");
@@ -1312,6 +1313,7 @@ const Ngs2Voice = struct {
     loop_end: usize = 0,
     gain: f32 = 1,
     pcm: ?ngs2_pcm.Stream = null,
+    atrac9: ?*ngs2_atrac9.Stream = null,
     ports: []Ngs2VoicePortInfo = &.{},
 };
 
@@ -1375,7 +1377,9 @@ const Ngs2CachedWaveform = struct {
 var ngs2_mutex = Lock{};
 var ngs2_systems = [_]Ngs2System{.{}} ** maximum_ngs2_systems;
 var ngs2_racks = [_]Ngs2Rack{.{}} ** maximum_ngs2_racks;
-var ngs2_voices = [_]Ngs2Voice{.{}} ** maximum_ngs2_voices;
+// Voice limits belong to each rack. A full sampler rack must not exhaust
+// the slots needed by the system's mastering/submixer racks.
+var ngs2_voices: std.ArrayList(Ngs2Voice) = .empty;
 var ngs2_waveform_cache = [_]Ngs2CachedWaveform{.{}} ** maximum_ngs2_cached_waveforms;
 var ngs2_waveform_cache_bytes: usize = 0;
 var ngs2_waveform_cache_sequence: u64 = 0;
@@ -1568,7 +1572,7 @@ fn ngs2RackGetInfo(handle: u64, output: u64, size: usize) callconv(abi.guest) i3
         .max_ports = rack.options.max_ports,
         .render_count = system.render_count,
     };
-    for (&ngs2_voices) |*voice| {
+    for (ngs2_voices.items) |*voice| {
         if (voice.active and voice.rack == handle and voice.state != .empty) {
             info.active_voices += 1;
             info.active_channel_works += voice.source_channels;
@@ -1591,22 +1595,27 @@ fn ngs2RackGetVoiceHandle(rack: u64, voice_id: u32, output: ?*u64) callconv(abi.
     defer ngs2_mutex.unlock();
     const owner = ngs2FindRack(rack) orelse return errno.KernelError.einval.raw();
     if (voice_id >= owner.options.max_voices) return errno.KernelError.einval.raw();
-    for (&ngs2_voices) |*voice| {
+    for (ngs2_voices.items) |*voice| {
         if (voice.active and voice.rack == rack and voice.voice_id == voice_id) {
             destination.* = voice.handle;
             return errno.ok;
         }
     }
-    for (&ngs2_voices) |*voice| {
-        if (voice.active) continue;
-        const ports = std.heap.page_allocator.alloc(Ngs2VoicePortInfo, owner.options.max_ports) catch return errno.KernelError.enomem.raw();
-        @memset(ports, .{});
-        const handle = ngs2Handle();
-        voice.* = .{ .active = true, .handle = handle, .rack = rack, .voice_id = voice_id, .ports = ports };
-        destination.* = handle;
-        return errno.ok;
-    }
-    return errno.KernelError.enomem.raw();
+    const allocator = std.heap.page_allocator;
+    const ports = allocator.alloc(Ngs2VoicePortInfo, owner.options.max_ports) catch return errno.KernelError.enomem.raw();
+    @memset(ports, .{});
+    const slot: *Ngs2Voice = slot: {
+        for (ngs2_voices.items) |*voice| if (!voice.active) break :slot voice;
+        const added = ngs2_voices.addOne(allocator) catch {
+            allocator.free(ports);
+            return errno.KernelError.enomem.raw();
+        };
+        break :slot added;
+    };
+    const handle = ngs2Handle();
+    slot.* = .{ .active = true, .handle = handle, .rack = rack, .voice_id = voice_id, .ports = ports };
+    destination.* = handle;
+    return errno.ok;
 }
 
 fn ngs2FindSystem(handle: u64) ?*Ngs2System {
@@ -1620,7 +1629,7 @@ fn ngs2FindRack(handle: u64) ?*Ngs2Rack {
 }
 
 fn ngs2FindVoice(handle: u64) ?*Ngs2Voice {
-    for (&ngs2_voices) |*voice| if (voice.active and voice.handle == handle) return voice;
+    for (ngs2_voices.items) |*voice| if (voice.active and voice.handle == handle) return voice;
     return null;
 }
 
@@ -1723,9 +1732,17 @@ fn ngs2CacheWaveform(address: u64, decoded: Ngs2DecodedWaveform) ?usize {
     return slot;
 }
 
+fn ngs2FreeAtrac9(voice: *Ngs2Voice) void {
+    if (voice.atrac9) |stream| {
+        stream.deinit(std.heap.page_allocator);
+        std.heap.page_allocator.destroy(stream);
+        voice.atrac9 = null;
+    }
+}
+
 fn ngs2ResetVoice(voice: *Ngs2Voice) void {
     if (voice.active) {
-        for (&ngs2_voices) |*source| {
+        for (ngs2_voices.items) |*source| {
             if (!source.active) continue;
             for (source.ports) |*port| {
                 if (port.dest_handle != voice.handle) continue;
@@ -1735,6 +1752,7 @@ fn ngs2ResetVoice(voice: *Ngs2Voice) void {
         }
     }
     ngs2FreeVoiceWaveform(voice);
+    ngs2FreeAtrac9(voice);
     if (voice.pcm) |*pcm| pcm.deinit(std.heap.page_allocator);
     std.heap.page_allocator.free(voice.ports);
     voice.* = .{};
@@ -1745,7 +1763,7 @@ fn ngs2RackDestroy(handle: u64, info_address: u64) callconv(abi.guest) i32 {
     defer ngs2_mutex.unlock();
     const rack = ngs2FindRack(handle) orelse return errno.KernelError.einval.raw();
     const buffer = rack.buffer;
-    for (&ngs2_voices) |*voice| {
+    for (ngs2_voices.items) |*voice| {
         if (voice.active and voice.rack == handle) ngs2ResetVoice(voice);
     }
     rack.* = .{};
@@ -1759,7 +1777,7 @@ fn ngs2SystemDestroy(handle: u64, info_address: u64) callconv(abi.guest) i32 {
     const buffer = system.buffer;
     for (&ngs2_racks) |*rack| {
         if (!rack.active or rack.system != handle) continue;
-        for (&ngs2_voices) |*voice| {
+        for (ngs2_voices.items) |*voice| {
             if (voice.active and voice.rack == rack.handle) ngs2ResetVoice(voice);
         }
         rack.* = .{};
@@ -2086,26 +2104,36 @@ fn ngs2VoiceControl(handle: u64, params_address: u64) callconv(abi.guest) i32 {
                 .{ handle, rack_id, format.waveform_type, format.channels, format.sample_rate, format.config_data },
             );
             ngs2FreeVoiceWaveform(voice);
+            ngs2FreeAtrac9(voice);
             if (voice.pcm) |*pcm| pcm.deinit(std.heap.page_allocator);
             voice.pcm = null;
             voice.state = .empty;
             voice.event = .none;
             @memset(voice.ports, .{});
             voice.gain = 1;
+            voice.source_rate = format.sample_rate;
+            voice.source_channels = @intCast(@min(format.channels, 8));
             if (format.waveform_type == 0x12 or format.waveform_type == 0x18) {
                 if (format.channels == 0 or format.channels > 8 or format.sample_rate < 8000 or format.sample_rate > 192000) return errno.KernelError.einval.raw();
                 voice.pcm = .{ .format = .{ .channels = @intCast(format.channels), .rate = format.sample_rate, .float32 = format.waveform_type == 0x18 } };
+            } else if (format.waveform_type == 0x40) {
+                const stream = std.heap.page_allocator.create(ngs2_atrac9.Stream) catch return errno.KernelError.enomem.raw();
+                stream.* = ngs2_atrac9.Stream.init(std.heap.page_allocator, format.*) catch {
+                    std.heap.page_allocator.destroy(stream);
+                    return errno.KernelError.einval.raw();
+                };
+                voice.atrac9 = stream;
             }
         } else if (sampler_command == 1) {
             if (header.size < @sizeOf(Ngs2VoiceWaveformParam)) return errno.KernelError.einval.raw();
             const waveform: *const Ngs2VoiceWaveformParam = @ptrFromInt(address);
-            if (voice.pcm) |*pcm| {
+            if (voice.pcm != null or voice.atrac9 != null) {
                 if (header.size < 32) return errno.KernelError.einval.raw();
                 const bytes = @as([*]const u8, @ptrFromInt(address))[0..32];
                 const flags = std.mem.readInt(u32, bytes[16..20], .little);
                 const count = std.mem.readInt(u32, bytes[20..24], .little);
                 const blocks_address = std.mem.readInt(u64, bytes[24..32], .little);
-                if (count > ngs2_pcm.max_blocks or flags & ~@as(u32, 0x15) != 0) return errno.KernelError.einval.raw();
+                if (count > ngs2_pcm.max_blocks or flags & ~@as(u32, if (voice.atrac9 != null) 0x17 else 0x15) != 0) return errno.KernelError.einval.raw();
                 if (count != 0 and !kernel_memory.isGuestRangeAccessible(blocks_address, @as(u64, count) * @sizeOf(Ngs2WaveformBlock))) return errno.KernelError.efault.raw();
                 var queued: [ngs2_pcm.max_blocks]ngs2_pcm.Block = undefined;
                 const blocks: []align(1) const Ngs2WaveformBlock = if (count == 0) &.{} else @as([*]align(1) const Ngs2WaveformBlock, @ptrFromInt(blocks_address))[0..count];
@@ -2117,14 +2145,26 @@ fn ngs2VoiceControl(handle: u64, params_address: u64) callconv(abi.guest) i32 {
                     queued[used] = .{ .data = @as([*]const u8, @ptrFromInt(data_address))[0..block.data_size], .skip = block.skip_samples, .frames = block.samples, .repeats = block.repeats, .user_data = block.user_data };
                     used += 1;
                 }
-                pcm.append(std.heap.page_allocator, queued[0..used], flags & 4 != 0, flags & 1 != 0) catch return errno.KernelError.einval.raw();
+                if (voice.pcm) |*pcm| {
+                    pcm.append(std.heap.page_allocator, queued[0..used], flags & 4 != 0, flags & 1 != 0) catch return errno.KernelError.einval.raw();
+                } else if (voice.atrac9) |stream| {
+                    stream.append(std.heap.page_allocator, queued[0..used], flags & 4 != 0, flags & 1 != 0, flags & 2 != 0) catch return errno.KernelError.einval.raw();
+                }
             } else {
                 ngs2ArmVoice(voice, waveform.data_address);
             }
+        } else if (sampler_command == 4) {
+            if (voice.pcm) |*pcm| for (pcm.blocks.items[pcm.cursor.block..]) |*block| {
+                block.repeats = 0;
+            };
+            if (voice.atrac9) |stream| for (stream.blocks.items) |*block| {
+                block.repeats = 0;
+            };
         } else if (sampler_command == 5 and header.size >= 12) {
             const pitch = @as(*align(1) const f32, @ptrFromInt(address + 8)).*;
             if (!std.math.isFinite(pitch) or pitch < 0 or pitch > 4) return errno.KernelError.einval.raw();
             if (voice.pcm) |*pcm| pcm.pitch = pitch;
+            if (voice.atrac9) |stream| stream.pitch = pitch;
         } else if (header.id >= 2 and header.id <= 5) {
             if (header.size < (if (header.id == 5) @as(u16, 24) else @as(u16, 16))) return errno.KernelError.einval.raw();
             const index = @as(*align(1) const u32, @ptrFromInt(address + 8)).*;
@@ -2233,7 +2273,7 @@ fn ngs2StateFlags(state: Ngs2VoiceState) u32 {
 fn ngs2ApplyEventsLocked(system_handle: u64) void {
     for (&ngs2_racks) |*rack| {
         if (!rack.active or rack.system != system_handle) continue;
-        for (&ngs2_voices) |*voice| {
+        for (ngs2_voices.items) |*voice| {
             if (!voice.active or voice.rack != rack.handle) continue;
             switch (voice.event) {
                 .none => {},
@@ -2253,6 +2293,7 @@ fn ngs2ApplyEventsLocked(system_handle: u64) void {
                 .stop_immediate, .kill => {
                     voice.state = .empty;
                     if (voice.pcm) |*pcm| pcm.clear();
+                    if (voice.atrac9) |stream| stream.clear();
                 },
             }
             voice.event = .none;
@@ -2284,6 +2325,17 @@ fn ngs2ParseWaveformData(
     // uses it to size voices for hundreds of loose PCM sound effects.
     const bytes: [*]const u8 = @ptrFromInt(data_address);
     const input = bytes[0..data_size];
+    // Use the same checked metadata parser as the file entry point. ATRAC9
+    // effects are RIFF containers too; reporting them as generic type 0x80
+    // loses the codec configuration, preroll and compressed block geometry.
+    if (ngs2_waveform.parse(ngs2_waveform.MemoryReader{ .bytes = input }, input.len)) |parsed| {
+        info.* = parsed;
+        return errno.ok;
+    } else |err| {
+        // Retain the older container decoder for PCM widths and VAG that the
+        // streaming parser does not support yet, but reject malformed RIFF.
+        if (err != error.UnknownFormat) return @bitCast(@as(u32, if (err == error.InvalidData) 0x804a8430 else 0x804a8431));
+    }
     if (input.len < 12 or !std.mem.eql(u8, input[0..4], "RIFF") or !std.mem.eql(u8, input[8..12], "WAVE")) {
         return errno.ok;
     }
@@ -2411,8 +2463,6 @@ fn ngs2MixBufferLocked(
     system: u64,
     buffer: Ngs2RenderBuffer,
     frames: u32,
-    initial_positions: *const [maximum_ngs2_voices]f64,
-    initial_playing: *const [maximum_ngs2_voices]bool,
     advance_voices: bool,
 ) void {
     if (buffer.address == 0 or buffer.size == 0 or buffer.channels == 0 or buffer.channels > 32) return;
@@ -2424,8 +2474,8 @@ fn ngs2MixBufferLocked(
     const output = destination[0 .. output_frames * output_channels];
     const sample_rate = (ngs2FindSystem(system) orelse return).sample_rate;
 
-    for (&ngs2_voices, 0..) |*voice, voice_index| {
-        if (!voice.active or !initial_playing[voice_index] or
+    for (ngs2_voices.items) |*voice| {
+        if (!voice.active or voice.state != .playing or
             voice.source_channels == 0 or !ngs2VoiceBelongsToSystem(voice, system)) continue;
         if (voice.pcm) |*pcm| {
             var accessible = true;
@@ -2440,13 +2490,18 @@ fn ngs2MixBufferLocked(
             if (advance_voices and pcm.finished()) voice.state = .empty;
             continue;
         }
+        if (voice.atrac9) |stream| {
+            stream.mix(output, output_channels, voice.gain);
+            if (advance_voices and stream.finished()) voice.state = .empty;
+            continue;
+        }
         if (voice.samples.len == 0) continue;
         const source_channels: usize = voice.source_channels;
         const source_frames = voice.samples.len / source_channels;
         const playback_end = @min(if (voice.loop_end != 0) voice.loop_end else source_frames, source_frames);
         if (playback_end == 0) continue;
         const step = @as(f64, @floatFromInt(voice.source_rate)) / @as(f64, @floatFromInt(sample_rate));
-        var position = initial_positions[voice_index];
+        var position = voice.position;
         var ended = false;
         for (0..output_frames) |output_frame| {
             var source_frame: usize = @intFromFloat(@max(position, 0));
@@ -2511,8 +2566,6 @@ fn ngs2SystemRender(system: u64, buffers_address: u64, count: u32) callconv(abi.
         if (buffer.size > 16 * 1024 * 1024 or !kernel_memory.isGuestRangeAccessible(buffer.address, buffer.size)) return errno.KernelError.efault.raw();
         if (buffer.channels != 0 and buffer.channels <= 32 and buffer.waveform_type == 0x18 and buffer.size >= @as(u64, buffer.channels) * @sizeOf(f32)) last_bus = index;
     }
-    var initial_positions: [maximum_ngs2_voices]f64 = @splat(0);
-    var initial_playing: [maximum_ngs2_voices]bool = @splat(false);
     ngs2_mutex.lock();
     const audio_system = ngs2FindSystem(system) orelse {
         ngs2_mutex.unlock();
@@ -2521,10 +2574,25 @@ fn ngs2SystemRender(system: u64, buffers_address: u64, count: u32) callconv(abi.
     const frames = @min(audio_system.grain, ngs2RenderFrameCount(render_buffers));
     audio_system.render_count +%= 1;
     ngs2ApplyEventsLocked(system);
-    for (&ngs2_voices, 0..) |*voice, index| {
-        initial_positions[index] = voice.position;
-        initial_playing[index] = voice.state == .playing;
-    }
+    if (last_bus != null) for (ngs2_voices.items) |*voice| {
+        if (!voice.active or voice.state != .playing or !ngs2VoiceBelongsToSystem(voice, system)) continue;
+        const stream = voice.atrac9 orelse continue;
+        var accessible = true;
+        for (stream.blocks.items[stream.wave_first orelse stream.cursor.block ..]) |block| {
+            if (!kernel_memory.isGuestRangeAccessible(@intFromPtr(block.data.ptr), block.data.len)) {
+                accessible = false;
+                break;
+            }
+        }
+        if (!accessible) {
+            voice.state = .empty;
+            continue;
+        }
+        stream.render(std.heap.page_allocator, frames, audio_system.sample_rate) catch |err| {
+            std.debug.print("[audio] NGS2 ATRAC9 voice=0x{x} failed: {s}\n", .{ voice.handle, @errorName(err) });
+            voice.state = .empty;
+        };
+    };
     for (render_buffers, 0..) |buffer, index| {
         if (buffer.address == 0 or buffer.size == 0) continue;
         const usable = buffer.channels != 0 and buffer.channels <= 32 and
@@ -2534,7 +2602,7 @@ fn ngs2SystemRender(system: u64, buffers_address: u64, count: u32) callconv(abi.
         const destination: [*]u8 = @ptrFromInt(buffer.address);
         @memset(destination[0..bytes], 0);
         // Re-read the same stream cursor for each bus; consume it only once.
-        ngs2MixBufferLocked(system, buffer, frames, &initial_positions, &initial_playing, index == last_bus.?);
+        ngs2MixBufferLocked(system, buffer, frames, index == last_bus.?);
     }
     ngs2_mutex.unlock();
     const call_index = ngs2_render_calls.fetchAdd(1, .monotonic);
@@ -2554,8 +2622,8 @@ fn ngs2VoiceGetState(handle: u64, state_address: u64, state_size: usize) callcon
         return errno.KernelError.einval.raw();
     };
     const state_flags = ngs2StateFlags(voice.state);
-    const pcm_cursor = if (voice.pcm) |*pcm| pcm.cursor else ngs2_pcm.Cursor{};
-    const read_address = if (voice.pcm) |*pcm| pcm.readAddress() else @as(u64, 0);
+    const pcm_cursor = if (voice.pcm) |*pcm| pcm.cursor else if (voice.atrac9) |stream| stream.cursor else ngs2_pcm.Cursor{};
+    const read_address = if (voice.pcm) |*pcm| pcm.readAddress() else if (voice.atrac9) |stream| stream.readAddress() else @as(u64, 0);
     ngs2_mutex.unlock();
     if (state_address != 0 and state_size != 0) {
         const bounded_size = @min(state_size, 0x400);
@@ -3929,7 +3997,7 @@ pub fn reset() void {
     ajm_mutex.unlock();
     next_batch.store(1, .monotonic);
     ngs2_mutex.lock();
-    for (&ngs2_voices) |*voice| ngs2ResetVoice(voice);
+    for (ngs2_voices.items) |*voice| ngs2ResetVoice(voice);
     for (&ngs2_waveform_cache, 0..) |*cached, index| {
         cached.references = 0;
         ngs2EvictCachedWaveform(index);
@@ -3939,7 +4007,8 @@ pub fn reset() void {
     ngs2_waveform_cache_sequence = 0;
     ngs2_systems = [_]Ngs2System{.{}} ** maximum_ngs2_systems;
     ngs2_racks = [_]Ngs2Rack{.{}} ** maximum_ngs2_racks;
-    ngs2_voices = [_]Ngs2Voice{.{}} ** maximum_ngs2_voices;
+    ngs2_voices.deinit(std.heap.page_allocator);
+    ngs2_voices = .empty;
     ngs2_mutex.unlock();
     next_ngs2_handle.store(0x4e47_0001, .monotonic);
     ngs2_render_calls.store(0, .monotonic);
@@ -4309,6 +4378,38 @@ test "NGS2 waveform file parses a mounted file at an offset and closes descripto
     try std.testing.expectEqual(before, filesystem.openCount());
 }
 
+test "NGS2 in-memory ATRAC9 metadata retains codec geometry and preroll" {
+    var wave: [100 + 384]u8 = @splat(0);
+    @memcpy(wave[0..4], "RIFF");
+    std.mem.writeInt(u32, wave[4..8], wave.len - 8, .little);
+    @memcpy(wave[8..16], "WAVEfmt ");
+    std.mem.writeInt(u32, wave[16..20], 52, .little);
+    std.mem.writeInt(u16, wave[20..22], 0xfffe, .little);
+    std.mem.writeInt(u16, wave[22..24], 2, .little);
+    std.mem.writeInt(u32, wave[24..28], 48000, .little);
+    std.mem.writeInt(u16, wave[32..34], 384, .little);
+    std.mem.writeInt(u16, wave[36..38], 34, .little);
+    std.mem.writeInt(u16, wave[38..40], 1024, .little);
+    @memcpy(wave[44..60], &[_]u8{ 0xd2, 0x42, 0xe1, 0x47, 0xba, 0x36, 0x8d, 0x4d, 0x88, 0xfc, 0x61, 0x65, 0x4f, 0x8c, 0x83, 0x6c });
+    std.mem.writeInt(u32, wave[64..68], 0xfe740bf0, .big);
+    @memcpy(wave[72..76], "fact");
+    std.mem.writeInt(u32, wave[76..80], 12, .little);
+    std.mem.writeInt(u32, wave[80..84], 700, .little);
+    std.mem.writeInt(u32, wave[84..88], 256, .little);
+    std.mem.writeInt(u32, wave[88..92], 256, .little);
+    @memcpy(wave[92..96], "data");
+    std.mem.writeInt(u32, wave[96..100], 384, .little);
+    var info: Ngs2WaveformInfo = .{};
+    try std.testing.expectEqual(errno.ok, ngs2ParseWaveformData(@intFromPtr(&wave), wave.len, &info));
+    try std.testing.expectEqual(@as(u32, 0x40), info.format.waveform_type);
+    try std.testing.expectEqual(@as(u32, 0xfe740bf0), info.format.config_data);
+    try std.testing.expectEqual(@as(u32, 384), info.audio_frame_size);
+    try std.testing.expectEqual(@as(u32, 256), info.blocks[0].skip_samples);
+    try std.testing.expectEqual(@as(u32, 700), info.blocks[0].samples);
+    try std.testing.expectEqual(@as(usize, 100), info.blocks[0].data_offset);
+    try std.testing.expectEqual(@as(i32, @bitCast(@as(u32, 0x804a8430))), ngs2ParseWaveformData(@intFromPtr(&wave), wave.len - 1, &info));
+}
+
 test "NGS2 custom sampler rack voices take the sampler format and block parameters" {
     reset();
     defer reset();
@@ -4651,4 +4752,37 @@ test "AudioOut2 decodes formats and mixes ports to stereo correctly" {
     try std.testing.expectApproxEqAbs(@as(f32, 0.25), mix[2], 0.001);
     try std.testing.expectApproxEqAbs(@as(f32, -0.25), mix[3], 0.001);
     try std.testing.expectApproxEqAbs(@as(f32, 0.5), peak, 0.001);
+}
+
+test "NGS2 full sampler rack leaves room for mastering and reuses destroyed voices" {
+    reset();
+    defer reset();
+    var system: u64 = 0;
+    try std.testing.expectEqual(errno.ok, ngs2SystemCreateWithAllocator(0, 0, &system));
+    var options: [176]u8 align(8) = @splat(0);
+    std.mem.writeInt(u64, options[0..8], options.len, .little);
+    std.mem.writeInt(u32, options[80..84], maximum_ngs2_voices, .little);
+    var sampler: u64 = 0;
+    try std.testing.expectEqual(errno.ok, ngs2RackCreateWithAllocator(system, 0x1000, @intFromPtr(&options), 0, &sampler));
+    var first: u64 = 0;
+    for (0..maximum_ngs2_voices) |i| {
+        var voice: u64 = 0;
+        try std.testing.expectEqual(errno.ok, ngs2RackGetVoiceHandle(sampler, @intCast(i), &voice));
+        if (i == 0) first = voice;
+    }
+    var master_rack: u64 = 0;
+    var master: u64 = 0;
+    try std.testing.expectEqual(errno.ok, ngs2RackCreateWithAllocator(system, 0x3000, 0, 0, &master_rack));
+    try std.testing.expectEqual(errno.ok, ngs2RackGetVoiceHandle(master_rack, 0, &master));
+    try std.testing.expect(first != master);
+    const slots = ngs2_voices.items.len;
+    try std.testing.expectEqual(maximum_ngs2_voices + 1, slots);
+    try std.testing.expectEqual(errno.ok, ngs2RackDestroy(sampler, 0));
+    try std.testing.expect(ngs2FindVoice(first) == null);
+    try std.testing.expect(ngs2FindVoice(master) != null);
+    try std.testing.expectEqual(errno.ok, ngs2RackCreateWithAllocator(system, 0x1000, 0, 0, &sampler));
+    var replacement: u64 = 0;
+    try std.testing.expectEqual(errno.ok, ngs2RackGetVoiceHandle(sampler, 0, &replacement));
+    try std.testing.expect(replacement != first);
+    try std.testing.expectEqual(slots, ngs2_voices.items.len);
 }

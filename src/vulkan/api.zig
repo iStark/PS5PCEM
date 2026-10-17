@@ -774,6 +774,9 @@ pub const DescriptorSetLayoutBindingFlagsCreateInfo = extern struct {
 };
 
 pub const descriptor_binding_partially_bound_bit: Flags = 0x0000_0004;
+pub const descriptor_binding_update_after_bind_bit: Flags = 0x0000_0001;
+pub const descriptor_set_layout_create_update_after_bind_pool_bit: Flags = 0x0000_0002;
+pub const descriptor_pool_create_update_after_bind_bit: Flags = 0x0000_0002;
 
 pub const DescriptorSetLayoutCreateInfo = extern struct {
     s_type: u32 = structure_type_descriptor_set_layout_create_info,
