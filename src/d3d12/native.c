@@ -327,6 +327,8 @@ static HRESULT compile_spirv(Ps5D3D12 *c, const uint32_t *words, size_t word_cou
     CROSS(spvc_compiler_create_compiler_options(compiler, &options));
     CROSS(spvc_compiler_options_set_uint(options, SPVC_COMPILER_OPTION_HLSL_SHADER_MODEL, 51));
     CROSS(spvc_compiler_options_set_bool(options, SPVC_COMPILER_OPTION_HLSL_FORCE_STORAGE_BUFFER_AS_UAV, SPVC_TRUE));
+    if (stage == SpvExecutionModelVertex)
+        CROSS(spvc_compiler_options_set_bool(options, SPVC_COMPILER_OPTION_HLSL_SUPPORT_NONZERO_BASE_VERTEX_BASE_INSTANCE, SPVC_TRUE));
     CROSS(spvc_compiler_install_compiler_options(compiler, options));
     CROSS(spvc_compiler_get_active_interface_variables(compiler, &active));
     CROSS(spvc_compiler_set_enabled_interface_variables(compiler, active));
@@ -368,6 +370,25 @@ static HRESULT storage_root(Ps5D3D12 *c, uint32_t count, ID3D12RootSignature **r
     parameter.DescriptorTable.pDescriptorRanges = &range;
     D3D12_ROOT_SIGNATURE_DESC desc = {0};
     desc.NumParameters = count ? 1 : 0;
+    desc.pParameters = &parameter;
+    ID3DBlob *blob = NULL, *errors = NULL;
+    HRESULT hr = c->serialize(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &errors);
+    if (SUCCEEDED(hr)) hr = ID3D12Device_CreateRootSignature(c->device, 0, ID3D10Blob_GetBufferPointer(blob), ID3D10Blob_GetBufferSize(blob), &IID_ID3D12RootSignature, (void **)root);
+    release(blob); release(errors);
+    return hr;
+}
+
+static HRESULT guest_graphics_root(Ps5D3D12 *c, ID3D12RootSignature **root) {
+    // Guest graphics resources are still rejected. SPIRV-Cross's auxiliary
+    // VertexInfo is therefore the sole cbuffer, assigned b0 by D3DCompiler.
+    // D3D's SV_VertexID/InstanceID exclude the draw's base values; Vulkan's
+    // VertexIndex/InstanceIndex (used by the shared translator) include them.
+    D3D12_ROOT_PARAMETER parameter = {0};
+    parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    parameter.Constants.Num32BitValues = 2;
+    parameter.ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+    D3D12_ROOT_SIGNATURE_DESC desc = {0};
+    desc.NumParameters = 1;
     desc.pParameters = &parameter;
     ID3DBlob *blob = NULL, *errors = NULL;
     HRESULT hr = c->serialize(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &errors);
@@ -658,23 +679,30 @@ done:
 }
 
 int32_t ps5_d3d12_draw_spirv(Ps5D3D12 *c, const uint32_t *vertex, size_t vertex_count,
-    const uint32_t *fragment, size_t fragment_count, const Ps5D3D12Draw *d, uint8_t *rgba) {
+    const uint32_t *fragment, size_t fragment_count, const Ps5D3D12Draw *d, const uint8_t *indices, size_t index_bytes, uint8_t *rgba) {
     if (!c || !vertex || !fragment || vertex_count < 5 || fragment_count < 5 || !d || !rgba ||
-        !d->width || !d->height || d->width > 16384 || d->height > 16384 || !d->vertex_count || !d->instance_count ||
+        !d->width || !d->height || d->width > 16384 || d->height > 16384 || (!d->vertex_count && !d->index_count) || !d->instance_count ||
         (d->topology != D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST && d->topology != D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP) ||
         d->cull_mode < D3D12_CULL_MODE_NONE || d->cull_mode > D3D12_CULL_MODE_BACK || d->write_mask > 15) return E_INVALIDARG;
+    if (d->index_count) {
+        if (!indices || (d->index_element_bytes != 2 && d->index_element_bytes != 4) ||
+            (uint64_t)d->index_count * d->index_element_bytes != index_bytes || index_bytes > 64u * 1024u * 1024u) return E_INVALIDARG;
+    } else if (index_bytes || d->index_element_bytes || d->primitive_restart) return E_INVALIDARG;
+    if (d->primitive_restart > 1 || (d->primitive_restart && d->topology != D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP)) return E_INVALIDARG;
     HRESULT hr;
     ID3DBlob *vs = NULL, *ps = NULL;
     ID3D12RootSignature *root = NULL;
     ID3D12PipelineState *pipeline = NULL;
-    ID3D12Resource *color = NULL, *upload = NULL, *readback = NULL;
+    ID3D12Resource *color = NULL, *upload = NULL, *readback = NULL, *index_upload = NULL;
     TRY(compile_spirv(c, vertex, vertex_count, SpvExecutionModelVertex, 0, &vs));
     TRY(compile_spirv(c, fragment, fragment_count, SpvExecutionModelFragment, 0, &ps));
-    TRY(storage_root(c, 0, &root));
+    TRY(guest_graphics_root(c, &root));
     D3D12_GRAPHICS_PIPELINE_STATE_DESC pipeline_desc = graphics_desc(root, vs, ps, 0);
     pipeline_desc.RasterizerState.CullMode = d->cull_mode;
     pipeline_desc.RasterizerState.FrontCounterClockwise = d->front_ccw != 0;
     pipeline_desc.BlendState.RenderTarget[0].RenderTargetWriteMask = (UINT8)d->write_mask;
+    pipeline_desc.IBStripCutValue = !d->primitive_restart ? D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED :
+        d->index_element_bytes == 2 ? D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFF : D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFFFFFF;
     TRY(ID3D12Device_CreateGraphicsPipelineState(c->device, &pipeline_desc, &IID_ID3D12PipelineState, (void **)&pipeline));
     D3D12_HEAP_PROPERTIES heap = {0}; heap.Type = D3D12_HEAP_TYPE_DEFAULT;
     D3D12_RESOURCE_DESC desc = {0};
@@ -695,6 +723,13 @@ int32_t ps5_d3d12_draw_spirv(Ps5D3D12 *c, const uint32_t *vertex, size_t vertex_
     TRY(ID3D12Resource_Map(upload, 0, &empty, &mapped));
     for (UINT y = 0; y < d->height; ++y) memcpy((uint8_t *)mapped + footprint.Offset + (size_t)y * footprint.Footprint.RowPitch, rgba + (size_t)y * d->width * 4, (size_t)d->width * 4);
     ID3D12Resource_Unmap(upload, 0, &entire);
+    if (d->index_count) {
+        TRY(buffer(c, index_bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, 0, &index_upload));
+        D3D12_RANGE written = {0, index_bytes};
+        TRY(ID3D12Resource_Map(index_upload, 0, &empty, &mapped));
+        memcpy(mapped, indices, index_bytes);
+        ID3D12Resource_Unmap(index_upload, 0, &written);
+    }
     D3D12_CPU_DESCRIPTOR_HANDLE view = rtv(c, OFFSCREEN_RTV);
     ID3D12Device_CreateRenderTargetView(c->device, color, NULL, view);
     TRY(begin(c));
@@ -705,13 +740,20 @@ int32_t ps5_d3d12_draw_spirv(Ps5D3D12 *c, const uint32_t *vertex, size_t vertex_
     transition(c, color, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_RENDER_TARGET);
     ID3D12GraphicsCommandList_SetPipelineState(c->commands, pipeline);
     ID3D12GraphicsCommandList_SetGraphicsRootSignature(c->commands, root);
+    const uint32_t base_values[2] = {d->index_count ? (uint32_t)d->base_vertex : d->first_vertex, d->first_instance};
+    ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(c->commands, 0, 2, base_values, 0);
     ID3D12GraphicsCommandList_OMSetRenderTargets(c->commands, 1, &view, FALSE, NULL);
     D3D12_VIEWPORT viewport = {d->viewport[0], d->viewport[1], d->viewport[2], d->viewport[3], d->viewport[4], d->viewport[5]};
     D3D12_RECT scissor = {d->scissor[0], d->scissor[1], d->scissor[2], d->scissor[3]};
     ID3D12GraphicsCommandList_RSSetViewports(c->commands, 1, &viewport);
     ID3D12GraphicsCommandList_RSSetScissorRects(c->commands, 1, &scissor);
     ID3D12GraphicsCommandList_IASetPrimitiveTopology(c->commands, d->topology);
-    ID3D12GraphicsCommandList_DrawInstanced(c->commands, d->vertex_count, d->instance_count, d->first_vertex, d->first_instance);
+    if (d->index_count) {
+        D3D12_INDEX_BUFFER_VIEW index_view = {ID3D12Resource_GetGPUVirtualAddress(index_upload), (UINT)index_bytes,
+            d->index_element_bytes == 2 ? DXGI_FORMAT_R16_UINT : DXGI_FORMAT_R32_UINT};
+        ID3D12GraphicsCommandList_IASetIndexBuffer(c->commands, &index_view);
+        ID3D12GraphicsCommandList_DrawIndexedInstanced(c->commands, d->index_count, d->instance_count, 0, d->base_vertex, d->first_instance);
+    } else ID3D12GraphicsCommandList_DrawInstanced(c->commands, d->vertex_count, d->instance_count, d->first_vertex, d->first_instance);
     transition(c, color, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
     source = destination;
     destination.pResource = readback; destination.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; destination.PlacedFootprint = footprint;
@@ -721,7 +763,7 @@ int32_t ps5_d3d12_draw_spirv(Ps5D3D12 *c, const uint32_t *vertex, size_t vertex_
     for (UINT y = 0; y < d->height; ++y) memcpy(rgba + (size_t)y * d->width * 4, (uint8_t *)mapped + footprint.Offset + (size_t)y * footprint.Footprint.RowPitch, (size_t)d->width * 4);
     ID3D12Resource_Unmap(readback, 0, &empty);
 done:
-    retire(c, readback); retire(c, upload); retire(c, color); retire(c, pipeline); retire(c, root); release(ps); release(vs);
+    retire(c, index_upload); retire(c, readback); retire(c, upload); retire(c, color); retire(c, pipeline); retire(c, root); release(ps); release(vs);
     return hr;
 }
 

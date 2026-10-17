@@ -173,8 +173,8 @@ pub const Renderer = struct {
     }
 
     pub fn draw(self: *Renderer, state: *const gpu.State, packet: gpu.pm4.Packet) !void {
-        if (packet.opcode != gpu.pm4.draw_index_auto or packet.body.len < 1) return error.IndexedAndIndirectDrawNotImplemented;
-        if (packet.body[0] == 0 or state.instance_count == 0) return;
+        const args = try DrawArguments.decode(state, packet);
+        if (args.count == 0 or state.instance_count == 0) return;
         for ([_]gpu.resources.ShaderStage{ .export_shader, .geometry, .hull }) |stage| {
             if (stage.programAddress(state) != null) return error.AdvancedGraphicsStagesNotImplemented;
         }
@@ -186,10 +186,12 @@ pub const Renderer = struct {
         if (render.raster.rasterizer_discard or render.raster.polygon_mode != 0 or render.raster.depth_bias_front or render.raster.depth_bias_back or (render.raster.cull_front and render.raster.cull_back)) return error.UnsupportedRasterState;
         if (render.primitive_type != 4 and render.primitive_type != 5) return error.UnsupportedPrimitive;
         var draw_state = try native.Draw.fullTarget(target.width, target.height);
-        draw_state.vertex_count = packet.body[0];
+        draw_state.vertex_count = if (args.index_bytes == 0) args.count else 0;
         draw_state.instance_count = state.instance_count;
         draw_state.first_vertex = state.readRegister(.uconfig, 0x24a) orelse 0;
         draw_state.topology = render.primitive_type;
+        const indices = try args.stage(self.allocator, self.memory, state, &draw_state);
+        defer self.allocator.free(indices);
         draw_state.cull_mode = if (render.raster.cull_front) 2 else if (render.raster.cull_back) 3 else 1;
         draw_state.front_ccw = @intFromBool(!render.raster.clockwise_front_face);
         draw_state.write_mask = target.write_mask & (render.shader_mask & 0xf);
@@ -220,7 +222,7 @@ pub const Renderer = struct {
         if (vertex.used_dispatcher or fragment.used_dispatcher) return error.UnboundedControlFlowNotImplemented;
         const pixels = try self.readLinear(target.address, target.width, target.height, target.pitch);
         defer self.allocator.free(pixels);
-        try self.device.drawSpirv(vertex.words, fragment.words, draw_state, pixels);
+        try self.device.drawIndexedSpirv(vertex.words, fragment.words, draw_state, indices, pixels);
         try self.writeLinear(target.address, target.width, target.height, target.pitch, pixels);
     }
 
@@ -261,6 +263,98 @@ pub const Renderer = struct {
             self.frames = 0;
             self.frame_started_ns = now;
         }
+    }
+};
+
+const DrawArguments = struct {
+    count: u32,
+    address: u64 = 0,
+    index_bytes: u32 = 0,
+
+    fn decode(state: *const gpu.State, packet: gpu.pm4.Packet) !DrawArguments {
+        const body = packet.body;
+        if (packet.opcode == gpu.pm4.draw_index_auto) {
+            if (body.len < 2) return error.InvalidDrawPacket;
+            // Only ordinary auto-index draws; opaque-count/streamout modes
+            // require additional state and must not become a guessed count.
+            if (body[1] != 2) return error.UnsupportedDrawInitiator;
+            return .{ .count = body[0] };
+        }
+        var args: DrawArguments = undefined;
+        var maximum: u32 = undefined;
+        var offset: u32 = 0;
+        switch (packet.opcode) {
+            gpu.pm4.draw_index_2 => {
+                if (body.len < 5) return error.InvalidDrawPacket;
+                if (body[4] != 0) return error.UnsupportedDrawInitiator;
+                args = .{ .count = body[3], .address = @as(u64, body[2]) << 32 | body[1] };
+                maximum = body[0];
+            },
+            gpu.pm4.draw_index_offset_2 => {
+                if (body.len < 4) return error.InvalidDrawPacket;
+                if (body[3] != 0) return error.UnsupportedDrawInitiator;
+                args = .{ .count = body[2], .address = state.index_base_address };
+                maximum = body[0];
+                offset = body[1];
+            },
+            else => return error.IndirectAndMultiDrawNotImplemented,
+        }
+        if (args.count == 0 or state.instance_count == 0) return .{ .count = 0 };
+        args.index_bytes = switch (state.index_type) {
+            0 => 2,
+            1 => 4,
+            2 => 1,
+            3 => return error.UnsupportedIndexType,
+        };
+        if (args.count > maximum) return error.IndexCountOutOfBounds;
+        args.address = try std.math.add(u64, args.address, @as(u64, offset) * args.index_bytes);
+        if (args.address == 0 or args.address % args.index_bytes != 0) return error.InvalidIndexAddress;
+        const bytes = @as(u64, args.count) * args.index_bytes;
+        if (bytes > 64 * 1024 * 1024) return error.IndexBufferTooLarge;
+        _ = try std.math.add(u64, args.address, bytes);
+        return args;
+    }
+
+    fn stage(self: DrawArguments, allocator: std.mem.Allocator, memory: Memory, state: *const gpu.State, draw_state: *native.Draw) ![]u8 {
+        if (self.index_bytes == 0) return allocator.alloc(u8, 0);
+        const native_bytes = @max(2, self.index_bytes);
+        const size = @as(usize, self.count) * native_bytes;
+        if (size > 64 * 1024 * 1024) return error.IndexBufferTooLarge;
+        const indices = try allocator.alloc(u8, size);
+        errdefer allocator.free(indices);
+        if (!memory.read(memory.context, self.address, indices[0 .. @as(usize, self.count) * self.index_bytes])) return error.GuestReadFailed;
+        const reset_control = state.readRegister(.uconfig, 0x24b) orelse 0;
+        const reset_index = state.readRegister(.context, 0x103) orelse 0;
+        const index_mask: u32 = switch (self.index_bytes) {
+            1 => 0xff,
+            2 => 0xffff,
+            else => 0xffffffff,
+        };
+        if (reset_control & ~@as(u32, 3) != 0) return error.UnsupportedPrimitiveRestartControl;
+        const restart = draw_state.topology == 5 and reset_control & 1 != 0 and
+            (reset_control & 2 == 0 or reset_index <= index_mask);
+        if (restart and reset_index & index_mask != index_mask) return error.CustomPrimitiveRestartNotImplemented;
+        draw_state.index_count = self.count;
+        draw_state.index_element_bytes = native_bytes;
+        draw_state.base_vertex = @bitCast(state.readRegister(.uconfig, 0x24a) orelse 0);
+        draw_state.first_vertex = 0;
+        draw_state.primitive_restart = @intFromBool(restart);
+        // Widen backwards in place so 8-bit source indices are not overwritten.
+        // Strip-cut markers are tested before applying the signed base vertex.
+        var i: usize = self.count;
+        while (i != 0) {
+            i -= 1;
+            const index: u32 = switch (self.index_bytes) {
+                1 => indices[i],
+                2 => std.mem.readInt(u16, indices[i * 2 ..][0..2], .little),
+                else => std.mem.readInt(u32, indices[i * 4 ..][0..4], .little),
+            };
+            const cut = restart and index == index_mask;
+            const vertex = @as(i64, index) + draw_state.base_vertex;
+            if (!cut and (vertex < 0 or vertex > std.math.maxInt(u32))) return error.InvalidBaseVertex;
+            if (self.index_bytes == 1) std.mem.writeInt(u16, indices[i * 2 ..][0..2], if (cut) 0xffff else @intCast(index), .little);
+        }
+        return indices;
     }
 };
 

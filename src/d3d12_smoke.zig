@@ -139,6 +139,7 @@ fn guestCommandProbe(allocator: std.mem.Allocator, vertex_words: []const u32, pi
         for (0..65) |x| row[x * 4 + 3] = 255;
         @memset(row[65 * 4 ..], 0xa7);
     }
+    const initial = memory.data;
     _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 2 });
     const center = 0x2000 + (18 * 72 + 32) * 4;
     if (!std.mem.eql(u8, memory.data[center..][0..4], &.{ 255, 0, 0, 255 }) or
@@ -149,16 +150,75 @@ fn guestCommandProbe(allocator: std.mem.Allocator, vertex_words: []const u32, pi
         }
     }
     const before = memory.data;
+    // Each indexed path must reproduce the complete auto-index image, including
+    // untouched row padding. Large 32-bit values exercise signed base-vertex
+    // addition; prefix values exercise INDEX_BASE + DRAW_INDEX_OFFSET_2.
+    for ([_]u2{ 0, 1, 2 }) |index_type| {
+        const element_bytes: usize = switch (index_type) {
+            0 => 2,
+            1 => 4,
+            else => 1,
+        };
+        const base: u32 = if (index_type == 1) 70000 else 7;
+        for ([_]bool{ false, true }) |with_offset| {
+            @memcpy(memory.data[0x2000..], initial[0x2000..]);
+            for (0..5) |i| {
+                const value: u32 = if (i < 2) 99 else base + @as(u32, @intCast(i - 2));
+                switch (index_type) {
+                    0 => std.mem.writeInt(u16, memory.data[0x600 + i * 2 ..][0..2], @intCast(value), .little),
+                    1 => std.mem.writeInt(u32, memory.data[0x600 + i * 4 ..][0..4], value, .little),
+                    else => memory.data[0x600 + i] = @intCast(value),
+                }
+            }
+            try state.writeRegister(.uconfig, 0x24a, @bitCast(-@as(i32, @intCast(base))));
+            _ = try executor.execute(&.{ command(gpu.pm4.index_type, 1), index_type, command(gpu.pm4.index_base, 2), 0x600, 0 });
+            const index_before = memory.data[0x600..0x620].*;
+            if (with_offset) {
+                _ = try executor.execute(&.{ command(gpu.pm4.draw_index_offset_2, 4), 3, 2, 3, 0 });
+            } else {
+                _ = try executor.execute(&.{ command(gpu.pm4.draw_index_2, 5), 3, @intCast(0x600 + 2 * element_bytes), 0, 3, 0 });
+            }
+            if (!std.mem.eql(u8, memory.data[0x2000..], before[0x2000..])) {
+                std.debug.print("Indexed mismatch: type={d}, offset={any}, center={any}\n", .{ index_type, with_offset, memory.data[center..][0..4] });
+                return error.Pm4IndexedGraphicsMismatch;
+            }
+            if (!std.mem.eql(u8, memory.data[0x600..0x620], &index_before)) return error.Pm4IndexDataModified;
+        }
+        // Fixed cut markers split two triangle strips. An 8-bit 0xff marker
+        // must widen to 0xffff instead of becoming a vertex in the second strip.
+        @memcpy(memory.data[0x2000..], initial[0x2000..]);
+        const marker: u32 = switch (index_type) {
+            0 => 0xffff,
+            1 => 0xffffffff,
+            else => 0xff,
+        };
+        for ([_]u32{ 0, 1, 2, marker, 0, 1, 2 }, 0..) |value, i| switch (index_type) {
+            0 => std.mem.writeInt(u16, memory.data[0x600 + i * 2 ..][0..2], @intCast(value), .little),
+            1 => std.mem.writeInt(u32, memory.data[0x600 + i * 4 ..][0..4], value, .little),
+            else => memory.data[0x600 + i] = @intCast(value),
+        };
+        try state.writeRegister(.uconfig, 0x24a, 0);
+        try state.writeRegister(.uconfig, 0x242, 5);
+        try state.writeRegister(.uconfig, 0x24b, 1);
+        try state.writeRegister(.context, 0x103, marker);
+        _ = try executor.execute(&.{ command(gpu.pm4.draw_index_2, 5), 7, 0x600, 0, 7, 0 });
+        if (!std.mem.eql(u8, memory.data[0x2000..], before[0x2000..])) return error.Pm4StripRestartMismatch;
+        try state.writeRegister(.uconfig, 0x242, 4);
+        try state.writeRegister(.uconfig, 0x24b, 0);
+    }
+    _ = try executor.execute(&.{ command(gpu.pm4.draw_index_2, 5), 0, 0, 0, 0, 0 });
+    @memcpy(&memory.data, &before);
     try state.writeRegister(.context, 0x08f, 0); // Shader mask also suppresses writes.
     _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 2 });
     if (!std.mem.eql(u8, &before, &memory.data)) return error.Pm4ShaderMaskMismatch;
     // A rejected operation poisons the queue; following guest labels must not
     // become visible as though all previous rendering had finished.
-    const rejected = executor.execute(&.{ command(gpu.pm4.draw_index_2, 5), 3, 0, 0, 3, 0 });
-    if (rejected) |_| return error.UnsupportedDrawWasAccepted else |err| if (err != error.BackendRejected) return err;
+    const rejected = executor.execute(&.{ command(gpu.pm4.draw_index_2, 5), 2, 0x600, 0, 3, 0 });
+    if (rejected) |_| return error.InvalidDrawWasAccepted else |err| if (err != error.BackendRejected) return err;
+    if ((renderer.failure orelse return error.IncorrectDrawFailure) != error.IndexCountOutOfBounds) return error.IncorrectDrawFailure;
     const backend = renderer.dcbBackend();
     if (backend.vtable.write(backend.context, 0x1200, &.{ 1, 2, 3, 4 })) return error.FailedSubmissionPublishedLabel;
-    std.debug.print("PASS PM4 compute/draw -> D3D12 -> guest memory, pitched target and shader mask; unsupported draw stops the queue\n", .{});
+    std.debug.print("PASS PM4 compute/draw -> D3D12 -> guest memory, pitched target and shader mask\nPASS indexed 8/16/32-bit draws, base vertex, index offsets, strip restart and zero count; invalid bounds stop the queue\n", .{});
 }
 
 fn command(opcode: u8, body_words: u14) u32 {
@@ -212,6 +272,7 @@ fn guestGraphicsProbe(allocator: std.mem.Allocator, device: *d3d12.Device) !void
     defer fragment.deinit(allocator);
     var pixels: [65 * 37 * 4]u8 = @splat(0);
     for (0..65 * 37) |i| pixels[i * 4 + 3] = 255;
+    const initial = pixels;
     var draw = try d3d12.Draw.fullTarget(65, 37);
     try device.drawSpirv(vertex.words, fragment.words, draw, &pixels);
     const center = (18 * 65 + 32) * 4;
@@ -221,6 +282,28 @@ fn guestGraphicsProbe(allocator: std.mem.Allocator, device: *d3d12.Device) !void
     draw.write_mask = 0;
     try device.drawSpirv(vertex.words, fragment.words, draw, &pixels);
     if (!std.mem.eql(u8, &before, &pixels)) return error.GuestColorMaskMismatch;
+    // Shift the procedural shader's triangle by seven vertex IDs, then undo
+    // that shift with each native draw base. This catches missing/doubled base
+    // constants, independently of input-assembler vertex-buffer fetches.
+    var shifted_words = vertex_words;
+    shifted_words[2] = @bitCast(@as(f32, 8));
+    var shifted_program = try rdna2.decodeProgram(allocator, &shifted_words);
+    defer shifted_program.deinit(allocator);
+    var shifted = try rdna2.translateProgramSpirv(allocator, &shifted_program, .{ .stage = .vertex, .vertex_index_vgpr = 5, .allow_control_flow_fallback = false });
+    defer shifted.deinit(allocator);
+    draw.write_mask = 15;
+    draw.first_vertex = 7;
+    pixels = initial;
+    try device.drawSpirv(shifted.words, fragment.words, draw, &pixels);
+    if (!std.mem.eql(u8, &before, &pixels)) return error.GuestFirstVertexMismatch;
+    draw.first_vertex = 0;
+    draw.index_count = 3;
+    draw.index_element_bytes = 2;
+    draw.base_vertex = 7;
+    pixels = initial;
+    try device.drawIndexedSpirv(shifted.words, fragment.words, draw, &.{ 0, 0, 1, 0, 2, 0 }, &pixels);
+    if (!std.mem.eql(u8, &before, &pixels)) return error.GuestPositiveBaseVertexMismatch;
     std.debug.print("PASS guest RDNA2 vertex/pixel shaders, raster output and preservation of masked target bytes\n", .{});
+    std.debug.print("PASS nonzero first vertex and positive indexed base vertex\n", .{});
     try guestCommandProbe(allocator, &vertex_words, &pixel_words);
 }

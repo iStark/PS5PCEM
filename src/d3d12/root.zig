@@ -29,6 +29,10 @@ pub const Draw = extern struct {
     cull_mode: u32 = 1,
     front_ccw: u32 = 0,
     write_mask: u32 = 15,
+    index_count: u32 = 0,
+    index_element_bytes: u32 = 0,
+    primitive_restart: u32 = 0,
+    base_vertex: i32 = 0,
     viewport: [6]f32,
     scissor: [4]i32,
 
@@ -122,14 +126,23 @@ pub const Device = struct {
     }
 
     pub fn drawSpirv(self: *Device, vertex: []const u32, fragment: []const u32, draw: Draw, rgba: []u8) Error!void {
+        return self.drawIndexedSpirv(vertex, fragment, draw, &.{}, rgba);
+    }
+
+    pub fn drawIndexedSpirv(self: *Device, vertex: []const u32, fragment: []const u32, draw: Draw, indices: []const u8, rgba: []u8) Error!void {
+        if (draw.index_count != 0) {
+            if ((draw.index_element_bytes != 2 and draw.index_element_bytes != 4) or
+                @as(u64, draw.index_count) * draw.index_element_bytes != indices.len or indices.len > 64 * 1024 * 1024) return error.InvalidArgument;
+        } else if (indices.len != 0 or draw.index_element_bytes != 0 or draw.primitive_restart != 0) return error.InvalidArgument;
+        if (draw.primitive_restart > 1 or (draw.primitive_restart != 0 and draw.topology != 5)) return error.InvalidArgument;
         if (rgba.len != try rgbaSize(draw.width, draw.height) or vertex.len < 5 or fragment.len < 5 or
-            vertex[0] != 0x07230203 or fragment[0] != 0x07230203 or draw.vertex_count == 0 or draw.instance_count == 0 or
+            vertex[0] != 0x07230203 or fragment[0] != 0x07230203 or (draw.vertex_count == 0 and draw.index_count == 0) or draw.instance_count == 0 or
             (draw.topology != 4 and draw.topology != 5) or draw.cull_mode < 1 or draw.cull_mode > 3 or draw.write_mask > 15) return error.InvalidArgument;
         for (draw.viewport) |value| if (!std.math.isFinite(value)) return error.InvalidArgument;
         if (draw.viewport[2] <= 0 or draw.viewport[3] <= 0 or draw.viewport[4] < 0 or draw.viewport[5] > 1 or draw.viewport[4] > draw.viewport[5] or
             draw.scissor[0] < 0 or draw.scissor[1] < 0 or draw.scissor[2] < draw.scissor[0] or draw.scissor[3] < draw.scissor[1]) return error.InvalidArgument;
         if (builtin.os.tag != .windows) return error.UnsupportedPlatform;
-        try self.check(ps5_d3d12_draw_spirv(self.handle, vertex.ptr, vertex.len, fragment.ptr, fragment.len, &draw, rgba.ptr));
+        try self.check(ps5_d3d12_draw_spirv(self.handle, vertex.ptr, vertex.len, fragment.ptr, fragment.len, &draw, indices.ptr, indices.len, rgba.ptr));
     }
 
     pub fn presentRgba(self: *Device, rgba: []const u8, width: u32, height: u32) Error!void {
@@ -154,7 +167,7 @@ extern fn ps5_d3d12_attach_window(*Handle, *anyopaque, u32, u32) i32;
 extern fn ps5_d3d12_present(*Handle, *const [4]f32) i32;
 extern fn ps5_d3d12_validation_errors(*Handle) u64;
 extern fn ps5_d3d12_dispatch_spirv(*Handle, [*]const u32, usize, [*]const Buffer, u32, *const [3]u32) i32;
-extern fn ps5_d3d12_draw_spirv(*Handle, [*]const u32, usize, [*]const u32, usize, *const Draw, [*]u8) i32;
+extern fn ps5_d3d12_draw_spirv(*Handle, [*]const u32, usize, [*]const u32, usize, *const Draw, [*]const u8, usize, [*]u8) i32;
 extern fn ps5_d3d12_present_rgba(*Handle, [*]const u8, u32, u32) i32;
 
 test "readback sizes reject empty and excessive textures before native allocation" {
