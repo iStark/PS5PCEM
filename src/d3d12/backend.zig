@@ -9,6 +9,7 @@ const gpu = @import("gpu");
 const rdna2 = @import("rdna2");
 const native = @import("root.zig");
 const graphics = @import("graphics.zig");
+const surfaces = @import("surfaces.zig");
 
 pub const Memory = struct {
     context: ?*anyopaque,
@@ -219,7 +220,7 @@ pub const Renderer = struct {
         const render = gpu.resources.decodeRenderState(state);
         const target = render.color_targets[0] orelse return error.MissingColorTarget;
         if (render.color_count != 1 or render.depth_control.test_enabled or render.depth_control.write_enabled or render.depth_control.stencil_enabled or render.depth_control.clear_enabled or render.depth_control.stencil_clear_enabled or render.blends[0].enabled) return error.DepthBlendAndMultipleTargetsNotImplemented;
-        if (target.format != 10 or target.number_type != 0 or target.component_swap != 0 or target.tile_mode != .linear or target.samples_log2 != 0 or target.fragments_log2 != 0 or target.mip_level != 0 or target.base_array_slice != 0 or target.last_array_slice != 0 or target.dcc_enabled or target.cmask_fast_clear or target.force_destination_alpha_one) return error.UnsupportedRenderTargetLayout;
+        const target_layout = try surfaces.colorLayout(target);
         if (render.color_control.isMetadataOperation() or (state.readRegister(.context, 0x202) != null and !render.color_control.allowsAttachmentWrites(render.target_mask)) or render.color_control.logic_operation != 0xcc) return error.ColorMetadataAndLogicOpsNotImplemented;
         if (render.raster.rasterizer_discard or render.raster.polygon_mode != 0 or render.raster.depth_bias_front or render.raster.depth_bias_back or (render.raster.cull_front and render.raster.cull_back)) return error.UnsupportedRasterState;
         if (render.primitive_type != 4 and render.primitive_type != 5) return error.UnsupportedPrimitive;
@@ -244,11 +245,11 @@ pub const Renderer = struct {
         defer vs.deinit(self.allocator);
         var ps = try gpu.shader_analysis.decode(self.allocator, self.reader(), ps_bindings.program_address, 4096);
         defer ps.deinit(self.allocator);
+        const interface = try graphics.linkInterface(state, vs.program.instructions.items, ps.program.instructions.items);
         // Stage resources need a shared descriptor layout and are the next
         // porting step. Reject them before GPU submission or target writes.
         for ([_]*const gpu.ShaderAnalysis{ &vs, &ps }) |analysis| for (analysis.program.instructions.items) |inst| switch (inst.family) {
             .mimg, .mubuf, .mtbuf, .flat, .smem, .ds => return error.GraphicsResourceBindingsNotImplemented,
-            .vintrp => return error.FragmentVaryingInterfaceNotImplemented,
             else => {},
         };
         var vs_scalar: [64]rdna2.spirv.ScalarRegister = undefined;
@@ -262,40 +263,51 @@ pub const Renderer = struct {
             vs_scalar[vs_scalar_count] = .{ .register = 3, .value = if (routing.vertex_wave32) 0x2020 else 0x4040 };
             vs_scalar_count += 1;
         }
-        var vertex = try vs.translateSpirv(self.allocator, .{ .stage = .vertex, .wave32 = routing.vertex_wave32, .program_address = vs_bindings.program_address, .vertex_index_vgpr = 5, .convert_negative_one_to_one_depth = !render.raster.zero_to_one_depth, .scalar_registers = vs_scalar[0..vs_scalar_count], .allow_control_flow_fallback = false });
+        var vertex = try vs.translateSpirv(self.allocator, .{
+            .stage = .vertex,
+            .wave32 = routing.vertex_wave32,
+            .program_address = vs_bindings.program_address,
+            .vertex_index_vgpr = 5,
+            .convert_negative_one_to_one_depth = !render.raster.zero_to_one_depth,
+            .scalar_registers = vs_scalar[0..vs_scalar_count],
+            .allow_control_flow_fallback = false,
+            .parameter_mask = interface.mask,
+            .vertex_parameter_sources = &interface.controls,
+        });
         defer vertex.deinit(self.allocator);
-        var fragment = try ps.translateSpirv(self.allocator, .{ .stage = .fragment, .wave32 = routing.fragment_wave32, .program_address = ps_bindings.program_address, .fragment_extent = .{ target.width, target.height }, .scalar_registers = ps_scalar[0..entryScalars(ps_bindings, &ps_scalar)], .allow_control_flow_fallback = false });
+        var fragment = try ps.translateSpirv(self.allocator, .{
+            .stage = .fragment,
+            .wave32 = routing.fragment_wave32,
+            .program_address = ps_bindings.program_address,
+            .fragment_extent = .{ target.width, target.height },
+            .scalar_registers = ps_scalar[0..entryScalars(ps_bindings, &ps_scalar)],
+            .allow_control_flow_fallback = false,
+            .parameter_mask = interface.mask,
+            .fragment_input_controls = &interface.controls,
+            .fragment_input_locations = &interface.locations,
+            .infer_fragment_parameter_mask = false,
+            .fragment_inputs = .{
+                .allocated = @truncate(state.readRegister(.context, 0x1b4) orelse 0),
+                .enabled = @truncate(state.readRegister(.context, 0x1b3) orelse 0),
+                .front_face_all_bits = ((state.readRegister(.context, 0x1b8) orelse 0) & (1 << 24)) != 0,
+            },
+        });
         defer fragment.deinit(self.allocator);
         if (vertex.used_dispatcher or fragment.used_dispatcher) return error.UnboundedControlFlowNotImplemented;
-        const pixels = try self.readLinear(target.address, target.width, target.height, target.pitch);
-        defer self.allocator.free(pixels);
-        try self.device.drawIndexedSpirv(vertex.words, fragment.words, draw_state, indices, pixels);
-        try self.writeLinear(target.address, target.width, target.height, target.pitch, pixels);
+        var surface = try surfaces.Staged.read(self.allocator, self.memory, target.address, target_layout);
+        defer surface.deinit();
+        try self.device.drawIndexedSpirv(vertex.words, fragment.words, draw_state, indices, surface.pixels);
+        try surface.write(self.memory);
     }
 
-    fn readLinear(self: *Renderer, address: u64, width: u32, height: u32, pitch: u32) ![]u8 {
-        const bytes = try native.rgbaSize(width, height);
-        if (pitch < width or pitch > 16384) return error.InvalidPitch;
-        const pixels = try self.allocator.alloc(u8, bytes);
-        errdefer self.allocator.free(pixels);
-        for (0..height) |y| {
-            const row_address = try std.math.add(u64, address, @as(u64, y) * pitch * 4);
-            if (!self.memory.read(self.memory.context, row_address, pixels[y * width * 4 ..][0 .. width * 4])) return error.GuestReadFailed;
-        }
-        return pixels;
-    }
-    fn writeLinear(self: *Renderer, address: u64, width: u32, height: u32, pitch: u32, pixels: []const u8) !void {
-        for (0..height) |y| {
-            const row_address = try std.math.add(u64, address, @as(u64, y) * pitch * 4);
-            if (!self.memory.write(self.memory.context, row_address, pixels[y * width * 4 ..][0 .. width * 4])) return error.GuestWriteFailed;
-        }
-    }
     pub fn present(self: *Renderer, flip: gpu.state.Flip) !void {
         const resolve = self.display_resolver orelse return error.DisplayResolverUnavailable;
         const display = resolve(flip) orelse return error.DisplayBufferUnavailable;
-        if (display.tiling_mode != 1 or (display.pixel_format != 0 and display.pixel_format != 0x8000000000000000)) return error.UnsupportedScanoutLayout;
-        const pixels = try self.readLinear(display.address, display.width, display.height, display.pitch_in_pixels);
-        defer self.allocator.free(pixels);
+        if (display.pixel_format != 0 and display.pixel_format != 0x8000000000000000) return error.UnsupportedScanoutLayout;
+        const layout = try surfaces.scanoutLayout(display.width, display.height, display.pitch_in_pixels, display.tiling_mode);
+        var surface = try surfaces.Staged.read(self.allocator, self.memory, display.address, layout);
+        defer surface.deinit();
+        const pixels = surface.pixels;
         if (display.pixel_format == 0x8000000000000000) {
             var offset: usize = 0;
             while (offset < pixels.len) : (offset += 4) std.mem.swap(u8, &pixels[offset], &pixels[offset + 2]);

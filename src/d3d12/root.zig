@@ -9,9 +9,11 @@ const builtin = @import("builtin");
 pub const backend = @import("backend.zig");
 pub const Renderer = backend.Renderer;
 pub const graphics = @import("graphics.zig");
+pub const surfaces = @import("surfaces.zig");
 
 test {
     _ = graphics;
+    _ = surfaces;
 }
 
 const Handle = opaque {};

@@ -12,6 +12,30 @@ pub const Routing = struct {
     fragment_wave32: bool,
 };
 
+pub const Interface = struct {
+    mask: u32 = 0,
+    controls: [32]u32 = undefined,
+    locations: [32]u8 = undefined,
+};
+
+pub fn linkInterface(state: *const gpu.State, vertex: []const gpu.ShaderInstruction, fragment: []const gpu.ShaderInstruction) !Interface {
+    const outputs = gpu.resource_checkpoints.graphicsInterface(vertex, null);
+    const inputs = gpu.resource_checkpoints.graphicsInterface(fragment, null);
+    var result = Interface{ .mask = inputs.attributes };
+    for (&result.controls, &result.locations, 0..) |*control, *location, i| {
+        location.* = @intCast(i);
+        control.* = state.readRegister(.context, 0x191 + @as(u32, @intCast(i))) orelse @as(u32, @intCast(i));
+        if (inputs.attributes & (@as(u32, 1) << @intCast(i)) == 0) continue;
+        // Smooth PARAM interpolation is provided by the native rasterizer.
+        // Default constants, flat/custom and point-sprite inputs need their
+        // own lowering; do not silently replace them with screen-space UVs.
+        if (control.* & ~@as(u32, 0x1f) != 0) return error.FragmentInterpolationModeNotImplemented;
+        if (outputs.parameters & (@as(u32, 1) << @intCast(control.*)) == 0) return error.MissingVertexParameterExport;
+    }
+    for (fragment) |inst| if (inst.opcode == .v_interp_mov_f32) return error.FragmentPerVertexInterpolationNotImplemented;
+    return result;
+}
+
 pub fn routing(state: *const gpu.State) !Routing {
     const enables = state.readRegister(.context, 0x2d5) orelse 0;
     const ls = enables & 3;
@@ -77,4 +101,19 @@ test "real geometry, tessellation and reserved routing remain explicit failures"
     try std.testing.expectError(error.UnsupportedNggStageRouting, routing(&state));
     try state.writeRegister(.context, 0x2d5, 0x2000);
     try std.testing.expectError(error.NggCullingNotImplemented, routing(&state));
+}
+
+test "fragment interface rejects absent exports and unsupported interpolation instead of synthesizing inputs" {
+    var state: gpu.State = .{};
+    const vertex = [_]gpu.ShaderInstruction{.{ .opcode = .exp, .export_target = 0x23, .export_enable = 15 }};
+    const fragment = [_]gpu.ShaderInstruction{.{
+        .opcode = .v_interp_p2_f32,
+        .src1 = .{ .kind = .integer_inline_constant, .value = 0 },
+        .src2 = .{ .kind = .integer_inline_constant, .value = 0 },
+    }};
+    try std.testing.expectError(error.MissingVertexParameterExport, linkInterface(&state, &vertex, &fragment));
+    try state.writeRegister(.context, 0x191, 3);
+    try std.testing.expectEqual(@as(u32, 1), (try linkInterface(&state, &vertex, &fragment)).mask);
+    try state.writeRegister(.context, 0x191, 0x403);
+    try std.testing.expectError(error.FragmentInterpolationModeNotImplemented, linkInterface(&state, &vertex, &fragment));
 }

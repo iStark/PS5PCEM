@@ -352,4 +352,126 @@ fn guestGraphicsProbe(allocator: std.mem.Allocator, device: *d3d12.Device) !void
     std.debug.print("PASS guest RDNA2 vertex/pixel shaders, raster output and preservation of masked target bytes\n", .{});
     std.debug.print("PASS nonzero first vertex and positive indexed base vertex\n", .{});
     try guestCommandProbe(allocator, &vertex_words, &pixel_words);
+    try guestSurfaceProbe(allocator, &vertex_words, &pixel_words);
+    try guestVaryingProbe(allocator, &vertex_words);
+}
+
+const GraphicsMemory = struct {
+    data: [1024 * 1024]u8 = @splat(0),
+    fn read(context: ?*anyopaque, address: u64, bytes: []u8) bool {
+        const self: *@This() = @ptrCast(@alignCast(context.?));
+        if (address > self.data.len or bytes.len > self.data.len - address) return false;
+        @memcpy(bytes, self.data[@intCast(address)..][0..bytes.len]);
+        return true;
+    }
+    fn write(context: ?*anyopaque, address: u64, bytes: []const u8) bool {
+        const self: *@This() = @ptrCast(@alignCast(context.?));
+        if (address > self.data.len or bytes.len > self.data.len - address) return false;
+        @memcpy(self.data[@intCast(address)..][0..bytes.len], bytes);
+        return true;
+    }
+    fn access(self: *@This()) d3d12.backend.Memory {
+        return .{ .context = self, .read = read, .write = write };
+    }
+};
+
+fn graphicsState(width: u32, height: u32, pitch: u32) !gpu.State {
+    var state = gpu.State{};
+    try state.writeRegister(.shader, 0x048, 2);
+    try state.writeRegister(.shader, 0x049, 0);
+    try state.writeRegister(.shader, 0x008, 4);
+    try state.writeRegister(.shader, 0x009, 0);
+    try state.writeRegister(.context, 0x318, 0x20);
+    try state.writeRegister(.context, 0x390, 0);
+    try state.writeRegister(.context, 0x31c, 10 << 2);
+    try state.writeRegister(.context, 0x319, pitch / 8 - 1);
+    try state.writeRegister(.context, 0x3b0, ((width - 1) << 14) | (height - 1));
+    try state.writeRegister(.context, 0x3b8, 0);
+    return state;
+}
+
+fn guestSurfaceProbe(allocator: std.mem.Allocator, vertex: []const u32, fragment: []const u32) !void {
+    var memory = try allocator.create(GraphicsMemory);
+    defer allocator.destroy(memory);
+    memory.* = .{};
+    @memcpy(memory.data[0x200..][0 .. vertex.len * 4], std.mem.sliceAsBytes(vertex));
+    @memcpy(memory.data[0x400..][0 .. fragment.len * 4], std.mem.sliceAsBytes(fragment));
+    var renderer = try d3d12.Renderer.init(allocator, memory.access(), false);
+    defer renderer.deinit();
+    var state = try graphicsState(259, 145, 280);
+    var executor = gpu.DcbExecutor{ .state = &state, .backend = renderer.dcbBackend(), .allocator = allocator };
+    const initial = try allocator.alloc(u8, 259 * 145 * 4);
+    defer allocator.free(initial);
+    for (initial, 0..) |*byte, i| byte.* = if (i % 4 == 3) 255 else @truncate(i *% 17 +% (i >> 8));
+    var reference: ?[]u8 = null;
+    defer if (reference) |bytes| allocator.free(bytes);
+    for ([_]gpu.resources.TileMode{ .linear, .standard_256b, .standard_4kb, .standard_64kb, .partially_resident, .render_target }) |mode| {
+        try state.writeRegister(.context, 0x3b8, @as(u32, @intFromEnum(mode)) << 14);
+        const target = gpu.resources.decodeColorTarget(&state, 0, 15).?;
+        const layout = try d3d12.surfaces.colorLayout(target);
+        @memset(memory.data[0x2000..], 0xa7);
+        const allocation = memory.data[0x2000..][0..@intCast(layout.required_source_bytes)];
+        try layout.tile(initial, allocation);
+        _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 2 });
+        var staged = try d3d12.surfaces.Staged.read(allocator, memory.access(), target.address, layout);
+        defer staged.deinit();
+        if (reference) |expected| {
+            if (!std.mem.eql(u8, expected, staged.pixels)) return error.TiledDrawImageMismatch;
+        } else reference = try allocator.dupe(u8, staged.pixels);
+        const expected_backing = try allocator.alloc(u8, allocation.len);
+        defer allocator.free(expected_backing);
+        @memset(expected_backing, 0xa7);
+        try layout.tile(reference.?, expected_backing);
+        if (!std.mem.eql(u8, allocation, expected_backing)) return error.TiledPaddingModified;
+        for (memory.data[0x2000 + allocation.len ..]) |byte| if (byte != 0xa7) return error.SurfaceWriteOutOfBounds;
+        if (mode == .render_target or mode == .linear) {
+            const scanout = try d3d12.surfaces.scanoutLayout(259, 145, 280, if (mode == .linear) 1 else 0);
+            var presented = try d3d12.surfaces.Staged.read(allocator, memory.access(), target.address, scanout);
+            defer presented.deinit();
+            if (!std.mem.eql(u8, reference.?, presented.pixels)) return error.ScanoutLayoutMismatch;
+        }
+    }
+    std.debug.print("PASS six guest surface layouts: identical D3D12 pixels, macro-tile XOR, padding and tiled/linear scanout staging\n", .{});
+}
+
+fn guestVaryingProbe(allocator: std.mem.Allocator, vertex: []const u32) !void {
+    var memory = try allocator.create(GraphicsMemory);
+    defer allocator.destroy(memory);
+    memory.* = .{};
+    var words: std.ArrayList(u32) = .empty;
+    defer words.deinit(allocator);
+    try words.appendSlice(allocator, vertex[0 .. vertex.len - 1]);
+    try words.appendSlice(allocator, &.{
+        vop2(0x03, 9, 5, 8),  vop2(0x03, 10, 6, 8),
+        vop1(0x01, 11, 255),  0x3f000000,
+        vop2(0x08, 9, 9, 11), vop2(0x08, 10, 10, 11),
+        vop1(0x01, 11, 255),  0x3e800000,
+        0xf8000a3f, 0x080b0a09, 0xbf810000, // PARAM3 = normalized x/y, .25, 1.
+    });
+    @memcpy(memory.data[0x200..][0 .. words.items.len * 4], std.mem.sliceAsBytes(words.items));
+    words.clearRetainingCapacity();
+    for (0..4) |component| {
+        const attr: u32 = if (component % 2 == 0) 0 else 4;
+        for (0..2) |phase| try words.append(allocator, 0xc8000000 | (@as(u32, @intCast(component)) << 18) |
+            (@as(u32, @intCast(phase)) << 16) | (attr << 10) | (@as(u32, @intCast(component)) << 8) | @as(u32, @intCast(phase)));
+    }
+    try words.appendSlice(allocator, &.{ 0xf800080f, 0x03020100, 0xbf810000 });
+    @memcpy(memory.data[0x400..][0 .. words.items.len * 4], std.mem.sliceAsBytes(words.items));
+    var renderer = try d3d12.Renderer.init(allocator, memory.access(), false);
+    defer renderer.deinit();
+    var state = try graphicsState(65, 37, 72);
+    try state.writeRegister(.context, 0x191, 3);
+    try state.writeRegister(.context, 0x195, 3); // Two distinct ATTRs consume PARAM3.
+    var executor = gpu.DcbExecutor{ .state = &state, .backend = renderer.dcbBackend(), .allocator = allocator };
+    _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 2 });
+    for ([_][2]usize{ .{ 32, 18 }, .{ 28, 18 }, .{ 36, 18 }, .{ 32, 12 }, .{ 32, 23 } }) |point| {
+        const x, const y = point;
+        const expected = [4]f32{ (@as(f32, @floatFromInt(x)) + 0.5) / 65 * 255, (1 - (@as(f32, @floatFromInt(y)) + 0.5) / 37) * 255, 63.75, 255 };
+        const actual = memory.data[0x2000 + (y * 72 + x) * 4 ..][0..4];
+        for (actual, expected) |a, e| if (@abs(@as(f32, @floatFromInt(a)) - e) > 1) {
+            std.debug.print("Varying mismatch at {d},{d}: {any}, expected {any}\n", .{ x, y, actual, expected });
+            return error.FragmentVaryingMismatch;
+        };
+    }
+    std.debug.print("PASS native interpolated RDNA2 PARAM values and two ATTR inputs remapped to PARAM3\n", .{});
 }
