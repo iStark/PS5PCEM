@@ -60,6 +60,10 @@ pub const Draw = extern struct {
     primitive_restart: u32 = 0,
     base_vertex: i32 = 0,
     blend: blending.State = .{},
+    // Zero means no depth attachment; otherwise a native D16/D32 DSV.
+    depth_format: u32 = 0,
+    depth_write: u32 = 0,
+    depth_compare: u32 = 8,
     viewport: [6]f32,
     scissor: [4]i32,
 
@@ -192,6 +196,12 @@ pub const Device = struct {
     }
 
     pub fn drawResourcesSpirv(self: *Device, vertex: []const u32, fragment: []const u32, draw: Draw, indices: []const u8, buffers: []const Buffer, images: []const SampledImage, rgba: []u8) Error!void {
+        return self.drawDepthResourcesSpirv(vertex, fragment, draw, indices, buffers, images, rgba, &.{});
+    }
+
+    pub fn drawDepthResourcesSpirv(self: *Device, vertex: []const u32, fragment: []const u32, draw: Draw, indices: []const u8, buffers: []const Buffer, images: []const SampledImage, rgba: []u8, depth: []u8) Error!void {
+        if (depth.len != try depthSize(draw.width, draw.height, draw.depth_format) or draw.depth_write > 1 or
+            draw.depth_compare < 1 or draw.depth_compare > 8 or (draw.depth_format == 0 and draw.depth_write != 0)) return error.InvalidArgument;
         if (!draw.blend.valid()) return error.InvalidArgument;
         if (buffers.len > 64 or images.len > 32) return error.InvalidArgument;
         for (buffers) |buffer| if (buffer.size == 0 or buffer.size % 4 != 0 or buffer.size > 256 * 1024 * 1024) return error.InvalidArgument;
@@ -215,7 +225,7 @@ pub const Device = struct {
         if (draw.viewport[2] <= 0 or draw.viewport[3] <= 0 or draw.viewport[4] < 0 or draw.viewport[5] > 1 or draw.viewport[4] > draw.viewport[5] or
             draw.scissor[0] < 0 or draw.scissor[1] < 0 or draw.scissor[2] < draw.scissor[0] or draw.scissor[3] < draw.scissor[1]) return error.InvalidArgument;
         if (builtin.os.tag != .windows) return error.UnsupportedPlatform;
-        try self.check(ps5_d3d12_draw_spirv(self.handle, vertex.ptr, vertex.len, fragment.ptr, fragment.len, &draw, indices.ptr, indices.len, buffers.ptr, @intCast(buffers.len), images.ptr, @intCast(images.len), rgba.ptr));
+        try self.check(ps5_d3d12_draw_spirv(self.handle, vertex.ptr, vertex.len, fragment.ptr, fragment.len, &draw, indices.ptr, indices.len, buffers.ptr, @intCast(buffers.len), images.ptr, @intCast(images.len), rgba.ptr, depth.ptr, depth.len));
     }
 
     pub fn presentRgba(self: *Device, rgba: []const u8, width: u32, height: u32) Error!void {
@@ -246,6 +256,16 @@ pub fn sampledImageSize(width: u32, height: u32, format: u32) Error!usize {
     return @as(usize, width / 4) * (height / 4) * bytes;
 }
 
+pub fn depthSize(width: u32, height: u32, format: u32) Error!usize {
+    const bytes = try rgbaSize(width, height);
+    return switch (format) {
+        0 => 0,
+        40 => bytes, // D32_FLOAT
+        55 => bytes / 2, // D16_UNORM
+        else => error.InvalidArgument,
+    };
+}
+
 extern fn ps5_d3d12_create(*?*Handle, *DeviceInfo, c_int, [*]u8, usize) i32;
 extern fn ps5_d3d12_destroy(*Handle) void;
 extern fn ps5_d3d12_error(*Handle) [*:0]const u8;
@@ -258,7 +278,7 @@ extern fn ps5_d3d12_validation_errors(*Handle) u64;
 extern fn ps5_d3d12_cache_stats(*Handle, *CacheStats) void;
 extern fn ps5_d3d12_cache_limits(*Handle, u32, u32) i32;
 extern fn ps5_d3d12_dispatch_spirv(*Handle, [*]const u32, usize, [*]const Buffer, u32, *const [3]u32) i32;
-extern fn ps5_d3d12_draw_spirv(*Handle, [*]const u32, usize, [*]const u32, usize, *const Draw, [*]const u8, usize, [*]const Buffer, u32, [*]const SampledImage, u32, [*]u8) i32;
+extern fn ps5_d3d12_draw_spirv(*Handle, [*]const u32, usize, [*]const u32, usize, *const Draw, [*]const u8, usize, [*]const Buffer, u32, [*]const SampledImage, u32, [*]u8, [*]u8, usize) i32;
 extern fn ps5_d3d12_present_rgba(*Handle, [*]const u8, u32, u32) i32;
 
 test "readback sizes reject empty and excessive textures before native allocation" {
@@ -267,6 +287,14 @@ test "readback sizes reject empty and excessive textures before native allocatio
     try std.testing.expectError(error.InvalidArgument, rgbaSize(1, 0));
     try std.testing.expectError(error.InvalidArgument, rgbaSize(16385, 1));
     try std.testing.expectError(error.InvalidArgument, rgbaSize(1, std.math.maxInt(u32)));
+}
+
+test "depth footprints accept only native D16 and D32 planes" {
+    try std.testing.expectEqual(@as(usize, 0), try depthSize(65, 37, 0));
+    try std.testing.expectEqual(@as(usize, 65 * 37 * 2), try depthSize(65, 37, 55));
+    try std.testing.expectEqual(@as(usize, 65 * 37 * 4), try depthSize(65, 37, 40));
+    try std.testing.expectError(error.InvalidArgument, depthSize(65, 37, 45));
+    try std.testing.expectError(error.InvalidArgument, depthSize(0, 37, 40));
 }
 
 test "sampled BC footprints count blocks and reject unsupported native extents" {

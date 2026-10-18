@@ -35,14 +35,13 @@ test "guest primitive numbers map explicitly and fans never masquerade as strips
     try std.testing.expectError(error.UnsupportedPrimitive, nativeTopology(7));
 }
 
-/// With depth/stencil already disabled by the draw boundary, viewport depth
-/// only remains observable through the pixel shader's position-Z input.
+/// Depth is observed by depth testing/writes or a pixel position-Z input.
 /// Replacing an unobserved depth mapping preserves clipping (performed before
 /// the viewport), coverage, perspective interpolation and all color outputs.
-pub fn viewportDepthRange(minimum: f32, maximum: f32, position_z_enabled: bool) ![2]f32 {
+pub fn viewportDepthRange(minimum: f32, maximum: f32, depth_observed: bool) ![2]f32 {
     if (!std.math.isFinite(minimum) or !std.math.isFinite(maximum)) return error.InvalidViewportDepth;
     if (minimum >= 0 and maximum <= 1 and minimum <= maximum) return .{ minimum, maximum };
-    if (position_z_enabled) return error.UnrestrictedViewportDepthNotImplemented;
+    if (depth_observed) return error.UnrestrictedViewportDepthNotImplemented;
     return .{ 0, 1 };
 }
 

@@ -440,6 +440,7 @@ fn guestGraphicsProbe(allocator: std.mem.Allocator, device: *d3d12.Device) !void
     std.debug.print("PASS nonzero first vertex and positive indexed base vertex\n", .{});
     try guestCommandProbe(allocator, &vertex_words, &pixel_words);
     try guestSurfaceProbe(allocator, &vertex_words, &pixel_words);
+    try guestDepthProbe(allocator, &vertex_words, &pixel_words);
     try guestVaryingProbe(allocator, &vertex_words);
     try guestResourcesProbe(allocator);
     try guestBlendingProbe(allocator, &vertex_words);
@@ -685,6 +686,149 @@ fn graphicsState(width: u32, height: u32, pitch: u32) !gpu.State {
     try state.writeRegister(.context, 0x3b0, ((width - 1) << 14) | (height - 1));
     try state.writeRegister(.context, 0x3b8, 0);
     return state;
+}
+
+fn guestDepthProbe(allocator: std.mem.Allocator, vertex: []const u32, fragment: []const u32) !void {
+    const memory = try allocator.create(GraphicsMemory);
+    defer allocator.destroy(memory);
+    memory.* = .{};
+    @memcpy(memory.data[0x400..][0 .. fragment.len * 4], std.mem.sliceAsBytes(fragment));
+    var renderer = try d3d12.Renderer.init(allocator, memory.access(), false);
+    defer renderer.deinit();
+    var state = try graphicsState(65, 37, 72);
+    try state.writeRegister(.context, 0x204, 1 << 19); // Guest 0..1 clip depth.
+    try state.writeRegister(.context, 0x007, 64 | (36 << 16));
+    try state.writeRegister(.context, 0x012, 0x200);
+    try state.writeRegister(.context, 0x014, 0x200);
+    var executor = gpu.DcbExecutor{ .state = &state, .backend = renderer.dcbBackend(), .allocator = allocator };
+    const packet: gpu.pm4.Packet = .{ .kind = .command, .header = command(gpu.pm4.draw_index_auto, 2), .opcode = gpu.pm4.draw_index_auto, .body = &.{ 3, 2 } };
+    const color_layout = try d3d12.surfaces.colorLayout(gpu.resources.decodeColorTarget(&state, 0, 15).?);
+    const color = memory.data[0x2000..][0..@intCast(color_layout.required_source_bytes)];
+    @memset(color, 0xa7);
+    @memcpy(memory.data[0x200..][0 .. vertex.len * 4], std.mem.sliceAsBytes(vertex));
+    _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 2 });
+    const reference = try allocator.dupe(u8, color);
+    defer allocator.free(reference);
+    var cases: usize = 0;
+    for ([_]u8{ 1, 3 }) |format| for ([_]gpu.resources.TileMode{ .linear, .depth }) |mode| {
+        try state.writeRegister(.context, 0x010, @as(u32, format) | (@as(u32, @intFromEnum(mode)) << 4));
+        const descriptor = gpu.resources.decodeDepthTarget(&state).?;
+        const layout = try d3d12.surfaces.depthLayout(descriptor, 65, 37, true);
+        const backing = memory.data[0x20000..][0..@intCast(layout.required_source_bytes)];
+        const bpp: usize = if (format == 1) 2 else 4;
+        for ([_]f32{ 0, 0.25, 0.5, 0.75, 1 }) |incoming| {
+            // Change the real guest VS in place; cache identity must follow it.
+            var program: std.ArrayList(u32) = .empty;
+            defer program.deinit(allocator);
+            for (vertex) |word| {
+                if (word == vop1(0x01, 7, 128)) {
+                    try program.appendSlice(allocator, &.{ vop1(0x01, 7, 255), @bitCast(incoming) });
+                } else try program.append(allocator, word);
+            }
+            @memcpy(memory.data[0x200..][0 .. program.items.len * 4], std.mem.sliceAsBytes(program.items));
+            for ([_]f32{ 0, 1 }) |stored| for (0..8) |compare| for (0..3) |write_mode| {
+                const passes = switch (compare) {
+                    0 => false,
+                    1 => incoming < stored,
+                    2 => incoming == stored,
+                    3 => incoming <= stored,
+                    4 => incoming > stored,
+                    5 => incoming != stored,
+                    6 => incoming >= stored,
+                    7 => true,
+                    else => unreachable,
+                };
+                const writes = write_mode == 1;
+                try state.writeRegister(.context, 0x200, 2 | (if (write_mode == 0) @as(u32, 0) else 4) | (@as(u32, @intCast(compare)) << 4));
+                try state.writeRegister(.context, 0x002, if (write_mode == 2) 1 << 24 else 0);
+                @memset(color, 0xa7);
+                @memset(backing, 0x5d);
+                // Initialize every logical depth texel; preserve row/tile tails.
+                for (0..37) |y| for (0..65) |x| {
+                    const offset: usize = @intCast(try layout.sourceByteOffset(@intCast(x), @intCast(y), 0));
+                    if (bpp == 2) std.mem.writeInt(u16, backing[offset..][0..2], if (stored == 0) 0 else 65535, .little) else std.mem.writeInt(u32, backing[offset..][0..4], @bitCast(stored), .little);
+                };
+                const expected = try allocator.dupe(u8, backing);
+                defer allocator.free(expected);
+                if (writes and passes) for (0..37) |y| {
+                    for (0..65) |x| {
+                        const color_offset: usize = @intCast(try color_layout.sourceByteOffset(@intCast(x), @intCast(y), 0));
+                        if (reference[color_offset] == 0xa7) continue;
+                        const offset: usize = @intCast(try layout.sourceByteOffset(@intCast(x), @intCast(y), 0));
+                        if (bpp == 2) std.mem.writeInt(u16, expected[offset..][0..2], @intFromFloat(@round(incoming * 65535)), .little) else std.mem.writeInt(u32, expected[offset..][0..4], @bitCast(incoming), .little);
+                    }
+                };
+                _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 2 });
+                if (bpp == 2 and writes and passes) for (0..37) |y| {
+                    for (0..65) |x| {
+                        const color_offset: usize = @intCast(try color_layout.sourceByteOffset(@intCast(x), @intCast(y), 0));
+                        if (reference[color_offset] == 0xa7) continue;
+                        const offset: usize = @intCast(try layout.sourceByteOffset(@intCast(x), @intCast(y), 0));
+                        const actual = std.mem.readInt(u16, backing[offset..][0..2], .little);
+                        // Interpolated 0.5 can land on either side of the D16
+                        // quantization midpoint. Check numeric precision first,
+                        // then retain exact checks for all untouched/padding bytes.
+                        const ideal = @as(f64, incoming) * 65535;
+                        if (@abs(@as(f64, @floatFromInt(actual)) - ideal) > 0.6) return error.DepthPrecisionMismatch;
+                        std.mem.writeInt(u16, expected[offset..][0..2], actual, .little);
+                    }
+                };
+                for (color, 0..) |byte, i| if (byte != (if (passes) reference[i] else @as(u8, 0xa7))) {
+                    std.debug.print("Depth color format={d} compare={d} in={d} stored={d} write={d} byte={d}\n", .{ format, compare, incoming, stored, write_mode, i });
+                    return error.DepthComparisonMismatch;
+                };
+                if (!std.mem.eql(u8, backing, expected)) {
+                    for (backing, expected, 0..) |actual_byte, expected_byte, i| if (actual_byte != expected_byte) {
+                        const aligned = i / bpp * bpp;
+                        std.debug.print("Depth bytes format={d} tile={f} compare={d} in={d} stored={d} write={d} offset={d} actual={any} expected={any}\n", .{ format, mode, compare, incoming, stored, write_mode, i, backing[aligned..][0..bpp], expected[aligned..][0..bpp] });
+                        break;
+                    };
+                    return error.DepthWritebackOrPaddingMismatch;
+                }
+                cases += 1;
+            };
+        }
+    };
+    // A committed first draw must affect the next comparison, with no CPU
+    // replacement of the depth plane between them. Then disable depth again.
+    try state.writeRegister(.context, 0x002, 0);
+    try state.writeRegister(.context, 0x200, 2 | 4 | (7 << 4));
+    @memset(memory.data[0x20000..0x30000], 0);
+    _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 2 });
+    @memset(color, 0xa7);
+    try state.writeRegister(.context, 0x200, 2 | (4 << 4)); // 1 > stored 1 must fail.
+    _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 2 });
+    for (color) |byte| if (byte != 0xa7) return error.ConsecutiveDepthDrawMismatch;
+    try state.writeRegister(.context, 0x200, 0);
+    _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 2 });
+    if (!std.mem.eql(u8, color, reference)) return error.DisabledDepthDrawMismatch;
+    try state.writeRegister(.context, 0x200, 2 | 4);
+    // Error paths must leave both attachment planes and guest labels intact.
+    const before = try allocator.dupe(u8, &memory.data);
+    defer allocator.free(before);
+    try state.writeRegister(.context, 0x002, 0);
+    try state.writeRegister(.context, 0x014, 0x300);
+    if (renderer.draw(&state, packet)) |_| return error.SeparateDepthAccepted else |err| if (err != error.SeparateDepthAddressesNotImplemented) return err;
+    try state.writeRegister(.context, 0x014, 0x200);
+    try state.writeRegister(.context, 0x012, 0x20);
+    try state.writeRegister(.context, 0x014, 0x20);
+    if (renderer.draw(&state, packet)) |_| return error.DepthColorAliasAccepted else |err| if (err != error.DepthColorAliasNotImplemented) return err;
+    try state.writeRegister(.context, 0x012, 0x200);
+    try state.writeRegister(.context, 0x014, 0x200);
+    try state.writeRegister(.context, 0x000, 1);
+    if (renderer.draw(&state, packet)) |_| return error.DepthClearAccepted else |err| if (err != error.DepthClearStencilAndBoundsNotImplemented) return err;
+    try state.writeRegister(.context, 0x000, 0);
+    try state.writeRegister(.context, 0x200, 3 | 4);
+    if (renderer.draw(&state, packet)) |_| return error.StencilAccepted else |err| if (err != error.DepthClearStencilAndBoundsNotImplemented) return err;
+    try state.writeRegister(.context, 0x200, 2 | 4 | (1 << 3));
+    if (renderer.draw(&state, packet)) |_| return error.DepthBoundsAccepted else |err| if (err != error.DepthClearStencilAndBoundsNotImplemented) return err;
+    try state.writeRegister(.context, 0x200, 2 | 4);
+    try state.writeRegister(.context, 0x010, 3 | (24 << 4) | (1 << 29));
+    if (executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 2 })) |_| return error.DepthMetadataAccepted else |err| if (err != error.BackendRejected) return err;
+    if (!std.mem.eql(u8, before, &memory.data)) return error.RejectedDepthModifiedMemory;
+    const backend = renderer.dcbBackend();
+    if (backend.vtable.write(backend.context, 0x1200, &.{ 1, 2, 3, 4 })) return error.FailedDepthPublishedLabel;
+    std.debug.print("PASS {d} guest depth cases: D16/D32, linear/depth-64K, all comparisons, read-only/write masks, shader mutation, consecutive draws, full color/depth and padding checks; invalid layouts stop before writes\n", .{cases});
 }
 
 fn guestSurfaceProbe(allocator: std.mem.Allocator, vertex: []const u32, fragment: []const u32) !void {

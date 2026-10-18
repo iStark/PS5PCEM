@@ -41,7 +41,7 @@ typedef struct ShaderEntry {
 /* Fixed-size words, not a native descriptor with pointers/padding. All other
  * PSO state is fixed by graphics_desc; dynamic constants/resources are rebound
  * on every draw and are deliberately absent from this key. */
-typedef struct PipelineKey { uint64_t words[16]; } PipelineKey;
+typedef struct PipelineKey { uint64_t words[19]; } PipelineKey;
 typedef struct PipelineEntry {
     PipelineKey key;
     uint64_t used;
@@ -1044,11 +1044,17 @@ static int valid_sampled_image(const Ps5D3D12Image *image) {
 
 int32_t ps5_d3d12_draw_spirv(Ps5D3D12 *c, const uint32_t *vertex, size_t vertex_count,
     const uint32_t *fragment, size_t fragment_count, const Ps5D3D12Draw *d, const uint8_t *indices, size_t index_bytes,
-    const Ps5D3D12Buffer *buffers, uint32_t buffer_count, const Ps5D3D12Image *images, uint32_t image_count, uint8_t *rgba) {
+    const Ps5D3D12Buffer *buffers, uint32_t buffer_count, const Ps5D3D12Image *images, uint32_t image_count, uint8_t *rgba,
+    uint8_t *depth_pixels, size_t depth_bytes) {
     if (!c || !vertex || !fragment || vertex_count < 5 || fragment_count < 5 || !d || !rgba ||
         !d->width || !d->height || d->width > 16384 || d->height > 16384 || (!d->vertex_count && !d->index_count) || !d->instance_count ||
         (d->topology != D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST && d->topology != D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP) ||
         d->cull_mode < D3D12_CULL_MODE_NONE || d->cull_mode > D3D12_CULL_MODE_BACK || d->write_mask > 15) return E_INVALIDARG;
+    const UINT depth_bpp = d->depth_format == DXGI_FORMAT_D16_UNORM ? 2 : 4;
+    if (d->depth_write > 1 || d->depth_compare < 1 || d->depth_compare > 8 ||
+        (d->depth_format == 0 ? (depth_bytes != 0 || d->depth_write != 0) :
+        ((d->depth_format != DXGI_FORMAT_D16_UNORM && d->depth_format != DXGI_FORMAT_D32_FLOAT) || !depth_pixels ||
+        (uint64_t)d->width * d->height * depth_bpp != depth_bytes))) return E_INVALIDARG;
     const Ps5D3D12Blend *blend = &d->blend;
     if (blend->enabled > 1 || !valid_blend_factor(blend->source_color, 0) || !valid_blend_factor(blend->destination_color, 0) ||
         !valid_blend_factor(blend->source_alpha, 1) || !valid_blend_factor(blend->destination_alpha, 1) ||
@@ -1073,6 +1079,7 @@ int32_t ps5_d3d12_draw_spirv(Ps5D3D12 *c, const uint32_t *vertex, size_t vertex_
     ID3D12RootSignature *root = NULL;
     ID3D12PipelineState *pipeline = NULL;
     ID3D12Resource *color = NULL, *upload = NULL, *readback = NULL, *index_upload = NULL;
+    ID3D12Resource *depth = NULL, *depth_upload = NULL, *depth_readback = NULL;
     uint64_t vs_id, ps_id;
     TRY(compile_spirv(c, vertex, vertex_count, SpvExecutionModelVertex, buffer_count, image_count, &vs, &vs_id));
     TRY(compile_spirv(c, fragment, fragment_count, SpvExecutionModelFragment, buffer_count, image_count, &ps, &ps_id));
@@ -1080,11 +1087,16 @@ int32_t ps5_d3d12_draw_spirv(Ps5D3D12 *c, const uint32_t *vertex, size_t vertex_
         d->index_element_bytes == 2 ? D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFF : D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFFFFFF;
     const PipelineKey key = {{2, vs_id, ps_id, buffer_count, image_count, d->cull_mode, d->front_ccw != 0,
         d->write_mask, blend->enabled, blend->source_color, blend->destination_color, blend->color_operation,
-        blend->source_alpha, blend->destination_alpha, blend->alpha_operation, strip_cut}};
+        blend->source_alpha, blend->destination_alpha, blend->alpha_operation, strip_cut,
+        d->depth_format, d->depth_write, d->depth_compare}};
     if (!cached_pipeline(c, &key, &root, &pipeline)) {
         const ULONGLONG started = GetTickCount64();
         TRY(guest_graphics_root(c, buffer_count, image_count, &root));
         D3D12_GRAPHICS_PIPELINE_STATE_DESC pipeline_desc = graphics_desc(root, vs, ps, 0);
+        pipeline_desc.DSVFormat = d->depth_format;
+        pipeline_desc.DepthStencilState.DepthEnable = d->depth_format != 0;
+        pipeline_desc.DepthStencilState.DepthWriteMask = d->depth_write ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
+        pipeline_desc.DepthStencilState.DepthFunc = d->depth_compare;
         pipeline_desc.RasterizerState.CullMode = d->cull_mode;
         pipeline_desc.RasterizerState.FrontCounterClockwise = d->front_ccw != 0;
         pipeline_desc.BlendState.RenderTarget[0].RenderTargetWriteMask = (UINT8)d->write_mask;
@@ -1120,6 +1132,28 @@ int32_t ps5_d3d12_draw_spirv(Ps5D3D12 *c, const uint32_t *vertex, size_t vertex_
     TRY(ID3D12Resource_Map(upload, 0, &empty, &mapped));
     for (UINT y = 0; y < d->height; ++y) memcpy((uint8_t *)mapped + footprint.Offset + (size_t)y * footprint.Footprint.RowPitch, rgba + (size_t)y * d->width * 4, (size_t)d->width * 4);
     ID3D12Resource_Unmap(upload, 0, &entire);
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT depth_footprint = {0};
+    D3D12_CPU_DESCRIPTOR_HANDLE depth_view = {0};
+    UINT64 depth_copy_bytes = 0;
+    if (d->depth_format) {
+        D3D12_RESOURCE_DESC depth_desc = desc;
+        depth_desc.Format = d->depth_format;
+        depth_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+        TRY(ID3D12Device_CreateCommittedResource(c->device, &heap, 0, &depth_desc, D3D12_RESOURCE_STATE_COPY_DEST, NULL, &IID_ID3D12Resource, (void **)&depth));
+        ID3D12Device_GetCopyableFootprints(c->device, &depth_desc, 0, 1, 0, &depth_footprint, NULL, NULL, &depth_copy_bytes);
+        TRY(buffer(c, depth_copy_bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, 0, &depth_upload));
+        if (d->depth_write) TRY(buffer(c, depth_copy_bytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST, 0, &depth_readback));
+        TRY(ID3D12Resource_Map(depth_upload, 0, &empty, &mapped));
+        for (UINT y = 0; y < d->height; ++y) memcpy((uint8_t *)mapped + depth_footprint.Offset + (size_t)y * depth_footprint.Footprint.RowPitch,
+            depth_pixels + (size_t)y * d->width * depth_bpp, (size_t)d->width * depth_bpp);
+        D3D12_RANGE depth_written = {0, (SIZE_T)depth_copy_bytes};
+        ID3D12Resource_Unmap(depth_upload, 0, &depth_written);
+        depth_view = ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(c->dsv_heap);
+        D3D12_DEPTH_STENCIL_VIEW_DESC dsv = {0};
+        dsv.Format = d->depth_format; dsv.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+        dsv.Flags = d->depth_write ? D3D12_DSV_FLAG_NONE : D3D12_DSV_FLAG_READ_ONLY_DEPTH;
+        ID3D12Device_CreateDepthStencilView(c->device, depth, &dsv, depth_view);
+    }
     if (d->index_count) {
         TRY(buffer(c, index_bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, 0, &index_upload));
         D3D12_RANGE written = {0, index_bytes};
@@ -1135,13 +1169,21 @@ int32_t ps5_d3d12_draw_spirv(Ps5D3D12 *c, const uint32_t *vertex, size_t vertex_
     destination.pResource = color; destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
     ID3D12GraphicsCommandList_CopyTextureRegion(c->commands, &destination, 0, 0, 0, &source, NULL);
     transition(c, color, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    if (depth) {
+        D3D12_TEXTURE_COPY_LOCATION depth_source = {0}, depth_destination = {0};
+        depth_source.pResource = depth_upload; depth_source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; depth_source.PlacedFootprint = depth_footprint;
+        depth_destination.pResource = depth; depth_destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        /* Depth copies must cover the complete subresource, with no box. */
+        ID3D12GraphicsCommandList_CopyTextureRegion(c->commands, &depth_destination, 0, 0, 0, &depth_source, NULL);
+        transition(c, depth, D3D12_RESOURCE_STATE_COPY_DEST, d->depth_write ? D3D12_RESOURCE_STATE_DEPTH_WRITE : D3D12_RESOURCE_STATE_DEPTH_READ);
+    }
     ID3D12GraphicsCommandList_SetPipelineState(c->commands, pipeline);
     ID3D12GraphicsCommandList_SetGraphicsRootSignature(c->commands, root);
     const uint32_t base_values[2] = {d->index_count ? (uint32_t)d->base_vertex : d->first_vertex, d->first_instance};
     ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(c->commands, 0, 2, base_values, 0);
     bind_graphics_resources(c, &resources, buffers, buffer_count, image_count);
     ID3D12GraphicsCommandList_OMSetBlendFactor(c->commands, blend->constants);
-    ID3D12GraphicsCommandList_OMSetRenderTargets(c->commands, 1, &view, FALSE, NULL);
+    ID3D12GraphicsCommandList_OMSetRenderTargets(c->commands, 1, &view, FALSE, depth ? &depth_view : NULL);
     D3D12_VIEWPORT viewport = {d->viewport[0], d->viewport[1], d->viewport[2], d->viewport[3], d->viewport[4], d->viewport[5]};
     D3D12_RECT scissor = {d->scissor[0], d->scissor[1], d->scissor[2], d->scissor[3]};
     ID3D12GraphicsCommandList_RSSetViewports(c->commands, 1, &viewport);
@@ -1157,14 +1199,29 @@ int32_t ps5_d3d12_draw_spirv(Ps5D3D12 *c, const uint32_t *vertex, size_t vertex_
     source = destination;
     destination.pResource = readback; destination.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; destination.PlacedFootprint = footprint;
     ID3D12GraphicsCommandList_CopyTextureRegion(c->commands, &destination, 0, 0, 0, &source, NULL);
+    if (depth_readback) {
+        transition(c, depth, D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        D3D12_TEXTURE_COPY_LOCATION depth_source = {0}, depth_destination = {0};
+        depth_source.pResource = depth; depth_source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        depth_destination.pResource = depth_readback; depth_destination.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; depth_destination.PlacedFootprint = depth_footprint;
+        ID3D12GraphicsCommandList_CopyTextureRegion(c->commands, &depth_destination, 0, 0, 0, &depth_source, NULL);
+    }
     TRY(submit(c));
     TRY(ID3D12Resource_Map(readback, 0, &entire, &mapped));
     for (UINT y = 0; y < d->height; ++y) memcpy(rgba + (size_t)y * d->width * 4, (uint8_t *)mapped + footprint.Offset + (size_t)y * footprint.Footprint.RowPitch, (size_t)d->width * 4);
     ID3D12Resource_Unmap(readback, 0, &empty);
+    if (depth_readback) {
+        D3D12_RANGE depth_range = {0, (SIZE_T)depth_copy_bytes};
+        TRY(ID3D12Resource_Map(depth_readback, 0, &depth_range, &mapped));
+        for (UINT y = 0; y < d->height; ++y) memcpy(depth_pixels + (size_t)y * d->width * depth_bpp,
+            (uint8_t *)mapped + depth_footprint.Offset + (size_t)y * depth_footprint.Footprint.RowPitch, (size_t)d->width * depth_bpp);
+        ID3D12Resource_Unmap(depth_readback, 0, &empty);
+    }
 done:
     for (UINT i = 0; i < buffer_count; ++i) { retire(c, resources.buffer_uploads[i]); retire(c, resources.buffers[i]); }
     for (UINT i = 0; i < image_count; ++i) { retire(c, resources.image_uploads[i]); retire(c, resources.images[i]); }
     retire(c, resources.samplers); retire(c, resources.views);
+    retire(c, depth_readback); retire(c, depth_upload); retire(c, depth);
     retire(c, index_upload); retire(c, readback); retire(c, upload); retire(c, color); retire(c, pipeline); retire(c, root); release(ps); release(vs);
     return hr;
 }

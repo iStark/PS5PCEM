@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Artur Strazewicz
 
 //! Guest surface staging uses the shared GFX10 address equations. D3D12 owns
-//! the native texture layout; upload/readback buffers carry tight RGBA texels.
+//! the native texture layout; upload/readback buffers carry tight color/depth texels.
 const std = @import("std");
 const gpu = @import("gpu");
 
@@ -15,6 +15,17 @@ pub fn colorLayout(target: gpu.resources.ColorTarget) !gpu.SurfaceLayout {
         target.force_destination_alpha_one) return error.UnsupportedRenderTargetLayout;
     const layout = try gpu.SurfaceLayout.fromColorTarget(target);
     try validate(layout, target.address);
+    return layout;
+}
+
+pub fn depthLayout(target: gpu.resources.DepthTarget, width: u32, height: u32, writable: bool) !gpu.SurfaceLayout {
+    if ((target.format != 1 and target.format != 3) or target.width != width or target.height != height or
+        target.samples_log2 != 0 or target.maximum_mip != 0 or target.mip_level != 0 or
+        target.base_array_slice != 0 or target.last_array_slice != 0 or target.htile_enabled)
+        return error.UnsupportedDepthLayout;
+    if (target.read_address == 0 or (writable and target.write_address != target.read_address)) return error.SeparateDepthAddressesNotImplemented;
+    const layout = try gpu.SurfaceLayout.fromDepthTarget(target);
+    try validate(layout, target.read_address);
     return layout;
 }
 
@@ -52,7 +63,7 @@ test "VideoOut RGBA8 and BGRA8 select the correct byte order without accepting H
 
 fn validate(layout: gpu.SurfaceLayout, address: u64) !void {
     if (layout.width == 0 or layout.height == 0 or layout.width > 16384 or layout.height > 16384 or
-        layout.layers != 1 or layout.block.bytes_per_element != 4 or
+        layout.layers != 1 or (layout.block.bytes_per_element != 4 and layout.block.bytes_per_element != 2) or
         layout.required_source_bytes > 256 * 1024 * 1024 or layout.staging_bytes > 256 * 1024 * 1024)
         return error.SurfaceBudgetExceeded;
     _ = try layout.sourceRange(address);
@@ -113,4 +124,30 @@ test "color layout derives tiled and absent linear pitches without accepting com
     try std.testing.expectError(error.ArithmeticOverflow, colorLayout(target));
     try std.testing.expectError(error.UnsupportedScanoutLayout, scanoutLayout(65, 37, 72, 2));
     try std.testing.expectError(error.InvalidPitch, scanoutLayout(65, 37, 64, 1));
+}
+
+test "depth layouts validate address and subresource contracts before staging" {
+    var target = std.mem.zeroes(gpu.resources.DepthTarget);
+    target.read_address = 0x10000;
+    target.write_address = 0x10000;
+    target.width = 65;
+    target.height = 37;
+    target.format = 3;
+    target.tile_mode = .linear;
+    try std.testing.expectEqual(@as(u32, 128), (try depthLayout(target, 65, 37, true)).row_pitch_elements);
+    target.write_address = 0x20000;
+    try std.testing.expectError(error.SeparateDepthAddressesNotImplemented, depthLayout(target, 65, 37, true));
+    _ = try depthLayout(target, 65, 37, false);
+    target.write_address = target.read_address;
+    target.htile_enabled = true;
+    try std.testing.expectError(error.UnsupportedDepthLayout, depthLayout(target, 65, 37, true));
+    target.htile_enabled = false;
+    target.samples_log2 = 1;
+    try std.testing.expectError(error.UnsupportedDepthLayout, depthLayout(target, 65, 37, true));
+    target.samples_log2 = 0;
+    target.mip_level = 1;
+    try std.testing.expectError(error.UnsupportedDepthLayout, depthLayout(target, 65, 37, true));
+    target.mip_level = 0;
+    target.read_address = std.math.maxInt(u64) - 32;
+    try std.testing.expectError(error.ArithmeticOverflow, depthLayout(target, 65, 37, false));
 }

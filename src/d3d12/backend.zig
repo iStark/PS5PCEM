@@ -96,6 +96,7 @@ pub const Renderer = struct {
             render.color_count,                   render.depth_control.test_enabled, render.depth_control.write_enabled,
             render.depth_control.stencil_enabled, render.blends[0].enabled,
         });
+        if (render.depth_target) |depth| std.debug.print("[d3d12 depth] target={any} control={any} viewport={any}\n", .{ depth, render.depth_control, render.viewport });
         if (render.blends[0].enabled) std.debug.print("[d3d12 blend] control=0x{x} constants={any}\n", .{
             state.readRegister(.context, 0x1e0) orelse 0,
             native.blending.decode(state, render.blends[0]) catch null,
@@ -227,12 +228,28 @@ pub const Renderer = struct {
         const routing = try graphics.routing(state);
         const render = gpu.resources.decodeRenderState(state);
         const target = render.color_targets[0] orelse return error.MissingColorTarget;
-        if (render.color_count != 1 or render.depth_control.test_enabled or render.depth_control.write_enabled or render.depth_control.stencil_enabled or render.depth_control.clear_enabled or render.depth_control.stencil_clear_enabled) return error.DepthAndMultipleTargetsNotImplemented;
+        if (render.color_count != 1) return error.MultipleTargetsNotImplemented;
+        if (render.depth_control.stencil_enabled or render.depth_control.clear_enabled or render.depth_control.stencil_clear_enabled or
+            (state.readRegister(.context, 0x200) orelse 0) & (1 << 3) != 0) return error.DepthClearStencilAndBoundsNotImplemented;
         const target_layout = try surfaces.colorLayout(target);
         if (render.color_control.isMetadataOperation() or (state.readRegister(.context, 0x202) != null and !render.color_control.allowsAttachmentWrites(render.target_mask)) or render.color_control.logic_operation != 0xcc) return error.ColorMetadataAndLogicOpsNotImplemented;
         if (render.raster.rasterizer_discard or render.raster.polygon_mode != 0 or render.raster.depth_bias_front or render.raster.depth_bias_back or (render.raster.cull_front and render.raster.cull_back)) return error.UnsupportedRasterState;
         const topology = try graphics.nativeTopology(render.primitive_type);
         var draw_state = try native.Draw.fullTarget(target.width, target.height);
+        var depth_surface: ?surfaces.Staged = null;
+        defer if (depth_surface) |*depth| depth.deinit();
+        if (render.depth_control.test_enabled) {
+            const depth = render.depth_target orelse return error.MissingDepthTarget;
+            const writable = render.depth_control.write_enabled and !depth.depth_read_only;
+            const layout = try surfaces.depthLayout(depth, target.width, target.height, writable);
+            const color_end = try std.math.add(u64, target.address, target_layout.required_source_bytes);
+            const depth_end = try std.math.add(u64, depth.read_address, layout.required_source_bytes);
+            if (depth.read_address < color_end and target.address < depth_end) return error.DepthColorAliasNotImplemented;
+            draw_state.depth_format = if (depth.format == 1) 55 else 40;
+            draw_state.depth_write = @intFromBool(writable);
+            draw_state.depth_compare = @as(u32, render.depth_control.compare_function) + 1;
+            depth_surface = try surfaces.Staged.read(self.allocator, self.memory, depth.read_address, layout);
+        }
         draw_state.blend = try native.blending.decode(state, render.blends[0]);
         draw_state.vertex_count = if (args.index_bytes == 0) args.count else 0;
         draw_state.instance_count = state.instance_count;
@@ -246,8 +263,9 @@ pub const Renderer = struct {
         if (render.viewport) |vp| {
             if (vp.x_scale <= 0 or vp.y_scale >= 0) return error.PositiveYOrMirroredViewportNotImplemented;
             const position_z_enabled = ((state.readRegister(.context, 0x1b4) orelse 0) & (state.readRegister(.context, 0x1b3) orelse 0)) & (1 << 10) != 0;
-            // The depth/stencil rejection above is required for this proof.
-            const depth = try graphics.viewportDepthRange(if (render.raster.zero_to_one_depth) vp.z_offset else vp.z_offset - vp.z_scale, vp.z_offset + vp.z_scale, position_z_enabled);
+            // Never normalize an out-of-range mapping when depth testing or
+            // the fragment shader can observe the resulting Z value.
+            const depth = try graphics.viewportDepthRange(if (render.raster.zero_to_one_depth) vp.z_offset else vp.z_offset - vp.z_scale, vp.z_offset + vp.z_scale, position_z_enabled or render.depth_control.test_enabled);
             draw_state.viewport = .{ vp.x_offset - vp.x_scale, vp.y_offset + vp.y_scale, vp.x_scale * 2, -vp.y_scale * 2, depth[0], depth[1] };
         }
         if (render.scissor) |scissor| draw_state.scissor = .{ scissor.left, scissor.top, scissor.right, scissor.bottom };
@@ -320,12 +338,13 @@ pub const Renderer = struct {
         if (vertex.used_dispatcher or fragment.used_dispatcher) return error.UnboundedControlFlowNotImplemented;
         var surface = try surfaces.Staged.read(self.allocator, self.memory, target.address, target_layout);
         defer surface.deinit();
-        self.device.drawResourcesSpirv(vertex.words, fragment.words, draw_state, indices, draw_resources.buffers.items, draw_resources.images.items, surface.pixels) catch |err| {
+        self.device.drawDepthResourcesSpirv(vertex.words, fragment.words, draw_state, indices, draw_resources.buffers.items, draw_resources.images.items, surface.pixels, if (depth_surface) |depth| depth.pixels else &.{}) catch |err| {
             std.debug.print("[d3d12 native draw] viewport={any} scissor={any} indices={d}/{d} mask={d} rgba={d} buffers={d} images={d}\n", .{ draw_state.viewport, draw_state.scissor, draw_state.index_count, indices.len, draw_state.write_mask, surface.pixels.len, draw_resources.buffers.items.len, draw_resources.images.items.len });
             for (draw_resources.images.items) |image| std.debug.print("[d3d12 sampled image] {d}x{d} bytes={d} filter=0x{x} lod={d}..{d} bias={d} address={d}/{d}/{d}\n", .{ image.width, image.height, image.size, image.filter, image.min_lod, image.max_lod, image.lod_bias, image.address_u, image.address_v, image.address_w });
             return err;
         };
         try surface.write(self.memory);
+        if (draw_state.depth_write != 0) if (depth_surface) |*depth| try depth.write(self.memory);
     }
 
     pub fn present(self: *Renderer, flip: gpu.state.Flip) !void {

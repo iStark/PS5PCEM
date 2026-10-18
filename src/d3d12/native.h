@@ -46,6 +46,7 @@ typedef struct Ps5D3D12Draw {
     uint32_t index_count, index_element_bytes, primitive_restart;
     int32_t base_vertex;
     Ps5D3D12Blend blend;
+    uint32_t depth_format, depth_write, depth_compare;
     float viewport[6];
     int32_t scissor[4];
 } Ps5D3D12Draw;
@@ -70,6 +71,7 @@ int32_t ps5_d3d12_dispatch_spirv(Ps5D3D12 *context, const uint32_t *words, size_
     const Ps5D3D12Buffer *buffers, uint32_t buffer_count, const uint32_t groups[3]);
 int32_t ps5_d3d12_draw_spirv(Ps5D3D12 *context, const uint32_t *vs, size_t vs_count,
     const uint32_t *ps, size_t ps_count, const Ps5D3D12Draw *draw, const uint8_t *indices, size_t index_bytes,
-    const Ps5D3D12Buffer *buffers, uint32_t buffer_count, const Ps5D3D12Image *images, uint32_t image_count, uint8_t *rgba);
+    const Ps5D3D12Buffer *buffers, uint32_t buffer_count, const Ps5D3D12Image *images, uint32_t image_count, uint8_t *rgba,
+    uint8_t *depth_pixels, size_t depth_bytes);
 int32_t ps5_d3d12_present_rgba(Ps5D3D12 *context, const uint8_t *rgba, uint32_t width, uint32_t height);
 #endif
