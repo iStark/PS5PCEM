@@ -861,6 +861,7 @@ fn guestResourcesProbe(allocator: std.mem.Allocator) !void {
     try state.writeRegister(.context, 0x1b3, 0);
     try state.writeRegister(.context, 0x1b4, 0);
     try guestCompressedImageProbe(allocator, memory, &state, &executor);
+    try guestPackedImageProbe(allocator, memory, &state, &executor, &renderer);
     try guestNarrowImageProbe(allocator, memory, &state, &executor, &renderer);
     try guestTexelCoordinatesProbe(allocator, memory, &state, &executor, &renderer, &vs);
     // A missing input must fail before touching the output attachment.
@@ -928,6 +929,67 @@ fn guestCompressedImageProbe(allocator: std.mem.Allocator, memory: *GraphicsMemo
         }
     }
     std.debug.print("PASS 12 guest BC1/BC2/BC3 texture cases: tiled/linear blocks, native row pitch, alpha and sRGB decoding, source preservation\n", .{});
+}
+
+fn guestPackedImageProbe(allocator: std.mem.Allocator, memory: *GraphicsMemory, state: *gpu.State, executor: *gpu.DcbExecutor, renderer: *d3d12.Renderer) !void {
+    // Compare packed GPU sampling against independently expanded RGBA8 for
+    // every target byte. Include the exact 256x128 tiled Raiden descriptor
+    // shape as well as odd rows that require padded D3D12 upload footprints.
+    const mappings = [_][4]u8{ .{ 4, 5, 6, 7 }, .{ 6, 5, 4, 7 }, .{ 7, 4, 5, 6 }, .{ 1, 6, 0, 7 } };
+    for ([_][2]u32{ .{ 13, 9 }, .{ 256, 128 } }) |extent| for ([_]gpu.resources.TileMode{ .linear, .standard_4kb }) |mode| for (mappings) |selectors| for ([_]u32{ 0, 1 }) |filter| {
+        const width = extent[0];
+        const height = extent[1];
+        var components: u32 = 0;
+        for (selectors, 0..) |select, i| components |= @as(u32, select) << @intCast(i * 3);
+        var packed_target: [0x3000]u8 = undefined;
+        for ([_]u16{ 136, 56 }) |format| {
+            const words = [_]u32{ 0x100, (@as(u32, format) << 20) | (((width - 1) & 3) << 30), ((width - 1) >> 2) | ((height - 1) << 14), (9 << 28) | (if (format == 136) components else 0xfac) | (@as(u32, @intFromEnum(mode)) << 20), 0, 0, 0, 0 };
+            for (words, 0..) |word, i| try state.writeRegister(.shader, 0x00c + @as(u32, @intCast(i)), word);
+            try state.writeRegister(.shader, 0x014, 2 | (2 << 3) | (2 << 6));
+            try state.writeRegister(.shader, 0x016, (filter << 20) | (filter << 22));
+            const descriptor = try gpu.resources.decodeImageDescriptor(&words);
+            const layout = try gpu.SurfaceLayout.fromImage(descriptor);
+            const pixels = try allocator.alloc(u8, @intCast(layout.staging_bytes));
+            defer allocator.free(pixels);
+            for (0..height) |y| for (0..width) |x| {
+                const nibbles = [_]u8{ @intCast(x % 16), @intCast((y + 3) % 16), @intCast((x + y + 7) % 16), @intCast((x * 3 + y * 5 + 1) % 16) };
+                if (format == 136) {
+                    const packed_value = @as(u16, nibbles[0]) | (@as(u16, nibbles[1]) << 4) | (@as(u16, nibbles[2]) << 8) | (@as(u16, nibbles[3]) << 12);
+                    std.mem.writeInt(u16, pixels[(y * width + x) * 2 ..][0..2], packed_value, .little);
+                } else {
+                    for (selectors, 0..) |select, i| pixels[(y * width + x) * 4 + i] = switch (select) {
+                        0 => 0,
+                        1 => 255,
+                        else => nibbles[select - 4] * 17,
+                    };
+                }
+            };
+            const backing = memory.data[0x10000..][0..@intCast(layout.required_source_bytes)];
+            @memset(backing, 0xa7);
+            try layout.tile(pixels, backing);
+            const before = try allocator.dupe(u8, backing);
+            defer allocator.free(before);
+            @memset(memory.data[0x2000..0x5000], 0);
+            _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 2 });
+            if (!std.mem.eql(u8, before, backing)) return error.PackedImageSourceModified;
+            if (format == 136) packed_target = memory.data[0x2000..0x5000].* else {
+                for (memory.data[0x2000..0x5000], packed_target, 0..) |expected, actual, i| if (@abs(@as(i16, actual) - expected) > 1) {
+                    std.debug.print("Packed image extent={any} tile={f} selectors={any} filter={d} byte={d}: {d} expected {d}\n", .{ extent, mode, selectors, filter, i, actual, expected });
+                    return error.PackedImageSamplingMismatch;
+                };
+            }
+        }
+    };
+    const before = memory.data[0x2000..0x5000].*;
+    const word1 = state.readRegister(.shader, 0x00d).?;
+    try state.writeRegister(.shader, 0x00d, (word1 & ~@as(u32, 0x1ff << 20)) | (136 << 20));
+    try state.writeRegister(.shader, 0x014, 2 | (2 << 3) | (2 << 6) | (1 << 20));
+    const packet: gpu.pm4.Packet = .{ .kind = .command, .header = command(gpu.pm4.draw_index_auto, 2), .opcode = gpu.pm4.draw_index_auto, .body = &.{ 3, 2 } };
+    if (renderer.draw(state, packet)) |_| return error.PackedSrgbAccepted else |err| if (err != error.GraphicsSamplerModeNotImplemented) return err;
+    if (!std.mem.eql(u8, &before, memory.data[0x2000..0x5000])) return error.RejectedPackedImageModifiedTarget;
+    try state.writeRegister(.shader, 0x014, 2 | (2 << 3) | (2 << 6));
+    try state.writeRegister(.shader, 0x016, 0);
+    std.debug.print("PASS RGBA4444: 32 packed/RGBA8 GPU comparisons, linear/tiled odd rows and Raiden extent, component selectors/constants, alpha, point/linear filtering, source preservation and sRGB rejection\n", .{});
 }
 
 fn guestNarrowImageProbe(allocator: std.mem.Allocator, memory: *GraphicsMemory, state: *gpu.State, executor: *gpu.DcbExecutor, renderer: *d3d12.Renderer) !void {

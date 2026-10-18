@@ -197,7 +197,7 @@ pub const Device = struct {
         for (buffers) |buffer| if (buffer.size == 0 or buffer.size % 4 != 0 or buffer.size > 256 * 1024 * 1024) return error.InvalidArgument;
         for (images) |image| {
             if (image.size != try sampledImageSize(image.width, image.height, image.format) or image.srgb > 1 or
-                ((image.format == 61 or image.format == 49) and image.srgb != 0) or
+                ((image.format == 61 or image.format == 49 or image.format == 115) and image.srgb != 0) or
                 image.address_u < 1 or image.address_u > 4 or image.address_v < 1 or image.address_v > 4 or
                 image.address_w < 1 or image.address_w > 4 or image.filter & ~@as(u32, 0x15) != 0 or
                 !std.math.isFinite(image.min_lod) or !std.math.isFinite(image.max_lod) or !std.math.isFinite(image.lod_bias) or
@@ -234,7 +234,7 @@ pub fn sampledImageSize(width: u32, height: u32, format: u32) Error!usize {
     const rgba = try rgbaSize(width, height);
     if (format == 28) return rgba;
     if (format == 61) return rgba / 4;
-    if (format == 49) return rgba / 2;
+    if (format == 49 or format == 115) return rgba / 2;
     // Native BC base dimensions must be whole 4x4 blocks. Smaller mip levels
     // will need a separate subresource path; never pad and change guest UVs.
     if (width % 4 != 0 or height % 4 != 0) return error.InvalidArgument;
@@ -272,6 +272,9 @@ test "readback sizes reject empty and excessive textures before native allocatio
 test "sampled BC footprints count blocks and reject unsupported native extents" {
     try std.testing.expectEqual(@as(usize, 3 * 7), try sampledImageSize(3, 7, 61));
     try std.testing.expectEqual(@as(usize, 3 * 7 * 2), try sampledImageSize(3, 7, 49));
+    try std.testing.expectEqual(@as(usize, 3 * 7 * 2), try sampledImageSize(3, 7, 115));
+    try std.testing.expectEqual(@as(usize, 2), try sampledImageSize(1, 1, 115));
+    try std.testing.expectEqual(@as(usize, 256 * 128 * 2), try sampledImageSize(256, 128, 115));
     try std.testing.expectEqual(@as(usize, 8192), try sampledImageSize(128, 128, 71));
     try std.testing.expectEqual(@as(usize, 16384), try sampledImageSize(128, 128, 77));
     try std.testing.expectEqual(@as(usize, 32), try sampledImageSize(8, 4, 74));

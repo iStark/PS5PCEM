@@ -139,6 +139,7 @@ pub const DrawResources = struct {
             1 => 61, // R8_UNORM
             14 => 49, // R8G8_UNORM
             56 => 28,
+            136 => 115, // B4G4R4A4_UNORM; component mapping restores guest XYZW.
             169, 170 => 71,
             171, 172 => 74,
             173, 174 => 77,
@@ -158,9 +159,9 @@ pub const DrawResources = struct {
             return error.GraphicsTextureFormatOrMipNotImplemented;
         }
         const expected_bytes = try native.sampledImageSize(descriptor.width, descriptor.height, format);
-        // R8/RG8 have no sRGB DXGI variants; adding one to their enum would
-        // accidentally select an integer format instead of gamma conversion.
-        if (sampler.force_srgb and (format == 61 or format == 49)) return error.GraphicsSamplerModeNotImplemented;
+        // Narrow and packed formats have no sRGB DXGI variants; adding one
+        // to their enum does not select a gamma-decoding view.
+        if (sampler.force_srgb and (format == 61 or format == 49 or format == 115)) return error.GraphicsSamplerModeNotImplemented;
         if (sampler.trunc_coordinates or sampler.filter_mode != 0 or
             sampler.maximum_anisotropy != 0 or sampler.minification_filter > 1 or sampler.magnification_filter > 1 or
             sampler.mip_filter > 2 or sampler.border_color_type == 3)
@@ -186,7 +187,10 @@ pub const DrawResources = struct {
             const mapped: u32 = switch (select) {
                 0 => 4,
                 1 => 5,
-                4...7 => select - 4,
+                // Guest 4_4_4_4 assigns X/Y/Z/W from low to high bits.
+                // DXGI B4G4R4A4 exposes those bits as B/G/R/A. Keep the
+                // original packed bytes and compensate in the SRV mapping.
+                4...7 => if (format == 115) ([_]u32{ 2, 1, 0, 3 })[select - 4] else select - 4,
                 else => return error.InvalidTextureComponent,
             };
             components |= mapped << @intCast(i * 3);

@@ -1030,7 +1030,7 @@ static int valid_blend_factor(uint32_t factor, int alpha) {
 static int valid_sampled_image(const Ps5D3D12Image *image) {
     if (!image->pixels || !image->width || !image->height || image->width > 16384 || image->height > 16384 || image->srgb > 1) return 0;
     if (image->format == DXGI_FORMAT_R8G8B8A8_UNORM) return (uint64_t)image->width * image->height * 4 == image->size;
-    if (image->format == DXGI_FORMAT_R8_UNORM || image->format == DXGI_FORMAT_R8G8_UNORM)
+    if (image->format == DXGI_FORMAT_R8_UNORM || image->format == DXGI_FORMAT_R8G8_UNORM || image->format == DXGI_FORMAT_B4G4R4A4_UNORM)
         return !image->srgb && (uint64_t)image->width * image->height * (image->format == DXGI_FORMAT_R8_UNORM ? 1 : 2) == image->size;
     if (image->width % 4 || image->height % 4) return 0;
     UINT block_bytes;
