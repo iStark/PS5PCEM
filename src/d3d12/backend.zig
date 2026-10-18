@@ -259,8 +259,9 @@ pub const Renderer = struct {
         draw_state.instance_count = state.instance_count;
         draw_state.first_vertex = state.readRegister(.uconfig, 0x24a) orelse 0;
         draw_state.topology = topology;
-        const indices = try args.stage(self.allocator, self.memory, state, &draw_state);
+        const indices = try args.stage(self.allocator, self.memory, state, &draw_state, render.primitive_type);
         defer self.allocator.free(indices);
+        if (render.primitive_type == 5 and indices.len == 0) return;
         draw_state.cull_mode = if (render.raster.cull_front) 2 else if (render.raster.cull_back) 3 else 1;
         draw_state.front_ccw = @intFromBool(!render.raster.clockwise_front_face);
         draw_state.write_mask = target.write_mask & (render.shader_mask & 0xf);
@@ -441,7 +442,42 @@ const DrawArguments = struct {
         return args;
     }
 
-    fn stage(self: DrawArguments, allocator: std.mem.Allocator, memory: Memory, state: *const gpu.State, draw_state: *native.Draw) ![]u8 {
+    fn stageFan(self: DrawArguments, allocator: std.mem.Allocator, memory: Memory, state: *const gpu.State, draw_state: *native.Draw) ![]u8 {
+        if (@as(u64, self.count -| 2) * 12 > 64 * 1024 * 1024) return error.IndexBufferTooLarge;
+        const source = try allocator.alloc(u8, @as(usize, self.count) * self.index_bytes);
+        defer allocator.free(source);
+        var fan = graphics.TriangleFan{
+            .count = self.count,
+            .indices = source,
+            .element_bytes = self.index_bytes,
+            .first_vertex = draw_state.first_vertex,
+            .provoking_last = (state.readRegister(.context, 0x205) orelse 0) & (1 << 19) != 0,
+        };
+        if (self.index_bytes != 0) {
+            if (!memory.read(memory.context, self.address, source)) return error.GuestReadFailed;
+            fan.base_vertex = @bitCast(draw_state.first_vertex);
+            const control = state.readRegister(.uconfig, 0x24b) orelse 0;
+            const reset = state.readRegister(.context, 0x103) orelse 0;
+            const mask: u32 = switch (self.index_bytes) {
+                1 => 0xff,
+                2 => 0xffff,
+                else => 0xffffffff,
+            };
+            if (control & ~@as(u32, 3) != 0) return error.UnsupportedPrimitiveRestartControl;
+            if (control & 1 != 0 and (control & 2 == 0 or reset <= mask)) fan.restart = reset & mask;
+        }
+        const indices = try fan.expand(allocator);
+        draw_state.vertex_count = 0;
+        draw_state.first_vertex = 0;
+        draw_state.base_vertex = fan.base_vertex;
+        draw_state.index_count = @intCast(indices.len / 4);
+        draw_state.index_element_bytes = 4;
+        draw_state.primitive_restart = 0;
+        return indices;
+    }
+
+    fn stage(self: DrawArguments, allocator: std.mem.Allocator, memory: Memory, state: *const gpu.State, draw_state: *native.Draw, primitive: u32) ![]u8 {
+        if (primitive == 5) return self.stageFan(allocator, memory, state, draw_state);
         if (self.index_bytes == 0) return allocator.alloc(u8, 0);
         const native_bytes = @max(2, self.index_bytes);
         const size = @as(usize, self.count) * native_bytes;

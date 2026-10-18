@@ -443,6 +443,7 @@ fn guestGraphicsProbe(allocator: std.mem.Allocator, device: *d3d12.Device) !void
     try guestDepthProbe(allocator, &vertex_words, &pixel_words);
     try guestViewportDepthProbe(allocator, &vertex_words, &pixel_words);
     try guestVaryingProbe(allocator, &vertex_words);
+    try guestFanProbe(allocator);
     try guestResourcesProbe(allocator);
     try guestBlendingProbe(allocator, &vertex_words);
     try guestCacheProbe(allocator, device, vertex.words, fragment.words);
@@ -1078,6 +1079,128 @@ fn guestVaryingProbe(allocator: std.mem.Allocator, vertex: []const u32) !void {
         };
     }
     std.debug.print("PASS native interpolated RDNA2 PARAM values and two ATTR inputs remapped to PARAM3\n", .{});
+}
+
+fn guestFanProbe(allocator: std.mem.Allocator) !void {
+    const memory = try allocator.create(GraphicsMemory);
+    defer allocator.destroy(memory);
+    memory.* = .{};
+    const vs = [_]u32{
+        0xe0382000, 0x80000005, // Position from s0 descriptor, indexed by v5.
+        0xe0382010, 0x80000805, // Smooth RGBA from the same 32-byte record.
+        0xf80000cf, 0x03020100,
+        0xf8000a0f, 0x0b0a0908,
+        0xbf810000,
+    };
+    const ps = [_]u32{
+        0xc8000000, 0xc8010001, 0xc8040100, 0xc8050101,
+        0xc8080200, 0xc8090201, 0xc80c0300, 0xc80d0301,
+        0xf800080f, 0x03020100, 0xbf810000,
+    };
+    @memcpy(memory.data[0x200..][0..@sizeOf(@TypeOf(vs))], std.mem.asBytes(&vs));
+    @memcpy(memory.data[0x400..][0..@sizeOf(@TypeOf(ps))], std.mem.asBytes(&ps));
+    const vertices = [_][8]f32{
+        .{ 0, 0, 0, 1, 1, 1, 1, 1 },
+        .{ -0.8, -0.8, 0, 1, 1, 0, 0, 1 },
+        .{ 0.8, -0.8, 0, 1, 0, 1, 0, 1 },
+        .{ 0.8, 0.8, 0, 1, 0, 0, 1, 1 },
+        .{ -0.8, 0.8, 0, 1, 1, 1, 0, 1 },
+        .{ -0.8, -0.8, 0, 1, 1, 0, 0, 1 },
+    };
+    @memcpy(memory.data[0x1000..][0..@sizeOf(@TypeOf(vertices))], std.mem.asBytes(&vertices));
+    @memcpy(memory.data[0x1000 + 7 * 32 ..][0..@sizeOf(@TypeOf(vertices))], std.mem.asBytes(&vertices));
+    var state = try graphicsState(65, 37, 72);
+    try state.writeRegister(.shader, 0x04b, 4 << 1);
+    for ([_]u32{ 0x1000, 32 << 16, 13, 0xfac }, 0..) |word, i| try state.writeRegister(.shader, 0x04c + @as(u32, @intCast(i)), word);
+    var renderer = try d3d12.Renderer.init(allocator, memory.access(), false);
+    defer renderer.deinit();
+    var executor = gpu.DcbExecutor{ .state = &state, .backend = renderer.dcbBackend(), .allocator = allocator };
+    @memset(memory.data[0x2000..0x5000], 0xa7);
+    const initial = memory.data[0x2000..0x5000].*;
+    var cases: usize = 0;
+    // Independent list reference: same coverage, winding, interpolation and
+    // untouched pitch padding. Cull both orientations to expose winding errors.
+    for ([_]u32{ 0, 1, 2, 4, 5, 6 }) |raster| {
+        try state.writeRegister(.context, 0x205, raster);
+        try state.writeRegister(.uconfig, 0x242, 4);
+        try state.writeRegister(.uconfig, 0x24a, 0);
+        try state.writeRegister(.uconfig, 0x24b, 0);
+        for ([_]u16{ 0, 1, 2, 0, 2, 3, 0, 3, 4, 0, 4, 5 }, 0..) |index, i| std.mem.writeInt(u16, memory.data[0x600 + i * 2 ..][0..2], index, .little);
+        @memcpy(memory.data[0x2000..0x5000], &initial);
+        _ = try executor.execute(&.{ command(gpu.pm4.index_type, 1), 0, command(gpu.pm4.draw_index_2, 5), 12, 0x600, 0, 12, 0 });
+        const expected = memory.data[0x2000..0x5000].*;
+        if (raster == 0 and std.mem.eql(u8, &initial, &expected)) return error.FanReferenceEmpty;
+        for ([_]bool{ false, true }) |last| {
+            try state.writeRegister(.context, 0x205, raster | @as(u32, if (last) 1 << 19 else 0));
+            try state.writeRegister(.uconfig, 0x242, 5);
+            for (0..7) |mode| {
+                const width: u32 = switch (mode) {
+                    0, 1 => 0,
+                    2 => 1,
+                    3, 5 => 2,
+                    else => 4,
+                };
+                const base: i32 = switch (mode) {
+                    1, 5 => 7,
+                    2, 3 => -7,
+                    4 => -70000,
+                    else => 0,
+                };
+                const index_bias: u32 = if (base < 0) @intCast(-base) else 0;
+                try state.writeRegister(.uconfig, 0x24a, @bitCast(base));
+                for (0..3) |cut_mode| {
+                    @memcpy(memory.data[0x2000..0x5000], &initial);
+                    const marker: u32 = if (cut_mode == 1) 99 else switch (width) {
+                        1 => 0xff,
+                        2 => 0xffff,
+                        else => 0xffffffff,
+                    };
+                    try state.writeRegister(.uconfig, 0x24b, if (cut_mode == 0) 0 else 1);
+                    try state.writeRegister(.context, 0x103, marker);
+                    if (width == 0) {
+                        _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 6, 2 });
+                    } else {
+                        const sequence = [_]u32{ marker, index_bias, marker, marker, index_bias, index_bias + 1, index_bias + 2, index_bias + 3, index_bias + 4, index_bias + 5, marker, index_bias + 1, index_bias + 2, marker };
+                        const values = if (cut_mode == 0) sequence[4..10] else &sequence;
+                        // Unused prefix tests DRAW_INDEX_OFFSET_2 as well.
+                        @memset(memory.data[0x600..0x680], 0xee);
+                        for (values, 0..) |value, i| switch (width) {
+                            1 => memory.data[0x600 + (i + 2)] = @intCast(value),
+                            2 => std.mem.writeInt(u16, memory.data[0x600 + (i + 2) * 2 ..][0..2], @intCast(value), .little),
+                            else => std.mem.writeInt(u32, memory.data[0x600 + (i + 2) * 4 ..][0..4], value, .little),
+                        };
+                        const source_before = memory.data[0x600..0x680].*;
+                        _ = try executor.execute(&.{ command(gpu.pm4.index_type, 1), if (width == 1) 2 else if (width == 2) 0 else 1, command(gpu.pm4.index_base, 2), 0x600, 0, command(gpu.pm4.draw_index_offset_2, 4), @intCast(values.len), 2, @intCast(values.len), 0 });
+                        if (!std.mem.eql(u8, &source_before, memory.data[0x600..0x680])) return error.FanModifiedSource;
+                    }
+                    if (!std.mem.eql(u8, &expected, memory.data[0x2000..0x5000])) {
+                        std.debug.print("Fan mismatch raster={d} last={any} mode={d} cut={d}\n", .{ raster, last, mode, cut_mode });
+                        return error.FanRasterMismatch;
+                    }
+                    cases += 1;
+                }
+            }
+        }
+    }
+    // Empty and incomplete fans do not fall through to a native nonindexed draw.
+    try state.writeRegister(.uconfig, 0x24a, 0);
+    for (0..3) |count| {
+        @memcpy(memory.data[0x2000..0x5000], &initial);
+        _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), @intCast(count), 2 });
+        if (!std.mem.eql(u8, &initial, memory.data[0x2000..0x5000])) return error.ShortFanModifiedTarget;
+    }
+    @memset(memory.data[0x600..0x606], 0xff);
+    try state.writeRegister(.uconfig, 0x24b, 3);
+    try state.writeRegister(.context, 0x103, 0xffff);
+    _ = try executor.execute(&.{ command(gpu.pm4.index_type, 1), 0, command(gpu.pm4.draw_index_2, 5), 3, 0x600, 0, 3, 0 });
+    if (!std.mem.eql(u8, &initial, memory.data[0x2000..0x5000])) return error.EmptyRestartFanModifiedTarget;
+    // Invalid base vertices must be rejected before modifying the attachment.
+    @memset(memory.data[0x600..0x606], 0);
+    try state.writeRegister(.uconfig, 0x24a, @bitCast(@as(i32, -1)));
+    const invalid: gpu.pm4.Packet = .{ .kind = .command, .header = command(gpu.pm4.draw_index_2, 5), .opcode = gpu.pm4.draw_index_2, .body = &.{ 3, 0x600, 0, 3, 0 } };
+    if (renderer.draw(&state, invalid)) |_| return error.InvalidFanBaseAccepted else |err| if (err != error.InvalidBaseVertex) return err;
+    if (!std.mem.eql(u8, &initial, memory.data[0x2000..0x5000])) return error.RejectedFanModifiedTarget;
+    std.debug.print("PASS {d} fan GPU cases: auto/8/16/32-bit, first/base vertices, index offsets, custom/fixed restart, both provoking orders, culling, smooth varyings and full-image/padding checks\n", .{cases});
 }
 
 fn guestResourcesProbe(allocator: std.mem.Allocator) !void {

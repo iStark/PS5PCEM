@@ -23,7 +23,7 @@ pub const Interface = struct {
 /// guest 5 is a fan and guest 6 is a strip; D3D12 uses 5 for a strip.
 pub fn nativeTopology(guest: u32) !u32 {
     return switch (guest) {
-        4 => 4, // DI_PT_TRILIST -> D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST
+        4, 5 => 4, // List, or fan expanded to a list before submission.
         6 => 5, // DI_PT_TRISTRIP -> D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP
         else => error.UnsupportedPrimitive,
     };
@@ -32,8 +32,107 @@ pub fn nativeTopology(guest: u32) !u32 {
 test "guest primitive numbers map explicitly and fans never masquerade as strips" {
     try std.testing.expectEqual(@as(u32, 4), try nativeTopology(4));
     try std.testing.expectEqual(@as(u32, 5), try nativeTopology(6));
-    try std.testing.expectError(error.UnsupportedPrimitive, nativeTopology(5));
+    try std.testing.expectEqual(@as(u32, 4), try nativeTopology(5));
     try std.testing.expectError(error.UnsupportedPrimitive, nativeTopology(7));
+}
+
+/// Fan triangles share the first index. Cyclic rotation preserves winding and
+/// makes the guest provoking vertex the first D3D12 list vertex: the previous
+/// rim vertex for FIRST, the current rim vertex for LAST (PA_SU_SC_MODE_CNTL).
+pub const TriangleFan = struct {
+    count: u32,
+    indices: []const u8 = &.{},
+    element_bytes: u32 = 0,
+    first_vertex: u32 = 0,
+    base_vertex: i32 = 0,
+    restart: ?u32 = null,
+    provoking_last: bool = false,
+
+    pub fn expand(self: TriangleFan, allocator: std.mem.Allocator) ![]u8 {
+        if (self.element_bytes != 0 and self.element_bytes != 1 and self.element_bytes != 2 and self.element_bytes != 4)
+            return error.UnsupportedIndexType;
+        if (@as(u64, self.count) * self.element_bytes != self.indices.len) return error.InvalidFanIndices;
+        const max_bytes = @as(u64, self.count -| 2) * 12;
+        if (max_bytes > 64 * 1024 * 1024) return error.IndexBufferTooLarge;
+        var result: std.ArrayList(u8) = .empty;
+        errdefer result.deinit(allocator);
+        try result.ensureTotalCapacity(allocator, @intCast(max_bytes));
+        var anchor: ?u32 = null;
+        var previous: ?u32 = null;
+        for (0..self.count) |i| {
+            const index = switch (self.element_bytes) {
+                0 => try std.math.add(u32, self.first_vertex, @intCast(i)),
+                1 => @as(u32, self.indices[i]),
+                2 => @as(u32, std.mem.readInt(u16, self.indices[i * 2 ..][0..2], .little)),
+                4 => std.mem.readInt(u32, self.indices[i * 4 ..][0..4], .little),
+                else => unreachable,
+            };
+            // Auto-index draws ignore primitive restart. Indexed markers are
+            // recognized before base-vertex arithmetic, including custom cuts.
+            if (self.element_bytes != 0 and self.restart != null and index == self.restart.?) {
+                anchor = null;
+                previous = null;
+                continue;
+            }
+            const vertex = @as(i64, index) + self.base_vertex;
+            if (vertex < 0 or vertex > std.math.maxInt(u32)) return error.InvalidBaseVertex;
+            if (anchor == null) {
+                anchor = index;
+            } else if (previous) |rim| {
+                const triangle: [3]u32 = if (self.provoking_last) .{ index, anchor.?, rim } else .{ rim, index, anchor.? };
+                for (triangle) |value| {
+                    const start = result.items.len;
+                    result.items.len += 4;
+                    std.mem.writeInt(u32, result.items[start..][0..4], value, .little);
+                }
+                previous = index;
+            } else previous = index;
+        }
+        return result.toOwnedSlice(allocator);
+    }
+};
+
+test "fan expansion preserves rim provoking vertices and independent restart segments" {
+    const allocator = std.testing.allocator;
+    for ([_]bool{ false, true }) |last| {
+        const fan = TriangleFan{ .count = 5, .first_vertex = 7, .provoking_last = last };
+        const result = try fan.expand(allocator);
+        defer allocator.free(result);
+        const expected: [9]u32 = if (last) .{ 9, 7, 8, 10, 7, 9, 11, 7, 10 } else .{ 8, 9, 7, 9, 10, 7, 10, 11, 7 };
+        for (expected, 0..) |value, i| try std.testing.expectEqual(value, std.mem.readInt(u32, result[i * 4 ..][0..4], .little));
+    }
+    // Leading, trailing and adjacent cuts; short segments never join neighbors.
+    const source = [_]u8{ 99, 8, 99, 9, 10, 99, 99, 7, 8, 9, 10, 99, 11, 12, 13, 99 };
+    for ([_]u32{ 1, 2, 4 }) |width| {
+        var encoded: [source.len * 4]u8 = @splat(0);
+        for (source, 0..) |value, i| switch (width) {
+            1 => encoded[i] = value,
+            2 => std.mem.writeInt(u16, encoded[i * 2 ..][0..2], value, .little),
+            else => std.mem.writeInt(u32, encoded[i * 4 ..][0..4], value, .little),
+        };
+        const result = try (TriangleFan{ .count = source.len, .indices = encoded[0 .. source.len * width], .element_bytes = width, .restart = 99, .base_vertex = -7 }).expand(allocator);
+        defer allocator.free(result);
+        const expected = [_]u32{ 8, 9, 7, 9, 10, 7, 12, 13, 11 };
+        try std.testing.expectEqual(expected.len * 4, result.len);
+        for (expected, 0..) |value, i| try std.testing.expectEqual(value, std.mem.readInt(u32, result[i * 4 ..][0..4], .little));
+    }
+}
+
+test "fan expansion bounds short fans and does not confuse disabled restart with indices" {
+    const allocator = std.testing.allocator;
+    for (0..3) |count| {
+        const result = try (TriangleFan{ .count = @intCast(count) }).expand(allocator);
+        defer allocator.free(result);
+        try std.testing.expectEqual(@as(usize, 0), result.len);
+    }
+    const result = try (TriangleFan{ .count = 3, .indices = &.{ 255, 1, 2 }, .element_bytes = 1 }).expand(allocator);
+    defer allocator.free(result);
+    try std.testing.expectEqual(@as(u32, 255), std.mem.readInt(u32, result[8..12], .little));
+    try std.testing.expectError(error.InvalidFanIndices, (TriangleFan{ .count = 4, .indices = &.{ 0, 1, 2 }, .element_bytes = 1 }).expand(allocator));
+    try std.testing.expectError(error.IndexBufferTooLarge, (TriangleFan{ .count = std.math.maxInt(u32) }).expand(allocator));
+    try std.testing.expectError(error.Overflow, (TriangleFan{ .count = 3, .first_vertex = std.math.maxInt(u32) }).expand(allocator));
+    try std.testing.expectError(error.InvalidBaseVertex, (TriangleFan{ .count = 3, .indices = &.{ 0, 1, 2 }, .element_bytes = 1, .base_vertex = -1 }).expand(allocator));
+    try std.testing.expectError(error.InvalidBaseVertex, (TriangleFan{ .count = 1, .first_vertex = std.math.maxInt(u32), .base_vertex = 1 }).expand(allocator));
 }
 
 /// Depth is observed by depth testing/writes or a pixel position-Z input.
