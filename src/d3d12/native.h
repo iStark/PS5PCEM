@@ -46,7 +46,7 @@ typedef struct Ps5D3D12Draw {
     uint32_t index_count, index_element_bytes, primitive_restart;
     int32_t base_vertex;
     Ps5D3D12Blend blend;
-    uint32_t depth_format, depth_write, depth_compare;
+    uint32_t depth_format, depth_write, depth_compare, depth_clip_enabled;
     float viewport[6];
     int32_t scissor[4];
 } Ps5D3D12Draw;

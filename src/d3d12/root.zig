@@ -64,6 +64,7 @@ pub const Draw = extern struct {
     depth_format: u32 = 0,
     depth_write: u32 = 0,
     depth_compare: u32 = 8,
+    depth_clip_enabled: u32 = 1,
     viewport: [6]f32,
     scissor: [4]i32,
 
@@ -200,7 +201,7 @@ pub const Device = struct {
     }
 
     pub fn drawDepthResourcesSpirv(self: *Device, vertex: []const u32, fragment: []const u32, draw: Draw, indices: []const u8, buffers: []const Buffer, images: []const SampledImage, rgba: []u8, depth: []u8) Error!void {
-        if (depth.len != try depthSize(draw.width, draw.height, draw.depth_format) or draw.depth_write > 1 or
+        if (depth.len != try depthSize(draw.width, draw.height, draw.depth_format) or draw.depth_write > 1 or draw.depth_clip_enabled > 1 or
             draw.depth_compare < 1 or draw.depth_compare > 8 or (draw.depth_format == 0 and draw.depth_write != 0)) return error.InvalidArgument;
         if (!draw.blend.valid()) return error.InvalidArgument;
         if (buffers.len > 64 or images.len > 32) return error.InvalidArgument;

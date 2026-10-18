@@ -41,7 +41,7 @@ typedef struct ShaderEntry {
 /* Fixed-size words, not a native descriptor with pointers/padding. All other
  * PSO state is fixed by graphics_desc; dynamic constants/resources are rebound
  * on every draw and are deliberately absent from this key. */
-typedef struct PipelineKey { uint64_t words[19]; } PipelineKey;
+typedef struct PipelineKey { uint64_t words[20]; } PipelineKey;
 typedef struct PipelineEntry {
     PipelineKey key;
     uint64_t used;
@@ -1051,7 +1051,7 @@ int32_t ps5_d3d12_draw_spirv(Ps5D3D12 *c, const uint32_t *vertex, size_t vertex_
         (d->topology != D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST && d->topology != D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP) ||
         d->cull_mode < D3D12_CULL_MODE_NONE || d->cull_mode > D3D12_CULL_MODE_BACK || d->write_mask > 15) return E_INVALIDARG;
     const UINT depth_bpp = d->depth_format == DXGI_FORMAT_D16_UNORM ? 2 : 4;
-    if (d->depth_write > 1 || d->depth_compare < 1 || d->depth_compare > 8 ||
+    if (d->depth_write > 1 || d->depth_clip_enabled > 1 || d->depth_compare < 1 || d->depth_compare > 8 ||
         (d->depth_format == 0 ? (depth_bytes != 0 || d->depth_write != 0) :
         ((d->depth_format != DXGI_FORMAT_D16_UNORM && d->depth_format != DXGI_FORMAT_D32_FLOAT) || !depth_pixels ||
         (uint64_t)d->width * d->height * depth_bpp != depth_bytes))) return E_INVALIDARG;
@@ -1088,7 +1088,7 @@ int32_t ps5_d3d12_draw_spirv(Ps5D3D12 *c, const uint32_t *vertex, size_t vertex_
     const PipelineKey key = {{2, vs_id, ps_id, buffer_count, image_count, d->cull_mode, d->front_ccw != 0,
         d->write_mask, blend->enabled, blend->source_color, blend->destination_color, blend->color_operation,
         blend->source_alpha, blend->destination_alpha, blend->alpha_operation, strip_cut,
-        d->depth_format, d->depth_write, d->depth_compare}};
+        d->depth_format, d->depth_write, d->depth_compare, d->depth_clip_enabled}};
     if (!cached_pipeline(c, &key, &root, &pipeline)) {
         const ULONGLONG started = GetTickCount64();
         TRY(guest_graphics_root(c, buffer_count, image_count, &root));
@@ -1098,6 +1098,7 @@ int32_t ps5_d3d12_draw_spirv(Ps5D3D12 *c, const uint32_t *vertex, size_t vertex_
         pipeline_desc.DepthStencilState.DepthWriteMask = d->depth_write ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
         pipeline_desc.DepthStencilState.DepthFunc = d->depth_compare;
         pipeline_desc.RasterizerState.CullMode = d->cull_mode;
+        pipeline_desc.RasterizerState.DepthClipEnable = d->depth_clip_enabled != 0;
         pipeline_desc.RasterizerState.FrontCounterClockwise = d->front_ccw != 0;
         pipeline_desc.BlendState.RenderTarget[0].RenderTargetWriteMask = (UINT8)d->write_mask;
         pipeline_desc.BlendState.RenderTarget[0].BlendEnable = blend->enabled != 0;

@@ -5,6 +5,7 @@
 //! can remain in disabled banks across draws; their presence is not an enable.
 const std = @import("std");
 const gpu = @import("gpu");
+const rdna2 = @import("rdna2");
 
 pub const Routing = struct {
     stage: gpu.resources.ShaderStage,
@@ -43,6 +44,61 @@ pub fn viewportDepthRange(minimum: f32, maximum: f32, depth_observed: bool) ![2]
     if (minimum >= 0 and maximum <= 1 and minimum <= maximum) return .{ minimum, maximum };
     if (depth_observed) return error.UnrestrictedViewportDepthNotImplemented;
     return .{ 0, 1 };
+}
+
+pub const ViewportDepth = struct {
+    range: [2]f32,
+    transform: ?rdna2.spirv.VertexDepthTransform = null,
+};
+
+/// PA_SC_VPORT_ZMIN/MAX clamp per-pixel depth independently of PA_CL_VPORT_Z
+/// scale/offset. With an explicit 0..1 clamp we can apply Z in the VS, retain
+/// the original homogeneous planes as ClipDistance, and let D3D12 clamp after
+/// interpolation. Rebasing Z into 0.5..1 instead would lose small D32 values.
+pub fn viewportDepth(state: *const gpu.State, vp: gpu.resources.ViewportTransform, zero_to_one: bool, depth_test: bool, position_z: bool) !ViewportDepth {
+    const minimum = if (zero_to_one) vp.z_offset else vp.z_offset - vp.z_scale;
+    const maximum = vp.z_offset + vp.z_scale;
+    const range = viewportDepthRange(minimum, maximum, depth_test or position_z) catch |err| {
+        if (err != error.UnrestrictedViewportDepthNotImplemented) return err;
+        const clamp_min: f32 = @bitCast(state.readRegister(.context, 0x0b4) orelse return err);
+        const clamp_max: f32 = @bitCast(state.readRegister(.context, 0x0b5) orelse return err);
+        const clip = state.readRegister(.context, 0x204) orelse 0;
+        const vte = state.readRegister(.context, 0x206) orelse 0x43f;
+        // User planes, disabled clipping/near/far, and nonstandard vertex
+        // formats require separate lowering. Position-Z input is unproven.
+        if (position_z or clamp_min != 0 or clamp_max != 1 or
+            clip & 0x1c01003f != 0 or vte != 0x43f) return err;
+        return .{ .range = .{ 0, 1 }, .transform = .{
+            .scale = vp.z_scale,
+            .offset = vp.z_offset,
+            .negative_one_to_one = !zero_to_one,
+        } };
+    };
+    return .{ .range = range };
+}
+
+test "explicit unit depth clamp preserves unrestricted viewport without inventing defaults" {
+    var state: gpu.State = .{};
+    const vp: gpu.resources.ViewportTransform = .{ .x_scale = 1, .x_offset = 1, .y_scale = -1, .y_offset = 1, .z_scale = 1, .z_offset = 0 };
+    try std.testing.expectError(error.UnrestrictedViewportDepthNotImplemented, viewportDepth(&state, vp, false, true, false));
+    try state.writeRegister(.context, 0xb4, 0);
+    try state.writeRegister(.context, 0xb5, @bitCast(@as(f32, 1)));
+    const plan = try viewportDepth(&state, vp, false, true, false);
+    try std.testing.expectEqual([2]f32{ 0, 1 }, plan.range);
+    try std.testing.expectEqual(rdna2.spirv.VertexDepthTransform{ .scale = 1, .offset = 0, .negative_one_to_one = true }, plan.transform.?);
+    try std.testing.expect((try viewportDepth(&state, vp, true, true, false)).transform == null);
+    try std.testing.expect((try viewportDepth(&state, vp, false, false, false)).transform == null);
+    try std.testing.expectError(error.UnrestrictedViewportDepthNotImplemented, viewportDepth(&state, vp, false, true, true));
+    try state.writeRegister(.context, 0xb5, 0);
+    try std.testing.expectError(error.UnrestrictedViewportDepthNotImplemented, viewportDepth(&state, vp, false, true, false));
+    try state.writeRegister(.context, 0xb5, @bitCast(@as(f32, 1)));
+    for ([_]u32{ 1, 1 << 16, 1 << 26, 1 << 27, 1 << 28 }) |clip| {
+        try state.writeRegister(.context, 0x204, clip);
+        try std.testing.expectError(error.UnrestrictedViewportDepthNotImplemented, viewportDepth(&state, vp, false, true, false));
+    }
+    try state.writeRegister(.context, 0x204, 0);
+    try state.writeRegister(.context, 0x206, 0x42f);
+    try std.testing.expectError(error.UnrestrictedViewportDepthNotImplemented, viewportDepth(&state, vp, false, true, false));
 }
 
 test "only unobserved viewport depth can be normalized into the native range" {

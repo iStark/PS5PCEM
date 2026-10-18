@@ -441,6 +441,7 @@ fn guestGraphicsProbe(allocator: std.mem.Allocator, device: *d3d12.Device) !void
     try guestCommandProbe(allocator, &vertex_words, &pixel_words);
     try guestSurfaceProbe(allocator, &vertex_words, &pixel_words);
     try guestDepthProbe(allocator, &vertex_words, &pixel_words);
+    try guestViewportDepthProbe(allocator, &vertex_words, &pixel_words);
     try guestVaryingProbe(allocator, &vertex_words);
     try guestResourcesProbe(allocator);
     try guestBlendingProbe(allocator, &vertex_words);
@@ -829,6 +830,168 @@ fn guestDepthProbe(allocator: std.mem.Allocator, vertex: []const u32, fragment: 
     const backend = renderer.dcbBackend();
     if (backend.vtable.write(backend.context, 0x1200, &.{ 1, 2, 3, 4 })) return error.FailedDepthPublishedLabel;
     std.debug.print("PASS {d} guest depth cases: D16/D32, linear/depth-64K, all comparisons, read-only/write masks, shader mutation, consecutive draws, full color/depth and padding checks; invalid layouts stop before writes\n", .{cases});
+}
+
+fn guestViewportDepthProbe(allocator: std.mem.Allocator, vertex: []const u32, fragment: []const u32) !void {
+    const memory = try allocator.create(GraphicsMemory);
+    defer allocator.destroy(memory);
+    memory.* = .{};
+    @memcpy(memory.data[0x400..][0 .. fragment.len * 4], std.mem.sliceAsBytes(fragment));
+    var renderer = try d3d12.Renderer.init(allocator, memory.access(), false);
+    defer renderer.deinit();
+    var state = try graphicsState(65, 37, 72);
+    try state.writeRegister(.context, 0x007, 64 | (36 << 16));
+    try state.writeRegister(.context, 0x012, 0x200);
+    try state.writeRegister(.context, 0x014, 0x200);
+    try state.writeRegister(.context, 0x010, 3); // D32, linear, including padded rows.
+    try state.writeRegister(.context, 0xb4, 0);
+    try state.writeRegister(.context, 0xb5, @bitCast(@as(f32, 1)));
+    for ([_]f32{ 32.5, 32.5, -18.5, 18.5, 1, 0 }, 0..) |value, i|
+        try state.writeRegister(.context, 0x10f + @as(u32, @intCast(i)), @bitCast(value));
+    var executor = gpu.DcbExecutor{ .state = &state, .backend = renderer.dcbBackend(), .allocator = allocator };
+    const color_layout = try d3d12.surfaces.colorLayout(gpu.resources.decodeColorTarget(&state, 0, 15).?);
+    const depth_layout = try d3d12.surfaces.depthLayout(gpu.resources.decodeDepthTarget(&state).?, 65, 37, true);
+    const color = memory.data[0x2000..][0..@intCast(color_layout.required_source_bytes)];
+    const depth = memory.data[0x20000..][0..@intCast(depth_layout.required_source_bytes)];
+    @memset(color, 0xa7);
+    @memcpy(memory.data[0x200..][0 .. vertex.len * 4], std.mem.sliceAsBytes(vertex));
+    _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 2 });
+    const covered = try allocator.dupe(u8, color);
+    defer allocator.free(covered);
+    const expected = try allocator.alloc(u8, depth.len);
+    defer allocator.free(expected);
+    var program: std.ArrayList(u32) = .empty;
+    defer program.deinit(allocator);
+    const Mapping = struct { zero_to_one: bool = false, scale: f32 = 1, offset: f32 = 0 };
+    var cases: usize = 0;
+    for ([_]Mapping{ .{}, .{ .scale = 2, .offset = -0.25 }, .{ .zero_to_one = true, .scale = 2, .offset = -0.25 }, .{ .scale = -1 } }) |mapping| {
+        try state.writeRegister(.context, 0x204, if (mapping.zero_to_one) 1 << 19 else 0);
+        try state.writeRegister(.context, 0x113, @bitCast(mapping.scale));
+        try state.writeRegister(.context, 0x114, @bitCast(mapping.offset));
+        // Tiny positive D32 must survive: mapping through (z + 1) / 2 loses it.
+        for ([_]f32{ -2, -1, -0.5, -0x1p-25, 0, 0x1p-25, 0.25, 0.5, 1, 2 }) |z| {
+            program.clearRetainingCapacity();
+            for (vertex) |word| {
+                if (word == vop1(0x01, 7, 128)) {
+                    try program.appendSlice(allocator, &.{ vop1(0x01, 7, 255), @bitCast(z) });
+                } else try program.append(allocator, word);
+            }
+            @memcpy(memory.data[0x200..][0 .. program.items.len * 4], std.mem.sliceAsBytes(program.items));
+            const incoming = @max(@as(f32, 0), @min(@as(f32, 1), z * mapping.scale + mapping.offset));
+            const clipped = z < (if (mapping.zero_to_one) @as(f32, 0) else -1) or z > 1;
+            for ([_]f32{ 0, 1 }) |stored| for (0..8) |compare| for ([_]bool{ false, true }) |writes| {
+                const passes = !clipped and switch (compare) {
+                    0 => false,
+                    1 => incoming < stored,
+                    2 => incoming == stored,
+                    3 => incoming <= stored,
+                    4 => incoming > stored,
+                    5 => incoming != stored,
+                    6 => incoming >= stored,
+                    7 => true,
+                    else => unreachable,
+                };
+                try state.writeRegister(.context, 0x200, 2 | (if (writes) @as(u32, 4) else 0) | (@as(u32, @intCast(compare)) << 4));
+                @memset(color, 0xa7);
+                @memset(depth, 0x5d);
+                for (0..37) |y| for (0..65) |x| {
+                    const offset: usize = @intCast(try depth_layout.sourceByteOffset(@intCast(x), @intCast(y), 0));
+                    std.mem.writeInt(u32, depth[offset..][0..4], @bitCast(stored), .little);
+                };
+                @memcpy(expected, depth);
+                if (passes and writes) for (0..37) |y| {
+                    for (0..65) |x| {
+                        const color_offset: usize = @intCast(try color_layout.sourceByteOffset(@intCast(x), @intCast(y), 0));
+                        if (covered[color_offset] == 0xa7) continue;
+                        const offset: usize = @intCast(try depth_layout.sourceByteOffset(@intCast(x), @intCast(y), 0));
+                        std.mem.writeInt(u32, expected[offset..][0..4], @bitCast(incoming), .little);
+                    }
+                };
+                _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 2 });
+                for (color, 0..) |byte, i| if (byte != (if (passes) covered[i] else @as(u8, 0xa7))) {
+                    std.debug.print("Viewport color mapping={any} z={d} stored={d} compare={d} write={any} byte={d}\n", .{ mapping, z, stored, compare, writes, i });
+                    return error.ViewportDepthCoverageMismatch;
+                };
+                if (!std.mem.eql(u8, expected, depth)) {
+                    std.debug.print("Viewport depth mapping={any} z={d} stored={d} compare={d} write={any}\n", .{ mapping, z, stored, compare, writes });
+                    return error.ViewportDepthPrecisionOrPaddingMismatch;
+                }
+                cases += 1;
+            };
+        }
+    }
+    // One triangle intersects both original clip planes. Compare full coverage
+    // with native homogeneous clipping, then verify post-interpolation clamp.
+    program.clearRetainingCapacity();
+    for (vertex) |word| {
+        if (word == vop1(0x01, 7, 128)) {
+            try program.appendSlice(allocator, &.{ vop1(0x01, 7, 255), @bitCast(@as(f32, 2)), vop2(0x08, 7, 5, 7) });
+        } else try program.append(allocator, word);
+    }
+    @memcpy(memory.data[0x200..][0 .. program.items.len * 4], std.mem.sliceAsBytes(program.items));
+    try state.writeRegister(.context, 0x204, 0);
+    try state.writeRegister(.context, 0x113, @bitCast(@as(f32, 1)));
+    try state.writeRegister(.context, 0x114, 0);
+    try state.writeRegister(.context, 0x200, 0);
+    @memset(color, 0xa7);
+    _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 2 });
+    @memcpy(covered, color);
+    @memset(color, 0xa7);
+    @memset(depth, 0);
+    try state.writeRegister(.context, 0x200, 2 | 4 | (7 << 4));
+    _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 2 });
+    if (!std.mem.eql(u8, covered, color)) return error.ViewportDepthPlaneClippingMismatch;
+    for (0..37) |y| for (0..65) |x| {
+        const color_offset: usize = @intCast(try color_layout.sourceByteOffset(@intCast(x), @intCast(y), 0));
+        if (covered[color_offset] == 0xa7) continue;
+        const offset: usize = @intCast(try depth_layout.sourceByteOffset(@intCast(x), @intCast(y), 0));
+        const actual: f32 = @bitCast(std.mem.readInt(u32, depth[offset..][0..4], .little));
+        const ideal = @max(@as(f32, 0), 2 * (2 * (@as(f32, @floatFromInt(x)) + 0.5) / 65 - 1));
+        if (@abs(actual - ideal) > 0.000001) return error.ViewportDepthInterpolationMismatch;
+    };
+    // Keep identical SPIR-V while changing only native Z clipping: this state
+    // must be part of the PSO identity, including when returning to a hit.
+    program.clearRetainingCapacity();
+    for (vertex) |word| {
+        if (word == vop1(0x01, 7, 128)) {
+            try program.appendSlice(allocator, &.{ vop1(0x01, 7, 255), @bitCast(@as(f32, -0.5)) });
+        } else try program.append(allocator, word);
+    }
+    var vs = try rdna2.decodeProgram(allocator, program.items);
+    defer vs.deinit(allocator);
+    var ps = try rdna2.decodeProgram(allocator, fragment);
+    defer ps.deinit(allocator);
+    var vertex_module = try rdna2.translateProgramSpirv(allocator, &vs, .{
+        .stage = .vertex,
+        .vertex_index_vgpr = 5,
+        .vertex_depth_transform = .{ .scale = 1, .offset = 0, .negative_one_to_one = true },
+    });
+    defer vertex_module.deinit(allocator);
+    var pixel_module = try rdna2.translateProgramSpirv(allocator, &ps, .{ .stage = .fragment });
+    defer pixel_module.deinit(allocator);
+    const pixels = try allocator.alloc(u8, 65 * 37 * 4);
+    defer allocator.free(pixels);
+    const baseline = try allocator.alloc(u8, pixels.len);
+    defer allocator.free(baseline);
+    var native_draw = try d3d12.Draw.fullTarget(65, 37);
+    for ([_]u32{ 0, 1, 0 }, 0..) |clip, pass| {
+        native_draw.depth_clip_enabled = clip;
+        @memset(pixels, 0xa7);
+        try renderer.device.drawSpirv(vertex_module.words, pixel_module.words, native_draw, pixels);
+        if (pass == 0) {
+            if (std.mem.allEqual(u8, pixels, 0xa7)) return error.NativeDepthClampEmpty;
+            @memcpy(baseline, pixels);
+        } else if (clip == 1) {
+            if (!std.mem.allEqual(u8, pixels, 0xa7)) return error.NativeDepthClipCacheMismatch;
+        } else if (!std.mem.eql(u8, baseline, pixels)) return error.NativeDepthClampCacheMismatch;
+    }
+    const before = try allocator.dupe(u8, &memory.data);
+    defer allocator.free(before);
+    try state.writeRegister(.context, 0xb5, @bitCast(@as(f32, 0.5)));
+    const packet: gpu.pm4.Packet = .{ .kind = .command, .header = command(gpu.pm4.draw_index_auto, 2), .opcode = gpu.pm4.draw_index_auto, .body = &.{ 3, 2 } };
+    if (renderer.draw(&state, packet)) |_| return error.UnsupportedDepthClampAccepted else |err| if (err != error.UnrestrictedViewportDepthNotImplemented) return err;
+    if (!std.mem.eql(u8, before, &memory.data)) return error.RejectedViewportModifiedMemory;
+    std.debug.print("PASS {d} unrestricted viewport cases: explicit unit clamp, GL/DX planes, reversed/offset scale, tiny positive D32, all comparisons and write masks; crossing-plane coverage, interpolated clamp, native clip PSO reuse and rejected-clamp memory preservation\n", .{cases});
 }
 
 fn guestSurfaceProbe(allocator: std.mem.Allocator, vertex: []const u32, fragment: []const u32) !void {

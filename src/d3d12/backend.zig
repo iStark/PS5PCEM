@@ -97,6 +97,10 @@ pub const Renderer = struct {
             render.depth_control.stencil_enabled, render.blends[0].enabled,
         });
         if (render.depth_target) |depth| std.debug.print("[d3d12 depth] target={any} control={any} viewport={any}\n", .{ depth, render.depth_control, render.viewport });
+        std.debug.print("[d3d12 depth registers] clamp={any}/{any} clip={any} vte={any}\n", .{
+            state.readRegister(.context, 0xb4),  state.readRegister(.context, 0xb5),
+            state.readRegister(.context, 0x204), state.readRegister(.context, 0x206),
+        });
         if (render.blends[0].enabled) std.debug.print("[d3d12 blend] control=0x{x} constants={any}\n", .{
             state.readRegister(.context, 0x1e0) orelse 0,
             native.blending.decode(state, render.blends[0]) catch null,
@@ -260,13 +264,14 @@ pub const Renderer = struct {
         draw_state.cull_mode = if (render.raster.cull_front) 2 else if (render.raster.cull_back) 3 else 1;
         draw_state.front_ccw = @intFromBool(!render.raster.clockwise_front_face);
         draw_state.write_mask = target.write_mask & (render.shader_mask & 0xf);
+        var depth_transform: ?rdna2.spirv.VertexDepthTransform = null;
         if (render.viewport) |vp| {
             if (vp.x_scale <= 0 or vp.y_scale >= 0) return error.PositiveYOrMirroredViewportNotImplemented;
             const position_z_enabled = ((state.readRegister(.context, 0x1b4) orelse 0) & (state.readRegister(.context, 0x1b3) orelse 0)) & (1 << 10) != 0;
-            // Never normalize an out-of-range mapping when depth testing or
-            // the fragment shader can observe the resulting Z value.
-            const depth = try graphics.viewportDepthRange(if (render.raster.zero_to_one_depth) vp.z_offset else vp.z_offset - vp.z_scale, vp.z_offset + vp.z_scale, position_z_enabled or render.depth_control.test_enabled);
-            draw_state.viewport = .{ vp.x_offset - vp.x_scale, vp.y_offset + vp.y_scale, vp.x_scale * 2, -vp.y_scale * 2, depth[0], depth[1] };
+            const depth = try graphics.viewportDepth(state, vp, render.raster.zero_to_one_depth, render.depth_control.test_enabled, position_z_enabled);
+            depth_transform = depth.transform;
+            draw_state.depth_clip_enabled = @intFromBool(depth_transform == null);
+            draw_state.viewport = .{ vp.x_offset - vp.x_scale, vp.y_offset + vp.y_scale, vp.x_scale * 2, -vp.y_scale * 2, depth.range[0], depth.range[1] };
         }
         if (render.scissor) |scissor| draw_state.scissor = .{ scissor.left, scissor.top, scissor.right, scissor.bottom };
         const vs_bindings = try gpu.ShaderBindings.capture(state, routing.stage, null, self.reader());
@@ -299,7 +304,8 @@ pub const Renderer = struct {
             .scalarize_ballot_first = true,
             .program_address = vs_bindings.program_address,
             .vertex_index_vgpr = 5,
-            .convert_negative_one_to_one_depth = !render.raster.zero_to_one_depth,
+            .convert_negative_one_to_one_depth = !render.raster.zero_to_one_depth and depth_transform == null,
+            .vertex_depth_transform = depth_transform,
             .scalar_registers = vs_scalar[0..vs_scalar_count],
             .allow_control_flow_fallback = false,
             .parameter_mask = interface.mask,

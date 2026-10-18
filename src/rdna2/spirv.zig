@@ -402,6 +402,12 @@ fn colorExportValueType(color_type: ColorExportType) ValueType {
     };
 }
 
+pub const VertexDepthTransform = struct {
+    scale: f32,
+    offset: f32,
+    negative_one_to_one: bool,
+};
+
 pub const Options = struct {
     stage: Stage,
     local_size: [3]u32 = .{ 1, 1, 1 },
@@ -439,6 +445,10 @@ pub const Options = struct {
     /// Converts a guest -W..W position export to Vulkan's 0..W clip-depth
     /// convention. Leave clear when PA_CL_CLIP_CNTL selects DX clip space.
     convert_negative_one_to_one_depth: bool = false,
+    /// Apply viewport Z in the VS while keeping the original homogeneous
+    /// near/far planes as ClipDistance. The host must disable fixed Z clipping
+    /// and provide the guest's per-pixel depth clamp separately.
+    vertex_depth_transform: ?VertexDepthTransform = null,
     /// Match AMD's clipping of dormant (0,0,0,0) vertices on hosts whose
     /// perspective divide otherwise puts them at the viewport centre.
     /// Requires shaderClipDistance on the device and a direct raster path.
@@ -1064,6 +1074,8 @@ const Builder = struct {
     tess_coord_input: u32 = 0,
     patch_id_input: u32 = 0,
     convert_negative_one_to_one_depth: bool,
+    vertex_depth_transform: ?VertexDepthTransform,
+    depth_clip_output: u32 = 0,
     vertex_index_input: u32 = 0,
     instance_index_input: u32 = 0,
     position_output: u32 = 0,
@@ -1239,6 +1251,10 @@ const Builder = struct {
     used_dispatcher: bool = false,
 
     fn init(allocator: std.mem.Allocator, options: Options) Error!Builder {
+        if (options.vertex_depth_transform) |transform| {
+            if (options.stage != .vertex or options.convert_negative_one_to_one_depth or options.clip_zero_position or
+                !std.math.isFinite(transform.scale) or !std.math.isFinite(transform.offset)) return Error.InvalidStageInterface;
+        }
         var self = Builder{
             .allocator = allocator,
             .void_type = 0,
@@ -1253,6 +1269,7 @@ const Builder = struct {
             .vertex_index_vgpr = options.vertex_index_vgpr,
             .tessellation_inputs = options.tessellation_inputs,
             .convert_negative_one_to_one_depth = options.convert_negative_one_to_one_depth,
+            .vertex_depth_transform = options.vertex_depth_transform,
             .color_export_mappings = options.color_export_mappings,
             .color_export_types = options.color_export_types,
             .packed_color_exports = options.packed_color_exports,
@@ -1406,6 +1423,17 @@ const Builder = struct {
                     try self.emit(&self.declarations, 32, &.{ self.output_float_pointer, 3, self.float_type });
                     try self.emit(&self.declarations, 59, &.{ array_pointer, self.zero_position_clip_output, 3 });
                     try self.emit(&self.annotations, 71, &.{ self.zero_position_clip_output, 11, 3 }); // BuiltIn ClipDistance
+                }
+                if (options.vertex_depth_transform != null) {
+                    const array_type = self.id();
+                    const array_pointer = self.id();
+                    self.output_float_pointer = self.id();
+                    self.depth_clip_output = self.id();
+                    try self.emit(&self.declarations, 28, &.{ array_type, self.float_type, try self.constant(.bits32, 2) });
+                    try self.emit(&self.declarations, 32, &.{ array_pointer, 3, array_type });
+                    try self.emit(&self.declarations, 32, &.{ self.output_float_pointer, 3, self.float_type });
+                    try self.emit(&self.declarations, 59, &.{ array_pointer, self.depth_clip_output, 3 });
+                    try self.emit(&self.annotations, 71, &.{ self.depth_clip_output, 11, 3 });
                 }
 
                 for (0..32) |location| {
@@ -5128,6 +5156,7 @@ const Builder = struct {
             }); // OpCompositeConstruct
             try self.emit(&self.body, 62, &.{ self.position_output, zero_vector });
             try self.storeZeroPositionClip(zero_vector);
+            try self.storeDepthClip(try self.constant(.float32, 0), try self.constant(.float32, 0), null);
             if (self.layer_variable != 0) try self.emit(&self.body, 62, &.{ self.layer_variable, try self.constant(.sint32, 0) });
             for (self.parameter_variables) |variable| {
                 if (variable != 0) try self.emit(&self.body, 62, &.{ variable, zero_vector });
@@ -5976,6 +6005,19 @@ const Builder = struct {
         // screen-covering triangles.
         const out_w = w;
         var out_z = z;
+        if (is_position) if (self.vertex_depth_transform) |transform| {
+            if (transform.scale != 1) {
+                out_z = self.id();
+                try self.emit(&self.body, 133, &.{ self.float_type, out_z, z, try self.constant(.float32, @bitCast(transform.scale)) });
+            }
+            if (transform.offset != 0) {
+                const offset = self.id();
+                try self.emit(&self.body, 133, &.{ self.float_type, offset, w, try self.constant(.float32, @bitCast(transform.offset)) });
+                const sum = self.id();
+                try self.emit(&self.body, 129, &.{ self.float_type, sum, out_z, offset });
+                out_z = sum;
+            }
+        };
         if (is_position and self.convert_negative_one_to_one_depth) {
             // Vulkan clips Z to 0..W. The guest's OpenGL-style convention
             // clips to -W..W, so preserve its NDC depth with
@@ -6019,7 +6061,8 @@ const Builder = struct {
             components[3],
         }); // OpCompositeConstruct
         var exported = vector;
-        if (try self.laneEnabled()) |enabled| {
+        const lane_enabled = try self.laneEnabled();
+        if (lane_enabled) |enabled| {
             const current = self.id();
             try self.emit(&self.body, 61, &.{ output_vector_type, current, output }); // OpLoad
             const selected = self.id();
@@ -6028,12 +6071,36 @@ const Builder = struct {
         }
         try self.emit(&self.body, 62, &.{ output, exported }); // OpStore
         if (is_position) try self.storeZeroPositionClip(exported);
+        if (is_position) try self.storeDepthClip(z, w, lane_enabled);
         if (self.stage == .vertex and inst.export_target >= 0x20 and inst.export_target < 0x40) {
             const targets = self.vertex_parameter_targets[inst.export_target - 0x20];
             for (self.parameter_variables, 0..) |variable, location| {
                 if (variable != 0 and variable != output and targets & (@as(u32, 1) << @intCast(location)) != 0)
                     try self.emit(&self.body, 62, &.{ variable, exported });
             }
+        }
+    }
+
+    fn storeDepthClip(self: *Builder, z: u32, w: u32, enabled: ?u32) Error!void {
+        const transform = self.vertex_depth_transform orelse return;
+        var near = z;
+        if (transform.negative_one_to_one) {
+            near = self.id();
+            try self.emit(&self.body, 129, &.{ self.float_type, near, z, w });
+        }
+        const far = self.id();
+        try self.emit(&self.body, 131, &.{ self.float_type, far, w, z });
+        for ([_]u32{ near, far }, 0..) |distance, i| {
+            const pointer = self.id();
+            try self.emit(&self.body, 65, &.{ self.output_float_pointer, pointer, self.depth_clip_output, try self.constant(.bits32, @intCast(i)) });
+            var value = distance;
+            if (enabled) |condition| {
+                const old = self.id();
+                value = self.id();
+                try self.emit(&self.body, 61, &.{ self.float_type, old, pointer });
+                try self.emit(&self.body, 169, &.{ self.float_type, value, condition, distance, old });
+            }
+            try self.emit(&self.body, 62, &.{ pointer, value });
         }
     }
 
@@ -13345,7 +13412,7 @@ fn assemble(allocator: std.mem.Allocator, builder: *Builder, options: Options) E
         0,
     });
     try appendInstruction(allocator, &words, 17, &.{1}); // OpCapability Shader
-    if (builder.zero_position_clip_output != 0) try appendInstruction(allocator, &words, 17, &.{32});
+    if (builder.zero_position_clip_output != 0 or builder.depth_clip_output != 0) try appendInstruction(allocator, &words, 17, &.{32});
 
     if (builder.layer_variable != 0) {
         try appendInstruction(allocator, &words, 17, &.{if (options.stage == .vertex) @as(u32, 5254) else 2});
@@ -13477,6 +13544,7 @@ fn assemble(allocator: std.mem.Allocator, builder: *Builder, options: Options) E
     };
     if (builder.position_output != 0) try entry_point.append(allocator, builder.position_output);
     if (builder.zero_position_clip_output != 0) try entry_point.append(allocator, builder.zero_position_clip_output);
+    if (builder.depth_clip_output != 0) try entry_point.append(allocator, builder.depth_clip_output);
     if (builder.fragment_depth_output != 0) try entry_point.append(allocator, builder.fragment_depth_output);
     for (builder.color_outputs) |color_output| {
         if (color_output != 0) try entry_point.append(allocator, color_output);
@@ -14896,6 +14964,16 @@ test "vertex system value and position export lower to a stage interface" {
     defer converted.deinit(std.testing.allocator);
     try std.testing.expect(containsOpcode(converted.words, 129)); // OpFAdd z + w
     try std.testing.expect(containsOpcode(converted.words, 133)); // OpFMul by 0.5
+
+    const transform: VertexDepthTransform = .{ .scale = 1, .offset = 0, .negative_one_to_one = true };
+    var clamped = try translate(std.testing.allocator, &program, .{ .stage = .vertex, .vertex_depth_transform = transform });
+    defer clamped.deinit(std.testing.allocator);
+    try std.testing.expect(containsOpcode(clamped.words, 131)); // Far plane W - Z.
+    try std.testing.expect(!containsOpcode(clamped.words, 133)); // No lossy 0.5 depth rebasing.
+    try std.testing.expectError(error.InvalidStageInterface, translate(std.testing.allocator, &program, .{ .stage = .fragment, .vertex_depth_transform = transform }));
+    try std.testing.expectError(error.InvalidStageInterface, translate(std.testing.allocator, &program, .{ .stage = .vertex, .vertex_depth_transform = transform, .convert_negative_one_to_one_depth = true }));
+    try std.testing.expectError(error.InvalidStageInterface, translate(std.testing.allocator, &program, .{ .stage = .vertex, .vertex_depth_transform = transform, .clip_zero_position = true }));
+    try std.testing.expectError(error.InvalidStageInterface, translate(std.testing.allocator, &program, .{ .stage = .vertex, .vertex_depth_transform = .{ .scale = std.math.nan(f32), .offset = 0, .negative_one_to_one = true } }));
 }
 
 test "GETPC SETPC continuation still exports position" {
