@@ -18,6 +18,7 @@ pub fn main(init: std.process.Init) !void {
     var device = try d3d12.Device.init(debug);
     defer device.deinit();
     std.debug.print("D3D12 adapter: {s}, {d} MiB, validation={any}\n", .{ device.info.name(), device.info.dedicated_bytes / (1024 * 1024), device.info.debug_enabled != 0 });
+    std.debug.print("Shader model=0x{x}, WaveOps={d}, native lanes={d}..{d}\n", .{ device.info.shader_model, device.info.wave_ops, device.info.wave_lane_min, device.info.wave_lane_max });
 
     for ([_]usize{ 1, 255, 256, 257, 65537, 1048577 }) |size| {
         const source = try allocator.alloc(u8, size);
@@ -85,6 +86,7 @@ pub fn main(init: std.process.Init) !void {
     } else |err| if (err != error.NativeFailure) return err;
     if (!std.mem.eql(u32, &source_words, &preserved)) return error.InvalidLayoutModifiedBuffer;
     std.debug.print("PASS guest RDNA2 -> shared IR -> HLSL -> D3D12 compute, descriptor arrays and exact readback\n", .{});
+    try guestWaveProbe(allocator, &device);
 
     for ([_][2]u32{ .{ 1, 1 }, .{ 71, 37 }, .{ 256, 129 } }) |extent| {
         const width, const height = extent;
@@ -106,6 +108,62 @@ pub fn main(init: std.process.Init) !void {
     try guestGraphicsProbe(allocator, &device);
     if (device.validationErrors() != 0) return error.ValidationFailed;
     std.debug.print("D3D12 hardware probes passed\n", .{});
+}
+
+fn guestWaveProbe(allocator: std.mem.Allocator, device: *d3d12.Device) !void {
+    for ([_]?u32{ null, 0xffff, 0xffe0, 0x8000, 0 }) |mask| try guestWaveMaskProbe(allocator, device, mask);
+    std.debug.print("PASS guest readfirstlane -> DXC SM6 -> validated DXIL: full/partial/empty EXEC masks, exact broadcast readback and cached changed input\n", .{});
+}
+
+fn guestWaveMaskProbe(allocator: std.mem.Allocator, device: *d3d12.Device, mask: ?u32) !void {
+    // A partial 16-invocation wave, all active: read FIRST's dynamically loaded
+    // value, not each invocation's own value. Two inputs also exercise DXIL/PSO
+    // cache hits without reusing the previous dispatch's staged buffer contents.
+    const kernel = [_]u32{ 0xe0302000, 0x80000100, 0xe0702000, 0x80010100, 0xbf810000 };
+    var program = try rdna2.decodeProgram(allocator, &kernel);
+    defer program.deinit(allocator);
+    try program.instructions.insertSlice(allocator, 1, &.{
+        .{ .pc = 8, .opcode = .v_readfirstlane_b32, .dst = .{ .kind = .sgpr, .reg = 8 }, .src0 = .{ .kind = .vgpr, .reg = 1 }, .src_count = 1 },
+        .{ .pc = 12, .opcode = .v_mov_b32, .dst = .{ .kind = .vgpr, .reg = 1 }, .src0 = .{ .kind = .sgpr, .reg = 8 }, .src_count = 1 },
+    });
+    if (mask) |value| {
+        try program.instructions.insert(allocator, 1, .{ .pc = 0, .opcode = .s_mov_b64, .dst = .{ .kind = .exec_lo }, .src0 = .{ .kind = .literal_constant, .value = value }, .src_count = 1 });
+        // READFIRSTLANE writes an SGPR even under a narrowed/empty EXEC. Restore
+        // all live lanes before exporting that scalar through the output UAV.
+        try program.instructions.insert(allocator, 3, .{ .pc = 0, .opcode = .s_mov_b64, .dst = .{ .kind = .exec_lo }, .src0 = .{ .kind = .literal_constant, .value = 0xffff }, .src_count = 1 });
+    }
+    for (program.instructions.items, 0..) |*instruction, index| instruction.pc = @intCast(index * 8);
+    var shader = try rdna2.translateProgramSpirv(allocator, &program, .{
+        .stage = .compute,
+        .local_size = .{ 16, 1, 1 },
+        .wave32 = true,
+        .scalarize_ballot_first = true,
+        .compute_inputs = .{ .local_invocation_id_components = 1 },
+        .storage_buffers = &.{
+            .{ .resource_sgpr = 0, .descriptor_index = 0, .stride = 4, .extent_bytes = 64 },
+            .{ .resource_sgpr = 4, .descriptor_index = 1, .stride = 4, .extent_bytes = 64 },
+        },
+        .descriptor_array_length = 2,
+        .allow_control_flow_fallback = false,
+    });
+    defer shader.deinit(allocator);
+    var input: [16]u32 = undefined;
+    var output: [16]u32 = @splat(0xcccccccc);
+    const before = device.cacheStats();
+    for (0..2) |pass| {
+        for (&input, 0..) |*value, index| value.* = @intCast(1000 + index * 97 + pass * 12345);
+        try device.dispatchSpirv(shader.words, &.{
+            d3d12.Buffer.fromSlice(std.mem.asBytes(&input)),
+            d3d12.Buffer.fromSlice(std.mem.asBytes(&output)),
+        }, .{ 1, 1, 1 });
+        const expected: u32 = if (mask) |value| (if (value != 0) input[@intCast(@ctz(value))] else 0) else input[0];
+        for (output) |value| if (value != expected) {
+            std.debug.print("EXEC mask={any}: got {d}, expected {d}\n", .{ mask, value, expected });
+            return error.GuestWaveBroadcastMismatch;
+        };
+    }
+    const after = device.cacheStats();
+    if (before.enabled != 0 and (after.shader_hits != before.shader_hits + 1 or after.pipeline_hits != before.pipeline_hits + 1)) return error.GuestWaveCacheMiss;
 }
 
 fn guestCommandProbe(allocator: std.mem.Allocator, vertex_words: []const u32, pixel_words: []const u32) !void {

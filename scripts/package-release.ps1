@@ -136,6 +136,8 @@ try {
         @{ Source = (Join-Path $binaryRoot "ps5pcem.exe"); Destination = "ps5pcem.exe" },
         @{ Source = (Join-Path $binaryRoot "game-run.exe"); Destination = "game-run.exe" },
         @{ Source = (Join-Path $binaryRoot "pkgextractor.exe"); Destination = "pkgextractor.exe" },
+        @{ Source = (Join-Path $binaryRoot "dxcompiler.dll"); Destination = "dxcompiler.dll" },
+        @{ Source = (Join-Path $binaryRoot "dxil.dll"); Destination = "dxil.dll" },
         @{ Source = "README.md"; Destination = "README.md" },
         @{ Source = "LICENSE"; Destination = "LICENSE" },
         @{ Source = "VERSION"; Destination = "VERSION" },
@@ -149,6 +151,13 @@ try {
         Copy-Item -LiteralPath $source -Destination (Join-Path $stageRoot $entry.Destination)
     }
 
+    # Preserve Microsoft's compiler/validator binaries and their original
+    # signatures; redistribute all license notices from the pinned package.
+    $dxcLicenses = Join-Path $stageRoot "licenses\dxc"
+    New-Item -ItemType Directory -Path $dxcLicenses -Force | Out-Null
+    foreach ($notice in @("LICENCE-MIT.txt", "LICENSE-LLVM.txt", "LICENSE-MS.txt")) {
+        Copy-Item -LiteralPath (Join-Path $binaryRoot "licenses\dxc\$notice") -Destination $dxcLicenses
+    }
     $stageDocs = Join-Path $stageRoot "docs"
     Copy-Item -LiteralPath (Join-Path $repoRoot "docs") -Destination $stageDocs -Recurse
     $stageBranding = Join-Path $stageRoot "assets\branding"
@@ -162,7 +171,7 @@ PS5PCEM $Version - Windows x64 prototype
 2. Run ps5pcem.exe.
 3. Choose a directory containing a decrypted game you are legally allowed to use.
 
-Keep ps5pcem.exe, game-run.exe and pkgextractor.exe together. The portable build stores ps5pcem.ini,
+Keep ps5pcem.exe, game-run.exe, pkgextractor.exe, dxcompiler.dll and dxil.dll together. The portable build stores ps5pcem.ini,
 savedata, logs and caches beside the application. Games, firmware and system files
 are not included. This prototype is incomplete and many titles will not work yet.
 "@

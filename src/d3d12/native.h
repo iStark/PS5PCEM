@@ -12,6 +12,7 @@ typedef struct Ps5D3D12Info {
     uint32_t vendor_id;
     uint32_t device_id;
     uint32_t debug_enabled;
+    uint32_t shader_model, wave_ops, wave_lane_min, wave_lane_max;
 } Ps5D3D12Info;
 
 typedef struct Ps5D3D12CacheStats {

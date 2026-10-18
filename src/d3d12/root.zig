@@ -74,6 +74,10 @@ pub const DeviceInfo = extern struct {
     vendor_id: u32,
     device_id: u32,
     debug_enabled: u32,
+    shader_model: u32,
+    wave_ops: u32,
+    wave_lane_min: u32,
+    wave_lane_max: u32,
 
     pub fn name(self: *const DeviceInfo) []const u8 {
         return std.mem.sliceTo(&self.adapter, 0);

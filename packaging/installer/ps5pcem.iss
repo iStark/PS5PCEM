@@ -57,6 +57,9 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 [Files]
 Source: "{#SourceDir}\ps5pcem.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceDir}\game-run.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#SourceDir}\dxcompiler.dll"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#SourceDir}\dxil.dll"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#SourceDir}\licenses\*"; DestDir: "{app}\licenses"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "{#SourceDir}\pkgextractor.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceDir}\README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceDir}\README-PORTABLE.txt"; DestDir: "{app}"; Flags: ignoreversion

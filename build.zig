@@ -83,8 +83,27 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const d3d12_runtime = b.step("install-d3d12-runtime", "Install the pinned DXC compiler, validator and licenses");
     if (target.result.os.tag == .windows) {
         const spirv_cross = b.dependency("spirv_cross", .{});
+        if (b.lazyDependency("dxc", .{})) |dxc| {
+            d3d12.addSystemIncludePath(dxc.path(""));
+            d3d12.addCSourceFile(.{ .file = b.path("src/d3d12/dxc.cpp"), .flags = &.{ "-std=c++17", "-fms-extensions", "-Wall", "-Wextra", "-Werror" } });
+            const arch = switch (target.result.cpu.arch) {
+                .x86_64 => "x64",
+                .aarch64 => "arm64",
+                .x86 => "x86",
+                else => @panic("DXC has no Windows runtime for this architecture"),
+            };
+            for ([_][]const u8{ "dxcompiler.dll", "dxil.dll" }) |dll| {
+                const install = b.addInstallBinFile(dxc.path(b.fmt("bin/{s}/{s}", .{ arch, dll })), dll);
+                d3d12_runtime.dependOn(&install.step);
+            }
+            for ([_][]const u8{ "LICENCE-MIT.txt", "LICENSE-LLVM.txt", "LICENSE-MS.txt" }) |license| {
+                const install = b.addInstallBinFile(dxc.path(license), b.fmt("licenses/dxc/{s}", .{license}));
+                d3d12_runtime.dependOn(&install.step);
+            }
+        }
         d3d12.link_libc = true;
         d3d12.link_libcpp = true;
         d3d12.addIncludePath(spirv_cross.path(""));
@@ -620,12 +639,16 @@ pub fn build(b: *std.Build) void {
         game_run.image_base = 0x0200_0000_0000;
     }
     const install_game_run = b.addInstallArtifact(game_run, .{});
+    install_game_run.step.dependOn(d3d12_runtime);
     b.getInstallStep().dependOn(&install_game_run.step);
 
     const build_game_run_step = b.step("build-game-run", "Build only the PS5 title runner");
     build_game_run_step.dependOn(&install_game_run.step);
 
-    const game_run_cmd = b.addRunArtifact(game_run);
+    const game_run_cmd = if (target.result.os.tag == .windows)
+        b.addSystemCommand(&.{b.getInstallPath(.bin, "game-run.exe")})
+    else
+        b.addRunArtifact(game_run);
     game_run_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| game_run_cmd.addArgs(args);
 
@@ -795,9 +818,14 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const install_d3d12_smoke = b.addInstallArtifact(d3d12_smoke, .{});
+    install_d3d12_smoke.step.dependOn(d3d12_runtime);
     d3d12_smoke.stack_size = 16 * 1024 * 1024;
     b.step("build-d3d12-smoke", "Build the native Direct3D 12 hardware probe").dependOn(&install_d3d12_smoke.step);
-    const run_d3d12_smoke = b.addRunArtifact(d3d12_smoke);
+    const run_d3d12_smoke = if (target.result.os.tag == .windows)
+        b.addSystemCommand(&.{b.getInstallPath(.bin, "d3d12-smoke.exe")})
+    else
+        b.addRunArtifact(d3d12_smoke);
+    run_d3d12_smoke.step.dependOn(&install_d3d12_smoke.step);
     if (b.args) |args| run_d3d12_smoke.addArgs(args);
     b.step("d3d12-smoke", "Verify native D3D12 shaders and GPU readback on Windows").dependOn(&run_d3d12_smoke.step);
 
@@ -810,8 +838,14 @@ pub fn build(b: *std.Build) void {
             .imports = &.{ .{ .name = "d3d12", .module = d3d12 }, .{ .name = "window", .module = window } },
         }),
     });
-    b.step("build-d3d12-window-smoke", "Build the native D3D12 presentation probe").dependOn(&b.addInstallArtifact(d3d12_window_smoke, .{}).step);
-    const run_d3d12_window = b.addRunArtifact(d3d12_window_smoke);
+    const install_d3d12_window = b.addInstallArtifact(d3d12_window_smoke, .{});
+    install_d3d12_window.step.dependOn(d3d12_runtime);
+    b.step("build-d3d12-window-smoke", "Build the native D3D12 presentation probe").dependOn(&install_d3d12_window.step);
+    const run_d3d12_window = if (target.result.os.tag == .windows)
+        b.addSystemCommand(&.{b.getInstallPath(.bin, "d3d12-window-smoke.exe")})
+    else
+        b.addRunArtifact(d3d12_window_smoke);
+    run_d3d12_window.step.dependOn(&install_d3d12_window.step);
     if (b.args) |args| run_d3d12_window.addArgs(args);
     b.step("d3d12-window-smoke", "Verify native D3D12 swapchain presentation").dependOn(&run_d3d12_window.step);
 

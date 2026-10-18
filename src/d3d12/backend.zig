@@ -204,6 +204,7 @@ pub const Renderer = struct {
             .program_address = bindings.program_address,
             .local_size = local,
             .wave32 = initiator & (1 << 15) != 0,
+            .scalarize_ballot_first = true,
             .compute_inputs = .{ .workgroup_id_sgprs = system.workgroup_id_sgprs, .threadgroup_size_sgpr = system.threadgroup_size_sgpr, .local_invocation_id_components = system.local_invocation_id_components },
             .scalar_registers = scalar[0..scalar_count],
             .storage_buffers = storage.mappings.items,
@@ -277,6 +278,7 @@ pub const Renderer = struct {
         var vertex = try vs.translateSpirv(self.allocator, .{
             .stage = .vertex,
             .wave32 = routing.vertex_wave32,
+            .scalarize_ballot_first = true,
             .program_address = vs_bindings.program_address,
             .vertex_index_vgpr = 5,
             .convert_negative_one_to_one_depth = !render.raster.zero_to_one_depth,
@@ -294,6 +296,7 @@ pub const Renderer = struct {
         var fragment = try ps.translateSpirv(self.allocator, .{
             .stage = .fragment,
             .wave32 = routing.fragment_wave32,
+            .scalarize_ballot_first = true,
             .program_address = ps_bindings.program_address,
             .fragment_extent = .{ target.width, target.height },
             .scalar_registers = ps_scalar[0..entryScalars(ps_bindings, &ps_scalar)],

@@ -30,6 +30,11 @@
             .url = "https://github.com/xiph/opus/archive/refs/tags/v1.5.2.tar.gz",
             .hash = "N-V-__8AAMEO5AA16T-SYUVA1ipB1ctBxSMowU_ZD3tzi54M",
         },
+        .dxc = .{
+            .url = "https://github.com/microsoft/DirectXShaderCompiler/releases/download/v1.9.2609/dxc_2026_09_29.zip",
+            .hash = "N-V-__8AACP-kgSZh1qulwC-DRK3yDN0CtQpknS5km4LpcqB",
+            .lazy = true,
+        },
     },
     .paths = .{
         "build.zig",

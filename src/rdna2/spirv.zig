@@ -417,6 +417,10 @@ pub const Options = struct {
     /// Guest wave32 mode limits VALU scalar masks and EXEC lane indexing to
     /// the low word, independently of the host workgroup size.
     wave32: bool = false,
+    /// HLSL has no direct BallotFindLSB lowering in SPIRV-Cross. Scan the four
+    /// ballot words with ordinary integer instructions while retaining the
+    /// actual subgroup ballot and guest EXEC predicate.
+    scalarize_ballot_first: bool = false,
     /// Pixel extent used to normalize FragCoord when the paired vertex PARAM
     /// interface is unavailable. The backend supplies the active color target.
     fragment_extent: [2]u32 = .{ 1280, 720 },
@@ -1118,6 +1122,7 @@ const Builder = struct {
     wave_exchange_phase: u32 = 0,
     wave32: bool = false,
     wave_word_pointer: u32 = 0,
+    scalarize_ballot_first: bool = false,
     /// The execution mask, as low and high halves, once a shader has narrowed
     /// it. Null means untouched — every lane on — which is how a wave starts
     /// and needs no test emitted for it.
@@ -1275,6 +1280,7 @@ const Builder = struct {
             .converged_workgroup_dispatch = (options.wave64_workgroup or options.wave32_workgroup) and
                 @as(u64, options.local_size[0]) * options.local_size[1] * options.local_size[2] > @as(u32, if (options.wave32) 32 else 64),
             .wave32 = options.wave32,
+            .scalarize_ballot_first = options.scalarize_ballot_first,
             .fragment_extent = options.fragment_extent,
             .fragment_inputs = options.fragment_inputs,
             .fragment_quad_broadcasts = options.fragment_quad_broadcasts,
@@ -8301,8 +8307,7 @@ const Builder = struct {
             try self.emit(&self.body, 339, &.{ ballot_type, ballot, scope, predicate }); // OpGroupNonUniformBallot
             active_count = self.id();
             try self.emit(&self.body, 342, &.{ self.bits_type, active_count, scope, 0, ballot }); // Reduce
-            first_lane = self.id();
-            try self.emit(&self.body, 343, &.{ self.bits_type, first_lane, scope, ballot }); // FindLSB
+            first_lane = try self.ballotFirstBit(scope, ballot);
         }
         const lane = if (self.wave64_workgroup) try self.currentLaneId() else try self.subgroupLocalInvocationId();
         const lane_is_first = self.id();
@@ -8395,8 +8400,7 @@ const Builder = struct {
             const ballot_type = try self.ensureVec4(.bits32);
             const ballot = self.id();
             try self.emit(&self.body, 339, &.{ ballot_type, ballot, scope, predicate }); // OpGroupNonUniformBallot
-            first_lane = self.id();
-            try self.emit(&self.body, 343, &.{ self.bits_type, first_lane, scope, ballot }); // FindLSB
+            first_lane = try self.ballotFirstBit(scope, ballot);
         }
         const lane = if (self.wave64_workgroup) try self.currentLaneId() else try self.subgroupLocalInvocationId();
         const lane_is_first = self.id();
@@ -9237,6 +9241,28 @@ const Builder = struct {
         return result;
     }
 
+    fn ballotFirstBit(self: *Builder, scope: u32, ballot: u32) Error!u32 {
+        if (!self.scalarize_ballot_first) {
+            const first = self.id();
+            try self.emit(&self.body, 343, &.{ self.bits_type, first, scope, ballot });
+            return first;
+        }
+        // Visit high words first so any nonzero lower word wins. An empty
+        // ballot returns UINT_MAX; callers guard it before a shuffle/election.
+        var first = try self.constant(.bits32, 0xffff_ffff);
+        var word_index: u32 = 4;
+        while (word_index != 0) {
+            word_index -= 1;
+            const word = self.id();
+            try self.emit(&self.body, 81, &.{ self.bits_type, word, ballot, word_index });
+            const bit = try self.addBits(try self.waveFirstBit(word), try self.constant(.bits32, word_index * 32));
+            const selected = self.id();
+            try self.emit(&self.body, 169, &.{ self.bits_type, selected, try self.isNonZero(word), bit, first });
+            first = selected;
+        }
+        return first;
+    }
+
     fn readFirstLane(self: *Builder, inst: instruction.Instruction) Error!void {
         const source_value = try self.source(inst.src0, .bits32);
         if (self.wave64_workgroup) {
@@ -9258,8 +9284,7 @@ const Builder = struct {
             try self.emit(&self.body, 339, &.{ ballot_type, ballot, scope, enabled });
             const count = self.id();
             try self.emit(&self.body, 342, &.{ self.bits_type, count, scope, 0, ballot });
-            const first = self.id();
-            try self.emit(&self.body, 343, &.{ self.bits_type, first, scope, ballot });
+            const first = try self.ballotFirstBit(scope, ballot);
             const nonempty = try self.isNonZero(count);
             const zero = try self.constant(.bits32, 0);
             const lane = self.id();

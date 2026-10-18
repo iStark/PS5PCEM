@@ -19,12 +19,14 @@
 #include <math.h>
 #include <spirv_cross_c.h>
 #include "native.h"
+#include "dxc.h"
 
 typedef HRESULT (WINAPI *CreateFactoryFn)(REFIID, void **);
 typedef HRESULT (WINAPI *CreateDeviceFn)(IUnknown *, D3D_FEATURE_LEVEL, REFIID, void **);
 typedef HRESULT (WINAPI *GetDebugFn)(REFIID, void **);
 typedef HRESULT (WINAPI *SerializeRootFn)(const D3D12_ROOT_SIGNATURE_DESC *, D3D_ROOT_SIGNATURE_VERSION, ID3DBlob **, ID3DBlob **);
 typedef HRESULT (WINAPI *CompileFn)(LPCVOID, SIZE_T, LPCSTR, const D3D_SHADER_MACRO *, ID3DInclude *, LPCSTR, LPCSTR, UINT, UINT, ID3DBlob **, ID3DBlob **);
+typedef HRESULT (WINAPI *CreateBlobFn)(SIZE_T, ID3DBlob **);
 
 enum { BACK_BUFFERS = 3, OFFSCREEN_RTV = 3 };
 enum { SHADER_CACHE_CAPACITY = 256, PIPELINE_CACHE_CAPACITY = 512, SHADER_CACHE_BYTES = 32 * 1024 * 1024 };
@@ -51,6 +53,9 @@ struct Ps5D3D12 {
     HMODULE dxgi_lib, d3d12_lib, compiler_lib;
     SerializeRootFn serialize;
     CompileFn compile;
+    CreateBlobFn create_blob;
+    Ps5Dxc *dxc;
+    uint32_t shader_model, wave_ops;
     IDXGIFactory4 *factory;
     ID3D12Device *device;
     ID3D12CommandQueue *queue;
@@ -276,6 +281,18 @@ int32_t ps5_d3d12_create(Ps5D3D12 **out, Ps5D3D12Info *info, int debug, char *er
     info->dedicated_bytes = largest;
     info->vendor_id = selected_desc.VendorId;
     info->device_id = selected_desc.DeviceId;
+    // Request only the model used by this backend, including on older runtimes
+    // which reject queries for shader models they do not recognize.
+    D3D12_FEATURE_DATA_SHADER_MODEL model = { D3D_SHADER_MODEL_6_0 };
+    c->shader_model = SUCCEEDED(ID3D12Device_CheckFeatureSupport(c->device, D3D12_FEATURE_SHADER_MODEL, &model, sizeof(model))) ? model.HighestShaderModel : D3D_SHADER_MODEL_5_1;
+    D3D12_FEATURE_DATA_D3D12_OPTIONS1 wave = {0};
+    if (SUCCEEDED(ID3D12Device_CheckFeatureSupport(c->device, D3D12_FEATURE_D3D12_OPTIONS1, &wave, sizeof(wave)))) {
+        c->wave_ops = wave.WaveOps;
+        info->wave_lane_min = wave.WaveLaneCountMin;
+        info->wave_lane_max = wave.WaveLaneCountMax;
+    }
+    info->shader_model = c->shader_model;
+    info->wave_ops = c->wave_ops;
     if (debug) TRY(ID3D12Device_QueryInterface(c->device, &IID_ID3D12InfoQueue, (void **)&c->messages));
     D3D12_COMMAND_QUEUE_DESC queue = {0};
     queue.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
@@ -335,6 +352,7 @@ void ps5_d3d12_destroy(Ps5D3D12 *c) {
     release(c->device);
     release(c->factory);
     if (c->event) CloseHandle(c->event);
+    ps5_dxc_destroy(c->dxc);
     if (c->compiler_lib) FreeLibrary(c->compiler_lib);
     if (c->d3d12_lib) FreeLibrary(c->d3d12_lib);
     if (c->dxgi_lib) FreeLibrary(c->dxgi_lib);
@@ -367,17 +385,41 @@ done:
     return hr;
 }
 
-static HRESULT compile(Ps5D3D12 *c, const char *source, const char *entry, const char *profile, ID3DBlob **blob) {
+static HRESULT load_compiler(Ps5D3D12 *c) {
     if (!c->compiler_lib) {
         c->compiler_lib = LoadLibraryExW(L"d3dcompiler_47.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
         if (!c->compiler_lib) return failure(c, HRESULT_FROM_WIN32(GetLastError()), "D3DCompiler_47");
         c->compile = (CompileFn)GetProcAddress(c->compiler_lib, "D3DCompile");
+        c->create_blob = (CreateBlobFn)GetProcAddress(c->compiler_lib, "D3DCreateBlob");
     }
     if (!c->compile) return failure(c, E_NOINTERFACE, "D3DCompile");
+    if (!c->create_blob) return failure(c, E_NOINTERFACE, "D3DCreateBlob");
+    return S_OK;
+}
+static HRESULT compile(Ps5D3D12 *c, const char *source, const char *entry, const char *profile, ID3DBlob **blob) {
+    HRESULT hr = load_compiler(c);
+    if (FAILED(hr)) return hr;
     ID3DBlob *errors = NULL;
-    HRESULT hr = c->compile(source, strlen(source), "PS5PCEM native D3D12", NULL, NULL, entry, profile, D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, blob, &errors);
+    hr = c->compile(source, strlen(source), "PS5PCEM native D3D12", NULL, NULL, entry, profile, D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, blob, &errors);
     if (FAILED(hr)) snprintf(c->error, sizeof(c->error), "HLSL %s/%s: %.*s", entry, profile, errors ? (int)ID3D10Blob_GetBufferSize(errors) : 0, errors ? (char *)ID3D10Blob_GetBufferPointer(errors) : "");
     release(errors);
+    return hr;
+}
+static HRESULT compile_dxil(Ps5D3D12 *c, const char *source, const char *profile, ID3DBlob **blob) {
+    HRESULT hr = load_compiler(c);
+    if (FAILED(hr)) return hr;
+    if (!c->dxc) {
+        hr = ps5_dxc_create(&c->dxc, c->error, sizeof(c->error));
+        if (FAILED(hr)) return hr;
+    }
+    Ps5DxcCode result = {0};
+    hr = ps5_dxc_compile(c->dxc, source, profile, &result, c->error, sizeof(c->error));
+    if (SUCCEEDED(hr)) {
+        hr = c->create_blob(result.size, blob);
+        if (SUCCEEDED(hr)) memcpy(ID3D10Blob_GetBufferPointer(*blob), result.bytes, result.size);
+        else failure(c, hr, "create DXIL cache blob");
+    }
+    ps5_dxc_release(&result);
     return hr;
 }
 static HRESULT root_signature(Ps5D3D12 *c, int compute, ID3D12RootSignature **out) {
@@ -411,13 +453,26 @@ static HRESULT compile_spirv_uncached(Ps5D3D12 *c, const uint32_t *words, size_t
     spvc_set active = NULL;
     HRESULT hr = E_FAIL;
     const char *source = NULL;
+    int needs_wave = 0;
     if (spvc_context_create(&context) != SPVC_SUCCESS) return E_OUTOFMEMORY;
 #define CROSS(expr) do { if ((expr) != SPVC_SUCCESS) { snprintf(c->error, sizeof(c->error), "SPIRV-Cross %s: %s", #expr, spvc_context_get_last_error_string(context)); goto done; } } while (0)
     CROSS(spvc_context_parse_spirv(context, words, word_count, &ir));
     CROSS(spvc_context_create_compiler(context, SPVC_BACKEND_HLSL, ir, SPVC_CAPTURE_MODE_TAKE_OWNERSHIP, &compiler));
+    // Capabilities, not compiler error strings, select the bytecode format.
+    // The complete SPIR-V remains the cache key, so DXIL and DXBC cannot alias.
+    const SpvCapability *capabilities = NULL;
+    size_t capability_count = 0;
+    CROSS(spvc_compiler_get_declared_capabilities(compiler, &capabilities, &capability_count));
+    for (size_t i = 0; i < capability_count; ++i) {
+        if (capabilities[i] >= SpvCapabilityGroupNonUniform && capabilities[i] <= SpvCapabilityGroupNonUniformQuad) needs_wave = 1;
+    }
+    if (needs_wave && (c->shader_model < D3D_SHADER_MODEL_6_0 || !c->wave_ops)) {
+        hr = failure(c, DXGI_ERROR_UNSUPPORTED, "shader requires Shader Model 6.0 and hardware WaveOps");
+        goto done;
+    }
     CROSS(spvc_compiler_set_entry_point(compiler, "main", stage));
     CROSS(spvc_compiler_create_compiler_options(compiler, &options));
-    CROSS(spvc_compiler_options_set_uint(options, SPVC_COMPILER_OPTION_HLSL_SHADER_MODEL, 51));
+    CROSS(spvc_compiler_options_set_uint(options, SPVC_COMPILER_OPTION_HLSL_SHADER_MODEL, needs_wave ? 60 : 51));
     CROSS(spvc_compiler_options_set_bool(options, SPVC_COMPILER_OPTION_HLSL_FORCE_STORAGE_BUFFER_AS_UAV, stage == SpvExecutionModelGLCompute));
     if (stage == SpvExecutionModelVertex)
         CROSS(spvc_compiler_options_set_bool(options, SPVC_COMPILER_OPTION_HLSL_SUPPORT_NONZERO_BASE_VERTEX_BASE_INSTANCE, SPVC_TRUE));
@@ -465,7 +520,10 @@ static HRESULT compile_spirv_uncached(Ps5D3D12 *c, const uint32_t *words, size_t
         CROSS(spvc_compiler_hlsl_add_resource_binding(compiler, &remap));
     }
     CROSS(spvc_compiler_compile(compiler, &source));
-    hr = compile(c, source, "main", stage == SpvExecutionModelGLCompute ? "cs_5_1" : stage == SpvExecutionModelVertex ? "vs_5_1" : "ps_5_1", code);
+    if (needs_wave)
+        hr = compile_dxil(c, source, stage == SpvExecutionModelGLCompute ? "cs_6_0" : stage == SpvExecutionModelVertex ? "vs_6_0" : "ps_6_0", code);
+    else
+        hr = compile(c, source, "main", stage == SpvExecutionModelGLCompute ? "cs_5_1" : stage == SpvExecutionModelVertex ? "vs_5_1" : "ps_5_1", code);
 done:
     spvc_context_destroy(context);
     return hr;
