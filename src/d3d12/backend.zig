@@ -36,6 +36,8 @@ pub const Renderer = struct {
     fps_update: ?*const fn (?*anyopaque, u32) void = null,
     frames: u32 = 0,
     frame_started_ns: u64 = 0,
+    cache_report_ns: u64 = 0,
+    presented_frames: u64 = 0,
 
     pub fn init(allocator: std.mem.Allocator, memory: Memory, debug: bool) !Renderer {
         return .{ .allocator = allocator, .memory = memory, .device = try native.Device.init(debug) };
@@ -228,13 +230,13 @@ pub const Renderer = struct {
         const target_layout = try surfaces.colorLayout(target);
         if (render.color_control.isMetadataOperation() or (state.readRegister(.context, 0x202) != null and !render.color_control.allowsAttachmentWrites(render.target_mask)) or render.color_control.logic_operation != 0xcc) return error.ColorMetadataAndLogicOpsNotImplemented;
         if (render.raster.rasterizer_discard or render.raster.polygon_mode != 0 or render.raster.depth_bias_front or render.raster.depth_bias_back or (render.raster.cull_front and render.raster.cull_back)) return error.UnsupportedRasterState;
-        if (render.primitive_type != 4 and render.primitive_type != 5) return error.UnsupportedPrimitive;
+        const topology = try graphics.nativeTopology(render.primitive_type);
         var draw_state = try native.Draw.fullTarget(target.width, target.height);
         draw_state.blend = try native.blending.decode(state, render.blends[0]);
         draw_state.vertex_count = if (args.index_bytes == 0) args.count else 0;
         draw_state.instance_count = state.instance_count;
         draw_state.first_vertex = state.readRegister(.uconfig, 0x24a) orelse 0;
-        draw_state.topology = render.primitive_type;
+        draw_state.topology = topology;
         const indices = try args.stage(self.allocator, self.memory, state, &draw_state);
         defer self.allocator.free(indices);
         draw_state.cull_mode = if (render.raster.cull_front) 2 else if (render.raster.cull_back) 3 else 1;
@@ -341,6 +343,16 @@ pub const Renderer = struct {
             display.width, display.height, display.pixel_format, display.tiling_mode,
         });
         const now = gpu.frame_timing.timestampNs();
+        self.presented_frames +|= 1;
+        if (self.cache_report_ns == 0 or now -| self.cache_report_ns >= 5 * std.time.ns_per_s) {
+            const cache = self.device.cacheStats();
+            std.debug.print("[d3d12 cache] flip={d} enabled={d} shader={d}/{d} pso={d}/{d} entries={d}/{d} evictions={d}/{d} shader_kib={d} compile_ms={d} pso_ms={d}\n", .{
+                self.presented_frames, cache.enabled,          cache.shader_hits,      cache.shader_misses,      cache.pipeline_hits,       cache.pipeline_misses,
+                cache.shader_entries,  cache.pipeline_entries, cache.shader_evictions, cache.pipeline_evictions, cache.shader_bytes / 1024, cache.compile_ms,
+                cache.pipeline_ms,
+            });
+            self.cache_report_ns = now;
+        }
         if (self.frame_started_ns == 0) self.frame_started_ns = now;
         self.frames +|= 1;
         const elapsed = now -| self.frame_started_ns;

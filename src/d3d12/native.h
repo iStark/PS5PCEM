@@ -14,6 +14,13 @@ typedef struct Ps5D3D12Info {
     uint32_t debug_enabled;
 } Ps5D3D12Info;
 
+typedef struct Ps5D3D12CacheStats {
+    uint64_t enabled, shader_hits, shader_misses, shader_evictions;
+    uint64_t pipeline_hits, pipeline_misses, pipeline_evictions;
+    uint64_t shader_entries, pipeline_entries, shader_bytes;
+    uint64_t compile_ms, pipeline_ms;
+} Ps5D3D12CacheStats;
+
 typedef struct Ps5D3D12Buffer {
     uint8_t *bytes;
     size_t size;
@@ -53,6 +60,11 @@ int32_t ps5_d3d12_render(Ps5D3D12 *context, uint8_t *rgba, uint32_t width, uint3
 int32_t ps5_d3d12_attach_window(Ps5D3D12 *context, void *hwnd, uint32_t width, uint32_t height);
 int32_t ps5_d3d12_present(Ps5D3D12 *context, const float rgba[4]);
 uint64_t ps5_d3d12_validation_errors(Ps5D3D12 *context);
+void ps5_d3d12_cache_stats(Ps5D3D12 *context, Ps5D3D12CacheStats *stats);
+/* Clears cached objects after completion; limits are bounded by the built-in
+ * budgets. Zero entries disables caching (also PS5_D3D12_CACHE=0 at creation).
+ * Used by the hardware probe to exercise eviction and uncached equivalence. */
+int32_t ps5_d3d12_cache_limits(Ps5D3D12 *context, uint32_t shaders, uint32_t pipelines);
 int32_t ps5_d3d12_dispatch_spirv(Ps5D3D12 *context, const uint32_t *words, size_t word_count,
     const Ps5D3D12Buffer *buffers, uint32_t buffer_count, const uint32_t groups[3]);
 int32_t ps5_d3d12_draw_spirv(Ps5D3D12 *context, const uint32_t *vs, size_t vs_count,

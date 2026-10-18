@@ -18,6 +18,23 @@ pub const Interface = struct {
     locations: [32]u8 = undefined,
 };
 
+/// Guest DI_PT values are not D3D_PRIMITIVE_TOPOLOGY values. In particular,
+/// guest 5 is a fan and guest 6 is a strip; D3D12 uses 5 for a strip.
+pub fn nativeTopology(guest: u32) !u32 {
+    return switch (guest) {
+        4 => 4, // DI_PT_TRILIST -> D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST
+        6 => 5, // DI_PT_TRISTRIP -> D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP
+        else => error.UnsupportedPrimitive,
+    };
+}
+
+test "guest primitive numbers map explicitly and fans never masquerade as strips" {
+    try std.testing.expectEqual(@as(u32, 4), try nativeTopology(4));
+    try std.testing.expectEqual(@as(u32, 5), try nativeTopology(6));
+    try std.testing.expectError(error.UnsupportedPrimitive, nativeTopology(5));
+    try std.testing.expectError(error.UnsupportedPrimitive, nativeTopology(7));
+}
+
 /// With depth/stencil already disabled by the draw boundary, viewport depth
 /// only remains observable through the pixel shader's position-Z input.
 /// Replacing an unobserved depth mapping preserves clipping (performed before

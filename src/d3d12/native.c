@@ -27,6 +27,25 @@ typedef HRESULT (WINAPI *SerializeRootFn)(const D3D12_ROOT_SIGNATURE_DESC *, D3D
 typedef HRESULT (WINAPI *CompileFn)(LPCVOID, SIZE_T, LPCSTR, const D3D_SHADER_MACRO *, ID3DInclude *, LPCSTR, LPCSTR, UINT, UINT, ID3DBlob **, ID3DBlob **);
 
 enum { BACK_BUFFERS = 3, OFFSCREEN_RTV = 3 };
+enum { SHADER_CACHE_CAPACITY = 256, PIPELINE_CACHE_CAPACITY = 512, SHADER_CACHE_BYTES = 32 * 1024 * 1024 };
+typedef struct ShaderEntry {
+    uint32_t *words;
+    size_t word_count, bytes;
+    uint64_t hash, id, used;
+    SpvExecutionModel stage;
+    uint32_t buffers, images;
+    ID3DBlob *code;
+} ShaderEntry;
+/* Fixed-size words, not a native descriptor with pointers/padding. All other
+ * PSO state is fixed by graphics_desc; dynamic constants/resources are rebound
+ * on every draw and are deliberately absent from this key. */
+typedef struct PipelineKey { uint64_t words[16]; } PipelineKey;
+typedef struct PipelineEntry {
+    PipelineKey key;
+    uint64_t used;
+    ID3D12RootSignature *root;
+    ID3D12PipelineState *pipeline;
+} PipelineEntry;
 typedef struct RetiredObject { void *object; struct RetiredObject *next; } RetiredObject;
 struct Ps5D3D12 {
     HMODULE dxgi_lib, d3d12_lib, compiler_lib;
@@ -51,6 +70,11 @@ struct Ps5D3D12 {
     ID3D12Resource *back_buffers[BACK_BUFFERS];
     UINT width, height;
     HWND hwnd;
+    ShaderEntry shader_cache[SHADER_CACHE_CAPACITY];
+    PipelineEntry pipeline_cache[PIPELINE_CACHE_CAPACITY];
+    uint32_t shader_limit, pipeline_limit;
+    uint64_t cache_clock, next_shader_id;
+    Ps5D3D12CacheStats cache_stats;
     char error[1024];
 };
 
@@ -84,6 +108,64 @@ static void retire(Ps5D3D12 *c, void *object) {
      * in use by a timed-out GPU is never an acceptable recovery strategy. */
     if (!node) return;
     node->object = object; node->next = c->retired; c->retired = node;
+}
+static void evict_shader(Ps5D3D12 *c, ShaderEntry *entry) {
+    if (!entry->code) return;
+    c->cache_stats.shader_bytes -= entry->bytes;
+    --c->cache_stats.shader_entries;
+    ++c->cache_stats.shader_evictions;
+    release(entry->code);
+    free(entry->words);
+    memset(entry, 0, sizeof(*entry));
+}
+static void evict_pipeline(Ps5D3D12 *c, PipelineEntry *entry) {
+    if (!entry->pipeline) return;
+    --c->cache_stats.pipeline_entries;
+    ++c->cache_stats.pipeline_evictions;
+    retire(c, entry->pipeline);
+    retire(c, entry->root);
+    memset(entry, 0, sizeof(*entry));
+}
+void ps5_d3d12_cache_stats(Ps5D3D12 *c, Ps5D3D12CacheStats *stats) {
+    if (c && stats) *stats = c->cache_stats;
+}
+int32_t ps5_d3d12_cache_limits(Ps5D3D12 *c, uint32_t shaders, uint32_t pipelines) {
+    if (!c || shaders > SHADER_CACHE_CAPACITY || pipelines > PIPELINE_CACHE_CAPACITY) return E_INVALIDARG;
+    HRESULT hr = wait_idle(c);
+    if (FAILED(hr)) return hr;
+    for (UINT i = 0; i < PIPELINE_CACHE_CAPACITY; ++i) evict_pipeline(c, &c->pipeline_cache[i]);
+    for (UINT i = 0; i < SHADER_CACHE_CAPACITY; ++i) evict_shader(c, &c->shader_cache[i]);
+    c->shader_limit = shaders;
+    c->pipeline_limit = pipelines;
+    c->cache_stats.enabled = shaders != 0 || pipelines != 0;
+    return S_OK;
+}
+static int cached_pipeline(Ps5D3D12 *c, const PipelineKey *key, ID3D12RootSignature **root, ID3D12PipelineState **pipeline) {
+    for (UINT i = 0; i < c->pipeline_limit; ++i) {
+        PipelineEntry *entry = &c->pipeline_cache[i];
+        if (!entry->pipeline || memcmp(&entry->key, key, sizeof(*key))) continue;
+        entry->used = ++c->cache_clock;
+        ++c->cache_stats.pipeline_hits;
+        *root = entry->root; *pipeline = entry->pipeline;
+        IUnknown_AddRef((IUnknown *)*root); IUnknown_AddRef((IUnknown *)*pipeline);
+        return 1;
+    }
+    ++c->cache_stats.pipeline_misses;
+    return 0;
+}
+static void remember_pipeline(Ps5D3D12 *c, const PipelineKey *key, ID3D12RootSignature *root, ID3D12PipelineState *pipeline) {
+    if (!c->pipeline_limit) return;
+    PipelineEntry *victim = &c->pipeline_cache[0];
+    for (UINT i = 0; i < c->pipeline_limit; ++i) {
+        PipelineEntry *entry = &c->pipeline_cache[i];
+        if (!entry->pipeline) { victim = entry; break; }
+        if (entry->used < victim->used) victim = entry;
+    }
+    evict_pipeline(c, victim);
+    victim->key = *key; victim->root = root; victim->pipeline = pipeline;
+    victim->used = ++c->cache_clock;
+    IUnknown_AddRef((IUnknown *)root); IUnknown_AddRef((IUnknown *)pipeline);
+    ++c->cache_stats.pipeline_entries;
 }
 static HRESULT begin(Ps5D3D12 *c) {
     if (c->poisoned) return failure(c, E_FAIL, "submission after an incomplete GPU operation");
@@ -145,6 +227,13 @@ int32_t ps5_d3d12_create(Ps5D3D12 **out, Ps5D3D12Info *info, int debug, char *er
     error[0] = 0;
     Ps5D3D12 *c = calloc(1, sizeof(*c));
     if (!c) return E_OUTOFMEMORY;
+    char cache_option[8] = {0};
+    const DWORD option_length = GetEnvironmentVariableA("PS5_D3D12_CACHE", cache_option, sizeof(cache_option));
+    if (option_length != 1 || cache_option[0] != '0') {
+        c->shader_limit = SHADER_CACHE_CAPACITY;
+        c->pipeline_limit = PIPELINE_CACHE_CAPACITY;
+        c->cache_stats.enabled = 1;
+    }
     HRESULT hr = S_OK;
     IDXGIAdapter1 *selected = NULL;
     ID3D12Debug *debugger = NULL;
@@ -227,6 +316,8 @@ void ps5_d3d12_destroy(Ps5D3D12 *c) {
         c->retired = node->next;
         release(node->object); free(node);
     }
+    for (UINT i = 0; i < PIPELINE_CACHE_CAPACITY; ++i) evict_pipeline(c, &c->pipeline_cache[i]);
+    for (UINT i = 0; i < SHADER_CACHE_CAPACITY; ++i) evict_shader(c, &c->shader_cache[i]);
     for (UINT i = 0; i < BACK_BUFFERS; ++i) release(c->back_buffers[i]);
     release(c->swapchain);
     release(c->present_pipeline);
@@ -310,7 +401,7 @@ static HRESULT root_signature(Ps5D3D12 *c, int compute, ID3D12RootSignature **ou
 /* SPIR-V is the shared shader IR, not a host graphics API here. SPIRV-Cross
  * emits HLSL, which the Windows compiler turns into native D3D bytecode.
  * Reflection rejects resources not yet bound by this backend. */
-static HRESULT compile_spirv(Ps5D3D12 *c, const uint32_t *words, size_t word_count,
+static HRESULT compile_spirv_uncached(Ps5D3D12 *c, const uint32_t *words, size_t word_count,
     SpvExecutionModel stage, uint32_t buffer_count, uint32_t image_count, ID3DBlob **code) {
     spvc_context context = NULL;
     spvc_parsed_ir ir = NULL;
@@ -381,6 +472,55 @@ done:
 #undef CROSS
 }
 
+static HRESULT compile_spirv(Ps5D3D12 *c, const uint32_t *words, size_t word_count,
+    SpvExecutionModel stage, uint32_t buffer_count, uint32_t image_count, ID3DBlob **code, uint64_t *id) {
+    if (word_count > SIZE_MAX / sizeof(*words)) return E_INVALIDARG;
+    const size_t word_bytes = word_count * sizeof(*words);
+    uint64_t hash = UINT64_C(14695981039346656037);
+    for (size_t i = 0; i < word_count; ++i) { hash ^= words[i]; hash *= UINT64_C(1099511628211); }
+    for (UINT i = 0; i < c->shader_limit; ++i) {
+        ShaderEntry *entry = &c->shader_cache[i];
+        if (!entry->code || entry->hash != hash || entry->word_count != word_count || entry->stage != stage ||
+            entry->buffers != buffer_count || entry->images != image_count || memcmp(entry->words, words, word_bytes)) continue;
+        ++c->cache_stats.shader_hits;
+        entry->used = ++c->cache_clock;
+        *code = entry->code; *id = entry->id;
+        IUnknown_AddRef((IUnknown *)*code);
+        return S_OK;
+    }
+    ++c->cache_stats.shader_misses;
+    const ULONGLONG started = GetTickCount64();
+    HRESULT hr = compile_spirv_uncached(c, words, word_count, stage, buffer_count, image_count, code);
+    c->cache_stats.compile_ms += GetTickCount64() - started;
+    if (FAILED(hr)) return hr; // Failed validation/compilation is never cached.
+    *id = ++c->next_shader_id; // Never reuse an ID when an LRU slot is replaced.
+    const size_t code_bytes = ID3D10Blob_GetBufferSize(*code);
+    if (!c->shader_limit || word_bytes > SHADER_CACHE_BYTES || code_bytes > SHADER_CACHE_BYTES - word_bytes) return S_OK;
+    uint32_t *copy = malloc(word_bytes);
+    if (!copy) return S_OK; // Caching is optional; retain the valid compiled result.
+    memcpy(copy, words, word_bytes);
+    const size_t bytes = word_bytes + code_bytes;
+    ShaderEntry *victim;
+    do {
+        victim = &c->shader_cache[0];
+        for (UINT i = 0; i < c->shader_limit; ++i) {
+            ShaderEntry *entry = &c->shader_cache[i];
+            if (!entry->code) {
+                if (c->cache_stats.shader_bytes + bytes <= SHADER_CACHE_BYTES) { victim = entry; break; }
+                continue;
+            }
+            if (!victim->code || entry->used < victim->used) victim = entry;
+        }
+        evict_shader(c, victim);
+    } while (c->cache_stats.shader_bytes + bytes > SHADER_CACHE_BYTES);
+    *victim = (ShaderEntry){.words = copy, .word_count = word_count, .bytes = bytes, .hash = hash, .id = *id,
+        .used = ++c->cache_clock, .stage = stage, .buffers = buffer_count, .images = image_count, .code = *code};
+    IUnknown_AddRef((IUnknown *)*code);
+    ++c->cache_stats.shader_entries;
+    c->cache_stats.shader_bytes += bytes;
+    return S_OK;
+}
+
 static HRESULT storage_root(Ps5D3D12 *c, uint32_t count, ID3D12RootSignature **root) {
     D3D12_DESCRIPTOR_RANGE range = {0};
     range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
@@ -441,13 +581,20 @@ int32_t ps5_d3d12_dispatch_spirv(Ps5D3D12 *c, const uint32_t *words, size_t word
     ID3D12PipelineState *pipeline = NULL;
     ID3D12DescriptorHeap *heap = NULL;
     ID3D12Resource *gpu[64] = {0}, *upload[64] = {0}, *readback[64] = {0};
-    TRY(compile_spirv(c, words, word_count, SpvExecutionModelGLCompute, count, 0, &code));
-    TRY(storage_root(c, count, &root));
-    D3D12_COMPUTE_PIPELINE_STATE_DESC desc = {0};
-    desc.pRootSignature = root;
-    desc.CS.pShaderBytecode = ID3D10Blob_GetBufferPointer(code);
-    desc.CS.BytecodeLength = ID3D10Blob_GetBufferSize(code);
-    TRY(ID3D12Device_CreateComputePipelineState(c->device, &desc, &IID_ID3D12PipelineState, (void **)&pipeline));
+    uint64_t shader_id;
+    TRY(compile_spirv(c, words, word_count, SpvExecutionModelGLCompute, count, 0, &code, &shader_id));
+    const PipelineKey key = {{1, shader_id, 0, count}};
+    if (!cached_pipeline(c, &key, &root, &pipeline)) {
+        const ULONGLONG started = GetTickCount64();
+        TRY(storage_root(c, count, &root));
+        D3D12_COMPUTE_PIPELINE_STATE_DESC desc = {0};
+        desc.pRootSignature = root;
+        desc.CS.pShaderBytecode = ID3D10Blob_GetBufferPointer(code);
+        desc.CS.BytecodeLength = ID3D10Blob_GetBufferSize(code);
+        TRY(ID3D12Device_CreateComputePipelineState(c->device, &desc, &IID_ID3D12PipelineState, (void **)&pipeline));
+        c->cache_stats.pipeline_ms += GetTickCount64() - started;
+        remember_pipeline(c, &key, root, pipeline);
+    }
     if (count) {
         D3D12_DESCRIPTOR_HEAP_DESC descriptors = {0};
         descriptors.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
@@ -825,6 +972,8 @@ static int valid_blend_factor(uint32_t factor, int alpha) {
 static int valid_sampled_image(const Ps5D3D12Image *image) {
     if (!image->pixels || !image->width || !image->height || image->width > 16384 || image->height > 16384 || image->srgb > 1) return 0;
     if (image->format == DXGI_FORMAT_R8G8B8A8_UNORM) return (uint64_t)image->width * image->height * 4 == image->size;
+    if (image->format == DXGI_FORMAT_R8_UNORM || image->format == DXGI_FORMAT_R8G8_UNORM)
+        return !image->srgb && (uint64_t)image->width * image->height * (image->format == DXGI_FORMAT_R8_UNORM ? 1 : 2) == image->size;
     if (image->width % 4 || image->height % 4) return 0;
     UINT block_bytes;
     switch (image->format) {
@@ -866,24 +1015,34 @@ int32_t ps5_d3d12_draw_spirv(Ps5D3D12 *c, const uint32_t *vertex, size_t vertex_
     ID3D12RootSignature *root = NULL;
     ID3D12PipelineState *pipeline = NULL;
     ID3D12Resource *color = NULL, *upload = NULL, *readback = NULL, *index_upload = NULL;
-    TRY(compile_spirv(c, vertex, vertex_count, SpvExecutionModelVertex, buffer_count, image_count, &vs));
-    TRY(compile_spirv(c, fragment, fragment_count, SpvExecutionModelFragment, buffer_count, image_count, &ps));
-    TRY(guest_graphics_root(c, buffer_count, image_count, &root));
-    TRY(prepare_graphics_resources(c, &resources, buffers, buffer_count, images, image_count));
-    D3D12_GRAPHICS_PIPELINE_STATE_DESC pipeline_desc = graphics_desc(root, vs, ps, 0);
-    pipeline_desc.RasterizerState.CullMode = d->cull_mode;
-    pipeline_desc.RasterizerState.FrontCounterClockwise = d->front_ccw != 0;
-    pipeline_desc.BlendState.RenderTarget[0].RenderTargetWriteMask = (UINT8)d->write_mask;
-    pipeline_desc.BlendState.RenderTarget[0].BlendEnable = blend->enabled != 0;
-    pipeline_desc.BlendState.RenderTarget[0].SrcBlend = blend->source_color;
-    pipeline_desc.BlendState.RenderTarget[0].DestBlend = blend->destination_color;
-    pipeline_desc.BlendState.RenderTarget[0].BlendOp = blend->color_operation;
-    pipeline_desc.BlendState.RenderTarget[0].SrcBlendAlpha = blend->source_alpha;
-    pipeline_desc.BlendState.RenderTarget[0].DestBlendAlpha = blend->destination_alpha;
-    pipeline_desc.BlendState.RenderTarget[0].BlendOpAlpha = blend->alpha_operation;
-    pipeline_desc.IBStripCutValue = !d->primitive_restart ? D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED :
+    uint64_t vs_id, ps_id;
+    TRY(compile_spirv(c, vertex, vertex_count, SpvExecutionModelVertex, buffer_count, image_count, &vs, &vs_id));
+    TRY(compile_spirv(c, fragment, fragment_count, SpvExecutionModelFragment, buffer_count, image_count, &ps, &ps_id));
+    const D3D12_INDEX_BUFFER_STRIP_CUT_VALUE strip_cut = !d->primitive_restart ? D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED :
         d->index_element_bytes == 2 ? D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFF : D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFFFFFF;
-    TRY(ID3D12Device_CreateGraphicsPipelineState(c->device, &pipeline_desc, &IID_ID3D12PipelineState, (void **)&pipeline));
+    const PipelineKey key = {{2, vs_id, ps_id, buffer_count, image_count, d->cull_mode, d->front_ccw != 0,
+        d->write_mask, blend->enabled, blend->source_color, blend->destination_color, blend->color_operation,
+        blend->source_alpha, blend->destination_alpha, blend->alpha_operation, strip_cut}};
+    if (!cached_pipeline(c, &key, &root, &pipeline)) {
+        const ULONGLONG started = GetTickCount64();
+        TRY(guest_graphics_root(c, buffer_count, image_count, &root));
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC pipeline_desc = graphics_desc(root, vs, ps, 0);
+        pipeline_desc.RasterizerState.CullMode = d->cull_mode;
+        pipeline_desc.RasterizerState.FrontCounterClockwise = d->front_ccw != 0;
+        pipeline_desc.BlendState.RenderTarget[0].RenderTargetWriteMask = (UINT8)d->write_mask;
+        pipeline_desc.BlendState.RenderTarget[0].BlendEnable = blend->enabled != 0;
+        pipeline_desc.BlendState.RenderTarget[0].SrcBlend = blend->source_color;
+        pipeline_desc.BlendState.RenderTarget[0].DestBlend = blend->destination_color;
+        pipeline_desc.BlendState.RenderTarget[0].BlendOp = blend->color_operation;
+        pipeline_desc.BlendState.RenderTarget[0].SrcBlendAlpha = blend->source_alpha;
+        pipeline_desc.BlendState.RenderTarget[0].DestBlendAlpha = blend->destination_alpha;
+        pipeline_desc.BlendState.RenderTarget[0].BlendOpAlpha = blend->alpha_operation;
+        pipeline_desc.IBStripCutValue = strip_cut;
+        TRY(ID3D12Device_CreateGraphicsPipelineState(c->device, &pipeline_desc, &IID_ID3D12PipelineState, (void **)&pipeline));
+        c->cache_stats.pipeline_ms += GetTickCount64() - started;
+        remember_pipeline(c, &key, root, pipeline);
+    }
+    TRY(prepare_graphics_resources(c, &resources, buffers, buffer_count, images, image_count));
     D3D12_HEAP_PROPERTIES heap = {0}; heap.Type = D3D12_HEAP_TYPE_DEFAULT;
     D3D12_RESOURCE_DESC desc = {0};
     desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;

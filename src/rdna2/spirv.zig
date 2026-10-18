@@ -129,6 +129,10 @@ pub const SampledImageBinding = struct {
     comparison: bool = false,
     minimum_lod: f32 = 0,
     maximum_lod: f32 = 16,
+    /// Hosts without unnormalized samplers can normalize pixel coordinates
+    /// for ordinary fragment IMAGE_SAMPLE on a single-level 2D view. The
+    /// backend binds a matching clamp sampler and the shader samples LOD 0.
+    texel_coordinates_extent: ?[2]u32 = null,
     /// Exact native texel format for the measured multi-texel load subset.
     multi_texel_format: ?StorageImageFormat = null,
 };
@@ -7257,6 +7261,12 @@ const Builder = struct {
             return Error.InvalidStorageBinding;
         };
         const image_dimension = binding.dimension;
+        if (binding.texel_coordinates_extent) |extent| {
+            if (self.stage != .fragment or image_dimension != .two_d or inst.image_dimension != .dim_2d or
+                @as(u16, @bitCast(inst.image_sample_flags)) != 0 or
+                extent[0] == 0 or extent[1] == 0 or extent[0] > 16384 or extent[1] > 16384)
+                return Error.UnsupportedOpcode;
+        }
         const instruction_coordinate_components: u8 = if (one_dimensional)
             1
         else if (requested_dimension == .two_d)
@@ -7297,7 +7307,11 @@ const Builder = struct {
             try self.emit(&self.body, 80, &.{ self.vector2_type, coordinates, raw_x, coordinate_y });
         } else {
             const raw_y = try self.source(try imageAddressOperand(inst, coordinate_base + 1), .float32);
-            const coordinate_x, const coordinate_y = try self.sampleCoordinates(raw_x, raw_y);
+            var coordinate_x, var coordinate_y = try self.sampleCoordinates(raw_x, raw_y);
+            if (binding.texel_coordinates_extent) |extent| {
+                coordinate_x = try self.bvhBinary(136, self.float_type, coordinate_x, try self.constant(.float32, @bitCast(@as(f32, @floatFromInt(extent[0])))));
+                coordinate_y = try self.bvhBinary(136, self.float_type, coordinate_y, try self.constant(.float32, @bitCast(@as(f32, @floatFromInt(extent[1])))));
+            }
             if (image_dimension != .two_d) {
                 const coordinate_z = try self.source(try imageAddressOperand(inst, coordinate_base + 2), .float32);
                 if (image_dimension == .cube) {
@@ -7379,7 +7393,7 @@ const Builder = struct {
             }
             return;
         }
-        if (level_zero or explicit_lod) {
+        if (level_zero or explicit_lod or binding.texel_coordinates_extent != null) {
             // Compute shaders have no implicit derivatives. GFX10's
             // image_sample_lz names mip zero explicitly, which maps directly to
             // an explicit SPIR-V Lod operand and is valid in every shader stage.

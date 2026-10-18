@@ -81,6 +81,20 @@ pub const DeviceInfo = extern struct {
 };
 
 pub const Error = error{ UnsupportedPlatform, InvalidArgument, NativeFailure };
+pub const CacheStats = extern struct {
+    enabled: u64 = 0,
+    shader_hits: u64 = 0,
+    shader_misses: u64 = 0,
+    shader_evictions: u64 = 0,
+    pipeline_hits: u64 = 0,
+    pipeline_misses: u64 = 0,
+    pipeline_evictions: u64 = 0,
+    shader_entries: u64 = 0,
+    pipeline_entries: u64 = 0,
+    shader_bytes: u64 = 0,
+    compile_ms: u64 = 0,
+    pipeline_ms: u64 = 0,
+};
 pub const Device = struct {
     handle: *Handle,
     info: DeviceInfo,
@@ -144,6 +158,19 @@ pub const Device = struct {
         return ps5_d3d12_validation_errors(self.handle);
     }
 
+    pub fn cacheStats(self: *Device) CacheStats {
+        var stats = CacheStats{};
+        if (builtin.os.tag == .windows) ps5_d3d12_cache_stats(self.handle, &stats);
+        return stats;
+    }
+
+    /// Clears completed cached objects, retaining cumulative diagnostic counters.
+    pub fn cacheLimits(self: *Device, shaders: u32, pipelines: u32) Error!void {
+        if (shaders > 256 or pipelines > 512) return error.InvalidArgument;
+        if (builtin.os.tag != .windows) return error.UnsupportedPlatform;
+        try self.check(ps5_d3d12_cache_limits(self.handle, shaders, pipelines));
+    }
+
     pub fn dispatchSpirv(self: *Device, words: []const u32, buffers: []const Buffer, groups: [3]u32) Error!void {
         if (words.len < 5 or words[0] != 0x07230203 or buffers.len > 64) return error.InvalidArgument;
         for (groups) |size| if (size == 0 or size > 65535) return error.InvalidArgument;
@@ -166,6 +193,7 @@ pub const Device = struct {
         for (buffers) |buffer| if (buffer.size == 0 or buffer.size % 4 != 0 or buffer.size > 256 * 1024 * 1024) return error.InvalidArgument;
         for (images) |image| {
             if (image.size != try sampledImageSize(image.width, image.height, image.format) or image.srgb > 1 or
+                ((image.format == 61 or image.format == 49) and image.srgb != 0) or
                 image.address_u < 1 or image.address_u > 4 or image.address_v < 1 or image.address_v > 4 or
                 image.address_w < 1 or image.address_w > 4 or image.filter & ~@as(u32, 0x15) != 0 or
                 !std.math.isFinite(image.min_lod) or !std.math.isFinite(image.max_lod) or !std.math.isFinite(image.lod_bias) or
@@ -201,6 +229,8 @@ pub fn rgbaSize(width: u32, height: u32) Error!usize {
 pub fn sampledImageSize(width: u32, height: u32, format: u32) Error!usize {
     const rgba = try rgbaSize(width, height);
     if (format == 28) return rgba;
+    if (format == 61) return rgba / 4;
+    if (format == 49) return rgba / 2;
     // Native BC base dimensions must be whole 4x4 blocks. Smaller mip levels
     // will need a separate subresource path; never pad and change guest UVs.
     if (width % 4 != 0 or height % 4 != 0) return error.InvalidArgument;
@@ -221,6 +251,8 @@ extern fn ps5_d3d12_render(*Handle, [*]u8, u32, u32) i32;
 extern fn ps5_d3d12_attach_window(*Handle, *anyopaque, u32, u32) i32;
 extern fn ps5_d3d12_present(*Handle, *const [4]f32) i32;
 extern fn ps5_d3d12_validation_errors(*Handle) u64;
+extern fn ps5_d3d12_cache_stats(*Handle, *CacheStats) void;
+extern fn ps5_d3d12_cache_limits(*Handle, u32, u32) i32;
 extern fn ps5_d3d12_dispatch_spirv(*Handle, [*]const u32, usize, [*]const Buffer, u32, *const [3]u32) i32;
 extern fn ps5_d3d12_draw_spirv(*Handle, [*]const u32, usize, [*]const u32, usize, *const Draw, [*]const u8, usize, [*]const Buffer, u32, [*]const SampledImage, u32, [*]u8) i32;
 extern fn ps5_d3d12_present_rgba(*Handle, [*]const u8, u32, u32) i32;
@@ -234,6 +266,8 @@ test "readback sizes reject empty and excessive textures before native allocatio
 }
 
 test "sampled BC footprints count blocks and reject unsupported native extents" {
+    try std.testing.expectEqual(@as(usize, 3 * 7), try sampledImageSize(3, 7, 61));
+    try std.testing.expectEqual(@as(usize, 3 * 7 * 2), try sampledImageSize(3, 7, 49));
     try std.testing.expectEqual(@as(usize, 8192), try sampledImageSize(128, 128, 71));
     try std.testing.expectEqual(@as(usize, 16384), try sampledImageSize(128, 128, 77));
     try std.testing.expectEqual(@as(usize, 32), try sampledImageSize(8, 4, 74));

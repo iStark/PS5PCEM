@@ -132,26 +132,43 @@ pub const DrawResources = struct {
             return error.DynamicGraphicsImageNotImplemented;
         const descriptor = try gpu.resources.decodeImageDescriptor(&words);
         const sampler = try gpu.resources.decodeSamplerDescriptor(&sampler_words);
+        errdefer std.debug.print("[d3d12 sampler] program=0x{x} pc=0x{x} words={x},{x},{x},{x} descriptor={any}\n", .{
+            resolver.bindings.program_address, inst.pc, sampler_words[0], sampler_words[1], sampler_words[2], sampler_words[3], sampler,
+        });
         const format: u32 = switch (descriptor.unified_format) {
+            1 => 61, // R8_UNORM
+            14 => 49, // R8G8_UNORM
             56 => 28,
             169, 170 => 71,
             171, 172 => 74,
             173, 174 => 77,
             else => 0,
         };
-        if (descriptor.image_type != .color_2d or format == 0 or descriptor.viewBaseLevel() != 0 or
+        // A 2D instruction can view the sole layer of an array descriptor.
+        // Multi-layer descriptors and array-indexed instructions remain rejected.
+        const single_layer = descriptor.depth_or_layers == 1 and descriptor.base_array == 0;
+        const view_2d = descriptor.image_type == .color_2d or (descriptor.image_type == .color_2d_array and single_layer);
+        const compressed = format == 71 or format == 74 or format == 77;
+        if (!view_2d or !single_layer or format == 0 or descriptor.viewBaseLevel() != 0 or
             descriptor.viewMipLevels() != 1 or descriptor.max_mip != 0 or descriptor.base_array != 0 or
-            descriptor.min_lod != 0 or (format != 28 and descriptor.bc_swizzle != 0) or
+            descriptor.min_lod != 0 or (compressed and descriptor.bc_swizzle != 0) or
             descriptor.dccMetadataAddress() != null or gpu.MetadataSurface.fromImage(descriptor).hasAny())
         {
             std.debug.print("[d3d12 image] program=0x{x} pc=0x{x} descriptor={any}\n", .{ resolver.bindings.program_address, inst.pc, descriptor });
             return error.GraphicsTextureFormatOrMipNotImplemented;
         }
         const expected_bytes = try native.sampledImageSize(descriptor.width, descriptor.height, format);
-        if (sampler.unnormalized_coordinates or sampler.trunc_coordinates or sampler.filter_mode != 0 or
+        // R8/RG8 have no sRGB DXGI variants; adding one to their enum would
+        // accidentally select an integer format instead of gamma conversion.
+        if (sampler.force_srgb and (format == 61 or format == 49)) return error.GraphicsSamplerModeNotImplemented;
+        if (sampler.trunc_coordinates or sampler.filter_mode != 0 or
             sampler.maximum_anisotropy != 0 or sampler.minification_filter > 1 or sampler.magnification_filter > 1 or
             sampler.mip_filter > 2 or sampler.border_color_type == 3)
             return error.GraphicsSamplerModeNotImplemented;
+        const unnormalized = sampler.unnormalized_coordinates;
+        if (unnormalized and (resolver.bindings.stage != .pixel or @as(u16, @bitCast(inst.image_sample_flags)) != 0 or
+            sampler.mip_filter != 0 or sampler.minimum_lod != 0 or sampler.lod_bias != 0 or
+            sampler.minification_filter != sampler.magnification_filter)) return error.GraphicsSamplerModeNotImplemented;
         const layout = try gpu.SurfaceLayout.fromImage(descriptor);
         if (layout.staging_bytes != expected_bytes) return error.GraphicsImageFootprintMismatch;
         if (self.images.items.len >= 32 or layout.required_source_bytes > 256 * 1024 * 1024 or
@@ -181,15 +198,15 @@ pub const DrawResources = struct {
             .width = descriptor.width,
             .height = descriptor.height,
             .format = format,
-            .srgb = @intFromBool(sampler.force_srgb or (format != 28 and descriptor.unified_format % 2 == 0)),
+            .srgb = @intFromBool(sampler.force_srgb or (compressed and descriptor.unified_format % 2 == 0)),
             .components = components,
             .filter = (@as(u32, sampler.minification_filter) << 4) | (@as(u32, sampler.magnification_filter) << 2) | @intFromBool(sampler.mip_filter == 2),
-            .address_u = try addressMode(sampler.clamp_x),
-            .address_v = try addressMode(sampler.clamp_y),
-            .address_w = try addressMode(sampler.clamp_z),
-            .min_lod = sampler.minimum_lod,
-            .max_lod = sampler.maximum_lod,
-            .lod_bias = sampler.lod_bias,
+            .address_u = if (unnormalized) try unnormalizedAddressMode(sampler.clamp_x) else try addressMode(sampler.clamp_x),
+            .address_v = if (unnormalized) try unnormalizedAddressMode(sampler.clamp_y) else try addressMode(sampler.clamp_y),
+            .address_w = if (unnormalized) 3 else try addressMode(sampler.clamp_z),
+            .min_lod = if (unnormalized) 0 else sampler.minimum_lod,
+            .max_lod = if (unnormalized) 0 else sampler.maximum_lod,
+            .lod_bias = if (unnormalized) 0 else sampler.lod_bias,
             .border = switch (sampler.border_color_type) {
                 0 => .{ 0, 0, 0, 0 },
                 1 => .{ 0, 0, 0, 1 },
@@ -206,6 +223,7 @@ pub const DrawResources = struct {
             .instruction_pc = inst.pc,
             .minimum_lod = sampler.minimum_lod,
             .maximum_lod = sampler.maximum_lod,
+            .texel_coordinates_extent = if (unnormalized) .{ descriptor.width, descriptor.height } else null,
         });
     }
 };
@@ -229,6 +247,17 @@ fn addressMode(guest: u8) !u32 {
         1 => 2,
         2 => 3,
         4 => 4,
+        else => error.GraphicsSamplerAddressModeNotImplemented,
+    };
+}
+
+fn unnormalizedAddressMode(guest: u8) !u32 {
+    // With FORCE_UNNORMALIZED, wrap uses the same edge clamp as mode 2.
+    // Mode 6 preserves the explicit border. Mirror/half-border need their
+    // own coordinate rules and must not silently become ordinary wrapping.
+    return switch (guest) {
+        0, 2 => 3,
+        6 => 4,
         else => error.GraphicsSamplerAddressModeNotImplemented,
     };
 }

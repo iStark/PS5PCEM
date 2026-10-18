@@ -67,6 +67,23 @@ pub fn main(init: std.process.Init) !void {
         d3d12.Buffer.fromSlice(std.mem.asBytes(&copied_words)),
     }, .{ 1, 1, 1 });
     if (!std.mem.eql(u32, &source_words, &copied_words)) return error.GuestComputeMismatch;
+    const compute_cache = device.cacheStats();
+    for (&source_words) |*word| word.* ^= 0xabcdef12;
+    @memset(&copied_words, 0xcc);
+    try device.dispatchSpirv(translated.words, &.{
+        d3d12.Buffer.fromSlice(std.mem.asBytes(&source_words)),
+        d3d12.Buffer.fromSlice(std.mem.asBytes(&copied_words)),
+    }, .{ 1, 1, 1 });
+    if (!std.mem.eql(u32, &source_words, &copied_words)) return error.CachedComputeReadbackMismatch;
+    if (compute_cache.enabled != 0 and (device.cacheStats().shader_hits != compute_cache.shader_hits + 1 or
+        device.cacheStats().pipeline_hits != compute_cache.pipeline_hits + 1)) return error.ComputeCacheMiss;
+    const preserved = source_words;
+    // Same bytecode with a different binding count must still fail reflection,
+    // even after the valid layout has populated the shader cache.
+    if (device.dispatchSpirv(translated.words, &.{d3d12.Buffer.fromSlice(std.mem.asBytes(&source_words))}, .{ 1, 1, 1 })) |_| {
+        return error.CachedInvalidLayoutAccepted;
+    } else |err| if (err != error.NativeFailure) return err;
+    if (!std.mem.eql(u32, &source_words, &preserved)) return error.InvalidLayoutModifiedBuffer;
     std.debug.print("PASS guest RDNA2 -> shared IR -> HLSL -> D3D12 compute, descriptor arrays and exact readback\n", .{});
 
     for ([_][2]u32{ .{ 1, 1 }, .{ 71, 37 }, .{ 256, 129 } }) |extent| {
@@ -191,6 +208,17 @@ fn guestCommandProbe(allocator: std.mem.Allocator, vertex_words: []const u32, pi
     }
     try state.writeRegister(.context, 0x2d5, 0);
     try state.writeRegister(.shader, 0x048, 2);
+    // Four-vertex guest strips (DI_PT_TRISTRIP=6) must match an explicitly
+    // expanded list, including the second triangle and untouched padding.
+    @memcpy(memory.data[0x2000..], initial[0x2000..]);
+    try state.writeRegister(.uconfig, 0x242, 6);
+    _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 4, 2 });
+    const strip_image = memory.data[0x2000..].*;
+    @memcpy(memory.data[0x2000..], initial[0x2000..]);
+    for ([_]u16{ 0, 1, 2, 2, 1, 3 }, 0..) |index, i| std.mem.writeInt(u16, memory.data[0x600 + i * 2 ..][0..2], index, .little);
+    try state.writeRegister(.uconfig, 0x242, 4);
+    _ = try executor.execute(&.{ command(gpu.pm4.index_type, 1), 0, command(gpu.pm4.draw_index_2, 5), 6, 0x600, 0, 6, 0 });
+    if (!std.mem.eql(u8, memory.data[0x2000..], &strip_image) or std.mem.eql(u8, &strip_image, before[0x2000..])) return error.Pm4FourVertexStripMismatch;
     // ES remains populated: switching back to legacy VS must ignore it.
     // Each indexed path must reproduce the complete auto-index image, including
     // untouched row padding. Large 32-bit values exercise signed base-vertex
@@ -240,7 +268,7 @@ fn guestCommandProbe(allocator: std.mem.Allocator, vertex_words: []const u32, pi
             else => memory.data[0x600 + i] = @intCast(value),
         };
         try state.writeRegister(.uconfig, 0x24a, 0);
-        try state.writeRegister(.uconfig, 0x242, 5);
+        try state.writeRegister(.uconfig, 0x242, 6);
         try state.writeRegister(.uconfig, 0x24b, 1);
         try state.writeRegister(.context, 0x103, marker);
         _ = try executor.execute(&.{ command(gpu.pm4.draw_index_2, 5), 7, 0x600, 0, 7, 0 });
@@ -262,6 +290,7 @@ fn guestCommandProbe(allocator: std.mem.Allocator, vertex_words: []const u32, pi
     if (backend.vtable.write(backend.context, 0x1200, &.{ 1, 2, 3, 4 })) return error.FailedSubmissionPublishedLabel;
     std.debug.print("PASS PM4 compute/draw -> D3D12 -> guest memory, pitched target and shader mask\nPASS indexed 8/16/32-bit draws, base vertex, index offsets, strip restart and zero count; invalid bounds stop the queue\n", .{});
     std.debug.print("PASS NGG passthrough vertex routing, GS USER_DATA, wave32/wave64 system registers and stale-bank isolation\n", .{});
+    std.debug.print("PASS guest topology 6 four-vertex strip equals expanded triangle list; indexed restart uses the guest enum\n", .{});
 }
 
 fn command(opcode: u8, body_words: u14) u32 {
@@ -356,6 +385,83 @@ fn guestGraphicsProbe(allocator: std.mem.Allocator, device: *d3d12.Device) !void
     try guestVaryingProbe(allocator, &vertex_words);
     try guestResourcesProbe(allocator);
     try guestBlendingProbe(allocator, &vertex_words);
+    try guestCacheProbe(allocator, device, vertex.words, fragment.words);
+}
+
+fn guestCacheProbe(allocator: std.mem.Allocator, device: *d3d12.Device, vertex: []const u32, fragment: []const u32) !void {
+    const enabled = device.cacheStats().enabled != 0;
+    defer device.cacheLimits(if (enabled) 256 else 0, if (enabled) 512 else 0) catch {};
+    const pixel_bytes = 65 * 37 * 4;
+    const cases = 24;
+    const baseline = try allocator.alloc([pixel_bytes]u8, cases);
+    defer allocator.free(baseline);
+    const mutable_fragment = try allocator.dupe(u32, fragment);
+    defer allocator.free(mutable_fragment);
+    var constant: ?usize = null;
+    var offset: usize = 5;
+    while (offset < fragment.len) {
+        const count: usize = fragment[offset] >> 16;
+        if (count == 0 or count > fragment.len - offset) return error.InvalidSpirvProbe;
+        if (count == 4 and fragment[offset] & 0xffff == 43 and fragment[offset + 3] == 0x3f800000) {
+            constant = offset + 3;
+            break;
+        }
+        offset += count;
+    }
+    const constant_index = constant orelse return error.MissingSpirvConstant;
+    // Compare complete GPU readbacks, including dynamic state, shader bytes
+    // changed in place, immutable PSO changes and deliberate LRU eviction.
+    for ([_][2]u32{ .{ 0, 0 }, .{ 256, 512 }, .{ 2, 1 } }, 0..) |limits, pass| {
+        try device.cacheLimits(limits[0], limits[1]);
+        const before = device.cacheStats();
+        for (0..cases) |variant| {
+            var pixels: [pixel_bytes]u8 = @splat(0x39);
+            var draw = try d3d12.Draw.fullTarget(65, 37);
+            draw.blend.enabled = 1;
+            draw.blend.source_color = 14; // Dynamic blend factor, rebound on cache hits.
+            draw.blend.destination_color = 15;
+            draw.blend.constants = .{ @as(f32, @floatFromInt(variant % 4)) / 4, 0.5, 0.75, 1 };
+            draw.scissor[2] = 40 + @as(i32, @intCast(variant % 3));
+            draw.viewport[0] = @floatFromInt(variant % 2);
+            if (variant >= 4) draw.write_mask = @intCast(variant % 16);
+            if (variant >= 8) draw.cull_mode = 1 + @as(u32, @intCast(variant % 3));
+            if (variant >= 12) draw.front_ccw = @intCast(variant % 2);
+            mutable_fragment[constant_index] = if (variant % 5 == 4) 0x3f000000 else fragment[constant_index];
+            try device.drawSpirv(vertex, mutable_fragment, draw, &pixels);
+            if (pass == 0) baseline[variant] = pixels else if (!std.mem.eql(u8, &baseline[variant], &pixels)) return error.CachedGraphicsMismatch;
+            if (pass == 1 and variant == 3) {
+                const stats = device.cacheStats();
+                if (stats.shader_misses != before.shader_misses + 2 or stats.pipeline_misses != before.pipeline_misses + 1 or
+                    stats.shader_hits != before.shader_hits + 6 or stats.pipeline_hits != before.pipeline_hits + 3) return error.DynamicStateCacheMiss;
+            }
+        }
+        const after = device.cacheStats();
+        if (pass == 2 and (after.shader_evictions == before.shader_evictions or after.pipeline_evictions == before.pipeline_evictions or
+            after.shader_entries > 2 or after.pipeline_entries > 1)) return error.CacheEvictionNotExercised;
+    }
+    // Repeated draw timing is a host microbenchmark, not a game FPS result.
+    mutable_fragment[constant_index] = fragment[constant_index];
+    for ([_]bool{ false, true }) |cache_enabled| {
+        try device.cacheLimits(if (cache_enabled) 256 else 0, if (cache_enabled) 512 else 0);
+        var pixels: [pixel_bytes]u8 = @splat(0);
+        const draw = try d3d12.Draw.fullTarget(65, 37);
+        try device.drawSpirv(vertex, fragment, draw, &pixels);
+        const started = gpu.frame_timing.timestampNs();
+        const before = device.cacheStats();
+        for (0..32) |_| {
+            @memset(&pixels, 0);
+            try device.drawSpirv(vertex, fragment, draw, &pixels);
+            if (!std.mem.eql(u8, pixels[(18 * 65 + 32) * 4 ..][0..4], &.{ 255, 0, 0, 255 })) return error.CachedBenchmarkMismatch;
+        }
+        const elapsed = gpu.frame_timing.timestampNs() - started;
+        const after = device.cacheStats();
+        if (cache_enabled and (after.shader_misses != before.shader_misses or after.pipeline_misses != before.pipeline_misses or
+            after.shader_hits != before.shader_hits + 64 or after.pipeline_hits != before.pipeline_hits + 32)) return error.WarmCacheMiss;
+        std.debug.print("D3D12 repeated-draw probe: cache={any} draws=32 total_us={d} shader_misses={d} pso_misses={d}\n", .{
+            cache_enabled, elapsed / std.time.ns_per_us, after.shader_misses - before.shader_misses, after.pipeline_misses - before.pipeline_misses,
+        });
+    }
+    std.debug.print("PASS cached/uncached full-image equivalence (24 cases), dynamic state reuse, in-place shader mutation and bounded shader/PSO eviction\n", .{});
 }
 
 fn guestBlendingProbe(allocator: std.mem.Allocator, vertex: []const u32) !void {
@@ -697,6 +803,8 @@ fn guestResourcesProbe(allocator: std.mem.Allocator) !void {
     try state.writeRegister(.context, 0x1b3, 0);
     try state.writeRegister(.context, 0x1b4, 0);
     try guestCompressedImageProbe(allocator, memory, &state, &executor);
+    try guestNarrowImageProbe(allocator, memory, &state, &executor, &renderer);
+    try guestTexelCoordinatesProbe(allocator, memory, &state, &executor, &renderer, &vs);
     // A missing input must fail before touching the output attachment.
     const before = memory.data[0x2000..0x5000].*;
     try state.writeRegister(.shader, 0x04c, memory.data.len + 256);
@@ -762,4 +870,105 @@ fn guestCompressedImageProbe(allocator: std.mem.Allocator, memory: *GraphicsMemo
         }
     }
     std.debug.print("PASS 12 guest BC1/BC2/BC3 texture cases: tiled/linear blocks, native row pitch, alpha and sRGB decoding, source preservation\n", .{});
+}
+
+fn guestNarrowImageProbe(allocator: std.mem.Allocator, memory: *GraphicsMemory, state: *gpu.State, executor: *gpu.DcbExecutor, renderer: *d3d12.Renderer) !void {
+    for ([_]u16{ 1, 14 }) |format| for ([_]gpu.resources.TileMode{ .linear, .standard_4kb }) |mode| for ([_]u32{ 9, 13 }) |image_type| {
+        const width: u32 = 13;
+        const height: u32 = 9;
+        const components: u32 = if (format == 1) 4 | (0 << 3) | (0 << 6) | (1 << 9) else 4 | (5 << 3) | (0 << 6) | (1 << 9);
+        const words = [_]u32{ 0x100, (@as(u32, format) << 20) | (((width - 1) & 3) << 30), ((width - 1) >> 2) | ((height - 1) << 14), (image_type << 28) | components | (@as(u32, @intFromEnum(mode)) << 20), 0, 0, 0, 0 };
+        for (words, 0..) |word, i| try state.writeRegister(.shader, 0x00c + @as(u32, @intCast(i)), word);
+        const descriptor = try gpu.resources.decodeImageDescriptor(&words);
+        if (descriptor.depth_or_layers != 1) return error.InvalidNarrowImageProbe;
+        const layout = try gpu.SurfaceLayout.fromImage(descriptor);
+        const pixels = try allocator.alloc(u8, @intCast(layout.staging_bytes));
+        defer allocator.free(pixels);
+        const bytes: usize = if (format == 1) 1 else 2;
+        for (0..height) |y| for (0..width) |x| {
+            pixels[(y * width + x) * bytes] = @intCast(20 + x * 11);
+            if (bytes == 2) pixels[(y * width + x) * bytes + 1] = @intCast(40 + y * 19);
+        };
+        const backing = memory.data[0x10000..][0..@intCast(layout.required_source_bytes)];
+        @memset(backing, 0xa7);
+        try layout.tile(pixels, backing);
+        const before = try allocator.dupe(u8, backing);
+        defer allocator.free(before);
+        @memset(memory.data[0x2000..0x5000], 0);
+        _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 2 });
+        if (!std.mem.eql(u8, before, backing)) return error.NarrowImageSourceModified;
+        for ([_][2]usize{ .{ 30, 23 }, .{ 34, 23 }, .{ 30, 15 }, .{ 34, 15 } }) |point| {
+            const tx: usize = @intFromFloat((@as(f32, @floatFromInt(point[0])) + 0.5) / 65 * @as(f32, @floatFromInt(width)));
+            const ty: usize = @intFromFloat((1 - (@as(f32, @floatFromInt(point[1])) + 0.5) / 37) * @as(f32, @floatFromInt(height)));
+            const expected = [4]u8{ @intCast(20 + tx * 11), if (bytes == 2) @intCast(40 + ty * 19) else 0, 0, 255 };
+            const actual = memory.data[0x2000 + (point[1] * 72 + point[0]) * 4 ..][0..4];
+            for (actual, expected) |a, e| if (@abs(@as(i16, a) - e) > 1) return error.NarrowImageSamplingMismatch;
+        }
+    };
+    const before = memory.data[0x2000..0x5000].*;
+    const packet: gpu.pm4.Packet = .{ .kind = .command, .header = command(gpu.pm4.draw_index_auto, 2), .opcode = gpu.pm4.draw_index_auto, .body = &.{ 3, 2 } };
+    try state.writeRegister(.shader, 0x010, 1); // Two layers cannot become a 2D view.
+    if (renderer.draw(state, packet)) |_| return error.MultiLayerViewAccepted else |err| if (err != error.GraphicsTextureFormatOrMipNotImplemented) return err;
+    try state.writeRegister(.shader, 0x010, 0);
+    try state.writeRegister(.shader, 0x014, 2 | (2 << 3) | (2 << 6) | (1 << 20));
+    if (renderer.draw(state, packet)) |_| return error.NarrowSrgbAccepted else |err| if (err != error.GraphicsSamplerModeNotImplemented) return err;
+    try state.writeRegister(.shader, 0x014, 2 | (2 << 3) | (2 << 6));
+    if (!std.mem.eql(u8, &before, memory.data[0x2000..0x5000])) return error.RejectedViewModifiedTarget;
+    std.debug.print("PASS R8/RG8 textures: linear/tiled, narrow upload rows, one-layer array views, components and unchanged source bytes (8 cases); multi-layer/sRGB rejection\n", .{});
+}
+
+fn guestTexelCoordinatesProbe(allocator: std.mem.Allocator, memory: *GraphicsMemory, state: *gpu.State, executor: *gpu.DcbExecutor, renderer: *d3d12.Renderer, vertex: []const u32) !void {
+    // Reuse the 13x9 tiled RG8 image, but supply pixel coordinates from the
+    // vertex stage. Compare the entire target against normalized sampling,
+    // then verify an exact texel center, edge clamp and explicit border.
+    var pixel_vertex: std.ArrayList(u32) = .empty;
+    defer pixel_vertex.deinit(allocator);
+    try pixel_vertex.appendSlice(allocator, vertex[0 .. vertex.len - 3]);
+    try pixel_vertex.appendSlice(allocator, &.{
+        vop1(0x01, 4, 255), @bitCast(@as(f32, 13)), vop2(0x08, 6, 6, 4),
+        vop1(0x01, 4, 255), @bitCast(@as(f32, 9)),  vop2(0x08, 7, 7, 4),
+    });
+    try pixel_vertex.appendSlice(allocator, vertex[vertex.len - 3 ..]);
+    var reference: [0x3000]u8 = undefined;
+    for ([_]u32{ 0, 1 }) |filter| {
+        try state.writeRegister(.shader, 0x016, (filter << 20) | (filter << 22) | (1 << 24));
+        for ([_]u32{ 0, 1, 2 }) |variant| {
+            const words = if (variant == 0) vertex else pixel_vertex.items;
+            @memcpy(memory.data[0x200..][0 .. words.len * 4], std.mem.sliceAsBytes(words));
+            try state.writeRegister(.shader, 0x014, if (variant == 0) 0x92 else if (variant == 1) 0x8000 else 0x8092);
+            @memset(memory.data[0x2000..0x5000], 0);
+            _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 2 });
+            if (variant == 0) reference = memory.data[0x2000..0x5000].* else {
+                for (memory.data[0x2000..0x5000], reference) |a, e| if (@abs(@as(i16, a) - e) > 1) return error.TexelCoordinateImageMismatch;
+            }
+        }
+    }
+    for ([_][2]f32{ .{ 6.5, 4.5 }, .{ -2, -3 }, .{ 18, 12 } }, 0..) |uv, point| for ([_]u32{ 0, 2, 6 }) |clamp| {
+        pixel_vertex.clearRetainingCapacity();
+        try pixel_vertex.appendSlice(allocator, vertex[0 .. vertex.len - 3]);
+        try pixel_vertex.appendSlice(allocator, &.{ vop1(0x01, 6, 255), @bitCast(uv[0]), vop1(0x01, 7, 255), @bitCast(uv[1]) });
+        try pixel_vertex.appendSlice(allocator, vertex[vertex.len - 3 ..]);
+        @memcpy(memory.data[0x200..][0 .. pixel_vertex.items.len * 4], std.mem.sliceAsBytes(pixel_vertex.items));
+        try state.writeRegister(.shader, 0x014, 0x8000 | clamp | (clamp << 3));
+        @memset(memory.data[0x2000..0x5000], 0);
+        _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 2 });
+        // This view maps B/A to constants 0/1, including border samples.
+        const expected: [4]u8 = if (clamp == 6 and point != 0) .{ 0, 0, 0, 255 } else switch (point) {
+            0 => .{ 86, 116, 0, 255 },
+            1 => .{ 20, 40, 0, 255 },
+            else => .{ 152, 192, 0, 255 },
+        };
+        const actual = memory.data[0x2000 + (18 * 72 + 32) * 4 ..][0..4];
+        for (actual, expected) |a, e| if (@abs(@as(i16, a) - e) > 1) {
+            std.debug.print("Texel coordinate point={d} clamp={d} actual={any} expected={any}\n", .{ point, clamp, actual, expected });
+            return error.TexelCoordinateClampMismatch;
+        };
+    };
+    const before = memory.data[0x2000..0x5000].*;
+    try state.writeRegister(.shader, 0x016, 0x05500000); // Unsupported unnormalized mip filter.
+    const packet: gpu.pm4.Packet = .{ .kind = .command, .header = command(gpu.pm4.draw_index_auto, 2), .opcode = gpu.pm4.draw_index_auto, .body = &.{ 3, 2 } };
+    if (renderer.draw(state, packet)) |_| return error.UnnormalizedMipAccepted else |err| if (err != error.GraphicsSamplerModeNotImplemented) return err;
+    if (!std.mem.eql(u8, &before, memory.data[0x2000..0x5000])) return error.RejectedSamplerModifiedTarget;
+    try state.writeRegister(.shader, 0x016, 0x01500000);
+    std.debug.print("PASS pixel-coordinate sampling: point/linear full-image equivalence, texel centers, out-of-range edge/border clamps and unsupported mip rejection\n", .{});
 }
