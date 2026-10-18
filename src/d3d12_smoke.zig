@@ -1086,6 +1086,12 @@ fn guestResourcesProbe(allocator: std.mem.Allocator) !void {
     memory.* = .{};
     const vs = [_]u32{
         0xf4080200, 0xfa000000, // s_load_dwordx4 s8, [s0:s1]
+        0xbf06830a, // s_cmp_eq_u32 s10, 3: true.
+        vop1(0x01, 30, 128), // Vector work between CMP/CSELECT preserves SCC.
+        sop2(0x0a, 11, 11, 128), // Keep the descriptor's format word.
+        0xbf06800a, // s_cmp_eq_u32 s10, 0: false.
+        vop2(0x04, 31, 30, 30),
+        sop2(0x0a, 11, 128, 11),
         0xe0382000, 0x80020005, // buffer_load_dwordx4 v0, v5, s8, 0 idxen
         0xf80000cf,          0x03020100, // POS0
         vop1(0x01, 4, 255),  0x3f000000,
