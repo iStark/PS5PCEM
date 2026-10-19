@@ -5,6 +5,7 @@
 //! the native texture layout; upload/readback buffers carry tight color/depth texels.
 const std = @import("std");
 const gpu = @import("gpu");
+const staging = @import("staging.zig");
 
 pub fn colorLayout(target: gpu.resources.ColorTarget) !gpu.SurfaceLayout {
     if (target.format != 10 or target.number_type != 0 or target.component_swap != 0 or
@@ -70,21 +71,28 @@ fn validate(layout: gpu.SurfaceLayout, address: u64) !void {
 }
 
 pub const Staged = struct {
-    allocator: std.mem.Allocator,
+    backing_lease: staging.Lease,
+    pixel_lease: staging.Lease,
     layout: gpu.SurfaceLayout,
     address: u64,
     backing: []u8,
     pixels: []u8,
 
     pub fn read(allocator: std.mem.Allocator, memory: anytype, address: u64, layout: gpu.SurfaceLayout) !Staged {
+        return readPooled(allocator, null, memory, address, layout);
+    }
+
+    pub fn readPooled(allocator: std.mem.Allocator, pool: ?*staging.Pool, memory: anytype, address: u64, layout: gpu.SurfaceLayout) !Staged {
         try validate(layout, address);
-        const backing = try allocator.alloc(u8, @intCast(layout.required_source_bytes));
-        errdefer allocator.free(backing);
-        const pixels = try allocator.alloc(u8, @intCast(layout.staging_bytes));
-        errdefer allocator.free(pixels);
+        var backing_lease = try staging.Lease.alloc(allocator, pool, @intCast(layout.required_source_bytes));
+        errdefer backing_lease.deinit();
+        var pixel_lease = try staging.Lease.alloc(allocator, pool, @intCast(layout.staging_bytes));
+        errdefer pixel_lease.deinit();
+        const backing = backing_lease.bytes;
+        const pixels = pixel_lease.bytes;
         if (!memory.read(memory.context, address, backing)) return error.GuestReadFailed;
         try layout.detile(backing, pixels);
-        return .{ .allocator = allocator, .layout = layout, .address = address, .backing = backing, .pixels = pixels };
+        return .{ .backing_lease = backing_lease, .pixel_lease = pixel_lease, .layout = layout, .address = address, .backing = backing, .pixels = pixels };
     }
 
     pub fn write(self: *Staged, memory: anytype) !void {
@@ -96,8 +104,8 @@ pub const Staged = struct {
     }
 
     pub fn deinit(self: *Staged) void {
-        self.allocator.free(self.pixels);
-        self.allocator.free(self.backing);
+        self.pixel_lease.deinit();
+        self.backing_lease.deinit();
         self.* = undefined;
     }
 };
@@ -150,4 +158,56 @@ test "depth layouts validate address and subresource contracts before staging" {
     target.mip_level = 0;
     target.read_address = std.math.maxInt(u64) - 32;
     try std.testing.expectError(error.ArithmeticOverflow, depthLayout(target, 65, 37, false));
+}
+
+test "pooled surfaces refresh guest bytes, preserve newly changed padding and release failed reads" {
+    const Memory = struct {
+        data: []u8,
+        fail: bool = false,
+        fn read(context: ?*anyopaque, _: u64, bytes: []u8) bool {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            if (self.fail) return false;
+            @memcpy(bytes, self.data[0..bytes.len]);
+            return true;
+        }
+        fn write(context: ?*anyopaque, _: u64, bytes: []const u8) bool {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            @memcpy(self.data[0..bytes.len], bytes);
+            return true;
+        }
+        fn access(self: *@This()) @import("backend.zig").Memory {
+            return .{ .context = self, .read = read, .write = write };
+        }
+    };
+    var pool = staging.Pool{ .allocator = std.testing.allocator };
+    defer pool.deinit();
+    for ([_]gpu.resources.TileMode{ .linear, .render_target }) |mode| for ([_]u8{ 2, 4 }) |bpp| {
+        const layout = try gpu.SurfaceLayout.init(.{ .tile_mode = mode, .width = 65, .height = 37, .row_pitch_elements = 80 }, bpp);
+        const backing = try std.testing.allocator.alloc(u8, @intCast(layout.required_source_bytes));
+        defer std.testing.allocator.free(backing);
+        const expected = try std.testing.allocator.alloc(u8, backing.len);
+        defer std.testing.allocator.free(expected);
+        const pixels = try std.testing.allocator.alloc(u8, @intCast(layout.staging_bytes));
+        defer std.testing.allocator.free(pixels);
+        var memory = Memory{ .data = backing };
+        for (0..3) |iteration| {
+            for (pixels, 0..) |*byte, i| byte.* = @truncate(i *% 197 +% iteration *% 31);
+            @memset(backing, 0x36);
+            try layout.tile(pixels, backing);
+            var surface = try Staged.readPooled(std.testing.allocator, &pool, memory.access(), 0x10000, layout);
+            defer surface.deinit();
+            try std.testing.expectEqualSlices(u8, pixels, surface.pixels);
+            // All padding changes after the initial snapshot must survive writeback.
+            @memset(backing, 0x9a);
+            @memset(expected, 0x9a);
+            for (surface.pixels) |*byte| byte.* ^= 0x71;
+            try layout.tile(surface.pixels, expected);
+            try surface.write(memory.access());
+            try std.testing.expectEqualSlices(u8, expected, backing);
+        }
+        memory.fail = true;
+        try std.testing.expectError(error.GuestReadFailed, Staged.readPooled(std.testing.allocator, &pool, memory.access(), 0x10000, layout));
+        for (pool.entries) |entry| try std.testing.expect(!entry.busy);
+    };
+    try std.testing.expect(pool.hits > 0);
 }

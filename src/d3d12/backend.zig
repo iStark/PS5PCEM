@@ -11,6 +11,7 @@ const native = @import("root.zig");
 const graphics = @import("graphics.zig");
 const surfaces = @import("surfaces.zig");
 const resources = @import("resources.zig");
+const staging = @import("staging.zig");
 
 pub const Memory = struct {
     context: ?*anyopaque,
@@ -28,6 +29,7 @@ pub const DisplayBuffer = struct {
 pub const Renderer = struct {
     allocator: std.mem.Allocator,
     device: native.Device,
+    staging_pool: staging.Pool,
     memory: Memory,
     failure: ?anyerror = null,
     on_failure: ?*const fn (anyerror) void = null,
@@ -40,10 +42,11 @@ pub const Renderer = struct {
     presented_frames: u64 = 0,
 
     pub fn init(allocator: std.mem.Allocator, memory: Memory, debug: bool) !Renderer {
-        return .{ .allocator = allocator, .memory = memory, .device = try native.Device.init(debug) };
+        return .{ .allocator = allocator, .memory = memory, .device = try native.Device.init(debug), .staging_pool = .{ .allocator = allocator } };
     }
     pub fn deinit(self: *Renderer) void {
         self.device.deinit();
+        self.staging_pool.deinit();
         self.* = undefined;
     }
     pub fn dcbBackend(self: *Renderer) gpu.DcbBackend {
@@ -252,7 +255,7 @@ pub const Renderer = struct {
             draw_state.depth_format = if (depth.format == 1) 55 else 40;
             draw_state.depth_write = @intFromBool(writable);
             draw_state.depth_compare = @as(u32, render.depth_control.compare_function) + 1;
-            depth_surface = try surfaces.Staged.read(self.allocator, self.memory, depth.read_address, layout);
+            depth_surface = try surfaces.Staged.readPooled(self.allocator, &self.staging_pool, self.memory, depth.read_address, layout);
         }
         draw_state.blend = try native.blending.decode(state, render.blends[0]);
         draw_state.vertex_count = if (args.index_bytes == 0) args.count else 0;
@@ -282,7 +285,7 @@ pub const Renderer = struct {
         var ps = try gpu.shader_analysis.decode(self.allocator, self.reader(), ps_bindings.program_address, 4096);
         defer ps.deinit(self.allocator);
         const interface = try graphics.linkInterface(state, vs.program.instructions.items, ps.program.instructions.items);
-        var draw_resources = resources.DrawResources{ .allocator = self.allocator, .reader = self.reader() };
+        var draw_resources = resources.DrawResources{ .allocator = self.allocator, .reader = self.reader(), .pool = &self.staging_pool };
         defer draw_resources.deinit();
         var vs_resources = try draw_resources.capture(&vs_bindings, &vs);
         defer vs_resources.deinit(self.allocator);
@@ -349,7 +352,7 @@ pub const Renderer = struct {
         });
         defer fragment.deinit(self.allocator);
         if (vertex.used_dispatcher or fragment.used_dispatcher) return error.UnboundedControlFlowNotImplemented;
-        var surface = try surfaces.Staged.read(self.allocator, self.memory, target.address, target_layout);
+        var surface = try surfaces.Staged.readPooled(self.allocator, &self.staging_pool, self.memory, target.address, target_layout);
         defer surface.deinit();
         self.device.drawDepthResourcesSpirv(vertex.words, fragment.words, draw_state, indices, draw_resources.buffers.items, draw_resources.images.items, surface.pixels, if (depth_surface) |depth| depth.pixels else &.{}) catch |err| {
             std.debug.print("[d3d12 native draw] viewport={any} scissor={any} indices={d}/{d} mask={d} rgba={d} buffers={d} images={d}\n", .{ draw_state.viewport, draw_state.scissor, draw_state.index_count, indices.len, draw_state.write_mask, surface.pixels.len, draw_resources.buffers.items.len, draw_resources.images.items.len });
@@ -366,7 +369,7 @@ pub const Renderer = struct {
         errdefer std.debug.print("[d3d12 scanout] rejected buffer={any}\n", .{display});
         const swap_red_blue = try surfaces.scanoutSwapsRedBlue(display.pixel_format);
         const layout = try surfaces.scanoutLayout(display.width, display.height, display.pitch_in_pixels, display.tiling_mode);
-        var surface = try surfaces.Staged.read(self.allocator, self.memory, display.address, layout);
+        var surface = try surfaces.Staged.readPooled(self.allocator, &self.staging_pool, self.memory, display.address, layout);
         defer surface.deinit();
         const pixels = surface.pixels;
         if (swap_red_blue) {
@@ -382,6 +385,10 @@ pub const Renderer = struct {
         if (self.cache_report_ns == 0 or now -| self.cache_report_ns >= 5 * std.time.ns_per_s) {
             const cache = self.device.cacheStats();
             const pool = self.device.resourceStats();
+            const scratch = &self.staging_pool;
+            std.debug.print("[d3d12 staging] flip={d} hit={d} miss={d} evict={d} bypass={d} kib={d}/{d}\n", .{
+                self.presented_frames, scratch.hits, scratch.misses, scratch.evictions, scratch.bypasses, scratch.bytes / 1024, scratch.limit / 1024,
+            });
             std.debug.print("[d3d12 resources] flip={d} hit={d} miss={d} evict={d} bypass={d} entries={d} kib={d}/{d} create_ms={d}\n", .{
                 self.presented_frames, pool.hits, pool.misses, pool.evictions, pool.bypasses, pool.entries, pool.bytes / 1024, pool.limit / 1024, pool.create_ms,
             });

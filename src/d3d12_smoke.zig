@@ -444,7 +444,7 @@ fn guestGraphicsProbe(allocator: std.mem.Allocator, device: *d3d12.Device) !void
     try guestViewportDepthProbe(allocator, &vertex_words, &pixel_words);
     try guestVaryingProbe(allocator, &vertex_words);
     try guestFanProbe(allocator);
-    try guestResourcesProbe(allocator);
+    for ([_]usize{ 0, d3d12.staging.Pool.default_limit }) |limit| try guestResourcesProbe(allocator, limit);
     try guestDynamicScalarsProbe(allocator, &vertex_words);
     try guestBlendingProbe(allocator, &vertex_words);
     try guestCacheProbe(allocator, device, vertex.words, fragment.words);
@@ -1351,7 +1351,7 @@ fn guestFanProbe(allocator: std.mem.Allocator) !void {
     std.debug.print("PASS {d} fan GPU cases: auto/8/16/32-bit, first/base vertices, index offsets, custom/fixed restart, both provoking orders, culling, smooth varyings and full-image/padding checks\n", .{cases});
 }
 
-fn guestResourcesProbe(allocator: std.mem.Allocator) !void {
+fn guestResourcesProbe(allocator: std.mem.Allocator, staging_limit: usize) !void {
     var memory = try allocator.create(GraphicsMemory);
     defer allocator.destroy(memory);
     memory.* = .{};
@@ -1401,6 +1401,7 @@ fn guestResourcesProbe(allocator: std.mem.Allocator) !void {
     for (user, 0..) |word, i| try state.writeRegister(.shader, 0x00c + @as(u32, @intCast(i)), word);
     var renderer = try d3d12.Renderer.init(allocator, memory.access(), false);
     defer renderer.deinit();
+    renderer.staging_pool.limit = staging_limit;
     var executor = gpu.DcbExecutor{ .state = &state, .backend = renderer.dcbBackend(), .allocator = allocator };
     for (0..5) |variant| {
         const scale: [4]f32 = if (variant == 1) .{ 0.5, 0.25, 1, 1 } else .{ 1, 1, 1, 1 };
@@ -1454,6 +1455,9 @@ fn guestResourcesProbe(allocator: std.mem.Allocator) !void {
     const rejected = renderer.draw(&state, .{ .kind = .command, .header = command(gpu.pm4.draw_index_auto, 2), .opcode = gpu.pm4.draw_index_auto, .body = &.{ 3, 2 } });
     if (rejected) |_| return error.InvalidGraphicsPointerAccepted else |_| {}
     if (!std.mem.eql(u8, &before, memory.data[0x2000..0x5000])) return error.RejectedDrawModifiedTarget;
+    for (renderer.staging_pool.entries) |entry| if (entry.busy) return error.LeakedStagingLease;
+    if (renderer.staging_pool.bytes > staging_limit or (staging_limit != 0 and renderer.staging_pool.hits == 0)) return error.StagingPoolNotExercised;
+    std.debug.print("PASS CPU staging budget={d} KiB: hits={d} misses={d}, no live leases after rejected draw\n", .{ staging_limit / 1024, renderer.staging_pool.hits, renderer.staging_pool.misses });
     std.debug.print("PASS guest vertex fetch, SMEM pointer and constant buffers, texture arrays, sampler filtering, sRGB, swizzles and failed-read isolation\n", .{});
     std.debug.print("PASS unobserved -1..1 viewport depth preserves the full color image; position-Z consumers remain rejected\n", .{});
 }

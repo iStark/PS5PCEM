@@ -8,6 +8,7 @@ const std = @import("std");
 const gpu = @import("gpu");
 const rdna2 = @import("rdna2");
 const native = @import("root.zig");
+const staging = @import("staging.zig");
 
 pub const Stage = struct {
     buffers: std.ArrayList(rdna2.spirv.StorageBufferBinding) = .empty,
@@ -23,13 +24,15 @@ pub const Stage = struct {
 pub const DrawResources = struct {
     allocator: std.mem.Allocator,
     reader: gpu.ShaderMemoryReader,
+    pool: ?*staging.Pool = null,
+    leases: [96]staging.Lease = undefined,
+    lease_count: usize = 0,
     buffers: std.ArrayList(native.Buffer) = .empty,
     images: std.ArrayList(native.SampledImage) = .empty,
     total: usize = 0,
 
     pub fn deinit(self: *DrawResources) void {
-        for (self.buffers.items) |buffer| self.allocator.free(buffer.bytes[0..buffer.size]);
-        for (self.images.items) |image| self.allocator.free(image.pixels[0..image.size]);
+        for (self.leases[0..self.lease_count]) |*lease| lease.deinit();
         self.buffers.deinit(self.allocator);
         self.images.deinit(self.allocator);
     }
@@ -40,13 +43,18 @@ pub const DrawResources = struct {
         if (self.buffers.items.len >= 64 or bytes_needed > 256 * 1024 * 1024 or
             self.total + bytes_needed > 256 * 1024 * 1024) return error.GraphicsSnapshotBudgetExceeded;
         _ = try std.math.add(u64, address, size);
-        const bytes = try self.allocator.alloc(u8, bytes_needed);
-        errdefer self.allocator.free(bytes);
-        @memset(bytes, 0);
+        var lease = try staging.Lease.alloc(self.allocator, self.pool, bytes_needed);
+        errdefer lease.deinit();
+        const bytes = lease.bytes;
+        // Guest reads and the optional pointer header overwrite their ranges.
+        // Only padding (including the empty-buffer default) needs zeroing.
+        @memset(bytes[header + size ..], 0);
         if (pointer_header) std.mem.writeInt(u64, bytes[0..8], address, .little);
         if (size != 0) try self.reader.read(address, bytes[header..][0..size]);
         const slot: u32 = @intCast(self.buffers.items.len);
         try self.buffers.append(self.allocator, native.Buffer.fromSlice(bytes));
+        self.leases[self.lease_count] = lease;
+        self.lease_count += 1;
         self.total += bytes_needed;
         return slot;
     }
@@ -175,12 +183,14 @@ pub const DrawResources = struct {
         if (self.images.items.len >= 32 or layout.required_source_bytes > 256 * 1024 * 1024 or
             self.total + layout.staging_bytes > 256 * 1024 * 1024) return error.GraphicsSnapshotBudgetExceeded;
         _ = try layout.sourceRange(descriptor.address);
-        const backing = try self.allocator.alloc(u8, @intCast(layout.required_source_bytes));
-        defer self.allocator.free(backing);
+        var backing_lease = try staging.Lease.alloc(self.allocator, self.pool, @intCast(layout.required_source_bytes));
+        defer backing_lease.deinit();
+        const backing = backing_lease.bytes;
         try self.reader.read(descriptor.address, backing);
-        const pixels = try self.allocator.alloc(u8, @intCast(layout.staging_bytes));
+        var pixel_lease = try staging.Lease.alloc(self.allocator, self.pool, @intCast(layout.staging_bytes));
+        const pixels = pixel_lease.bytes;
         var owns_pixels = true;
-        errdefer if (owns_pixels) self.allocator.free(pixels);
+        errdefer if (owns_pixels) pixel_lease.deinit();
         try layout.detile(backing, pixels);
         var components: u32 = 1 << 12;
         for (descriptor.dst_select, 0..) |select, i| {
@@ -219,6 +229,8 @@ pub const DrawResources = struct {
             },
         });
         owns_pixels = false;
+        self.leases[self.lease_count] = pixel_lease;
+        self.lease_count += 1;
         self.total += pixels.len;
         try stage.images.append(self.allocator, .{
             .resource_sgpr = inst.src1.reg,
@@ -264,4 +276,41 @@ fn unnormalizedAddressMode(guest: u8) !u32 {
         6 => 4,
         else => error.GraphicsSamplerAddressModeNotImplemented,
     };
+}
+
+test "pooled graphics snapshots initialize headers, padding and changed guest contents" {
+    const Memory = struct {
+        value: u8 = 0,
+        fail: bool = false,
+        fn read(context: ?*anyopaque, address: u64, bytes: []u8) bool {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            if (self.fail) return false;
+            for (bytes, 0..) |*byte, i| byte.* = @truncate(address + i + self.value);
+            return true;
+        }
+    };
+    var pool = staging.Pool{ .allocator = std.testing.allocator };
+    defer pool.deinit();
+    var memory = Memory{};
+    for (0..3) |iteration| {
+        memory.value = @intCast(iteration * 17);
+        var captured = DrawResources{ .allocator = std.testing.allocator, .pool = &pool, .reader = .{ .context = &memory, .read_fn = Memory.read } };
+        defer captured.deinit();
+        for ([_]bool{ false, true }) |header| for ([_]usize{ 0, 1, 3, 4, 17, 257 }) |size| {
+            const slot = try captured.snapshot(0x1234, size, header);
+            const buffer = captured.buffers.items[slot];
+            const bytes = buffer.bytes[0..buffer.size];
+            const offset: usize = if (header) 8 else 0;
+            if (header) try std.testing.expectEqual(@as(u64, 0x1234), std.mem.readInt(u64, bytes[0..8], .little));
+            for (bytes[offset..][0..size], 0..) |byte, i| try std.testing.expectEqual(@as(u8, @truncate(0x1234 + i + memory.value)), byte);
+            try std.testing.expect(std.mem.allEqual(u8, bytes[offset + size ..], 0));
+        };
+        const count = captured.lease_count;
+        memory.fail = true;
+        try std.testing.expectError(error.MemoryReadFailed, captured.snapshot(0x1234, 8, true));
+        try std.testing.expectEqual(count, captured.lease_count);
+        memory.fail = false;
+    }
+    for (pool.entries) |entry| try std.testing.expect(!entry.busy);
+    try std.testing.expect(pool.hits > 0);
 }
