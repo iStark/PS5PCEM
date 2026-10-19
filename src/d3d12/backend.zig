@@ -27,6 +27,43 @@ pub const DisplayBuffer = struct {
     tiling_mode: u32,
     pixel_format: u64,
 };
+const TargetKey = struct { address: u64, layout: gpu.SurfaceLayout };
+const PreparedDraw = struct {
+    draw: native.Draw,
+    indices: []u8,
+    resources: resources.DrawResources,
+    vertex: rdna2.spirv.Module,
+    fragment: rdna2.spirv.Module,
+    fn deinit(self: *PreparedDraw, allocator: std.mem.Allocator) void {
+        allocator.free(self.indices);
+        self.resources.deinit();
+        self.vertex.deinit(allocator);
+        self.fragment.deinit(allocator);
+    }
+};
+const PendingDraws = struct {
+    color: surfaces.Staged,
+    depth: ?surfaces.Staged,
+    color_key: TargetKey,
+    depth_key: ?TargetKey,
+    draws: [native.max_draw_batch]PreparedDraw = undefined,
+    count: usize = 0,
+    bytes: usize = 0,
+    depth_write: bool = false,
+    fn deinit(self: *PendingDraws, allocator: std.mem.Allocator) void {
+        for (self.draws[0..self.count]) |*draw| draw.deinit(allocator);
+        self.color.deinit();
+        if (self.depth) |*depth| depth.deinit();
+    }
+    fn overlaps(self: *const PendingDraws, address: u64, size: usize) bool {
+        if (size == 0) return false;
+        const end = address +| size;
+        if (address < self.color.address + self.color.backing.len and self.color.address < end) return true;
+        if (self.depth) |depth| if (address < depth.address + depth.backing.len and depth.address < end) return true;
+        return false;
+    }
+};
+
 pub const Renderer = struct {
     allocator: std.mem.Allocator,
     device: native.Device,
@@ -42,11 +79,21 @@ pub const Renderer = struct {
     frame_started_ns: u64 = 0,
     cache_report_ns: u64 = 0,
     presented_frames: u64 = 0,
+    // One retains the immediate API contract for direct users. The runner can
+    // opt into bounded grouping; no guest bytes are used as a validity stamp.
+    draw_batch_limit: usize = 1,
+    pending_draws: ?PendingDraws = null,
+    batch_groups: u64 = 0,
+    batch_draws: u64 = 0,
+    batch_hazards: u64 = 0,
+    const draw_batch_bytes = 128 * 1024 * 1024;
 
     pub fn init(allocator: std.mem.Allocator, memory: Memory, debug: bool) !Renderer {
         return .{ .allocator = allocator, .memory = memory, .device = try native.Device.init(debug), .staging_pool = .{ .allocator = allocator }, .conversion_cache = .{ .allocator = allocator } };
     }
     pub fn deinit(self: *Renderer) void {
+        // Teardown does not publish unfinished work or acknowledge its labels.
+        if (self.pending_draws) |*pending| pending.deinit(self.allocator);
         self.device.deinit();
         self.conversion_cache.deinit();
         self.staging_pool.deinit();
@@ -56,7 +103,7 @@ pub const Renderer = struct {
         return .{ .context = self, .vtable = &vtable };
     }
     fn reader(self: *Renderer) gpu.ShaderMemoryReader {
-        return .{ .context = self.memory.context, .read_fn = self.memory.read };
+        return .{ .context = self, .read_fn = read };
     }
     fn from(context: ?*anyopaque) *Renderer {
         return @ptrCast(@alignCast(context.?));
@@ -71,11 +118,73 @@ pub const Renderer = struct {
     }
     fn read(context: ?*anyopaque, address: u64, bytes: []u8) bool {
         const self = from(context);
-        return self.failure == null and self.memory.read(self.memory.context, address, bytes);
+        if (self.failure != null) return false;
+        if (self.pending_draws) |*pending| if (pending.overlaps(address, bytes.len)) {
+            self.batch_hazards += 1;
+            self.flushDraws() catch |err| return self.rejected("draw dependency", err);
+        };
+        return self.memory.read(self.memory.context, address, bytes);
     }
     fn write(context: ?*anyopaque, address: u64, bytes: []const u8) bool {
         const self = from(context);
-        return self.failure == null and self.memory.write(self.memory.context, address, bytes);
+        if (!drain(context)) return false;
+        return self.memory.write(self.memory.context, address, bytes);
+    }
+    fn readLive(context: ?*anyopaque, address: u64, bytes: []u8) bool {
+        if (!drain(context)) return false;
+        const self = from(context);
+        return self.memory.read(self.memory.context, address, bytes);
+    }
+    fn drain(context: ?*anyopaque) bool {
+        const self = from(context);
+        if (self.failure != null) return false;
+        self.flushDraws() catch |err| return self.rejected("draw completion", err);
+        return true;
+    }
+    fn acquire(context: ?*anyopaque, _: gpu.state.AcquireMem) bool {
+        return drain(context);
+    }
+    fn event(context: ?*anyopaque, _: gpu.state.EventWrite) bool {
+        return drain(context);
+    }
+    fn release(context: ?*anyopaque, value: gpu.state.ReleaseMem) bool {
+        if (!drain(context)) return false;
+        // Preserve the executor's existing immediate-value release semantics,
+        // including releases that only carry an interrupt and no memory write.
+        const self = from(context);
+        if ((value.destination == 0 or value.destination == 1) and value.address != 0) {
+            var data: [8]u8 = undefined;
+            std.mem.writeInt(u64, &data, value.data, .little);
+            const size: usize = switch (value.data_selection) {
+                1 => 4,
+                2 => 8,
+                else => 0,
+            };
+            if (size != 0) return self.memory.write(self.memory.context, value.address, data[0..size]);
+        }
+        return true;
+    }
+    pub fn flushDraws(self: *Renderer) anyerror!void {
+        if (self.failure) |err| return err;
+        const pending = if (self.pending_draws) |*value| value else return;
+        defer {
+            pending.deinit(self.allocator);
+            self.pending_draws = null;
+        }
+        var jobs: [native.max_draw_batch]native.DrawJob = undefined;
+        for (pending.draws[0..pending.count], jobs[0..pending.count]) |*prepared, *job| job.* = .{
+            .vertex = prepared.vertex.words,
+            .fragment = prepared.fragment.words,
+            .draw = prepared.draw,
+            .indices = prepared.indices,
+            .buffers = prepared.resources.buffers.items,
+            .images = prepared.resources.images.items,
+        };
+        try self.device.drawBatchSpirv(jobs[0..pending.count], pending.color.pixels, if (pending.depth) |depth| depth.pixels else &.{});
+        try pending.color.write(self.memory);
+        if (pending.depth_write) if (pending.depth) |*depth| try depth.write(self.memory);
+        self.batch_groups += 1;
+        self.batch_draws += pending.count;
     }
     fn dispatchCallback(context: ?*anyopaque, state: *const gpu.State, packet: gpu.pm4.Packet) bool {
         const self = from(context);
@@ -146,14 +255,19 @@ pub const Renderer = struct {
     const vtable = gpu.DcbBackend.VTable{
         .read = read,
         .write = write,
-        .read_live = read,
-        .read_wait = read,
+        .read_live = readLive,
+        .read_wait = readLive,
+        .drain_releases = drain,
+        .acquire = acquire,
+        .release = release,
+        .event = event,
         .dispatch = dispatchCallback,
         .draw = drawCallback,
         .flip = flipCallback,
     };
 
     pub fn dispatch(self: *Renderer, state: *const gpu.State, packet: gpu.pm4.Packet) !void {
+        try self.flushDraws();
         if (packet.opcode != gpu.pm4.dispatch_direct or packet.body.len < 3) return error.UnsupportedDispatchPacket;
         const local = [3]u32{
             @max(1, state.readRegister(.shader, 0x207) orelse 1),
@@ -246,8 +360,7 @@ pub const Renderer = struct {
         if (render.raster.rasterizer_discard or render.raster.polygon_mode != 0 or render.raster.depth_bias_front or render.raster.depth_bias_back or (render.raster.cull_front and render.raster.cull_back)) return error.UnsupportedRasterState;
         const topology = try graphics.nativeTopology(render.primitive_type);
         var draw_state = try native.Draw.fullTarget(target.width, target.height);
-        var depth_surface: ?surfaces.Staged = null;
-        defer if (depth_surface) |*depth| depth.deinit();
+        var depth_key: ?TargetKey = null;
         if (render.depth_control.test_enabled) {
             const depth = render.depth_target orelse return error.MissingDepthTarget;
             const writable = render.depth_control.write_enabled and !depth.depth_read_only;
@@ -258,15 +371,16 @@ pub const Renderer = struct {
             draw_state.depth_format = if (depth.format == 1) 55 else 40;
             draw_state.depth_write = @intFromBool(writable);
             draw_state.depth_compare = @as(u32, render.depth_control.compare_function) + 1;
-            depth_surface = try surfaces.Staged.readCached(self.allocator, &self.staging_pool, &self.conversion_cache, self.memory, depth.read_address, layout);
+            depth_key = .{ .address = depth.read_address, .layout = layout };
         }
         draw_state.blend = try native.blending.decode(state, render.blends[0]);
         draw_state.vertex_count = if (args.index_bytes == 0) args.count else 0;
         draw_state.instance_count = state.instance_count;
         draw_state.first_vertex = state.readRegister(.uconfig, 0x24a) orelse 0;
         draw_state.topology = topology;
-        const indices = try args.stage(self.allocator, self.memory, state, &draw_state, render.primitive_type);
-        defer self.allocator.free(indices);
+        var queued = false;
+        const indices = try args.stage(self.allocator, .{ .context = self, .read = read, .write = write }, state, &draw_state, render.primitive_type);
+        defer if (!queued) self.allocator.free(indices);
         if (render.primitive_type == 5 and indices.len == 0) return;
         draw_state.cull_mode = if (render.raster.cull_front) 2 else if (render.raster.cull_back) 3 else 1;
         draw_state.front_ccw = @intFromBool(!render.raster.clockwise_front_face);
@@ -289,7 +403,7 @@ pub const Renderer = struct {
         defer ps.deinit(self.allocator);
         const interface = try graphics.linkInterface(state, vs.program.instructions.items, ps.program.instructions.items);
         var draw_resources = resources.DrawResources{ .allocator = self.allocator, .reader = self.reader(), .pool = &self.staging_pool, .cache = &self.conversion_cache };
-        defer draw_resources.deinit();
+        defer if (!queued) draw_resources.deinit();
         var vs_resources = try draw_resources.capture(&vs_bindings, &vs);
         defer vs_resources.deinit(self.allocator);
         var ps_resources = try draw_resources.capture(&ps_bindings, &ps);
@@ -328,7 +442,7 @@ pub const Renderer = struct {
             .descriptor_array_length = @intCast(@max(1, draw_resources.buffers.items.len)),
             .sampled_image_array_length = @intCast(@max(1, draw_resources.images.items.len)),
         });
-        defer vertex.deinit(self.allocator);
+        defer if (!queued) vertex.deinit(self.allocator);
         var fragment = try ps.translateSpirv(self.allocator, .{
             .stage = .fragment,
             .wave32 = routing.fragment_wave32,
@@ -353,20 +467,33 @@ pub const Renderer = struct {
                 .front_face_all_bits = ((state.readRegister(.context, 0x1b8) orelse 0) & (1 << 24)) != 0,
             },
         });
-        defer fragment.deinit(self.allocator);
+        defer if (!queued) fragment.deinit(self.allocator);
         if (vertex.used_dispatcher or fragment.used_dispatcher) return error.UnboundedControlFlowNotImplemented;
-        var surface = try surfaces.Staged.readCached(self.allocator, &self.staging_pool, &self.conversion_cache, self.memory, target.address, target_layout);
-        defer surface.deinit();
-        self.device.drawDepthResourcesSpirv(vertex.words, fragment.words, draw_state, indices, draw_resources.buffers.items, draw_resources.images.items, surface.pixels, if (depth_surface) |depth| depth.pixels else &.{}) catch |err| {
-            std.debug.print("[d3d12 native draw] viewport={any} scissor={any} indices={d}/{d} mask={d} rgba={d} buffers={d} images={d}\n", .{ draw_state.viewport, draw_state.scissor, draw_state.index_count, indices.len, draw_state.write_mask, surface.pixels.len, draw_resources.buffers.items.len, draw_resources.images.items.len });
-            for (draw_resources.images.items) |image| std.debug.print("[d3d12 sampled image] {d}x{d} bytes={d} filter=0x{x} lod={d}..{d} bias={d} address={d}/{d}/{d}\n", .{ image.width, image.height, image.size, image.filter, image.min_lod, image.max_lod, image.lod_bias, image.address_u, image.address_v, image.address_w });
-            return err;
-        };
-        try surface.write(self.memory);
-        if (draw_state.depth_write != 0) if (depth_surface) |*depth| try depth.write(self.memory);
+        const color_key = TargetKey{ .address = target.address, .layout = target_layout };
+        const owned_bytes = draw_resources.total + indices.len + 4 * (vertex.words.len + fragment.words.len);
+        if (self.pending_draws) |*pending| {
+            if (!std.meta.eql(pending.color_key, color_key) or !std.meta.eql(pending.depth_key, depth_key) or
+                pending.count >= @min(native.max_draw_batch, @max(1, self.draw_batch_limit)) or
+                pending.bytes + owned_bytes > draw_batch_bytes) try self.flushDraws();
+        }
+        if (self.pending_draws == null) {
+            var color = try surfaces.Staged.readCached(self.allocator, &self.staging_pool, &self.conversion_cache, self.memory, target.address, target_layout);
+            errdefer color.deinit();
+            var depth: ?surfaces.Staged = null;
+            if (depth_key) |key| depth = try surfaces.Staged.readCached(self.allocator, &self.staging_pool, &self.conversion_cache, self.memory, key.address, key.layout);
+            self.pending_draws = .{ .color = color, .depth = depth, .color_key = color_key, .depth_key = depth_key };
+        }
+        const pending = &self.pending_draws.?;
+        pending.draws[pending.count] = .{ .draw = draw_state, .indices = indices, .resources = draw_resources, .vertex = vertex, .fragment = fragment };
+        pending.count += 1;
+        pending.bytes += owned_bytes;
+        pending.depth_write = pending.depth_write or draw_state.depth_write != 0;
+        queued = true;
+        if (pending.count >= @min(native.max_draw_batch, @max(1, self.draw_batch_limit)) or pending.bytes >= draw_batch_bytes) try self.flushDraws();
     }
 
     pub fn present(self: *Renderer, flip: gpu.state.Flip) !void {
+        try self.flushDraws();
         const resolve = self.display_resolver orelse return error.DisplayResolverUnavailable;
         const display = resolve(flip) orelse return error.DisplayBufferUnavailable;
         errdefer std.debug.print("[d3d12 scanout] rejected buffer={any}\n", .{display});
@@ -386,6 +513,9 @@ pub const Renderer = struct {
         const now = gpu.frame_timing.timestampNs();
         self.presented_frames +|= 1;
         if (self.cache_report_ns == 0 or now -| self.cache_report_ns >= 5 * std.time.ns_per_s) {
+            std.debug.print("[d3d12 batches] flip={d} limit={d} draws={d} groups={d} hazards={d}\n", .{
+                self.presented_frames, self.draw_batch_limit, self.batch_draws, self.batch_groups, self.batch_hazards,
+            });
             const cache = self.device.cacheStats();
             const pool = self.device.resourceStats();
             const attachments = self.device.attachmentStats();

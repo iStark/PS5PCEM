@@ -225,6 +225,29 @@ fn guestCommandProbe(allocator: std.mem.Allocator, vertex_words: []const u32, pi
         }
     }
     const before = memory.data;
+    renderer.draw_batch_limit = 8;
+    const batch_backend = renderer.dcbBackend();
+    for (0..6) |boundary| {
+        memory.data = initial;
+        for (0..3) |_| _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 2 });
+        if (!std.mem.eql(u8, &memory.data, &initial)) return error.BatchPublishedBeforeBoundary;
+        var observed: [4]u8 = undefined;
+        if (!batch_backend.vtable.read(batch_backend.context, 0x600, &observed) or renderer.pending_draws == null) return error.UnrelatedReadFlushedBatch;
+        switch (boundary) {
+            0 => if (!batch_backend.vtable.read(batch_backend.context, center, &observed)) return error.BatchFeedbackReadFailed,
+            1 => if (!batch_backend.vtable.read_wait.?(batch_backend.context, 0x600, &observed)) return error.BatchWaitFailed,
+            2 => if (!batch_backend.vtable.drain_releases.?(batch_backend.context)) return error.BatchDrainFailed,
+            3 => if (!batch_backend.vtable.write(batch_backend.context, 0x600, &.{ 1, 2, 3, 4 })) return error.BatchWriteFailed,
+            4 => _ = try executor.execute(&.{ command(gpu.pm4.release_mem, 7), 0, 1 << 29, 0x600, 0, 0x1234, 0, 0 }),
+            5 => if (!batch_backend.vtable.read_live.?(batch_backend.context, 0x600, &observed)) return error.BatchLiveReadFailed,
+            else => unreachable,
+        }
+        if (renderer.pending_draws != null or !std.mem.eql(u8, memory.data[0x2000..], before[0x2000..])) return error.BatchBoundaryImageMismatch;
+        if (boundary == 4 and std.mem.readInt(u32, memory.data[0x600..][0..4], .little) != 0x1234) return error.BatchReleaseLabelMissing;
+    }
+    renderer.draw_batch_limit = 1;
+    memory.data = before;
+    std.debug.print("PASS queued PM4 draws: target feedback, wait/live reads, guest writes, release labels and submission drain publish completed pixels; unrelated reads preserve the group\n", .{});
     // Use the actual Raiden routing (ES program / GS USER_DATA / NGG
     // passthrough), with a deliberately stale legacy VS bank. The shader
     // consumes USER_DATA[0] at s8 and merged wave info at s3; either wrong bank
@@ -453,6 +476,87 @@ fn guestGraphicsProbe(allocator: std.mem.Allocator, device: *d3d12.Device) !void
     try guestResourcePoolProbe(allocator, device, vertex.words, fragment.words);
     try guestUploadPressureProbe(device, vertex.words, fragment.words);
     try guestAttachmentProbe(allocator, device, vertex.words, fragment.words);
+    try guestBatchProbe(device, vertex.words, fragment.words);
+}
+
+fn guestBatchProbe(device: *d3d12.Device, vertex: []const u32, fragment: []const u32) !void {
+    const saved_pool = device.resourceStats().limit;
+    defer device.resourcePoolLimit(saved_pool) catch {};
+    for ([_]u64{ 0, 256 * 1024 * 1024, 256 * 1024 }) |budget| {
+        try device.resourcePoolLimit(budget);
+        for (0..6) |variant| {
+            const width: u32 = if (variant % 2 == 0) 65 else 128;
+            const height: u32 = 37;
+            var initial_color: [128 * 37 * 4]u8 = undefined;
+            for (&initial_color, 0..) |*byte, i| byte.* = @truncate(i *% 37 + variant *% 19);
+            var initial_depth: [128 * 37 * 4]u8 = @splat(0xff);
+            const format: u32 = ([_]u32{ 0, 55, 40 })[variant / 2];
+            if (format == 40) for (0..initial_depth.len / 4) |i| std.mem.writeInt(u32, initial_depth[i * 4 ..][0..4], @bitCast(@as(f32, 1)), .little);
+            const color_size = width * height * 4;
+            const depth_size = try d3d12.depthSize(width, height, format);
+            var jobs: [8]d3d12.DrawJob = undefined;
+            for (&jobs, 0..) |*job, i| {
+                var draw = try d3d12.Draw.fullTarget(width, height);
+                draw.depth_format = format;
+                draw.depth_write = @intFromBool(format != 0 and i % 3 == 1);
+                draw.depth_compare = if (i % 2 == 0) 4 else 2;
+                draw.scissor[0] = @intCast(i * 3);
+                draw.scissor[2] -= @intCast(i);
+                draw.write_mask = @intCast(1 + i % 7);
+                draw.blend.enabled = 1;
+                draw.blend.source_color = 14; // Per-draw blend factor.
+                draw.blend.destination_color = 15;
+                draw.blend.constants = @splat(@as(f32, @floatFromInt(i + 1)) / 9);
+                job.* = .{ .vertex = vertex, .fragment = fragment, .draw = draw };
+            }
+            for (1..9) |count| {
+                var sequential = initial_color;
+                var reference_depth = initial_depth;
+                for (jobs[0..count]) |job| try device.drawDepthResourcesSpirv(job.vertex, job.fragment, job.draw, &.{}, &.{}, &.{}, sequential[0..color_size], reference_depth[0..depth_size]);
+                var batched = initial_color;
+                var depth = initial_depth;
+                try device.drawBatchSpirv(jobs[0..count], batched[0..color_size], depth[0..depth_size]);
+                if (!std.mem.eql(u8, &sequential, &batched) or !std.mem.eql(u8, &reference_depth, &depth)) return error.NativeBatchImageMismatch;
+            }
+            var output = initial_color;
+            var depth = initial_depth;
+            const good = jobs[1];
+            // Structurally valid SPIR-V header, malformed shader body: fail in
+            // native compilation after the first draw has been recorded.
+            jobs[1].fragment = &.{ 0x07230203, 0x10000, 0, 1, 0, 0 };
+            if (device.drawBatchSpirv(jobs[0..2], output[0..color_size], depth[0..depth_size])) |_| return error.InvalidBatchShaderAccepted else |_| {}
+            if (!std.mem.eql(u8, &initial_color, &output) or !std.mem.eql(u8, &initial_depth, &depth)) return error.FailedBatchPublishedPixels;
+            jobs[1] = good;
+            try device.drawBatchSpirv(jobs[0..2], output[0..color_size], depth[0..depth_size]);
+            if (device.resourceStats().bytes > budget) return error.BatchPoolBudgetExceeded;
+        }
+    }
+    // A full group may hold 1,536 small input resources concurrently. It
+    // must not thrash the object slots while well below the byte budget.
+    try device.resourcePoolLimit(256 * 1024 * 1024);
+    const cache_enabled = device.cacheStats().enabled != 0;
+    defer device.cacheLimits(if (cache_enabled) 256 else 0, if (cache_enabled) 512 else 0) catch {};
+    try device.cacheLimits(2, 2); // Evict PSOs while earlier recorded draws own refs.
+    var data: [256]u8 = @splat(0x53);
+    const buffers: [64]d3d12.Buffer = @splat(d3d12.Buffer.fromSlice(&data));
+    const images: [32]d3d12.SampledImage = @splat(.{ .pixels = &data, .size = data.len, .width = 8, .height = 8 });
+    var jobs: [8]d3d12.DrawJob = undefined;
+    for (&jobs, 0..) |*job, i| {
+        var draw = try d3d12.Draw.fullTarget(65, 37);
+        draw.write_mask = @intCast(i + 1);
+        job.* = .{ .vertex = vertex, .fragment = fragment, .draw = draw, .buffers = &buffers, .images = &images };
+    }
+    var color: [65 * 37 * 4]u8 = @splat(0);
+    try device.drawBatchSpirv(&jobs, &color, &.{});
+    const reference = color;
+    const warm = device.resourceStats();
+    @memset(&color, 0);
+    try device.drawBatchSpirv(&jobs, &color, &.{});
+    const after = device.resourceStats();
+    if (!std.mem.eql(u8, &color, &reference) or warm.entries <= 256 or after.entries > 2048 or
+        after.bytes > 256 * 1024 * 1024 or after.misses != warm.misses or after.bypasses != warm.bypasses) return error.BatchCapacityThrashing;
+    std.debug.print("PASS full batch occupancy: {d} resources / {d} KiB, zero warm allocations/bypasses, PSO eviction preserves recorded object lifetime\n", .{ after.entries, after.bytes / 1024 });
+    std.debug.print("PASS batched graphics: 144 full color/depth comparisons, 1..8 draws, D16/D32, read/write depth, padded/contiguous rows, blend/scissor/mask changes, pool pressure and recovery after invalid second shader\n", .{});
 }
 
 fn guestAttachmentProbe(allocator: std.mem.Allocator, device: *d3d12.Device, vertex: []const u32, fragment: []const u32) !void {
@@ -614,7 +718,7 @@ fn guestResourcePoolProbe(allocator: std.mem.Allocator, device: *d3d12.Device, v
             } else if (!std.mem.eql(u8, reference[variant][0..max_bytes], &color) or
                 !std.mem.eql(u8, reference[variant][max_bytes..], &depth)) return error.ResourcePoolImageMismatch;
             const stats = device.resourceStats();
-            if (stats.bytes > limit or stats.entries > 256) return error.ResourcePoolBudgetExceeded;
+            if (stats.bytes > limit or stats.entries > 2048) return error.ResourcePoolBudgetExceeded;
         }
         const after = device.resourceStats();
         if (pass == 1 and after.hits == before.hits) return error.ResourcePoolNotReused;
@@ -1547,6 +1651,31 @@ fn guestResourcesProbe(allocator: std.mem.Allocator, staging_limit: usize, uploa
         }
     }
     if (!std.mem.eql(u8, memory.data[0x1000..][0..@sizeOf(@TypeOf(positions))], std.mem.asBytes(&positions))) return error.ReadOnlyVertexDataModified;
+    const saved_state = state;
+    const saved_memory = memory.*;
+    var batch_reference: [0x3000]u8 = undefined;
+    for ([_]usize{ 1, 8 }) |batch_limit| {
+        state = saved_state;
+        memory.* = saved_memory;
+        @memset(memory.data[0x2000..0x5000], 0);
+        renderer.draw_batch_limit = batch_limit;
+        for (0..7) |i| {
+            // Reuse the same guest addresses with different data between draws.
+            // Each queued snapshot must keep its own vertex/texture/uniform bytes.
+            const scale = [_]f32{ @as(f32, @floatFromInt(i + 1)) / 8, 1, 0.5, 1 };
+            @memcpy(memory.data[0x1900..][0..16], std.mem.asBytes(&scale));
+            @memset(memory.data[0x10000..][0..8], @intCast(31 * i));
+            try state.writeRegister(.context, 0x00c, @as(u32, @intCast(i * 5)));
+            try state.writeRegister(.context, 0x00d, 65 | (37 << 16));
+            _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 2 });
+        }
+        try renderer.flushDraws();
+        if (batch_limit == 1) batch_reference = memory.data[0x2000..0x5000].* else if (!std.mem.eql(u8, &batch_reference, memory.data[0x2000..0x5000])) return error.BatchResourceSnapshotMismatch;
+    }
+    renderer.draw_batch_limit = 1;
+    memory.* = saved_memory;
+    state = saved_state;
+    std.debug.print("PASS queued resource snapshots: seven changing sampled/uniform inputs match sequential rendering\n", .{});
     const baseline = memory.data[0x2000..0x5000].*;
     for ([_]f32{ 32.5, 32.5, -18.5, 18.5, 1, 0 }, 0..) |value, i| try state.writeRegister(.context, 0x10f + @as(u32, @intCast(i)), @bitCast(value));
     @memset(memory.data[0x2000..0x5000], 0);

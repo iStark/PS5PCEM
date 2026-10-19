@@ -969,6 +969,11 @@ fn run(init: std.process.Init) !bool {
             .write = runtime.firmware.libs.agc_submit.writeGuestMemory,
         }, init.minimal.environ.containsUnempty(allocator, "PS5_D3D12_VALIDATION") catch false);
         const directx = &directx_renderer.?;
+        directx.draw_batch_limit = d3d12.max_draw_batch;
+        if (init.minimal.environ.getAlloc(allocator, "PS5_D3D12_DRAW_BATCH")) |value| {
+            defer allocator.free(value);
+            directx.draw_batch_limit = std.math.clamp(std.fmt.parseInt(usize, value, 10) catch 1, 1, d3d12.max_draw_batch);
+        } else |_| {}
         if (init.minimal.environ.getAlloc(allocator, "PS5_D3D12_SURFACE_CACHE")) |value| {
             defer allocator.free(value);
             if (std.mem.eql(u8, value, "0")) directx.conversion_cache.limit = 0;

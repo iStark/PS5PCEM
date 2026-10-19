@@ -8,7 +8,9 @@ const std = @import("std");
 
 pub const Pool = struct {
     pub const default_limit = 256 * 1024 * 1024;
-    pub const slot_count = 128;
+    // Eight draws can retain up to 96 independent input snapshots each.
+    // Object slots scale with that lifetime; the byte budget is unchanged.
+    pub const slot_count = 1024;
     const Entry = struct { bytes: []u8 = &.{}, busy: bool = false, stamp: u64 = 0 };
     allocator: std.mem.Allocator,
     limit: usize = default_limit,

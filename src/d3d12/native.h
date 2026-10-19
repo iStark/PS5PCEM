@@ -65,6 +65,19 @@ typedef struct Ps5D3D12Draw {
     uint32_t scalar_values[129]; /* VS 0..64, PS 65..128; binding 10. */
 } Ps5D3D12Draw;
 
+/* A bounded group shares attachments; all per-draw inputs remain immutable
+ * until the single synchronous call returns. */
+typedef struct Ps5D3D12DrawJob {
+    const uint32_t *vertex; size_t vertex_count;
+    const uint32_t *fragment; size_t fragment_count;
+    const Ps5D3D12Draw *draw;
+    const uint8_t *indices; size_t index_bytes;
+    const Ps5D3D12Buffer *buffers; uint32_t buffer_count;
+    const Ps5D3D12Image *images; uint32_t image_count;
+} Ps5D3D12DrawJob;
+int32_t ps5_d3d12_draw_batch(Ps5D3D12 *context, const Ps5D3D12DrawJob *jobs, uint32_t count,
+    uint8_t *rgba, uint8_t *depth, size_t depth_bytes);
+
 /* HRESULTs and the operation name are preserved; a failure never falls back
  * to another rendering API or silently accepts an unexecuted command. */
 int32_t ps5_d3d12_create(Ps5D3D12 **out, Ps5D3D12Info *info, int debug, char *error, size_t error_size);

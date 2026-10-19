@@ -279,6 +279,25 @@ pub const Device = struct {
     }
 
     pub fn drawDepthResourcesSpirv(self: *Device, vertex: []const u32, fragment: []const u32, draw: Draw, indices: []const u8, buffers: []const Buffer, images: []const SampledImage, rgba: []u8, depth: []u8) Error!void {
+        try validateDraw(vertex, fragment, draw, indices, buffers, images, rgba, depth);
+        if (builtin.os.tag != .windows) return error.UnsupportedPlatform;
+        try self.check(ps5_d3d12_draw_spirv(self.handle, vertex.ptr, vertex.len, fragment.ptr, fragment.len, &draw, indices.ptr, indices.len, buffers.ptr, @intCast(buffers.len), images.ptr, @intCast(images.len), rgba.ptr, depth.ptr, depth.len));
+    }
+
+    pub fn drawBatchSpirv(self: *Device, jobs: []const DrawJob, rgba: []u8, depth: []u8) Error!void {
+        if (jobs.len == 0 or jobs.len > max_draw_batch) return error.InvalidArgument;
+        var native_jobs: [max_draw_batch]NativeDrawJob = undefined;
+        for (jobs, native_jobs[0..jobs.len]) |*job, *out| {
+            if (job.draw.width != jobs[0].draw.width or job.draw.height != jobs[0].draw.height or
+                job.draw.depth_format != jobs[0].draw.depth_format) return error.InvalidArgument;
+            try validateDraw(job.vertex, job.fragment, job.draw, job.indices, job.buffers, job.images, rgba, depth);
+            out.* = .{ .vertex = job.vertex.ptr, .vertex_count = job.vertex.len, .fragment = job.fragment.ptr, .fragment_count = job.fragment.len, .draw = &job.draw, .indices = job.indices.ptr, .index_bytes = job.indices.len, .buffers = job.buffers.ptr, .buffer_count = @intCast(job.buffers.len), .images = job.images.ptr, .image_count = @intCast(job.images.len) };
+        }
+        if (builtin.os.tag != .windows) return error.UnsupportedPlatform;
+        try self.check(ps5_d3d12_draw_batch(self.handle, &native_jobs, @intCast(jobs.len), rgba.ptr, depth.ptr, depth.len));
+    }
+
+    fn validateDraw(vertex: []const u32, fragment: []const u32, draw: Draw, indices: []const u8, buffers: []const Buffer, images: []const SampledImage, rgba: []u8, depth: []u8) Error!void {
         if (draw.dynamic_scalars > 1) return error.InvalidArgument;
         if (depth.len != try depthSize(draw.width, draw.height, draw.depth_format) or draw.depth_write > 1 or draw.depth_clip_enabled > 1 or
             draw.depth_compare < 1 or draw.depth_compare > 8 or (draw.depth_format == 0 and draw.depth_write != 0)) return error.InvalidArgument;
@@ -304,8 +323,6 @@ pub const Device = struct {
         for (draw.viewport) |value| if (!std.math.isFinite(value)) return error.InvalidArgument;
         if (draw.viewport[2] <= 0 or draw.viewport[3] <= 0 or draw.viewport[4] < 0 or draw.viewport[5] > 1 or draw.viewport[4] > draw.viewport[5] or
             draw.scissor[0] < 0 or draw.scissor[1] < 0 or draw.scissor[2] < draw.scissor[0] or draw.scissor[3] < draw.scissor[1]) return error.InvalidArgument;
-        if (builtin.os.tag != .windows) return error.UnsupportedPlatform;
-        try self.check(ps5_d3d12_draw_spirv(self.handle, vertex.ptr, vertex.len, fragment.ptr, fragment.len, &draw, indices.ptr, indices.len, buffers.ptr, @intCast(buffers.len), images.ptr, @intCast(images.len), rgba.ptr, depth.ptr, depth.len));
     }
 
     pub fn presentRgba(self: *Device, rgba: []const u8, width: u32, height: u32) Error!void {
@@ -314,6 +331,30 @@ pub const Device = struct {
         try self.check(ps5_d3d12_present_rgba(self.handle, rgba.ptr, width, height));
     }
 };
+
+pub const max_draw_batch = 8;
+pub const DrawJob = struct {
+    vertex: []const u32,
+    fragment: []const u32,
+    draw: Draw,
+    indices: []const u8 = &.{},
+    buffers: []const Buffer = &.{},
+    images: []const SampledImage = &.{},
+};
+const NativeDrawJob = extern struct {
+    vertex: [*]const u32,
+    vertex_count: usize,
+    fragment: [*]const u32,
+    fragment_count: usize,
+    draw: *const Draw,
+    indices: [*]const u8,
+    index_bytes: usize,
+    buffers: [*]const Buffer,
+    buffer_count: u32,
+    images: [*]const SampledImage,
+    image_count: u32,
+};
+extern fn ps5_d3d12_draw_batch(*Handle, [*]const NativeDrawJob, u32, [*]u8, [*]u8, usize) i32;
 
 pub fn rgbaSize(width: u32, height: u32) Error!usize {
     if (width == 0 or height == 0 or width > 16384 or height > 16384) return error.InvalidArgument;
