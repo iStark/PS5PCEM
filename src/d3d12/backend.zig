@@ -299,6 +299,10 @@ pub const Renderer = struct {
             vs_scalar[vs_scalar_count] = .{ .register = 3, .value = if (routing.vertex_wave32) 0x2020 else 0x4040 };
             vs_scalar_count += 1;
         }
+        const ps_scalar_count = entryScalars(ps_bindings, &ps_scalar);
+        draw_state.dynamic_scalars = 1;
+        for (vs_scalar[0..vs_scalar_count], 0..) |scalar, i| draw_state.scalar_values[i] = scalar.value;
+        for (ps_scalar[0..ps_scalar_count], 0..) |scalar, i| draw_state.scalar_values[65 + i] = scalar.value;
         var vertex = try vs.translateSpirv(self.allocator, .{
             .stage = .vertex,
             .wave32 = routing.vertex_wave32,
@@ -308,6 +312,7 @@ pub const Renderer = struct {
             .convert_negative_one_to_one_depth = !render.raster.zero_to_one_depth and depth_transform == null,
             .vertex_depth_transform = depth_transform,
             .scalar_registers = vs_scalar[0..vs_scalar_count],
+            .dynamic_scalar_binding = .{ .binding = 10 },
             .allow_control_flow_fallback = false,
             .parameter_mask = interface.mask,
             .vertex_parameter_sources = &interface.controls,
@@ -324,7 +329,8 @@ pub const Renderer = struct {
             .scalarize_ballot_first = true,
             .program_address = ps_bindings.program_address,
             .fragment_extent = .{ target.width, target.height },
-            .scalar_registers = ps_scalar[0..entryScalars(ps_bindings, &ps_scalar)],
+            .scalar_registers = ps_scalar[0..ps_scalar_count],
+            .dynamic_scalar_binding = .{ .binding = 10, .value_base = 65 },
             .allow_control_flow_fallback = false,
             .parameter_mask = interface.mask,
             .fragment_input_controls = &interface.controls,

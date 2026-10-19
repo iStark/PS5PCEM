@@ -49,6 +49,8 @@ typedef struct Ps5D3D12Draw {
     uint32_t depth_format, depth_write, depth_compare, depth_clip_enabled;
     float viewport[6];
     int32_t scissor[4];
+    uint32_t dynamic_scalars;
+    uint32_t scalar_values[129]; /* VS 0..64, PS 65..128; binding 10. */
 } Ps5D3D12Draw;
 
 /* HRESULTs and the operation name are preserved; a failure never falls back

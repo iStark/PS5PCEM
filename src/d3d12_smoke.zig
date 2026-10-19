@@ -445,8 +445,64 @@ fn guestGraphicsProbe(allocator: std.mem.Allocator, device: *d3d12.Device) !void
     try guestVaryingProbe(allocator, &vertex_words);
     try guestFanProbe(allocator);
     try guestResourcesProbe(allocator);
+    try guestDynamicScalarsProbe(allocator, &vertex_words);
     try guestBlendingProbe(allocator, &vertex_words);
     try guestCacheProbe(allocator, device, vertex.words, fragment.words);
+}
+
+fn guestDynamicScalarsProbe(allocator: std.mem.Allocator, vertex_words: []const u32) !void {
+    const memory = try allocator.create(GraphicsMemory);
+    defer allocator.destroy(memory);
+    memory.* = .{};
+    var renderer = try d3d12.Renderer.init(allocator, memory.access(), false);
+    defer renderer.deinit();
+    var state = try graphicsState(65, 37, 72);
+    var executor = gpu.DcbExecutor{ .state = &state, .backend = renderer.dcbBackend(), .allocator = allocator };
+    var reference: [8][72 * 37 * 4]u8 = undefined;
+    const target = memory.data[0x2000..][0..reference[0].len];
+    const vertex = try allocator.dupe(u32, vertex_words);
+    defer allocator.free(vertex);
+    var dynamic_vertex: std.ArrayList(u32) = .empty;
+    defer dynamic_vertex.deinit(allocator);
+    try dynamic_vertex.appendSlice(allocator, vertex_words[0..1]);
+    try dynamic_vertex.append(allocator, vop1(0x01, 2, 0)); // VS s0 replaces a literal position offset.
+    try dynamic_vertex.appendSlice(allocator, vertex_words[3..]);
+    const dynamic_pixel = [_]u32{ vop1(0x01, 0, 0), vop1(0x01, 1, 1), vop1(0x01, 2, 2), vop1(0x01, 3, 3), 0xf800080f, 0x03020100, 0xbf810000 };
+    var constant_pixel = [_]u32{ vop1(0x01, 0, 255), 0, vop1(0x01, 1, 255), 0, vop1(0x01, 2, 255), 0, vop1(0x01, 3, 255), 0, 0xf800080f, 0x03020100, 0xbf810000 };
+    // Independent literal shaders supply the complete coverage/color reference.
+    // Then change VS/PS USER_DATA together without changing their instructions.
+    for (0..2) |pass| for (0..reference.len) |variant| {
+        const shift: u32 = @bitCast(@as(f32, 1) + @as(f32, @floatFromInt(variant)) / 8);
+        const color = [_]f32{ @as(f32, @floatFromInt(variant)) / 8, @as(f32, @floatFromInt(8 - variant)) / 8, 0.25, 1 };
+        @memset(target, 0xa7);
+        if (pass == 0) {
+            vertex[2] = shift;
+            for (color, 0..) |value, i| constant_pixel[i * 2 + 1] = @bitCast(value);
+            @memcpy(memory.data[0x200..][0 .. vertex.len * 4], std.mem.sliceAsBytes(vertex));
+            @memcpy(memory.data[0x400..][0..@sizeOf(@TypeOf(constant_pixel))], std.mem.asBytes(&constant_pixel));
+        } else {
+            @memcpy(memory.data[0x200..][0 .. dynamic_vertex.items.len * 4], std.mem.sliceAsBytes(dynamic_vertex.items));
+            @memcpy(memory.data[0x400..][0..@sizeOf(@TypeOf(dynamic_pixel))], std.mem.asBytes(&dynamic_pixel));
+            try state.writeRegister(.shader, 0x04b, 2); // VS USER_DATA count 1.
+            try state.writeRegister(.shader, 0x04c, shift);
+            try state.writeRegister(.shader, 0x00b, 8); // PS USER_DATA count 4.
+            for (color, 0..) |value, i| try state.writeRegister(.shader, 0x00c + @as(u32, @intCast(i)), @bitCast(value));
+        }
+        const before = renderer.device.cacheStats();
+        _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 2 });
+        if (pass == 0) {
+            @memcpy(&reference[variant], target);
+            if (std.mem.allEqual(u8, target, 0xa7)) return error.DynamicScalarReferenceEmpty;
+        } else {
+            if (!std.mem.eql(u8, &reference[variant], target)) return error.DynamicScalarRasterMismatch;
+            const after = renderer.device.cacheStats();
+            if (variant != 0 and before.enabled != 0 and (after.shader_misses != before.shader_misses or
+                after.pipeline_misses != before.pipeline_misses or after.shader_hits != before.shader_hits + 2 or
+                after.pipeline_hits != before.pipeline_hits + 1)) return error.DynamicScalarCacheMiss;
+        }
+    };
+    if (std.mem.eql(u8, &reference[0], &reference[7])) return error.DynamicScalarReferenceUnchanged;
+    std.debug.print("PASS dynamic VS/PS scalar uploads: 8 complete literal-reference images, changing coverage/color, unchanged shader and PSO cache entries\n", .{});
 }
 
 fn guestCacheProbe(allocator: std.mem.Allocator, device: *d3d12.Device, vertex: []const u32, fragment: []const u32) !void {
