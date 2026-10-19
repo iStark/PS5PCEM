@@ -388,6 +388,11 @@ pub const Renderer = struct {
         if (self.cache_report_ns == 0 or now -| self.cache_report_ns >= 5 * std.time.ns_per_s) {
             const cache = self.device.cacheStats();
             const pool = self.device.resourceStats();
+            const attachments = self.device.attachmentStats();
+            std.debug.print("[d3d12 attachments] flip={d} enabled={d} color_hit={d} depth_hit={d} miss={d} avoided_kib={d} pairs={d}\n", .{
+                self.presented_frames, attachments.enabled,              attachments.color_hits, attachments.depth_hits,
+                attachments.misses,    attachments.avoided_bytes / 1024, attachments.pairs,
+            });
             const uploads = self.device.uploadStats();
             std.debug.print("[d3d12 uploads] flip={d} buffer_hit={d} image_hit={d} miss={d} avoided_kib={d} evict={d} bypass={d} kib={d}/{d}\n", .{
                 self.presented_frames, uploads.buffer_hits, uploads.image_hits,   uploads.misses,       uploads.avoided_bytes / 1024,

@@ -21,6 +21,8 @@
 #include "native.h"
 #include "dxc.h"
 
+extern int ps5_d3d12_equal_bytes(const uint8_t *a, const uint8_t *b, size_t size);
+
 typedef HRESULT (WINAPI *CreateFactoryFn)(REFIID, void **);
 typedef HRESULT (WINAPI *CreateDeviceFn)(IUnknown *, D3D_FEATURE_LEVEL, REFIID, void **);
 typedef HRESULT (WINAPI *GetDebugFn)(REFIID, void **);
@@ -42,6 +44,9 @@ typedef struct ResourceEntry {
     uint8_t *snapshot;
     size_t snapshot_capacity, snapshot_size;
     int snapshot_valid;
+    /* Symmetric, non-owning pair inside the fixed pool: texture and its latest
+     * completed readback. Reuse/eviction of either member breaks both links. */
+    struct ResourceEntry *attachment_peer;
 } ResourceEntry;
 typedef struct ShaderEntry {
     uint32_t *words;
@@ -96,6 +101,7 @@ struct Ps5D3D12 {
     ResourceEntry resource_pool[RESOURCE_POOL_CAPACITY];
     Ps5D3D12ResourceStats resource_stats;
     Ps5D3D12UploadStats upload_stats;
+    Ps5D3D12AttachmentStats attachment_stats;
     uint64_t resource_clock;
     char error[1024];
 };
@@ -140,8 +146,14 @@ static void discard_snapshot(Ps5D3D12 *c, ResourceEntry *entry) {
     entry->snapshot_capacity = entry->snapshot_size = 0;
     entry->snapshot_valid = 0;
 }
+static void invalidate_attachment(ResourceEntry *entry) {
+    if (!entry->attachment_peer) return;
+    entry->attachment_peer->attachment_peer = NULL;
+    entry->attachment_peer = NULL;
+}
 static void evict_resource(Ps5D3D12 *c, ResourceEntry *entry) {
     if (!entry->resource) return;
+    invalidate_attachment(entry);
     discard_snapshot(c, entry);
     c->resource_stats.bytes -= entry->bytes;
     --c->resource_stats.entries;
@@ -154,6 +166,21 @@ void ps5_d3d12_resource_stats(Ps5D3D12 *c, Ps5D3D12ResourceStats *stats) {
 }
 void ps5_d3d12_upload_stats(Ps5D3D12 *c, Ps5D3D12UploadStats *stats) {
     if (c && stats) *stats = c->upload_stats;
+}
+void ps5_d3d12_attachment_stats(Ps5D3D12 *c, Ps5D3D12AttachmentStats *stats) {
+    if (!c || !stats) return;
+    *stats = c->attachment_stats;
+    stats->pairs = 0;
+    for (UINT i = 0; i < RESOURCE_POOL_CAPACITY; ++i)
+        if (c->resource_pool[i].attachment_peer && c->resource_pool[i].desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D) ++stats->pairs;
+}
+int32_t ps5_d3d12_attachment_cache(Ps5D3D12 *c, int enabled) {
+    if (!c || (enabled != 0 && enabled != 1)) return E_INVALIDARG;
+    HRESULT hr = wait_idle(c);
+    if (FAILED(hr)) return hr;
+    for (UINT i = 0; i < RESOURCE_POOL_CAPACITY; ++i) invalidate_attachment(&c->resource_pool[i]);
+    c->attachment_stats.enabled = enabled;
+    return S_OK;
 }
 int32_t ps5_d3d12_upload_cache_limit(Ps5D3D12 *c, uint64_t bytes) {
     if (!c || bytes > UPLOAD_CACHE_BYTES) return E_INVALIDARG;
@@ -199,6 +226,7 @@ static HRESULT acquire_resource(Ps5D3D12 *c, const D3D12_RESOURCE_DESC *desc,
         c->resource_stats.entries < RESOURCE_POOL_CAPACITY &&
         reusable->bytes <= c->resource_stats.limit - c->resource_stats.bytes) reusable = NULL;
     if (reusable) {
+        invalidate_attachment(reusable);
         reusable->busy = 1;
         reusable->snapshot_valid = 0;
         *out = reusable->resource;
@@ -299,6 +327,56 @@ static HRESULT acquire_snapshot_resource(Ps5D3D12 *c, const D3D12_RESOURCE_DESC 
     entry->snapshot_size = size;
     entry->snapshot_valid = 1;
     return S_OK;
+}
+/* Compare fresh tight guest pixels against a completed readback, including
+ * every logical byte but excluding native row padding. No new CPU shadow is
+ * allocated. Both members are leased together before other preparation can
+ * reuse their storage. Texture states still begin/end at COPY_DEST. */
+static HRESULT acquire_attachment(Ps5D3D12 *c, const D3D12_RESOURCE_DESC *desc,
+    const D3D12_PLACED_SUBRESOURCE_FOOTPRINT *footprint, UINT64 copy_bytes,
+    const uint8_t *pixels, UINT row_bytes, ID3D12Resource **texture, ID3D12Resource **readback, int *reused) {
+    if (c->pending || c->poisoned) return failure(c, E_FAIL, "attachment reuse after incomplete GPU work");
+    *reused = 0;
+    if (c->attachment_stats.enabled) for (UINT i = 0; i < RESOURCE_POOL_CAPACITY; ++i) {
+        ResourceEntry *entry = &c->resource_pool[i], *proof = entry->attachment_peer;
+        if (!proof || entry->busy || proof->busy || !same_resource(&entry->desc, desc)) continue;
+        if (entry->heap != D3D12_HEAP_TYPE_DEFAULT || entry->initial_state != D3D12_RESOURCE_STATE_COPY_DEST ||
+            proof->heap != D3D12_HEAP_TYPE_READBACK || proof->desc.Width < copy_bytes) continue;
+        D3D12_RANGE range = {0, (SIZE_T)copy_bytes}, empty = {0, 0};
+        void *mapped;
+        HRESULT hr = ID3D12Resource_Map(proof->resource, 0, &range, &mapped);
+        if (FAILED(hr)) return failure(c, hr, "map retained attachment readback");
+        int equal = 1;
+        if (footprint->Footprint.RowPitch == row_bytes) {
+            equal = ps5_d3d12_equal_bytes(pixels, (uint8_t *)mapped + footprint->Offset, (size_t)row_bytes * desc->Height);
+        } else for (UINT y = 0; y < desc->Height; ++y) if (!ps5_d3d12_equal_bytes(pixels + (size_t)y * row_bytes,
+            (uint8_t *)mapped + footprint->Offset + (size_t)y * footprint->Footprint.RowPitch, row_bytes)) { equal = 0; break; }
+        ID3D12Resource_Unmap(proof->resource, 0, &empty);
+        if (!equal) continue;
+        entry->busy = proof->busy = 1;
+        *texture = entry->resource; *readback = proof->resource;
+        IUnknown_AddRef((IUnknown *)*texture); IUnknown_AddRef((IUnknown *)*readback);
+        c->resource_stats.hits += 2;
+        if (desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) ++c->attachment_stats.depth_hits;
+        else ++c->attachment_stats.color_hits;
+        c->attachment_stats.avoided_bytes += (uint64_t)row_bytes * desc->Height;
+        *reused = 1;
+        return S_OK;
+    }
+    ++c->attachment_stats.misses;
+    return acquire_resource(c, desc, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST, 0, texture);
+}
+static void remember_attachment(Ps5D3D12 *c, ID3D12Resource *texture, ID3D12Resource *readback) {
+    if (!c->attachment_stats.enabled || !texture || !readback || c->pending || c->poisoned) return;
+    ResourceEntry *a = NULL, *b = NULL;
+    for (UINT i = 0; i < RESOURCE_POOL_CAPACITY; ++i) {
+        ResourceEntry *entry = &c->resource_pool[i];
+        if (entry->resource == texture) a = entry;
+        if (entry->resource == readback) b = entry;
+    }
+    if (!a || !b) return; // Temporary/unpooled storage has no retained proof.
+    invalidate_attachment(a); invalidate_attachment(b);
+    a->attachment_peer = b; b->attachment_peer = a;
 }
 static void return_resource(Ps5D3D12 *c, ID3D12Resource *resource, int completed) {
     if (!resource) return;
@@ -459,6 +537,9 @@ int32_t ps5_d3d12_create(Ps5D3D12 **out, Ps5D3D12Info *info, int debug, char *er
     char upload_option[8] = {0};
     if (GetEnvironmentVariableA("PS5_D3D12_UPLOAD_CACHE", upload_option, sizeof(upload_option)) == 1 && upload_option[0] == '1')
         c->upload_stats.limit = UPLOAD_CACHE_BYTES;
+    char attachment_option[8] = {0};
+    if (GetEnvironmentVariableA("PS5_D3D12_ATTACHMENT_CACHE", attachment_option, sizeof(attachment_option)) == 1 && attachment_option[0] == '1')
+        c->attachment_stats.enabled = 1;
     char cache_option[8] = {0};
     const DWORD option_length = GetEnvironmentVariableA("PS5_D3D12_CACHE", cache_option, sizeof(cache_option));
     if (option_length != 1 || cache_option[0] != '0') {
@@ -1369,12 +1450,13 @@ int32_t ps5_d3d12_draw_spirv(Ps5D3D12 *c, const uint32_t *vertex, size_t vertex_
     desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     desc.SampleDesc.Count = 1;
     desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
-    TRY(acquire_resource(c, &desc, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST, 0, &color));
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint;
     UINT64 bytes;
     ID3D12Device_GetCopyableFootprints(c->device, &desc, 0, 1, 0, &footprint, NULL, NULL, &bytes);
-    TRY(graphics_buffer(c, bytes, D3D12_HEAP_TYPE_UPLOAD, &upload));
-    TRY(graphics_buffer(c, bytes, D3D12_HEAP_TYPE_READBACK, &readback));
+    int color_reused;
+    TRY(acquire_attachment(c, &desc, &footprint, bytes, rgba, d->width * 4, &color, &readback, &color_reused));
+    if (!color_reused) TRY(graphics_buffer(c, bytes, D3D12_HEAP_TYPE_UPLOAD, &upload));
+    if (!readback) TRY(graphics_buffer(c, bytes, D3D12_HEAP_TYPE_READBACK, &readback));
     void *mapped;
     D3D12_RANGE empty = {0, 0}, entire = {0, (SIZE_T)bytes};
     if (d->dynamic_scalars) {
@@ -1384,9 +1466,11 @@ int32_t ps5_d3d12_draw_spirv(Ps5D3D12 *c, const uint32_t *vertex, size_t vertex_
         D3D12_RANGE written = {0, sizeof(d->scalar_values)};
         ID3D12Resource_Unmap(scalar_upload, 0, &written);
     }
-    TRY(ID3D12Resource_Map(upload, 0, &empty, &mapped));
-    for (UINT y = 0; y < d->height; ++y) memcpy((uint8_t *)mapped + footprint.Offset + (size_t)y * footprint.Footprint.RowPitch, rgba + (size_t)y * d->width * 4, (size_t)d->width * 4);
-    ID3D12Resource_Unmap(upload, 0, &entire);
+    if (upload) {
+        TRY(ID3D12Resource_Map(upload, 0, &empty, &mapped));
+        for (UINT y = 0; y < d->height; ++y) memcpy((uint8_t *)mapped + footprint.Offset + (size_t)y * footprint.Footprint.RowPitch, rgba + (size_t)y * d->width * 4, (size_t)d->width * 4);
+        ID3D12Resource_Unmap(upload, 0, &entire);
+    }
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT depth_footprint = {0};
     D3D12_CPU_DESCRIPTOR_HANDLE depth_view = {0};
     UINT64 depth_copy_bytes = 0;
@@ -1394,15 +1478,19 @@ int32_t ps5_d3d12_draw_spirv(Ps5D3D12 *c, const uint32_t *vertex, size_t vertex_
         D3D12_RESOURCE_DESC depth_desc = desc;
         depth_desc.Format = d->depth_format;
         depth_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
-        TRY(acquire_resource(c, &depth_desc, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST, 0, &depth));
         ID3D12Device_GetCopyableFootprints(c->device, &depth_desc, 0, 1, 0, &depth_footprint, NULL, NULL, &depth_copy_bytes);
-        TRY(graphics_buffer(c, depth_copy_bytes, D3D12_HEAP_TYPE_UPLOAD, &depth_upload));
-        if (d->depth_write) TRY(graphics_buffer(c, depth_copy_bytes, D3D12_HEAP_TYPE_READBACK, &depth_readback));
-        TRY(ID3D12Resource_Map(depth_upload, 0, &empty, &mapped));
-        for (UINT y = 0; y < d->height; ++y) memcpy((uint8_t *)mapped + depth_footprint.Offset + (size_t)y * depth_footprint.Footprint.RowPitch,
-            depth_pixels + (size_t)y * d->width * depth_bpp, (size_t)d->width * depth_bpp);
-        D3D12_RANGE depth_written = {0, (SIZE_T)depth_copy_bytes};
-        ID3D12Resource_Unmap(depth_upload, 0, &depth_written);
+        int depth_reused;
+        TRY(acquire_attachment(c, &depth_desc, &depth_footprint, depth_copy_bytes, depth_pixels, d->width * depth_bpp,
+            &depth, &depth_readback, &depth_reused));
+        if (!depth_reused) TRY(graphics_buffer(c, depth_copy_bytes, D3D12_HEAP_TYPE_UPLOAD, &depth_upload));
+        if (d->depth_write && !depth_readback) TRY(graphics_buffer(c, depth_copy_bytes, D3D12_HEAP_TYPE_READBACK, &depth_readback));
+        if (depth_upload) {
+            TRY(ID3D12Resource_Map(depth_upload, 0, &empty, &mapped));
+            for (UINT y = 0; y < d->height; ++y) memcpy((uint8_t *)mapped + depth_footprint.Offset + (size_t)y * depth_footprint.Footprint.RowPitch,
+                depth_pixels + (size_t)y * d->width * depth_bpp, (size_t)d->width * depth_bpp);
+            D3D12_RANGE depth_written = {0, (SIZE_T)depth_copy_bytes};
+            ID3D12Resource_Unmap(depth_upload, 0, &depth_written);
+        }
         depth_view = ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(c->dsv_heap);
         D3D12_DEPTH_STENCIL_VIEW_DESC dsv = {0};
         dsv.Format = d->depth_format; dsv.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
@@ -1422,14 +1510,14 @@ int32_t ps5_d3d12_draw_spirv(Ps5D3D12 *c, const uint32_t *vertex, size_t vertex_
     D3D12_TEXTURE_COPY_LOCATION source = {0}, destination = {0};
     source.pResource = upload; source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; source.PlacedFootprint = footprint;
     destination.pResource = color; destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-    ID3D12GraphicsCommandList_CopyTextureRegion(c->commands, &destination, 0, 0, 0, &source, NULL);
+    if (upload) ID3D12GraphicsCommandList_CopyTextureRegion(c->commands, &destination, 0, 0, 0, &source, NULL);
     transition(c, color, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_RENDER_TARGET);
     if (depth) {
         D3D12_TEXTURE_COPY_LOCATION depth_source = {0}, depth_destination = {0};
         depth_source.pResource = depth_upload; depth_source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; depth_source.PlacedFootprint = depth_footprint;
         depth_destination.pResource = depth; depth_destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
         /* Depth copies must cover the complete subresource, with no box. */
-        ID3D12GraphicsCommandList_CopyTextureRegion(c->commands, &depth_destination, 0, 0, 0, &depth_source, NULL);
+        if (depth_upload) ID3D12GraphicsCommandList_CopyTextureRegion(c->commands, &depth_destination, 0, 0, 0, &depth_source, NULL);
         transition(c, depth, D3D12_RESOURCE_STATE_COPY_DEST, d->depth_write ? D3D12_RESOURCE_STATE_DEPTH_WRITE : D3D12_RESOURCE_STATE_DEPTH_READ);
     }
     ID3D12GraphicsCommandList_SetPipelineState(c->commands, pipeline);
@@ -1456,7 +1544,7 @@ int32_t ps5_d3d12_draw_spirv(Ps5D3D12 *c, const uint32_t *vertex, size_t vertex_
     source = destination;
     destination.pResource = readback; destination.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; destination.PlacedFootprint = footprint;
     ID3D12GraphicsCommandList_CopyTextureRegion(c->commands, &destination, 0, 0, 0, &source, NULL);
-    if (depth_readback) {
+    if (depth_readback && d->depth_write) {
         transition(c, depth, D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_COPY_SOURCE);
         D3D12_TEXTURE_COPY_LOCATION depth_source = {0}, depth_destination = {0};
         depth_source.pResource = depth; depth_source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
@@ -1466,7 +1554,7 @@ int32_t ps5_d3d12_draw_spirv(Ps5D3D12 *c, const uint32_t *vertex, size_t vertex_
     // Texture state does not decay like buffer state. Restore the pool's
     // initial state on the same submission before declaring storage reusable.
     transition(c, color, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
-    if (depth) transition(c, depth, depth_readback ? D3D12_RESOURCE_STATE_COPY_SOURCE : D3D12_RESOURCE_STATE_DEPTH_READ,
+    if (depth) transition(c, depth, d->depth_write ? D3D12_RESOURCE_STATE_COPY_SOURCE : D3D12_RESOURCE_STATE_DEPTH_READ,
         D3D12_RESOURCE_STATE_COPY_DEST);
     for (UINT i = 0; i < image_count; ++i) transition(c, resources.images[i],
         D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -1474,13 +1562,15 @@ int32_t ps5_d3d12_draw_spirv(Ps5D3D12 *c, const uint32_t *vertex, size_t vertex_
     TRY(ID3D12Resource_Map(readback, 0, &entire, &mapped));
     for (UINT y = 0; y < d->height; ++y) memcpy(rgba + (size_t)y * d->width * 4, (uint8_t *)mapped + footprint.Offset + (size_t)y * footprint.Footprint.RowPitch, (size_t)d->width * 4);
     ID3D12Resource_Unmap(readback, 0, &empty);
-    if (depth_readback) {
+    if (depth_readback && d->depth_write) {
         D3D12_RANGE depth_range = {0, (SIZE_T)depth_copy_bytes};
         TRY(ID3D12Resource_Map(depth_readback, 0, &depth_range, &mapped));
         for (UINT y = 0; y < d->height; ++y) memcpy(depth_pixels + (size_t)y * d->width * depth_bpp,
             (uint8_t *)mapped + depth_footprint.Offset + (size_t)y * depth_footprint.Footprint.RowPitch, (size_t)d->width * depth_bpp);
         ID3D12Resource_Unmap(depth_readback, 0, &empty);
     }
+    remember_attachment(c, color, readback);
+    remember_attachment(c, depth, depth_readback);
 done:
     for (UINT i = 0; i < buffer_count; ++i) { return_resource(c, resources.buffer_uploads[i], SUCCEEDED(hr)); return_resource(c, resources.buffers[i], SUCCEEDED(hr)); }
     for (UINT i = 0; i < image_count; ++i) { return_resource(c, resources.image_uploads[i], SUCCEEDED(hr)); return_resource(c, resources.images[i], SUCCEEDED(hr)); }

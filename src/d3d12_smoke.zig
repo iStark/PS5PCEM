@@ -452,6 +452,69 @@ fn guestGraphicsProbe(allocator: std.mem.Allocator, device: *d3d12.Device) !void
     try guestCacheProbe(allocator, device, vertex.words, fragment.words);
     try guestResourcePoolProbe(allocator, device, vertex.words, fragment.words);
     try guestUploadPressureProbe(device, vertex.words, fragment.words);
+    try guestAttachmentProbe(allocator, device, vertex.words, fragment.words);
+}
+
+fn guestAttachmentProbe(allocator: std.mem.Allocator, device: *d3d12.Device, vertex: []const u32, fragment: []const u32) !void {
+    const saved_pool = device.resourceStats().limit;
+    const saved_enabled = device.attachmentStats().enabled != 0;
+    defer device.resourcePoolLimit(saved_pool) catch {};
+    defer device.attachmentCache(saved_enabled) catch {};
+    const max_bytes = 128 * 39 * 4;
+    const reference = try allocator.alloc([max_bytes * 2]u8, 6 * 8);
+    defer allocator.free(reference);
+    for ([_]u64{ 256 * 1024 * 1024, 256 * 1024 * 1024, 256 * 1024 }, 0..) |budget, pass| {
+        try device.resourcePoolLimit(budget);
+        try device.attachmentCache(pass != 0);
+        const before = device.attachmentStats();
+        for (0..6) |variant| {
+            const width: u32 = if (variant % 2 == 0) 65 else 128;
+            const height: u32 = if (variant % 2 == 0) 37 else 39;
+            const bytes = width * height * 4;
+            var color: [max_bytes]u8 = undefined;
+            var depth: [max_bytes]u8 = @splat(0x6d);
+            for (&color, 0..) |*byte, i| byte.* = @truncate(i *% 47 + variant *% 19);
+            var draw = try d3d12.Draw.fullTarget(width, height);
+            draw.depth_format = ([_]u32{ 0, 55, 40 })[variant / 2];
+            draw.depth_compare = 4; // LESS_EQUAL: preserved results remain visible.
+            const depth_bytes: usize = if (draw.depth_format == 0) 0 else if (draw.depth_format == 55) bytes / 2 else bytes;
+            if (draw.depth_format == 55) @memset(depth[0..depth_bytes], 0xff);
+            if (draw.depth_format == 40) for (0..depth_bytes / 4) |i| std.mem.writeInt(u32, depth[i * 4 ..][0..4], @bitCast(@as(f32, 1)), .little);
+            for (0..8) |step| {
+                draw.depth_write = @intFromBool(draw.depth_format != 0 and step != 5 and step != 6);
+                draw.write_mask = if (step % 2 == 0) 15 else 5;
+                draw.scissor[2] = @intCast(width - step % 3);
+                if (step == 3) {
+                    color[bytes - 1] ^= 0x7f;
+                    color[(height / 2 * width + width / 2) * 4] ^= 0xc3;
+                }
+                if (step == 4 and depth_bytes != 0) @memset(depth[depth_bytes - (if (draw.depth_format == 55) @as(usize, 2) else 4) .. depth_bytes], 0);
+                if (step == 7) {
+                    // A differently shaped draw can borrow the same capacity-
+                    // class readback. Its old pair must no longer prove content.
+                    var scratch: [66 * 36 * 4]u8 = @splat(0x17);
+                    try device.drawSpirv(vertex, fragment, try d3d12.Draw.fullTarget(66, 36), &scratch);
+                }
+                const depth_before = depth;
+                try device.drawDepthResourcesSpirv(vertex, fragment, draw, &.{}, &.{}, &.{}, color[0..bytes], depth[0..depth_bytes]);
+                if (draw.depth_write == 0 and !std.mem.eql(u8, &depth_before, &depth)) return error.RetainedReadOnlyDepthChanged;
+                const record = &reference[variant * 8 + step];
+                if (pass == 0) {
+                    @memcpy(record[0..max_bytes], &color);
+                    @memcpy(record[max_bytes..], &depth);
+                } else if (!std.mem.eql(u8, record[0..max_bytes], &color) or !std.mem.eql(u8, record[max_bytes..], &depth)) return error.RetainedAttachmentImageMismatch;
+                if (device.resourceStats().bytes > budget) return error.RetainedAttachmentBudgetExceeded;
+            }
+        }
+        const after = device.attachmentStats();
+        if (pass == 0 and (after.color_hits != before.color_hits or after.depth_hits != before.depth_hits)) return error.DisabledAttachmentHit;
+        if (pass == 1 and (after.color_hits == before.color_hits or after.depth_hits == before.depth_hits or after.pairs == 0)) return error.AttachmentRetentionNotExercised;
+        try device.resourcePoolLimit(budget);
+        if (device.attachmentStats().pairs != 0) return error.StaleAttachmentPairAfterEviction;
+        std.debug.print("PASS retained attachments pass={d} pool_kib={d}: color hits={d}, depth hits={d}, avoided={d} bytes; all 48 padded/contiguous color/depth results match\n", .{
+            pass, budget / 1024, after.color_hits - before.color_hits, after.depth_hits - before.depth_hits, after.avoided_bytes - before.avoided_bytes,
+        });
+    }
 }
 
 fn guestUploadPressureProbe(device: *d3d12.Device, vertex: []const u32, fragment: []const u32) !void {

@@ -98,6 +98,21 @@ pub const DeviceInfo = extern struct {
 };
 
 pub const Error = error{ UnsupportedPlatform, InvalidArgument, NativeFailure };
+
+// Native readback proofs need equality, not lexicographic ordering. Keep the
+// exact comparison on Zig's vector/word path rather than the CRT's memcmp.
+export fn ps5_d3d12_equal_bytes(a: [*]const u8, b: [*]const u8, size: usize) c_int {
+    return @intFromBool(std.mem.eql(u8, a[0..size], b[0..size]));
+}
+
+pub const AttachmentStats = extern struct {
+    enabled: u64 = 0,
+    color_hits: u64 = 0,
+    depth_hits: u64 = 0,
+    misses: u64 = 0,
+    avoided_bytes: u64 = 0,
+    pairs: u64 = 0,
+};
 pub const UploadStats = extern struct {
     limit: u64 = 0,
     bytes: u64 = 0,
@@ -219,6 +234,17 @@ pub const Device = struct {
         return stats;
     }
 
+    pub fn attachmentStats(self: *Device) AttachmentStats {
+        var stats = AttachmentStats{};
+        if (builtin.os.tag == .windows) ps5_d3d12_attachment_stats(self.handle, &stats);
+        return stats;
+    }
+
+    pub fn attachmentCache(self: *Device, enabled: bool) Error!void {
+        if (builtin.os.tag != .windows) return error.UnsupportedPlatform;
+        try self.check(ps5_d3d12_attachment_cache(self.handle, @intFromBool(enabled)));
+    }
+
     pub fn uploadCacheLimit(self: *Device, bytes: u64) Error!void {
         if (bytes > 128 * 1024 * 1024) return error.InvalidArgument;
         if (builtin.os.tag != .windows) return error.UnsupportedPlatform;
@@ -333,6 +359,8 @@ extern fn ps5_d3d12_cache_stats(*Handle, *CacheStats) void;
 extern fn ps5_d3d12_cache_limits(*Handle, u32, u32) i32;
 extern fn ps5_d3d12_resource_stats(*Handle, *ResourceStats) void;
 extern fn ps5_d3d12_upload_stats(*Handle, *UploadStats) void;
+extern fn ps5_d3d12_attachment_stats(*Handle, *AttachmentStats) void;
+extern fn ps5_d3d12_attachment_cache(*Handle, c_int) i32;
 extern fn ps5_d3d12_upload_cache_limit(*Handle, u64) i32;
 extern fn ps5_d3d12_resource_pool_limit(*Handle, u64) i32;
 extern fn ps5_d3d12_dispatch_spirv(*Handle, [*]const u32, usize, [*]const Buffer, u32, *const [3]u32) i32;
