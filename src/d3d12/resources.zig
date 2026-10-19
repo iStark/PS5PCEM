@@ -9,6 +9,7 @@ const gpu = @import("gpu");
 const rdna2 = @import("rdna2");
 const native = @import("root.zig");
 const staging = @import("staging.zig");
+const surface_cache = @import("surface_cache.zig");
 
 pub const Stage = struct {
     buffers: std.ArrayList(rdna2.spirv.StorageBufferBinding) = .empty,
@@ -25,6 +26,7 @@ pub const DrawResources = struct {
     allocator: std.mem.Allocator,
     reader: gpu.ShaderMemoryReader,
     pool: ?*staging.Pool = null,
+    cache: ?*surface_cache.Cache = null,
     leases: [96]staging.Lease = undefined,
     lease_count: usize = 0,
     buffers: std.ArrayList(native.Buffer) = .empty,
@@ -191,7 +193,7 @@ pub const DrawResources = struct {
         const pixels = pixel_lease.bytes;
         var owns_pixels = true;
         errdefer if (owns_pixels) pixel_lease.deinit();
-        try layout.detile(backing, pixels);
+        if (self.cache) |c| try c.detile(descriptor.address, layout, backing, pixels) else try layout.detile(backing, pixels);
         var components: u32 = 1 << 12;
         for (descriptor.dst_select, 0..) |select, i| {
             const mapped: u32 = switch (select) {

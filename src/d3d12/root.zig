@@ -11,12 +11,14 @@ pub const Renderer = backend.Renderer;
 pub const graphics = @import("graphics.zig");
 pub const surfaces = @import("surfaces.zig");
 pub const staging = @import("staging.zig");
+pub const surface_cache = @import("surface_cache.zig");
 pub const blending = @import("blending.zig");
 
 test {
     _ = graphics;
     _ = surfaces;
     _ = staging;
+    _ = surface_cache;
     _ = @import("resources.zig");
     _ = blending;
 }

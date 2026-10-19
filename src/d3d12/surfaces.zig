@@ -6,6 +6,7 @@
 const std = @import("std");
 const gpu = @import("gpu");
 const staging = @import("staging.zig");
+const surface_cache = @import("surface_cache.zig");
 
 pub fn colorLayout(target: gpu.resources.ColorTarget) !gpu.SurfaceLayout {
     if (target.format != 10 or target.number_type != 0 or target.component_swap != 0 or
@@ -77,12 +78,17 @@ pub const Staged = struct {
     address: u64,
     backing: []u8,
     pixels: []u8,
+    cache: ?*surface_cache.Cache = null,
 
     pub fn read(allocator: std.mem.Allocator, memory: anytype, address: u64, layout: gpu.SurfaceLayout) !Staged {
         return readPooled(allocator, null, memory, address, layout);
     }
 
     pub fn readPooled(allocator: std.mem.Allocator, pool: ?*staging.Pool, memory: anytype, address: u64, layout: gpu.SurfaceLayout) !Staged {
+        return readCached(allocator, pool, null, memory, address, layout);
+    }
+
+    pub fn readCached(allocator: std.mem.Allocator, pool: ?*staging.Pool, cache: ?*surface_cache.Cache, memory: anytype, address: u64, layout: gpu.SurfaceLayout) !Staged {
         try validate(layout, address);
         var backing_lease = try staging.Lease.alloc(allocator, pool, @intCast(layout.required_source_bytes));
         errdefer backing_lease.deinit();
@@ -91,15 +97,15 @@ pub const Staged = struct {
         const backing = backing_lease.bytes;
         const pixels = pixel_lease.bytes;
         if (!memory.read(memory.context, address, backing)) return error.GuestReadFailed;
-        try layout.detile(backing, pixels);
-        return .{ .backing_lease = backing_lease, .pixel_lease = pixel_lease, .layout = layout, .address = address, .backing = backing, .pixels = pixels };
+        if (cache) |c| try c.detile(address, layout, backing, pixels) else try layout.detile(backing, pixels);
+        return .{ .backing_lease = backing_lease, .pixel_lease = pixel_lease, .layout = layout, .address = address, .backing = backing, .pixels = pixels, .cache = cache };
     }
 
     pub fn write(self: *Staged, memory: anytype) !void {
         // Re-read padding immediately before writeback. Only the logical view
         // is replaced; tail tiles and row padding retain their guest contents.
         if (!memory.read(memory.context, self.address, self.backing)) return error.GuestReadFailed;
-        try self.layout.tile(self.pixels, self.backing);
+        if (self.cache) |c| try c.tile(self.address, self.layout, self.pixels, self.backing) else try self.layout.tile(self.pixels, self.backing);
         if (!memory.write(memory.context, self.address, self.backing)) return error.GuestWriteFailed;
     }
 
@@ -164,6 +170,8 @@ test "pooled surfaces refresh guest bytes, preserve newly changed padding and re
     const Memory = struct {
         data: []u8,
         fail: bool = false,
+        fail_write: bool = false,
+        writes: usize = 0,
         fn read(context: ?*anyopaque, _: u64, bytes: []u8) bool {
             const self: *@This() = @ptrCast(@alignCast(context.?));
             if (self.fail) return false;
@@ -172,6 +180,8 @@ test "pooled surfaces refresh guest bytes, preserve newly changed padding and re
         }
         fn write(context: ?*anyopaque, _: u64, bytes: []const u8) bool {
             const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.writes += 1;
+            if (self.fail_write) return false;
             @memcpy(self.data[0..bytes.len], bytes);
             return true;
         }
@@ -181,6 +191,8 @@ test "pooled surfaces refresh guest bytes, preserve newly changed padding and re
     };
     var pool = staging.Pool{ .allocator = std.testing.allocator };
     defer pool.deinit();
+    var cache = surface_cache.Cache{ .allocator = std.testing.allocator };
+    defer cache.deinit();
     for ([_]gpu.resources.TileMode{ .linear, .render_target }) |mode| for ([_]u8{ 2, 4 }) |bpp| {
         const layout = try gpu.SurfaceLayout.init(.{ .tile_mode = mode, .width = 65, .height = 37, .row_pitch_elements = 80 }, bpp);
         const backing = try std.testing.allocator.alloc(u8, @intCast(layout.required_source_bytes));
@@ -194,7 +206,7 @@ test "pooled surfaces refresh guest bytes, preserve newly changed padding and re
             for (pixels, 0..) |*byte, i| byte.* = @truncate(i *% 197 +% iteration *% 31);
             @memset(backing, 0x36);
             try layout.tile(pixels, backing);
-            var surface = try Staged.readPooled(std.testing.allocator, &pool, memory.access(), 0x10000, layout);
+            var surface = try Staged.readCached(std.testing.allocator, &pool, &cache, memory.access(), 0x10000, layout);
             defer surface.deinit();
             try std.testing.expectEqualSlices(u8, pixels, surface.pixels);
             // All padding changes after the initial snapshot must survive writeback.
@@ -204,9 +216,17 @@ test "pooled surfaces refresh guest bytes, preserve newly changed padding and re
             try layout.tile(surface.pixels, expected);
             try surface.write(memory.access());
             try std.testing.expectEqualSlices(u8, expected, backing);
+            const hits = cache.tile_hits;
+            const writes = memory.writes;
+            try surface.write(memory.access());
+            try std.testing.expectEqual(hits + 1, cache.tile_hits);
+            try std.testing.expectEqual(writes + 1, memory.writes);
+            memory.fail_write = true;
+            try std.testing.expectError(error.GuestWriteFailed, surface.write(memory.access()));
+            memory.fail_write = false;
         }
         memory.fail = true;
-        try std.testing.expectError(error.GuestReadFailed, Staged.readPooled(std.testing.allocator, &pool, memory.access(), 0x10000, layout));
+        try std.testing.expectError(error.GuestReadFailed, Staged.readCached(std.testing.allocator, &pool, &cache, memory.access(), 0x10000, layout));
         for (pool.entries) |entry| try std.testing.expect(!entry.busy);
     };
     try std.testing.expect(pool.hits > 0);

@@ -969,6 +969,10 @@ fn run(init: std.process.Init) !bool {
             .write = runtime.firmware.libs.agc_submit.writeGuestMemory,
         }, init.minimal.environ.containsUnempty(allocator, "PS5_D3D12_VALIDATION") catch false);
         const directx = &directx_renderer.?;
+        if (init.minimal.environ.getAlloc(allocator, "PS5_D3D12_SURFACE_CACHE")) |value| {
+            defer allocator.free(value);
+            if (std.mem.eql(u8, value, "0")) directx.conversion_cache.limit = 0;
+        } else |_| {}
         directx.on_failure = stopUnsupportedD3D12;
         directx.display_resolver = resolveD3D12VideoOutBuffer;
         if (!force_headless) {

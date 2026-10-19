@@ -440,7 +440,7 @@ fn guestGraphicsProbe(allocator: std.mem.Allocator, device: *d3d12.Device) !void
     std.debug.print("PASS nonzero first vertex and positive indexed base vertex\n", .{});
     try guestCommandProbe(allocator, &vertex_words, &pixel_words);
     try guestSurfaceProbe(allocator, &vertex_words, &pixel_words);
-    try guestDepthProbe(allocator, &vertex_words, &pixel_words);
+    for ([_]usize{ 0, d3d12.surface_cache.Cache.default_limit }) |limit| try guestDepthProbe(allocator, &vertex_words, &pixel_words, limit);
     try guestViewportDepthProbe(allocator, &vertex_words, &pixel_words);
     try guestVaryingProbe(allocator, &vertex_words);
     try guestFanProbe(allocator);
@@ -838,7 +838,7 @@ fn graphicsState(width: u32, height: u32, pitch: u32) !gpu.State {
     return state;
 }
 
-fn guestDepthProbe(allocator: std.mem.Allocator, vertex: []const u32, fragment: []const u32) !void {
+fn guestDepthProbe(allocator: std.mem.Allocator, vertex: []const u32, fragment: []const u32, conversion_limit: usize) !void {
     const memory = try allocator.create(GraphicsMemory);
     defer allocator.destroy(memory);
     memory.* = .{};
@@ -847,6 +847,7 @@ fn guestDepthProbe(allocator: std.mem.Allocator, vertex: []const u32, fragment: 
     defer renderer.deinit();
     var state = try graphicsState(65, 37, 72);
     try state.writeRegister(.context, 0x204, 1 << 19); // Guest 0..1 clip depth.
+    renderer.conversion_cache.limit = conversion_limit;
     try state.writeRegister(.context, 0x007, 64 | (36 << 16));
     try state.writeRegister(.context, 0x012, 0x200);
     try state.writeRegister(.context, 0x014, 0x200);
@@ -978,6 +979,8 @@ fn guestDepthProbe(allocator: std.mem.Allocator, vertex: []const u32, fragment: 
     if (!std.mem.eql(u8, before, &memory.data)) return error.RejectedDepthModifiedMemory;
     const backend = renderer.dcbBackend();
     if (backend.vtable.write(backend.context, 0x1200, &.{ 1, 2, 3, 4 })) return error.FailedDepthPublishedLabel;
+    if (conversion_limit != 0 and (renderer.conversion_cache.detile_hits == 0 or renderer.conversion_cache.tile_hits == 0)) return error.SurfaceConversionCacheNotExercised;
+    std.debug.print("PASS conversion budget={d} KiB: detile hits={d}, tile hits={d}\n", .{ conversion_limit / 1024, renderer.conversion_cache.detile_hits, renderer.conversion_cache.tile_hits });
     std.debug.print("PASS {d} guest depth cases: D16/D32, linear/depth-64K, all comparisons, read-only/write masks, shader mutation, consecutive draws, full color/depth and padding checks; invalid layouts stop before writes\n", .{cases});
 }
 
@@ -1402,6 +1405,7 @@ fn guestResourcesProbe(allocator: std.mem.Allocator, staging_limit: usize) !void
     var renderer = try d3d12.Renderer.init(allocator, memory.access(), false);
     defer renderer.deinit();
     renderer.staging_pool.limit = staging_limit;
+    renderer.conversion_cache.limit = staging_limit;
     var executor = gpu.DcbExecutor{ .state = &state, .backend = renderer.dcbBackend(), .allocator = allocator };
     for (0..5) |variant| {
         const scale: [4]f32 = if (variant == 1) .{ 0.5, 0.25, 1, 1 } else .{ 1, 1, 1, 1 };
@@ -1457,6 +1461,8 @@ fn guestResourcesProbe(allocator: std.mem.Allocator, staging_limit: usize) !void
     if (!std.mem.eql(u8, &before, memory.data[0x2000..0x5000])) return error.RejectedDrawModifiedTarget;
     for (renderer.staging_pool.entries) |entry| if (entry.busy) return error.LeakedStagingLease;
     if (renderer.staging_pool.bytes > staging_limit or (staging_limit != 0 and renderer.staging_pool.hits == 0)) return error.StagingPoolNotExercised;
+    if (staging_limit != 0 and renderer.conversion_cache.detile_hits == 0) return error.SampledConversionCacheNotExercised;
+    std.debug.print("PASS sampled conversion budget={d} KiB: detile hits={d}, tile hits={d}\n", .{ staging_limit / 1024, renderer.conversion_cache.detile_hits, renderer.conversion_cache.tile_hits });
     std.debug.print("PASS CPU staging budget={d} KiB: hits={d} misses={d}, no live leases after rejected draw\n", .{ staging_limit / 1024, renderer.staging_pool.hits, renderer.staging_pool.misses });
     std.debug.print("PASS guest vertex fetch, SMEM pointer and constant buffers, texture arrays, sampler filtering, sRGB, swizzles and failed-read isolation\n", .{});
     std.debug.print("PASS unobserved -1..1 viewport depth preserves the full color image; position-Z consumers remain rejected\n", .{});
