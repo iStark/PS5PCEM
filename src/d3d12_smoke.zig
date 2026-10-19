@@ -444,11 +444,49 @@ fn guestGraphicsProbe(allocator: std.mem.Allocator, device: *d3d12.Device) !void
     try guestViewportDepthProbe(allocator, &vertex_words, &pixel_words);
     try guestVaryingProbe(allocator, &vertex_words);
     try guestFanProbe(allocator);
-    for ([_]usize{ 0, d3d12.staging.Pool.default_limit }) |limit| try guestResourcesProbe(allocator, limit);
+    var resource_reference: [5][0x3000]u8 = undefined;
+    for ([_]usize{ 0, 128 * 1024 * 1024, 32 }) |limit|
+        try guestResourcesProbe(allocator, if (limit == 0) 0 else d3d12.staging.Pool.default_limit, limit, &resource_reference);
     try guestDynamicScalarsProbe(allocator, &vertex_words);
     try guestBlendingProbe(allocator, &vertex_words);
     try guestCacheProbe(allocator, device, vertex.words, fragment.words);
     try guestResourcePoolProbe(allocator, device, vertex.words, fragment.words);
+    try guestUploadPressureProbe(device, vertex.words, fragment.words);
+}
+
+fn guestUploadPressureProbe(device: *d3d12.Device, vertex: []const u32, fragment: []const u32) !void {
+    const saved_limit = device.uploadStats().limit;
+    defer device.uploadCacheLimit(saved_limit) catch {};
+    var color: [65 * 37 * 4]u8 = undefined;
+    var pixels: [16]u8 = @splat(0x7f);
+    try device.uploadCacheLimit(128 * 1024 * 1024);
+    const alternating_before = device.uploadStats();
+    for (0..6) |i| {
+        @memset(&pixels, @intCast(i % 3 * 83 + 5));
+        @memset(&color, 0);
+        const image = d3d12.SampledImage{ .pixels = &pixels, .size = pixels.len, .width = 2, .height = 2 };
+        try device.drawResourcesSpirv(vertex, fragment, try d3d12.Draw.fullTarget(65, 37), &.{}, &.{}, &.{image}, &color);
+    }
+    const alternating_after = device.uploadStats();
+    if (alternating_after.misses != alternating_before.misses + 3 or
+        alternating_after.image_hits != alternating_before.image_hits + 3) return error.AlternatingUploadContentsNotRetained;
+    try device.uploadCacheLimit(32);
+    const before = device.uploadStats();
+    const original = pixels;
+    // Different descriptions retain three GPU objects but only two CPU proofs
+    // fit. No busy proof is an eviction candidate; a later draw may evict idle ones.
+    for ([_][2]u32{ .{ 1, 4 }, .{ 2, 2 }, .{ 4, 1 }, .{ 1, 4 } }) |extent| {
+        @memset(&color, 0);
+        const image = d3d12.SampledImage{ .pixels = &pixels, .size = pixels.len, .width = extent[0], .height = extent[1] };
+        try device.drawResourcesSpirv(vertex, fragment, try d3d12.Draw.fullTarget(65, 37), &.{}, &.{}, &.{image}, &color);
+        if (device.uploadStats().bytes > 32) return error.UploadCacheBudgetExceeded;
+        if (!std.mem.eql(u8, color[(18 * 65 + 32) * 4 ..][0..4], &.{ 255, 0, 0, 255 })) return error.UploadPressureDrawMismatch;
+        if (!std.mem.eql(u8, &pixels, &original)) return error.UploadPressureModifiedSource;
+    }
+    if (device.uploadStats().evictions == before.evictions) return error.UploadCacheEvictionNotExercised;
+    try device.resourcePoolLimit(device.resourceStats().limit);
+    if (device.uploadStats().bytes != 0) return error.PoolEvictionLeakedUploadSnapshots;
+    std.debug.print("PASS alternating image-content retention and upload snapshot LRU pressure: same pointer/shape with three contents, distinct shapes, 32-byte budget, unchanged source and GPU-pool eviction cleanup\n", .{});
 }
 
 fn guestResourcePoolProbe(allocator: std.mem.Allocator, device: *d3d12.Device, vertex: []const u32, fragment: []const u32) !void {
@@ -1354,7 +1392,7 @@ fn guestFanProbe(allocator: std.mem.Allocator) !void {
     std.debug.print("PASS {d} fan GPU cases: auto/8/16/32-bit, first/base vertices, index offsets, custom/fixed restart, both provoking orders, culling, smooth varyings and full-image/padding checks\n", .{cases});
 }
 
-fn guestResourcesProbe(allocator: std.mem.Allocator, staging_limit: usize) !void {
+fn guestResourcesProbe(allocator: std.mem.Allocator, staging_limit: usize, upload_limit: usize, reference: *[5][0x3000]u8) !void {
     var memory = try allocator.create(GraphicsMemory);
     defer allocator.destroy(memory);
     memory.* = .{};
@@ -1406,6 +1444,7 @@ fn guestResourcesProbe(allocator: std.mem.Allocator, staging_limit: usize) !void
     defer renderer.deinit();
     renderer.staging_pool.limit = staging_limit;
     renderer.conversion_cache.limit = staging_limit;
+    try renderer.device.uploadCacheLimit(upload_limit);
     var executor = gpu.DcbExecutor{ .state = &state, .backend = renderer.dcbBackend(), .allocator = allocator };
     for (0..5) |variant| {
         const scale: [4]f32 = if (variant == 1) .{ 0.5, 0.25, 1, 1 } else .{ 1, 1, 1, 1 };
@@ -1419,6 +1458,13 @@ fn guestResourcesProbe(allocator: std.mem.Allocator, staging_limit: usize) !void
         try state.writeRegister(.shader, 0x00f, if (variant == 3) 0x9000032e else user[3]); // B,G,R,1
         @memset(memory.data[0x2000..0x5000], 0);
         _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 2 });
+        if (upload_limit == 0) reference[variant] = memory.data[0x2000..0x5000].*;
+        if (!std.mem.eql(u8, &reference[variant], memory.data[0x2000..0x5000])) return error.CachedUploadImageMismatch;
+        // Repeat the same inputs with a fresh attachment. This must exercise
+        // reuse without letting one simultaneously bound slot overwrite another.
+        @memset(memory.data[0x2000..0x5000], 0);
+        _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 2 });
+        if (!std.mem.eql(u8, &reference[variant], memory.data[0x2000..0x5000])) return error.WarmUploadImageMismatch;
         if (variant == 4) {
             const center = memory.data[0x2000 + (18 * 72 + 32) * 4 ..][0..4];
             for (center, [_]u8{ 128, 128, 128, 255 }) |a, e| if (@abs(@as(i16, a) - e) > 1) return error.LinearSamplerMismatch;
@@ -1462,6 +1508,16 @@ fn guestResourcesProbe(allocator: std.mem.Allocator, staging_limit: usize) !void
     for (renderer.staging_pool.entries) |entry| if (entry.busy) return error.LeakedStagingLease;
     if (renderer.staging_pool.bytes > staging_limit or (staging_limit != 0 and renderer.staging_pool.hits == 0)) return error.StagingPoolNotExercised;
     if (staging_limit != 0 and renderer.conversion_cache.detile_hits == 0) return error.SampledConversionCacheNotExercised;
+    const uploads = renderer.device.uploadStats();
+    if (uploads.bytes > upload_limit) return error.UploadCacheBudgetExceeded;
+    if (upload_limit == 0 and (uploads.buffer_hits != 0 or uploads.image_hits != 0)) return error.DisabledUploadCacheHit;
+    if (upload_limit > 32 and (uploads.buffer_hits == 0 or uploads.image_hits == 0 or uploads.avoided_bytes == 0)) return error.UploadCacheNotExercised;
+    if (upload_limit == 32 and uploads.bypasses == 0) return error.UploadCachePressureNotExercised;
+    try renderer.device.uploadCacheLimit(0);
+    if (renderer.device.uploadStats().bytes != 0) return error.UploadCacheNotReleased;
+    std.debug.print("PASS upload cache budget={d}: buffer hits={d}, image hits={d}, avoided={d} bytes, evictions={d}, bypass={d}; full images match and teardown releases snapshots\n", .{
+        upload_limit, uploads.buffer_hits, uploads.image_hits, uploads.avoided_bytes, uploads.evictions, uploads.bypasses,
+    });
     std.debug.print("PASS sampled conversion budget={d} KiB: detile hits={d}, tile hits={d}\n", .{ staging_limit / 1024, renderer.conversion_cache.detile_hits, renderer.conversion_cache.tile_hits });
     std.debug.print("PASS CPU staging budget={d} KiB: hits={d} misses={d}, no live leases after rejected draw\n", .{ staging_limit / 1024, renderer.staging_pool.hits, renderer.staging_pool.misses });
     std.debug.print("PASS guest vertex fetch, SMEM pointer and constant buffers, texture arrays, sampler filtering, sRGB, swizzles and failed-read isolation\n", .{});

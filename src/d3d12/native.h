@@ -26,6 +26,10 @@ typedef struct Ps5D3D12ResourceStats {
     uint64_t limit, bytes, entries, hits, misses, evictions, bypasses, create_ms;
 } Ps5D3D12ResourceStats;
 
+typedef struct Ps5D3D12UploadStats {
+    uint64_t limit, bytes, buffer_hits, image_hits, misses, avoided_bytes, evictions, bypasses;
+} Ps5D3D12UploadStats;
+
 typedef struct Ps5D3D12Buffer {
     uint8_t *bytes;
     size_t size;
@@ -70,6 +74,10 @@ int32_t ps5_d3d12_present(Ps5D3D12 *context, const float rgba[4]);
 uint64_t ps5_d3d12_validation_errors(Ps5D3D12 *context);
 void ps5_d3d12_cache_stats(Ps5D3D12 *context, Ps5D3D12CacheStats *stats);
 void ps5_d3d12_resource_stats(Ps5D3D12 *context, Ps5D3D12ResourceStats *stats);
+void ps5_d3d12_upload_stats(Ps5D3D12 *context, Ps5D3D12UploadStats *stats);
+/* Exact CPU snapshots prove completed read-only GPU contents; zero disables
+ * upload reuse. GPU storage remains subject to the resource-pool budget. */
+int32_t ps5_d3d12_upload_cache_limit(Ps5D3D12 *context, uint64_t bytes);
 /* Flush completed pooled storage; zero disables pooling. Maximum 256 MiB. */
 int32_t ps5_d3d12_resource_pool_limit(Ps5D3D12 *context, uint64_t bytes);
 /* Clears cached objects after completion; limits are bounded by the built-in

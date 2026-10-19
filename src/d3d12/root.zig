@@ -98,6 +98,16 @@ pub const DeviceInfo = extern struct {
 };
 
 pub const Error = error{ UnsupportedPlatform, InvalidArgument, NativeFailure };
+pub const UploadStats = extern struct {
+    limit: u64 = 0,
+    bytes: u64 = 0,
+    buffer_hits: u64 = 0,
+    image_hits: u64 = 0,
+    misses: u64 = 0,
+    avoided_bytes: u64 = 0,
+    evictions: u64 = 0,
+    bypasses: u64 = 0,
+};
 pub const ResourceStats = extern struct {
     limit: u64 = 0,
     bytes: u64 = 0,
@@ -201,6 +211,18 @@ pub const Device = struct {
         if (bytes > 256 * 1024 * 1024) return error.InvalidArgument;
         if (builtin.os.tag != .windows) return error.UnsupportedPlatform;
         try self.check(ps5_d3d12_resource_pool_limit(self.handle, bytes));
+    }
+
+    pub fn uploadStats(self: *Device) UploadStats {
+        var stats = UploadStats{};
+        if (builtin.os.tag == .windows) ps5_d3d12_upload_stats(self.handle, &stats);
+        return stats;
+    }
+
+    pub fn uploadCacheLimit(self: *Device, bytes: u64) Error!void {
+        if (bytes > 128 * 1024 * 1024) return error.InvalidArgument;
+        if (builtin.os.tag != .windows) return error.UnsupportedPlatform;
+        try self.check(ps5_d3d12_upload_cache_limit(self.handle, bytes));
     }
 
     /// Clears completed cached objects, retaining cumulative diagnostic counters.
@@ -310,6 +332,8 @@ extern fn ps5_d3d12_validation_errors(*Handle) u64;
 extern fn ps5_d3d12_cache_stats(*Handle, *CacheStats) void;
 extern fn ps5_d3d12_cache_limits(*Handle, u32, u32) i32;
 extern fn ps5_d3d12_resource_stats(*Handle, *ResourceStats) void;
+extern fn ps5_d3d12_upload_stats(*Handle, *UploadStats) void;
+extern fn ps5_d3d12_upload_cache_limit(*Handle, u64) i32;
 extern fn ps5_d3d12_resource_pool_limit(*Handle, u64) i32;
 extern fn ps5_d3d12_dispatch_spirv(*Handle, [*]const u32, usize, [*]const Buffer, u32, *const [3]u32) i32;
 extern fn ps5_d3d12_draw_spirv(*Handle, [*]const u32, usize, [*]const u32, usize, *const Draw, [*]const u8, usize, [*]const Buffer, u32, [*]const SampledImage, u32, [*]u8, [*]u8, usize) i32;
