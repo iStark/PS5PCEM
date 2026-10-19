@@ -93,6 +93,16 @@ pub const DeviceInfo = extern struct {
 };
 
 pub const Error = error{ UnsupportedPlatform, InvalidArgument, NativeFailure };
+pub const ResourceStats = extern struct {
+    limit: u64 = 0,
+    bytes: u64 = 0,
+    entries: u64 = 0,
+    hits: u64 = 0,
+    misses: u64 = 0,
+    evictions: u64 = 0,
+    bypasses: u64 = 0,
+    create_ms: u64 = 0,
+};
 pub const CacheStats = extern struct {
     enabled: u64 = 0,
     shader_hits: u64 = 0,
@@ -174,6 +184,18 @@ pub const Device = struct {
         var stats = CacheStats{};
         if (builtin.os.tag == .windows) ps5_d3d12_cache_stats(self.handle, &stats);
         return stats;
+    }
+
+    pub fn resourceStats(self: *Device) ResourceStats {
+        var stats = ResourceStats{};
+        if (builtin.os.tag == .windows) ps5_d3d12_resource_stats(self.handle, &stats);
+        return stats;
+    }
+
+    pub fn resourcePoolLimit(self: *Device, bytes: u64) Error!void {
+        if (bytes > 256 * 1024 * 1024) return error.InvalidArgument;
+        if (builtin.os.tag != .windows) return error.UnsupportedPlatform;
+        try self.check(ps5_d3d12_resource_pool_limit(self.handle, bytes));
     }
 
     /// Clears completed cached objects, retaining cumulative diagnostic counters.
@@ -282,6 +304,8 @@ extern fn ps5_d3d12_present(*Handle, *const [4]f32) i32;
 extern fn ps5_d3d12_validation_errors(*Handle) u64;
 extern fn ps5_d3d12_cache_stats(*Handle, *CacheStats) void;
 extern fn ps5_d3d12_cache_limits(*Handle, u32, u32) i32;
+extern fn ps5_d3d12_resource_stats(*Handle, *ResourceStats) void;
+extern fn ps5_d3d12_resource_pool_limit(*Handle, u64) i32;
 extern fn ps5_d3d12_dispatch_spirv(*Handle, [*]const u32, usize, [*]const Buffer, u32, *const [3]u32) i32;
 extern fn ps5_d3d12_draw_spirv(*Handle, [*]const u32, usize, [*]const u32, usize, *const Draw, [*]const u8, usize, [*]const Buffer, u32, [*]const SampledImage, u32, [*]u8, [*]u8, usize) i32;
 extern fn ps5_d3d12_present_rgba(*Handle, [*]const u8, u32, u32) i32;

@@ -381,6 +381,10 @@ pub const Renderer = struct {
         self.presented_frames +|= 1;
         if (self.cache_report_ns == 0 or now -| self.cache_report_ns >= 5 * std.time.ns_per_s) {
             const cache = self.device.cacheStats();
+            const pool = self.device.resourceStats();
+            std.debug.print("[d3d12 resources] flip={d} hit={d} miss={d} evict={d} bypass={d} entries={d} kib={d}/{d} create_ms={d}\n", .{
+                self.presented_frames, pool.hits, pool.misses, pool.evictions, pool.bypasses, pool.entries, pool.bytes / 1024, pool.limit / 1024, pool.create_ms,
+            });
             std.debug.print("[d3d12 cache] flip={d} enabled={d} shader={d}/{d} pso={d}/{d} entries={d}/{d} evictions={d}/{d} shader_kib={d} compile_ms={d} pso_ms={d}\n", .{
                 self.presented_frames, cache.enabled,          cache.shader_hits,      cache.shader_misses,      cache.pipeline_hits,       cache.pipeline_misses,
                 cache.shader_entries,  cache.pipeline_entries, cache.shader_evictions, cache.pipeline_evictions, cache.shader_bytes / 1024, cache.compile_ms,

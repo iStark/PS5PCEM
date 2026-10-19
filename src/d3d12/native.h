@@ -22,6 +22,10 @@ typedef struct Ps5D3D12CacheStats {
     uint64_t compile_ms, pipeline_ms;
 } Ps5D3D12CacheStats;
 
+typedef struct Ps5D3D12ResourceStats {
+    uint64_t limit, bytes, entries, hits, misses, evictions, bypasses, create_ms;
+} Ps5D3D12ResourceStats;
+
 typedef struct Ps5D3D12Buffer {
     uint8_t *bytes;
     size_t size;
@@ -65,6 +69,9 @@ int32_t ps5_d3d12_attach_window(Ps5D3D12 *context, void *hwnd, uint32_t width, u
 int32_t ps5_d3d12_present(Ps5D3D12 *context, const float rgba[4]);
 uint64_t ps5_d3d12_validation_errors(Ps5D3D12 *context);
 void ps5_d3d12_cache_stats(Ps5D3D12 *context, Ps5D3D12CacheStats *stats);
+void ps5_d3d12_resource_stats(Ps5D3D12 *context, Ps5D3D12ResourceStats *stats);
+/* Flush completed pooled storage; zero disables pooling. Maximum 256 MiB. */
+int32_t ps5_d3d12_resource_pool_limit(Ps5D3D12 *context, uint64_t bytes);
 /* Clears cached objects after completion; limits are bounded by the built-in
  * budgets. Zero entries disables caching (also PS5_D3D12_CACHE=0 at creation).
  * Used by the hardware probe to exercise eviction and uncached equivalence. */

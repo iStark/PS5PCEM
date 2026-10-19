@@ -448,6 +448,98 @@ fn guestGraphicsProbe(allocator: std.mem.Allocator, device: *d3d12.Device) !void
     try guestDynamicScalarsProbe(allocator, &vertex_words);
     try guestBlendingProbe(allocator, &vertex_words);
     try guestCacheProbe(allocator, device, vertex.words, fragment.words);
+    try guestResourcePoolProbe(allocator, device, vertex.words, fragment.words);
+}
+
+fn guestResourcePoolProbe(allocator: std.mem.Allocator, device: *d3d12.Device, vertex: []const u32, fragment: []const u32) !void {
+    const saved_limit = device.resourceStats().limit;
+    defer device.resourcePoolLimit(saved_limit) catch {};
+    const max_bytes = 71 * 39 * 4;
+    const cases = 24;
+    const reference = try allocator.alloc([max_bytes * 2]u8, cases);
+    defer allocator.free(reference);
+    // Every pass starts with independently changed guest bytes. Small budgets
+    // exercise both LRU eviction and a draw with more live storage than fits.
+    for ([_]u64{ 0, 256 * 1024 * 1024, 256 * 1024 }, 0..) |limit, pass| {
+        try device.resourcePoolLimit(limit);
+        const before = device.resourceStats();
+        for (0..cases) |variant| {
+            const width: u32 = if (variant % 4 < 2) 65 else 71;
+            const height: u32 = if (variant % 4 < 2) 37 else 39;
+            const bytes = width * height * 4;
+            var color: [max_bytes]u8 = undefined;
+            for (&color, 0..) |*byte, i| byte.* = @truncate(i *% 37 + variant *% 17);
+            var depth: [max_bytes]u8 = undefined;
+            var draw = try d3d12.Draw.fullTarget(width, height);
+            draw.dynamic_scalars = 1;
+            draw.scalar_values = @splat(@intCast(variant));
+            draw.depth_format = switch (variant % 6) {
+                0, 1 => 0,
+                2, 3 => 55,
+                else => 40,
+            };
+            draw.depth_write = @intFromBool(draw.depth_format != 0 and variant % 2 != 0);
+            draw.depth_compare = 2;
+            const depth_bytes: usize = if (draw.depth_format == 0) 0 else if (draw.depth_format == 55) bytes / 2 else bytes;
+            @memset(&depth, 0);
+            if (draw.depth_format == 55) @memset(depth[0..depth_bytes], 0xff);
+            if (draw.depth_format == 40) for (0..depth_bytes / 4) |i| std.mem.writeInt(u32, depth[i * 4 ..][0..4], @bitCast(@as(f32, 1)), .little);
+            draw.scissor[2] -= @intCast(variant % 7);
+            draw.write_mask = @intCast(1 + variant % 15);
+            draw.index_count = 3;
+            draw.index_element_bytes = 2;
+            const indices = [3]u16{ 0, 1, 2 };
+            var buffer_bytes: [3][512]u8 = undefined;
+            var buffers: [3]d3d12.Buffer = undefined;
+            for (&buffer_bytes, 0..) |*data, i| {
+                @memset(data, @intCast(variant + i * 31));
+                const size = (if (variant % 4 < 2) @as(usize, 128) else 384) + variant % 16 * 4;
+                buffers[i] = d3d12.Buffer.fromSlice(data[0..size]);
+            }
+            const source_copy = buffer_bytes;
+            var image_pixels: [2][8 * 8 * 4]u8 = undefined;
+            var images: [2]d3d12.SampledImage = undefined;
+            for (&image_pixels, 0..) |*data, i| {
+                @memset(data, @intCast(variant + i * 83));
+                images[i] = .{ .pixels = data, .size = data.len, .width = 8, .height = 8 };
+            }
+            const image_copy = image_pixels;
+            try device.drawDepthResourcesSpirv(vertex, fragment, draw, std.mem.asBytes(&indices), &buffers, &images, color[0..bytes], depth[0..depth_bytes]);
+            if (!std.mem.eql(u8, std.mem.asBytes(&source_copy), std.mem.asBytes(&buffer_bytes)) or
+                !std.mem.eql(u8, std.mem.asBytes(&image_copy), std.mem.asBytes(&image_pixels))) return error.ResourcePoolModifiedSource;
+            if (pass == 0) {
+                @memcpy(reference[variant][0..max_bytes], &color);
+                @memcpy(reference[variant][max_bytes..], &depth);
+            } else if (!std.mem.eql(u8, reference[variant][0..max_bytes], &color) or
+                !std.mem.eql(u8, reference[variant][max_bytes..], &depth)) return error.ResourcePoolImageMismatch;
+            const stats = device.resourceStats();
+            if (stats.bytes > limit or stats.entries > 256) return error.ResourcePoolBudgetExceeded;
+        }
+        const after = device.resourceStats();
+        if (pass == 1 and after.hits == before.hits) return error.ResourcePoolNotReused;
+        if (pass == 2 and (after.evictions == before.evictions or after.bypasses == before.bypasses)) return error.ResourcePoolPressureNotExercised;
+    }
+    // Warm native allocation timing, not a game-FPS benchmark.
+    for ([_]u64{ 0, 256 * 1024 * 1024 }) |limit| {
+        try device.resourcePoolLimit(limit);
+        var pixels: [65 * 37 * 4]u8 = @splat(0);
+        const draw = try d3d12.Draw.fullTarget(65, 37);
+        try device.drawSpirv(vertex, fragment, draw, &pixels);
+        const before = device.resourceStats();
+        const started = gpu.frame_timing.timestampNs();
+        for (0..32) |_| {
+            @memset(&pixels, 0);
+            try device.drawSpirv(vertex, fragment, draw, &pixels);
+            if (!std.mem.eql(u8, pixels[(18 * 65 + 32) * 4 ..][0..4], &.{ 255, 0, 0, 255 })) return error.ResourcePoolBenchmarkMismatch;
+        }
+        const elapsed = gpu.frame_timing.timestampNs() - started;
+        const after = device.resourceStats();
+        if (limit != 0 and (after.misses != before.misses or after.hits != before.hits + 32 * 3)) return error.ResourcePoolWarmAllocation;
+        std.debug.print("D3D12 resource-pool probe: limit_kib={d} draws=32 total_us={d} hit={d} miss={d}\n", .{
+            limit / 1024, elapsed / std.time.ns_per_us, after.hits - before.hits, after.misses - before.misses,
+        });
+    }
+    std.debug.print("PASS resource pooling: 24 full color/depth references across disabled/normal/256KiB budgets, changed extents/formats/bytes, simultaneous equal-size leases, eviction/bypass and zero warm allocations\n", .{});
 }
 
 fn guestDynamicScalarsProbe(allocator: std.mem.Allocator, vertex_words: []const u32) !void {
