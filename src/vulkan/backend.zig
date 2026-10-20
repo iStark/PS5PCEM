@@ -24,7 +24,7 @@ const release_clock = @import("release_clock.zig");
 const pipeline_compiler = @import("pipeline_compiler.zig");
 const pipeline_cache_save = @import("pipeline_cache_save.zig");
 const pipeline_warmup = @import("pipeline_warmup.zig");
-const spirv_cache = @import("spirv_cache.zig");
+const spirv_cache = rdna2.translation_cache;
 const tessellation_spirv = @import("tessellation_spirv.zig");
 // Kept opt-in while the live LS/HS resource path is being validated.
 pub export var native_tessellation: bool = false;

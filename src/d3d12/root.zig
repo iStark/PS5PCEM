@@ -13,6 +13,8 @@ pub const surfaces = @import("surfaces.zig");
 pub const staging = @import("staging.zig");
 pub const surface_cache = @import("surface_cache.zig");
 pub const blending = @import("blending.zig");
+pub const shader_cache = @import("shader_cache.zig");
+pub const texture_cache = @import("texture_cache.zig");
 
 test {
     _ = graphics;
@@ -21,6 +23,8 @@ test {
     _ = surface_cache;
     _ = @import("resources.zig");
     _ = blending;
+    _ = shader_cache;
+    _ = texture_cache;
 }
 
 const Handle = opaque {};
@@ -332,7 +336,7 @@ pub const Device = struct {
     }
 };
 
-pub const max_draw_batch = 8;
+pub const max_draw_batch = 64;
 pub const DrawJob = struct {
     vertex: []const u32,
     fragment: []const u32,

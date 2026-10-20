@@ -1685,6 +1685,31 @@ pub const AddressSpace = struct {
         return tracker.rememberRangeGeneration(first_page, end_page, fingerprint);
     }
 
+    /// An immutable CPU snapshot also needs protection against writes through
+    /// independently mapped physical aliases. Conservatively decline those
+    /// ranges, and include mapping creation/protection identity so an alias
+    /// created, written and removed between observations cannot restore an old
+    /// certificate. The ordinary GPU residency query retains its existing API.
+    pub fn gpuSnapshotGeneration(self: *AddressSpace, address: u64, size: usize) u64 {
+        if (size == 0) return 0;
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.host_mapping_state_uncertain) return 0;
+        const mapping = self.mappingForPageLocked(address & ~(page_size - 1)) orelse return 0;
+        if (address < mapping.address or address >= mapping.end() or size > mapping.end() - address) return 0;
+        if (mapping.kind == .direct_memory) {
+            const physical = (mapping.backing_offset orelse return 0) + address - mapping.address;
+            for (self.mappings.items) |other| {
+                if (other.address == mapping.address or other.kind != .direct_memory) continue;
+                const offset = other.backing_offset orelse continue;
+                if (physical < offset + other.size and offset < physical + size) return 0;
+            }
+        }
+        const generation = self.gpuGeneration(address, size);
+        if (generation == 0) return 0;
+        return std.hash.Wyhash.hash(0, std.mem.asBytes(&[_]u64{ generation, self.mapping_identity }));
+    }
+
     /// Invalidates tracked pages before an emulator/HLE write. Native guest
     /// writes take the exception path below instead.
     pub fn notifyGuestWrite(self: *AddressSpace, address: u64, size: usize) void {
@@ -3724,6 +3749,31 @@ test "uniform GPU publications reuse only complete unchanged watched pages" {
     const alias = address + 4 * size;
     try space.mapFixed(alias, size, .read_write, .direct_memory, size);
     try testing.expectEqual(null, space.publishGpuUniform32(address, source, value));
+}
+
+test "immutable snapshot generations reject physical aliases and detect their removal" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const size = windows_allocation_granularity;
+    var space = try AddressSpace.initWithDirectMemory(testing.allocator, 2 * size);
+    defer space.deinit();
+    const address = user.start;
+    const alias = address + 4 * size;
+    try space.mapFixed(address, size, .read_write, .direct_memory, 0);
+    space.enableGpuMemoryTracking();
+    _ = try space.trackGpuRead(address, size);
+    const initial = space.gpuSnapshotGeneration(address + 3, 17);
+    try testing.expect(initial != 0);
+    try testing.expectEqual(initial, space.gpuSnapshotGeneration(address + 3, 17));
+    try space.mapFixed(alias, size, .read_write, .direct_memory, 0);
+    try testing.expectEqual(@as(u64, 0), space.gpuSnapshotGeneration(address + 3, 17));
+    @as(*volatile u8, @ptrFromInt(alias + 3)).* = 0x7d;
+    try space.unmap(alias, size);
+    const changed = space.gpuSnapshotGeneration(address + 3, 17);
+    try testing.expect(changed != 0 and changed != initial);
+    try testing.expectEqual(@as(u8, 0x7d), @as(*volatile u8, @ptrFromInt(address + 3)).*);
+    space.notifyGuestWrite(address + 3, 1);
+    try testing.expectEqual(@as(u64, 0), space.gpuSnapshotGeneration(address + 3, 17));
+    try testing.expectEqual(@as(u64, 0), space.gpuSnapshotGeneration(address + size - 8, 16));
 }
 
 test "GPU publication aliases revalidate remaps permissions and physical aliases" {

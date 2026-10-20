@@ -10,6 +10,37 @@ const rdna2 = @import("rdna2");
 const native = @import("root.zig");
 const staging = @import("staging.zig");
 const surface_cache = @import("surface_cache.zig");
+const texture_cache = @import("texture_cache.zig");
+
+/// Count immutable image storage once per batch. Sampler/view differences
+/// still occupy independent descriptors, but do not duplicate the CPU pixels.
+pub const ImageBudget = struct {
+    images: [native.max_draw_batch * 32]native.SampledImage = undefined,
+    count: usize = 0,
+
+    fn contains(images: []const native.SampledImage, image: native.SampledImage) bool {
+        for (images) |previous| {
+            if (previous.pixels == image.pixels and previous.size == image.size) return true;
+        }
+        return false;
+    }
+    pub fn additional(self: *const ImageBudget, total: usize, images: []const native.SampledImage) usize {
+        var bytes = total;
+        for (images, 0..) |image, i| {
+            if (contains(self.images[0..self.count], image) or contains(images[0..i], image))
+                bytes -= image.size;
+        }
+        return bytes;
+    }
+    pub fn append(self: *ImageBudget, images: []const native.SampledImage) void {
+        for (images) |image| {
+            if (contains(self.images[0..self.count], image)) continue;
+            std.debug.assert(self.count < self.images.len);
+            self.images[self.count] = image;
+            self.count += 1;
+        }
+    }
+};
 
 pub const Stage = struct {
     buffers: std.ArrayList(rdna2.spirv.StorageBufferBinding) = .empty,
@@ -22,19 +53,44 @@ pub const Stage = struct {
     }
 };
 
+test "batch budget counts pinned image storage once, not its views or equal contents" {
+    var first: [16]u8 = @splat(1);
+    var second = first;
+    const images = [_]native.SampledImage{
+        .{ .pixels = &first, .size = first.len, .width = 2, .height = 2 },
+        .{ .pixels = &first, .size = first.len, .width = 2, .height = 2, .filter = 0x15 },
+        .{ .pixels = &second, .size = second.len, .width = 2, .height = 2 },
+    };
+    var budget = ImageBudget{};
+    try std.testing.expectEqual(@as(usize, 39), budget.additional(55, &images));
+    budget.append(&images);
+    try std.testing.expectEqual(@as(usize, 2), budget.count);
+    try std.testing.expectEqual(@as(usize, 7), budget.additional(55, &images));
+    budget.append(&images);
+    try std.testing.expectEqual(@as(usize, 2), budget.count);
+    budget = .{};
+    try std.testing.expectEqual(@as(usize, 39), budget.additional(55, &images));
+}
+
 pub const DrawResources = struct {
     allocator: std.mem.Allocator,
     reader: gpu.ShaderMemoryReader,
     pool: ?*staging.Pool = null,
     cache: ?*surface_cache.Cache = null,
+    textures: ?*texture_cache.Cache = null,
+    tracking: texture_cache.Tracking = .{},
+    texture_leases: [32]texture_cache.Lease = undefined,
+    texture_lease_count: usize = 0,
     leases: [96]staging.Lease = undefined,
     lease_count: usize = 0,
     buffers: std.ArrayList(native.Buffer) = .empty,
+    buffer_keys: [64]struct { address: u64, size: usize, pointer_header: bool } = undefined,
     images: std.ArrayList(native.SampledImage) = .empty,
     total: usize = 0,
 
     pub fn deinit(self: *DrawResources) void {
         for (self.leases[0..self.lease_count]) |*lease| lease.deinit();
+        for (self.texture_leases[0..self.texture_lease_count]) |lease| lease.release();
         self.buffers.deinit(self.allocator);
         self.images.deinit(self.allocator);
     }
@@ -42,9 +98,24 @@ pub const DrawResources = struct {
     fn snapshot(self: *DrawResources, address: u64, size: usize, pointer_header: bool) !u32 {
         const header: usize = if (pointer_header) 8 else 0;
         const bytes_needed = std.mem.alignForward(usize, @max(4, try std.math.add(usize, size, header)), 4);
+        _ = try std.math.add(u64, address, size);
+        // Several instructions often read the same complete descriptor.
+        // Validate current guest bytes before sharing its immutable snapshot;
+        // even a changed tail byte or a failed read must prevent reuse.
+        for (self.buffers.items, self.buffer_keys[0..self.buffers.items.len], 0..) |buffer, key, i| {
+            if (key.address != address or key.size != size or key.pointer_header != pointer_header) continue;
+            var scratch: [16384]u8 = undefined;
+            var offset: usize = 0;
+            while (offset < size) {
+                const count = @min(scratch.len, size - offset);
+                try self.reader.read(address + offset, scratch[0..count]);
+                if (!std.mem.eql(u8, scratch[0..count], buffer.bytes[header + offset ..][0..count])) break;
+                offset += count;
+            }
+            if (offset == size) return @intCast(i);
+        }
         if (self.buffers.items.len >= 64 or bytes_needed > 256 * 1024 * 1024 or
             self.total + bytes_needed > 256 * 1024 * 1024) return error.GraphicsSnapshotBudgetExceeded;
-        _ = try std.math.add(u64, address, size);
         var lease = try staging.Lease.alloc(self.allocator, self.pool, bytes_needed);
         errdefer lease.deinit();
         const bytes = lease.bytes;
@@ -55,6 +126,7 @@ pub const DrawResources = struct {
         if (size != 0) try self.reader.read(address, bytes[header..][0..size]);
         const slot: u32 = @intCast(self.buffers.items.len);
         try self.buffers.append(self.allocator, native.Buffer.fromSlice(bytes));
+        self.buffer_keys[slot] = .{ .address = address, .size = size, .pointer_header = pointer_header };
         self.leases[self.lease_count] = lease;
         self.lease_count += 1;
         self.total += bytes_needed;
@@ -185,15 +257,25 @@ pub const DrawResources = struct {
         if (self.images.items.len >= 32 or layout.required_source_bytes > 256 * 1024 * 1024 or
             self.total + layout.staging_bytes > 256 * 1024 * 1024) return error.GraphicsSnapshotBudgetExceeded;
         _ = try layout.sourceRange(descriptor.address);
-        var backing_lease = try staging.Lease.alloc(self.allocator, self.pool, @intCast(layout.required_source_bytes));
-        defer backing_lease.deinit();
-        const backing = backing_lease.bytes;
-        try self.reader.read(descriptor.address, backing);
-        var pixel_lease = try staging.Lease.alloc(self.allocator, self.pool, @intCast(layout.staging_bytes));
-        const pixels = pixel_lease.bytes;
+        var retained: ?texture_cache.Lease = null;
+        var pixel_lease: staging.Lease = undefined;
+        const pixels: []const u8 = if (self.textures) |textures| blk: {
+            retained = try textures.acquire(self.allocator, self.reader, self.tracking, descriptor.address, layout);
+            break :blk retained.?.pixels();
+        } else blk: {
+            var backing_lease = try staging.Lease.alloc(self.allocator, self.pool, @intCast(layout.required_source_bytes));
+            defer backing_lease.deinit();
+            const backing = backing_lease.bytes;
+            try self.reader.read(descriptor.address, backing);
+            pixel_lease = try staging.Lease.alloc(self.allocator, self.pool, @intCast(layout.staging_bytes));
+            errdefer pixel_lease.deinit();
+            if (self.cache) |c| try c.detile(descriptor.address, layout, backing, pixel_lease.bytes) else try layout.detile(backing, pixel_lease.bytes);
+            break :blk pixel_lease.bytes;
+        };
         var owns_pixels = true;
-        errdefer if (owns_pixels) pixel_lease.deinit();
-        if (self.cache) |c| try c.detile(descriptor.address, layout, backing, pixels) else try layout.detile(backing, pixels);
+        errdefer if (owns_pixels) {
+            if (retained) |lease| lease.release() else pixel_lease.deinit();
+        };
         var components: u32 = 1 << 12;
         for (descriptor.dst_select, 0..) |select, i| {
             const mapped: u32 = switch (select) {
@@ -231,8 +313,13 @@ pub const DrawResources = struct {
             },
         });
         owns_pixels = false;
-        self.leases[self.lease_count] = pixel_lease;
-        self.lease_count += 1;
+        if (retained) |lease| {
+            self.texture_leases[self.texture_lease_count] = lease;
+            self.texture_lease_count += 1;
+        } else {
+            self.leases[self.lease_count] = pixel_lease;
+            self.lease_count += 1;
+        }
         self.total += pixels.len;
         try stage.images.append(self.allocator, .{
             .resource_sgpr = inst.src1.reg,
@@ -245,6 +332,34 @@ pub const DrawResources = struct {
         });
     }
 };
+
+test "duplicate instruction snapshots compare all current bytes and keep changed versions" {
+    const Memory = struct {
+        data: [32769]u8 = @splat(0x51),
+        fail: bool = false,
+        fn read(context: ?*anyopaque, address: u64, bytes: []u8) bool {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            if (self.fail or address < 0x1000 or address - 0x1000 + bytes.len > self.data.len) return false;
+            @memcpy(bytes, self.data[@intCast(address - 0x1000)..][0..bytes.len]);
+            return true;
+        }
+    };
+    var memory = Memory{};
+    var captured = DrawResources{ .allocator = std.testing.allocator, .reader = .{ .context = &memory, .read_fn = Memory.read } };
+    defer captured.deinit();
+    const first = try captured.snapshot(0x1000, memory.data.len, false);
+    const cost = captured.total;
+    try std.testing.expectEqual(first, try captured.snapshot(0x1000, memory.data.len, false));
+    try std.testing.expectEqual(cost, captured.total);
+    memory.data[memory.data.len - 1] ^= 0x80;
+    const changed = try captured.snapshot(0x1000, memory.data.len, false);
+    try std.testing.expect(changed != first);
+    try std.testing.expectEqual(@as(u8, 0x51), captured.buffers.items[first].bytes[memory.data.len - 1]);
+    try std.testing.expectEqual(changed, try captured.snapshot(0x1000, memory.data.len, false));
+    try std.testing.expect(changed != try captured.snapshot(0x1000, memory.data.len, true));
+    memory.fail = true;
+    try std.testing.expectError(error.MemoryReadFailed, captured.snapshot(0x1000, memory.data.len, false));
+}
 
 fn scalarOffset(resolver: *gpu.scalar_resources.Resolver, operand: gpu.ShaderOperand, pc: u32) !u32 {
     if (gpu.scalar_provenance.scalarRegisterIndex(operand)) |reg| {

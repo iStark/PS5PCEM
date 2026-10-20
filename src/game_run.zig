@@ -963,12 +963,26 @@ fn run(init: std.process.Init) !bool {
     } else |_| default_retirement_slack_mib) * 1024 * 1024;
     // Linux presents to an X11 window through VK_KHR_xlib_surface.
     if (selected_api == .d3d12) {
+        if (enable_gpu_page_tracker) emu.address_space.?.enableGpuMemoryTracking();
         directx_renderer = try d3d12.Renderer.init(allocator, .{
             .context = &emu.address_space.?,
             .read = runtime.firmware.libs.agc_submit.readGuestMemory,
             .write = runtime.firmware.libs.agc_submit.writeGuestMemory,
+            .track_gpu_read = if (enable_gpu_page_tracker) runtime.firmware.libs.agc_submit.trackSnapshotRead else null,
+            .gpu_generation = if (enable_gpu_page_tracker) runtime.firmware.libs.agc_submit.snapshotGeneration else null,
         }, init.minimal.environ.containsUnempty(allocator, "PS5_D3D12_VALIDATION") catch false);
         const directx = &directx_renderer.?;
+        if (init.minimal.environ.getAlloc(allocator, "PS5_D3D12_TEXTURE_CACHE")) |value| {
+            defer allocator.free(value);
+            if (std.mem.eql(u8, value, "0")) directx.textures.limit = 0;
+        } else |_| {}
+        if (init.minimal.environ.getAlloc(allocator, "PS5_D3D12_GUEST_SHADER_CACHE")) |value| {
+            defer allocator.free(value);
+            if (std.mem.eql(u8, value, "0")) {
+                directx.shader_analyses.enabled = false;
+                directx.translations.maximum_entries = 0;
+            }
+        } else |_| {}
         directx.draw_batch_limit = d3d12.max_draw_batch;
         if (init.minimal.environ.getAlloc(allocator, "PS5_D3D12_DRAW_BATCH")) |value| {
             defer allocator.free(value);

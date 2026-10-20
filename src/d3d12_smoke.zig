@@ -227,12 +227,14 @@ fn guestCommandProbe(allocator: std.mem.Allocator, vertex_words: []const u32, pi
     const before = memory.data;
     renderer.draw_batch_limit = 8;
     const batch_backend = renderer.dcbBackend();
-    for (0..6) |boundary| {
+    for (0..7) |boundary| {
         memory.data = initial;
         for (0..3) |_| _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 2 });
         if (!std.mem.eql(u8, &memory.data, &initial)) return error.BatchPublishedBeforeBoundary;
         var observed: [4]u8 = undefined;
         if (!batch_backend.vtable.read(batch_backend.context, 0x600, &observed) or renderer.pending_draws == null) return error.UnrelatedReadFlushedBatch;
+        _ = try executor.execute(&.{ command(gpu.pm4.event_write, 1), 0x2f });
+        if (renderer.pending_draws == null or !std.mem.eql(u8, &memory.data, &initial)) return error.CacheEventPublishedBeforeBoundary;
         switch (boundary) {
             0 => if (!batch_backend.vtable.read(batch_backend.context, center, &observed)) return error.BatchFeedbackReadFailed,
             1 => if (!batch_backend.vtable.read_wait.?(batch_backend.context, 0x600, &observed)) return error.BatchWaitFailed,
@@ -240,6 +242,7 @@ fn guestCommandProbe(allocator: std.mem.Allocator, vertex_words: []const u32, pi
             3 => if (!batch_backend.vtable.write(batch_backend.context, 0x600, &.{ 1, 2, 3, 4 })) return error.BatchWriteFailed,
             4 => _ = try executor.execute(&.{ command(gpu.pm4.release_mem, 7), 0, 1 << 29, 0x600, 0, 0x1234, 0, 0 }),
             5 => if (!batch_backend.vtable.read_live.?(batch_backend.context, 0x600, &observed)) return error.BatchLiveReadFailed,
+            6 => _ = try executor.execute(&.{ command(gpu.pm4.event_write, 3), 0x139, 0x600, 0 }),
             else => unreachable,
         }
         if (renderer.pending_draws != null or !std.mem.eql(u8, memory.data[0x2000..], before[0x2000..])) return error.BatchBoundaryImageMismatch;
@@ -537,14 +540,17 @@ fn guestBatchProbe(device: *d3d12.Device, vertex: []const u32, fragment: []const
     const cache_enabled = device.cacheStats().enabled != 0;
     defer device.cacheLimits(if (cache_enabled) 256 else 0, if (cache_enabled) 512 else 0) catch {};
     try device.cacheLimits(2, 2); // Evict PSOs while earlier recorded draws own refs.
-    var data: [256]u8 = @splat(0x53);
-    const buffers: [64]d3d12.Buffer = @splat(d3d12.Buffer.fromSlice(&data));
-    const images: [32]d3d12.SampledImage = @splat(.{ .pixels = &data, .size = data.len, .width = 8, .height = 8 });
+    var data: [8][256]u8 = undefined;
+    var buffers: [8][64]d3d12.Buffer = undefined;
+    var images: [8][32]d3d12.SampledImage = undefined;
     var jobs: [8]d3d12.DrawJob = undefined;
     for (&jobs, 0..) |*job, i| {
+        @memset(&data[i], @intCast(i + 0x53));
+        buffers[i] = @splat(d3d12.Buffer.fromSlice(&data[i]));
+        images[i] = @splat(.{ .pixels = &data[i], .size = data[i].len, .width = 8, .height = 8 });
         var draw = try d3d12.Draw.fullTarget(65, 37);
         draw.write_mask = @intCast(i + 1);
-        job.* = .{ .vertex = vertex, .fragment = fragment, .draw = draw, .buffers = &buffers, .images = &images };
+        job.* = .{ .vertex = vertex, .fragment = fragment, .draw = draw, .buffers = &buffers[i], .images = &images[i] };
     }
     var color: [65 * 37 * 4]u8 = @splat(0);
     try device.drawBatchSpirv(&jobs, &color, &.{});
@@ -556,6 +562,17 @@ fn guestBatchProbe(device: *d3d12.Device, vertex: []const u32, fragment: []const
     if (!std.mem.eql(u8, &color, &reference) or warm.entries <= 256 or after.entries > 2048 or
         after.bytes > 256 * 1024 * 1024 or after.misses != warm.misses or after.bypasses != warm.bypasses) return error.BatchCapacityThrashing;
     std.debug.print("PASS full batch occupancy: {d} resources / {d} KiB, zero warm allocations/bypasses, PSO eviction preserves recorded object lifetime\n", .{ after.entries, after.bytes / 1024 });
+    // Longer groups must preserve rendering and reuse immutable inputs.
+    var long_jobs: [d3d12.max_draw_batch]d3d12.DrawJob = undefined;
+    var sequential: [65 * 37 * 4]u8 = @splat(0);
+    for (&long_jobs, 0..) |*job, i| {
+        job.* = jobs[i % jobs.len];
+        try device.drawDepthResourcesSpirv(job.vertex, job.fragment, job.draw, &.{}, job.buffers, job.images, &sequential, &.{});
+    }
+    @memset(&color, 0);
+    try device.drawBatchSpirv(&long_jobs, &color, &.{});
+    if (!std.mem.eql(u8, &sequential, &color)) return error.LongBatchImageMismatch;
+    std.debug.print("PASS 64-draw group: repeated immutable inputs, complete output matches sequential rendering\n", .{});
     std.debug.print("PASS batched graphics: 144 full color/depth comparisons, 1..8 draws, D16/D32, read/write depth, padded/contiguous rows, blend/scissor/mask changes, pool pressure and recovery after invalid second shader\n", .{});
 }
 
@@ -1654,12 +1671,13 @@ fn guestResourcesProbe(allocator: std.mem.Allocator, staging_limit: usize, uploa
     const saved_state = state;
     const saved_memory = memory.*;
     var batch_reference: [0x3000]u8 = undefined;
-    for ([_]usize{ 1, 8 }) |batch_limit| {
+    for ([_]usize{ 1, 8, d3d12.max_draw_batch }) |batch_limit| {
         state = saved_state;
         memory.* = saved_memory;
         @memset(memory.data[0x2000..0x5000], 0);
         renderer.draw_batch_limit = batch_limit;
-        for (0..7) |i| {
+        for (0..d3d12.max_draw_batch) |draw_index| {
+            const i = draw_index % 7;
             // Reuse the same guest addresses with different data between draws.
             // Each queued snapshot must keep its own vertex/texture/uniform bytes.
             const scale = [_]f32{ @as(f32, @floatFromInt(i + 1)) / 8, 1, 0.5, 1 };
@@ -1675,7 +1693,7 @@ fn guestResourcesProbe(allocator: std.mem.Allocator, staging_limit: usize, uploa
     renderer.draw_batch_limit = 1;
     memory.* = saved_memory;
     state = saved_state;
-    std.debug.print("PASS queued resource snapshots: seven changing sampled/uniform inputs match sequential rendering\n", .{});
+    std.debug.print("PASS queued resource snapshots: 64 draws with changing and repeated sampled/uniform inputs match sequential rendering at limits 1, 8 and 64\n", .{});
     const baseline = memory.data[0x2000..0x5000].*;
     for ([_]f32{ 32.5, 32.5, -18.5, 18.5, 1, 0 }, 0..) |value, i| try state.writeRegister(.context, 0x10f + @as(u32, @intCast(i)), @bitCast(value));
     @memset(memory.data[0x2000..0x5000], 0);

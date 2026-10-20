@@ -8,13 +8,14 @@ const std = @import("std");
 
 pub const Pool = struct {
     pub const default_limit = 256 * 1024 * 1024;
-    // Eight draws can retain up to 96 independent input snapshots each.
-    // Object slots scale with that lifetime; the byte budget is unchanged.
-    pub const slot_count = 1024;
-    const Entry = struct { bytes: []u8 = &.{}, busy: bool = false, stamp: u64 = 0 };
+    // A 64-draw group can retain 96 inputs per draw. Idle size classes make
+    // warm acquisition constant-time without expanding the byte budget.
+    pub const slot_count = 8192;
+    const Entry = struct { bytes: []u8 = &.{}, busy: bool = false, stamp: u64 = 0, previous: ?usize = null, next: ?usize = null };
     allocator: std.mem.Allocator,
     limit: usize = default_limit,
     entries: [slot_count]Entry = @splat(.{}),
+    idle: [@bitSizeOf(usize)]?usize = @splat(null),
     bytes: usize = 0,
     clock: u64 = 0,
     hits: u64 = 0,
@@ -32,12 +33,12 @@ pub const Pool = struct {
 
     pub fn acquire(self: *Pool, size: usize) std.mem.Allocator.Error!Lease {
         const capacity = std.math.ceilPowerOfTwo(usize, @max(256, size)) catch return error.OutOfMemory;
-        for (&self.entries, 0..) |*entry, i| {
-            if (!entry.busy and entry.bytes.len == capacity) {
-                entry.busy = true;
-                self.hits += 1;
-                return .{ .allocator = self.allocator, .pool = self, .slot = i, .bytes = entry.bytes[0..size] };
-            }
+        if (self.idle[std.math.log2_int(usize, capacity)]) |i| {
+            const entry = &self.entries[i];
+            self.unlinkIdle(i);
+            entry.busy = true;
+            self.hits += 1;
+            return .{ .allocator = self.allocator, .pool = self, .slot = i, .bytes = entry.bytes[0..size] };
         }
         self.misses += 1;
         if (capacity <= self.limit) {
@@ -59,6 +60,7 @@ pub const Pool = struct {
                     return .{ .allocator = self.allocator, .pool = self, .slot = empty.?, .bytes = storage[0..size] };
                 }
                 const victim = oldest orelse break; // All remaining storage is leased.
+                self.unlinkIdle(victim);
                 self.bytes -= self.entries[victim].bytes.len;
                 self.allocator.free(self.entries[victim].bytes);
                 self.entries[victim] = .{};
@@ -69,6 +71,24 @@ pub const Pool = struct {
         // lease end and do not expand the retained-memory budget.
         self.bypasses += 1;
         return Lease.alloc(self.allocator, null, size);
+    }
+
+    fn unlinkIdle(self: *Pool, index: usize) void {
+        const entry = &self.entries[index];
+        std.debug.assert(!entry.busy and entry.bytes.len != 0);
+        if (entry.previous) |previous| self.entries[previous].next = entry.next else self.idle[std.math.log2_int(usize, entry.bytes.len)] = entry.next;
+        if (entry.next) |next| self.entries[next].previous = entry.previous;
+        entry.previous = null;
+        entry.next = null;
+    }
+
+    fn returnIdle(self: *Pool, index: usize) void {
+        const entry = &self.entries[index];
+        const bucket = std.math.log2_int(usize, entry.bytes.len);
+        entry.previous = null;
+        entry.next = self.idle[bucket];
+        if (entry.next) |next| self.entries[next].previous = index;
+        self.idle[bucket] = index;
     }
 };
 
@@ -89,6 +109,7 @@ pub const Lease = struct {
             pool.clock +|= 1;
             entry.stamp = pool.clock;
             entry.busy = false;
+            pool.returnIdle(self.slot);
         } else self.allocator.free(self.bytes);
         self.* = undefined;
     }

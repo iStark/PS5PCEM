@@ -3,7 +3,7 @@
 
 //! Reuse translations while keeping dynamic uniforms outside the cache key.
 const std = @import("std");
-const rdna2 = @import("rdna2");
+const rdna2 = @import("root.zig");
 
 pub var reuse_program_hash_state = std.atomic.Value(bool).init(true);
 pub export var reuse_prefix_identity_aliases: bool = true;

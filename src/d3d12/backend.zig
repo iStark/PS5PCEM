@@ -13,11 +13,16 @@ const surfaces = @import("surfaces.zig");
 const resources = @import("resources.zig");
 const staging = @import("staging.zig");
 const surface_cache = @import("surface_cache.zig");
+const shader_cache = @import("shader_cache.zig");
+const texture_cache = @import("texture_cache.zig");
+const translation_cache = rdna2.translation_cache;
 
 pub const Memory = struct {
     context: ?*anyopaque,
     read: *const fn (?*anyopaque, u64, []u8) bool,
     write: *const fn (?*anyopaque, u64, []const u8) bool,
+    track_gpu_read: ?*const fn (?*anyopaque, u64, usize) u64 = null,
+    gpu_generation: ?*const fn (?*anyopaque, u64, usize) u64 = null,
 };
 pub const DisplayBuffer = struct {
     address: u64,
@@ -32,13 +37,13 @@ const PreparedDraw = struct {
     draw: native.Draw,
     indices: []u8,
     resources: resources.DrawResources,
-    vertex: rdna2.spirv.Module,
-    fragment: rdna2.spirv.Module,
+    vertex: translation_cache.Lease,
+    fragment: translation_cache.Lease,
     fn deinit(self: *PreparedDraw, allocator: std.mem.Allocator) void {
         allocator.free(self.indices);
         self.resources.deinit();
-        self.vertex.deinit(allocator);
-        self.fragment.deinit(allocator);
+        self.vertex.release();
+        self.fragment.release();
     }
 };
 const PendingDraws = struct {
@@ -49,6 +54,7 @@ const PendingDraws = struct {
     draws: [native.max_draw_batch]PreparedDraw = undefined,
     count: usize = 0,
     bytes: usize = 0,
+    image_budget: resources.ImageBudget = .{},
     depth_write: bool = false,
     fn deinit(self: *PendingDraws, allocator: std.mem.Allocator) void {
         for (self.draws[0..self.count]) |*draw| draw.deinit(allocator);
@@ -69,6 +75,9 @@ pub const Renderer = struct {
     device: native.Device,
     staging_pool: staging.Pool,
     conversion_cache: surface_cache.Cache,
+    shader_analyses: shader_cache.Cache = .{},
+    textures: texture_cache.Cache = .{},
+    translations: translation_cache.Cache = .{ .maximum_bytes = 32 * 1024 * 1024, .maximum_entries = 256 },
     memory: Memory,
     failure: ?anyerror = null,
     on_failure: ?*const fn (anyerror) void = null,
@@ -94,6 +103,9 @@ pub const Renderer = struct {
     pub fn deinit(self: *Renderer) void {
         // Teardown does not publish unfinished work or acknowledge its labels.
         if (self.pending_draws) |*pending| pending.deinit(self.allocator);
+        self.translations.deinit(self.allocator);
+        self.shader_analyses.deinit();
+        self.textures.deinit();
         self.device.deinit();
         self.conversion_cache.deinit();
         self.staging_pool.deinit();
@@ -125,6 +137,25 @@ pub const Renderer = struct {
         };
         return self.memory.read(self.memory.context, address, bytes);
     }
+    fn textureGeneration(context: ?*anyopaque, address: u64, size: usize) u64 {
+        const self = from(context);
+        // A cached read still observes every earlier overlapping GPU write.
+        if (self.pending_draws) |*pending| if (pending.overlaps(address, size)) {
+            self.batch_hazards += 1;
+            self.flushDraws() catch |err| {
+                _ = self.rejected("texture dependency", err);
+                return 0;
+            };
+        };
+        if (self.failure != null) return 0;
+        return if (self.memory.gpu_generation) |callback| callback(self.memory.context, address, size) else 0;
+    }
+    fn trackTexture(context: ?*anyopaque, address: u64, size: usize) u64 {
+        _ = textureGeneration(context, address, size);
+        const self = from(context);
+        if (self.failure != null) return 0;
+        return if (self.memory.track_gpu_read) |callback| callback(self.memory.context, address, size) else 0;
+    }
     fn write(context: ?*anyopaque, address: u64, bytes: []const u8) bool {
         const self = from(context);
         if (!drain(context)) return false;
@@ -144,8 +175,12 @@ pub const Renderer = struct {
     fn acquire(context: ?*anyopaque, _: gpu.state.AcquireMem) bool {
         return drain(context);
     }
-    fn event(context: ?*anyopaque, _: gpu.state.EventWrite) bool {
-        return drain(context);
+    fn event(context: ?*anyopaque, value: gpu.state.EventWrite) bool {
+        // Non-addressed GPU cache/order events do not publish CPU-visible
+        // results. Ordered RT draws and dependency reads preserve that order;
+        // releases, addressed events and CPU observations still drain.
+        if (value.address != null) return drain(context);
+        return from(context).failure == null;
     }
     fn release(context: ?*anyopaque, value: gpu.state.ReleaseMem) bool {
         if (!drain(context)) return false;
@@ -173,8 +208,8 @@ pub const Renderer = struct {
         }
         var jobs: [native.max_draw_batch]native.DrawJob = undefined;
         for (pending.draws[0..pending.count], jobs[0..pending.count]) |*prepared, *job| job.* = .{
-            .vertex = prepared.vertex.words,
-            .fragment = prepared.fragment.words,
+            .vertex = prepared.vertex.view().words,
+            .fragment = prepared.fragment.view().words,
             .draw = prepared.draw,
             .indices = prepared.indices,
             .buffers = prepared.resources.buffers.items,
@@ -285,8 +320,9 @@ pub const Renderer = struct {
         var bindings = try gpu.ShaderBindings.capture(state, .compute, null, self.reader());
         const system = gpu.resources.decodeComputeSystemRegisters(state);
         bindings.compute_dispatch = .{ .system = system, .group_count = groups, .local_size = local };
-        var analysis = try gpu.shader_analysis.decode(self.allocator, self.reader(), bindings.program_address, 4096);
-        defer analysis.deinit(self.allocator);
+        const analysis_lease = try self.shader_analyses.acquire(self.allocator, self.reader(), bindings.program_address);
+        defer analysis_lease.release();
+        const analysis = analysis_lease.view();
         var storage = Storage{ .allocator = self.allocator };
         defer storage.deinit();
         const unknown: gpu.scalar_provenance.ScalarRegisters = @splat(.{});
@@ -324,7 +360,7 @@ pub const Renderer = struct {
         }
         var scalar: [64]rdna2.spirv.ScalarRegister = undefined;
         const scalar_count = entryScalars(bindings, &scalar);
-        var module = try analysis.translateSpirv(self.allocator, .{
+        const module_lease = try self.translations.acquirePrepared(self.allocator, &analysis.program, .{
             .stage = .compute,
             .program_address = bindings.program_address,
             .local_size = local,
@@ -335,8 +371,9 @@ pub const Renderer = struct {
             .storage_buffers = storage.mappings.items,
             .descriptor_array_length = @intCast(@max(1, storage.count)),
             .allow_control_flow_fallback = false,
-        });
-        defer module.deinit(self.allocator);
+        }, analysis.pipeline_options, analysis.translation_key);
+        defer module_lease.release();
+        const module = module_lease.view();
         if (module.used_dispatcher or module.used_control_flow_fallback) return error.UnboundedControlFlowNotImplemented;
         var native_buffers: [64]native.Buffer = undefined;
         for (storage.data[0..storage.count], native_buffers[0..storage.count]) |bytes, *buffer| buffer.* = native.Buffer.fromSlice(bytes);
@@ -397,16 +434,25 @@ pub const Renderer = struct {
         if (render.scissor) |scissor| draw_state.scissor = .{ scissor.left, scissor.top, scissor.right, scissor.bottom };
         const vs_bindings = try gpu.ShaderBindings.capture(state, routing.stage, null, self.reader());
         const ps_bindings = try gpu.ShaderBindings.capture(state, .pixel, null, self.reader());
-        var vs = try gpu.shader_analysis.decode(self.allocator, self.reader(), vs_bindings.program_address, 4096);
-        defer vs.deinit(self.allocator);
-        var ps = try gpu.shader_analysis.decode(self.allocator, self.reader(), ps_bindings.program_address, 4096);
-        defer ps.deinit(self.allocator);
+        const vs_lease = try self.shader_analyses.acquire(self.allocator, self.reader(), vs_bindings.program_address);
+        defer vs_lease.release();
+        const ps_lease = try self.shader_analyses.acquire(self.allocator, self.reader(), ps_bindings.program_address);
+        defer ps_lease.release();
+        const vs = vs_lease.view();
+        const ps = ps_lease.view();
         const interface = try graphics.linkInterface(state, vs.program.instructions.items, ps.program.instructions.items);
-        var draw_resources = resources.DrawResources{ .allocator = self.allocator, .reader = self.reader(), .pool = &self.staging_pool, .cache = &self.conversion_cache };
+        var draw_resources = resources.DrawResources{
+            .allocator = self.allocator,
+            .reader = self.reader(),
+            .pool = &self.staging_pool,
+            .cache = &self.conversion_cache,
+            .textures = &self.textures,
+            .tracking = .{ .context = self, .generation = textureGeneration, .arm = trackTexture },
+        };
         defer if (!queued) draw_resources.deinit();
-        var vs_resources = try draw_resources.capture(&vs_bindings, &vs);
+        var vs_resources = try draw_resources.capture(&vs_bindings, vs);
         defer vs_resources.deinit(self.allocator);
-        var ps_resources = try draw_resources.capture(&ps_bindings, &ps);
+        var ps_resources = try draw_resources.capture(&ps_bindings, ps);
         defer ps_resources.deinit(self.allocator);
         var vs_scalar: [65]rdna2.spirv.ScalarRegister = undefined;
         var ps_scalar: [64]rdna2.spirv.ScalarRegister = undefined;
@@ -423,7 +469,7 @@ pub const Renderer = struct {
         draw_state.dynamic_scalars = 1;
         for (vs_scalar[0..vs_scalar_count], 0..) |scalar, i| draw_state.scalar_values[i] = scalar.value;
         for (ps_scalar[0..ps_scalar_count], 0..) |scalar, i| draw_state.scalar_values[65 + i] = scalar.value;
-        var vertex = try vs.translateSpirv(self.allocator, .{
+        const vertex = try self.translations.acquirePrepared(self.allocator, &vs.program, .{
             .stage = .vertex,
             .wave32 = routing.vertex_wave32,
             .scalarize_ballot_first = true,
@@ -441,9 +487,9 @@ pub const Renderer = struct {
             .sampled_images = vs_resources.images.items,
             .descriptor_array_length = @intCast(@max(1, draw_resources.buffers.items.len)),
             .sampled_image_array_length = @intCast(@max(1, draw_resources.images.items.len)),
-        });
-        defer if (!queued) vertex.deinit(self.allocator);
-        var fragment = try ps.translateSpirv(self.allocator, .{
+        }, vs.pipeline_options, vs.translation_key);
+        defer if (!queued) vertex.release();
+        const fragment = try self.translations.acquirePrepared(self.allocator, &ps.program, .{
             .stage = .fragment,
             .wave32 = routing.fragment_wave32,
             .scalarize_ballot_first = true,
@@ -466,15 +512,16 @@ pub const Renderer = struct {
                 .enabled = @truncate(state.readRegister(.context, 0x1b3) orelse 0),
                 .front_face_all_bits = ((state.readRegister(.context, 0x1b8) orelse 0) & (1 << 24)) != 0,
             },
-        });
-        defer if (!queued) fragment.deinit(self.allocator);
-        if (vertex.used_dispatcher or fragment.used_dispatcher) return error.UnboundedControlFlowNotImplemented;
+        }, ps.pipeline_options, ps.translation_key);
+        defer if (!queued) fragment.release();
+        if (vertex.view().used_dispatcher or fragment.view().used_dispatcher) return error.UnboundedControlFlowNotImplemented;
         const color_key = TargetKey{ .address = target.address, .layout = target_layout };
-        const owned_bytes = draw_resources.total + indices.len + 4 * (vertex.words.len + fragment.words.len);
+        const owned_bytes = draw_resources.total + indices.len + 4 * (vertex.view().words.len + fragment.view().words.len);
         if (self.pending_draws) |*pending| {
+            const additional = pending.image_budget.additional(owned_bytes, draw_resources.images.items);
             if (!std.meta.eql(pending.color_key, color_key) or !std.meta.eql(pending.depth_key, depth_key) or
                 pending.count >= @min(native.max_draw_batch, @max(1, self.draw_batch_limit)) or
-                pending.bytes + owned_bytes > draw_batch_bytes) try self.flushDraws();
+                pending.bytes + additional > draw_batch_bytes) try self.flushDraws();
         }
         if (self.pending_draws == null) {
             var color = try surfaces.Staged.readCached(self.allocator, &self.staging_pool, &self.conversion_cache, self.memory, target.address, target_layout);
@@ -484,9 +531,10 @@ pub const Renderer = struct {
             self.pending_draws = .{ .color = color, .depth = depth, .color_key = color_key, .depth_key = depth_key };
         }
         const pending = &self.pending_draws.?;
+        pending.bytes += pending.image_budget.additional(owned_bytes, draw_resources.images.items);
+        pending.image_budget.append(draw_resources.images.items);
         pending.draws[pending.count] = .{ .draw = draw_state, .indices = indices, .resources = draw_resources, .vertex = vertex, .fragment = fragment };
         pending.count += 1;
-        pending.bytes += owned_bytes;
         pending.depth_write = pending.depth_write or draw_state.depth_write != 0;
         queued = true;
         if (pending.count >= @min(native.max_draw_batch, @max(1, self.draw_batch_limit)) or pending.bytes >= draw_batch_bytes) try self.flushDraws();
@@ -513,8 +561,15 @@ pub const Renderer = struct {
         const now = gpu.frame_timing.timestampNs();
         self.presented_frames +|= 1;
         if (self.cache_report_ns == 0 or now -| self.cache_report_ns >= 5 * std.time.ns_per_s) {
+            std.debug.print("[d3d12 textures] flip={d} page={d} content={d} miss={d} evict={d} kib={d}\n", .{
+                self.presented_frames, self.textures.page_hits, self.textures.content_hits, self.textures.misses, self.textures.evictions, self.textures.bytes / 1024,
+            });
             std.debug.print("[d3d12 batches] flip={d} limit={d} draws={d} groups={d} hazards={d}\n", .{
                 self.presented_frames, self.draw_batch_limit, self.batch_draws, self.batch_groups, self.batch_hazards,
+            });
+            std.debug.print("[d3d12 guest shaders] flip={d} analysis={d}/{d} invalidations={d} translation={d}/{d} kib={d}\n", .{
+                self.presented_frames,  self.shader_analyses.hits, self.shader_analyses.misses,    self.shader_analyses.invalidations,
+                self.translations.hits, self.translations.misses,  self.translations.bytes / 1024,
             });
             const cache = self.device.cacheStats();
             const pool = self.device.resourceStats();

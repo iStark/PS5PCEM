@@ -86,6 +86,7 @@ struct Ps5D3D12 {
     int pending, poisoned;
     RetiredObject *retired;
     ID3D12DescriptorHeap *rtv_heap, *dsv_heap;
+    ID3D12DescriptorHeap *draw_views, *draw_samplers;
     UINT rtv_stride;
     ID3D12RootSignature *compute_root, *graphics_root;
     ID3D12PipelineState *compute_pipeline, *graphics_pipeline, *present_pipeline;
@@ -653,6 +654,8 @@ void ps5_d3d12_destroy(Ps5D3D12 *c) {
     release(c->compute_root);
     release(c->rtv_heap);
     release(c->dsv_heap);
+    release(c->draw_views);
+    release(c->draw_samplers);
     release(c->commands);
     release(c->allocator);
     release(c->fence);
@@ -1237,33 +1240,34 @@ done:
 
 typedef struct GraphicsResources {
     ID3D12DescriptorHeap *views, *samplers;
+    UINT view_offset, sampler_offset;
     ID3D12Resource *buffers[64], *buffer_uploads[64], *images[32], *image_uploads[32];
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprints[32];
+    uint8_t buffer_shared[64];
 } GraphicsResources;
+typedef struct DrawBatch DrawBatch;
+static ID3D12Resource *batch_buffer(DrawBatch *batch, const Ps5D3D12Buffer *buffer);
+static ID3D12Resource *batch_image(DrawBatch *batch, const Ps5D3D12Image *image);
+static HRESULT batch_heaps(Ps5D3D12 *c, DrawBatch *batch, GraphicsResources *r, UINT views, UINT samplers);
 
-static HRESULT prepare_graphics_resources(Ps5D3D12 *c, GraphicsResources *r,
+static HRESULT prepare_graphics_resources(Ps5D3D12 *c, DrawBatch *batch, GraphicsResources *r,
     const Ps5D3D12Buffer *buffers, UINT buffer_count, const Ps5D3D12Image *images, UINT image_count) {
     HRESULT hr = S_OK;
-    D3D12_DESCRIPTOR_HEAP_DESC heap_desc = {0};
-    heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    heap_desc.NumDescriptors = buffer_count + image_count;
-    heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-    if (heap_desc.NumDescriptors) TRY(ID3D12Device_CreateDescriptorHeap(c->device, &heap_desc, &IID_ID3D12DescriptorHeap, (void **)&r->views));
-    if (image_count) {
-        heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER;
-        heap_desc.NumDescriptors = image_count;
-        TRY(ID3D12Device_CreateDescriptorHeap(c->device, &heap_desc, &IID_ID3D12DescriptorHeap, (void **)&r->samplers));
-    }
+    TRY(batch_heaps(c, batch, r, buffer_count + image_count, image_count));
     D3D12_CPU_DESCRIPTOR_HANDLE view = {0}, sampler_handle = {0};
     if (r->views) view = ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(r->views);
     if (r->samplers) sampler_handle = ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(r->samplers);
     const UINT view_stride = ID3D12Device_GetDescriptorHandleIncrementSize(c->device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     const UINT sampler_stride = ID3D12Device_GetDescriptorHandleIncrementSize(c->device, D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
+    view.ptr += (SIZE_T)r->view_offset * view_stride;
+    sampler_handle.ptr += (SIZE_T)r->sampler_offset * sampler_stride;
     D3D12_RANGE empty = {0, 0};
     for (UINT i = 0; i < buffer_count; ++i) {
         const D3D12_RESOURCE_DESC buffer_desc = graphics_buffer_desc(buffers[i].size);
-        int reused;
-        TRY(acquire_snapshot_resource(c, &buffer_desc, D3D12_RESOURCE_STATE_COMMON,
+        int reused = 1;
+        r->buffers[i] = batch_buffer(batch, &buffers[i]);
+        r->buffer_shared[i] = r->buffers[i] != NULL;
+        if (!r->buffers[i]) TRY(acquire_snapshot_resource(c, &buffer_desc, D3D12_RESOURCE_STATE_COMMON,
             buffers[i].bytes, buffers[i].size, &r->buffers[i], &reused));
         if (!reused) {
             TRY(graphics_buffer(c, buffers[i].size, D3D12_HEAP_TYPE_UPLOAD, &r->buffer_uploads[i]));
@@ -1286,8 +1290,9 @@ static HRESULT prepare_graphics_resources(Ps5D3D12 *c, GraphicsResources *r,
         desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
         desc.Width = image->width; desc.Height = image->height; desc.MipLevels = desc.DepthOrArraySize = 1;
         desc.SampleDesc.Count = 1; desc.Format = image->format + (image->srgb ? 1 : 0);
-        int reused;
-        TRY(acquire_snapshot_resource(c, &desc, D3D12_RESOURCE_STATE_COPY_DEST,
+        int reused = 1;
+        r->images[i] = batch_image(batch, image);
+        if (!r->images[i]) TRY(acquire_snapshot_resource(c, &desc, D3D12_RESOURCE_STATE_COPY_DEST,
             image->pixels, image->size, &r->images[i], &reused));
         UINT64 size, row_bytes;
         UINT rows;
@@ -1323,10 +1328,13 @@ done:
 static void bind_graphics_resources(Ps5D3D12 *c, GraphicsResources *r, const Ps5D3D12Buffer *buffers, UINT buffer_count, UINT image_count) {
     for (UINT i = 0; i < buffer_count; ++i) {
         if (r->buffer_uploads[i]) ID3D12GraphicsCommandList_CopyBufferRegion(c->commands, r->buffers[i], 0, r->buffer_uploads[i], 0, buffers[i].size);
-        transition(c, r->buffers[i], r->buffer_uploads[i] ? D3D12_RESOURCE_STATE_COPY_DEST : D3D12_RESOURCE_STATE_COMMON,
+        if (!r->buffer_shared[i]) transition(c, r->buffers[i], r->buffer_uploads[i] ? D3D12_RESOURCE_STATE_COPY_DEST : D3D12_RESOURCE_STATE_COMMON,
             D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     }
     for (UINT i = 0; i < image_count; ++i) {
+        int alias = 0;
+        for (UINT j = 0; j < i; ++j) if (r->images[j] == r->images[i]) { alias = 1; break; }
+        if (alias) continue;
         D3D12_TEXTURE_COPY_LOCATION source = {0}, destination = {0};
         source.pResource = r->image_uploads[i]; source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; source.PlacedFootprint = r->footprints[i];
         destination.pResource = r->images[i]; destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
@@ -1337,12 +1345,15 @@ static void bind_graphics_resources(Ps5D3D12 *c, GraphicsResources *r, const Ps5
         ID3D12DescriptorHeap *heaps[2] = {r->views, r->samplers};
         ID3D12GraphicsCommandList_SetDescriptorHeaps(c->commands, image_count ? 2 : 1, heaps);
         D3D12_GPU_DESCRIPTOR_HANDLE view = ID3D12DescriptorHeap_GetGPUDescriptorHandleForHeapStart(r->views);
+        view.ptr += (UINT64)r->view_offset * ID3D12Device_GetDescriptorHandleIncrementSize(c->device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
         UINT parameter = 1;
         if (buffer_count) ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(c->commands, parameter++, view);
         view.ptr += (UINT64)buffer_count * ID3D12Device_GetDescriptorHandleIncrementSize(c->device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
         if (image_count) {
             ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(c->commands, parameter++, view);
-            ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(c->commands, parameter, ID3D12DescriptorHeap_GetGPUDescriptorHandleForHeapStart(r->samplers));
+            D3D12_GPU_DESCRIPTOR_HANDLE sampler = ID3D12DescriptorHeap_GetGPUDescriptorHandleForHeapStart(r->samplers);
+            sampler.ptr += (UINT64)r->sampler_offset * ID3D12Device_GetDescriptorHandleIncrementSize(c->device, D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
+            ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(c->commands, parameter, sampler);
         }
     }
 }
@@ -1370,23 +1381,91 @@ static int valid_sampled_image(const Ps5D3D12Image *image) {
     return (uint64_t)(image->width / 4) * (image->height / 4) * block_bytes == image->size;
 }
 
-enum { DRAW_BATCH_CAPACITY = 8 };
+enum { DRAW_BATCH_CAPACITY = 64 };
 typedef struct DrawLease {
     GraphicsResources resources;
     UINT buffer_count, image_count;
+    const Ps5D3D12Buffer *buffer_inputs;
+    const Ps5D3D12Image *image_inputs;
     ID3D12Resource *scalar, *indices;
     ID3D12RootSignature *root;
     ID3D12PipelineState *pipeline;
 } DrawLease;
-typedef struct DrawBatch {
+struct DrawBatch {
     DrawLease leases[DRAW_BATCH_CAPACITY];
     UINT count, width, height, depth_bpp;
+    UINT views, samplers;
     int recording, depth_write, needs_depth_readback;
     D3D12_RESOURCE_STATES depth_state;
     ID3D12Resource *color, *upload, *readback, *depth, *depth_upload, *depth_readback;
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint, depth_footprint;
     UINT64 bytes, depth_bytes;
-} DrawBatch;
+};
+
+/* Each draw owns a disjoint descriptor range until batch completion. The
+ * device's two heaps are reused only by later synchronous batches, never
+ * rewritten while a previous submission can still reference them. */
+static HRESULT batch_heaps(Ps5D3D12 *c, DrawBatch *batch, GraphicsResources *r, UINT views, UINT samplers) {
+    HRESULT hr = S_OK;
+    if (batch->views + views > DRAW_BATCH_CAPACITY * 96 || batch->samplers + samplers > DRAW_BATCH_CAPACITY * 32)
+        return failure(c, E_INVALIDARG, "batch descriptor capacity");
+    D3D12_DESCRIPTOR_HEAP_DESC desc = {0};
+    desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    if (views) {
+        if (!c->draw_views) {
+            desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV; desc.NumDescriptors = DRAW_BATCH_CAPACITY * 96;
+            TRY(ID3D12Device_CreateDescriptorHeap(c->device, &desc, &IID_ID3D12DescriptorHeap, (void **)&c->draw_views));
+        }
+        r->views = c->draw_views; ID3D12DescriptorHeap_AddRef(r->views);
+        r->view_offset = batch->views; batch->views += views;
+    }
+    if (samplers) {
+        if (!c->draw_samplers) {
+            desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER; desc.NumDescriptors = DRAW_BATCH_CAPACITY * 32;
+            TRY(ID3D12Device_CreateDescriptorHeap(c->device, &desc, &IID_ID3D12DescriptorHeap, (void **)&c->draw_samplers));
+        }
+        r->samplers = c->draw_samplers; ID3D12DescriptorHeap_AddRef(r->samplers);
+        r->sampler_offset = batch->samplers; batch->samplers += samplers;
+    }
+done:
+    return hr;
+}
+
+/* Inputs remain immutable and owned by the caller until the whole batch
+ * completes. Exact content checks permit shared read-only native resources
+ * without retaining another CPU copy or trusting a guest address/hash.
+ * Search only earlier draws: images are back in COPY_DEST after each draw;
+ * buffers remain in shader-read state until the command list completes. */
+static ID3D12Resource *batch_buffer(DrawBatch *batch, const Ps5D3D12Buffer *buffer) {
+    for (UINT n = batch->count; n > 0; --n) {
+        DrawLease *l = &batch->leases[n - 1];
+        for (UINT i = 0; i < l->buffer_count; ++i) {
+            const Ps5D3D12Buffer *previous = &l->buffer_inputs[i];
+            if (previous->size == buffer->size &&
+                ps5_d3d12_equal_bytes(previous->bytes, buffer->bytes, buffer->size)) {
+                ID3D12Resource_AddRef(l->resources.buffers[i]);
+                return l->resources.buffers[i];
+            }
+        }
+    }
+    return NULL;
+}
+static ID3D12Resource *batch_image(DrawBatch *batch, const Ps5D3D12Image *image) {
+    for (UINT n = batch->count; n > 0; --n) {
+        DrawLease *l = &batch->leases[n - 1];
+        for (UINT i = 0; i < l->image_count; ++i) {
+            const Ps5D3D12Image *previous = &l->image_inputs[i];
+            if (previous->width == image->width && previous->height == image->height &&
+                previous->format == image->format && previous->srgb == image->srgb &&
+                previous->size == image->size &&
+                ps5_d3d12_equal_bytes(previous->pixels, image->pixels, image->size)) {
+                ID3D12Resource_AddRef(l->resources.images[i]);
+                return l->resources.images[i];
+            }
+        }
+    }
+    return NULL;
+}
 
 static void cleanup_batch(Ps5D3D12 *c, DrawBatch *batch, int complete) {
     if (batch->recording) ID3D12GraphicsCommandList_Close(c->commands);
@@ -1520,7 +1599,7 @@ static HRESULT record_draw(Ps5D3D12 *c, DrawBatch *batch, const uint32_t *vertex
         c->cache_stats.pipeline_ms += GetTickCount64() - started;
         remember_pipeline(c, &key, root, pipeline);
     }
-    TRY(prepare_graphics_resources(c, &resources, buffers, buffer_count, images, image_count));
+    TRY(prepare_graphics_resources(c, batch, &resources, buffers, buffer_count, images, image_count));
     D3D12_RESOURCE_DESC desc = {0};
     desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
     desc.Width = d->width; desc.Height = d->height;
@@ -1628,11 +1707,16 @@ static HRESULT record_draw(Ps5D3D12 *c, DrawBatch *batch, const uint32_t *vertex
         ID3D12GraphicsCommandList_IASetIndexBuffer(c->commands, &index_view);
         ID3D12GraphicsCommandList_DrawIndexedInstanced(c->commands, d->index_count, d->instance_count, 0, d->base_vertex, d->first_instance);
     } else ID3D12GraphicsCommandList_DrawInstanced(c->commands, d->vertex_count, d->instance_count, d->first_vertex, d->first_instance);
-    for (UINT i = 0; i < image_count; ++i) transition(c, resources.images[i],
-        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+    for (UINT i = 0; i < image_count; ++i) {
+        int alias = 0;
+        for (UINT j = 0; j < i; ++j) if (resources.images[j] == resources.images[i]) { alias = 1; break; }
+        if (!alias) transition(c, resources.images[i],
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+    }
     DrawLease *lease = &batch->leases[batch->count++];
     lease->resources = resources; memset(&resources, 0, sizeof(resources));
     lease->buffer_count = buffer_count; lease->image_count = image_count;
+    lease->buffer_inputs = buffers; lease->image_inputs = images;
     lease->scalar = scalar_upload; scalar_upload = NULL;
     lease->indices = index_upload; index_upload = NULL;
     lease->root = root; root = NULL; lease->pipeline = pipeline; pipeline = NULL;
@@ -1673,6 +1757,7 @@ done:
 int32_t ps5_d3d12_draw_batch(Ps5D3D12 *c, const Ps5D3D12DrawJob *jobs, uint32_t count,
     uint8_t *rgba, uint8_t *depth, size_t depth_bytes) {
     if (!c || !jobs || !count || count > DRAW_BATCH_CAPACITY || !jobs[0].draw) return E_INVALIDARG;
+    if (c->pending || c->poisoned) return failure(c, E_FAIL, "previous GPU submission has not completed");
     const Ps5D3D12Draw *first = jobs[0].draw;
     for (UINT i = 0; i < count; ++i) {
         const Ps5D3D12Draw *d = jobs[i].draw;

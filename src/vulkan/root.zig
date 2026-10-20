@@ -43,7 +43,7 @@ test {
     _ = @import("buffer_write_ranges.zig");
     _ = @import("buffer_upload_chunks.zig");
     _ = @import("cache_budget_recovery.zig");
-    _ = @import("spirv_cache.zig");
+    _ = @import("rdna2").translation_cache;
     _ = @import("release_clock.zig");
     _ = @import("timeline_wait.zig");
     _ = @import("descriptor_indexing.zig");

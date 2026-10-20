@@ -1511,6 +1511,17 @@ pub fn gpuGeneration(context: ?*anyopaque, address: u64, size: usize) u64 {
     return space.gpuGeneration(resolved, size);
 }
 
+pub fn trackSnapshotRead(context: ?*anyopaque, address: u64, size: usize) u64 {
+    _ = trackGpuRead(context, address, size);
+    return snapshotGeneration(context, address, size);
+}
+
+pub fn snapshotGeneration(context: ?*anyopaque, address: u64, size: usize) u64 {
+    const space = addressSpaceFromContext(context) orelse return 0;
+    const resolved = resolveGuestMemoryAddress(address, size) orelse return 0;
+    return space.gpuSnapshotGeneration(resolved, size);
+}
+
 pub fn gpuTrackingEpoch(context: ?*anyopaque) u64 {
     const space = addressSpaceFromContext(context) orelse return 0;
     return space.gpuTrackingEpoch();
