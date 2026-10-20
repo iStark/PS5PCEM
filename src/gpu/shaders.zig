@@ -126,6 +126,8 @@ pub const Metadata = struct {
     resource_counts: [4]u16,
     input_semantics_address: u64,
     input_semantics_count: u32,
+    /// Per-invocation spill allocation declared by the AGC shader header.
+    private_memory_size_bytes: u32 = 0,
 
     pub fn read(reader: MemoryReader, header_address: u64) Error!Metadata {
         const user_data_address = try reader.readU64(try addAddress(header_address, 0x08));
@@ -158,7 +160,9 @@ pub const Metadata = struct {
         }
 
         const input_semantics_address = try reader.readU64(try addAddress(header_address, 0x30));
-        const input_semantics_count = try reader.readU32(try addAddress(header_address, 0x50));
+        // The input count, scratch dword count and output count share eight
+        // bytes. Read them together so dispatch setup needs no extra read.
+        const counts = try reader.readU64(try addAddress(header_address, 0x50));
 
         return .{
             .header_address = header_address,
@@ -170,7 +174,8 @@ pub const Metadata = struct {
             .direct_resource_count = direct_count,
             .resource_counts = resource_counts,
             .input_semantics_address = input_semantics_address,
-            .input_semantics_count = input_semantics_count,
+            .input_semantics_count = @truncate(counts),
+            .private_memory_size_bytes = @as(u32, @as(u16, @truncate(counts >> 32))) * 4,
         };
     }
 
@@ -695,10 +700,14 @@ test "batched metadata preserves fields narrow-reader fallback and malformed err
     memory.writeInt(u64, header + 8, body);
     memory.writeInt(u64, header + 0x30, 0x11c0);
     memory.writeInt(u32, header + 0x50, 3);
+    memory.writeInt(u16, header + 0x54, 73);
+    memory.writeInt(u16, header + 0x56, 9);
     for (0..5) |i| memory.writeInt(u64, body + i * 8, 0x1180 + i * 8);
     for (0..7) |i| memory.writeInt(u16, body + 0x28 + i * 2, @intCast(i + 1));
     batch_shader_metadata_reads = false;
     const expected = try Metadata.read(memory.reader(), header);
+    try testing.expectEqual(@as(u32, 3), expected.input_semantics_count);
+    try testing.expectEqual(@as(u32, 292), expected.private_memory_size_bytes);
     const legacy_calls = memory.calls;
     memory.calls = 0;
     batch_shader_metadata_reads = true;

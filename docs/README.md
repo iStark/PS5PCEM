@@ -35,6 +35,7 @@ short and visual; implementation details live here.
 
 - [Release notes](release-notes/)
 - [Screenshots and captures](images/)
+- [Severed Steel startup, first level and captures, 21 October 2026](development/severed-steel-startup-2026-10-21.md)
 - [1080p startup and buffer reuse, 27 September 2026](development/1080p-buffer-reuse-2026-09-27.md)
 - [GPU submission and Yotei performance report, 24 September 2026](development/yotei-performance-2026-09-24.md)
 - [GitHub releases](https://github.com/iStark/PS5PCEM/releases)

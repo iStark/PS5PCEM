@@ -1165,7 +1165,12 @@ pub const DcbExecutor = struct {
             var bytes: [8]u8 = undefined;
             const size: usize = if (wait.width == .bits_32) 4 else 8;
             const read_wait = self.backend.vtable.read_wait orelse self.backend.vtable.read;
-            if (!read_wait(self.backend.context, wait.address, bytes[0..size])) return Error.MemoryReadFailed;
+            if (!read_wait(self.backend.context, wait.address, bytes[0..size])) {
+                std.debug.print("[gpu wait] unreadable address=0x{x} width={d} reference=0x{x} mask=0x{x} control={d}/{d} standard={} body={any}\n", .{
+                    wait.address, size * 8, wait.reference, wait.mask, wait.compare_function, wait.operation, standard, body,
+                });
+                return Error.MemoryReadFailed;
+            }
             break :value switch (wait.width) {
                 .bits_32 => @as(u64, std.mem.readInt(u32, bytes[0..4], .little)),
                 .bits_64 => std.mem.readInt(u64, &bytes, .little),

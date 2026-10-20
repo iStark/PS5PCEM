@@ -7775,6 +7775,21 @@ pub const Renderer = struct {
             self.flip_callbacks -| self.video_surface_last_flip <= 2;
     }
 
+    fn videoTargetForPresentation(self: *const Renderer, display: DisplayBuffer) ?usize {
+        if (self.window_presentation == null) return null;
+        const index = self.latest_video_render_target_index orelse return null;
+        if (index >= self.render_targets.items.len or !self.render_targets.items[index].initialized) return null;
+        if (!self.fullscreenVideoActive()) {
+            if (self.flip_callbacks -| self.video_surface_last_flip > 2) return null;
+            // A movie may be a menu background or an offscreen material. Once
+            // this frame composites into its registered display allocation,
+            // that complete image includes UI the raw movie cannot contain.
+            if (self.batch_color_targets.contains(display.address) and
+                self.latestPresentableTargetAtAddress(display.address, display.width, display.height) != null) return null;
+        }
+        return index;
+    }
+
     fn canElideCoveredDraw(self: *Renderer, state: *const gpu.State) bool {
         if (!self.fullscreenVideoActive()) return false;
         const memory = self.guest_memory orelse return false;
@@ -10955,7 +10970,7 @@ pub const Renderer = struct {
             .flat_apertures = if (scene_collision_query) .{ .shared = 0x8000_0000, .private = 0x7000_0000 } else .{},
             // These traversal kernels spill beyond 15 LDS stack entries into
             // a private stack bounded at byte 0xd4, rounded to a 256-byte slot.
-            .private_memory_size_bytes = if (scene_collision_query) 256 else 0,
+            .private_memory_size_bytes = @max(computePrivateMemorySizeBytes(state, bindings.metadata), if (scene_collision_query) @as(u32, 256) else 0),
             .allow_float64 = self.shader_float64_available,
             .allow_image_float32_atomic_min_max = self.image_float32_atomic_min_max_available,
         }, analysis.pipeline_options, if (self.prepared_program_keys_enabled) analysis.translation_key else null) catch |err| {
@@ -10970,7 +10985,7 @@ pub const Renderer = struct {
             }
             if (self.shouldReportComputeShaderFailure(program_address, err)) {
                 std.debug.print(
-                    "[vulkan dcb] compute program 0x{x}: {d} instructions, groups={d}x{d}x{d}, local={d}x{d}x{d}, rsrc2=0x{x}\n",
+                    "[vulkan dcb] compute program 0x{x}: {d} instructions, groups={d}x{d}x{d}, local={d}x{d}x{d}, rsrc2=0x{x}, header=0x{x}, scratch={d}\n",
                     .{
                         program_address,
                         analysis.program.instructions.items.len,
@@ -10981,6 +10996,8 @@ pub const Renderer = struct {
                         local_size[1],
                         local_size[2],
                         state.readRegister(.shader, 0x213) orelse 0,
+                        header_address orelse 0,
+                        computePrivateMemorySizeBytes(state, bindings.metadata),
                     },
                 );
                 std.debug.print("[vulkan dcb] Translation error: {s}\n", .{@errorName(err)});
@@ -36920,9 +36937,14 @@ pub const Renderer = struct {
         // also checks completed faults. Unrelated CPU-owned data must not turn
         // a queued diagnostic record back into a per-dispatch fence wait.
         if (self.flat_memory_fault_failed or self.sampled_fault_failed) return false;
-        self.flushPendingGuestWrite(address, bytes.len) catch return false;
+        self.flushPendingGuestWrite(address, bytes.len) catch |err| {
+            std.debug.print("[vulkan dcb] operand publication failed address=0x{x} size={d}: {s}\n", .{ address, bytes.len, @errorName(err) });
+            return false;
+        };
         const memory = self.guest_memory orelse return false;
-        return memory.read(memory.context, address, bytes);
+        const success = memory.read(memory.context, address, bytes);
+        if (!success) std.debug.print("[vulkan dcb] operand read failed address=0x{x} size={d}\n", .{ address, bytes.len });
+        return success;
     }
 
     /// A WAIT_REG_MEM or predicate read observes memory in stream order: every
@@ -39080,9 +39102,8 @@ pub const Renderer = struct {
             // into its older camera target, present the newest proven video
             // surface directly. The override expires as soon as planar video
             // draws stop, so menus/gameplay resume using the requested buffer.
-            const presenting_video = self.window_presentation != null and
-                self.latest_video_render_target_index != null and
-                (self.fullscreenVideoActive() or self.flip_callbacks -| self.video_surface_last_flip <= 2);
+            const video_for_presentation = self.videoTargetForPresentation(requested.?);
+            const presenting_video = video_for_presentation != null;
             if (presenting_video != self.was_presenting_video) {
                 self.was_presenting_video = presenting_video;
                 if (self.video_presentation_reports < 16) {
@@ -39099,7 +39120,7 @@ pub const Renderer = struct {
                 }
             }
             if (presenting_video) {
-                const video_index = self.latest_video_render_target_index.?;
+                const video_index = video_for_presentation.?;
                 if (video_index < self.render_targets.items.len and
                     self.render_targets.items[video_index].initialized)
                 {
@@ -41376,6 +41397,12 @@ fn computeLdsSizeBytes(state: *const gpu.State) u32 {
     const rsrc2 = state.readRegister(.shader, 0x213) orelse return 0;
     const blocks = (rsrc2 >> 15) & 0x1ff;
     return blocks * 512;
+}
+
+fn computePrivateMemorySizeBytes(state: *const gpu.State, metadata: ?gpu.shaders.Metadata) u32 {
+    const rsrc2 = state.readRegister(.shader, 0x213) orelse return 0;
+    if (rsrc2 & 1 == 0) return 0; // COMPUTE_PGM_RSRC2.SCRATCH_EN
+    return if (metadata) |header| header.private_memory_size_bytes else 0;
 }
 
 fn scalarPrefixEnd(analysis: *const gpu.ShaderAnalysis) u32 {
@@ -47695,6 +47722,45 @@ test "a prebuffered video cannot cover later gameplay while its decoder remains 
     renderer.active_video_decoder.store(9, .release);
     renderer.window_presentation = null;
     try std.testing.expect(!renderer.fullscreenVideoActive());
+}
+
+test "a composited menu retains its UI over an active background movie" {
+    const renderer = try std.testing.allocator.create(Renderer);
+    defer std.testing.allocator.destroy(renderer);
+    renderer.window_presentation = @as(WindowPresentation, undefined);
+    renderer.prioritize_fullscreen_video = false;
+    renderer.active_video_decoder = .init(7);
+    renderer.flip_callbacks = 20;
+    renderer.video_surface_last_flip = 20;
+    renderer.latest_video_render_target_index = 0;
+    renderer.batch_color_targets = .{};
+    var targets: [2]CachedRenderTarget = undefined;
+    for (&targets, 0..) |*target, index| {
+        target.initialized = true;
+        target.target.descriptor.address = 0x2000 + index * 0x1000;
+        target.target.descriptor.width = if (index == 0) 960 else 1920;
+        target.target.descriptor.height = if (index == 0) 540 else 1080;
+        target.target.format.vulkan = vk.format_r8g8b8a8_unorm;
+        target.last_used_sequence = index + 1;
+    }
+    renderer.render_targets = .{ .items = &targets, .capacity = targets.len };
+    var display: DisplayBuffer = undefined;
+    display.address = 0x3000;
+    display.width = 1920;
+    display.height = 1080;
+    // A retained old scanout alone does not displace the video fallback.
+    try std.testing.expectEqual(@as(?usize, 0), renderer.videoTargetForPresentation(display));
+    renderer.batch_color_targets.note(0x3000);
+    try std.testing.expectEqual(@as(?usize, null), renderer.videoTargetForPresentation(display));
+    // A rejected draw without a resident result cannot vouch for a composite.
+    targets[1].initialized = false;
+    try std.testing.expectEqual(@as(?usize, 0), renderer.videoTargetForPresentation(display));
+    targets[1].initialized = true;
+    // Explicit fullscreen playback retains its existing priority and expiry.
+    renderer.prioritize_fullscreen_video = true;
+    try std.testing.expectEqual(@as(?usize, 0), renderer.videoTargetForPresentation(display));
+    renderer.flip_callbacks = 23;
+    try std.testing.expectEqual(@as(?usize, null), renderer.videoTargetForPresentation(display));
 }
 
 test "retiring an older storage image binding preserves the current pass pin" {
