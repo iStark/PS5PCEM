@@ -490,6 +490,7 @@ pub const Mapping = struct {
     /// Original guest ABI protection mask, including GPU access bits.
     protection_bits: i32 = 0,
     memory_type: i32 = 0,
+    gpu_mask_id: u8 = 0,
     /// Kernel MemoryPool ownership; retained by commits and interval splits.
     pooled: bool = false,
     name: [maximum_name_length]u8 = [_]u8{0} ** maximum_name_length,
@@ -503,6 +504,7 @@ pub const Mapping = struct {
 pub const MappingMetadata = struct {
     protection_bits: ?i32 = null,
     memory_type: ?i32 = null,
+    gpu_mask_id: ?u8 = null,
     name: ?[]const u8 = null,
     pooled: ?bool = null,
 };
@@ -2552,6 +2554,7 @@ fn updateMappingMetadata(allocator: std.mem.Allocator, mappings: *std.ArrayList(
         mapping.* = offsetMapping(mapping.*, start, stop - start);
         if (metadata.protection_bits) |bits| mapping.protection_bits = bits;
         if (metadata.memory_type) |memory_type| mapping.memory_type = memory_type;
+        if (metadata.gpu_mask_id) |value| mapping.gpu_mask_id = value;
         if (metadata.pooled) |pooled| mapping.pooled = pooled;
         if (metadata.name) |name| mapping.name = namedMapping(name);
     }
@@ -2627,6 +2630,7 @@ fn appendMetadataTransformed(
         var middle = offsetMapping(mapping, middle_start, middle_end - middle_start);
         if (metadata.protection_bits) |bits| middle.protection_bits = bits;
         if (metadata.memory_type) |memory_type| middle.memory_type = memory_type;
+        if (metadata.gpu_mask_id) |value| middle.gpu_mask_id = value;
         if (metadata.pooled) |pooled| middle.pooled = pooled;
         if (metadata.name) |name| middle.name = namedMapping(name);
         try out.append(allocator, middle);

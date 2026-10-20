@@ -697,6 +697,26 @@ fn takeAutoLocked(size: u64, memory_type: i32) ?u64 {
     return allocated;
 }
 
+/// Native mapper submissions share donated storage with the HLE AMPR path.
+/// A failed mapping must not consume its donated slice or leak a new physical
+/// reservation. Keep allocation and rollback under the same allocator lock.
+pub fn mapAutoMemory(address: u64, size: u64, memory_type: i32, protection: i32) i32 {
+    lock.lock();
+    defer lock.unlock();
+    const previous = auto_pool;
+    const physical = takeAutoLocked(size, memory_type) orelse return errno.KernelError.enomem.raw();
+    const status = memory.hostMapDirectMemoryFixed(address, size, protection, physical);
+    if (status != errno.ok) {
+        var donated = false;
+        for (previous[0..auto_pool_count]) |range| {
+            if (physical >= range.start and physical - range.start < range.size) donated = true;
+        }
+        auto_pool = previous;
+        if (!donated) _ = memory.hostReleaseDirectMemory(physical, size);
+    }
+    return status;
+}
+
 fn applyRead(command: ReadCommand) Error!void {
     if (!memory.isGuestRangeAccessible(command.destination, command.size)) return error.InvalidRead;
     const destination: [*]u8 = @ptrFromInt(command.destination);

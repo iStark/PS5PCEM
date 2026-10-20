@@ -40,6 +40,7 @@ pub const libs = struct {
     pub const agc = @import("libs/agc.zig");
     pub const agc_submit = @import("libs/agc_submit.zig");
     pub const kernel_aio = @import("libs/kernel_aio.zig");
+    pub const kernel_mapper = @import("libs/kernel_mapper.zig");
     pub const kernel_files = @import("libs/kernel_files.zig");
     pub const kernel_memory = @import("libs/kernel_memory.zig");
     pub const kernel_runtime = @import("libs/kernel_runtime.zig");
@@ -78,6 +79,7 @@ pub fn registerAll(db: *Database, gpa: @import("std").mem.Allocator) symbols.Err
     try libs.audio.register(db, gpa);
     try libs.agc.register(db, gpa);
     try libs.kernel_aio.register(db, gpa);
+    try libs.kernel_mapper.register(db, gpa);
     try libs.bootstrap_services.register(db, gpa);
     try libs.cxx_abi.register(db, gpa);
     try libs.dialogs.register(db, gpa);
@@ -139,6 +141,7 @@ test {
     _ = libs.agc;
     _ = libs.agc_submit;
     _ = libs.kernel_aio;
+    _ = libs.kernel_mapper;
     _ = libs.kernel_files;
     _ = libs.kernel_memory;
     _ = libs.kernel_runtime;

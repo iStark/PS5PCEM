@@ -301,6 +301,23 @@ fn initializeImpl(_: ?*anyopaque, _: i32) callconv(abi.guest) i32 {
 
 fn initializeParam(_: ?*anyopaque) callconv(abi.guest) void {}
 
+const SchedulingParam = extern struct {
+    window: i32,
+    delayed_limit: i32,
+    split_enabled: u32,
+    split_size: u32,
+    split_chunk_size: u32,
+};
+
+fn setParam(param: ?*align(1) SchedulingParam, window: i32, delayed_limit: i32, split_enabled: u32, split_size: u32, split_chunk_size: u32) callconv(abi.guest) i32 {
+    const output = param orelse return KernelError.efault.raw();
+    if (window < 0 or window > 128 or delayed_limit < 0 or delayed_limit > 128 or
+        split_enabled > 1 or split_size > 0x1000000 or split_chunk_size > 0x1000000) return KernelError.einval.raw();
+    if (!@import("memory").isHostRangeWritable(@intFromPtr(output), @sizeOf(SchedulingParam))) return KernelError.efault.raw();
+    output.* = .{ .window = window, .delayed_limit = delayed_limit, .split_enabled = split_enabled, .split_size = split_size, .split_chunk_size = split_chunk_size };
+    return errno.ok;
+}
+
 pub const exports = [_]symbols.Export{
     .{ .name = "sceKernelAioSubmitReadCommands", .function = trace.wrap("sceKernelAioSubmitReadCommands", &submitReadCommands), .expect_id = "HgX7+AORI58" },
     .{ .name = "sceKernelAioSubmitWriteCommands", .function = trace.wrap("sceKernelAioSubmitWriteCommands", &submitWriteCommands), .expect_id = "XQ8C8y+de+E" },
@@ -310,6 +327,7 @@ pub const exports = [_]symbols.Export{
     .{ .name = "sceKernelAioDeleteRequest", .function = trace.wrap("sceKernelAioDeleteRequest", &deleteRequest), .expect_id = "5TgME6AYty4" },
     .{ .name = "sceKernelAioInitializeImpl", .function = trace.wrap("sceKernelAioInitializeImpl", &initializeImpl), .expect_id = "vYU8P9Td2Zo" },
     .{ .name = "sceKernelAioInitializeParam", .function = trace.wrap("sceKernelAioInitializeParam", &initializeParam), .expect_id = "nu4a0-arQis" },
+    .{ .name = "sceKernelAioSetParam", .function = trace.wrap("sceKernelAioSetParam", &setParam), .expect_id = "9WK-vhNXimw" },
 };
 
 pub fn register(db: *symbols.Database, gpa: std.mem.Allocator) symbols.Error!void {
@@ -553,4 +571,14 @@ test "asynchronous read exports register under published identifiers" {
     try register(&db, testing.allocator);
     try testing.expectEqual(exports.len, db.count());
     try testing.expect(db.findByName("sceKernelAioSubmitReadCommands", .function) != null);
+}
+
+test "AMM AIO scheduling parameters write the guest structure and reject invalid values" {
+    var params = SchedulingParam{ .window = -1, .delayed_limit = -1, .split_enabled = 99, .split_size = 99, .split_chunk_size = 99 };
+    try testing.expectEqual(errno.ok, setParam(&params, 128, 64, 1, 0x100000, 0x10000));
+    try testing.expectEqualDeep(SchedulingParam{ .window = 128, .delayed_limit = 64, .split_enabled = 1, .split_size = 0x100000, .split_chunk_size = 0x10000 }, params);
+    const before = params;
+    try testing.expectEqual(KernelError.einval.raw(), setParam(&params, 129, 0, 0, 0, 0));
+    try testing.expectEqualDeep(before, params);
+    try testing.expectEqual(KernelError.efault.raw(), setParam(null, 0, 0, 0, 0, 0));
 }

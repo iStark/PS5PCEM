@@ -532,6 +532,100 @@ pub fn hostUnmap(va: u64, len: u64) i32 {
     return sceKernelMunmap(va, len);
 }
 
+pub fn hostReleaseDirectMemory(physical: u64, len: u64) i32 {
+    return sceKernelReleaseDirectMemory(physical, len);
+}
+
+/// Kernel AMM changes permissions on each original interval independently.
+/// A mask must not erase permissions or memory types on neighbouring pages.
+pub fn hostModifyProtection(address: u64, len: u64, bits: i32, mask: i32, memory_type: ?i32, gpu_mask_id: ?u8) i32 {
+    if (address == 0 or len == 0 or (address | len) & (page_size - 1) != 0) return KernelError.einval.raw();
+    const end = std.math.add(u64, address, len) catch return KernelError.einval.raw();
+    if (decodeProtection(bits) == null or decodeProtection(mask) == null) return KernelError.einval.raw();
+    if (memory_type) |value| if (value < 0 or value > 31) return KernelError.einval.raw();
+    pool_lock.lock();
+    defer pool_lock.unlock();
+    const space = guest_address_space orelse return KernelError.enosys.raw();
+    // Validate the entire range before changing its first page.
+    var cursor = address;
+    while (cursor < end) {
+        const mapping = space.query(cursor, false) orelse return KernelError.eacces.raw();
+        if (mapping.kind == .reserved) return KernelError.eacces.raw();
+        cursor = @min(end, mapping.end());
+    }
+    cursor = address;
+    while (cursor < end) {
+        const mapping = space.query(cursor, false).?;
+        const size = @min(end, mapping.end()) - cursor;
+        const effective = (mapping.protection_bits & ~mask) | (bits & mask);
+        const protection = decodeProtection(effective) orelse return KernelError.einval.raw();
+        space.protectGuestWithType(cursor, size, protection, effective, memory_type) catch |err| return mapAddressSpaceError(err);
+        if (gpu_mask_id) |value| space.setMetadata(cursor, size, .{ .gpu_mask_id = value }) catch |err| return mapAddressSpaceError(err);
+        cursor += size;
+    }
+    return errno.ok;
+}
+
+/// AMM aliases share the physical backing, including writes made after mapping.
+/// Overlapping moves and replacement of occupied targets are refused before any
+/// mutation; they require an atomic host remap that is not available here yet.
+pub fn hostAliasDirectMemory(destination: u64, source: u64, len: u64, bits: i32, gpu_mask_id: ?u8, move: bool) i32 {
+    if (destination == 0 or source == 0 or len == 0 or (destination | source | len) & (page_size - 1) != 0) return KernelError.einval.raw();
+    const end = std.math.add(u64, source, len) catch return KernelError.einval.raw();
+    const destination_end = std.math.add(u64, destination, len) catch return KernelError.einval.raw();
+    const protection = decodeProtection(bits) orelse return KernelError.einval.raw();
+    if (destination < end and source < destination_end) return KernelError.einval.raw();
+    pool_lock.lock();
+    defer pool_lock.unlock();
+    const space = guest_address_space orelse return KernelError.enosys.raw();
+    var pieces: std.ArrayList(memory.Mapping) = .empty;
+    defer pieces.deinit(std.heap.page_allocator);
+    var cursor = source;
+    while (cursor < end) {
+        var mapping = space.query(cursor, false) orelse return KernelError.eacces.raw();
+        if (mapping.kind != .direct_memory or mapping.pooled or mapping.backing_offset == null) return KernelError.eacces.raw();
+        mapping.backing_offset.? += cursor - mapping.address;
+        mapping.size = @min(end, mapping.end()) - cursor;
+        mapping.address = destination + cursor - source;
+        pieces.append(std.heap.page_allocator, mapping) catch return KernelError.enomem.raw();
+        cursor += mapping.size;
+    }
+    cursor = destination;
+    while (cursor < destination_end) {
+        const mapping = space.query(cursor, true) orelse break;
+        if (mapping.address >= destination_end) break;
+        if (mapping.kind != .reserved or mapping.pooled) return KernelError.eexist.raw();
+        cursor = mapping.end();
+    }
+    var mapped_bytes: u64 = 0;
+    for (pieces.items) |piece| {
+        const status: i32 = blk: {
+            if (space.isMappedAs(piece.address, piece.size, .reserved)) {
+                space.mapInReservation(piece.address, piece.size, protection, .direct_memory, piece.backing_offset) catch |err| break :blk mapAddressSpaceError(err);
+            } else {
+                space.mapFixed(piece.address, piece.size, protection, .direct_memory, piece.backing_offset) catch |err| break :blk mapAddressSpaceError(err);
+            }
+            mapped_bytes += piece.size;
+            space.setMetadata(piece.address, piece.size, .{
+                .protection_bits = bits,
+                .memory_type = piece.memory_type,
+                .gpu_mask_id = gpu_mask_id orelse piece.gpu_mask_id,
+                .name = "mapper",
+            }) catch |err| break :blk mapAddressSpaceError(err);
+            break :blk errno.ok;
+        };
+        if (status != errno.ok) {
+            if (mapped_bytes != 0) space.unmap(destination, mapped_bytes) catch {};
+            return status;
+        }
+    }
+    if (move) space.unmap(source, len) catch |err| {
+        space.unmap(destination, len) catch {};
+        return mapAddressSpaceError(err);
+    };
+    return errno.ok;
+}
+
 // ---------------------------------------------------------------------------
 // Guest entry points
 // ---------------------------------------------------------------------------
@@ -1685,6 +1779,7 @@ fn sceKernelVirtualQuery(
     info.offset = if (mapping.pooled) 0 else mapping.backing_offset orelse 0;
     info.protection = mapping.protection_bits;
     info.memory_type = mapping.memory_type;
+    info.gpu_mask_id = mapping.gpu_mask_id;
     info.state = if (mapping.pooled)
         state_pooled | (if (mapping.kind == .reserved) @as(u32, 0) else state_committed)
     else switch (mapping.kind) {
@@ -1742,6 +1837,41 @@ fn sceKernelMprotect(
         protection_bits,
     ) catch |err| return mapAddressSpaceError(err);
     return errno.ok;
+}
+
+fn sceKernelMtypeprotect(address: u64, len: u64, memory_type: i32, bits: i32) callconv(abi.guest) i32 {
+    if (len == 0) return errno.ok;
+    return hostModifyProtection(address, len, bits, 0x3f7, memory_type, null);
+}
+
+fn sceKernelReleaseFlexibleMemory(address: u64, len: u64) callconv(abi.guest) i32 {
+    if (address == 0 or len == 0 or (address | len) & (page_size - 1) != 0) return KernelError.einval.raw();
+    pool_lock.lock();
+    defer pool_lock.unlock();
+    const space = guest_address_space orelse return KernelError.enosys.raw();
+    if (!space.isMappedAs(address, len, .flexible)) return KernelError.einval.raw();
+    space.unmap(address, len) catch |err| return mapAddressSpaceError(err);
+    return errno.ok;
+}
+
+test "AMM mtypeprotect updates page type and flexible release restores the budget" {
+    var space = try memory.AddressSpace.initWithDirectMemory(std.testing.allocator, 0x100000);
+    defer space.deinit();
+    init(std.testing.allocator);
+    defer deinit();
+    attachAddressSpace(&space);
+    defer attachAddressSpace(null);
+    var address: u64 = 0x1000000000;
+    try std.testing.expectEqual(errno.ok, sceKernelMapFlexibleMemory(&address, 0x10000, 3, map_fixed));
+    try std.testing.expectEqual(errno.ok, sceKernelMtypeprotect(address, 0x4000, 10, 1));
+    var info = VirtualQueryInfo{};
+    try std.testing.expectEqual(errno.ok, sceKernelVirtualQuery(address, 0, &info, @sizeOf(VirtualQueryInfo)));
+    try std.testing.expectEqual(@as(i32, 10), info.memory_type);
+    try std.testing.expectEqual(@as(i32, 1), info.protection);
+    try std.testing.expect(!space.isWritable(address, 4));
+    try std.testing.expectEqual(errno.ok, sceKernelReleaseFlexibleMemory(address, 0x10000));
+    try std.testing.expect(space.query(address, false) == null);
+    try std.testing.expectEqual(KernelError.einval.raw(), sceKernelReleaseFlexibleMemory(address, 0x10000));
 }
 
 fn sceKernelSetVirtualRangeName(
@@ -2258,6 +2388,8 @@ pub const exports = [_]symbols.Export{
         .function = trace.wrap("sceKernelMprotect", &sceKernelMprotect),
         .expect_id = "vSMAm3cxYTY",
     },
+    .{ .name = "sceKernelMtypeprotect", .function = trace.wrap("sceKernelMtypeprotect", &sceKernelMtypeprotect), .expect_id = "9bfdLIyuwCY" },
+    .{ .name = "sceKernelReleaseFlexibleMemory", .function = trace.wrap("sceKernelReleaseFlexibleMemory", &sceKernelReleaseFlexibleMemory), .expect_id = "teiItL2boFw" },
     .{
         .name = "sceKernelSetVirtualRangeName",
         .function = trace.wrap("sceKernelSetVirtualRangeName", &sceKernelSetVirtualRangeName),

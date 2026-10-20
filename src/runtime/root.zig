@@ -95,6 +95,7 @@ pub const Runtime = struct {
         hle.libs.audio_propagation.reset();
         hle.libs.json.reset();
         hle.apr.reset();
+        hle.libs.kernel_mapper.reset();
         hle.libs.bootstrap_services.reset();
         hle.libs.dialogs.reset();
         hle.libs.fiber.reset();
@@ -124,6 +125,7 @@ pub const Runtime = struct {
         // Deferred AMPR waits own snapshots that can still write guest memory.
         // Cancel and join them before detaching mappings and kernel objects.
         hle.apr.reset();
+        hle.libs.kernel_mapper.reset();
         hle.libs.kernel_memory.attachAddressSpace(null);
         hle.libs.kernel_memory.deinit();
         hle.libs.audio.reset();
