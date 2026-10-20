@@ -64,6 +64,8 @@ pub export var gpu_timestamp_min_us: u64 = 1000;
 /// Optional upper bound on CPU recording latency; zero retains unlimited
 /// batching. Submission remains asynchronous and never drops guest work.
 pub export var command_batch_max_ns: u64 = 0;
+pub export var conservative_uncaptured_dependencies: bool = true;
+pub export var defer_vector_only_smem: bool = false;
 pub export var reuse_larger_buffers: bool = true;
 /// Keep immediate GDS clears in queue order without a host round trip.
 pub export var native_gds_dma: bool = true;
@@ -1131,6 +1133,13 @@ const DrawUploadSlice = struct {
     size: vk.DeviceSize,
 };
 
+const TransientSnapshots = @import("transient_snapshots.zig").Cache(DrawUploadSlice, 4096);
+pub export var reuse_transient_snapshots: bool = true;
+pub export var retain_transient_snapshots: bool = true;
+pub export var transient_snapshot_entries: u32 = 512;
+const DrawReuseAdmission = @import("reuse_admission.zig").Admission;
+pub export var adaptive_draw_reuse_capture: bool = true;
+
 const DrawUploadCacheEntry = struct {
     guest_address: u64,
     size: usize,
@@ -1164,6 +1173,51 @@ const command_buffer_pending_tick = std.math.maxInt(u64);
 const maximum_guest_buffers = maximum_storage_descriptors;
 const maximum_retained_buffer_entries = 8192;
 pub const maximum_storage_descriptors = 64;
+pub export var batched_storage_occupancy: bool = true;
+
+fn storageOccupancyMask(occupied: *const [maximum_storage_descriptors]bool) u64 {
+    // Reading byte lanes avoids the per-lane boolean normalization generated
+    // by converting [64]bool directly to @Vector(64, bool). All slots are
+    // initialized, including unoccupied and reserved descriptor slots.
+    const bytes: @Vector(maximum_storage_descriptors, u8) = std.mem.asBytes(occupied).*;
+    return @bitCast(bytes != @as(@Vector(maximum_storage_descriptors, u8), @splat(0)));
+}
+
+test "descriptor occupancy preserves sparse slots lowest match and exact ranges" {
+    const previous = batched_storage_occupancy;
+    defer batched_storage_occupancy = previous;
+    const resources = try std.testing.allocator.create(ComputeResources);
+    defer std.testing.allocator.destroy(resources);
+    resources.* = .{};
+    for (0..68) |pattern| {
+        const mask: u64 = switch (pattern) {
+            64 => 0,
+            65 => std.math.maxInt(u64),
+            66 => 0x5555_aaaa_5555_aaaa,
+            67 => 0x8000_0000_0000_0001,
+            else => @as(u64, 1) << @intCast(pattern),
+        };
+        for (&resources.occupied, &resources.addresses, &resources.sizes, 0..) |*used, *address, *size, index| {
+            used.* = mask & (@as(u64, 1) << @intCast(index)) != 0;
+            // Duplicate addresses with different sizes and exact duplicates
+            // retain the original lowest-slot selection.
+            address.* = 0x1000 + (index % 13) * 64;
+            size.* = 4 * (1 + index % 3);
+        }
+        try std.testing.expectEqual(mask, storageOccupancyMask(&resources.occupied));
+        batched_storage_occupancy = false;
+        const expected_free = resources.freeDescriptor();
+        batched_storage_occupancy = true;
+        try std.testing.expectEqual(expected_free, resources.freeDescriptor());
+        for (0..15) |index| for ([_]usize{ 0, 4, 8, 12, 16 }) |size| {
+            const address = 0x1000 + index * 64;
+            batched_storage_occupancy = false;
+            const expected = resources.descriptorForRange(address, size);
+            batched_storage_occupancy = true;
+            try std.testing.expectEqual(expected, resources.descriptorForRange(address, size));
+        };
+    }
+}
 const maximum_storage_images = rdna2.spirv.maximum_storage_images;
 const dynamic_scalar_descriptor_binding = 2 + maximum_storage_images;
 const sampled_image_3d_descriptor_binding = dynamic_scalar_descriptor_binding + 1;
@@ -3626,6 +3680,9 @@ const FrameProfile = struct {
     draw_reuse_hits: u64 = 0,
     transient_buffer_uploads: u64 = 0,
     transient_buffer_bytes: u64 = 0,
+    transient_buffer_reuses: u64 = 0,
+    scalar_descriptor_reuses: u64 = 0,
+    transient_buffer_reused_bytes: u64 = 0,
     index_bounds_hits: u64 = 0,
     index_bounds_misses: u64 = 0,
     dynamic_state_commands: u64 = 0,
@@ -3634,6 +3691,7 @@ const FrameProfile = struct {
     pipeline_binds_avoided: u64 = 0,
     draw_reuse_scalar_hits: u64 = 0,
     draw_reuse_misses: u64 = 0,
+    draw_reuse_deferred_captures: u64 = 0,
     draw_reuse_rejections: [6]u64 = @splat(0),
     draw_reuse_tracked_reads: u64 = 0,
     buffer_cache_hits: u64 = 0,
@@ -4937,22 +4995,28 @@ const ComputeResources = struct {
         result.store_preparation_incomplete = false;
         result.program_address = 0;
         result.incomplete_store_origin = .{};
-        @memset(&result.write_origins, .{});
-        @memset(&result.write_extent_eligible, true);
-        @memset(&result.write_extent_seen, false);
-        @memset(&result.write_extent_tracked, false);
         result.vertex_index_proof = .{};
         // Only occupied slots and the prefixes named by these counts are read.
         // Preserve the unused multi-megabyte arrays across draws/dispatches.
         result.mapping_count = 0;
         result.scalar_count = 0;
-        @memset(&result.addresses, 0);
-        @memset(&result.sizes, 0);
-        @memset(&result.occupied, false);
-        @memset(&result.writable, false);
-        for (&result.write_ranges) |*ranges| {
-            ranges.whole = false;
-            ranges.count = 0;
+        // An unused slot retains its initialized state. Reset the slots owned
+        // by the previous operation, including store-only diagnostic slots,
+        // instead of clearing every descriptor's write metadata on each draw.
+        var dirty = storageOccupancyMask(&result.occupied) | storageOccupancyMask(&result.writable);
+        while (dirty != 0) {
+            const slot = @ctz(dirty);
+            dirty &= dirty - 1;
+            result.addresses[slot] = 0;
+            result.sizes[slot] = 0;
+            result.occupied[slot] = false;
+            result.writable[slot] = false;
+            result.write_origins[slot] = .{};
+            result.write_extent_eligible[slot] = true;
+            result.write_extent_seen[slot] = false;
+            result.write_extent_tracked[slot] = false;
+            result.write_ranges[slot].whole = false;
+            result.write_ranges[slot].count = 0;
         }
         result.specialized_scalar_prefix_end = 0;
         result.entry_scalar_snapshot_end = 0;
@@ -4969,6 +5033,15 @@ const ComputeResources = struct {
     }
 
     fn descriptorForRange(self: *const ComputeResources, address: u64, size: usize) ?u32 {
+        if (@atomicLoad(bool, &batched_storage_occupancy, .monotonic)) {
+            var occupied = storageOccupancyMask(&self.occupied);
+            while (occupied != 0) {
+                const index = @ctz(occupied);
+                occupied &= occupied - 1;
+                if (self.addresses[index] == address and self.sizes[index] == size) return @intCast(index);
+            }
+            return null;
+        }
         for (self.occupied, 0..) |used, index| {
             if (used and self.addresses[index] == address and self.sizes[index] == size) return @intCast(index);
         }
@@ -4976,6 +5049,10 @@ const ComputeResources = struct {
     }
 
     fn freeDescriptor(self: *const ComputeResources) ?u32 {
+        if (@atomicLoad(bool, &batched_storage_occupancy, .monotonic)) {
+            const free = ~storageOccupancyMask(&self.occupied);
+            return if (free == 0) null else @intCast(@ctz(free));
+        }
         for (self.occupied, 0..) |used, index| {
             if (!used) return @intCast(index);
         }
@@ -5320,6 +5397,39 @@ fn canReuseStorageMapping(attribute_specific: bool, previous: ?gpu.ShaderSpirvSt
     var unqualified = current;
     unqualified.instruction_pc = null;
     return std.meta.eql(original, unqualified);
+}
+
+pub export var reuse_scalar_buffer_descriptors: bool = true;
+
+const ScalarBufferDescriptorKey = struct {
+    resource_sgpr: u32,
+    words: [3]u32,
+
+    fn capture(registers: *const gpu.scalar_provenance.ScalarRegisters, sgpr: u32) ?@This() {
+        if (sgpr > registers.len - 3) return null;
+        var key = @This(){ .resource_sgpr = sgpr, .words = undefined };
+        for (&key.words, registers[sgpr..][0..3]) |*word, value| {
+            if (!value.known) return null;
+            word.* = value.value;
+        }
+        return key;
+    }
+};
+
+test "scalar buffer reuse keys require every descriptor word at the current checkpoint" {
+    var registers: gpu.scalar_provenance.ScalarRegisters = @splat(.{ .known = true, .value = 7 });
+    const original = ScalarBufferDescriptorKey.capture(&registers, 125).?;
+    try std.testing.expect(ScalarBufferDescriptorKey.capture(&registers, 126) == null);
+    try std.testing.expect(!std.meta.eql(original, ScalarBufferDescriptorKey.capture(&registers, 124).?));
+    for (125..128) |word| {
+        registers[word].value += 1;
+        try std.testing.expect(!std.meta.eql(original, ScalarBufferDescriptorKey.capture(&registers, 125).?));
+        registers[word].value -= 1;
+        registers[word].known = false;
+        try std.testing.expect(ScalarBufferDescriptorKey.capture(&registers, 125) == null);
+        registers[word].known = true;
+    }
+    try std.testing.expectEqualDeep(original, ScalarBufferDescriptorKey.capture(&registers, 125).?);
 }
 
 /// AGC's attribute table uses the sparse VertexAttribFormat numbering while a
@@ -5937,7 +6047,6 @@ const Lock = struct {
 
 const DrawScalarScratch = struct {
     vertex: gpu.ScalarEvaluation,
-    vertex_seeded: gpu.ScalarEvaluation,
     fragment: gpu.ScalarEvaluation,
     vertex_registers: [gpu.scalar_provenance.maximum_scalar_specializations]gpu.ShaderSpirvScalarRegister,
     fragment_registers: [gpu.scalar_provenance.maximum_scalar_specializations]gpu.ShaderSpirvScalarRegister,
@@ -5990,6 +6099,7 @@ pub const Renderer = struct {
     /// Command-processor writes and dispatches close the batch before they can
     /// invalidate these entries, so later draws may safely reuse each slice.
     draw_upload_cache: std.ArrayList(DrawUploadCacheEntry) = .empty,
+    transient_snapshots: ?*TransientSnapshots = null,
     index_cache: std.ArrayList(CachedIndexBuffer) = .empty,
     index_cache_bytes: usize = 0,
     /// Ranges given up as streamed after repeated rewrites, by address.
@@ -6055,6 +6165,7 @@ pub const Renderer = struct {
     /// Consecutive draws that bind the same shaders and user data skip
     /// scalar walks and buffer staging and record into the open batch.
     draw_reuse_valid: bool = false,
+    draw_reuse_admission: DrawReuseAdmission = .{},
     draw_reuse_input_key: u64 = 0,
     draw_reuse_fetch_bounds: ?DrawFetchBounds = null,
     draw_reuse_index_proof: VertexIndexProof = .{},
@@ -7503,6 +7614,7 @@ pub const Renderer = struct {
         for (self.imported_allocations.items) |allocation| self.releaseImportedAllocation(allocation);
         self.imported_allocations.deinit(self.allocator);
         self.draw_upload_cache.deinit(self.allocator);
+        if (self.transient_snapshots) |cache| self.allocator.destroy(cache);
         for (self.index_cache.items) |entry| self.destroyBuffer(entry.buffer);
         self.index_cache.deinit(self.allocator);
         self.index_cache_streamed.deinit(self.allocator);
@@ -8729,10 +8841,35 @@ pub const Renderer = struct {
         try self.flushGuestIndexRange(guest_address, size);
         var bytes: [4096]u8 = undefined;
         if (!memory.read(memory.context, guest_address, bytes[0..size])) return Error.GuestMemoryReadFailed;
+        const snapshots: ?*TransientSnapshots = if (@atomicLoad(bool, &reuse_transient_snapshots, .monotonic)) blk: {
+            if (self.transient_snapshots == null) {
+                const cache = try self.allocator.create(TransientSnapshots);
+                cache.* = .{};
+                self.transient_snapshots = cache;
+            }
+            self.transient_snapshots.?.setEntryLimit(@atomicLoad(u32, &transient_snapshot_entries, .monotonic));
+            break :blk self.transient_snapshots;
+        } else null;
+        if (snapshots) |cache| if (cache.find(guest_address, bytes[0..size])) |upload| {
+            // Referencing an earlier slice also prevents the current draw from
+            // wrapping over it before that draw has been recorded.
+            self.draw_upload_batch_uses_ring = true;
+            self.updateStorageDescriptorRangeKnown(descriptor_index, upload.buffer, upload.offset, size, null);
+            if (self.needsDrawUploadFingerprint())
+                self.active_storage_source_hashes[descriptor_index] = gpu.parallel_copy.fingerprint(bytes[0..size]);
+            self.active_descriptor_set = self.descriptor_set;
+            self.frame_profile.transient_buffer_reuses +|= 1;
+            self.frame_profile.transient_buffer_reused_bytes +|= size;
+            return true;
+        };
         const upload = try self.allocateDrawUpload(size);
         const mapping = try self.mapDrawUpload(upload);
         defer mapping.release(self);
         @memcpy(mapping.bytes, bytes[0..size]);
+        // Spill storage has a shorter lifetime; only ring slices participate.
+        if (snapshots) |cache| if (self.draw_upload_buffer) |ring| {
+            if (upload.buffer == ring.handle) cache.remember(guest_address, bytes[0..size], upload);
+        };
         self.updateStorageDescriptorRangeKnown(descriptor_index, upload.buffer, upload.offset, size, null);
         // Draw reuse must validate the exact snapshot uploaded, never a later
         // guest read or a read from the potentially write-combined GPU mapping.
@@ -8744,6 +8881,69 @@ pub const Renderer = struct {
         self.frame_profile.transient_buffer_uploads +|= 1;
         self.frame_profile.transient_buffer_bytes +|= size;
         return true;
+    }
+
+    /// Exercise retained ring slices across submissions, descriptor resets,
+    /// a hit which pins a full ring, and subsequent reuse of the ring bytes.
+    pub fn probeTransientSnapshotRetention(self: *Renderer, source: u64, size: usize) anyerror!void {
+        try std.testing.expect(size > 0 and size <= 4096);
+        var expected: [4096]u8 = undefined;
+        const memory = self.guest_memory orelse return Error.GuestMemoryUnavailable;
+        try std.testing.expect(memory.read(memory.context, source, expected[0..size]));
+        const output = try self.createBuffer(3 * 4096, vk.buffer_usage_transfer_dst_bit, vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit);
+        defer self.destroyBuffer(output);
+        try self.finishDrawBatch();
+        const uploads = self.frame_profile.transient_buffer_uploads;
+        const hits = self.frame_profile.transient_buffer_reuses;
+        const wraps = self.frame_profile.draw_upload_wraps;
+        const retained = @atomicLoad(bool, &retain_transient_snapshots, .monotonic);
+        var first_offset: u64 = undefined;
+        for (0..3) |pass| {
+            try self.beginFrameDraw();
+            if (pass == 2) {
+                // The previous retained hit pinned an exhausted ring. Spill
+                // retirement must permit recycling, even with identical input.
+                const padding = try self.allocateDrawUpload(4096);
+                const mapping = try self.mapDrawUpload(padding);
+                @memset(mapping.bytes, 0xdd);
+                mapping.release(self);
+                try std.testing.expect(self.frame_profile.draw_upload_wraps > wraps);
+            }
+            try std.testing.expect(try self.tryStageTransientStorageBuffer(0, source, size));
+            if (pass == 0) first_offset = self.active_storage_offsets[0];
+            if (pass == 1 and retained) {
+                try std.testing.expectEqual(first_offset, self.active_storage_offsets[0]);
+                try std.testing.expectEqual(uploads + 1, self.frame_profile.transient_buffer_uploads);
+                try std.testing.expectEqual(hits + 1, self.frame_profile.transient_buffer_reuses);
+            }
+            if (pass == 1) {
+                try std.testing.expect(self.draw_upload_batch_uses_ring);
+                self.draw_upload_offset = draw_upload_ring_bytes;
+                const spill = try self.allocateDrawUpload(16);
+                try std.testing.expect(spill.buffer != self.draw_upload_buffer.?.handle);
+                const mapping = try self.mapDrawUpload(spill);
+                @memset(mapping.bytes, 0xee);
+                mapping.release(self);
+            }
+            const commands = try self.beginOneShot();
+            defer self.releaseOneShot(commands);
+            const copy = vk.BufferCopy{ .source_offset = self.active_storage_offsets[0], .destination_offset = pass * 4096, .size = size };
+            self.device_functions.cmd_copy_buffer(commands, self.active_storage_buffers[0], output.handle, 1, @ptrCast(&copy));
+            const host = vk.BufferMemoryBarrier{
+                .source_access_mask = vk.access_transfer_write_bit,
+                .destination_access_mask = vk.access_host_read_bit,
+                .buffer = output.handle,
+                .offset = pass * 4096,
+                .size = size,
+            };
+            self.device_functions.cmd_pipeline_barrier(commands, vk.pipeline_stage_transfer_bit, vk.pipeline_stage_host_bit, 0, 0, null, 1, @ptrCast(&host), 0, null);
+            try self.submitOneShot(commands);
+            try self.finishDrawBatch();
+        }
+        try std.testing.expectEqual(uploads + @as(u64, if (retained) 2 else 3), self.frame_profile.transient_buffer_uploads);
+        var observed: [3 * 4096]u8 = undefined;
+        try self.readMapped(output, &observed);
+        for (0..3) |pass| try std.testing.expectEqualSlices(u8, expected[0..size], observed[pass * 4096 ..][0..size]);
     }
 
     pub fn stageGuestStorageBufferAt(
@@ -9642,6 +9842,7 @@ pub const Renderer = struct {
         // index lists within compute-written arenas (Minecraft's UI uses +0x74).
         // Publish the producing view before bounds analysis or CPU index upload.
         const end = std.math.add(u64, address, size) catch return Error.GuestBufferTooLarge;
+        if (self.guest_buffers.items.len == 0) return;
         var candidates = self.bufferAliasCandidates(address, size);
         while (candidates.next()) |index| {
             const entry = &self.guest_buffers.items[index];
@@ -13628,6 +13829,7 @@ pub const Renderer = struct {
         // Resolvers borrow the instruction-local snapshot until this lease is
         // released. No register array or unused load history needs copying.
         const buffer_scan_started = self.resourceTimestampNs();
+        var scalar_buffer_key: ?ScalarBufferDescriptorKey = null;
         var buffer_instructions = gpu.resource_checkpoints.Iterator.init(instructions, if (analysis.resource_checkpoints) |*plan| plan else null, .resource);
         while (buffer_instructions.next()) |instruction_index| {
             const candidate = &instructions[instruction_index];
@@ -13755,6 +13957,21 @@ pub const Renderer = struct {
                 inst.pc,
             );
             if (!scalarRegistersKnown(instruction_scalar, resource_sgpr, if (isBufferScalarLoad(inst.opcode)) 3 else 4)) result.scalar_reuse_safe = false;
+            const scalar_key = if (read_only_snapshots and isBufferScalarLoad(inst.opcode) and
+                @atomicLoad(bool, &reuse_scalar_buffer_descriptors, .monotonic))
+                ScalarBufferDescriptorKey.capture(instruction_scalar, resource_sgpr)
+            else
+                null;
+            if (scalar_key) |key| if (scalar_buffer_key) |previous| {
+                if (std.meta.eql(previous, key)) {
+                    // The first load installed an unqualified mapping with
+                    // no attribute offset/index substitution. SMEM offsets
+                    // remain live in the shader, and all three V# words at
+                    // this instruction still match. No resource is omitted.
+                    self.frame_profile.scalar_descriptor_reuses +|= 1;
+                    continue;
+                }
+            };
             // The instruction-local scalar state is authoritative. Attribute
             // tables are ordered by semantic/location, while shader fetches
             // are free to consume those attributes in a different order. In
@@ -13947,6 +14164,9 @@ pub const Renderer = struct {
             }
             result.mappings[result.mapping_count] = mapping;
             result.mapping_count += 1;
+            if (mapping.instruction_pc == null and !mapping.use_vertex_index and mapping.soffset_value == null) {
+                if (scalar_key) |key| scalar_buffer_key = key;
+            }
             if (is_store) result.noteBufferStore(descriptor_index, inst.*);
             store_prepared = true;
         }
@@ -15906,6 +16126,19 @@ pub const Renderer = struct {
             break;
         }
 
+        return self.decodeAnalyzedProgram(reader, address, header_address, fetch_return, stale_index);
+    }
+
+    // Decoding owns large temporary analysis values. Keep that stack frame
+    // off the already-validated cache-hit path used by every draw.
+    noinline fn decodeAnalyzedProgram(
+        self: *Renderer,
+        reader: gpu.ShaderMemoryReader,
+        address: u64,
+        header_address: ?u64,
+        fetch_return: bool,
+        stale_index: ?usize,
+    ) anyerror!*const gpu.ShaderAnalysis {
         const started = self.resourceTimestampNs();
         const byte_limit = shaderProgramByteLimit(reader, header_address, address);
         var analysis = if (fetch_return)
@@ -23264,6 +23497,130 @@ pub const Renderer = struct {
     }
 
     /// Compare actual rasterized output with full and proven-prefix SSBO views.
+    pub fn probeVectorOnlyBufferLoads(self: *Renderer) anyerror!void {
+        const Memory = struct {
+            words: [4]u32 = undefined,
+            reads: usize = 0,
+            address: u64 = 0x1000,
+            fn read(context: ?*anyopaque, address: u64, bytes: []u8) bool {
+                const memory: *@This() = @ptrCast(@alignCast(context.?));
+                if (address < memory.address or address - memory.address > 16 or bytes.len > 16 - (address - memory.address)) return false;
+                memory.reads += 1;
+                @memcpy(bytes, std.mem.asBytes(&memory.words)[@intCast(address - memory.address)..][0..bytes.len]);
+                return true;
+            }
+            fn write(_: ?*anyopaque, _: u64, _: []const u8) bool {
+                return false;
+            }
+        };
+        var memory = Memory{};
+        const previous = self.guest_memory;
+        defer self.guest_memory = previous;
+        self.guest_memory = .{ .context = &memory, .read = Memory.read, .write = Memory.write };
+        const reader = gpu.ShaderMemoryReader{ .context = &memory, .read_fn = Memory.read };
+        var program = rdna2.Program{ .code = &.{}, .instructions = .empty };
+        try program.instructions.append(self.allocator, .{
+            .pc = 0,
+            .word_count = 2,
+            .family = .smem,
+            .opcode = .s_buffer_load_dwordx4,
+            .dst = .{ .kind = .sgpr, .reg = 20 },
+            .src0 = .{ .kind = .sgpr, .reg = 0 },
+            .src1 = .{ .kind = .null },
+            .data_words = 4,
+            .src_count = 2,
+        });
+        var repeated_load = program.instructions.items[0];
+        repeated_load.pc = 8;
+        try program.instructions.append(self.allocator, repeated_load);
+        // Shrink NUM_RECORDS before the third load. Reusing the first SSBO
+        // range after this overwrite would expose out-of-range components.
+        try program.instructions.append(self.allocator, .{
+            .pc = 16,
+            .word_count = 1,
+            .family = .sop1,
+            .opcode = .s_mov_b32,
+            .dst = .{ .kind = .sgpr, .reg = 2 },
+            .src0 = .{ .kind = .sgpr, .reg = 4 },
+            .src_count = 1,
+        });
+        repeated_load.pc = 20;
+        try program.instructions.append(self.allocator, repeated_load);
+        for (0..4) |i| try program.instructions.append(self.allocator, .{
+            .pc = @intCast(28 + i * 4),
+            .word_count = 1,
+            .family = .vop1,
+            .opcode = .v_mov_b32,
+            .dst = .{ .kind = .vgpr, .reg = @intCast(i) },
+            .src0 = .{ .kind = .sgpr, .reg = @intCast(20 + i) },
+            .src_count = 1,
+        });
+        try program.instructions.appendSlice(self.allocator, &.{
+            .{ .pc = 44, .word_count = 2, .family = .mubuf, .opcode = .buffer_load_dword, .dst = .{ .kind = .vgpr }, .src0 = .{ .kind = .vgpr, .reg = 4 }, .src1 = .{ .kind = .sgpr }, .src2 = .{ .kind = .integer_inline_constant }, .data_words = 1 },
+            .{ .pc = 52, .word_count = 1, .family = .sop1, .opcode = .s_mov_b64, .dst = .{ .kind = .sgpr, .reg = 20 }, .src0 = .{ .kind = .integer_inline_constant }, .src_count = 1 },
+            .{ .pc = 56, .word_count = 1, .family = .sopc, .opcode = .s_cmp_eq_u64, .src0 = .{ .kind = .sgpr, .reg = 20 }, .src1 = .{ .kind = .integer_inline_constant }, .src_count = 2 },
+            .{ .pc = 60, .word_count = 2, .family = .exp, .opcode = .exp, .export_enable = 15, .export_done = true, .src0 = .{ .kind = .vgpr, .reg = 0 }, .src1 = .{ .kind = .vgpr, .reg = 1 }, .src2 = .{ .kind = .vgpr, .reg = 2 }, .src3 = .{ .kind = .vgpr, .reg = 3 } },
+            .{ .pc = 68, .word_count = 1, .family = .sopp, .opcode = .s_endpgm },
+        });
+        var analysis = gpu.ShaderAnalysis{
+            .code = .empty,
+            .program = program,
+            .graph = try rdna2.control_flow.buildInstructions(self.allocator, program.instructions.items),
+            .module = try rdna2.ir.lower(self.allocator, &program),
+        };
+        defer analysis.deinit(self.allocator);
+        try analysis.enableResourceCheckpoints(self.allocator);
+        const plan = &analysis.resource_checkpoints.?;
+        try std.testing.expectEqualSlices(u32, &.{ 0, 8, 20 }, plan.gpu_only_buffer_loads.?);
+        const evaluation = try self.allocator.create(gpu.ScalarEvaluation);
+        defer self.allocator.destroy(evaluation);
+        var bindings = std.mem.zeroes(gpu.ShaderBindings);
+        bindings.stage = .pixel;
+        bindings.user_data_count = 5;
+        bindings.user_data[0] = 0x1000;
+        bindings.resource_instruction_budget = 16 * 1024;
+        // Admission takes two matching walks; the third moved/color-changed
+        // buffer exercises a real hit with the written descriptor word pinned.
+        for ([_]u32{ 16, 8 }) |extent| for ([_][4]f32{ .{ 0.25, 0.5, 0.75, 1 }, .{ 0.75, 0.25, 0.5, 1 }, .{ 0.5, 0.75, 0.25, 1 } }) |color| {
+            memory.address += 0x100;
+            bindings.user_data[0] = @intCast(memory.address);
+            for (color, &memory.words) |value, *word| word.* = @bitCast(value);
+            bindings.user_data[2] = extent;
+            bindings.user_data[4] = extent / 2;
+            var reference: @TypeOf(self.graphics_probe_frame) = undefined;
+            for ([_]bool{ false, true }) |deferred| {
+                bindings.defer_vector_buffer_loads = deferred;
+                bindings.conservative_user_data_mask = deferred;
+                memory.reads = 0;
+                if (!self.resource_preparation.startScalar(0, reader, &bindings, program.instructions.items, plan, evaluation))
+                    return error.VectorLoadWalkUnavailable;
+                defer self.resource_preparation.finish();
+                try std.testing.expectEqual(@as(usize, if (deferred) 0 else 3), memory.reads);
+                try self.beginFrameDraw();
+                const descriptor_reuses = self.frame_profile.scalar_descriptor_reuses;
+                const resources = try self.prepareComputeResources(&bindings, reader, &analysis, program.instructions.items, evaluation, 0x100, null, &.{}, null, true);
+                defer resources.deinit(self);
+                if (deferred and @atomicLoad(bool, &reuse_scalar_buffer_descriptors, .monotonic) and
+                    self.frame_profile.scalar_descriptor_reuses <= descriptor_reuses)
+                    return error.ScalarDescriptorReuseNotExercised;
+                if (resources.mapping_count == 0) return error.VectorLoadNoMappings;
+                var module = try rdna2.translateSpirv(self.allocator, &program, .{
+                    .stage = .fragment,
+                    .storage_buffers = resources.mappings[0..resources.mapping_count],
+                    .scalar_registers = resources.scalar_registers[0..resources.scalar_count],
+                    .specialized_scalar_prefix_end = 0x100,
+                    .descriptor_array_length = maximum_storage_descriptors,
+                });
+                defer module.deinit(self.allocator);
+                try self.drawGraphicsShaders(&graphics_probe_vertex_spirv, module.words, &.{}, &.{}, GraphicsPipelineState.default(graphics_probe_width, graphics_probe_height), null, &.{}, null, false, true, false, .{ .vertex_count = 3 });
+                if (!deferred) reference = self.graphics_probe_frame else try std.testing.expectEqualSlices(u8, &reference, &self.graphics_probe_frame);
+                if (self.graphics_probe_colored_pixels <= 100) return error.VectorLoadNoColoredPixels;
+            }
+        };
+        if (self.resource_preparation.stats.cached_walks == 0) return error.VectorLoadCacheNotExercised;
+        std.debug.print("vector-only buffer loads passed: cached host walks rebind live GPU buffers; changed addresses, constants and per-word bounds preserve pixels\n", .{});
+    }
+
     pub fn probeBoundedVertexFetches(self: *Renderer) anyerror!void {
         const op = struct {
             fn v(reg: u32) rdna2.Operand {
@@ -24764,8 +25121,8 @@ pub const Renderer = struct {
             traceShaderAnalysisFailure(reader, .pixel, fragment_address, fragment_header, err);
             return err;
         };
-        const vertex_bindings = try gpu.ShaderBindings.capture(state, vertex_stage, vertex_header, reader);
-        const fragment_bindings = if (fragment_address != 0)
+        var vertex_bindings = try gpu.ShaderBindings.capture(state, vertex_stage, vertex_header, reader);
+        var fragment_bindings = if (fragment_address != 0)
             try gpu.ShaderBindings.capture(state, .pixel, fragment_header, reader)
         else
             gpu.ShaderBindings{
@@ -24779,9 +25136,21 @@ pub const Renderer = struct {
                 .srt_address = null,
                 .direct_pointers = .{},
             };
-        const draw_input_key = drawReuseInputKey(state, pipeline_state, vertex_stage, render_state.primitive_type, vertex_analysis, fragment_analysis);
+        // A declined capture with no replay candidate cannot consume these
+        // hashes. Keep the admission decision itself at its original miss
+        // point so successful replay still resets the probe schedule.
+        const need_reuse_keys = self.reuse_graphics_resources and
+            (self.draw_reuse_valid or !@atomicLoad(bool, &adaptive_draw_reuse_capture, .monotonic) or
+                self.draw_reuse_admission.wantsCapture());
+        const draw_input_key = if (need_reuse_keys)
+            drawReuseInputKey(state, pipeline_state, vertex_stage, render_state.primitive_type, vertex_analysis, fragment_analysis)
+        else
+            0;
         const draw_epoch = if (memory.gpu_tracking_epoch) |query| query(memory.context) else 0;
-        const draw_key = drawResourceKey(vertex_address, fragment_address, &vertex_bindings, &fragment_bindings, target.descriptor.address, if (depth_plane) |plane| plane.address else 0, extra_colors);
+        const draw_key = if (need_reuse_keys)
+            drawResourceKey(vertex_address, fragment_address, &vertex_bindings, &fragment_bindings, target.descriptor.address, if (depth_plane) |plane| plane.address else 0, extra_colors)
+        else
+            0;
         const reuse_matches = self.reuse_graphics_resources and !self.traceCurrentGraphicsFrame() and self.draw_reuse_valid and self.draw_batch_active and
             drawReuseShapeSafe(vertex_stage, render_state.primitive_type, draw) and
             draw_epoch != 0 and self.draw_reuse_epoch == draw_epoch and self.draw_reuse_input_key == draw_input_key;
@@ -24795,6 +25164,7 @@ pub const Renderer = struct {
             self.draw_reuse_valid and self.draw_batch_active and
             (if (memory.gpu_tracking_epoch) |query| query(memory.context) == draw_epoch else false);
         if (exact_reuse and reuse_memory_matches) {
+            self.draw_reuse_admission.hit();
             self.frame_profile.draw_reuse_hits +|= 1;
             var reused_state = self.draw_reuse_pipeline;
             reused_state.copyDynamicFrom(pipeline_state);
@@ -24818,6 +25188,7 @@ pub const Renderer = struct {
             return;
         }
         if (scalar_reuse and reuse_memory_matches) {
+            self.draw_reuse_admission.hit();
             self.frame_profile.draw_reuse_scalar_hits +|= 1;
             patchReusedUserDataScalars(self.draw_reuse_vertex_scalars[0..self.draw_reuse_vertex_scalar_count], &vertex_bindings);
             patchReusedUserDataScalars(self.draw_reuse_fragment_scalars[0..self.draw_reuse_fragment_scalar_count], &fragment_bindings);
@@ -24851,8 +25222,16 @@ pub const Renderer = struct {
         self.frame_profile.draw_reuse_misses +|= 1;
         try self.beginFrameDraw();
         self.draw_reuse_load_count = 0;
-        self.draw_reuse_reads_complete = true;
-        self.draw_reuse_recording = self.reuse_graphics_resources and draw_epoch != 0;
+        const capture_reuse = self.reuse_graphics_resources and draw_epoch != 0 and
+            (!@atomicLoad(bool, &adaptive_draw_reuse_capture, .monotonic) or self.draw_reuse_admission.miss());
+        self.draw_reuse_reads_complete = capture_reuse;
+        self.draw_reuse_recording = capture_reuse;
+        if (!capture_reuse and @atomicLoad(bool, &conservative_uncaptured_dependencies, .monotonic)) {
+            vertex_bindings.conservative_user_data_mask = true;
+            fragment_bindings.conservative_user_data_mask = true;
+        }
+        if (self.reuse_graphics_resources and !capture_reuse)
+            self.frame_profile.draw_reuse_deferred_captures +|= 1;
         defer self.draw_reuse_recording = false;
         if (tessellation != null or !drawReuseShapeSafe(vertex_stage, render_state.primitive_type, draw))
             self.stopUnusableDrawCapture();
@@ -24896,6 +25275,14 @@ pub const Renderer = struct {
                     }
                 } else |_| {}
             }
+        }
+        const read_only_snapshots = tessellation == null and shaderResourcesAreReadOnly(vertex_analysis, vertex_instructions) and
+            shaderResourcesAreReadOnly(fragment_analysis, fragment_analysis.program.instructions.items);
+        if (!capture_reuse and read_only_snapshots and @atomicLoad(bool, &defer_vector_only_smem, .monotonic)) {
+            vertex_bindings.defer_vector_buffer_loads = true;
+            fragment_bindings.defer_vector_buffer_loads = true;
+            vertex_bindings.conservative_user_data_mask = true;
+            fragment_bindings.conservative_user_data_mask = true;
         }
         const vertex_interface = gpu.resource_checkpoints.graphicsInterface(vertex_instructions, if (vertex_analysis.resource_checkpoints) |*plan| plan else null);
         const fragment_interface = gpu.resource_checkpoints.graphicsInterface(fragment_analysis.program.instructions.items, if (fragment_analysis.resource_checkpoints) |*plan| plan else null);
@@ -25129,18 +25516,6 @@ pub const Renderer = struct {
             };
             vertex_scalar_count += 1;
         }
-        // Attribute metadata helps resource discovery, but its V# register
-        // names describe a later fetch, not the shader's entry ABI. Keep
-        // synthetic descriptors out of the actual initial scalar values.
-        const vertex_scalar_mut = &scalar_scratch.vertex_seeded;
-        vertex_scalar_mut.copyFrom(vertex_scalar);
-        seedVertexBufferEvaluation(
-            &vertex_bindings,
-            reader,
-            vertex_instructions,
-            vertex_scalar_mut,
-        );
-
         const fragment_provenance_started = self.resourceTimestampNs();
         const fragment_scalar = &scalar_scratch.fragment;
         const prepared_fragment = owns_preparation and (self.resource_preparation.takeScalar(0, &fragment_bindings, fragment_analysis.program.instructions.items, reader, fragment_scalar) or
@@ -25180,8 +25555,6 @@ pub const Renderer = struct {
             break :range self.cachedDrawVertexRange(reader, draw);
         } else null;
         const bounded_fetches_before = self.frame_profile.bounded_vertex_fetches;
-        const read_only_snapshots = tessellation == null and shaderResourcesAreReadOnly(vertex_analysis, vertex_instructions) and
-            shaderResourcesAreReadOnly(fragment_analysis, fragment_analysis.program.instructions.items);
         if (!read_only_snapshots or vertex_instruction_storage.items.len != 0 or fragment_specialization != null)
             self.stopUnusableDrawCapture();
         const vertex_storage = self.prepareComputeResources(
@@ -25189,7 +25562,7 @@ pub const Renderer = struct {
             reader,
             vertex_analysis,
             vertex_instructions,
-            vertex_scalar_mut,
+            vertex_scalar,
             vertex_scalar_end,
             null,
             graphics_resources.mappings[fragment_mapping_count..graphics_resources.mapping_count],
@@ -26188,7 +26561,10 @@ pub const Renderer = struct {
                         drawReuseShapeSafe(vertex_stage, render_state.primitive_type, draw) and
                         fragment_words.ptr == fragment_module.words.ptr and shaderResourcesAreReadOnly(vertex_analysis, vertex_instructions) and
                         shaderResourcesAreReadOnly(fragment_analysis, fragment_analysis.program.instructions.items),
-                    drawBindingKey(vertex_address, fragment_address, &vertex_bindings, &fragment_bindings, target.descriptor.address, if (depth_plane) |plane| plane.address else 0, extra_colors, vertex_reuse_mask, fragment_reuse_mask, draw_epoch),
+                    if (self.draw_reuse_reads_complete)
+                        drawBindingKey(vertex_address, fragment_address, &vertex_bindings, &fragment_bindings, target.descriptor.address, if (depth_plane) |plane| plane.address else 0, extra_colors, vertex_reuse_mask, fragment_reuse_mask, draw_epoch)
+                    else
+                        0,
                     draw_epoch,
                     vertex_reuse_mask,
                     fragment_reuse_mask,
@@ -34996,7 +35372,7 @@ pub const Renderer = struct {
         self.pending_command_buffers.clearRetainingCapacity();
         self.pending_command_slots.clearRetainingCapacity();
         self.pending_descriptor_slots.clearRetainingCapacity();
-        self.draw_upload_cache.clearRetainingCapacity();
+        self.clearDrawUploadCache();
         self.frame_profile.submits += 1;
         for (&self.frame_profile.submit_sites) |*site| {
             if (site.caller == 0 or site.caller == caller) {
@@ -35013,9 +35389,21 @@ pub const Renderer = struct {
         }
     }
 
+    fn clearDrawUploadCache(self: *Renderer) void {
+        self.draw_upload_cache.clearRetainingCapacity();
+        // These snapshots only name immutable ring slices. Submitting their
+        // readers does not recycle the ring or change any of its bytes.
+        if (!@atomicLoad(bool, &retain_transient_snapshots, .monotonic))
+            self.invalidateTransientSnapshots();
+    }
+
+    fn invalidateTransientSnapshots(self: *Renderer) void {
+        if (self.transient_snapshots) |cache| cache.invalidate();
+    }
+
     fn resetDrawRings(self: *Renderer) void {
         self.pending_storage_descriptors = 0;
-        self.draw_upload_cache.clearRetainingCapacity();
+        self.clearDrawUploadCache();
         self.descriptor_set = self.descriptor_sets[0];
         self.active_descriptor_set = null;
         @memset(&self.active_storage_buffers, 0);
@@ -35448,7 +35836,8 @@ pub const Renderer = struct {
             }
             try self.waitForSubmittedWork();
             self.draw_upload_offset = 0;
-            self.draw_upload_cache.clearRetainingCapacity();
+            self.clearDrawUploadCache();
+            self.invalidateTransientSnapshots();
             self.frame_profile.draw_upload_wraps +|= 1;
             offset = reserveAlignedRange(
                 &self.draw_upload_offset,
@@ -35478,7 +35867,11 @@ pub const Renderer = struct {
         if (self.draw_upload_spills.items.len == 0) return;
         // Cached slices can name a spill from the previous batch. Clear those
         // references before its Vulkan allocation enters timeline retirement.
-        self.draw_upload_cache.clearRetainingCapacity();
+        self.clearDrawUploadCache();
+        // A retained hit can pin an exhausted ring, forcing this batch to
+        // spill. Drop those hints so the next batch can recycle the ring
+        // instead of pinning it again and allocating spills indefinitely.
+        self.invalidateTransientSnapshots();
         for (self.draw_upload_spills.items) |buffer| self.destroyBuffer(buffer);
         self.draw_upload_spills.clearRetainingCapacity();
     }
@@ -38364,7 +38757,7 @@ pub const Renderer = struct {
             );
             std.debug.print("[gpu uploads] flip={d} wraps={d} spills={d} spill_kib={d}\n", .{ self.flip_callbacks, profile.draw_upload_wraps, profile.draw_upload_spills, profile.draw_upload_spill_bytes / 1024 });
             std.debug.print("[gpu state] flip={d} dynamic={d} avoided={d} pipelines={d} avoided={d}\n", .{ self.flip_callbacks, profile.dynamic_state_commands, profile.dynamic_state_avoided, profile.pipeline_binds, profile.pipeline_binds_avoided });
-            std.debug.print("[gpu transient buffers] flip={d} uploads={d} kib={d}\n", .{ self.flip_callbacks, profile.transient_buffer_uploads, profile.transient_buffer_bytes / 1024 });
+            std.debug.print("[gpu transient buffers] flip={d} uploads={d} kib={d} reused={d}/{d}KiB scalar_descriptors={d}\n", .{ self.flip_callbacks, profile.transient_buffer_uploads, profile.transient_buffer_bytes / 1024, profile.transient_buffer_reuses, profile.transient_buffer_reused_bytes / 1024, profile.scalar_descriptor_reuses });
             std.debug.print("[gpu index bounds] flip={d} hit={d} miss={d}\n", .{ self.flip_callbacks, profile.index_bounds_hits, profile.index_bounds_misses });
             if (profile.cold_storage_images != 0) std.debug.print("[gpu cold storage] flip={d} evicted={d} bytes={d}\n", .{
                 self.flip_callbacks, profile.cold_storage_images, profile.cold_storage_image_bytes,
@@ -38384,9 +38777,10 @@ pub const Renderer = struct {
                     profile.draw_reuse_misses,
                 },
             );
-            std.debug.print("[gpu draw reuse] flip={d} reject(scope/reads/scalar/storage/images/source)={d}/{d}/{d}/{d}/{d}/{d} tracked_reads={d}\n", .{
-                self.flip_callbacks,              profile.draw_reuse_rejections[0], profile.draw_reuse_rejections[1], profile.draw_reuse_rejections[2],
-                profile.draw_reuse_rejections[3], profile.draw_reuse_rejections[4], profile.draw_reuse_rejections[5], profile.draw_reuse_tracked_reads,
+            std.debug.print("[gpu draw reuse] flip={d} reject(scope/reads/scalar/storage/images/source)={d}/{d}/{d}/{d}/{d}/{d} tracked_reads={d} deferred_captures={d}\n", .{
+                self.flip_callbacks,                  profile.draw_reuse_rejections[0], profile.draw_reuse_rejections[1], profile.draw_reuse_rejections[2],
+                profile.draw_reuse_rejections[3],     profile.draw_reuse_rejections[4], profile.draw_reuse_rejections[5], profile.draw_reuse_tracked_reads,
+                profile.draw_reuse_deferred_captures,
             });
         }
         self.sampled_address_census.clearRetainingCapacity();
@@ -45640,144 +46034,6 @@ fn resolveComputeBufferDescriptor(
     return null;
 }
 
-/// Helps resource preparation find attribute buffers described by AGC tables.
-/// These recovered V#s must not become entry-point SGPR values: the same
-/// registers initially contain SPI wave counts, user pointers and constants.
-fn seedVertexBufferEvaluation(
-    bindings: *const gpu.ShaderBindings,
-    reader: gpu.ShaderMemoryReader,
-    instructions: []const gpu.ShaderInstruction,
-    evaluation: *gpu.ScalarEvaluation,
-) void {
-    if (log_verbose_gpu) std.debug.print(
-        "[vulkan dcb] vertex seed: stage={s} header={any} srt={any} ud_base={d} ud_count={d} scalar_s4={any}\n",
-        .{
-            @tagName(bindings.stage),
-            bindings.metadata != null,
-            bindings.srt_address != null,
-            bindings.scalar_user_data_base,
-            bindings.user_data_count,
-            evaluation.registers[4].known,
-        },
-    );
-    const vertex = (gpu.VertexBindings.capture(bindings, reader) catch |err| {
-        std.debug.print("[vulkan dcb] VertexBindings.capture failed: {s}\n", .{@errorName(err)});
-        return;
-    }) orelse {
-        if (log_verbose_gpu) std.debug.print(
-            "[vulkan dcb] VertexBindings: no attr/buffer tables (fetch={any})\n",
-            .{bindings.direct_pointers.fetch_shader != null},
-        );
-        return;
-    };
-    if (vertex.attribute_count == 0) return;
-
-    // Collect unique resource SGPRs referenced by MUBUF loads, in program order.
-    var resource_sgprs: [16]u32 = undefined;
-    var resource_count: usize = 0;
-    for (instructions) |inst| {
-        const is_load = switch (inst.opcode) {
-            .buffer_load_ubyte,
-            .buffer_load_sbyte,
-            .buffer_load_ushort,
-            .buffer_load_sshort,
-            .buffer_load_ubyte_d16,
-            .buffer_load_ubyte_d16_hi,
-            .buffer_load_sbyte_d16,
-            .buffer_load_sbyte_d16_hi,
-            .buffer_load_short_d16,
-            .buffer_load_short_d16_hi,
-            .buffer_load_dword,
-            .buffer_load_dwordx2,
-            .buffer_load_dwordx3,
-            .buffer_load_dwordx4,
-            .buffer_load_format_x,
-            .buffer_load_format_xy,
-            .buffer_load_format_xyz,
-            .buffer_load_format_xyzw,
-            .buffer_load_format_d16_x,
-            .buffer_load_format_d16_xy,
-            .buffer_load_format_d16_xyz,
-            .buffer_load_format_d16_xyzw,
-            => true,
-            else => false,
-        };
-        if (!is_load or inst.src1.kind != .sgpr) continue;
-        const sgpr = inst.src1.reg;
-        var seen = false;
-        for (resource_sgprs[0..resource_count]) |existing| {
-            if (existing == sgpr) {
-                seen = true;
-                break;
-            }
-        }
-        if (seen or resource_count >= resource_sgprs.len) continue;
-        resource_sgprs[resource_count] = sgpr;
-        resource_count += 1;
-    }
-    if (resource_count == 0) return;
-
-    // Unique attribute buffers in location order.
-    var buffers: [16]gpu.BufferDescriptor = undefined;
-    var buffer_words: [16][4]u32 = undefined;
-    var buffer_count: usize = 0;
-    for (vertex.slice()) |attr| {
-        if (!isPlausibleBufferDescriptor(attr.buffer)) continue;
-        var dupe = false;
-        for (buffers[0..buffer_count]) |existing| {
-            if (existing.address == attr.buffer.address) {
-                dupe = true;
-                break;
-            }
-        }
-        if (dupe or buffer_count >= buffers.len) continue;
-        var words: [4]u32 = undefined;
-        reader.read(attr.descriptor_address, std.mem.asBytes(&words)) catch continue;
-        const decoded = gpu.resources.decodeBufferDescriptor(&words) catch continue;
-        if (!isPlausibleBufferDescriptor(decoded)) continue;
-        buffers[buffer_count] = decoded;
-        buffer_words[buffer_count] = words;
-        buffer_count += 1;
-    }
-    if (buffer_count == 0) {
-        std.debug.print(
-            "[vulkan dcb] VertexBindings: {d} attrs but no plausible buffers\n",
-            .{vertex.attribute_count},
-        );
-        return;
-    }
-
-    const pairs = @min(resource_count, buffer_count);
-    var pair: usize = 0;
-    while (pair < pairs) : (pair += 1) {
-        const sgpr = resource_sgprs[pair];
-        const words = buffer_words[pair];
-        if (log_verbose_gpu) std.debug.print(
-            "[vulkan dcb] seed V# s{d}:s{d} addr=0x{x} size=0x{x} stride={d} records={d}\n",
-            .{
-                sgpr,
-                sgpr + 3,
-                buffers[pair].address,
-                buffers[pair].size_bytes,
-                buffers[pair].stride,
-                buffers[pair].record_count,
-            },
-        );
-        var word_i: u32 = 0;
-        while (word_i < 4) : (word_i += 1) {
-            const reg = sgpr + word_i;
-            if (reg < evaluation.registers.len) {
-                evaluation.registers[reg] = .{
-                    .known = true,
-                    .value = words[word_i],
-                    .sources = .{},
-                    .producer_pc = 0,
-                };
-            }
-        }
-    }
-}
-
 fn layerAvailable(enumerate: vk.PfnEnumerateInstanceLayerProperties, wanted: []const u8) bool {
     var count: u32 = 0;
     if (enumerate(&count, null) != vk.success or count == 0 or count > 64) return false;
@@ -49652,6 +49908,7 @@ test "prepared resource pools reset bindings and keep active loans distinct" {
     renderer.free_graphics_resource_count = 0;
     defer renderer.destroyResourcePools();
     const first = try ComputeResources.acquire(&renderer);
+    first.noteBufferStore(3, .{ .pc = 12, .opcode = .buffer_store_dword });
     first.mapping_count = 17;
     first.scalar_count = 23;
     first.scalar_memory_count = 9;
@@ -49661,6 +49918,16 @@ test "prepared resource pools reset bindings and keep active loans distinct" {
     first.sizes[7] = 4096;
     first.occupied[7] = true;
     first.writable[7] = true;
+    first.write_origins[7] = .{ .program = 0x2000, .pc = 24, .reason = .mapping };
+    first.write_ranges[7].include(.{ .first = 16, .end = 32 });
+    first.write_extent_eligible[7] = false;
+    first.write_extent_seen[7] = true;
+    first.write_extent_tracked[7] = true;
+    // A retained read-only descriptor and a store without an occupied
+    // mapping must also return to their original state.
+    first.occupied[maximum_storage_descriptors - 1] = true;
+    first.addresses[maximum_storage_descriptors - 1] = 0x3000;
+    first.sizes[maximum_storage_descriptors - 1] = 64;
     first.flat_memory_fault = .{ .buffer = 1, .offset = 8, .size = 4 };
     first.deinit(&renderer);
     const reused = try ComputeResources.acquire(&renderer);
@@ -49673,6 +49940,16 @@ test "prepared resource pools reset bindings and keep active loans distinct" {
     try std.testing.expect(!reused.hasWritableExternalState());
     try std.testing.expect(reused.descriptorForRange(0x1000, 4096) == null);
     try std.testing.expect(reused.flat_memory_fault == null);
+    for (0..maximum_storage_descriptors) |slot| {
+        try std.testing.expectEqual(@as(u64, 0), reused.addresses[slot]);
+        try std.testing.expectEqual(@as(usize, 0), reused.sizes[slot]);
+        try std.testing.expect(!reused.occupied[slot] and !reused.writable[slot]);
+        try std.testing.expectEqualDeep(BufferWriteOrigin{}, reused.write_origins[slot]);
+        try std.testing.expect(!reused.write_ranges[slot].whole);
+        try std.testing.expectEqual(@as(usize, 0), reused.write_ranges[slot].count);
+        try std.testing.expect(reused.write_extent_eligible[slot]);
+        try std.testing.expect(!reused.write_extent_seen[slot] and !reused.write_extent_tracked[slot]);
+    }
     const second = try ComputeResources.acquire(&renderer);
     try std.testing.expect(second != reused);
     second.deinit(&renderer);

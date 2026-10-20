@@ -7834,6 +7834,19 @@ fn runTransientStorageProbe(allocator: std.mem.Allocator, timeline: bool) !void 
         if (i != 0) guest.word(source, @intCast(0x98760000 + i));
         if (i == 4) renderer.draw_upload_offset = 256 * 1024 * 1024 - 8;
         try std.testing.expect(try renderer.tryStageTransientStorageBuffer(0, source, 16));
+        if (i < 4) {
+            // Equal bytes reuse an immutable ring slice. Marking it in-use is
+            // required even when this draw made no new ring allocation.
+            const offset = renderer.active_storage_offsets[0];
+            const uploads = renderer.frame_profile.transient_buffer_uploads;
+            const hits = renderer.frame_profile.transient_buffer_reuses;
+            renderer.draw_upload_batch_uses_ring = false;
+            try std.testing.expect(try renderer.tryStageTransientStorageBuffer(0, source, 16));
+            try std.testing.expect(renderer.draw_upload_batch_uses_ring);
+            try std.testing.expectEqual(offset, renderer.active_storage_offsets[0]);
+            try std.testing.expectEqual(uploads, renderer.frame_profile.transient_buffer_uploads);
+            try std.testing.expectEqual(hits + 1, renderer.frame_profile.transient_buffer_reuses);
+        }
         try std.testing.expect(renderer.active_storage_cache_indices[0] == null);
         const uploaded_hash = renderer.active_storage_source_hashes[0];
         if (renderer.draw_reuse_recording and renderer.draw_reuse_reads_complete) {
@@ -7870,7 +7883,13 @@ fn runTransientStorageProbe(allocator: std.mem.Allocator, timeline: bool) !void 
     try std.testing.expect(!try renderer.tryStageTransientStorageBuffer(0, source, 16));
     renderer.draw_batch_active = false;
     renderer.descriptor_set = renderer.descriptor_sets[0];
-    std.debug.print("transient storage passed (timeline={any}): GPU input, unaligned address, eight independent queued reads, ring spill, no persistent allocations\n", .{timeline});
+    for ([_]bool{ false, true }) |retained| {
+        const previous = vulkan.backend.retain_transient_snapshots;
+        defer vulkan.backend.retain_transient_snapshots = previous;
+        vulkan.backend.retain_transient_snapshots = retained;
+        try renderer.probeTransientSnapshotRetention(source, 16);
+    }
+    std.debug.print("transient storage passed (timeline={any}): GPU input, unaligned address, eight independent queued reads, cross-submission reuse, pinned ring spill/recycling, no persistent allocations\n", .{timeline});
 }
 
 fn runQueuedDeviceUploadProbe(allocator: std.mem.Allocator, fingerprint: bool, draw_uploads: bool, large: bool, host_backing: bool) !void {
@@ -13383,7 +13402,7 @@ fn runLargeIndirectImageProbe(allocator: std.mem.Allocator) !void {
 noinline fn runRendererProbe(allocator: std.mem.Allocator, comptime probe: fn (*vulkan.Renderer) anyerror!void) !void {
     const renderer = try allocator.create(vulkan.Renderer);
     defer allocator.destroy(renderer);
-    renderer.* = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true });
+    renderer.* = try vulkan.Renderer.init(allocator, .{ .enable_validation = true, .enable_timeline_scheduler = true });
     defer renderer.deinit();
     try probe(renderer);
 }
@@ -15009,6 +15028,10 @@ pub fn main(init: std.process.Init) !void {
         try runRendererProbe(allocator, vulkan.Renderer.probeBoundedVertexFetches);
         return;
     }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--vector-only-buffer-loads")) {
+        try runRendererProbe(allocator, vulkan.Renderer.probeVectorOnlyBufferLoads);
+        return;
+    }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--private-spills")) {
         try runRendererProbe(allocator, vulkan.Renderer.probePrivateSpills);
         return;
@@ -15377,7 +15400,12 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--transient-storage")) {
-        for ([_]bool{ false, true }) |timeline| try runTransientStorageProbe(allocator, timeline);
+        const previous = vulkan.backend.transient_snapshot_entries;
+        defer vulkan.backend.transient_snapshot_entries = previous;
+        for ([_]u32{ 512, 4096 }) |entries| {
+            vulkan.backend.transient_snapshot_entries = entries;
+            for ([_]bool{ false, true }) |timeline| try runTransientStorageProbe(allocator, timeline);
+        }
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--queued-device-uploads")) {

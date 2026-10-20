@@ -81,6 +81,55 @@ pub fn appendValue(key: *std.ArrayList(u8), allocator: std.mem.Allocator, value:
     std.debug.assert(cursor == bytes.ptr + bytes.len);
 }
 
+/// Encode a normalized slice with one capacity check. The mapper must be pure:
+/// sizing and writing visit the same values. The result is byte-for-byte the
+/// ordinary length followed by appendValue for each normalized element.
+pub fn appendMappedSlice(key: *std.ArrayList(u8), allocator: std.mem.Allocator, values: anytype, mapper: anytype) std.mem.Allocator.Error!void {
+    var size: usize = @sizeOf(usize);
+    for (values) |value| size += serializedSize(mapper.map(value));
+    const bytes = try key.addManyAsSlice(allocator, size);
+    var cursor: [*]u8 = bytes.ptr;
+    writeValue(&cursor, @as(usize, values.len));
+    for (values) |value| writeValue(&cursor, mapper.map(value));
+    std.debug.assert(cursor == bytes.ptr + bytes.len);
+}
+
+test "mapped slices preserve canonical bytes across optional payloads and lengths" {
+    const Value = struct { present: ?u32, small: u3, dynamic: u64 };
+    const Mapper = struct {
+        keep: bool,
+        pub fn map(self: @This(), value: Value) Value {
+            var result = value;
+            result.dynamic = 0;
+            if (!self.keep) result.present = null;
+            return result;
+        }
+    };
+    const a = std.testing.allocator;
+    var values: [129]Value = undefined;
+    for (&values, 0..) |*value, i| value.* = .{
+        .present = if (i % 3 == 0) null else @intCast(i),
+        .small = @truncate(i),
+        .dynamic = i * 777,
+    };
+    var reference: std.ArrayList(u8) = .empty;
+    defer reference.deinit(a);
+    var batched: std.ArrayList(u8) = .empty;
+    defer batched.deinit(a);
+    for ([_]bool{ false, true }) |keep| for (0..values.len + 1) |length| {
+        reference.clearRetainingCapacity();
+        batched.clearRetainingCapacity();
+        // Also retain an existing, unaligned key prefix.
+        try reference.append(a, 0x99);
+        try batched.append(a, 0x99);
+        const mapper = Mapper{ .keep = keep };
+        try appendValue(&reference, a, length);
+        for (values[0..length]) |value| try appendValue(&reference, a, mapper.map(value));
+        try appendMappedSlice(&batched, a, values[0..length], mapper);
+        try std.testing.expectEqualSlices(u8, reference.items, batched.items);
+    };
+}
+
 fn fixedSize(comptime T: type) ?usize {
     return switch (@typeInfo(T)) {
         .@"struct" => |info| blk: {

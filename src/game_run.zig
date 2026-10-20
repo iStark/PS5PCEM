@@ -677,6 +677,10 @@ fn run(init: std.process.Init) !bool {
     const prefer_integrated_gpu = init.minimal.environ.containsUnempty(allocator, "PS5_VULKAN_PREFER_INTEGRATED") catch false;
     const use_big_helmet_gpu_profile = std.ascii.eqlIgnoreCase(title_identifier, "PPSA19943");
     const use_astro_bot_gpu_profile = std.ascii.eqlIgnoreCase(title_identifier, astro_bot_title_id);
+    const use_raiden_vulkan_profile = selected_api == .vulkan and std.ascii.eqlIgnoreCase(title_identifier, "PPSA08832");
+    // Match the validated gameplay profile without diagnostic flag writes.
+    // Other titles retain the smaller active table; every hit checks all bytes.
+    vulkan.backend.transient_snapshot_entries = if (use_raiden_vulkan_profile) 4096 else 512;
     // Big Helmet Heroes' and ASTRO BOT's packed 10-bit scanouts have been
     // checked against the CPU conversion. Avoid reading their 4K attachment
     // back every flip: about 32 MiB and 12 ms per ASTRO BOT frame.
@@ -692,7 +696,7 @@ fn run(init: std.process.Init) !bool {
     } else |_| true;
     // Keep the GPU fed while the CPU prepares the next resources. This only
     // submits recorded work asynchronously; guest ordering remains intact.
-    const default_batch_age_us: u64 = if (use_big_helmet_gpu_profile) 1000 else if (use_astro_bot_gpu_profile) 250 else 0;
+    const default_batch_age_us: u64 = if (use_big_helmet_gpu_profile or use_raiden_vulkan_profile) 1000 else if (use_astro_bot_gpu_profile) 250 else 0;
     vulkan.backend.command_batch_max_ns = (if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_COMMAND_BATCH_US")) |text| parse: {
         defer allocator.free(text);
         break :parse @min(std.fmt.parseInt(u64, std.mem.trim(u8, text, " \t\r\n"), 10) catch default_batch_age_us, 1000000);
@@ -735,13 +739,14 @@ fn run(init: std.process.Init) !bool {
         adaptive_compiler_workers = false;
         break :workers std.math.clamp(std.fmt.parseInt(usize, std.mem.trim(u8, text, " \t\r\n"), 10) catch 2, 1, 4);
     } else |_| if (adaptive_cpu_workers) cpu_worker_limits.compilers else 2;
-    // GTA III, Big Helmet Heroes and ASTRO BOT spend more on ordering callbacks than
-    // they gain from command lookahead in the measured scenes.
+    // These measured workloads spend more on ordering callbacks than they gain
+    // from command lookahead. Raiden IV's Vulkan opening also benefits from
+    // keeping its short draw preparations on the owner thread.
     // Retain the environment override for comparisons and other titles.
     const parallel_commands = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_PARALLEL_COMMANDS")) |text| enabled: {
         defer allocator.free(text);
         break :enabled !std.mem.eql(u8, std.mem.trim(u8, text, " \t\r\n"), "0");
-    } else |_| !std.ascii.eqlIgnoreCase(title_identifier, gta_iii_title_id) and !use_big_helmet_gpu_profile and !use_astro_bot_gpu_profile;
+    } else |_| !std.ascii.eqlIgnoreCase(title_identifier, gta_iii_title_id) and !use_big_helmet_gpu_profile and !use_astro_bot_gpu_profile and !use_raiden_vulkan_profile;
     var adaptive_resource_workers = adaptive_cpu_workers;
     const resource_preparation_workers = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_RESOURCE_WORKERS")) |text| workers: {
         defer allocator.free(text);
@@ -1104,6 +1109,8 @@ fn run(init: std.process.Init) !bool {
         });
         const address_space = &emu.address_space.?;
         if (enable_gpu_page_tracker) address_space.enableGpuMemoryTracking();
+        address_space.watch_large_uniform_publications = use_raiden_vulkan_profile and enable_gpu_page_tracker;
+        vulkan.backend.defer_vector_only_smem = use_raiden_vulkan_profile;
         const guest_memory = vulkan.GuestMemory{
             .host_source = if (enable_host_import) .{
                 .context = address_space,

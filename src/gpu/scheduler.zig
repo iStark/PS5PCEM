@@ -14,6 +14,7 @@ const gpu_state = @import("state.zig");
 const command_workers = @import("command_workers.zig");
 
 var live_indirect_refresh_reports = std.atomic.Value(u32).init(0);
+pub export var indexed_submission_snapshots: bool = true;
 
 fn reportRefreshedStream(address: u64, bytes: []const u8) void {
     if (bytes.len & 3 != 0) return;
@@ -78,6 +79,7 @@ const Submission = struct {
     words: []u32,
     backend: executor.Backend,
     snapshots: std.ArrayList(Snapshot) = .empty,
+    snapshot_index: SnapshotIndex = .{},
     continuation: ?executor.Continuation = null,
     gpu_work_seen: bool = false,
 
@@ -85,6 +87,7 @@ const Submission = struct {
         allocator.free(self.words);
         for (self.snapshots.items) |snapshot| allocator.free(snapshot.words);
         self.snapshots.deinit(allocator);
+        self.snapshot_index.deinit(allocator);
         self.* = undefined;
     }
 };
@@ -100,7 +103,209 @@ const Snapshot = struct {
     /// time after GPU work has run. Normal CPU-authored work streams and
     /// indirect register lists stay immutable.
     live_after_gpu_work: bool = false,
+    index_next: ?usize = null,
 };
+
+/// Each range belongs to its smallest enclosing power-of-two region. A read
+/// only visits the occupied ancestors of its starting address, then checks
+/// exact containment. Keep insertion order when overlapping snapshots cover
+/// the same bytes: the earliest captured version remains authoritative.
+const SnapshotIndex = struct {
+    const OrderedRange = struct { address: u64, end: u64, prefix_end: u64, slot: usize };
+    const Region = struct { prefix: u64, height: u7 };
+    const Context = struct {
+        pub fn hash(_: Context, key: Region) u64 {
+            var value = key.prefix ^ (@as(u64, key.height) *% 0x9e3779b97f4a7c15);
+            value ^= value >> 33;
+            value *%= 0xff51afd7ed558ccd;
+            return value ^ (value >> 33);
+        }
+
+        pub fn eql(_: Context, a: Region, b: Region) bool {
+            return a.prefix == b.prefix and a.height == b.height;
+        }
+    };
+    heads: std.HashMapUnmanaged(Region, usize, Context, 80) = .empty,
+    ordered: std.ArrayList(OrderedRange) = .empty,
+    levels: u128 = 0,
+    first_address: u64 = std.math.maxInt(u64),
+    last_endpoint: u64 = 0,
+
+    fn region(address: u64, height: u7) Region {
+        return .{
+            .prefix = if (height == 64) 0 else address >> @as(u6, @intCast(height)),
+            .height = height,
+        };
+    }
+
+    fn insert(self: *SnapshotIndex, allocator: std.mem.Allocator, address: u64, size: usize, slot: usize) !?usize {
+        // Include the one-past endpoint so zero-length reads keep their old
+        // semantics, including a read immediately after the final word.
+        const end = std.math.add(u64, address, size) catch return Error.InvalidPacket;
+        const height: u7 = @intCast(64 - @clz(address ^ end));
+        const entry = try self.heads.getOrPut(allocator, region(address, height));
+        const previous: ?usize = if (entry.found_existing) entry.value_ptr.* else null;
+        entry.value_ptr.* = slot;
+        self.levels |= @as(u128, 1) << height;
+        self.first_address = @min(self.first_address, address);
+        self.last_endpoint = @max(self.last_endpoint, end);
+        return previous;
+    }
+
+    fn contains(snapshot: *const Snapshot, address: u64, size: usize) bool {
+        if (address < snapshot.address) return false;
+        const offset = address - snapshot.address;
+        const length = std.mem.sliceAsBytes(snapshot.words).len;
+        return offset <= length and size <= length - offset;
+    }
+
+    /// Capture remains incremental. Execution can use a compact sorted view
+    /// once all indirect streams/register lists have been retained.
+    fn finish(self: *SnapshotIndex, allocator: std.mem.Allocator, snapshots: []const Snapshot) !void {
+        self.ordered.clearRetainingCapacity();
+        if (snapshots.len <= 16) return;
+        try self.ordered.ensureTotalCapacity(allocator, snapshots.len);
+        for (snapshots, 0..) |snapshot, slot| self.ordered.appendAssumeCapacity(.{
+            .address = snapshot.address,
+            .end = snapshot.address + snapshot.words.len * 4,
+            .prefix_end = 0,
+            .slot = slot,
+        });
+        std.mem.sort(OrderedRange, self.ordered.items, {}, struct {
+            fn less(_: void, a: OrderedRange, b: OrderedRange) bool {
+                return a.address < b.address;
+            }
+        }.less);
+        var end: u64 = 0;
+        for (self.ordered.items) |*range| {
+            end = @max(end, range.end);
+            range.prefix_end = end;
+        }
+    }
+
+    fn find(self: *const SnapshotIndex, snapshots: []const Snapshot, address: u64, size: usize) ?usize {
+        if (address < self.first_address or address > self.last_endpoint or size > self.last_endpoint - address) return null;
+        if (snapshots.len <= 16 or !@atomicLoad(bool, &indexed_submission_snapshots, .monotonic)) {
+            for (snapshots, 0..) |*snapshot, i| if (contains(snapshot, address, size)) return i;
+            return null;
+        }
+        if (@atomicLoad(bool, &ordered_submission_snapshots, .monotonic) and
+            self.ordered.items.len == snapshots.len)
+        ordered: {
+            const ranges = self.ordered.items;
+            var low: usize = 0;
+            var high = ranges.len;
+            while (low < high) {
+                const middle = low + (high - low) / 2;
+                if (ranges[middle].address <= address) low = middle + 1 else high = middle;
+            }
+            const end = address + size; // Covered by the bounds check above.
+            var first: ?usize = null;
+            var visited: usize = 0;
+            while (low != 0) {
+                low -= 1;
+                const range = ranges[low];
+                if (range.prefix_end < end) break;
+                // Heavily nested ranges retain the region-index bound rather
+                // than turning an unlucky query into a long reverse scan.
+                if (visited == 16) break :ordered;
+                visited += 1;
+                if (range.end >= end) {
+                    first = @min(first orelse range.slot, range.slot);
+                    if (first == 0) return 0;
+                }
+            }
+            return first;
+        }
+        // A containing range's enclosing region must also contain both
+        // endpoints of this query. Smaller regions cannot match, even when
+        // they share the starting address. The bounds check above makes this
+        // addition safe and preserves zero-length endpoint reads.
+        const minimum_height: u7 = @intCast(64 - @clz(address ^ (address + size)));
+        var levels = self.levels & (@as(u128, std.math.maxInt(u128)) << minimum_height);
+        var first: ?usize = null;
+        while (levels != 0) {
+            const height: u7 = @intCast(@ctz(levels));
+            levels &= levels - 1;
+            var next = self.heads.get(region(address, height));
+            while (next) |slot| {
+                const snapshot = &snapshots[slot];
+                if ((first == null or slot < first.?) and contains(snapshot, address, size)) first = slot;
+                next = snapshot.index_next;
+            }
+        }
+        return first;
+    }
+
+    fn deinit(self: *SnapshotIndex, allocator: std.mem.Allocator) void {
+        self.heads.deinit(allocator);
+        self.ordered.deinit(allocator);
+    }
+};
+
+pub export var ordered_submission_snapshots: bool = true;
+
+test "submission snapshot index preserves earliest overlapping ranges and endpoints" {
+    const a = std.testing.allocator;
+    const enabled = indexed_submission_snapshots;
+    defer indexed_submission_snapshots = enabled;
+    indexed_submission_snapshots = true;
+    var index = SnapshotIndex{};
+    defer index.deinit(a);
+    var words: [128]u32 = @splat(0);
+    var snapshots: std.ArrayList(Snapshot) = .empty;
+    defer snapshots.deinit(a);
+    const starts = [_]u64{ 0x1040, 0x1000, 0x1040, 0x10fc, 0x7fff_ffff_ffff_fff8, 0xffff_ffff_ffff_ff00 };
+    for (starts, 0..) |address, i| {
+        const length: usize = if (i == 5) 8 else 32;
+        const next = try index.insert(a, address, length * 4, snapshots.items.len);
+        try snapshots.append(a, .{ .address = address, .words = words[0..length], .index_next = next });
+    }
+    try std.testing.expectEqual(@as(?usize, 0), index.find(snapshots.items, 0x1040, 8));
+    try std.testing.expectEqual(@as(?usize, 1), index.find(snapshots.items, 0x1010, 8));
+    try std.testing.expectEqual(@as(?usize, 0), index.find(snapshots.items, 0x10c0, 0));
+    try std.testing.expectEqual(@as(?usize, null), index.find(snapshots.items, 0x10c0, 1));
+    try std.testing.expectEqual(@as(?usize, 4), index.find(snapshots.items, 0x8000_0000_0000_0000, 16));
+    try std.testing.expectEqual(@as(?usize, null), index.find(snapshots.items, std.math.maxInt(u64) - 3, 8));
+    try std.testing.expectError(Error.InvalidPacket, index.insert(a, std.math.maxInt(u64) - 3, 8, snapshots.items.len));
+
+    // Many disjoint and nested ranges, with byte-granular reads crossing the
+    // aligned region boundaries. Compare against the original ordered scan.
+    for (0..2048) |i| {
+        const address = 0x20000 + ((i * 7919) % 4096) * 4;
+        const length = 1 + (i * 13) % words.len;
+        const next = try index.insert(a, address, length * 4, snapshots.items.len);
+        try snapshots.append(a, .{ .address = address, .words = words[0..length], .index_next = next });
+    }
+    // Recheck the explicit endpoints through the indexed path as well as
+    // through the small-collection linear path above.
+    try std.testing.expectEqual(@as(?usize, 0), index.find(snapshots.items, 0x1040, 8));
+    try std.testing.expectEqual(@as(?usize, 0), index.find(snapshots.items, 0x10c0, 0));
+    try std.testing.expectEqual(@as(?usize, null), index.find(snapshots.items, 0x10c0, 1));
+    try std.testing.expectEqual(@as(?usize, 4), index.find(snapshots.items, 0x8000_0000_0000_0000, 16));
+    try std.testing.expectEqual(@as(?usize, null), index.find(snapshots.items, std.math.maxInt(u64) - 3, 8));
+    for ([_]bool{ false, true }) |ordered| {
+        if (ordered) try index.finish(a, snapshots.items);
+        try std.testing.expectEqual(@as(?usize, 0), index.find(snapshots.items, 0x1040, 8));
+        try std.testing.expectEqual(@as(?usize, 0), index.find(snapshots.items, 0x10c0, 0));
+        try std.testing.expectEqual(@as(?usize, null), index.find(snapshots.items, 0x10c0, 1));
+        try std.testing.expectEqual(@as(?usize, 4), index.find(snapshots.items, 0x8000_0000_0000_0000, 16));
+        try std.testing.expectEqual(@as(?usize, null), index.find(snapshots.items, std.math.maxInt(u64) - 3, 8));
+        for (0..4096) |i| {
+            const address = 0x1ffff + (i * 31) % 0x4400;
+            const length = (i * 7) % 513;
+            const expected: ?usize = for (snapshots.items, 0..) |*snapshot, slot| {
+                if (SnapshotIndex.contains(snapshot, address, length)) break slot;
+            } else null;
+            try std.testing.expectEqual(expected, index.find(snapshots.items, address, length));
+        }
+    }
+    const next = try index.insert(a, 0x30000, 4, snapshots.items.len);
+    try snapshots.append(a, .{ .address = 0x30000, .words = words[0..1], .index_next = next });
+    try std.testing.expectEqual(@as(?usize, snapshots.items.len - 1), index.find(snapshots.items, 0x30000, 4));
+    try index.finish(a, snapshots.items);
+    try std.testing.expectEqual(@as(?usize, snapshots.items.len - 1), index.find(snapshots.items, 0x30000, 4));
+}
 
 const Queue = struct {
     state: gpu_state.State = .{},
@@ -345,6 +550,7 @@ pub const Scheduler = struct {
                 .original = active.backend,
                 .snapshot_lock = &self.snapshot_lock,
                 .snapshots = active.snapshots.items,
+                .snapshot_index = &active.snapshot_index,
                 .forced_read = queue.forced_read,
                 .gpu_work_seen = active.gpu_work_seen,
             };
@@ -399,6 +605,7 @@ pub const Scheduler = struct {
         var snapshot_backend = SnapshotBackend{
             .original = active.backend,
             .snapshots = active.snapshots.items,
+            .snapshot_index = &active.snapshot_index,
             .forced_read = forced_read,
             .gpu_work_seen = active.gpu_work_seen,
         };
@@ -451,6 +658,7 @@ pub const Scheduler = struct {
             0,
             &active_addresses,
         );
+        try submission.snapshot_index.finish(self.allocator, submission.snapshots.items);
         return submission;
     }
 
@@ -564,13 +772,10 @@ pub const Scheduler = struct {
         command_stream: bool,
     ) Error![]const u32 {
         const byte_count = std.math.mul(usize, word_count, @sizeOf(u32)) catch return Error.InvalidPacket;
-        const requested_end = std.math.add(u64, address, byte_count) catch return Error.InvalidPacket;
+        _ = std.math.add(u64, address, byte_count) catch return Error.InvalidPacket;
 
-        for (submission.snapshots.items) |*snapshot| {
-            if (address < snapshot.address) continue;
-            const snapshot_bytes = std.mem.sliceAsBytes(snapshot.words);
-            const snapshot_end = std.math.add(u64, snapshot.address, snapshot_bytes.len) catch continue;
-            if (requested_end > snapshot_end) continue;
+        if (submission.snapshot_index.find(submission.snapshots.items, address, byte_count)) |slot| {
+            const snapshot = &submission.snapshots.items[slot];
             const offset: usize = @intCast(address - snapshot.address);
             if (offset & 0x3 != 0) return Error.InvalidPacket;
             const selected = snapshot.words[offset / 4 ..][0..word_count];
@@ -583,10 +788,12 @@ pub const Scheduler = struct {
         if (!submission.backend.vtable.read(submission.backend.context, address, std.mem.sliceAsBytes(words))) {
             return Error.MemoryReadFailed;
         }
+        const index_next = try submission.snapshot_index.insert(self.allocator, address, byte_count, submission.snapshots.items.len);
         try submission.snapshots.append(self.allocator, .{
             .address = address,
             .words = words,
             .live_after_gpu_work = command_stream and !containsGpuWork(words),
+            .index_next = index_next,
         });
         return words;
     }
@@ -624,6 +831,7 @@ const SnapshotBackend = struct {
     original: executor.Backend,
     snapshot_lock: ?*std.Io.Mutex = null,
     snapshots: []const Snapshot,
+    snapshot_index: *const SnapshotIndex,
     forced_read: ?ForcedRead,
     gpu_work_seen: bool,
 
@@ -655,15 +863,13 @@ const SnapshotBackend = struct {
         const lock = self.snapshot_lock orelse return false;
         lock.lockUncancelable(std.Io.Threaded.global_single_threaded.io());
         defer lock.unlock(std.Io.Threaded.global_single_threaded.io());
-        for (self.snapshots) |snapshot| {
+        if (self.snapshot_index.find(self.snapshots, address, bytes.len)) |slot| {
+            const snapshot = self.snapshots[slot];
             // GPU-generated streams must observe preceding queued dispatches.
             // They take the owner path even before the first producer runs.
-            if (address < snapshot.address) continue;
             const source = std.mem.sliceAsBytes(snapshot.words);
             const offset64 = address - snapshot.address;
-            if (offset64 > source.len) continue;
             const offset: usize = @intCast(offset64);
-            if (bytes.len > source.len - offset) continue;
             if (snapshot.live_after_gpu_work) return false;
             @memcpy(bytes, source[offset..][0..bytes.len]);
             return true;
@@ -673,13 +879,11 @@ const SnapshotBackend = struct {
 
     fn read(context: ?*anyopaque, address: u64, bytes: []u8) bool {
         const self = from(context);
-        for (self.snapshots) |snapshot| {
-            if (address < snapshot.address) continue;
+        if (self.snapshot_index.find(self.snapshots, address, bytes.len)) |slot| {
+            const snapshot = self.snapshots[slot];
             const source = std.mem.sliceAsBytes(snapshot.words);
             const offset64 = address - snapshot.address;
-            if (offset64 > source.len) continue;
             const offset: usize = @intCast(offset64);
-            if (bytes.len > source.len - offset) continue;
             if (snapshot.live_after_gpu_work and self.gpu_work_seen and
                 self.original.vtable.read(self.original.context, address, bytes))
             {

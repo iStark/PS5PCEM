@@ -13,6 +13,16 @@ pub export var rep_copy_min_bytes: usize = 256 * 1024;
 /// The caller must provide disjoint ranges of equal length, as for @memcpy.
 fn copyBytes(destination: []u8, source: []const u8) void {
     std.debug.assert(destination.len == source.len);
+    // Descriptors and scalar loads dominate the call count. Constant sizes
+    // lower directly to unaligned loads/stores without the dynamic memcpy
+    // dispatch. Larger and unusual lengths retain the ordinary implementation.
+    switch (destination.len) {
+        inline 0, 1, 2, 4, 8, 16, 32, 64 => |length| {
+            @memcpy(destination[0..length], source[0..length]);
+            return;
+        },
+        else => {},
+    }
     if (builtin.os.tag == .windows and builtin.cpu.arch == .x86_64) {
         if (destination.len >= @max(64, @atomicLoad(usize, &rep_copy_min_bytes, .monotonic)) and @atomicLoad(bool, &rep_large_copies, .monotonic)) {
             var dst = destination.ptr;
@@ -30,6 +40,21 @@ fn copyBytes(destination: []u8, source: []const u8) void {
         }
     }
     @memcpy(destination, source);
+}
+
+test "short guest copies preserve every byte and unaligned boundary" {
+    var source: [96]u8 = undefined;
+    for (&source, 0..) |*byte, i| byte.* = @truncate(i * 47);
+    var destination: [96]u8 = undefined;
+    for (0..16) |offset| {
+        for (0..81) |length| {
+            @memset(&destination, 0xcd);
+            copyBytes(destination[offset..][0..length], source[15 - offset ..][0..length]);
+            try std.testing.expectEqualSlices(u8, source[15 - offset ..][0..length], destination[offset..][0..length]);
+            try std.testing.expect(std.mem.allEqual(u8, destination[0..offset], 0xcd));
+            try std.testing.expect(std.mem.allEqual(u8, destination[offset + length ..], 0xcd));
+        }
+    }
 }
 
 /// Fingerprint every byte using the same partitioning regardless of the pool's

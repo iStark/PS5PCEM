@@ -23,6 +23,7 @@ pub export var lean_uniform_state_init: bool = true;
 pub export var uniform_state_value_bytes_avoided: u64 = 0;
 pub export var lean_scalar_scratch_init: bool = true;
 pub export var scalar_scratch_bytes_avoided: u64 = 0;
+pub export var vector_buffer_loads_deferred: u64 = 0;
 
 const OpcodeNameFlag = enum { wide, cmpx, exec, movrel };
 const opcode_name_flags = blk: {
@@ -1216,13 +1217,94 @@ fn scalarWalkVisitsImpl(inst: anytype) bool {
 }
 
 pub export var advance_sparse_scalar_cursor: bool = true;
+pub export var direct_scalar_moves: bool = true;
+pub export var linear_resource_walks: bool = true;
 pub export var cached_loop_write_masks: bool = true;
 pub export var cached_loop_write_hits: u64 = 0;
 
 pub const WalkPlan = struct {
     steps: ?[]const u32 = null,
     loop_writes: ?*const LoopWritePlan = null,
+    gpu_only_buffer_loads: []const u32 = &.{},
+    linear: bool = false,
 };
+
+/// A sequential resource walk needs no branch search, spill state or dense
+/// cursor recovery. Only complete, contiguous programs without lane transfers
+/// qualify; manual plans and budget-limited prefixes use the ordinary walker.
+pub fn isLinearResourceProgram(instructions: []const rdna2.Instruction) bool {
+    if (instructions.len == 0) return false;
+    var next: u64 = 0;
+    for (instructions) |inst| {
+        if (inst.pc != next or inst.word_count == 0 or inst.opcode.isBranch() or
+            inst.opcode == .unknown or inst.opcode == .unsupported or
+            inst.family == .unknown or opcodeNameHas(inst.opcode, .movrel)) return false;
+        switch (inst.opcode) {
+            .s_setpc_b64,
+            .s_swappc_b64,
+            .s_call_b64,
+            .v_writelane_b32,
+            .v_readlane_b32,
+            .v_readfirstlane_b32,
+            .s_cbranch_cdbgsys,
+            .s_cbranch_cdbguser,
+            .s_cbranch_cdbgsys_or_user,
+            .s_cbranch_cdbgsys_and_user,
+            => return false,
+            else => {},
+        }
+        next += @as(u64, inst.word_count) * 4;
+    }
+    return switch (instructions[instructions.len - 1].opcode) {
+        .s_endpgm, .s_code_end => true,
+        else => false,
+    };
+}
+
+fn evaluateLinearResources(
+    result: *Evaluation,
+    reader: shaders.MemoryReader,
+    bindings: *const shaders.StageBindings,
+    instructions: []const rdna2.Instruction,
+    collector: ?*RegisterCheckpointCollector,
+    plan: WalkPlan,
+    retain_load_history: bool,
+) void {
+    var scc: ?bool = null;
+    var deferred_cursor: usize = 0;
+    for (plan.steps.?) |index| {
+        const inst = &instructions[index];
+        result.stop_pc = inst.pc;
+        if (collector) |checkpoints_| checkpoints_.captureBefore(result, inst.pc);
+        result.instruction_count += 1;
+        recordResourceUserData(result, inst);
+        if (inst.family == .smem) {
+            if (bindings.defer_vector_buffer_loads) {
+                while (deferred_cursor < plan.gpu_only_buffer_loads.len and plan.gpu_only_buffer_loads[deferred_cursor] < inst.pc)
+                    deferred_cursor += 1;
+                if (deferred_cursor < plan.gpu_only_buffer_loads.len and plan.gpu_only_buffer_loads[deferred_cursor] == inst.pc) {
+                    invalidateDestination(result, inst.dst, inst.data_words);
+                    _ = @atomicRmw(u64, &vector_buffer_loads_deferred, .Add, 1, .monotonic);
+                    continue;
+                }
+            }
+            if (!executeSmem(result, reader, bindings, inst, retain_load_history)) {
+                result.memory_read_failed = true;
+                invalidateDestination(result, inst.dst, inst.data_words);
+                result.stop_reason = .instruction_limit;
+            }
+        } else switch (inst.opcode) {
+            .s_endpgm, .s_code_end => {
+                result.dense_instruction_count = @as(u64, index) + 1;
+                result.stop_reason = .end_program;
+                return;
+            },
+            .s_nop, .s_waitcnt, .s_barrier, .s_sleep, .s_sendmsg, .s_ttrace_data, .s_inst_prefetch => {},
+            else => if (scalarWalkVisitsRef(inst)) executeScalar(result, bindings.program_address, inst, &scc),
+        }
+    }
+    unreachable; // The immutable plan includes its terminating instruction.
+}
 
 /// Loop-carried scalar writes depend only on the immutable decoded program.
 /// Live lane spills still use the original walk, which also visits vector
@@ -1339,6 +1421,8 @@ fn evaluateInto(
 ) void {
     const steps = if (walk) |plan| plan.steps else null;
     result.reset();
+    if (bindings.conservative_user_data_mask)
+        result.address_user_data_mask = std.math.maxInt(u64);
     const scalar_base: usize = bindings.scalar_user_data_base;
     const available = @min(
         @as(usize, bindings.user_data_count),
@@ -1351,6 +1435,16 @@ fn evaluateInto(
             .sources = .{ .user_data = true },
         };
         result.user_data_dependencies[scalar_base + index] = if (index < 64) @as(u64, 1) << @intCast(index) else 0;
+    }
+    if (end_pc == null and follow_lane_mask_fallthrough and @atomicLoad(bool, &linear_resource_walks, .monotonic)) {
+        if (walk) |plan| if (plan.linear) {
+            if (plan.steps) |list| if (list.len <= bindings.resource_instruction_budget) {
+                if (decoded_instructions) |instructions| {
+                    evaluateLinearResources(result, reader, bindings, instructions, checkpoint_collector, plan, retain_load_history);
+                    return;
+                }
+            };
+        };
     }
 
     var scc: ?bool = null;
@@ -1366,6 +1460,7 @@ fn evaluateInto(
     var has_static_calls: ?bool = if (@atomicLoad(bool, &cached_scalar_call_analysis, .monotonic)) null else if (decoded_instructions) |instructions| rdna2.scalar_calls.present(instructions) else false;
     var dense_walk = steps == null;
     var current_step: usize = 0;
+    var deferred_load_cursor: usize = 0;
     var skipped_instructions: u64 = 0;
     const compact_walk = @atomicLoad(bool, &compact_scalar_walks, .monotonic);
     const instruction_limit: u32 = if (follow_lane_mask_fallthrough) bindings.resource_instruction_budget else maximum_instructions;
@@ -1497,6 +1592,24 @@ fn evaluateInto(
             continue;
         }
         if (inst.family == .smem) {
+            if (bindings.defer_vector_buffer_loads) if (walk) |plan| {
+                // The proof admits forward-only programs. Every listed PC is
+                // visited at most once, so retain a cursor across SMEM steps.
+                while (deferred_load_cursor < plan.gpu_only_buffer_loads.len and
+                    plan.gpu_only_buffer_loads[deferred_load_cursor] < inst.pc)
+                    deferred_load_cursor += 1;
+                if (deferred_load_cursor < plan.gpu_only_buffer_loads.len and
+                    plan.gpu_only_buffer_loads[deferred_load_cursor] == inst.pc)
+                {
+                    // Only host discovery is reduced. Do not manufacture a
+                    // scalar specialization: prepareComputeResources binds the
+                    // original buffer load and the GPU executes it normally.
+                    invalidateDestination(result, inst.dst, inst.data_words);
+                    _ = @atomicRmw(u64, &vector_buffer_loads_deferred, .Add, 1, .monotonic);
+                    pc +%= inst.word_count * 4;
+                    continue;
+                }
+            };
             if (!executeSmem(result, reader, bindings, inst, retain_load_history)) {
                 result.memory_read_failed = true;
                 if (!follow_lane_mask_fallthrough) {
@@ -1961,6 +2074,35 @@ fn executeScalar(result: *Evaluation, program_address: u64, inst: *const rdna2.I
         },
         else => {},
     }
+    if (@atomicLoad(bool, &direct_scalar_moves, .monotonic) and inst.src_count <= 1 and
+        (inst.opcode == .s_mov_b32 or inst.opcode == .s_movk_i32 or inst.opcode == .s_mov_b64))
+    {
+        const words: u8 = if (inst.opcode == .s_mov_b64) 2 else 1;
+        const low = source(result, inst.src0) orelse {
+            invalidateDestination(result, inst.dst, words);
+            return;
+        };
+        if (words == 1) {
+            write(result, inst.dst, low.value, low.sources, inst.pc, low.user_bits);
+            return;
+        }
+        const destination = scalarRegisterIndex(inst.dst) orelse return;
+        if (destination + 1 >= maximum_scalar_registers) {
+            invalidateDestination(result, inst.dst, 2);
+            return;
+        }
+        // Resolve the complete source before writing an overlapping pair.
+        // Widening still distinguishes signed inline, float and literal data.
+        const wide = wideSource(result, inst.src0, low) orelse {
+            invalidateDestination(result, inst.dst, 2);
+            return;
+        };
+        result.registers[destination] = .{ .known = true, .value = @truncate(wide.value), .sources = wide.sources, .producer_pc = inst.pc };
+        result.registers[destination + 1] = .{ .known = true, .value = @truncate(wide.value >> 32), .sources = wide.sources, .producer_pc = inst.pc };
+        result.user_data_dependencies[destination] = wide.user_bits;
+        result.user_data_dependencies[destination + 1] = wide.user_bits;
+        return; // MOV never modifies SCC.
+    }
     if (inst.opcode == .s_wqm_b32 or inst.opcode == .s_not_b32) {
         const a = source(result, inst.src0) orelse {
             invalidateDestination(result, inst.dst, 1);
@@ -2364,6 +2506,54 @@ fn source(result: *const Evaluation, operand: rdna2.Operand) ?ScalarValue {
     };
 }
 
+test "direct scalar moves preserve overlap widening provenance unknowns and SCC" {
+    const previous = direct_scalar_moves;
+    defer direct_scalar_moves = previous;
+    const a = std.testing.allocator;
+    const initial = try a.create(Evaluation);
+    defer a.destroy(initial);
+    const expected = try a.create(Evaluation);
+    defer a.destroy(expected);
+    const actual = try a.create(Evaluation);
+    defer a.destroy(actual);
+    for (0..4) |known| {
+        initial.reset();
+        for (&initial.registers, &initial.user_data_dependencies, 0..) |*value, *bits, i| {
+            value.* = .{ .known = true, .value = @as(u32, @intCast(i)) *% 0x1234567, .sources = if (i & 1 == 0) .{ .memory = true } else .{ .user_data = true }, .producer_pc = @intCast(i * 8) };
+            bits.* = @as(u64, 1) << @as(u6, @truncate(i));
+        }
+        initial.registers[10].known = known & 1 != 0;
+        initial.registers[11].known = known & 2 != 0;
+        for ([_]rdna2.Opcode{ .s_mov_b32, .s_movk_i32, .s_mov_b64 }) |opcode| {
+            for ([_]rdna2.Operand{
+                .{ .kind = .sgpr, .reg = 10 }, .{ .kind = .sgpr, .reg = 11 },
+                .{ .kind = .sgpr, .reg = 9 },  .{ .kind = .sgpr, .reg = 127 },
+                .{ .kind = .vcc_lo },          .{ .kind = .exec_lo },
+                .{ .kind = .m0 },              .{ .kind = .null },
+            }) |destination| for ([_]rdna2.Operand{
+                .{ .kind = .sgpr, .reg = 10 },                                                           .{ .kind = .sgpr, .reg = 127 },
+                .{ .kind = .integer_inline_constant, .value = 0xffff_ffff },                             .{ .kind = .literal_constant, .value = 0xffff_ffff },
+                .{ .kind = .float_inline_constant, .value = @bitCast(@as(f32, 0.5)), .float_val = 0.5 }, .{ .kind = .null },
+                .{ .kind = .unknown },                                                                   .{ .kind = .vcc_lo },
+                .{ .kind = .exec_lo },
+            }) |operand| for ([_]?bool{ false, true, null }) |condition| {
+                const inst = rdna2.Instruction{ .pc = 0x1234, .family = .sop1, .opcode = opcode, .dst = destination, .src0 = operand, .src_count = 1 };
+                expected.copyFrom(initial);
+                actual.copyFrom(initial);
+                var expected_scc = condition;
+                var actual_scc = condition;
+                direct_scalar_moves = false;
+                executeScalar(expected, 0, &inst, &expected_scc);
+                direct_scalar_moves = true;
+                executeScalar(actual, 0, &inst, &actual_scc);
+                try std.testing.expect(std.meta.eql(expected.registers, actual.registers));
+                try std.testing.expectEqualSlices(u64, &expected.user_data_dependencies, &actual.user_data_dependencies);
+                try std.testing.expectEqual(expected_scc, actual_scc);
+            };
+        }
+    }
+}
+
 fn bitfieldExtractUnsigned32(value: u32, control: u32) u32 {
     const offset: u5 = @intCast(control & 0x1f);
     const encoded_width: u32 = (control >> 16) & 0x7f;
@@ -2419,7 +2609,7 @@ pub fn scalarRegisterIndex(value: rdna2.Operand) ?usize {
     };
 }
 
-fn destinationWords(opcode: rdna2.Opcode) u8 {
+pub fn destinationWords(opcode: rdna2.Opcode) u8 {
     return switch (opcode) {
         .s_mov_b64,
         .s_not_b64,
@@ -2571,6 +2761,27 @@ fn testResourceCheckpoints(
     try std.testing.expectEqual(complete.memory_read_failed, lightweight.memory_read_failed);
     try std.testing.expectEqual(complete.address_user_data_mask, lightweight.address_user_data_mask);
     try std.testing.expectEqual(@as(usize, 0), lightweight.load_count);
+    if (isLinearResourceProgram(instructions)) {
+        const dense_indices = try std.testing.allocator.alloc(u32, instructions.len);
+        defer std.testing.allocator.free(dense_indices);
+        for (dense_indices, 0..) |*index, i| index.* = @intCast(i);
+        const linear_plan = WalkPlan{ .steps = steps orelse dense_indices, .linear = true };
+        trace = .{ .source_reader = reader };
+        var linear: Evaluation = undefined;
+        evaluateDecodedResourceStateAtCheckpointsInto(&linear, traced, bindings, instructions, pcs, without_history, linear_plan);
+        try std.testing.expectEqual(read_count, trace.count);
+        try std.testing.expectEqual(digest, trace.digest.final());
+        try std.testing.expectEqualDeep(snapshots, without_history);
+        try std.testing.expectEqualDeep(complete.registers, linear.registers);
+        try std.testing.expectEqualDeep(complete.user_data_dependencies, linear.user_data_dependencies);
+        try std.testing.expectEqualDeep(complete.loadSlice(), linear.loadSlice());
+        try std.testing.expectEqual(complete.instruction_count, linear.instruction_count);
+        try std.testing.expectEqual(complete.dense_instruction_count, linear.dense_instruction_count);
+        try std.testing.expectEqual(complete.stop_pc, linear.stop_pc);
+        try std.testing.expectEqual(complete.stop_reason, linear.stop_reason);
+        try std.testing.expectEqual(complete.memory_read_failed, linear.memory_read_failed);
+        try std.testing.expectEqual(complete.address_user_data_mask, linear.address_user_data_mask);
+    }
     if (steps == null) {
         var loop_writes = try LoopWritePlan.init(std.testing.allocator, instructions);
         defer loop_writes.deinit(std.testing.allocator);
@@ -2695,6 +2906,23 @@ test "saturated resource dependencies preserve later scalar execution and memory
     try std.testing.expectEqualDeep(previous.loadSlice(), current.loadSlice());
     try std.testing.expectEqual(previous.address_user_data_mask, current.address_user_data_mask);
     try std.testing.expectEqual(previous.stop_reason, current.stop_reason);
+
+    // Uncaptured draws may choose a conservative mask from entry, without
+    // changing instructions, loads, values or their producer provenance.
+    var straight = instructions;
+    straight[1] = .{ .pc = 4, .word_count = 1, .family = .sopp, .opcode = .s_nop };
+    var conservative = bindings;
+    conservative.conservative_user_data_mask = true;
+    evaluateDecodedResourceStateInto(previous, memory.reader(), &bindings, &straight);
+    try std.testing.expect(previous.address_user_data_mask != std.math.maxInt(u64));
+    memory.read_count = 0;
+    evaluateDecodedResourceStateInto(current, memory.reader(), &conservative, &straight);
+    try std.testing.expectEqual(reads, memory.read_count);
+    try std.testing.expectEqualDeep(previous.registers, current.registers);
+    try std.testing.expectEqualDeep(previous.user_data_dependencies, current.user_data_dependencies);
+    try std.testing.expectEqualDeep(previous.loadSlice(), current.loadSlice());
+    try std.testing.expectEqual(previous.stop_reason, current.stop_reason);
+    try std.testing.expectEqual(@as(u64, std.math.maxInt(u64)), current.address_user_data_mask);
 }
 
 test "vector scalar fast path preserves loads, dependency masks and scalar clobbers" {

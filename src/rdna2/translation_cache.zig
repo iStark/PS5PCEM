@@ -8,6 +8,41 @@ const rdna2 = @import("root.zig");
 pub var reuse_program_hash_state = std.atomic.Value(bool).init(true);
 pub export var reuse_prefix_identity_aliases: bool = true;
 pub export var prefix_identity_alias_hits: u64 = 0;
+pub export var batch_translation_key_slices: bool = true;
+
+const SampledKey = struct {
+    pub fn map(_: @This(), binding: rdna2.spirv.SampledImageBinding) rdna2.spirv.SampledImageBinding {
+        var keyed = binding;
+        // Lookup payload comes from the live descriptor SSBO.
+        if (keyed.lookup != null) keyed.candidate_words = @splat(0);
+        return keyed;
+    }
+};
+const StorageKey = struct {
+    pub fn map(_: @This(), binding: rdna2.spirv.StorageBufferBinding) rdna2.spirv.StorageBufferBinding {
+        var keyed = binding;
+        // Runtime extent and backend vertex-table hints do not affect code.
+        keyed.extent_bytes = null;
+        keyed.use_vertex_index = false;
+        if (keyed.lookup != null) keyed.candidate_words = @splat(0);
+        return keyed;
+    }
+};
+const ScalarKey = struct {
+    dynamic: bool,
+    pub fn map(self: @This(), scalar: rdna2.spirv.ScalarRegister) rdna2.spirv.ScalarRegister {
+        var keyed = scalar;
+        if (self.dynamic) keyed.value = 0;
+        return keyed;
+    }
+};
+
+fn appendMappedKey(key: *std.ArrayList(u8), allocator: std.mem.Allocator, values: anytype, mapper: anytype) std.mem.Allocator.Error!void {
+    if (@atomicLoad(bool, &batch_translation_key_slices, .monotonic))
+        return rdna2.cache_key.appendMappedSlice(key, allocator, values, mapper);
+    try appendValue(key, allocator, values.len);
+    for (values) |value| try appendValue(key, allocator, mapper.map(value));
+}
 
 /// A dynamic scalar's array index is also its uniform-buffer word. Call this
 /// before both translation and upload, never only while constructing a key.
@@ -248,34 +283,9 @@ pub const Cache = struct {
         key_options.storage_buffers = &.{};
         key_options.sampled_images = &.{};
         try appendValue(&self.key, allocator, key_options);
-        try appendValue(&self.key, allocator, options.sampled_images.len);
-        for (options.sampled_images) |binding| {
-            var keyed = binding;
-            // Hashed lookups read exact descriptor words from the live SSBO.
-            // View kinds, slots, lookup bounds and fault checks still affect
-            // code generation and remain part of the key.
-            if (keyed.lookup != null) keyed.candidate_words = @splat(0);
-            try appendValue(&self.key, allocator, keyed);
-        }
-        try appendValue(&self.key, allocator, options.storage_buffers.len);
-        for (options.storage_buffers) |binding| {
-            var keyed = binding;
-            // Bounds come from OpArrayLength on the live descriptor range.
-            // The vertex-table marker is backend metadata; neither field is
-            // read by translation or its binding validation.
-            keyed.extent_bytes = null;
-            keyed.use_vertex_index = false;
-            if (keyed.lookup != null) keyed.candidate_words = @splat(0);
-            try appendValue(&self.key, allocator, keyed);
-        }
-        try appendValue(&self.key, allocator, options.scalar_registers.len);
-        for (options.scalar_registers) |scalar| {
-            var keyed = scalar;
-            // The translator loads these values through the dynamic SSBO.
-            // Register order and producer PC still select the SSBO word.
-            if (options.dynamic_scalar_binding != null) keyed.value = 0;
-            try appendValue(&self.key, allocator, keyed);
-        }
+        try appendMappedKey(&self.key, allocator, options.sampled_images, SampledKey{});
+        try appendMappedKey(&self.key, allocator, options.storage_buffers, StorageKey{});
+        try appendMappedKey(&self.key, allocator, options.scalar_registers, ScalarKey{ .dynamic = options.dynamic_scalar_binding != null });
         self.sequence +%= 1;
         const prefix_bytes = if (borrowed) |prefix| prefix.bytes else self.key.items[0..serialized_prefix_length];
         const prefix_identity = if (borrowed) |prefix| prefix.identity else 0;

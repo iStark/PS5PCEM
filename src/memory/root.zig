@@ -683,11 +683,14 @@ pub const Error = error{
 const Lock = HostMutex;
 
 pub export var known_uniform_publications: bool = true;
+pub export var vector_uniform_publications: bool = true;
+pub export var watch_uniform_publications: bool = true;
 pub export var uniform_publication_compares_avoided: u64 = 0;
 
 const TrackedGpuPage = struct {
     generation: u64,
     uniform_generation: u64 = 0,
+    uniform_mapping_identity: u64 = 0,
     uniform_value: u32 = 0,
     restore_protection: Protection,
     armed: bool = false,
@@ -851,6 +854,9 @@ pub const AddressSpace = struct {
     // virtual views, and recheck the current guest mapping before every copy.
     publication_views: [64]?PublicationView = @splat(null),
     next_publication_view: usize = 0,
+    /// Opt in for workloads that repeatedly clear large CPU-readable buffers.
+    /// Native writes still invalidate the ordinary page-watch certificates.
+    watch_large_uniform_publications: bool = false,
 
     pub fn init(allocator: std.mem.Allocator) Error!AddressSpace {
         if (@sizeOf(usize) != @sizeOf(u64)) return Error.UnsupportedHost;
@@ -1258,6 +1264,14 @@ pub const AddressSpace = struct {
     pub fn publishGpuUniform32(self: *AddressSpace, address: u64, source: []const u8, value: u32) ?usize {
         const pattern: ?u32 = if (address & 3 == 0 and source.len & 3 == 0 and
             @atomicLoad(bool, &known_uniform_publications, .monotonic)) value else null;
+        if (builtin.os.tag == .windows and pattern != null and source.len >= 64 * 1024 and
+            source.len <= 64 * 1024 * 1024 and self.watch_large_uniform_publications and
+            @atomicLoad(bool, &watch_uniform_publications, .monotonic))
+        {
+            // The publication still validates the complete mapping and rejects
+            // physical aliases. Failure to arm merely keeps byte comparison.
+            _ = self.trackGpuRead(address, source.len) catch 0;
+        }
         return self.publishGpuBytesWithPattern(address, source, pattern);
     }
 
@@ -1327,23 +1341,31 @@ pub const AddressSpace = struct {
             const uniform_page = if (pattern != null and tracker.enabled) tracker.pages.getPtr(page) else null;
             const known_equal = if (uniform_page) |tracked| tracked.armed and
                 tracked.uniform_generation != 0 and tracked.uniform_generation == tracked.generation and
+                tracked.uniform_mapping_identity == self.mapping_identity and
                 tracked.uniform_value == pattern.? else false;
             if (known_equal) {
                 unchanged += end - cursor;
                 avoided += end - cursor;
-            } else if (std.mem.eql(u8, destination[cursor..end], source[cursor..end])) {
+            } else if (if (pattern != null and @atomicLoad(bool, &vector_uniform_publications, .monotonic))
+                @import("uniform.zig").matches32(destination[cursor..end], pattern.?)
+            else
+                std.mem.eql(u8, destination[cursor..end], source[cursor..end]))
+            {
                 unchanged += end - cursor;
             } else {
-                @memcpy(destination[cursor..end], source[cursor..end]);
                 if (tracker.enabled) if (tracker.pages.getPtr(page)) |tracked| {
                     // Keep armed exactly as it was. A later native CPU write
                     // still faults and advances the generation a second time.
+                    // Publish invalidation before alias bytes become visible
+                    // to readers whose epoch query does not take this lock.
                     tracked.generation = tracker.nextGeneration(page);
                 };
+                @memcpy(destination[cursor..end], source[cursor..end]);
             }
             if (uniform_page) |tracked| {
                 if (tracked.armed and address + cursor == page and end - cursor == page_size) {
                     tracked.uniform_generation = tracked.generation;
+                    tracked.uniform_mapping_identity = self.mapping_identity;
                     tracked.uniform_value = pattern.?;
                 }
             }
@@ -1741,15 +1763,24 @@ pub const AddressSpace = struct {
                     }
                     run_end = gpuProtectionRunEnd(page, run_end);
                 }
+                // Invalidate the whole intended run before restoring writes.
+                // A partial/failed protection change may invalidate extra
+                // pages conservatively; none can expose bytes under an old
+                // epoch. Generation queries serialize on the tracker lock.
+                var invalidated = page;
+                while (invalidated < run_end) : (invalidated += page_size) {
+                    tracker.pages.getPtr(invalidated).?.generation = tracker.nextGeneration(invalidated);
+                }
                 run_end = tracker.protectRun(page, run_end, tracked.restore_protection) catch {
                     page += page_size;
                     continue;
                 };
+            } else {
+                tracked.generation = tracker.nextGeneration(page);
             }
             while (page < run_end) : (page += page_size) {
                 const changed = tracker.pages.getPtr(page).?;
                 changed.armed = false;
-                changed.generation = tracker.nextGeneration(page);
             }
         }
     }
@@ -1773,9 +1804,11 @@ pub const AddressSpace = struct {
             // faults and unmapped pages still belong to the normal handler.
             return windowsRangeAccessible(fault_address, 1, .write);
         }
+        // Another native thread can write as soon as protection changes.
+        // Epoch readers must reject the previous snapshot before that point.
+        tracked.generation = tracker.nextGeneration(page);
         _ = tracker.protectRun(page, page + page_size, tracked.restore_protection) catch return false;
         tracked.armed = false;
-        tracked.generation = tracker.nextGeneration(page);
         return true;
     }
 
@@ -3753,6 +3786,41 @@ test "uniform GPU publications reuse only complete unchanged watched pages" {
     const alias = address + 4 * size;
     try space.mapFixed(alias, size, .read_write, .direct_memory, size);
     try testing.expectEqual(null, space.publishGpuUniform32(address, source, value));
+    // An alias can change backing while the original VA remains watched.
+    // Removing it must not resurrect the original uniform certificate.
+    @as(*u8, @ptrFromInt(alias)).* = 0;
+    try space.unmap(alias, size);
+    const before_alias_removal = uniform_publication_compares_avoided;
+    try testing.expectEqual(size - page_size, space.publishGpuUniform32(address, source, value).?);
+    try testing.expectEqual(before_alias_removal, uniform_publication_compares_avoided);
+    try testing.expectEqualSlices(u8, source, guest);
+}
+
+test "large uniform publication watches retain writes and rearm after native invalidation" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const size = windows_allocation_granularity;
+    var space = try AddressSpace.initWithDirectMemory(testing.allocator, size);
+    defer space.deinit();
+    const address = user.start;
+    try space.mapFixed(address, size, .read_write, .direct_memory, 0);
+    space.enableGpuMemoryTracking();
+    const source = try testing.allocator.alloc(u8, size);
+    defer testing.allocator.free(source);
+    @memset(source, 0x39);
+    const value: u32 = 0x39393939;
+    _ = space.publishGpuUniform32(address, source, value).?;
+    try testing.expectEqual(@as(u64, 0), space.gpuGeneration(address, size));
+    space.watch_large_uniform_publications = true;
+    _ = space.publishGpuUniform32(address, source, value).?;
+    try testing.expect(space.gpuGeneration(address, size) != 0);
+    const before = uniform_publication_compares_avoided;
+    try testing.expectEqual(size, space.publishGpuUniform32(address, source, value).?);
+    try testing.expectEqual(before + size, uniform_publication_compares_avoided);
+    try testing.expect(space.handleGpuTrackedWriteFault(address + 19));
+    @as(*u8, @ptrFromInt(address + 19)).* = 0x55;
+    try testing.expectEqual(size - page_size, space.publishGpuUniform32(address, source, value).?);
+    try testing.expectEqualSlices(u8, source, @as([*]const u8, @ptrFromInt(address))[0..size]);
+    try testing.expect(space.gpuGeneration(address, size) != 0);
 }
 
 test "immutable snapshot generations reject physical aliases and detect their removal" {

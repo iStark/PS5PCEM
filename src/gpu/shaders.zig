@@ -10,6 +10,8 @@
 //! separately identifies the user-SGPR pair holding the guest SRT pointer.
 
 const std = @import("std");
+pub export var batch_shader_metadata_reads: bool = true;
+pub export var batch_vertex_table_reads: bool = true;
 const gpu_state = @import("state.zig");
 const resources = @import("resources.zig");
 
@@ -129,15 +131,16 @@ pub const Metadata = struct {
         const user_data_address = try reader.readU64(try addAddress(header_address, 0x08));
         if (user_data_address == 0) return Error.InvalidMetadata;
 
-        const direct_offsets_address = try reader.readU64(user_data_address);
+        const body = MetadataBody.capture(reader, user_data_address);
+        const direct_offsets_address = try body.readInt(u64, 0);
         var resource_offsets_addresses: [4]u64 = undefined;
         for (&resource_offsets_addresses, 0..) |*address, index| {
-            address.* = try reader.readU64(try addAddress(user_data_address, 0x08 + index * 8));
+            address.* = try body.readInt(u64, 0x08 + index * 8);
         }
 
-        const extended_size = try reader.readU16(try addAddress(user_data_address, 0x28));
-        const srt_size = try reader.readU16(try addAddress(user_data_address, 0x2a));
-        const direct_count = try reader.readU16(try addAddress(user_data_address, 0x2c));
+        const extended_size = try body.readInt(u16, 0x28);
+        const srt_size = try body.readInt(u16, 0x2a);
+        const direct_count = try body.readInt(u16, 0x2c);
         if (direct_count > maximum_metadata_entries or
             (direct_count != 0 and direct_offsets_address == 0))
         {
@@ -146,7 +149,7 @@ pub const Metadata = struct {
 
         var resource_counts: [4]u16 = undefined;
         for (&resource_counts, 0..) |*count, index| {
-            count.* = try reader.readU16(try addAddress(user_data_address, 0x2e + index * 2));
+            count.* = try body.readInt(u16, 0x2e + index * 2);
             if (count.* > maximum_metadata_entries or
                 (count.* != 0 and resource_offsets_addresses[index] == 0))
             {
@@ -204,6 +207,32 @@ pub const Metadata = struct {
     }
 };
 
+/// This body consists entirely of adjacent fields read by Metadata.read.
+/// A reader that cannot provide the whole span retains the original narrow
+/// reads and validation order, including malformed/truncated metadata.
+const MetadataBody = struct {
+    reader: MemoryReader,
+    address: u64,
+    bytes: [0x36]u8 = undefined,
+    available: bool = false,
+
+    fn capture(reader: MemoryReader, address: u64) MetadataBody {
+        var result = MetadataBody{ .reader = reader, .address = address };
+        if (!@atomicLoad(bool, &batch_shader_metadata_reads, .monotonic)) return result;
+        _ = addAddress(address, result.bytes.len - 1) catch return result;
+        reader.read(address, &result.bytes) catch return result;
+        result.available = true;
+        return result;
+    }
+
+    fn readInt(self: *const MetadataBody, comptime T: type, offset: usize) Error!T {
+        if (self.available) return std.mem.readInt(T, self.bytes[offset..][0..@sizeOf(T)], .little);
+        var bytes: [@sizeOf(T)]u8 = undefined;
+        try self.reader.read(try addAddress(self.address, offset), &bytes);
+        return std.mem.readInt(T, &bytes, .little);
+    }
+};
+
 pub const Descriptor = union(enum) {
     read_only_texture: resources.ImageDescriptor,
     read_write_texture: resources.ImageDescriptor,
@@ -242,6 +271,12 @@ pub const StageBindings = struct {
     /// Bounded resource walk. Validated long loops can request more visits
     /// without raising the cost ceiling for unrelated draws and dispatches.
     resource_instruction_budget: u32 = 16 * 1024,
+    /// Pin every USER_DATA word when no scalar-only replay is being captured.
+    /// Evaluation and resource discovery still execute normally.
+    conservative_user_data_mask: bool = false,
+    /// A read-only graphics draw may leave proven vector-only buffer loads to
+    /// the GPU. The shader and its live storage binding retain the instruction.
+    defer_vector_buffer_loads: bool = false,
     /// Bounds of system SGPRs for this dispatch, separate from uniform USER_DATA.
     compute_dispatch: ?struct {
         system: resources.ComputeSystemRegisters,
@@ -485,6 +520,14 @@ pub const VertexBindings = struct {
             .attribute_table_address = attribute_table.?,
             .buffer_table_address = buffer_table.?,
         };
+        if (@atomicLoad(bool, &batch_vertex_table_reads, .monotonic)) {
+            // Read each small table once. Holes between selected indices may
+            // cross inaccessible memory; retain the original per-entry path
+            // when a complete span cannot be read.
+            if (captureTables(reader, metadata, attribute_table.?, buffer_table.?)) |batched|
+                return batched
+            else |_| {}
+        }
         for (0..metadata.input_semantics_count) |location| {
             const semantic_word = try reader.readU32(try addAddress(
                 metadata.input_semantics_address,
@@ -513,6 +556,51 @@ pub const VertexBindings = struct {
             };
             result.attribute_count += 1;
         }
+        return result;
+    }
+
+    fn captureTables(reader: MemoryReader, metadata: Metadata, attributes: u64, buffers: u64) Error!VertexBindings {
+        var semantic_bytes: [maximum_vertex_semantics * 4]u8 = undefined;
+        var attribute_bytes: [maximum_vertex_semantics * 4]u8 = undefined;
+        var buffer_bytes: [@as(usize, maximum_vertex_semantics) * 16]u8 = undefined;
+        try reader.read(metadata.input_semantics_address, semantic_bytes[0 .. metadata.input_semantics_count * 4]);
+        var first_attribute: usize = maximum_vertex_semantics;
+        var last_attribute: usize = 0;
+        for (0..metadata.input_semantics_count) |i| {
+            const semantic: VertexSemantic = @bitCast(std.mem.readInt(u32, semantic_bytes[i * 4 ..][0..4], .little));
+            if (semantic.semantic >= maximum_vertex_semantics) return Error.VertexTableIndexOutOfRange;
+            first_attribute = @min(first_attribute, semantic.semantic);
+            last_attribute = @max(last_attribute, semantic.semantic);
+        }
+        try reader.read(try addAddress(attributes, first_attribute * 4), attribute_bytes[0 .. (last_attribute - first_attribute + 1) * 4]);
+        var first_buffer: usize = maximum_vertex_semantics;
+        var last_buffer: usize = 0;
+        var result = VertexBindings{ .attribute_table_address = attributes, .buffer_table_address = buffers };
+        for (0..metadata.input_semantics_count) |i| {
+            const semantic: VertexSemantic = @bitCast(std.mem.readInt(u32, semantic_bytes[i * 4 ..][0..4], .little));
+            const word = std.mem.readInt(u32, attribute_bytes[(@as(usize, semantic.semantic) - first_attribute) * 4 ..][0..4], .little);
+            const index: u8 = @truncate(word & 0x1f);
+            first_buffer = @min(first_buffer, index);
+            last_buffer = @max(last_buffer, index);
+            result.attributes[i] = .{
+                .location = @intCast(i),
+                .semantic = semantic,
+                .buffer_index = index,
+                .attribute_format = @truncate((word >> 5) & 0x1ff),
+                .offset_bytes = @truncate((word >> 14) & 0xfff),
+                .per_instance = word & (1 << 26) != 0,
+                .descriptor_address = try addAddress(buffers, @as(u64, index) * 16),
+                .buffer = undefined,
+            };
+        }
+        try reader.read(try addAddress(buffers, first_buffer * 16), buffer_bytes[0 .. (last_buffer - first_buffer + 1) * 16]);
+        for (result.attributes[0..metadata.input_semantics_count]) |*attribute| {
+            var words: [4]u32 = undefined;
+            const offset = (@as(usize, attribute.buffer_index) - first_buffer) * 16;
+            for (&words, 0..) |*word, i| word.* = std.mem.readInt(u32, buffer_bytes[offset + i * 4 ..][0..4], .little);
+            attribute.buffer = try resources.decodeBufferDescriptor(&words);
+        }
+        result.attribute_count = @intCast(metadata.input_semantics_count);
         return result;
     }
 
@@ -571,9 +659,13 @@ const testing = std.testing;
 const TestMemory = struct {
     base: u64,
     bytes: []u8,
+    calls: usize = 0,
+    maximum_read: usize = std.math.maxInt(usize),
 
     fn read(context: ?*anyopaque, address: u64, destination: []u8) bool {
         const self: *TestMemory = @ptrCast(@alignCast(context.?));
+        self.calls += 1;
+        if (destination.len > self.maximum_read) return false;
         if (address < self.base) return false;
         const offset64 = address - self.base;
         if (offset64 > std.math.maxInt(usize)) return false;
@@ -592,6 +684,43 @@ const TestMemory = struct {
         std.mem.writeInt(T, self.bytes[offset..][0..@sizeOf(T)], value, .little);
     }
 };
+
+test "batched metadata preserves fields narrow-reader fallback and malformed error order" {
+    const old = batch_shader_metadata_reads;
+    defer batch_shader_metadata_reads = old;
+    var storage: [0x200]u8 = @splat(0);
+    var memory = TestMemory{ .base = 0x1000, .bytes = &storage };
+    const header = memory.base;
+    const body = header + 0x80;
+    memory.writeInt(u64, header + 8, body);
+    memory.writeInt(u64, header + 0x30, 0x11c0);
+    memory.writeInt(u32, header + 0x50, 3);
+    for (0..5) |i| memory.writeInt(u64, body + i * 8, 0x1180 + i * 8);
+    for (0..7) |i| memory.writeInt(u16, body + 0x28 + i * 2, @intCast(i + 1));
+    batch_shader_metadata_reads = false;
+    const expected = try Metadata.read(memory.reader(), header);
+    const legacy_calls = memory.calls;
+    memory.calls = 0;
+    batch_shader_metadata_reads = true;
+    try testing.expectEqualDeep(expected, try Metadata.read(memory.reader(), header));
+    try testing.expectEqual(@as(usize, 4), memory.calls);
+    try testing.expect(memory.calls < legacy_calls);
+    memory.maximum_read = 8;
+    memory.calls = 0;
+    try testing.expectEqualDeep(expected, try Metadata.read(memory.reader(), header));
+    try testing.expectEqual(legacy_calls + 1, memory.calls);
+    memory.maximum_read = std.math.maxInt(usize);
+    memory.bytes = storage[0 .. 0x80 + 0x35];
+    for ([_]bool{ false, true }) |enabled| {
+        batch_shader_metadata_reads = enabled;
+        try testing.expectError(Error.MemoryReadFailed, Metadata.read(memory.reader(), header));
+    }
+    memory.writeInt(u16, body + 0x2c, maximum_metadata_entries + 1);
+    for ([_]bool{ false, true }) |enabled| {
+        batch_shader_metadata_reads = enabled;
+        try testing.expectError(Error.MetadataCountOutOfRange, Metadata.read(memory.reader(), header));
+    }
+}
 
 test "AGC metadata resolves inline sharps and extended user data independently of SRT size" {
     var storage = [_]u8{0} ** 0x500;
@@ -817,6 +946,46 @@ test "AGC direct vertex fetch and extended-user-data tables are snapshotted" {
     try testing.expectEqual(vertex_data, attribute.buffer.address);
     try testing.expectEqual(@as(u16, 16), attribute.buffer.stride);
     try testing.expectEqual(vertex_data + 8, try attribute.vertexAddress());
+
+    // Reordered semantics, two attributes sharing a V#, and a distant V#.
+    // Check both readable spans and a backend which only permits individual
+    // descriptor reads. Mutating a descriptor must affect the next capture.
+    var multi = bindings;
+    multi.metadata.?.input_semantics_count = 3;
+    memory.writeInt(u32, semantics + 4, 4);
+    memory.writeInt(u32, semantics + 8, 0);
+    memory.writeInt(u32, attributes, 3 | (9 << 14));
+    memory.writeInt(u32, attributes + 16, 9 | (5 << 14));
+    for (0..4) |i| memory.writeInt(u32, buffers + 9 * 16 + i * 4, try memory.reader().readU32(descriptor + i * 4));
+    memory.writeInt(u32, buffers + 9 * 16, @truncate(vertex_data + 0x1000));
+    const saved_batch = batch_vertex_table_reads;
+    defer batch_vertex_table_reads = saved_batch;
+    batch_vertex_table_reads = false;
+    const expected = (try VertexBindings.capture(&multi, memory.reader())).?;
+    batch_vertex_table_reads = true;
+    const batched = (try VertexBindings.capture(&multi, memory.reader())).?;
+    try testing.expectEqualDeep(expected.slice(), batched.slice());
+    const Narrow = struct {
+        memory: *TestMemory,
+        rejected: usize = 0,
+        fn read(context: ?*anyopaque, address: u64, bytes: []u8) bool {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            if (bytes.len > 16) {
+                self.rejected += 1;
+                return false;
+            }
+            return self.memory.reader().read_fn(self.memory, address, bytes);
+        }
+    };
+    var narrow = Narrow{ .memory = &memory };
+    const fallback = (try VertexBindings.capture(&multi, .{ .context = &narrow, .read_fn = Narrow.read })).?;
+    try testing.expect(narrow.rejected != 0);
+    try testing.expectEqualDeep(expected.slice(), fallback.slice());
+    memory.writeInt(u32, descriptor, @truncate(vertex_data + 0x2000));
+    const changed = (try VertexBindings.capture(&multi, memory.reader())).?;
+    try testing.expectEqual(vertex_data + 0x2000, changed.slice()[0].buffer.address);
+    try testing.expectEqual(vertex_data + 0x1000, changed.slice()[1].buffer.address);
+    try testing.expectEqual(vertex_data + 0x2000, changed.slice()[2].buffer.address);
 
     // A partially supplied embedded layout must fail as one unit.
     memory.writeInt(u16, direct + @as(u16, @intFromEnum(DirectResourceType.pointer_vertex_attribute_table)) * 2, illegal_direct_offset);

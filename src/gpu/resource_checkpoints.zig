@@ -13,6 +13,48 @@ pub export var cached_pointer_preparation: bool = true;
 pub export var omit_inert_scalar_steps: bool = true;
 pub export var scalar_noop_plan_hits: u64 = 0;
 
+/// Only non-buffer scalar loads participate in missing-pointer recovery.
+/// Bound its seen-PC scratch by actual candidate instructions, even when the
+/// caller's specialization prefix extends to the end of the address space.
+pub fn pointerLoadEnd(instructions: []const rdna2.Instruction, plan: ?*const Plan) u64 {
+    if (plan) |retained| if (retained.matches(instructions)) {
+        if (retained.pointer_load_end) |end| return end;
+    };
+    return collectPointerLoadEnd(instructions);
+}
+
+fn collectPointerLoadEnd(instructions: []const rdna2.Instruction) u64 {
+    var end: u64 = 0;
+    for (instructions) |*inst| switch (inst.opcode) {
+        .s_load_dword, .s_load_dwordx2, .s_load_dwordx4, .s_load_dwordx8, .s_load_dwordx16 => end = @max(end, @as(u64, inst.pc) + 4),
+        else => {},
+    };
+    return end;
+}
+
+test "pointer recovery bounds use real load PCs and exact plan identity" {
+    const a = std.testing.allocator;
+    const instructions = [_]rdna2.Instruction{
+        .{ .pc = 0, .family = .smem, .opcode = .s_buffer_load_dwordx4, .data_words = 4 },
+        .{ .pc = 8, .family = .sopp, .opcode = .s_endpgm },
+    };
+    var plan = try Plan.init(a, &instructions);
+    defer plan.deinit(a);
+    try std.testing.expectEqual(@as(u64, 0), pointerLoadEnd(&instructions, &plan));
+    var different = instructions;
+    different[0].opcode = .s_load_dwordx4;
+    try std.testing.expectEqual(@as(u64, 4), pointerLoadEnd(&different, &plan));
+    try std.testing.expectEqual(@as(u64, 4), pointerLoadEnd(&different, null));
+    const unordered = [_]rdna2.Instruction{
+        .{ .pc = 0xffff_fffc, .family = .smem, .opcode = .s_load_dwordx16, .data_words = 16 },
+        .{ .pc = 8, .family = .smem, .opcode = .s_load_dword, .data_words = 1 },
+        .{ .pc = 16, .family = .sopp, .opcode = .s_endpgm },
+    };
+    try std.testing.expectEqual(@as(u64, 0x1_0000_0000), pointerLoadEnd(&unordered, null));
+    plan.pointer_load_end = null;
+    try std.testing.expectEqual(@as(u64, 0), pointerLoadEnd(&instructions, &plan));
+}
+
 pub fn hasFlatMemoryReads(instructions: []const rdna2.Instruction, plan: ?*const Plan) bool {
     if (@atomicLoad(bool, &cached_pointer_preparation, .monotonic)) {
         if (plan) |retained| if (retained.matches(instructions)) {
@@ -130,8 +172,12 @@ pub const Plan = struct {
     /// plans opt out; this summary belongs to the exact decoded allocation.
     uniform_scalar_reads: ?u128 = null,
     flat_memory_reads: ?bool = null,
+    pointer_load_end: ?u64 = null,
     loop_writes: ?scalar.LoopWritePlan = null,
     effect_steps: ?[]const u32 = null,
+    gpu_only_buffer_loads: ?[]const u32 = null,
+    passthrough_registers: u128 = 0,
+    linear_resource_walk: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, instructions: []const rdna2.Instruction) !Plan {
         const resource = try collect(allocator, instructions, .resource);
@@ -149,6 +195,8 @@ pub const Plan = struct {
         var loop_writes = try scalar.LoopWritePlan.init(allocator, instructions);
         errdefer loop_writes.deinit(allocator);
         const effect_steps = try collectEffectSteps(allocator, instructions, scalar_steps);
+        errdefer allocator.free(effect_steps);
+        const gpu_only_buffer_loads = try @import("vector_only_smem.zig").collect(allocator, instructions);
         return .{
             .identity = next_plan_identity.fetchAdd(1, .monotonic),
             .instructions = instructions,
@@ -166,8 +214,12 @@ pub const Plan = struct {
             .entry_block_end = entryBlockEnd(instructions),
             .uniform_scalar_reads = scalar.uniformScalarReadMask(instructions),
             .flat_memory_reads = collectFlatMemoryReads(instructions),
+            .pointer_load_end = collectPointerLoadEnd(instructions),
             .loop_writes = loop_writes,
             .effect_steps = effect_steps,
+            .gpu_only_buffer_loads = gpu_only_buffer_loads,
+            .passthrough_registers = @import("vector_only_smem.zig").passthroughRegisters(instructions, gpu_only_buffer_loads),
+            .linear_resource_walk = scalar.isLinearResourceProgram(instructions),
         };
     }
 
@@ -180,6 +232,7 @@ pub const Plan = struct {
         allocator.free(self.scalar_steps);
         if (self.loop_writes) |*plan| plan.deinit(allocator);
         if (self.effect_steps) |steps| allocator.free(steps);
+        if (self.gpu_only_buffer_loads) |pcs_| allocator.free(pcs_);
         self.* = undefined;
     }
 
@@ -194,7 +247,12 @@ pub const Plan = struct {
     pub fn walk(self: *const Plan) scalar.WalkPlan {
         const steps = if (@atomicLoad(bool, &omit_inert_scalar_steps, .monotonic)) self.effect_steps orelse self.scalar_steps else self.scalar_steps;
         if (steps.len < self.scalar_steps.len) _ = @atomicRmw(u64, &scalar_noop_plan_hits, .Add, 1, .monotonic);
-        return .{ .steps = steps, .loop_writes = if (self.loop_writes) |*plan| plan else null };
+        return .{
+            .steps = steps,
+            .loop_writes = if (self.loop_writes) |*plan| plan else null,
+            .gpu_only_buffer_loads = self.gpu_only_buffer_loads orelse &.{},
+            .linear = self.linear_resource_walk,
+        };
     }
 
     pub fn matches(self: *const Plan, instructions: []const rdna2.Instruction) bool {
@@ -740,6 +798,72 @@ const TestMemory = struct {
         return .{ .context = self, .read_fn = read };
     }
 };
+
+test "linear resource walks preserve deferred loads failed reads and instruction limits" {
+    const a = std.testing.allocator;
+    const code = [_]rdna2.Instruction{
+        .{ .pc = 0, .family = .sopp, .opcode = .s_nop },
+        .{ .pc = 4, .word_count = 2, .family = .smem, .opcode = .s_load_dword, .src0 = .{ .kind = .sgpr }, .src1 = .{ .kind = .null }, .dst = .{ .kind = .sgpr, .reg = 12 }, .data_words = 1 },
+        .{ .pc = 12, .word_count = 2, .family = .smem, .opcode = .s_buffer_load_dword, .src0 = .{ .kind = .sgpr, .reg = 4 }, .src1 = .{ .kind = .null }, .dst = .{ .kind = .sgpr, .reg = 20 }, .data_words = 1 },
+        .{ .pc = 20, .family = .vop2, .opcode = .v_mul_f32, .dst = .{ .kind = .vgpr }, .src0 = .{ .kind = .sgpr, .reg = 20 } },
+        .{ .pc = 24, .family = .sopc, .opcode = .s_cmp_eq_u32, .src0 = .{ .kind = .sgpr, .reg = 12 }, .src1 = .{ .kind = .integer_inline_constant, .value = 7 }, .src_count = 2 },
+        .{ .pc = 28, .family = .sop2, .opcode = .s_cselect_b32, .dst = .{ .kind = .sgpr, .reg = 11 }, .src0 = .{ .kind = .sgpr, .reg = 12 }, .src1 = .{ .kind = .integer_inline_constant }, .src_count = 2 },
+        .{ .pc = 32, .word_count = 2, .family = .mubuf, .opcode = .buffer_load_dword, .src1 = .{ .kind = .sgpr, .reg = 8 } },
+        .{ .pc = 40, .family = .sopp, .opcode = .s_endpgm },
+    };
+    var plan = try Plan.init(a, &code);
+    defer plan.deinit(a);
+    try std.testing.expect(plan.linear_resource_walk);
+    try std.testing.expectEqualSlices(u32, &.{12}, plan.gpu_only_buffer_loads.?);
+    var bindings = std.mem.zeroes(shaders.StageBindings);
+    bindings.user_data_count = 6;
+    bindings.user_data[0] = 0x4000;
+    bindings.user_data[4] = 0x4000;
+    bindings.user_data[6] = 4;
+    bindings.user_data_count = 7;
+    const before = try a.alloc(scalar.ScalarRegisters, plan.resource.len);
+    defer a.free(before);
+    const after = try a.alloc(scalar.ScalarRegisters, plan.resource.len);
+    defer a.free(after);
+    const old = try a.create(scalar.Evaluation);
+    defer a.destroy(old);
+    const fresh = try a.create(scalar.Evaluation);
+    defer a.destroy(fresh);
+    var generic = plan.walk();
+    generic.linear = false;
+    for ([_]?u32{ 7, 9, null }) |value| {
+        for ([_]bool{ false, true }) |deferred| {
+            bindings.defer_vector_buffer_loads = deferred;
+            for ([_]u32{ 0, 1, 3, 6, 7, 8, 128 }) |budget| {
+                bindings.resource_instruction_budget = budget;
+                var memory = TestMemory{ .value = value };
+                scalar.evaluateDecodedResourceStateAtCheckpointsInto(old, memory.reader(), &bindings, &code, plan.resource, before, generic);
+                const reads = memory.reads;
+                memory.reads = 0;
+                scalar.evaluateDecodedResourceStateAtCheckpointsInto(fresh, memory.reader(), &bindings, &code, plan.resource, after, plan.walk());
+                try std.testing.expectEqual(reads, memory.reads);
+                try std.testing.expectEqualDeep(old.registers, fresh.registers);
+                try std.testing.expectEqualDeep(old.user_data_dependencies, fresh.user_data_dependencies);
+                try std.testing.expectEqualDeep(old.loadSlice(), fresh.loadSlice());
+                try std.testing.expectEqualDeep(before, after);
+                try std.testing.expectEqual(old.instruction_count, fresh.instruction_count);
+                try std.testing.expectEqual(old.dense_instruction_count, fresh.dense_instruction_count);
+                try std.testing.expectEqual(old.stop_pc, fresh.stop_pc);
+                try std.testing.expectEqual(old.stop_reason, fresh.stop_reason);
+                try std.testing.expectEqual(old.memory_read_failed, fresh.memory_read_failed);
+                try std.testing.expectEqual(old.address_user_data_mask, fresh.address_user_data_mask);
+            }
+        }
+    }
+    var changed = code;
+    changed[1].pc += 4;
+    try std.testing.expect(!scalar.isLinearResourceProgram(&changed));
+    for ([_]rdna2.Opcode{ .s_branch, .s_setpc_b64, .s_call_b64, .v_writelane_b32, .v_readlane_b32, .s_cbranch_cdbguser, .unsupported }) |opcode| {
+        changed = code;
+        changed[1].opcode = opcode;
+        try std.testing.expect(!scalar.isLinearResourceProgram(&changed));
+    }
+}
 
 test "inert scalar steps preserve counted loops memory reads and dense budget accounting" {
     const instructions = [_]rdna2.Instruction{

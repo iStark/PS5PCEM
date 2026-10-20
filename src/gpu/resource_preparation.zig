@@ -18,6 +18,62 @@ pub export var indexed_resource_snapshot_capture: bool = true;
 pub export var collapse_contained_scalar_reads: bool = true;
 pub export var resource_walk_cache_entries: u32 = 64;
 pub export var resource_walk_cache_bytes: u64 = 32 * 1024 * 1024;
+pub export var recycle_resource_walk_entries: bool = true;
+pub export var content_aware_walk_admission: bool = true;
+pub export var parameterized_resource_walks: bool = true;
+pub export var hinted_resource_walks: bool = true;
+
+fn passthroughWords(plan: *const checkpoints.Plan, bindings: *const shaders.StageBindings) u64 {
+    if (!bindings.defer_vector_buffer_loads or !bindings.conservative_user_data_mask or bindings.compute_dispatch != null or
+        !@atomicLoad(bool, &parameterized_resource_walks, .monotonic)) return 0;
+    var mask: u64 = 0;
+    for (0..@min(bindings.user_data_count, 64)) |word| {
+        const reg = @as(usize, bindings.scalar_user_data_base) + word;
+        if (reg < 128 and plan.passthrough_registers & (@as(u128, 1) << @intCast(reg)) != 0)
+            mask |= @as(u64, 1) << @intCast(word);
+    }
+    return mask;
+}
+
+fn sameBindings(a: *const shaders.StageBindings, b: *const shaders.StageBindings, passthrough: u64) bool {
+    if (passthrough == 0) return std.meta.eql(a.*, b.*);
+    // Streaming draws usually differ in their first descriptor pointer.
+    // Reject that before comparing optional metadata and dispatch layouts.
+    for (a.user_data, b.user_data, 0..) |old, new, word| {
+        if ((word >= 64 or passthrough & (@as(u64, 1) << @intCast(word)) == 0) and old != new) return false;
+    }
+    inline for (@typeInfo(shaders.StageBindings).@"struct".fields) |field| {
+        if (comptime !std.mem.eql(u8, field.name, "user_data"))
+            if (!std.meta.eql(@field(a, field.name), @field(b, field.name))) return false;
+    }
+    return true;
+}
+
+fn hashBindings(hasher: *std.hash.Wyhash, bindings: *const shaders.StageBindings) void {
+    inline for (@typeInfo(shaders.StageBindings).@"struct".fields) |field| {
+        if (comptime std.mem.eql(u8, field.name, "user_data"))
+            hasher.update(std.mem.sliceAsBytes(&bindings.user_data))
+        else
+            std.hash.autoHash(hasher, @field(bindings, field.name));
+    }
+}
+
+fn rebindRegisters(registers: *scalar.ScalarRegisters, bindings: *const shaders.StageBindings, mask: u64) void {
+    var remaining = mask;
+    while (remaining != 0) {
+        const word = @ctz(remaining);
+        remaining &= remaining - 1;
+        const reg = @as(usize, bindings.scalar_user_data_base) + word;
+        // Unvisited checkpoints remain unknown. The proof excludes every
+        // write and host consumer of these unchanged entry registers.
+        if (registers[reg].known) registers[reg].value = bindings.user_data[word];
+    }
+}
+
+fn rebindCheckpoints(values: []scalar.ScalarRegisters, bindings: *const shaders.StageBindings, mask: u64) void {
+    if (mask == 0) return;
+    for (values) |*registers| rebindRegisters(registers, bindings, mask);
+}
 
 fn io() std.Io {
     return std.Io.Threaded.global_single_threaded.io();
@@ -209,6 +265,9 @@ const WalkCache = struct {
         bindings: shaders.StageBindings,
         snapshot: Snapshot,
         evaluation: scalar.Evaluation,
+        /// Owning allocation; the two views below expose only initialized
+        /// checkpoints. Replacement may change either view without reallocating.
+        checkpoint_storage: []scalar.ScalarRegisters,
         sampled: []scalar.ScalarRegisters,
         resource: []scalar.ScalarRegisters,
         has_sampled: bool,
@@ -216,14 +275,35 @@ const WalkCache = struct {
         age: u64,
 
         fn bytes(self: *const Entry) usize {
-            return @sizeOf(Entry) + (self.sampled.len + self.resource.len) * @sizeOf(scalar.ScalarRegisters);
+            return @sizeOf(Entry) + self.checkpoint_storage.len * @sizeOf(scalar.ScalarRegisters);
         }
 
         fn destroy(self: *Entry) void {
             const a = std.heap.page_allocator;
-            a.free(self.sampled);
-            a.free(self.resource);
+            a.free(self.checkpoint_storage);
             a.destroy(self);
+        }
+
+        fn fits(self: *const Entry, sampled_count: usize, resource_count: usize) bool {
+            return if (@atomicLoad(bool, &recycle_resource_walk_entries, .monotonic))
+                sampled_count + resource_count <= self.checkpoint_storage.len
+            else
+                sampled_count == self.sampled.len and resource_count == self.resource.len;
+        }
+
+        fn replace(self: *Entry, plan: *const checkpoints.Plan, bindings: *const shaders.StageBindings, snapshot: *const Snapshot, evaluation: *const scalar.Evaluation, sampled: ?[]const scalar.ScalarRegisters, resource: []const scalar.ScalarRegisters, age: u64) void {
+            const sampled_values = sampled orelse &.{};
+            self.sampled = self.checkpoint_storage[0..sampled_values.len];
+            self.resource = self.checkpoint_storage[sampled_values.len..][0..resource.len];
+            self.plan_identity = plan.identity;
+            self.bindings = bindings.*;
+            self.snapshot.copyFrom(snapshot);
+            self.evaluation.copyFrom(evaluation);
+            @memcpy(self.sampled, sampled_values);
+            @memcpy(self.resource, resource);
+            self.has_sampled = sampled != null;
+            self.exact_loop_budget = @atomicLoad(bool, &exact_scalar_walk_budget, .monotonic);
+            self.age = age;
         }
     };
     entries: [maximum_entries]?*Entry = @splat(null),
@@ -232,9 +312,12 @@ const WalkCache = struct {
     enabled: bool = true,
     entry_limit: usize = 64,
     byte_limit: usize = 32 * 1024 * 1024,
-    /// Admit only inputs seen twice. Streaming per-draw constants must not
-    /// allocate and evict a large snapshot on every single cache miss.
+    /// Admit only complete inputs seen twice, including captured bytes.
+    /// Recycled addresses alone do not make streaming constants reusable.
     admission: [512]u64 = @splat(0),
+    /// Indices are hints only. Replaced entries, changed bindings and changed
+    /// captured memory still pass the complete lookup checks below.
+    hints: [64]?u16 = @splat(null),
 
     fn updateLimits(self: *WalkCache) void {
         const entries = std.math.clamp(@atomicLoad(u32, &resource_walk_cache_entries, .monotonic), 1, maximum_entries);
@@ -260,17 +343,35 @@ const WalkCache = struct {
     fn lookup(self: *WalkCache, plan: *const checkpoints.Plan, bindings: *const shaders.StageBindings, reader: shaders.MemoryReader, needs_sampled: bool) ?*const Entry {
         if (!self.enabled or plan.identity == 0) return null;
         self.updateLimits();
-        for (self.entries[0..self.entry_limit]) |maybe| {
-            const entry = maybe orelse continue;
-            if (entry.plan_identity != plan.identity or (needs_sampled and !entry.has_sampled) or
-                (!plan.forward_only and entry.exact_loop_budget != @atomicLoad(bool, &exact_scalar_walk_budget, .monotonic)) or
-                !std.meta.eql(entry.bindings, bindings.*)) continue;
-            if (!entry.snapshot.matches(reader)) return null;
-            self.sequence +%= 1;
-            entry.age = self.sequence;
-            return entry;
+        const passthrough = passthroughWords(plan, bindings);
+        const hint = &self.hints[plan.identity % self.hints.len];
+        var selected: ?usize = null;
+        if (@atomicLoad(bool, &hinted_resource_walks, .monotonic)) {
+            if (hint.*) |index| if (index < self.entry_limit) {
+                if (self.entries[index]) |entry| if (matchesKey(entry, plan, bindings, passthrough, needs_sampled)) {
+                    selected = index;
+                };
+            };
         }
-        return null;
+        if (selected == null) for (self.entries[0..self.entry_limit], 0..) |maybe, index| {
+            const entry = maybe orelse continue;
+            if (!matchesKey(entry, plan, bindings, passthrough, needs_sampled)) continue;
+            selected = index;
+            break;
+        };
+        const index = selected orelse return null;
+        const entry = self.entries[index].?;
+        if (!entry.snapshot.matches(reader)) return null;
+        hint.* = @intCast(index);
+        self.sequence +%= 1;
+        entry.age = self.sequence;
+        return entry;
+    }
+
+    fn matchesKey(entry: *const Entry, plan: *const checkpoints.Plan, bindings: *const shaders.StageBindings, passthrough: u64, needs_sampled: bool) bool {
+        return entry.plan_identity == plan.identity and (!needs_sampled or entry.has_sampled) and
+            (plan.forward_only or entry.exact_loop_budget == @atomicLoad(bool, &exact_scalar_walk_budget, .monotonic)) and
+            sameBindings(&entry.bindings, bindings, passthrough);
     }
 
     fn remember(self: *WalkCache, plan: *const checkpoints.Plan, bindings: *const shaders.StageBindings, snapshot: *const Snapshot, evaluation: *const scalar.Evaluation, sampled: ?[]const scalar.ScalarRegisters, resource: []const scalar.ScalarRegisters) void {
@@ -281,7 +382,22 @@ const WalkCache = struct {
         if (size > self.byte_limit / 4) return;
         var hasher = std.hash.Wyhash.init(0);
         std.hash.autoHash(&hasher, plan.identity);
-        std.hash.autoHash(&hasher, bindings.*);
+        const passthrough = passthroughWords(plan, bindings);
+        var normalized = bindings.*;
+        var remaining = passthrough;
+        while (remaining != 0) {
+            const word = @ctz(remaining);
+            remaining &= remaining - 1;
+            normalized.user_data[word] = 0;
+        }
+        hashBindings(&hasher, &normalized);
+        if (@atomicLoad(bool, &content_aware_walk_admission, .monotonic)) {
+            for (snapshot.reads[0..snapshot.count]) |*read| {
+                std.hash.autoHash(&hasher, read.address);
+                std.hash.autoHash(&hasher, read.size);
+                hasher.update(read.bytes[0..read.size]);
+            }
+        }
         const key = hasher.final() | 1;
         const admission = &self.admission[key % self.admission.len];
         if (admission.* != key) {
@@ -291,16 +407,10 @@ const WalkCache = struct {
         var slot: ?usize = null;
         for (self.entries[0..self.entry_limit], 0..) |maybe, i| {
             if (maybe) |entry| {
-                if (entry.plan_identity == plan.identity and std.meta.eql(entry.bindings, bindings.*)) {
-                    if (entry.sampled.len == sampled_values.len and entry.resource.len == resource.len) {
-                        entry.snapshot.copyFrom(snapshot);
-                        entry.evaluation.copyFrom(evaluation);
-                        @memcpy(entry.sampled, sampled_values);
-                        @memcpy(entry.resource, resource);
-                        entry.has_sampled = sampled != null;
-                        entry.exact_loop_budget = @atomicLoad(bool, &exact_scalar_walk_budget, .monotonic);
+                if (entry.plan_identity == plan.identity and sameBindings(&entry.bindings, bindings, passthrough)) {
+                    if (entry.fits(sampled_values.len, resource.len)) {
                         self.sequence +%= 1;
-                        entry.age = self.sequence;
+                        entry.replace(plan, bindings, snapshot, evaluation, sampled, resource, self.sequence);
                         return;
                     }
                     self.remove(i);
@@ -311,24 +421,29 @@ const WalkCache = struct {
         }
         while (slot == null or self.bytes + size > self.byte_limit) {
             const victim = self.oldest() orelse return;
+            const previous = self.entries[victim].?;
+            // A smaller walk can reuse the allocation too, including a
+            // different sampled/resource split. Budget accounting retains the
+            // full capacity; lookups see only the newly initialized views.
+            if (@atomicLoad(bool, &recycle_resource_walk_entries, .monotonic) and
+                previous.fits(sampled_values.len, resource.len))
+            {
+                self.sequence +%= 1;
+                previous.replace(plan, bindings, snapshot, evaluation, sampled, resource, self.sequence);
+                return;
+            }
             self.remove(victim);
             slot = victim;
         }
         const a = std.heap.page_allocator;
         const entry = a.create(Entry) catch return;
-        const sampled_copy = a.dupe(scalar.ScalarRegisters, sampled_values) catch {
-            a.destroy(entry);
-            return;
-        };
-        const resource_copy = a.dupe(scalar.ScalarRegisters, resource) catch {
-            a.free(sampled_copy);
+        const storage = a.alloc(scalar.ScalarRegisters, sampled_values.len + resource.len) catch {
             a.destroy(entry);
             return;
         };
         self.sequence +%= 1;
-        entry.* = .{ .plan_identity = plan.identity, .bindings = bindings.*, .snapshot = .{}, .evaluation = undefined, .sampled = sampled_copy, .resource = resource_copy, .has_sampled = sampled != null, .exact_loop_budget = @atomicLoad(bool, &exact_scalar_walk_budget, .monotonic), .age = self.sequence };
-        entry.snapshot.copyFrom(snapshot);
-        entry.evaluation.copyFrom(evaluation);
+        entry.* = .{ .plan_identity = 0, .bindings = undefined, .snapshot = .{}, .evaluation = undefined, .checkpoint_storage = storage, .sampled = undefined, .resource = undefined, .has_sampled = false, .exact_loop_budget = false, .age = 0 };
+        entry.replace(plan, bindings, snapshot, evaluation, sampled, resource, self.sequence);
         self.entries[slot.?] = entry;
         self.bytes += size;
     }
@@ -508,6 +623,10 @@ pub const Pool = struct {
                 @memcpy(sampled.snapshots, cached.sampled);
                 @memcpy(resource.snapshots, cached.resource);
                 stage.scalar_result.copyFrom(&cached.evaluation);
+                const passthrough = passthroughWords(plan.?, bindings);
+                rebindCheckpoints(sampled.snapshots, bindings, passthrough);
+                rebindCheckpoints(resource.snapshots, bindings, passthrough);
+                rebindRegisters(&stage.scalar_result.registers, bindings, passthrough);
                 stage.snapshot.copyFrom(&cached.snapshot);
                 self.stats.cached_walks += 1;
                 self.retainShared(stage, bindings, plan.?, resource);
@@ -540,7 +659,10 @@ pub const Pool = struct {
             if (self.walk_cache.lookup(plan.?, bindings, reader, false)) |cached| {
                 @memcpy(resource.snapshots, cached.resource);
                 scalar_result.copyFrom(&cached.evaluation);
-                stage.scalar_result.copyFrom(&cached.evaluation);
+                const passthrough = passthroughWords(plan.?, bindings);
+                rebindCheckpoints(resource.snapshots, bindings, passthrough);
+                rebindRegisters(&scalar_result.registers, bindings, passthrough);
+                stage.scalar_result.copyFrom(scalar_result);
                 stage.snapshot.copyFrom(&cached.snapshot);
                 self.stats.cached_walks += 1;
                 self.retainShared(stage, bindings, plan.?, resource);
@@ -681,6 +803,70 @@ const TestMemory = struct {
         return .{ .context = self, .read_fn = read };
     }
 };
+
+test "parameterized walks rebind GPU-only entry words and still validate host reads" {
+    const a = std.testing.allocator;
+    const code = [_]rdna2.Instruction{
+        .{ .pc = 0, .word_count = 2, .family = .smem, .opcode = .s_buffer_load_dwordx4, .src0 = .{ .kind = .sgpr, .reg = 0 }, .src1 = .{ .kind = .null }, .dst = .{ .kind = .sgpr, .reg = 20 }, .data_words = 4 },
+        .{ .pc = 8, .word_count = 2, .family = .smem, .opcode = .s_load_dword, .src0 = .{ .kind = .sgpr, .reg = 4 }, .src1 = .{ .kind = .null }, .dst = .{ .kind = .sgpr, .reg = 30 }, .data_words = 1 },
+        .{ .pc = 16, .family = .mimg, .opcode = .image_sample, .src1 = .{ .kind = .sgpr, .reg = 0 }, .src2 = .{ .kind = .sgpr, .reg = 40 } },
+        .{ .pc = 24, .family = .sopp, .opcode = .s_endpgm },
+    };
+    var plan = try checkpoints.Plan.init(a, &code);
+    defer plan.deinit(a);
+    var bindings = std.mem.zeroes(shaders.StageBindings);
+    bindings.user_data_count = 6;
+    bindings.user_data[4] = 0x4000;
+    bindings.resource_instruction_budget = 64;
+    bindings.defer_vector_buffer_loads = true;
+    bindings.conservative_user_data_mask = true;
+    try std.testing.expectEqual(@as(u64, 15), passthroughWords(&plan, &bindings));
+    const pool = try a.create(Pool);
+    defer a.destroy(pool);
+    pool.* = .{ .worker_limit = 0 };
+    defer pool.deinit();
+    const expected = try a.create(scalar.Evaluation);
+    defer a.destroy(expected);
+    const actual = try a.create(scalar.Evaluation);
+    defer a.destroy(actual);
+    const reference_sampled = try a.alloc(scalar.ScalarRegisters, plan.sampled.len);
+    defer a.free(reference_sampled);
+    const reference_resource = try a.alloc(scalar.ScalarRegisters, plan.resource.len);
+    defer a.free(reference_resource);
+    var scratch = checkpoints.Pool{};
+    defer scratch.deinit(a);
+    var memory = TestMemory{ .owner = std.Thread.getCurrentId() };
+    for (0..6) |iteration| {
+        bindings.user_data[0] = @intCast(0x1000 + iteration * 0x100);
+        bindings.user_data[2] = @intCast(16 + iteration * 4);
+        var original_hash = std.hash.Wyhash.init(71);
+        var batched_hash = std.hash.Wyhash.init(71);
+        std.hash.autoHash(&original_hash, bindings);
+        hashBindings(&batched_hash, &bindings);
+        try std.testing.expectEqual(original_hash.final(), batched_hash.final());
+        if (iteration == 3) memory.value = 7;
+        scalar.evaluateDecodedResourceStateAtTwoCheckpointsInto(expected, memory.reader(), &bindings, &code, plan.sampled, reference_sampled, plan.resource, reference_resource, plan.walk());
+        const hits = pool.stats.cached_walks;
+        var sampled = (try pool.startSampled(0, memory.reader(), &bindings, &code, &plan, &scratch, a)).?;
+        defer sampled.release();
+        try std.testing.expect(pool.takeScalar(0, &bindings, &code, memory.reader(), actual));
+        var resource = pool.take(&code, &bindings, .resource, memory.reader()).?;
+        defer resource.release();
+        try std.testing.expectEqual(hits + @as(u64, if (iteration == 2 or iteration == 5) 1 else 0), pool.stats.cached_walks);
+        try std.testing.expectEqualDeep(expected.registers, actual.registers);
+        try std.testing.expectEqualDeep(expected.loadSlice(), actual.loadSlice());
+        try std.testing.expectEqualDeep(reference_sampled, sampled.snapshots);
+        try std.testing.expectEqualDeep(reference_resource, resource.snapshots);
+        pool.finish();
+    }
+    // A changed host pointer is never treated as a GPU-only parameter.
+    const hits = pool.stats.cached_walks;
+    bindings.user_data[4] = 0x5000;
+    try std.testing.expect(pool.startScalar(0, memory.reader(), &bindings, &code, &plan, actual));
+    try std.testing.expect(actual.memory_read_failed);
+    try std.testing.expectEqual(hits, pool.stats.cached_walks);
+    pool.finish();
+}
 
 test "resource workers match serial checkpoints and never access guest memory" {
     for ([_]usize{ 1, 2, 4 }) |limit| try exerciseResourcePool(limit, false, false);
@@ -1099,6 +1285,183 @@ test "indexed dense visit counts include branch gaps and reject malformed destin
             try std.testing.expectEqual(@as(?u64, dense.instruction_count), indexed.dense_instruction_count);
         }
     }
+}
+
+test "resource walk cache recycling replaces identity dependencies and scalar results" {
+    const old_limit = resource_walk_cache_entries;
+    defer resource_walk_cache_entries = old_limit;
+    resource_walk_cache_entries = 1;
+    var cache = WalkCache{};
+    defer cache.deinit();
+    const snapshot = try std.testing.allocator.create(Snapshot);
+    defer std.testing.allocator.destroy(snapshot);
+    const evaluation = try std.testing.allocator.create(scalar.Evaluation);
+    defer std.testing.allocator.destroy(evaluation);
+    var memory = TestMemory{ .owner = std.Thread.getCurrentId() };
+    var bindings = std.mem.zeroes(shaders.StageBindings);
+    const instructions = [_]rdna2.Instruction{.{ .opcode = .s_endpgm }};
+    var plan = try checkpoints.Plan.init(std.testing.allocator, &instructions);
+    defer plan.deinit(std.testing.allocator);
+    var initial: ?*const WalkCache.Entry = null;
+    for (0..5) |i| {
+        bindings.user_data[0] = @intCast(i);
+        memory.value = @intCast(i + 1);
+        snapshot.* = .{ .source = memory.reader() };
+        var bytes: [4]u8 = undefined;
+        try std.testing.expect(Snapshot.capture(snapshot, 0x4000, &bytes));
+        evaluation.reset();
+        evaluation.instruction_count = @intCast(i + 17);
+        cache.remember(&plan, &bindings, snapshot, evaluation, null, &.{});
+        cache.remember(&plan, &bindings, snapshot, evaluation, null, &.{});
+        const found = cache.lookup(&plan, &bindings, memory.reader(), false).?;
+        if (initial) |entry| try std.testing.expect(entry == found) else initial = found;
+        try std.testing.expectEqual(i + 17, found.evaluation.instruction_count);
+        memory.value = 99;
+        try std.testing.expect(cache.lookup(&plan, &bindings, memory.reader(), false) == null);
+        memory.value = @intCast(i + 1);
+        bindings.user_data[0] = 100;
+        try std.testing.expect(cache.lookup(&plan, &bindings, memory.reader(), false) == null);
+    }
+    try std.testing.expectEqual(@sizeOf(WalkCache.Entry), cache.bytes);
+}
+
+test "resource walk hints retain full identity binding and dependency validation" {
+    const saved_hints = hinted_resource_walks;
+    const saved_entries = resource_walk_cache_entries;
+    defer {
+        hinted_resource_walks = saved_hints;
+        resource_walk_cache_entries = saved_entries;
+    }
+    resource_walk_cache_entries = 4;
+    const a = std.testing.allocator;
+    const snapshot = try a.create(Snapshot);
+    defer a.destroy(snapshot);
+    const evaluation = try a.create(scalar.Evaluation);
+    defer a.destroy(evaluation);
+    var memory = TestMemory{ .owner = std.Thread.getCurrentId() };
+    const bindings = std.mem.zeroes(shaders.StageBindings);
+    const instructions = [_]rdna2.Instruction{.{ .opcode = .s_endpgm }};
+    var plan = try checkpoints.Plan.init(a, &instructions);
+    defer plan.deinit(a);
+    // Share the hint bucket, but never the exact immutable-analysis identity.
+    var other = plan;
+    other.identity += 64;
+    for ([_]bool{ false, true }) |enabled| {
+        hinted_resource_walks = enabled;
+        var cache = WalkCache{};
+        defer cache.deinit();
+        snapshot.* = .{ .source = memory.reader() };
+        var bytes: [4]u8 = undefined;
+        try std.testing.expect(Snapshot.capture(snapshot, 0x4000, &bytes));
+        for ([_]*const checkpoints.Plan{ &plan, &other }, 0..) |selected, i| {
+            evaluation.reset();
+            evaluation.instruction_count = @intCast(i + 17);
+            cache.remember(selected, &bindings, snapshot, evaluation, null, &.{});
+            cache.remember(selected, &bindings, snapshot, evaluation, null, &.{});
+        }
+        for (0..8) |i| {
+            const selected = if (i % 2 == 0) &plan else &other;
+            const found = cache.lookup(selected, &bindings, memory.reader(), false).?;
+            try std.testing.expectEqual(@as(u32, @intCast(i % 2 + 17)), found.evaluation.instruction_count);
+        }
+        var changed = bindings;
+        changed.user_data[0] = 99;
+        try std.testing.expect(cache.lookup(&other, &changed, memory.reader(), false) == null);
+        try std.testing.expect(cache.lookup(&other, &bindings, memory.reader(), true) == null);
+        memory.value = null;
+        try std.testing.expect(cache.lookup(&other, &bindings, memory.reader(), false) == null);
+        memory.value = 1;
+        // An out-of-range hint must not be dereferenced after a limit change.
+        cache.hints[plan.identity % cache.hints.len] = 511;
+        try std.testing.expect(cache.lookup(&plan, &bindings, memory.reader(), false) != null);
+        resource_walk_cache_entries = 1;
+        try std.testing.expect(cache.lookup(&other, &bindings, memory.reader(), false) == null);
+        resource_walk_cache_entries = 4;
+    }
+}
+
+test "resource walk admission ignores repeatedly changing contents at the same address" {
+    const previous = content_aware_walk_admission;
+    defer content_aware_walk_admission = previous;
+    content_aware_walk_admission = true;
+    var cache = WalkCache{};
+    defer cache.deinit();
+    const a = std.testing.allocator;
+    const snapshot = try a.create(Snapshot);
+    defer a.destroy(snapshot);
+    const evaluation = try a.create(scalar.Evaluation);
+    defer a.destroy(evaluation);
+    evaluation.reset();
+    var memory = TestMemory{ .owner = std.Thread.getCurrentId() };
+    var bindings = std.mem.zeroes(shaders.StageBindings);
+    const instructions = [_]rdna2.Instruction{.{ .opcode = .s_endpgm }};
+    var plan = try checkpoints.Plan.init(a, &instructions);
+    defer plan.deinit(a);
+    for (0..128) |value| {
+        memory.value = @intCast(value);
+        snapshot.* = .{ .source = memory.reader() };
+        var bytes: [4]u8 = undefined;
+        try std.testing.expect(Snapshot.capture(snapshot, 0x4000, &bytes));
+        cache.remember(&plan, &bindings, snapshot, evaluation, null, &.{});
+        try std.testing.expectEqual(@as(usize, 0), cache.bytes);
+    }
+    cache.remember(&plan, &bindings, snapshot, evaluation, null, &.{});
+    try std.testing.expect(cache.lookup(&plan, &bindings, memory.reader(), false) != null);
+    // Admission is only a cost heuristic. Hits still check the actual bytes.
+    memory.value = 99;
+    try std.testing.expect(cache.lookup(&plan, &bindings, memory.reader(), false) == null);
+}
+
+test "resource walk recycling changes checkpoint views without exposing stale tails" {
+    const old_limit = resource_walk_cache_entries;
+    const old_bytes = resource_walk_cache_bytes;
+    defer {
+        resource_walk_cache_entries = old_limit;
+        resource_walk_cache_bytes = old_bytes;
+    }
+    resource_walk_cache_entries = 1;
+    resource_walk_cache_bytes = 32 * 1024 * 1024;
+    var cache = WalkCache{};
+    defer cache.deinit();
+    const a = std.testing.allocator;
+    const snapshot = try a.create(Snapshot);
+    defer a.destroy(snapshot);
+    snapshot.* = .{};
+    const evaluation = try a.create(scalar.Evaluation);
+    defer a.destroy(evaluation);
+    evaluation.reset();
+    const states = try a.alloc(scalar.ScalarRegisters, 4);
+    defer a.free(states);
+    var memory = TestMemory{ .owner = std.Thread.getCurrentId() };
+    var bindings = std.mem.zeroes(shaders.StageBindings);
+    const instructions = [_]rdna2.Instruction{.{ .opcode = .s_endpgm }};
+    var plan = try checkpoints.Plan.init(a, &instructions);
+    defer plan.deinit(a);
+    var first: ?*const WalkCache.Entry = null;
+    var storage: ?[*]scalar.ScalarRegisters = null;
+    for ([_][2]usize{ .{ 3, 1 }, .{ 0, 1 }, .{ 2, 2 }, .{ 1, 0 } }, 0..) |counts, iteration| {
+        for (states, 0..) |*state, index| {
+            state.* = @splat(.{ .known = true, .value = @intCast(100 * iteration + index) });
+        }
+        // Exercise both matching identity replacement and LRU replacement.
+        bindings.user_data[0] = @intCast(iteration / 2);
+        const sampled = if (counts[0] == 0) null else states[0..counts[0]];
+        const resource = states[counts[0]..][0..counts[1]];
+        cache.remember(&plan, &bindings, snapshot, evaluation, sampled, resource);
+        cache.remember(&plan, &bindings, snapshot, evaluation, sampled, resource);
+        const found = cache.lookup(&plan, &bindings, memory.reader(), false).?;
+        if (first) |initial| try std.testing.expect(initial == found) else first = found;
+        if (storage) |initial| try std.testing.expect(initial == found.checkpoint_storage.ptr) else storage = found.checkpoint_storage.ptr;
+        try std.testing.expectEqualDeep(sampled orelse &.{}, found.sampled);
+        try std.testing.expectEqualDeep(resource, found.resource);
+        try std.testing.expectEqual(sampled != null, found.has_sampled);
+        try std.testing.expectEqual(@sizeOf(WalkCache.Entry) + 4 * @sizeOf(scalar.ScalarRegisters), cache.bytes);
+    }
+    // A reduced budget accounts for retained capacity, not just the short view.
+    resource_walk_cache_bytes = @sizeOf(WalkCache.Entry);
+    cache.updateLimits();
+    try std.testing.expectEqual(@as(usize, 0), cache.bytes);
+    try std.testing.expect(cache.lookup(&plan, &bindings, memory.reader(), false) == null);
 }
 
 test "resource walk cache releases retired entries when bounded limits shrink" {

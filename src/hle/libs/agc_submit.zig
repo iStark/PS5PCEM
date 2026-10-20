@@ -1577,7 +1577,12 @@ fn traceShaderBinding(state: *const gpu.State, stage: gpu.resources.ShaderStage)
     if (traced_shader_program_count >= traced_shader_programs.len) return;
     traced_shader_programs[traced_shader_program_count] = program_address;
     traced_shader_program_count += 1;
+    traceNewShaderBinding(state, stage, program_address);
+}
 
+// Diagnostic scalar history occupies tens of KiB. Do not probe that stack
+// frame on every draw when tracing is disabled or this shader was seen.
+noinline fn traceNewShaderBinding(state: *const gpu.State, stage: gpu.resources.ShaderStage, program_address: u64) void {
     const header_address = shader_registry.find(program_address);
     const bindings = gpu.ShaderBindings.capture(
         state,

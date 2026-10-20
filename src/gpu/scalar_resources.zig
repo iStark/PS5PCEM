@@ -18,6 +18,7 @@ pub var definition_cache_misses = std.atomic.Value(u64).init(0);
 pub var persistent_definition_cache_enabled = std.atomic.Value(bool).init(true);
 pub var persistent_definition_cache_hits = std.atomic.Value(u64).init(0);
 pub var persistent_definition_cache_misses = std.atomic.Value(u64).init(0);
+pub export var bounded_pointer_recovery_scratch: bool = true;
 
 // Reaching-definition recovery only reads this snapshot. Sharing the immutable
 // unknown state avoids copying 128 register records for every preparation.
@@ -40,10 +41,15 @@ pub fn appendMissingPointerLoads(
     prefix_end: u32,
 ) usize {
     if (prefix_end == 0) return count;
+    const candidate_end = if (@atomicLoad(bool, &bounded_pointer_recovery_scratch, .monotonic))
+        @min(@as(u64, prefix_end), checkpoints.pointerLoadEnd(instructions, plan))
+    else
+        @as(u64, prefix_end);
+    if (candidate_end == 0) return count;
     var seen: std.StaticBitSet(64 * 1024) = undefined;
     // No instruction at or beyond prefix_end is eligible. Initialize only
     // words that can be queried, retaining the existing maximum-PC bound.
-    const slots: usize = @intCast(@min(seen.capacity(), (@as(u64, prefix_end) + 3) / 4));
+    const slots: usize = @intCast(@min(seen.capacity(), (candidate_end + 3) / 4));
     const mask_bits = @bitSizeOf(@TypeOf(seen).MaskInt);
     @memset(seen.masks[0 .. (slots + mask_bits - 1) / mask_bits], 0);
     for (output[0..count]) |entry| if (entry.producer_pc) |pc| {
@@ -713,6 +719,8 @@ test "missing pointer recovery preserves all sixteen words and rejects partial r
 }
 
 test "pointer recovery honors prefix and bitmap boundaries without reading unused words" {
+    const previous = bounded_pointer_recovery_scratch;
+    defer bounded_pointer_recovery_scratch = previous;
     const M = struct {
         reads: usize = 0,
         fn read(context: ?*anyopaque, address: u64, bytes: []u8) bool {
@@ -733,18 +741,21 @@ test "pointer recovery honors prefix and bitmap boundaries without reading unuse
         };
         var graph = try rdna2.control_flow.buildInstructions(std.testing.allocator, &instructions);
         defer graph.deinit(std.testing.allocator);
+        var plan = try checkpoints.Plan.init(std.testing.allocator, &instructions);
+        defer plan.deinit(std.testing.allocator);
         for ([_]u32{ 0, pc, pc + 1, std.math.maxInt(u32) }) |prefix| {
-            for ([_]bool{ false, true }) |already_seen| {
+            for ([_]bool{ false, true }) |already_seen| for ([_]bool{ false, true }) |bounded| for ([_]bool{ false, true }) |planned| {
+                bounded_pointer_recovery_scratch = bounded;
                 var memory = M{};
                 var output: [2]rdna2.spirv.ScalarRegister = undefined;
                 output[0] = .{ .register = 4, .value = 99, .producer_pc = if (already_seen) pc else std.math.maxInt(u32) };
-                const count = appendMissingPointerLoads(&bindings, .{ .context = &memory, .read_fn = M.read }, &instructions, &graph, null, null, &output, 1, prefix);
+                const count = appendMissingPointerLoads(&bindings, .{ .context = &memory, .read_fn = M.read }, &instructions, &graph, null, if (planned) &plan else null, &output, 1, prefix);
                 const recovered = !already_seen and pc < prefix and pc < 262144;
                 try std.testing.expectEqual(@as(usize, if (recovered) 2 else 1), count);
                 try std.testing.expectEqual(@as(usize, @intFromBool(recovered)), memory.reads);
                 try std.testing.expectEqual(@as(u32, 99), output[0].value);
                 if (recovered) try std.testing.expectEqual(@as(u32, 0x12345678), output[1].value);
-            }
+            };
         }
     }
 }
