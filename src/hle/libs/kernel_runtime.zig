@@ -726,13 +726,22 @@ fn readGuestCString(address: u64, buffer: []u8) ?[]const u8 {
 }
 
 fn aprKernelError(err: apr.Error) i32 {
-    return switch (err) {
-        error.FileNotFound, error.UnknownFile => KernelError.enoent.raw(),
-        error.FileTableFull, error.CommandBufferTableFull, error.SubmissionTableFull, error.OutOfMemory => KernelError.enomem.raw(),
-        error.IoFailed => KernelError.eio.raw(),
-        error.InvalidPath, error.InvalidCommandBuffer, error.TooManyCommands, error.InvalidRead, error.UnknownSubmission, error.MappingFailed => KernelError.einval.raw(),
-        error.OutOfDirectMemory => KernelError.eagain.raw(),
+    const status: KernelError = switch (err) {
+        error.FileNotFound, error.UnknownFile => .enoent,
+        error.FileTableFull, error.CommandBufferTableFull, error.SubmissionTableFull, error.OutOfMemory => .enomem,
+        error.IoFailed => .eio,
+        error.InvalidPath, error.InvalidCommandBuffer, error.TooManyCommands, error.InvalidRead, error.UnknownSubmission, error.MappingFailed => .einval,
+        error.OutOfDirectMemory => .eagain,
     };
+    return aprStatusError(status);
+}
+
+fn aprStatusError(status: KernelError) i32 {
+    // Some converted libkernel wrappers reconstruct SCE errors from __error()
+    // after a negative return. Leaving errno=0 would turn a rejected read into
+    // success, with its destination still uninitialized.
+    setPosixErrno(@intCast(@as(u32, @bitCast(status.raw())) & 0xffff));
+    return status.raw();
 }
 
 fn aprSubmitCommandBufferAndGetResult(
@@ -741,13 +750,23 @@ fn aprSubmitCommandBufferAndGetResult(
     result_address: u64,
     identifier_address: u64,
 ) callconv(abi.guest) i32 {
-    if (command_buffer == 0) return KernelError.einval.raw();
-    if ((result_address != 0 and !memory_api.isGuestRangeAccessible(result_address, 8)) or
-        (identifier_address != 0 and !memory_api.isGuestRangeAccessible(identifier_address, @sizeOf(u32))))
+    if (command_buffer == 0) return aprStatusError(.einval);
+    if ((result_address != 0 and !host_memory.isHostRangeWritable(result_address, 8)) or
+        (identifier_address != 0 and !host_memory.isHostRangeWritable(identifier_address, @sizeOf(u32))))
     {
-        return KernelError.efault.raw();
+        return aprStatusError(.efault);
     }
-    const identifier = apr.submitCommandBuffer(command_buffer) catch |err| return aprKernelError(err);
+    var error_offset: u32 = 0;
+    const identifier = apr.submitCommandBufferWithOffset(command_buffer, &error_offset) catch |err| {
+        const status = aprKernelError(err);
+        if (result_address != 0) {
+            const result: *[8]u8 = @ptrFromInt(result_address);
+            std.mem.writeInt(i32, result[0..4], status, .little);
+            std.mem.writeInt(u32, result[4..8], error_offset, .little);
+        }
+        std.debug.print("[apr] submit failed cb=0x{x} offset=0x{x}: {s}\n", .{ command_buffer, error_offset, @errorName(err) });
+        return status;
+    };
     if (result_address != 0) {
         const result: *[8]u8 = @ptrFromInt(result_address);
         @memset(result, 0);
@@ -757,6 +776,33 @@ fn aprSubmitCommandBufferAndGetResult(
         std.mem.writeInt(u32, identifier_output, identifier, .little);
     }
     return 0;
+}
+
+test "native APR kernel errors publish a packet offset and cannot become success through errno" {
+    apr.reset();
+    defer apr.reset();
+    const packets = @import("../apr_packets.zig");
+    const words = [_]u32{ 0x5452000f, 0xdeadbeef };
+    var header = packets.Header{
+        .kind = 0,
+        .offset = 8,
+        .count = 2,
+        .capacity = 8,
+        .storage = @intFromPtr(&words),
+    };
+    var result: [8]u8 = @splat(0);
+    var identifier: u32 = 0xfeedbeef;
+    setPosixErrno(0);
+    defer setPosixErrno(0);
+    const status = aprSubmitCommandBufferAndGetResult(@intFromPtr(&header), 0, @intFromPtr(&result), @intFromPtr(&identifier));
+    try std.testing.expectEqual(KernelError.einval.raw(), status);
+    try std.testing.expectEqual(status, std.mem.readInt(i32, result[0..4], .little));
+    try std.testing.expectEqual(@as(u32, 4), std.mem.readInt(u32, result[4..8], .little));
+    try std.testing.expectEqual(@as(u32, 0xfeedbeef), identifier);
+    try std.testing.expectEqual(errno.Posix.einval, errnoAddress().*);
+    // Mirrors the title's negative-return wrapper.
+    const reconstructed: i32 = if (errnoAddress().* == 0) 0 else @bitCast(errno.kernel_error_base | @as(u32, @intCast(errnoAddress().*)));
+    try std.testing.expectEqual(status, reconstructed);
 }
 
 fn aprWaitCommandBuffer(identifier: u32) callconv(abi.guest) i32 {

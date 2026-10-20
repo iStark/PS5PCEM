@@ -1,5 +1,9 @@
 # ASTRO BOT: native AMPR kernel imports — October 20, 2026
 
+Follow-up: the reporter confirmed that linking succeeds and supplied a loading
+assertion log. See [native APR asset loading](astro-native-apr-black-screen-2026-10-20.md)
+for the subsequent command-buffer compatibility fix and its verification limits.
+
 [Issue #8](https://github.com/iStark/PS5PCEM/issues/8) reports 21 unresolved
 `libkernel` imports from `fakelib/libSceAmpr.sprx` in ASTRO BOT PPSA21567.
 All 21 now have named, NID-checked implementations. The loader still rejects

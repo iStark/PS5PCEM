@@ -15,6 +15,8 @@ const errno = @import("errno.zig");
 const builtin = @import("builtin");
 const runtime = @import("libs/kernel_runtime.zig");
 const memory_module = @import("memory");
+const packets = @import("apr_packets.zig");
+const mapper = @import("libs/kernel_mapper.zig");
 pub const counters = @import("ampr_counters.zig");
 
 pub const maximum_path: usize = 1024;
@@ -128,6 +130,8 @@ const Op = union(enum) {
     completion: CompletionCommand,
     map: AmmMapCommand,
     counter: CounterCommand,
+    wait_address: packets.AddressWait,
+    native_map: @import("amm_packets.zig").Command,
 };
 
 const AutoPoolRange = struct {
@@ -148,18 +152,23 @@ const CommandBuffer = struct {
     // The guest storage capacity limits recording, not an arbitrary number of
     // reads or an 8-bit index. Keep values in order for independent submissions.
     ops: std.ArrayList(Op) = .empty,
+    native_offsets: std.ArrayList(u32) = .empty,
     cursor: ?GatherScatterCursor = null,
     map_active: bool = false,
 
     fn deinit(self: *CommandBuffer) void {
         self.ops.deinit(file_allocator);
+        self.native_offsets.deinit(file_allocator);
         self.* = .{};
     }
 
     fn clone(self: *const CommandBuffer) Error!CommandBuffer {
         var result = self.*;
         result.ops = .empty;
+        result.native_offsets = .empty;
+        errdefer result.deinit();
         try result.ops.appendSlice(file_allocator, self.ops.items);
+        try result.native_offsets.appendSlice(file_allocator, self.native_offsets.items);
         return result;
     }
 };
@@ -555,6 +564,99 @@ pub fn mapActive(address: u64) Error!bool {
 }
 
 pub fn submitCommandBuffer(address: u64) Error!u32 {
+    var error_offset: u32 = 0;
+    return submitCommandBufferWithOffset(address, &error_offset);
+}
+
+/// Guest libSceAmpr can construct its own 24-byte header and packed stream.
+/// Such objects never enter the HLE registry. Decode a private snapshot before
+/// executing anything, so malformed tails cannot partially perform I/O.
+fn snapshotNative(address: u64, error_offset: *u32) Error!CommandBuffer {
+    if (!memory_module.isHostRangeReadable(address, @sizeOf(packets.Header))) return error.InvalidCommandBuffer;
+    const header_ptr: *align(1) const packets.Header = @ptrFromInt(address);
+    const header = header_ptr.*;
+    if (header.offset == 0 or header.offset & 3 != 0 or header.offset > header.capacity or
+        header.offset > 64 * 1024 * 1024 or header.count <= 0 or
+        @as(u32, @intCast(header.count)) > header.offset / 4 or
+        !memory_module.isHostRangeReadable(header.storage, header.offset)) return error.InvalidCommandBuffer;
+    const source: [*]const u8 = @ptrFromInt(header.storage);
+    const bytes = try file_allocator.dupe(u8, source[0..header.offset]);
+    defer file_allocator.free(bytes);
+    var pending: CommandBuffer = .{ .address = address };
+    errdefer pending.deinit();
+    var offset: usize = 0;
+    while (offset < bytes.len) {
+        error_offset.* = @intCast(offset);
+        const decoded = packets.decode(bytes[offset..]) catch {
+            const opcode = std.mem.readInt(u32, bytes[offset..][0..4], .little);
+            std.debug.print("[apr] invalid native packet cb=0x{x} offset=0x{x} header=0x{x}\n", .{ address, offset, opcode });
+            return error.InvalidCommandBuffer;
+        };
+        const op: ?Op = switch (decoded.command) {
+            .read => |command| blk: {
+                const cursor = pending.cursor;
+                const file = command.file orelse (cursor orelse return error.InvalidCommandBuffer).file_identifier;
+                const dest = command.destination orelse (cursor orelse return error.InvalidCommandBuffer).destination;
+                const file_offset = command.offset orelse (cursor orelse return error.InvalidCommandBuffer).file_offset;
+                if (dest == 0 or file_offset >= maximum_file_offset or findFileLocked(file) == null) return error.InvalidRead;
+                const next_dest = std.math.add(u64, dest, command.size) catch return error.InvalidRead;
+                const next_offset = std.math.add(u64, file_offset, command.size) catch return error.InvalidRead;
+                pending.cursor = .{ .file_identifier = file, .destination = next_dest, .file_offset = next_offset };
+                break :blk .{ .read = .{ .file_identifier = file, .destination = dest, .file_offset = file_offset, .size = command.size } };
+            },
+            .reset => blk: {
+                pending.cursor = null;
+                break :blk null;
+            },
+            .map_begin => |command| blk: {
+                if (pending.map_active) return error.InvalidCommandBuffer;
+                pending.map_active = true;
+                break :blk .{ .native_map = command };
+            },
+            .map_end => blk: {
+                if (!pending.map_active) return error.InvalidCommandBuffer;
+                pending.map_active = false;
+                break :blk null;
+            },
+            .map => |command| .{ .native_map = command },
+            .wait_address => |command| .{ .wait_address = command },
+            .write_address => |command| switch (command.source) {
+                .immediate => .{ .write = .{ .destination = command.address, .value = command.value } },
+                else => .{ .counter = .{ .read = .{
+                    .destination = command.address,
+                    .counter = if (command.source == .time) 0 else @intCast(command.value),
+                    .source = switch (command.source) {
+                        .time => .time,
+                        .word => .word,
+                        .pair => .pair,
+                        else => unreachable,
+                    },
+                } } },
+            },
+            .wait_counter => |command| .{ .counter = .{ .wait = command } },
+            .write_counter => |command| .{ .counter = .{ .write = command } },
+            .event => |command| .{ .completion = .{
+                .queue_handle = @intCast(command.queue),
+                .ident = command.ident,
+                .completion_token = command.data,
+                .user_data = command.data,
+            } },
+            .marker => null,
+        };
+        if (op) |value| {
+            try pending.ops.append(file_allocator, value);
+            try pending.native_offsets.append(file_allocator, @intCast(offset));
+        }
+        offset += decoded.bytes;
+        pending.command_count += 1;
+    }
+    error_offset.* = @intCast(offset);
+    if (pending.command_count != @as(u32, @intCast(header.count)) or pending.map_active) return error.InvalidCommandBuffer;
+    return pending;
+}
+
+pub fn submitCommandBufferWithOffset(address: u64, error_offset: *u32) Error!u32 {
+    error_offset.* = 0;
     var pending: CommandBuffer = .{};
     defer pending.deinit();
     var sink: ?CompletionSink = null;
@@ -562,13 +664,15 @@ pub fn submitCommandBuffer(address: u64) Error!u32 {
         lock.lock();
         defer lock.unlock();
         if (stopping.load(.acquire)) return error.IoFailed;
-        const buffer = findCommandBufferLocked(address) orelse return error.InvalidCommandBuffer;
         // Reserve before executing: a full submission table must not repeat
         // counter updates or publish an event for an untrackable submission.
         const index = for (&submissions, 0..) |*submission, i| {
             if (!submission.active) break i;
         } else return error.SubmissionTableFull;
-        pending = try buffer.clone();
+        pending = if (findCommandBufferLocked(address)) |buffer|
+            try buffer.clone()
+        else
+            try snapshotNative(address, error_offset);
         for (pending.ops.items) |*op| {
             if (op.* == .map and op.map.kind == .map_auto) {
                 op.map.dmem_offset = takeAutoLocked(op.map.size, op.map.memory_type) orelse return error.OutOfDirectMemory;
@@ -587,7 +691,10 @@ pub fn submitCommandBuffer(address: u64) Error!u32 {
         lock.unlock();
     }
     var cursor: usize = 0;
-    const complete = try executePending(&pending, &cursor, sink);
+    const complete = executePending(&pending, &cursor, sink) catch |err| {
+        if (cursor < pending.native_offsets.items.len) error_offset.* = pending.native_offsets.items[cursor];
+        return err;
+    };
     lock.lock();
     defer lock.unlock();
     if (complete) {
@@ -601,6 +708,7 @@ pub fn submitCommandBuffer(address: u64) Error!u32 {
         snapshot.* = pending;
         submissions[slot].worker = std.Thread.spawn(.{}, deferredMain, .{ slot, snapshot, cursor, sink }) catch return error.IoFailed;
         pending.ops = .empty; // Ownership transfers only after a successful spawn.
+        pending.native_offsets = .empty;
     }
     return submissions[slot].identifier;
 }
@@ -613,6 +721,15 @@ fn executePending(pending: *const CommandBuffer, cursor: *usize, sink: ?Completi
             .write => |command| try applyWrite(command),
             .completion => |command| try applyCompletion(command, sink),
             .map => |command| try applyAmmMap(command),
+            .native_map => |command| {
+                const status = mapper.execute(command);
+                if (status != errno.ok) return error.MappingFailed;
+            },
+            .wait_address => |command| {
+                if (command.address & 7 != 0 or !memory_module.isHostRangeReadable(command.address, 8)) return error.InvalidRead;
+                const source: *const u64 = @ptrFromInt(command.address);
+                if (!counters.compare(command.compare, @atomicLoad(u64, source, .acquire), command.value, std.math.maxInt(u64), .pair)) return false;
+            },
             .counter => |counter| switch (counter) {
                 .write => |command| counter_bank.write(command),
                 .wait => |command| if (!counter_bank.satisfied(command)) return false,
@@ -718,11 +835,12 @@ pub fn mapAutoMemory(address: u64, size: u64, memory_type: i32, protection: i32)
 }
 
 fn applyRead(command: ReadCommand) Error!void {
-    if (!memory.isGuestRangeAccessible(command.destination, command.size)) return error.InvalidRead;
+    if (!writableRange(command.destination, command.size) or
+        (command.bytes_read_address != 0 and !writableRange(command.bytes_read_address, 8))) return error.InvalidRead;
     const destination: [*]u8 = @ptrFromInt(command.destination);
     const bytes_read = try read(command.file_identifier, command.file_offset, destination[0..command.size]);
     if (command.bytes_read_address != 0) {
-        if (!memory.isGuestRangeAccessible(command.bytes_read_address, 8)) return error.InvalidRead;
+        if (memory.attachedAddressSpace()) |space| space.notifyGuestWrite(command.bytes_read_address, 8);
         const output: *[8]u8 = @ptrFromInt(command.bytes_read_address);
         std.mem.writeInt(u64, output, bytes_read, .little);
     }
@@ -730,13 +848,18 @@ fn applyRead(command: ReadCommand) Error!void {
 
 pub fn writeDestinationValid(address: u64) bool {
     if (address == 0 or address & 7 != 0) return false;
+    return writableRange(address, 8);
+}
+
+fn writableRange(address: u64, size: usize) bool {
+    if (address == 0) return false;
     if (memory.attachedAddressSpace()) |space| {
-        if (space.isWritable(address, 8)) return true;
+        if (space.isWritable(address, size)) return true;
         // A tracked read-only mapping must not fall back to its host page's
         // possibly broader permissions.
         if (space.query(address, false) != null) return false;
     } else if (builtin.os.tag != .windows and builtin.os.tag != .linux) return true;
-    return memory_module.isHostRangeWritable(address, 8);
+    return memory_module.isHostRangeWritable(address, size);
 }
 
 fn applyWrite(command: WriteCommand) Error!void {
@@ -1013,6 +1136,189 @@ test "APR scene file IDs grow without exhausting the descriptor cache" {
     reset();
     try std.testing.expectError(error.UnknownFile, fileSize(identifiers[0]));
     try std.testing.expectEqual(@as(u32, 1), (try resolve("asset-0.bin")).identifier);
+}
+
+test "native APR loads distinct asset names without an HLE command registry entry" {
+    reset();
+    defer reset();
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const io = std.testing.io;
+    const names = [_][]const u8{ "ui_wipe_transitions_1", "hero_respawn_icon_01" };
+    var output: [2][32]u8 = @splat(@splat(0));
+    var words: [10]u32 = undefined;
+    filesystem.attach(io, temporary.dir);
+    defer filesystem.detach();
+    for (names, 0..) |name, index| {
+        const file = try temporary.dir.createFile(io, name, .{});
+        try file.writeStreamingAll(io, name);
+        file.close(io);
+        const resolved = try resolve(name);
+        const destination = @intFromPtr(&output[index]);
+        // Native five-dword ReadFile, not our private HLE recording format.
+        @memcpy(words[index * 5 ..][0..5], &[_]u32{
+            0x428,                  @intCast(name.len - 1),      resolved.identifier,
+            @truncate(destination), @intCast(destination >> 32),
+        });
+    }
+    const NativeHeader = extern struct {
+        kind: u32 = 0,
+        offset: u32,
+        count: i32,
+        capacity: u32,
+        storage: u64,
+    };
+    var header = NativeHeader{
+        .offset = @sizeOf(@TypeOf(words)),
+        .count = 2,
+        .capacity = @sizeOf(@TypeOf(words)),
+        .storage = @intFromPtr(&words),
+    };
+    try waitCommandBuffer(try submitCommandBuffer(@intFromPtr(&header)));
+    for (names, 0..) |name, index| {
+        try std.testing.expectEqualStrings(name, output[index][0..name.len]);
+        try std.testing.expectEqual(@as(u8, 0), output[index][name.len]);
+    }
+}
+
+fn nativeTestHeader(words: []const u32, count: i32) packets.Header {
+    return .{
+        .kind = 0,
+        .offset = @intCast(words.len * 4),
+        .count = count,
+        .capacity = @intCast(words.len * 4),
+        .storage = @intFromPtr(words.ptr),
+    };
+}
+
+test "native APR gather scatter reads advance independent destination and file cursors" {
+    reset();
+    defer reset();
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const io = std.testing.io;
+    const file = try temporary.dir.createFile(io, "parts.bin", .{});
+    try file.writeStreamingAll(io, "abcdefghijklmnop");
+    file.close(io);
+    filesystem.attach(io, temporary.dir);
+    defer filesystem.detach();
+    const resolved = try resolve("parts.bin");
+    var output: [16]u8 = @splat(0);
+    var done: u64 = 0;
+    const base = @intFromPtr(&output);
+    const label = @intFromPtr(&done);
+    const words = [_]u32{
+        0x428,            3, resolved.identifier,                            @truncate(base),      @intCast(base >> 32),
+        0x8129,           3, 0x22a | (@as(u32, @intCast(base >> 32)) << 12), 3,                    @truncate(base + 8),
+        0x432b,           3, @truncate(base + 12),                           @intCast(base >> 32), 0x1105 | @as(u32, @truncate((label >> 16) & 0xffff0000)),
+        @truncate(label),
+    };
+    var header = nativeTestHeader(&words, 5);
+    try waitCommandBuffer(try submitCommandBuffer(@intFromPtr(&header)));
+    try std.testing.expectEqualStrings("abcdijklmnopefgh", &output);
+    try std.testing.expectEqual(@as(u64, 1), done);
+}
+
+test "native APR validates whole streams before side effects" {
+    reset();
+    defer reset();
+    var value: u64 = 0;
+    const address = @intFromPtr(&value);
+    var words = [_]u32{
+        0x1105 | @as(u32, @truncate((address >> 16) & 0xffff0000)), @truncate(address),
+        0xdeadbeef,
+    };
+    var header = nativeTestHeader(&words, 2);
+    var offset: u32 = 0;
+    try std.testing.expectError(error.InvalidCommandBuffer, submitCommandBufferWithOffset(@intFromPtr(&header), &offset));
+    try std.testing.expectEqual(@as(u32, 8), offset);
+    try std.testing.expectEqual(@as(u64, 0), value);
+    // The same valid write must also remain unexecuted on a bad header count.
+    header.offset = 8;
+    try std.testing.expectError(error.InvalidCommandBuffer, submitCommandBuffer(@intFromPtr(&header)));
+    try std.testing.expectEqual(@as(u64, 0), value);
+    header.count = 1;
+    header.capacity = 4;
+    try std.testing.expectError(error.InvalidCommandBuffer, submitCommandBuffer(@intFromPtr(&header)));
+    try std.testing.expectError(error.InvalidCommandBuffer, submitCommandBuffer(1));
+    // A reset makes compressed reads invalid until the next full ReadFile.
+    words = .{ 0x2f, 0x129, 3 };
+    header = nativeTestHeader(&words, 2);
+    try std.testing.expectError(error.InvalidCommandBuffer, submitCommandBuffer(@intFromPtr(&header)));
+}
+
+test "native APR waiting submissions own their decoded commands" {
+    reset();
+    defer reset();
+    var ready: u64 = 0;
+    var completed: u64 = 0;
+    const wait_address = @intFromPtr(&ready);
+    const output = @intFromPtr(&completed);
+    var words = [_]u32{
+        0x201 | @as(u32, @truncate((wait_address >> 16) & 0xffff0000)), @truncate(wait_address), 1,
+        0x1105 | @as(u32, @truncate((output >> 16) & 0xffff0000)),      @truncate(output),
+    };
+    var header = nativeTestHeader(&words, 2);
+    const id = try submitCommandBuffer(@intFromPtr(&header));
+    try std.testing.expectEqual(@as(u64, 0), @atomicLoad(u64, &completed, .acquire));
+    @memset(&words, 0xdeadbeef);
+    header = std.mem.zeroes(packets.Header);
+    @atomicStore(u64, &ready, 1, .release);
+    try expectSubmissionReady(id);
+    try waitCommandBuffer(id);
+    try std.testing.expectEqual(@as(u64, 1), @atomicLoad(u64, &completed, .acquire));
+}
+
+test "native APR maps storage before a read and publishes counters and an event after it" {
+    reset();
+    defer reset();
+    var space = try memory_module.AddressSpace.initWithDirectMemory(std.testing.allocator, 0x100000);
+    defer space.deinit();
+    memory.init(std.testing.allocator);
+    defer memory.deinit();
+    memory.attachAddressSpace(&space);
+    defer memory.attachAddressSpace(null);
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const io = std.testing.io;
+    try temporary.dir.writeFile(io, .{ .sub_path = "mapped.dat", .data = "mapped-payload" });
+    filesystem.attach(io, temporary.dir);
+    defer filesystem.detach();
+    const file = try resolve("mapped.dat");
+    const base: u64 = 0x1000000000;
+    const Sink = struct {
+        var event: ?CompletionCommand = null;
+        var complete: bool = false;
+        fn publish(command: CompletionCommand) bool {
+            event = command;
+            complete = std.mem.eql(u8, @as([*]const u8, @ptrFromInt(0x1000000000))[0..14], "mapped-payload");
+            return true;
+        }
+    };
+    Sink.event = null;
+    Sink.complete = false;
+    attachCompletionSink(Sink.publish);
+    defer attachCompletionSink(null);
+    const words = [_]u32{
+        0x322d,          @truncate(base >> 14), 4, // MapBegin: 16 KiB, CPU read/write.
+        0x428,           13,                    file.identifier,
+        @truncate(base), @intCast(base >> 32),  0x2e,
+        0x03001006, // Counter 3 = 1 on completion.
+        0x03010002, // Wait for counter 3 == 1.
+        0x408,
+        7,
+        9,
+        0x12345678,
+        0xabcdef01,
+    };
+    var header = nativeTestHeader(&words, 6);
+    try std.testing.expect(space.query(base, false) == null);
+    try waitCommandBuffer(try submitCommandBuffer(@intFromPtr(&header)));
+    try std.testing.expect(Sink.complete);
+    try std.testing.expectEqual(@as(u64, 1), counter_bank.read(3, .word));
+    try std.testing.expectEqual(@as(i64, 7), Sink.event.?.queue_handle);
+    try std.testing.expectEqual(@as(u64, 9), Sink.event.?.ident);
+    try std.testing.expectEqual(@as(u64, 0xabcdef0112345678), Sink.event.?.completion_token);
 }
 
 test "a deferred APR read completes through its submission identifier" {

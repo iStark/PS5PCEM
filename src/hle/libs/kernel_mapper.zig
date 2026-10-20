@@ -79,7 +79,8 @@ fn protect(destination: u64, address: u64, size: u64, memory_type: ?u64, protect
     return write(destination, .{ .kind = .protect, .address = address, .size = size, .memory_type = if (memory_type) |value| @intCast(value) else null, .protection = @intCast(protection), .mask = @intCast(mask), .gpu_mask = if (gpu_mask) |value| @intCast(value) else null }, out_size);
 }
 
-fn execute(command: Command) i32 {
+/// Shared by native AMM indirect buffers and APR map/read command streams.
+pub fn execute(command: Command) i32 {
     if (command.prt) return E.enosys.raw();
     switch (command.kind) {
         .unmap => return memory.hostUnmap(command.address, command.size),
