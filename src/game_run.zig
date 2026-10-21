@@ -15,6 +15,7 @@ const graphics_api = @import("graphics_api.zig");
 const window = @import("window");
 const display_mode = @import("display_mode.zig");
 const performance_mode = @import("performance_mode.zig");
+const frame_limit = @import("frame_limit.zig");
 
 fn acquireHostMemory(context: ?*anyopaque, address: u64, size: usize, identity: u64) ?vulkan.GuestMemory.HostMapping {
     const view = runtime.firmware.libs.agc_submit.pinDirectMemory(context, address, size, identity) orelse return null;
@@ -42,6 +43,7 @@ const usage =
     \\enters the title process. --app0 supplies full game content when eboot.bin
     \\comes from a sparse patch directory. Direct execution requires Windows or Linux x86-64.
     \\PS5_GRAPHICS_API=vulkan|d3d12 selects the renderer. D3D12 is experimental and Windows-only.
+    \\PS5_FPS_LIMIT=30|60|120|0 caps completed flips; 0 or unset leaves them uncapped.
     \\
 ;
 
@@ -379,6 +381,15 @@ fn run(init: std.process.Init) !bool {
         };
     } else |_| user_service.GamePresetPriority.performance;
     user_service.configureGamePreset(game_preset);
+    const fps_limit = if (init.minimal.environ.getAlloc(allocator, frame_limit.environment_name)) |value| limit: {
+        defer allocator.free(value);
+        break :limit frame_limit.Limit.parse(value) orelse {
+            try stderr.print("Invalid {s}='{s}'; expected 30, 60, 120 or 0; leaving flips uncapped\n", .{ frame_limit.environment_name, value });
+            try stderr.flush();
+            break :limit frame_limit.default;
+        };
+    } else |_| frame_limit.default;
+    runtime.firmware.video_out.setFrameLimit(fps_limit.hz());
     // Unset PS5_GAME_PRESET matches the launcher: priority 1. Yotei stores
     // that as internal mode 2, the 1080p preference without ray tracing.
     // Output status reports HD, SDR and 59.94 Hz, and does not offer 120 Hz.
@@ -386,6 +397,11 @@ fn run(init: std.process.Init) !bool {
         output_mode.width(), output_mode.height(), runtime.firmware.video_out.outputResolutionClass(),
     });
     try out.print("  Preset  {s}\n", .{render_preset.label()});
+    if (fps_limit.hz() != 0) {
+        try out.print("  Frame limit  {d} FPS\n", .{fps_limit.hz()});
+    } else {
+        try out.writeAll("  Frame limit  none\n");
+    }
     try out.print("  Renderer  {s}{s}\n", .{ selected_api.label(), if (selected_api == .d3d12) " (experimental; incomplete guest graphics support)" else "" });
     try out.print("  Game preference  {s}; applied by titles that read system game presets\n", .{game_preset.label()});
     try out.flush();

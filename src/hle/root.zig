@@ -128,6 +128,7 @@ test {
     _ = savedata;
     _ = host_stack;
     _ = video_out;
+    _ = @import("host_sleep.zig");
     _ = graphics_device;
     _ = apr;
     _ = errno;

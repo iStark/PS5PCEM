@@ -27,6 +27,7 @@ const gpu = @import("gpu");
 const apr = @import("../apr.zig");
 const filesystem = @import("../filesystem.zig");
 const video_out = @import("../video_out.zig");
+const host_sleep = @import("../host_sleep.zig");
 const guest_memory = @import("memory");
 
 const invalid_argument = errno.KernelError.einval.raw();
@@ -1472,7 +1473,14 @@ fn videoOutSubmitFlip(handle: i32, index: i32, mode: i32, argument: i64) callcon
         .argument = argument,
     });
     const delay_us = video_out.reserveFlipDelay(kernel_runtime.processTimeMicroseconds());
-    if (delay_us != 0) _ = kernel_threading.sceKernelUsleep(delay_us);
+    if (delay_us != 0) {
+        // A frame cap needs sub-millisecond waits; the guest sleep follows
+        // the coarse system tick, which is enough only for the 120 Hz pacing.
+        if (video_out.frameLimit() != 0)
+            host_sleep.sleepMicroseconds(delay_us)
+        else
+            _ = kernel_threading.sceKernelUsleep(delay_us);
+    }
     return errno.ok;
 }
 
@@ -1742,14 +1750,14 @@ fn videoOutSubmitEopFlip(
     // silent stall into a failure at the call responsible for it.
     const flip_arg: i64 = @bitCast(argument);
     video_out.noteFlipSubmit(flip_arg, kernel_runtime.processTimeCounter());
-    if (!agc_submit.presentFlip(.{
+    const flip: gpu.state.Flip = .{
         .video_out_handle = @intCast(handle),
         .display_buffer_index = index,
         .mode = mode,
         .argument = flip_arg,
-    })) {
-        return video_out_error_invalid_index;
-    }
+    };
+    agc_submit.paceCappedFlip(flip);
+    if (!agc_submit.presentFlip(flip)) return video_out_error_invalid_index;
     return errno.ok;
 }
 

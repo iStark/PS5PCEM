@@ -14,6 +14,7 @@ const builtin = @import("builtin");
 const display_mode = @import("display_mode.zig");
 const performance_mode = @import("performance_mode.zig");
 const graphics_api = @import("graphics_api.zig");
+const frame_limit = @import("frame_limit.zig");
 
 comptime {
     // The interface contains a fair amount of Cyrillic text converted to
@@ -45,8 +46,9 @@ const isNewerRelease = common.isNewerRelease;
 const jsonStringValue = common.jsonStringValue;
 
 test {
-    // The shared file's own tests run with each launcher's.
+    // The shared files' own tests run with each launcher's.
     _ = common;
+    _ = frame_limit;
 }
 
 const Rect = struct {
@@ -84,6 +86,7 @@ var show_fps = false;
 var output_mode = display_mode.default;
 var render_preset = performance_mode.default;
 var selected_graphics_api = graphics_api.default;
+var selected_frame_limit = frame_limit.default;
 var game_performance = true;
 var mapping = mapping_defaults;
 var capture_mapping: ?usize = null;
@@ -858,6 +861,7 @@ fn clickableAt(x: i32, y: i32) bool {
     return switch (current_page) {
         .library => recentGameAt(x, y) != null or
             indexOfRect(&library_graphics_api_rects, x, y) != null or
+            indexOfRect(&library_frame_limit_rects, x, y) != null or
             libraryViewAt(x, y) != null or
             libraryArrowAt(x, y) != null or
             libraryDotAt(x, y) != null or
@@ -915,6 +919,12 @@ fn handleClick(window: Win32.Window, x: i32, y: i32) void {
 fn handleLibraryClick(window: Win32.Window, x: i32, y: i32) void {
     if (indexOfRect(&library_graphics_api_rects, x, y)) |index| {
         selectGraphicsApi(index);
+        return;
+    }
+    if (indexOfRect(&library_frame_limit_rects, x, y)) |index| {
+        selected_frame_limit = frame_limit.choices[index];
+        saveSettings();
+        setStatusPhrase(.status_fps_limit_saved, false);
         return;
     }
     if (extract_state != .idle and extract_copy_rect.contains(x, y)) {
@@ -1000,9 +1010,20 @@ const graphics_api_rects = [_]Rect{
     .{ .left = 462, .top = 592, .right = 640, .bottom = 632 },
 };
 
+// The library's bottom card holds three groups: the game folder (306-456),
+// the graphics API (472-748) and the frame limit (764-1066). The API group is
+// as wide as Russian needs for its label beside the experimental note, and the
+// last frame-limit button fits the longest "Unlimited" (German, 100 px).
 const library_graphics_api_rects = [_]Rect{
-    .{ .left = 730, .top = 571, .right = 876, .bottom = 611 },
-    .{ .left = 888, .top = 571, .right = 1066, .bottom = 611 },
+    .{ .left = 472, .top = 571, .right = 582, .bottom = 611 },
+    .{ .left = 590, .top = 571, .right = 748, .bottom = 611 },
+};
+
+const library_frame_limit_rects = [_]Rect{
+    .{ .left = 764, .top = 571, .right = 814, .bottom = 611 },
+    .{ .left = 820, .top = 571, .right = 870, .bottom = 611 },
+    .{ .left = 876, .top = 571, .right = 932, .bottom = 611 },
+    .{ .left = 938, .top = 571, .right = 1066, .bottom = 611 },
 };
 
 fn selectGraphicsApi(index: usize) void {
@@ -1181,14 +1202,16 @@ fn drawLibrary(dc: Win32.DeviceContext) void {
     }
 
     card(dc, .{ .left = 282, .top = 536, .right = 1086, .bottom = 622 });
-    localizedText(dc, .graphics_api, .{ .left = 730, .top = 546, .right = 886, .bottom = 566 }, 0x009b9088, small_font, Win32.dt_left | Win32.dt_end_ellipsis);
-    if (selected_graphics_api == .d3d12) localizedText(dc, .graphics_api_experimental, .{ .left = 890, .top = 546, .right = 1066, .bottom = 566 }, 0x006f8cff, small_font, Win32.dt_right | Win32.dt_end_ellipsis);
+    localizedText(dc, .graphics_api, .{ .left = 472, .top = 546, .right = 748, .bottom = 566 }, 0x009b9088, small_font, Win32.dt_left | Win32.dt_end_ellipsis);
+    if (selected_graphics_api == .d3d12) localizedText(dc, .graphics_api_experimental, .{ .left = 610, .top = 546, .right = 748, .bottom = 566 }, 0x006f8cff, small_font, Win32.dt_right | Win32.dt_end_ellipsis);
     drawGraphicsApiButtons(dc, &library_graphics_api_rects);
-    localizedText(dc, .folder_label, .{ .left = 306, .top = 552, .right = 520, .bottom = 572 }, 0x009b9088, small_font, Win32.dt_left | Win32.dt_end_ellipsis);
+    localizedText(dc, .fps_limit, .{ .left = 764, .top = 546, .right = 1066, .bottom = 566 }, 0x009b9088, small_font, Win32.dt_left | Win32.dt_end_ellipsis);
+    drawFrameLimitButtons(dc);
+    localizedText(dc, .folder_label, .{ .left = 306, .top = 546, .right = 456, .bottom = 566 }, 0x009b9088, small_font, Win32.dt_left | Win32.dt_end_ellipsis);
     if (game_folder_length == 0) {
-        localizedText(dc, .folder_empty, .{ .left = 306, .top = 582, .right = 706, .bottom = 607 }, 0x007e746d, regular_font, Win32.dt_left | Win32.dt_end_ellipsis);
+        localizedText(dc, .folder_empty, .{ .left = 306, .top = 582, .right = 456, .bottom = 607 }, 0x007e746d, regular_font, Win32.dt_left | Win32.dt_end_ellipsis);
     } else {
-        text(dc, &game_folder, @intCast(game_folder_length), .{ .left = 306, .top = 580, .right = 706, .bottom = 607 }, 0x00d8d0c9, regular_font, Win32.dt_left | Win32.dt_end_ellipsis);
+        text(dc, &game_folder, @intCast(game_folder_length), .{ .left = 306, .top = 580, .right = 456, .bottom = 607 }, 0x00d8d0c9, regular_font, Win32.dt_left | Win32.dt_end_ellipsis);
     }
 
     button(dc, library_browse_rect, .choose_folder, false);
@@ -2115,6 +2138,21 @@ fn drawGraphicsApiButtons(dc: Win32.DeviceContext, rectangles: *const [2]Rect) v
     }
 }
 
+/// A segmented row: the chosen limit is lit and drawn in the accent colour.
+fn drawFrameLimitButtons(dc: Win32.DeviceContext) void {
+    for (library_frame_limit_rects, frame_limit.choices) |rectangle, limit| {
+        const selected = selected_frame_limit == limit;
+        roundFill(dc, rectangle, 8, if (selected) 0x0042362e else 0x00251f1b);
+        const color: u32 = if (selected) 0x00ffac64 else 0x00f4f0ea;
+        const area = Rect{ .left = rectangle.left + 4, .top = rectangle.top + 10, .right = rectangle.right - 4, .bottom = rectangle.bottom - 5 };
+        if (limit == .unlimited) {
+            localizedText(dc, .fps_unlimited, area, color, medium_font, Win32.dt_center | Win32.dt_end_ellipsis);
+        } else {
+            textUtf8(dc, limit.value(), area, color, medium_font, Win32.dt_center);
+        }
+    }
+}
+
 fn pageHeading(dc: Win32.DeviceContext, heading: Phrase, subtitle: Phrase) void {
     pageHeadingBefore(dc, heading, subtitle, update_rect.left - 16);
 }
@@ -2576,6 +2614,12 @@ fn launchGame(owner: Win32.Window) void {
     _ = Win32.SetEnvironmentVariableW(w(display_mode.environment_name), @ptrCast(&resolution_value));
     _ = Win32.SetEnvironmentVariableW(w(performance_mode.environment_name), presetEnvironment());
     _ = Win32.SetEnvironmentVariableW(w(graphics_api.environment_name), if (selected_graphics_api == .d3d12) w("d3d12") else w("vulkan"));
+    _ = Win32.SetEnvironmentVariableW(w(frame_limit.environment_name), switch (selected_frame_limit) {
+        .fps30 => w("30"),
+        .fps60 => w("60"),
+        .fps120 => w("120"),
+        .unlimited => w("0"),
+    });
     _ = Win32.SetEnvironmentVariableW(w("PS5_GAME_PRESET"), if (game_performance) w("performance") else w("default"));
     _ = Win32.SetEnvironmentVariableW(w("PS5_INPUT_MODE"), inputModeEnvironment());
     var controller_value = [_:0]u16{@as(u16, '0') + controller_index};
@@ -2892,6 +2936,7 @@ fn loadSettings() void {
     var api_utf8: [96]u8 = undefined;
     const api_utf8_length = std.unicode.utf16LeToUtf8(&api_utf8, api_value[0..api_length]) catch 0;
     selected_graphics_api = graphics_api.Api.parse(api_utf8[0..api_utf8_length]) orelse graphics_api.default;
+    selected_frame_limit = frame_limit.Limit.fromHz(Win32.GetPrivateProfileIntW(w("launcher"), w("fps_limit"), frame_limit.default.hz(), @ptrCast(&ini_path))) orelse frame_limit.default;
     game_performance = Win32.GetPrivateProfileIntW(w("launcher"), w("game_performance"), 1, @ptrCast(&ini_path)) != 0;
     const mode_value = Win32.GetPrivateProfileIntW(w("launcher"), w("input_mode"), 2, @ptrCast(&ini_path));
     if (mode_value <= 2) input_mode = @enumFromInt(mode_value);
@@ -2917,6 +2962,7 @@ fn saveSettings() void {
     writeIniInt(w("launcher"), w("output_resolution"), output_mode.height());
     writeIniInt(w("launcher"), w("render_preset"), @intFromEnum(render_preset));
     _ = Win32.WritePrivateProfileStringW(w("launcher"), w("graphics_api"), if (selected_graphics_api == .d3d12) w("d3d12") else w("vulkan"), @ptrCast(&ini_path));
+    writeIniInt(w("launcher"), w("fps_limit"), selected_frame_limit.hz());
     writeIniInt(w("launcher"), w("game_performance"), @intFromBool(game_performance));
     writeIniInt(w("launcher"), w("input_mode"), @intFromEnum(input_mode));
     writeIniInt(w("launcher"), w("language"), @intFromEnum(language));

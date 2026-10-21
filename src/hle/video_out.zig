@@ -114,6 +114,10 @@ var open_process_time_us: u64 = 0;
 var last_flip_argument: i64 = 0;
 var has_last_flip_argument: bool = false;
 var next_flip_time_us: u64 = 0;
+/// Cap from PS5_FPS_LIMIT in frames per second; zero leaves flips uncapped.
+var frame_limit_hz: u32 = 0;
+/// CPU flips are paced to the emulated 120 Hz refresh even without a cap.
+const cpu_flip_interval_us: u64 = 8_333;
 // The currently modeled VideoOut ABI distinguishes HD (1) and UHD (2).
 // Keep this independent of registered buffers: games may render internally at
 // a higher resolution than the selected output. Do not invent 1440p/8K ABI IDs.
@@ -145,7 +149,21 @@ pub fn reset() void {
     last_flip_argument = 0;
     has_last_flip_argument = false;
     next_flip_time_us = 0;
+    frame_limit_hz = 0;
     output_resolution_class = 1;
+}
+
+/// Sets the launcher's frame cap; zero removes it.
+pub fn setFrameLimit(hz: u32) void {
+    lock.lock();
+    defer lock.unlock();
+    frame_limit_hz = hz;
+}
+
+pub fn frameLimit() u32 {
+    lock.lock();
+    defer lock.unlock();
+    return frame_limit_hz;
 }
 
 pub fn open(index: i32) bool {
@@ -162,12 +180,35 @@ pub fn open(index: i32) bool {
 
 /// Pace completed flips without adding a full refresh interval to slow frames.
 /// Reserve under the VideoOut lock; the caller sleeps after releasing it.
+/// CPU flips keep the 120 Hz refresh, or the frame cap when it is slower.
 pub fn reserveFlipDelay(process_time_us: u64) u32 {
     lock.lock();
     defer lock.unlock();
     if (!opened) return 0;
-    // 120 Hz. A finished frame no longer waits out a 60 Hz slot.
-    const interval_us: u64 = 8_333;
+    // A finished frame no longer waits out a 60 Hz slot.
+    return reserveSlotLocked(process_time_us, @max(cpu_flip_interval_us, frameIntervalLocked()));
+}
+
+/// Pacing for flips completed from a GPU command stream: zero unless the
+/// launcher set a cap. Shares the deadline with CPU flips, so a title that
+/// mixes both still gets one frame per slot.
+pub fn reserveFrameLimitDelay(process_time_us: u64) u32 {
+    lock.lock();
+    defer lock.unlock();
+    if (!opened) return 0;
+    const interval_us = frameIntervalLocked();
+    if (interval_us == 0) return 0;
+    return reserveSlotLocked(process_time_us, interval_us);
+}
+
+fn frameIntervalLocked() u64 {
+    if (frame_limit_hz == 0) return 0;
+    return std.time.us_per_s / frame_limit_hz;
+}
+
+/// A frame that arrives late starts the next slot from now: missed slots are
+/// not caught up with a burst of undelayed flips.
+fn reserveSlotLocked(process_time_us: u64, interval_us: u64) u32 {
     const deadline = @max(next_flip_time_us, process_time_us);
     const delay = deadline - process_time_us;
     next_flip_time_us = deadline +| interval_us;
@@ -187,6 +228,36 @@ test "flip pacing credits rendering time and does not catch up missed frames" {
     try std.testing.expect(close(primary_handle));
     try std.testing.expect(open(0));
     try std.testing.expectEqual(@as(u32, 0), reserveFlipDelay(102_000));
+}
+
+test "a frame cap paces command-stream flips and slows CPU flips below 120 Hz" {
+    reset();
+    defer reset();
+    try std.testing.expect(open(0));
+    // Without a cap, command-stream flips are never delayed.
+    try std.testing.expectEqual(@as(u32, 0), reserveFrameLimitDelay(1_000));
+    try std.testing.expectEqual(@as(u32, 0), reserveFrameLimitDelay(1_100));
+
+    setFrameLimit(60);
+    try std.testing.expectEqual(@as(u32, 60), frameLimit());
+    try std.testing.expectEqual(@as(u32, 0), reserveFrameLimitDelay(10_000));
+    // The next slot opens 16,666 us later; a frame finished after 4 ms waits.
+    try std.testing.expectEqual(@as(u32, 12_666), reserveFrameLimitDelay(14_000));
+    // A slow frame is not delayed further and does not earn a catch-up burst.
+    try std.testing.expectEqual(@as(u32, 0), reserveFrameLimitDelay(80_000));
+    try std.testing.expectEqual(@as(u32, 16_666), reserveFrameLimitDelay(80_000));
+
+    // CPU flips follow the cap when it is slower than the 120 Hz refresh.
+    setFrameLimit(30);
+    try std.testing.expectEqual(@as(u32, 0), reserveFlipDelay(200_000));
+    try std.testing.expectEqual(@as(u32, 33_333), reserveFlipDelay(200_000));
+    setFrameLimit(120);
+    try std.testing.expectEqual(@as(u32, 0), reserveFlipDelay(400_000));
+    try std.testing.expectEqual(@as(u32, 8_333), reserveFlipDelay(400_000));
+
+    setFrameLimit(0);
+    try std.testing.expectEqual(@as(u32, 0), reserveFrameLimitDelay(500_000));
+    try std.testing.expectEqual(@as(u32, 0), reserveFrameLimitDelay(500_000));
 }
 
 /// Records process time at open so GetVblankStatus can report elapsed time.

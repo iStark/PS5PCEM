@@ -92,13 +92,26 @@ The optional counter updates the measured guest flip rate once per second in
 the Vulkan game-window title. Direct command-line runs can enable it with
 `PS5_SHOW_FPS=1`.
 
+The Library page also offers an FPS limit of 30, 60 or 120, or Unlimited,
+saved as `fps_limit` in `ps5pcem.ini` and passed to `game-run` as
+`PS5_FPS_LIMIT` (`0` means no limit). The cap holds every completed VideoOut
+flip to its slot, whether the title flips from the CPU or from its GPU command
+stream, so the game itself slows down rather than only the window, with either
+renderer. A late frame is not delayed further and does not earn a catch-up
+burst. Unlimited keeps the existing pacing: CPU flips stay at the emulated
+120 Hz refresh and command-stream flips are not held. On Windows the wait uses
+a high-resolution waitable timer, because the default 15.6 ms system tick
+cannot hold a 16.7 ms frame slot. With Asterix & Obelix: Slap Them All! on an
+RTX 3070 Ti at its title screen, which runs at several hundred FPS uncapped,
+one-second window-title samples held 29.9–30.0, 59.9–60.0 and 119.8–120.0 FPS.
+
 Input profiles can use a controller, a remappable keyboard profile, or both at
 once. A DualSense or DualShock 4 is read straight from HID over either USB or
 Bluetooth and takes precedence; XInput remains the path for Xbox-compatible
 pads and for anything presenting itself as one. WASD controls the left stick;
 Alt plus the arrow keys controls the right stick. The launcher passes these preferences through
-`PS5_INPUT_MODE`, `PS5_CONTROLLER_INDEX`, `PS5_KEYMAP`, `PS5_SHOW_FPS`, and
-`PS5_AUDIO_DISABLED`, so direct CLI and automated runs keep their previous
+`PS5_INPUT_MODE`, `PS5_CONTROLLER_INDEX`, `PS5_KEYMAP`, `PS5_SHOW_FPS`,
+`PS5_FPS_LIMIT`, and `PS5_AUDIO_DISABLED`, so direct CLI and automated runs keep their previous
 behaviour unless those variables are set.
 For unattended diagnostics, `PS5_INPUT_MODE=scripted` keeps the existing
 bring-up button pulses while ignoring physical keyboard and controller input.

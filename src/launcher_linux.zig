@@ -18,14 +18,16 @@ const common = @import("launcher_common.zig");
 const display_mode = @import("display_mode.zig");
 const performance_mode = @import("performance_mode.zig");
 const graphics_api = @import("graphics_api.zig");
+const frame_limit = @import("frame_limit.zig");
 
 const Language = common.Language;
 const language_labels = common.language_labels;
 const Phrase = common.Phrase;
 
 test {
-    // The shared file's own tests run with each launcher's.
+    // The shared files' own tests run with each launcher's.
     _ = common;
+    _ = frame_limit;
 }
 
 /// The branding icon, embedded so the sidebar and the window have it however
@@ -69,6 +71,7 @@ var language: Language = .english;
 var controller_index: u8 = 0;
 var sound_enabled = true;
 var show_fps = false;
+var selected_frame_limit = frame_limit.default;
 var output_mode = display_mode.default;
 var render_preset = performance_mode.default;
 var game_performance = true;
@@ -516,6 +519,13 @@ const nav_rects = [_]Rect{
 const library_browse_rect = Rect{ .left = 282, .top = 646, .right = 500, .bottom = 700 };
 const library_extract_rect = Rect{ .left = 516, .top = 646, .right = 760, .bottom = 700 };
 const library_launch_rect = Rect{ .left = 776, .top = 646, .right = 1086, .bottom = 700 };
+// Same groups as the Windows library card: folder, graphics API, frame limit.
+const library_frame_limit_rects = [_]Rect{
+    .{ .left = 764, .top = 571, .right = 814, .bottom = 611 },
+    .{ .left = 820, .top = 571, .right = 870, .bottom = 611 },
+    .{ .left = 876, .top = 571, .right = 932, .bottom = 611 },
+    .{ .left = 938, .top = 571, .right = 1066, .bottom = 611 },
+};
 const library_prev_rect = Rect{ .left = 236, .top = 298, .right = 270, .bottom = 354 };
 const library_next_rect = Rect{ .left = 1085, .top = 298, .right = 1119, .bottom = 354 };
 const update_rect = Rect{ .left = 936, .top = 44, .right = 1086, .bottom = 72 };
@@ -706,6 +716,7 @@ fn clickableAt(x: i32, y: i32) bool {
     if (update_rect.contains(x, y)) return update_state != .checking;
     return switch (current_page) {
         .library => recentGameAt(x, y) != null or
+            indexOfRect(&library_frame_limit_rects, x, y) != null or
             libraryViewAt(x, y) != null or
             libraryArrowAt(x, y) != null or
             libraryDotAt(x, y) != null or
@@ -924,6 +935,12 @@ fn handleClick(x: i32, y: i32) void {
 }
 
 fn handleLibraryClick(x: i32, y: i32) void {
+    if (indexOfRect(&library_frame_limit_rects, x, y)) |index| {
+        selected_frame_limit = frame_limit.choices[index];
+        saveSettings();
+        setStatusPhrase(.status_fps_limit_saved, false);
+        return;
+    }
     if (extract_state != .idle and extract_copy_rect.contains(x, y)) {
         copyExtractLog();
         return;
@@ -1197,18 +1214,30 @@ fn drawLibrary(cr: *anyopaque) void {
     }
 
     card(cr, .{ .left = 282, .top = 536, .right = 1086, .bottom = 622 });
-    localizedText(cr, .graphics_api, .{ .left = 730, .top = 546, .right = 886, .bottom = 566 }, 0x009b9088, .small, .{});
-    text(cr, "Windows", .{ .left = 888, .top = 546, .right = 1066, .bottom = 566 }, 0x007e746d, .small, .{ .alignment = .right });
-    roundFill(cr, .{ .left = 730, .top = 571, .right = 876, .bottom = 611 }, 8, 0x0042362e);
-    roundFill(cr, .{ .left = 742, .top = 586, .right = 752, .bottom = 596 }, 5, 0x00ffac64);
-    text(cr, "Vulkan", .{ .left = 762, .top = 581, .right = 868, .bottom = 606 }, 0x00f4f0ea, .medium, .{});
-    roundFill(cr, .{ .left = 888, .top = 571, .right = 1066, .bottom = 611 }, 8, 0x00251f1b);
-    text(cr, "DirectX 12", .{ .left = 920, .top = 581, .right = 1058, .bottom = 606 }, 0x007e746d, .medium, .{});
-    localizedText(cr, .folder_label, .{ .left = 306, .top = 552, .right = 520, .bottom = 572 }, 0x009b9088, .small, .{});
+    localizedText(cr, .graphics_api, .{ .left = 472, .top = 546, .right = 748, .bottom = 566 }, 0x009b9088, .small, .{});
+    text(cr, "Windows", .{ .left = 610, .top = 546, .right = 748, .bottom = 566 }, 0x007e746d, .small, .{ .alignment = .right });
+    roundFill(cr, .{ .left = 472, .top = 571, .right = 582, .bottom = 611 }, 8, 0x0042362e);
+    roundFill(cr, .{ .left = 484, .top = 586, .right = 494, .bottom = 596 }, 5, 0x00ffac64);
+    text(cr, "Vulkan", .{ .left = 504, .top = 581, .right = 574, .bottom = 606 }, 0x00f4f0ea, .medium, .{});
+    roundFill(cr, .{ .left = 590, .top = 571, .right = 748, .bottom = 611 }, 8, 0x00251f1b);
+    text(cr, "DirectX 12", .{ .left = 622, .top = 581, .right = 740, .bottom = 606 }, 0x007e746d, .medium, .{});
+    localizedText(cr, .fps_limit, .{ .left = 764, .top = 546, .right = 1066, .bottom = 566 }, 0x009b9088, .small, .{});
+    for (library_frame_limit_rects, frame_limit.choices) |rectangle, limit| {
+        const selected = selected_frame_limit == limit;
+        roundFill(cr, rectangle, 8, if (selected) 0x0042362e else 0x00251f1b);
+        const colour: u32 = if (selected) 0x00ffac64 else 0x00f4f0ea;
+        const area = Rect{ .left = rectangle.left + 4, .top = rectangle.top + 10, .right = rectangle.right - 4, .bottom = rectangle.bottom - 5 };
+        if (limit == .unlimited) {
+            localizedText(cr, .fps_unlimited, area, colour, .medium, .{ .alignment = .center });
+        } else {
+            text(cr, limit.value(), area, colour, .medium, .{ .alignment = .center });
+        }
+    }
+    localizedText(cr, .folder_label, .{ .left = 306, .top = 546, .right = 456, .bottom = 566 }, 0x009b9088, .small, .{});
     if (game_folder_length == 0) {
-        localizedText(cr, .folder_empty, .{ .left = 306, .top = 582, .right = 706, .bottom = 607 }, 0x007e746d, .regular, .{});
+        localizedText(cr, .folder_empty, .{ .left = 306, .top = 582, .right = 456, .bottom = 607 }, 0x007e746d, .regular, .{});
     } else {
-        text(cr, game_folder[0..game_folder_length], .{ .left = 306, .top = 580, .right = 706, .bottom = 607 }, 0x00d8d0c9, .regular, .{});
+        text(cr, game_folder[0..game_folder_length], .{ .left = 306, .top = 580, .right = 456, .bottom = 607 }, 0x00d8d0c9, .regular, .{});
     }
 
     button(cr, library_browse_rect, .choose_folder, false);
@@ -2131,6 +2160,7 @@ fn launchGame() void {
     setEnvironment(display_mode.environment_name, output_mode.value());
     setEnvironment(performance_mode.environment_name, render_preset.value());
     setEnvironment(graphics_api.environment_name, graphics_api.Api.vulkan.value());
+    setEnvironment(frame_limit.environment_name, selected_frame_limit.value());
     setEnvironment("PS5_GAME_PRESET", if (game_performance) "performance" else "default");
     setEnvironment("PS5_INPUT_MODE", switch (input_mode) {
         .controller => "controller",
@@ -2525,6 +2555,8 @@ fn applyLauncherSetting(key: []const u8, value: []const u8) void {
         sound_enabled = number != 0;
     } else if (std.mem.eql(u8, key, "show_fps")) {
         show_fps = number != 0;
+    } else if (std.mem.eql(u8, key, "fps_limit")) {
+        selected_frame_limit = frame_limit.Limit.fromHz(number) orelse frame_limit.default;
     } else if (std.mem.eql(u8, key, "output_resolution")) {
         output_mode = display_mode.Mode.fromHeight(number) orelse display_mode.default;
     } else if (std.mem.eql(u8, key, "render_preset")) {
@@ -2559,6 +2591,7 @@ fn writeSettings(stream: *std.Io.Writer) !void {
     try stream.print("show_fps={d}\n", .{@intFromBool(show_fps)});
     try stream.print("output_resolution={d}\n", .{output_mode.height()});
     try stream.writeAll("graphics_api=vulkan\n");
+    try stream.print("fps_limit={d}\n", .{selected_frame_limit.hz()});
     try stream.print("render_preset={d}\n", .{@intFromEnum(render_preset)});
     try stream.print("game_performance={d}\n", .{@intFromBool(game_performance)});
     try stream.print("input_mode={d}\n", .{@intFromEnum(input_mode)});

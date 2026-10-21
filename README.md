@@ -30,10 +30,10 @@
 ## Launcher
 
 <p align="center">
-  <img src="docs/images/launcher-library.png" alt="PS5PCEM launcher showing its recent-game library">
+  <img src="docs/images/launcher-library.png" alt="PS5PCEM launcher showing its recent-game library with the game folder, the Vulkan / DirectX 12 choice and a 60 FPS limit selected">
 </p>
 
-<p align="center"><em>A native Windows library with local cover art, per-title saves, input profiles, and direct game launching.</em></p>
+<p align="center"><em>A native Windows library with local cover art, per-title saves, input profiles, a graphics API choice, an FPS limit, and direct game launching.</em></p>
 
 The launcher remembers up to 48 recent titles across pages of eight, shown as cover
 tiles or as a table and searchable by title, title ID or folder name. It reads artwork
@@ -47,6 +47,12 @@ Development builds also offer **Vulkan / DirectX 12** in the Windows library and
 DirectX 12 is an experimental native backend with limited PM4 and shader support;
 it is not ready for normal gameplay. Vulkan remains the default. See the
 [D3D12 implementation and validation notes](docs/architecture/d3d12.md).
+
+The library can also lock the frame rate to **30, 60 or 120 FPS**, or leave it
+unlimited (the default). The limit is saved for the next launch and reaches
+`game-run` as `PS5_FPS_LIMIT`; it paces every completed flip, so the game itself
+slows down, with either renderer. See the
+[launcher notes](docs/architecture/overview.md) for how it is applied and measured.
 
 ## See it running
 

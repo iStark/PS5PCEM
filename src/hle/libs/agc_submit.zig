@@ -36,6 +36,7 @@ const guest_address_space = @import("memory");
 const shader_registry = @import("agc_shader_registry.zig");
 const event_queue = @import("kernel_event_queue.zig");
 const video_out = @import("../video_out.zig");
+const host_sleep = @import("../host_sleep.zig");
 const kernel_runtime = @import("kernel_runtime.zig");
 
 /// A submission descriptor: where the buffer is and how long it is.
@@ -2301,7 +2302,23 @@ fn backendEvent(_: ?*anyopaque, value: gpu.state.EventWrite) bool {
     return ok;
 }
 
+/// With a frame cap, a GPU-ordered flip waits for its slot before it is
+/// presented and its completion is reported. That holds back the title's next
+/// frame the way a full display queue would. Nothing waits without a cap, and
+/// blank flips are never delayed. CPU flips pace themselves in SubmitFlip.
+pub fn paceCappedFlip(value: gpu.state.Flip) void {
+    if (value.display_buffer_index == -1) return;
+    const delay_us = video_out.reserveFrameLimitDelay(kernel_runtime.processTimeMicroseconds());
+    if (delay_us != 0) host_sleep.sleepMicroseconds(delay_us);
+}
+
+/// A flip packet in the GPU command stream.
 fn backendFlip(_: ?*anyopaque, value: gpu.state.Flip) bool {
+    paceCappedFlip(value);
+    return finishFlip(value);
+}
+
+fn finishFlip(value: gpu.state.Flip) bool {
     const accepted = if (value.display_buffer_index == -1)
         true
     else if (installed_backend) |backend|
@@ -2427,6 +2444,7 @@ fn presentUnconsumedConstructedFlip(submission: Submission, outcome: SubmitOutco
         );
         recovered_constructed_flip_reports += 1;
     }
+    paceCappedFlip(pending.value);
     _ = presentFlip(pending.value);
 }
 
@@ -2480,10 +2498,12 @@ pub fn attachBackend(backend: ?gpu.DcbBackend) void {
 
 /// Presents a CPU/EOP VideoOut request through the same ordered backend used by
 /// a PM4 `SetFlip` packet.
+/// A flip that its caller paces outside the execution lock: SubmitFlip after
+/// presenting, EOP flips and recovered DCB flips before.
 pub fn presentFlip(flip: gpu.state.Flip) bool {
     execution_lock.lock();
     defer execution_lock.unlock();
-    return backendFlip(null, flip);
+    return finishFlip(flip);
 }
 
 /// Clears retained queue/register state between process runtimes.
