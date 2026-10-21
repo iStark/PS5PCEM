@@ -7,6 +7,7 @@ const std = @import("std");
 
 pub export var reuse_buffer_overlap_queries: bool = true;
 pub export var sequential_overlap_iteration: bool = true;
+pub export var bounded_overlap_levels: bool = true;
 
 pub fn Index(comptime capacity: usize) type {
     return struct {
@@ -27,6 +28,11 @@ pub fn Index(comptime capacity: usize) type {
         level_next: [capacity]Slot = undefined,
         level_previous: [capacity]Slot = undefined,
         level_counts: [65]usize = undefined,
+        // Conservative inclusive bounds for each occupied size class. They
+        // expand on replacement and reset when a class becomes empty; a stale
+        // bound may add work, but can never hide an overlapping allocation.
+        level_first: [65]u64 = undefined,
+        level_last: [65]u64 = undefined,
         levels: u128 = 0,
         valid: bool = false,
         // Only the allocation ranges are memoized. Callers still inspect the
@@ -126,9 +132,19 @@ pub fn Index(comptime capacity: usize) type {
             self.links[slot] = head.*;
             head.* = @intCast(slot);
             self.linkLevel(slot, height);
+            self.includeBounds(height, address, size);
+        }
+
+        fn includeBounds(self: *Self, height: u7, address: u64, size: u64) void {
+            self.level_first[height] = @min(self.level_first[height], address);
+            self.level_last[height] = @max(self.level_last[height], address +| (size -| 1));
         }
 
         fn linkLevel(self: *Self, slot: usize, height: u7) void {
+            if (self.level_counts[height] == 0) {
+                self.level_first[height] = std.math.maxInt(u64);
+                self.level_last[height] = 0;
+            }
             const next = self.level_heads[height];
             self.level_next[slot] = next;
             self.level_previous[slot] = empty;
@@ -159,6 +175,7 @@ pub fn Index(comptime capacity: usize) type {
                 self.unlinkLevel(slot, old_height);
                 self.linkLevel(slot, new_height);
             }
+            self.includeBounds(new_height, address, size);
             if (old_bucket == new_bucket) return;
             var link = &self.heads[old_bucket];
             while (link.* != empty and link.* != slot) link = &self.links[link.*];
@@ -189,11 +206,14 @@ pub fn Index(comptime capacity: usize) type {
             // allocation. Choose bucket lookup or its own list independently.
             var result = Iterator{};
             var levels = self.levels;
+            const query_last = address +| (size - 1);
+            const bounded = @atomicLoad(bool, &bounded_overlap_levels, .monotonic);
             while (levels != 0) {
                 const height: u7 = @intCast(@ctz(levels));
                 levels &= levels - 1;
+                if (bounded and (address > self.level_last[height] or query_last < self.level_first[height])) continue;
                 var key = region(address, height);
-                const last = region(address +| (size - 1), height);
+                const last = region(query_last, height);
                 const count = (last - key) +| 1;
                 if (count > @min(256, self.level_counts[height])) {
                     var slot = self.level_heads[height];
@@ -332,6 +352,30 @@ test "short writes avoid scanning a full resident cache" {
     }
     try std.testing.expect(narrow and wide);
     try std.testing.expect(checked < 64);
+}
+
+test "overlap level bounds follow replacement across empty and reused classes" {
+    const Entry = struct { guest_address: u64, size: u64 };
+    var entries = [_]Entry{.{ .guest_address = 0x10000, .size = 32 }};
+    var index = Index(16){};
+    defer index.deinit();
+    _ = index.candidates(&entries, 0x10000, 1);
+    // Moving within the same class must extend its bounds, even if the hash
+    // bucket happens to stay the same. Leaving and reusing a class must reset
+    // its bounds without inheriting an exclusion from its previous occupant.
+    for ([_]Entry{
+        .{ .guest_address = 0x700000, .size = 32 },
+        .{ .guest_address = 0x20, .size = 8 },
+        .{ .guest_address = 0x80, .size = 32 },
+        .{ .guest_address = 0xfffffffffffffff8, .size = 8 },
+    }) |replacement| {
+        index.replace(0, entries[0].guest_address, entries[0].size, replacement.guest_address, replacement.size);
+        entries[0] = replacement;
+        var found = index.candidates(&entries, replacement.guest_address + replacement.size - 1, 1);
+        try std.testing.expectEqual(@as(?usize, 0), found.next());
+        var outside = index.candidates(&entries, 0x80000000, 4);
+        try std.testing.expectEqual(null, outside.next());
+    }
 }
 
 test "buffer-sized overlap queries avoid scanning unrelated allocations" {

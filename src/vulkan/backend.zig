@@ -51,6 +51,11 @@ pub export var capture_vertex_program: u64 = 0;
 pub export var capture_vertex_flip: u64 = 0;
 pub export var capture_fragment_program: u64 = 0;
 pub export var capture_graphics_buffers: bool = true;
+/// Disable pre-draw GPU readbacks when inspecting the final target. Waiting
+/// here can let guest threads recycle constant buffers before draw setup ends.
+pub export var capture_graphics_before: bool = true;
+/// Diagnostic comparison for one explicitly selected draw only.
+pub export var capture_graphics_ignore_depth: bool = false;
 // Diagnostic comparison until the full visibility pass is validated natively.
 pub export var yotei_visibility_gpu: bool = false;
 // Compare exact depth-filtered, packed-coordinate lists with the legacy fallback.
@@ -18593,6 +18598,9 @@ pub const Renderer = struct {
             const texel = colorDccClearTexel(code, descriptor) orelse continue;
             var clear = vk.ClearColorValue{ .float32 = @splat(0) };
             switch (target.format.vulkan) {
+                vk.format_r16g16b16a16_unorm => {
+                    for (0..4) |channel| clear.float32[channel] = @as(f32, @floatFromInt(std.mem.readInt(u16, texel.bytes[channel * 2 ..][0..2], .little))) / 65535.0;
+                },
                 vk.format_r16g16b16a16_sfloat => {
                     for (0..4) |channel| clear.float32[channel] = @as(f16, @bitCast(std.mem.readInt(u16, texel.bytes[channel * 2 ..][0..2], .little)));
                 },
@@ -22053,14 +22061,14 @@ pub const Renderer = struct {
 
     pub fn probeColorDccNativeClears(self: *Renderer) anyerror!void {
         const memory = self.guest_memory.?;
-        for ([_]u8{ 10, 12 }) |format| {
+        for ([_][2]u8{ .{ 10, 0 }, .{ 12, 7 }, .{ 12, 0 } }) |encoding| {
             var color = std.mem.zeroes(gpu.resources.ColorTarget);
             color.address = 0x1a000;
             color.width = 16;
             color.height = 16;
             color.pitch = 16;
-            color.format = format;
-            color.number_type = if (format == 12) 7 else 0;
+            color.format = encoding[0];
+            color.number_type = encoding[1];
             color.tile_mode = .linear;
             color.write_mask = 0xf;
             color.dcc_enabled = true;
@@ -22094,6 +22102,19 @@ pub const Renderer = struct {
                 } else return error.MissingPresentedFrame;
                 try std.testing.expectEqual(try colorTargetFrameBytes(target), actual.len);
                 for (actual, 0..) |value, offset| try std.testing.expectEqual(texel.bytes[offset % texel.length], value);
+                // A subsequent metadata-only clear must also replace an
+                // already resident attachment, without re-uploading its stale
+                // native allocation (for example a velocity buffer).
+                const next_code: u8 = if (code == 0) 0xc0 else 0;
+                const next_metadata: [64]u8 = @splat(next_code);
+                try std.testing.expect(memory.write(memory.context, color.dcc_address, &next_metadata));
+                try self.applyUniformDccWrite(color.dcc_address, &next_metadata);
+                try self.readbackRenderTarget(index, true);
+                const cleared = for (self.completed_frames.items) |frame| {
+                    if (frame.target) |view| if (sameRenderTarget(view, target)) break frame.pixels.items;
+                } else return error.MissingPresentedFrame;
+                const next_texel = colorDccClearTexel(next_code, color).?;
+                for (cleared, 0..) |value, offset| try std.testing.expectEqual(next_texel.bytes[offset % next_texel.length], value);
             }
         }
     }
@@ -23733,39 +23754,49 @@ pub const Renderer = struct {
                 return .{ .kind = .vgpr, .reg = index };
             }
         }.reg;
-        try program.instructions.appendSlice(self.allocator, &.{
-            .{ .pc = 0, .family = .mubuf, .opcode = .buffer_load_format_xyzw, .dst = v(12), .src0 = v(5), .src1 = .{ .kind = .sgpr, .reg = 16 }, .src2 = .{ .kind = .literal_constant, .value = 0 }, .index_enable = true, .data_words = 4 },
-            .{ .pc = 8, .family = .exp, .opcode = .exp, .export_target = 12, .export_enable = 15, .export_done = true, .src0 = v(12), .src1 = v(13), .src2 = v(14), .src3 = v(15) },
-            .{ .pc = 16, .opcode = .s_endpgm },
-        });
         const triangle = [3][4]f32{ .{ -0.8, -0.8, 0.5, 1 }, .{ 0.8, -0.8, 0.5, 1 }, .{ 0, 0.8, 0.5, 1 } };
         var reference: [graphics_probe_bytes]u8 = undefined;
-        for ([_]bool{ false, true }) |clipping| {
-            var module = try rdna2.translateSpirv(self.allocator, &program, .{
-                .stage = .vertex,
-                .vertex_index_vgpr = 5,
-                .clip_zero_position = clipping,
-                .storage_buffers = &.{.{ .resource_sgpr = 16, .descriptor_index = 0, .stride = 16, .unified_format = 77 }},
+        for ([_]bool{ false, true }) |dispatcher| {
+            program.instructions.clearRetainingCapacity();
+            if (dispatcher) try program.instructions.appendSlice(self.allocator, &.{
+                .{ .pc = 0, .family = .sopk, .opcode = .s_call_b64, .dst = .{ .kind = .sgpr, .reg = 0 }, .data_words = 2, .branch_target = 8 },
+                .{ .pc = 4, .opcode = .s_endpgm },
             });
-            defer module.deinit(self.allocator);
-            for (0..4) |pass| {
-                if (!clipping and pass != 0) continue;
-                var positions = triangle;
-                if (pass == 1) positions[2] = .{ 0, 0, 0, 0 };
-                if (pass == 2) positions[2] = .{ -0.0, 0, -0.0, 0 };
-                try self.writeMappedAt(buffer, 0, std.mem.asBytes(&positions));
-                try self.beginFrameDraw();
-                self.updateStorageDescriptorRange(0, buffer.handle, 0, buffer.size);
-                try self.drawGraphicsShaders(module.words, &graphics_probe_fragment_spirv, &.{}, &.{}, GraphicsPipelineState.default(graphics_probe_width, graphics_probe_height), null, &.{}, null, false, true, false, .{ .vertex_count = 3 });
-                if (!clipping) {
-                    try std.testing.expect(self.graphics_probe_colored_pixels > 0);
-                    @memcpy(&reference, &self.graphics_probe_frame);
-                } else if (pass == 0 or pass == 3) {
-                    try std.testing.expectEqualSlices(u8, &reference, &self.graphics_probe_frame);
-                } else try std.testing.expectEqual(@as(u32, 0), self.graphics_probe_colored_pixels);
+            const base: u32 = if (dispatcher) 8 else 0;
+            try program.instructions.appendSlice(self.allocator, &.{
+                .{ .pc = base, .family = .mubuf, .opcode = .buffer_load_format_xyzw, .dst = v(12), .src0 = v(5), .src1 = .{ .kind = .sgpr, .reg = 16 }, .src2 = .{ .kind = .literal_constant, .value = 0 }, .index_enable = true, .data_words = 4 },
+                .{ .pc = base + 8, .family = .exp, .opcode = .exp, .export_target = 12, .export_enable = 15, .export_done = true, .src0 = v(12), .src1 = v(13), .src2 = v(14), .src3 = v(15) },
+                if (dispatcher) .{ .pc = base + 16, .family = .sop1, .opcode = .s_setpc_b64, .src0 = .{ .kind = .sgpr, .reg = 0 }, .data_words = 2 } else .{ .pc = base + 16, .opcode = .s_endpgm },
+            });
+            for ([_]bool{ false, true }) |clipping| {
+                var module = try rdna2.translateSpirv(self.allocator, &program, .{
+                    .stage = .vertex,
+                    .vertex_index_vgpr = 5,
+                    .clip_zero_position = clipping,
+                    .program_address = 0x10000,
+                    .storage_buffers = &.{.{ .resource_sgpr = 16, .descriptor_index = 0, .stride = 16, .unified_format = 77 }},
+                });
+                defer module.deinit(self.allocator);
+                try std.testing.expectEqual(dispatcher, module.used_dispatcher);
+                for (0..4) |pass| {
+                    if (!clipping and pass != 0) continue;
+                    var positions = triangle;
+                    if (pass == 1) positions[2] = .{ 0, 0, 0, 0 };
+                    if (pass == 2) positions[2] = .{ -0.0, 0, -0.0, 0 };
+                    try self.writeMappedAt(buffer, 0, std.mem.asBytes(&positions));
+                    try self.beginFrameDraw();
+                    self.updateStorageDescriptorRange(0, buffer.handle, 0, buffer.size);
+                    try self.drawGraphicsShaders(module.words, &graphics_probe_fragment_spirv, &.{}, &.{}, GraphicsPipelineState.default(graphics_probe_width, graphics_probe_height), null, &.{}, null, false, true, false, .{ .vertex_count = 3 });
+                    if (!clipping) {
+                        try std.testing.expect(self.graphics_probe_colored_pixels > 0);
+                        @memcpy(&reference, &self.graphics_probe_frame);
+                    } else if (pass == 0 or pass == 3) {
+                        try std.testing.expectEqualSlices(u8, &reference, &self.graphics_probe_frame);
+                    } else try std.testing.expectEqual(@as(u32, 0), self.graphics_probe_colored_pixels);
+                }
             }
         }
-        std.debug.print("zero-position clipping passed: ordinary triangles unchanged, +/-zero dormant vertex clipped, valid geometry restored\n", .{});
+        std.debug.print("zero-position clipping passed: straight-line and dispatcher triangles unchanged, +/-zero dormant vertex clipped, valid geometry restored\n", .{});
     }
 
     pub fn probePrivateSpills(self: *Renderer) anyerror!void {
@@ -25627,6 +25658,7 @@ pub const Renderer = struct {
         if (capture_draw) {
             @atomicStore(u64, &capture_vertex_flip, 0, .monotonic);
             const prefix = capture_prefix;
+            try dumpDiagnosticBytes(self.allocator, prefix, ".pipeline", std.mem.asBytes(&pipeline_state));
             try dumpDiagnosticBytes(self.allocator, prefix, ".target", std.mem.asBytes(&target));
             try dumpDiagnosticBytes(self.allocator, prefix, ".state", std.mem.asBytes(state));
             try dumpDiagnosticBytes(self.allocator, prefix, ".draw", std.mem.asBytes(&draw));
@@ -25634,15 +25666,23 @@ pub const Renderer = struct {
             try dumpDiagnosticBytes(self.allocator, prefix, ".mappings", std.mem.sliceAsBytes(vertex_storage.mappings[0..vertex_storage.mapping_count]));
             try dumpDiagnosticBytes(self.allocator, prefix, ".image-descriptors", std.mem.sliceAsBytes(graphics_resources.descriptors[0..graphics_resources.image_count]));
             try dumpDiagnosticBytes(self.allocator, prefix, ".image-mappings", std.mem.sliceAsBytes(graphics_resources.mappings[0..graphics_resources.mapping_count]));
-            if (capture_target) self.captureGraphicsTarget(target, prefix, "before") catch |err|
+            try dumpDiagnosticBytes(self.allocator, prefix, ".fragment-loads", std.mem.sliceAsBytes(fragment_scalar.loadSlice()));
+            const capture_before = @atomicLoad(bool, &capture_graphics_before, .monotonic);
+            if (capture_before) if (depth_plane) |plane| self.captureGraphicsDepth(plane, prefix) catch |err|
+                std.debug.print("[vulkan diagnostic] depth capture failed: {s}\n", .{@errorName(err)});
+            if (capture_before and capture_target) self.captureGraphicsTarget(target, prefix, "before") catch |err|
                 std.debug.print("[vulkan diagnostic] target capture failed: {s}\n", .{@errorName(err)});
-            if (capture_buffers) self.captureStorageBuffers(vertex_storage, prefix, "vertex", null) catch |err|
+            if (capture_before and capture_buffers) self.captureStorageBuffers(vertex_storage, prefix, "vertex", null) catch |err|
                 std.debug.print("[vulkan diagnostic] buffer capture failed: {s}\n", .{@errorName(err)});
-            (if (capture_small_hdr)
+            if (capture_before) (if (capture_small_hdr)
                 self.captureSampledImages(graphics_resources.images[0..graphics_resources.image_count], graphics_resources.descriptors[0..graphics_resources.image_count], prefix, null)
             else
                 self.captureGraphicsImages(graphics_resources, prefix)) catch |err|
                 std.debug.print("[vulkan diagnostic] sampled capture failed: {s}\n", .{@errorName(err)});
+            if (@atomicLoad(bool, &capture_graphics_ignore_depth, .monotonic)) {
+                pipeline_state.depth_test_enable = 0;
+                pipeline_state.depth_write_enable = 0;
+            }
         }
         // Vertex V# registers also carry constants in other lifetimes. Their
         // recovered loads use the same dynamic scalar path as fragment loads.
@@ -26523,6 +26563,10 @@ pub const Renderer = struct {
                 self.frame_profile.shader_translate_ns +|= elapsedHostNanoseconds(vertex_translate_started);
                 defer vertex_lease.release();
                 const vertex_module = vertex_lease.view();
+                if (capture_draw) {
+                    try dumpDiagnosticBytes(self.allocator, capture_prefix, ".vertex.spv", std.mem.sliceAsBytes(vertex_module.words));
+                    try dumpDiagnosticBytes(self.allocator, capture_prefix, ".vertex-scalars", std.mem.sliceAsBytes(vertex_scalar_regs[0..vertex_scalar_count]));
+                }
                 if (self.dump_graphics_spirv) {
                     dumpGraphicsSpirv(self.allocator, "vs", vertex_address, vertex_module.words);
                 }
@@ -29670,8 +29714,12 @@ pub const Renderer = struct {
     const StorageDepthSource = struct { index: usize, aspect: u32 };
 
     fn storageDepthSource(self: *const Renderer, descriptor: gpu.ImageDescriptor) ?StorageDepthSource {
-        if (descriptor.image_type != .color_2d or descriptor.samplesLog2() != 0 or
-            descriptor.base_array != 0 or descriptor.depth_or_layers > 1 or
+        // A one-layer array view addresses the same depth plane as a 2D
+        // view. UE's depth clears use IMAGE_STORE through that array view;
+        // rejecting it leaves the raster attachment at its previous depth.
+        if ((descriptor.image_type != .color_2d and descriptor.image_type != .color_2d_array) or
+            descriptor.samplesLog2() != 0 or
+            descriptor.base_array != 0 or descriptor.depth_or_layers != 1 or
             descriptor.viewBaseLevel() != 0 or descriptor.viewMipLevels() != 1) return null;
         const format = storageImageFormat(descriptor.unified_format) orelse return null;
         var selected: ?StorageDepthSource = null;
@@ -32389,6 +32437,47 @@ pub const Renderer = struct {
         const selected = @atomicLoad(u64, &capture_storage_image_address, .monotonic);
         if (selected == 0) return;
         return self.captureSampledImages(resources.images[0..resources.image_count], resources.descriptors[0..resources.image_count], prefix, if (selected == std.math.maxInt(u64)) null else selected);
+    }
+
+    fn captureGraphicsDepth(self: *Renderer, target: GuestDepthTarget, prefix: []const u8) !void {
+        const cached = for (self.depth_targets.items) |entry| {
+            if (entry.initialized and entry.target.sameAllocation(target)) break entry;
+        } else return;
+        if (target.samples_log2 != 0) return error.UnsupportedDiagnosticDepthTarget;
+        const bytes_per_texel: u64 = switch (target.format) {
+            vk.format_d16_unorm => 2,
+            vk.format_d32_sfloat, vk.format_d32_sfloat_s8_uint => 4,
+            else => return error.UnsupportedDiagnosticDepthTarget,
+        };
+        const byte_count = @as(u64, target.width) * target.height * bytes_per_texel;
+        if (byte_count == 0 or byte_count > 64 * 1024 * 1024) return error.UnsupportedDiagnosticDepthTarget;
+        const readback = try self.createBuffer(byte_count, vk.buffer_usage_transfer_dst_bit, vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit);
+        defer self.destroyBuffer(readback);
+        const command_buffer = try self.beginOneShot();
+        defer self.releaseOneShot(command_buffer);
+        const range = vk.ImageSubresourceRange{ .aspect_mask = target.aspectMask() };
+        try self.transitionTrackedImage(command_buffer, cached.image.handle, range, image_state.transfer_source_usage);
+        const copy = vk.BufferImageCopy{
+            .image_subresource = .{ .aspect_mask = vk.image_aspect_depth_bit },
+            .image_extent = .{ .width = target.width, .height = target.height, .depth = 1 },
+        };
+        self.device_functions.cmd_copy_image_to_buffer(command_buffer, cached.image.handle, vk.image_layout_transfer_src_optimal, readback.handle, 1, @ptrCast(&copy));
+        const barrier = vk.BufferMemoryBarrier{
+            .source_access_mask = vk.access_transfer_write_bit,
+            .destination_access_mask = vk.access_host_read_bit,
+            .buffer = readback.handle,
+            .offset = 0,
+            .size = readback.size,
+        };
+        self.device_functions.cmd_pipeline_barrier(command_buffer, vk.pipeline_stage_transfer_bit, vk.pipeline_stage_host_bit, 0, 0, null, 1, @ptrCast(&barrier), 0, null);
+        try self.transitionTrackedImage(command_buffer, cached.image.handle, range, image_state.depth_attachment_usage);
+        try self.submitOneShot(command_buffer);
+        try self.waitForSubmittedWork();
+        const mapping = try self.mapBufferRange(readback, 0, byte_count);
+        defer mapping.release(self);
+        var suffix_buffer: [128]u8 = undefined;
+        const suffix = try std.fmt.bufPrint(&suffix_buffer, "-depth-{x}-{d}x{d}-vk{d}.bin", .{ target.address, target.width, target.height, target.format });
+        try dumpDiagnosticBytes(self.allocator, prefix, suffix, mapping.bytes);
     }
 
     /// Read the bound images before dispatch as well as before graphics draws.
@@ -37248,6 +37337,10 @@ pub const Renderer = struct {
         // queued too: the guest is told only when the label is published.
         if (!self.defer_internal_releases or !self.timeline_scheduler_enabled or
             self.imported_allocations.items.len != 0 or release.data_selection > 5) return false;
+        // Linear storage images are also CPU readback destinations. Until their
+        // transfers have a retirement ticket, publish them at the synchronous
+        // completion boundary rather than exposing a label over stale bytes.
+        if (self.hasPendingLinearStorageImages()) return false;
         const pending = DeferredRelease{ .tick = 0, .release = release };
         const size = pending.size();
         // A label needs a CPU-visible destination. A release without one
@@ -37305,6 +37398,7 @@ pub const Renderer = struct {
         while (count < self.deferred_internal_release_count and
             self.deferred_internal_releases[count].tick <= self.completed_tick) count += 1;
         if (count == 0) return;
+        if (self.hasPendingLinearStorageImages()) return;
         // Publication writes back CPU-visible compute output first. Unless all of it
         // is retired too, that writeback would wait; leave it to a draining
         // point that is allowed to.
@@ -37465,6 +37559,7 @@ pub const Renderer = struct {
             // must leave it pending instead of accidentally blocking on it.
             const large_outputs = self.releasesPublishLargeBuffers(count);
             if (!wait) {
+                if (self.hasPendingLinearStorageImages()) return .pending;
                 const selected = self.completionBufferCandidates(large_outputs);
                 var entries = selected.iterator(.{});
                 while (entries.next()) |index| {
@@ -37516,7 +37611,32 @@ pub const Renderer = struct {
         return selected;
     }
 
+    fn hasPendingLinearStorageImages(self: *const Renderer) bool {
+        for (self.storage_image_cache.items) |cached| {
+            if (cached.valid and cached.gpu_dirty and cached.descriptor.tile_mode == .linear) return true;
+        }
+        return false;
+    }
+
     fn publishDeferredStorageWrites(self: *Renderer, large_outputs: bool) bool {
+        // The CPU can read a linear IMAGE_STORE destination directly after a
+        // fence, without a subsequent shader binding or backend memory read.
+        // Publish those images before the label/interrupt just like buffers.
+        // Keep the normal alias, CPU replacement and row-padding guards.
+        if (self.hasPendingLinearStorageImages()) {
+            const memory = self.guest_memory orelse {
+                self.last_sync_error = Error.GuestMemoryUnavailable;
+                return false;
+            };
+            for (self.storage_image_cache.items, 0..) |cached, index| {
+                if (!cached.valid or !cached.gpu_dirty or cached.descriptor.tile_mode != .linear) continue;
+                self.flushCachedStorageImage(memory, index) catch |err| {
+                    self.last_sync_error = err;
+                    std.debug.print("[vulkan dcb] linear image completion writeback failed: {s}\n", .{@errorName(err)});
+                    return false;
+                };
+            }
+        }
         if (!self.defer_small_storage_writes_enabled and !large_outputs) return true;
         const selected = self.completionBufferCandidates(large_outputs);
         defer {
@@ -42792,6 +42912,15 @@ fn storageImageCanAliasRenderTarget(
 /// one complete native texel. Keep exceptional half values on the raw-buffer
 /// path: a Vulkan float clear need not preserve NaN payloads or subnormals.
 fn packedBufferClearColor(image_format: u32, words: [4]u32) ?vk.ClearColorValue {
+    if (image_format == vk.format_r16g16b16a16_unorm) {
+        if (words[0] != words[2] or words[1] != words[3]) return null;
+        var values: [4]f32 = undefined;
+        for (&values, 0..) |*value, channel| {
+            const bits: u16 = @truncate(words[channel / 2] >> @as(u5, @intCast((channel % 2) * 16)));
+            value.* = @as(f32, @floatFromInt(bits)) / 65535.0;
+        }
+        return .{ .float32 = values };
+    }
     if (image_format == vk.format_r16g16_sfloat or image_format == vk.format_r16g16b16a16_sfloat) {
         const channels: usize = if (image_format == vk.format_r16g16_sfloat) 2 else 4;
         if (words[0] != words[2] or words[1] != words[3]) return null;
@@ -43274,18 +43403,19 @@ fn colorDccClearTexel(code: u8, descriptor: gpu.resources.ColorTarget) ?DccClear
             result.length = 4;
         },
         12 => {
-            if (descriptor.number_type != 7) return null;
+            if ((descriptor.number_type != 7 and descriptor.number_type != 0) or descriptor.component_swap != 0) return null;
             result.length = 8;
             if (code == 0x20) {
                 std.mem.writeInt(u32, result.bytes[0..4], descriptor.clear_words[0], .little);
                 std.mem.writeInt(u32, result.bytes[4..8], descriptor.clear_words[1], .little);
                 return result;
             }
+            const one: u16 = if (descriptor.number_type == 0) 0xffff else 0x3c00;
             const channels: [4]u16 = switch (code) {
                 0x00 => .{ 0x0000, 0x0000, 0x0000, 0x0000 },
-                0x40 => .{ 0x0000, 0x0000, 0x0000, 0x3c00 },
-                0x80 => .{ 0x3c00, 0x3c00, 0x3c00, 0x0000 },
-                0xc0 => .{ 0x3c00, 0x3c00, 0x3c00, 0x3c00 },
+                0x40 => .{ 0x0000, 0x0000, 0x0000, one },
+                0x80 => .{ one, one, one, 0x0000 },
+                0xc0 => .{ one, one, one, one },
                 else => return null,
             };
             for (channels, 0..) |channel, index| {
@@ -43309,10 +43439,11 @@ fn sampledDccFixedClearTexel(code: u8, descriptor: gpu.ImageDescriptor) ?DccClea
             for (0..4) |channel| result.bytes[channel] =
                 if (if (channel == alpha_channel) alpha_one else rgb_one) 255 else 0;
         },
-        71 => {
+        65, 71 => {
             result.length = 8;
+            const one: u16 = if (descriptor.unified_format == 65) 0xffff else 0x3c00;
             for (0..4) |channel| {
-                std.mem.writeInt(u16, result.bytes[channel * 2 ..][0..2], if (if (channel == alpha_channel) alpha_one else rgb_one) 0x3c00 else 0, .little);
+                std.mem.writeInt(u16, result.bytes[channel * 2 ..][0..2], if (if (channel == alpha_channel) alpha_one else rgb_one) one else 0, .little);
             }
         },
         else => return null,

@@ -5155,7 +5155,6 @@ const Builder = struct {
                 zero_float,
             }); // OpCompositeConstruct
             try self.emit(&self.body, 62, &.{ self.position_output, zero_vector });
-            try self.storeZeroPositionClip(zero_vector);
             try self.storeDepthClip(try self.constant(.float32, 0), try self.constant(.float32, 0), null);
             if (self.layer_variable != 0) try self.emit(&self.body, 62, &.{ self.layer_variable, try self.constant(.sint32, 0) });
             for (self.parameter_variables) |variable| {
@@ -6070,7 +6069,6 @@ const Builder = struct {
             exported = selected;
         }
         try self.emit(&self.body, 62, &.{ output, exported }); // OpStore
-        if (is_position) try self.storeZeroPositionClip(exported);
         if (is_position) try self.storeDepthClip(z, w, lane_enabled);
         if (self.stage == .vertex and inst.export_target >= 0x20 and inst.export_target < 0x40) {
             const targets = self.vertex_parameter_targets[inst.export_target - 0x20];
@@ -6330,6 +6328,16 @@ const Builder = struct {
     }
 
     fn returnFromShader(self: *Builder) Error!void {
+        // Derive synthetic clipping from the final position, after every guest
+        // branch has reconverged. Keeping this output in the dispatcher loop
+        // can leave its initial rejection value on the host even when the
+        // final position export is valid. Intermediate EXP values are not
+        // rasterized and must not decide whether the finished vertex survives.
+        if (self.zero_position_clip_output != 0) {
+            const position = self.id();
+            try self.emit(&self.body, 61, &.{ self.vector4_type, position, self.position_output });
+            try self.storeZeroPositionClip(position);
+        }
         if (self.fragment_valid_mask != 0) {
             // Merely suppressing an output store leaves undefined color and
             // still updates depth/stencil. Apply the final EXP.VM snapshot
