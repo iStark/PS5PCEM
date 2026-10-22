@@ -66,7 +66,7 @@ pub fn main(init: std.process.Init) !void {
     try device.dispatchSpirv(translated.words, &.{
         d3d12.Buffer.fromSlice(std.mem.asBytes(&source_words)),
         d3d12.Buffer.fromSlice(std.mem.asBytes(&copied_words)),
-    }, .{ 1, 1, 1 });
+    }, .{ 1, 1, 1 }, false);
     if (!std.mem.eql(u32, &source_words, &copied_words)) return error.GuestComputeMismatch;
     const compute_cache = device.cacheStats();
     for (&source_words) |*word| word.* ^= 0xabcdef12;
@@ -74,14 +74,14 @@ pub fn main(init: std.process.Init) !void {
     try device.dispatchSpirv(translated.words, &.{
         d3d12.Buffer.fromSlice(std.mem.asBytes(&source_words)),
         d3d12.Buffer.fromSlice(std.mem.asBytes(&copied_words)),
-    }, .{ 1, 1, 1 });
+    }, .{ 1, 1, 1 }, false);
     if (!std.mem.eql(u32, &source_words, &copied_words)) return error.CachedComputeReadbackMismatch;
     if (compute_cache.enabled != 0 and (device.cacheStats().shader_hits != compute_cache.shader_hits + 1 or
         device.cacheStats().pipeline_hits != compute_cache.pipeline_hits + 1)) return error.ComputeCacheMiss;
     const preserved = source_words;
     // Same bytecode with a different binding count must still fail reflection,
     // even after the valid layout has populated the shader cache.
-    if (device.dispatchSpirv(translated.words, &.{d3d12.Buffer.fromSlice(std.mem.asBytes(&source_words))}, .{ 1, 1, 1 })) |_| {
+    if (device.dispatchSpirv(translated.words, &.{d3d12.Buffer.fromSlice(std.mem.asBytes(&source_words))}, .{ 1, 1, 1 }, false)) |_| {
         return error.CachedInvalidLayoutAccepted;
     } else |err| if (err != error.NativeFailure) return err;
     if (!std.mem.eql(u32, &source_words, &preserved)) return error.InvalidLayoutModifiedBuffer;
@@ -155,7 +155,7 @@ fn guestWaveMaskProbe(allocator: std.mem.Allocator, device: *d3d12.Device, mask:
         try device.dispatchSpirv(shader.words, &.{
             d3d12.Buffer.fromSlice(std.mem.asBytes(&input)),
             d3d12.Buffer.fromSlice(std.mem.asBytes(&output)),
-        }, .{ 1, 1, 1 });
+        }, .{ 1, 1, 1 }, false);
         const expected: u32 = if (mask) |value| (if (value != 0) input[@intCast(@ctz(value))] else 0) else input[0];
         for (output) |value| if (value != expected) {
             std.debug.print("EXEC mask={any}: got {d}, expected {d}\n", .{ mask, value, expected });
@@ -1721,12 +1721,13 @@ fn guestResourcesProbe(allocator: std.mem.Allocator, staging_limit: usize, uploa
     const uploads = renderer.device.uploadStats();
     if (uploads.bytes > upload_limit) return error.UploadCacheBudgetExceeded;
     if (upload_limit == 0 and (uploads.buffer_hits != 0 or uploads.image_hits != 0)) return error.DisabledUploadCacheHit;
-    if (upload_limit > 32 and (uploads.buffer_hits == 0 or uploads.image_hits == 0 or uploads.avoided_bytes == 0)) return error.UploadCacheNotExercised;
+    // Cache-retained images are reused by snapshot ID before byte comparison.
+    if (upload_limit > 32 and (uploads.buffer_hits == 0 or uploads.image_hits + uploads.content_hits == 0 or uploads.avoided_bytes == 0)) return error.UploadCacheNotExercised;
     if (upload_limit == 32 and uploads.bypasses == 0) return error.UploadCachePressureNotExercised;
     try renderer.device.uploadCacheLimit(0);
     if (renderer.device.uploadStats().bytes != 0) return error.UploadCacheNotReleased;
-    std.debug.print("PASS upload cache budget={d}: buffer hits={d}, image hits={d}, avoided={d} bytes, evictions={d}, bypass={d}; full images match and teardown releases snapshots\n", .{
-        upload_limit, uploads.buffer_hits, uploads.image_hits, uploads.avoided_bytes, uploads.evictions, uploads.bypasses,
+    std.debug.print("PASS upload cache budget={d}: buffer hits={d}, image hits={d}, snapshot ID hits={d}, avoided={d} bytes, evictions={d}, bypass={d}; full images match and teardown releases snapshots\n", .{
+        upload_limit, uploads.buffer_hits, uploads.image_hits, uploads.content_hits, uploads.avoided_bytes, uploads.evictions, uploads.bypasses,
     });
     std.debug.print("PASS sampled conversion budget={d} KiB: detile hits={d}, tile hits={d}\n", .{ staging_limit / 1024, renderer.conversion_cache.detile_hits, renderer.conversion_cache.tile_hits });
     std.debug.print("PASS CPU staging budget={d} KiB: hits={d} misses={d}, no live leases after rejected draw\n", .{ staging_limit / 1024, renderer.staging_pool.hits, renderer.staging_pool.misses });

@@ -16,8 +16,13 @@ pub const Tracking = struct {
     }
 };
 
+/// Snapshot identities are never reused, so an equal ID implies equal pixels
+/// even after an entry is evicted and its memory is recycled.
+var next_content_id = std.atomic.Value(u64).init(1);
+
 const Entry = struct {
     allocator: std.mem.Allocator,
+    id: u64,
     address: u64,
     layout: gpu.SurfaceLayout,
     backing: []u8,
@@ -40,6 +45,10 @@ pub const Lease = struct {
     pub fn pixels(self: Lease) []const u8 {
         return self.entry.pixels;
     }
+    /// Identity of this immutable snapshot; equal IDs hold equal pixels.
+    pub fn contentId(self: Lease) u64 {
+        return self.entry.id;
+    }
     pub fn release(self: Lease) void {
         self.entry.release();
     }
@@ -47,13 +56,16 @@ pub const Lease = struct {
 
 pub const Cache = struct {
     entries: [128]?*Entry = @splat(null),
-    limit: usize = 128 * 1024 * 1024,
+    /// Sprite atlases reach 4096x4096 RGBA8: 128 MiB each with their backing.
+    limit: usize = 1024 * 1024 * 1024,
     bytes: usize = 0,
     clock: u64 = 0,
     page_hits: u64 = 0,
     content_hits: u64 = 0,
     misses: u64 = 0,
     evictions: u64 = 0,
+    /// Diagnostic: describe this many upcoming misses (address, extent, bytes).
+    miss_reports: u32 = 0,
 
     pub fn deinit(self: *Cache) void {
         for (&self.entries) |*slot| self.remove(slot);
@@ -106,11 +118,17 @@ pub const Cache = struct {
             }
         }
         self.misses += 1;
+        if (self.miss_reports != 0) {
+            self.miss_reports -= 1;
+            std.debug.print("[d3d12 texture miss] address=0x{x} {d}x{d} element={d}B backing={d} KiB pixels={d} KiB cached={d} KiB\n", .{
+                address, layout.width, layout.height, layout.block.bytes_per_element, size / 1024, layout.staging_bytes / 1024, self.bytes / 1024,
+            });
+        }
         const pixels = try allocator.alloc(u8, @intCast(layout.staging_bytes));
         errdefer allocator.free(pixels);
         try layout.detile(backing, pixels);
         const entry = try allocator.create(Entry);
-        entry.* = .{ .allocator = allocator, .address = address, .layout = layout, .backing = backing, .pixels = pixels, .generation = generation };
+        entry.* = .{ .allocator = allocator, .id = next_content_id.fetchAdd(1, .monotonic), .address = address, .layout = layout, .backing = backing, .pixels = pixels, .generation = generation };
         own_backing = false;
         const cost = backing.len + pixels.len;
         if (cost <= self.limit) {

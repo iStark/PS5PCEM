@@ -52,6 +52,8 @@ pub const SampledImage = extern struct {
     max_lod: f32 = 16,
     lod_bias: f32 = 0,
     border: [4]f32 = @splat(0),
+    /// Nonzero for an immutable cached snapshot; equal IDs hold equal pixels.
+    content_id: u64 = 0,
 };
 pub const Draw = extern struct {
     width: u32,
@@ -126,6 +128,7 @@ pub const UploadStats = extern struct {
     avoided_bytes: u64 = 0,
     evictions: u64 = 0,
     bypasses: u64 = 0,
+    content_hits: u64 = 0,
 };
 pub const ResourceStats = extern struct {
     limit: u64 = 0,
@@ -262,12 +265,14 @@ pub const Device = struct {
         try self.check(ps5_d3d12_cache_limits(self.handle, shaders, pipelines));
     }
 
-    pub fn dispatchSpirv(self: *Device, words: []const u32, buffers: []const Buffer, groups: [3]u32) Error!void {
-        if (words.len < 5 or words[0] != 0x07230203 or buffers.len > 64) return error.InvalidArgument;
+    /// With `gds`, the last buffer is the persistent global data share bound
+    /// after the guest storage array; it is read back like the others.
+    pub fn dispatchSpirv(self: *Device, words: []const u32, buffers: []const Buffer, groups: [3]u32, gds: bool) Error!void {
+        if (words.len < 5 or words[0] != 0x07230203 or buffers.len > 64 + @as(usize, @intFromBool(gds)) or (gds and buffers.len == 0)) return error.InvalidArgument;
         for (groups) |size| if (size == 0 or size > 65535) return error.InvalidArgument;
         for (buffers) |buffer| if (buffer.size == 0 or buffer.size % 4 != 0 or buffer.size > 256 * 1024 * 1024) return error.InvalidArgument;
         if (builtin.os.tag != .windows) return error.UnsupportedPlatform;
-        try self.check(ps5_d3d12_dispatch_spirv(self.handle, words.ptr, words.len, buffers.ptr, @intCast(buffers.len), &groups));
+        try self.check(ps5_d3d12_dispatch_spirv(self.handle, words.ptr, words.len, buffers.ptr, @intCast(buffers.len), &groups, @intFromBool(gds)));
     }
 
     pub fn drawSpirv(self: *Device, vertex: []const u32, fragment: []const u32, draw: Draw, rgba: []u8) Error!void {
@@ -408,7 +413,7 @@ extern fn ps5_d3d12_attachment_stats(*Handle, *AttachmentStats) void;
 extern fn ps5_d3d12_attachment_cache(*Handle, c_int) i32;
 extern fn ps5_d3d12_upload_cache_limit(*Handle, u64) i32;
 extern fn ps5_d3d12_resource_pool_limit(*Handle, u64) i32;
-extern fn ps5_d3d12_dispatch_spirv(*Handle, [*]const u32, usize, [*]const Buffer, u32, *const [3]u32) i32;
+extern fn ps5_d3d12_dispatch_spirv(*Handle, [*]const u32, usize, [*]const Buffer, u32, *const [3]u32, u32) i32;
 extern fn ps5_d3d12_draw_spirv(*Handle, [*]const u32, usize, [*]const u32, usize, *const Draw, [*]const u8, usize, [*]const Buffer, u32, [*]const SampledImage, u32, [*]u8, [*]u8, usize) i32;
 extern fn ps5_d3d12_present_rgba(*Handle, [*]const u8, u32, u32) i32;
 

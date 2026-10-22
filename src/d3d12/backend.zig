@@ -17,6 +17,11 @@ const shader_cache = @import("shader_cache.zig");
 const texture_cache = @import("texture_cache.zig");
 const translation_cache = rdna2.translation_cache;
 
+comptime {
+    // native.c binds the GDS block by this SPIR-V binding (PS5_GDS_BINDING).
+    std.debug.assert(rdna2.spirv.gds_descriptor_binding == 38);
+}
+
 pub const Memory = struct {
     context: ?*anyopaque,
     read: *const fn (?*anyopaque, u64, []u8) bool,
@@ -65,6 +70,11 @@ const PendingDraws = struct {
         if (size == 0) return false;
         const end = address +| size;
         if (address < self.color.address + self.color.backing.len and self.color.address < end) return true;
+        // The pending flush also rewrites the colour target's DCC keys.
+        if (self.color.dcc) |dcc| {
+            const keys = std.math.divCeil(usize, self.color.backing.len, surfaces.Dcc.block_bytes) catch unreachable;
+            if (address < dcc.address + keys and dcc.address < end) return true;
+        }
         if (self.depth) |depth| if (address < depth.address + depth.backing.len and depth.address < end) return true;
         return false;
     }
@@ -95,6 +105,8 @@ pub const Renderer = struct {
     batch_groups: u64 = 0,
     batch_draws: u64 = 0,
     batch_hazards: u64 = 0,
+    /// Persistent 64 KiB global data share, allocated by the first GDS dispatch.
+    gds: ?[]u8 = null,
     const draw_batch_bytes = 128 * 1024 * 1024;
 
     pub fn init(allocator: std.mem.Allocator, memory: Memory, debug: bool) !Renderer {
@@ -103,6 +115,7 @@ pub const Renderer = struct {
     pub fn deinit(self: *Renderer) void {
         // Teardown does not publish unfinished work or acknowledge its labels.
         if (self.pending_draws) |*pending| pending.deinit(self.allocator);
+        if (self.gds) |gds| self.allocator.free(gds);
         self.translations.deinit(self.allocator);
         self.shader_analyses.deinit();
         self.textures.deinit();
@@ -326,16 +339,29 @@ pub const Renderer = struct {
         var storage = Storage{ .allocator = self.allocator };
         defer storage.deinit();
         const unknown: gpu.scalar_provenance.ScalarRegisters = @splat(.{});
+        // COMPUTE_PGM_RSRC2.LDS_SIZE counts 128-dword (512-byte) granules.
+        const lds_bytes = ((state.readRegister(.shader, 0x213) orelse 0) >> 15 & 0x1ff) * 512;
+        var uses_gds = false;
         for (analysis.program.instructions.items) |inst| {
+            var resolver = gpu.scalar_resources.Resolver{ .bindings = &bindings, .reader = self.reader(), .instructions = analysis.program.instructions.items, .graph = &analysis.graph, .snapshot = &unknown };
             switch (inst.family) {
                 .mimg => return error.SampledAndStorageImagesNotImplemented,
                 .flat => return error.FlatMemoryNotImplemented,
-                .smem => return error.ScalarMemoryBindingsNotImplemented,
-                .ds => return error.WorkgroupMemoryNotImplemented,
+                .smem => {
+                    try storage.stageScalar(self.memory, &resolver, inst);
+                    continue;
+                },
+                .ds => {
+                    // The persistent GDS is a separate UAV after the storage
+                    // array. Workgroup LDS must fit D3D12's 32 KiB groupshared.
+                    if (inst.gds) {
+                        uses_gds = true;
+                    } else if (lds_bytes == 0 or lds_bytes > 32 * 1024) return error.WorkgroupMemoryNotImplemented;
+                    continue;
+                },
                 .mubuf, .mtbuf => {},
                 else => continue,
             }
-            var resolver = gpu.scalar_resources.Resolver{ .bindings = &bindings, .reader = self.reader(), .instructions = analysis.program.instructions.items, .graph = &analysis.graph, .snapshot = &unknown };
             var words: [4]u32 = undefined;
             if (!try resolver.words(inst.src1.reg, inst.pc, &words)) return error.DynamicBufferDescriptorNotImplemented;
             const descriptor = try gpu.resources.decodeBufferDescriptor(&words);
@@ -344,7 +370,7 @@ pub const Renderer = struct {
             if (descriptor.out_of_bounds_select == 2 or descriptor.address == 0 or descriptor.size_bytes == 0) return error.UnsupportedBufferDescriptor;
             const name = @tagName(inst.opcode);
             const writable = std.mem.indexOf(u8, name, "store") != null or std.mem.indexOf(u8, name, "atomic") != null;
-            const slot = try storage.stage(self.memory, descriptor.address, descriptor.size_bytes, writable);
+            const slot = try storage.stage(self.memory, descriptor.address, descriptor.size_bytes, writable, false);
             try storage.mappings.append(self.allocator, .{
                 .resource_sgpr = inst.src1.reg,
                 .instruction_pc = inst.pc,
@@ -369,15 +395,30 @@ pub const Renderer = struct {
             .compute_inputs = .{ .workgroup_id_sgprs = system.workgroup_id_sgprs, .threadgroup_size_sgpr = system.threadgroup_size_sgpr, .local_invocation_id_components = system.local_invocation_id_components },
             .scalar_registers = scalar[0..scalar_count],
             .storage_buffers = storage.mappings.items,
+            .scalar_memories = storage.pointers.items,
             .descriptor_array_length = @intCast(@max(1, storage.count)),
+            .workgroup_memory_size_bytes = lds_bytes,
+            .gds_storage = uses_gds,
             .allow_control_flow_fallback = false,
         }, analysis.pipeline_options, analysis.translation_key);
         defer module_lease.release();
         const module = module_lease.view();
         if (module.used_dispatcher or module.used_control_flow_fallback) return error.UnboundedControlFlowNotImplemented;
-        var native_buffers: [64]native.Buffer = undefined;
+        var native_buffers: [65]native.Buffer = undefined;
         for (storage.data[0..storage.count], native_buffers[0..storage.count]) |bytes, *buffer| buffer.* = native.Buffer.fromSlice(bytes);
-        try self.device.dispatchSpirv(module.words, native_buffers[0..storage.count], groups);
+        var buffer_count = storage.count;
+        if (uses_gds) {
+            // GDS persists across dispatches like the console's global data
+            // share; the native readback writes straight into this copy.
+            if (self.gds == null) {
+                const gds = try self.allocator.alloc(u8, 64 * 1024);
+                @memset(gds, 0);
+                self.gds = gds;
+            }
+            native_buffers[buffer_count] = native.Buffer.fromSlice(self.gds.?);
+            buffer_count += 1;
+        }
+        try self.device.dispatchSpirv(module.words, native_buffers[0..buffer_count], groups, uses_gds);
         for (0..storage.count) |i| {
             if (storage.writable[i] and !self.memory.write(self.memory.context, storage.addresses[i], storage.data[i][0..storage.sizes[i]])) return error.GuestWriteFailed;
         }
@@ -398,7 +439,12 @@ pub const Renderer = struct {
         const topology = try graphics.nativeTopology(render.primitive_type);
         var draw_state = try native.Draw.fullTarget(target.width, target.height);
         var depth_key: ?TargetKey = null;
-        if (render.depth_control.test_enabled) {
+        // A test that always passes and never writes cannot change a pixel:
+        // stencil and depth bounds were rejected above. It needs no depth
+        // attachment, so its HTILE state is irrelevant.
+        const depth_active = render.depth_control.test_enabled and
+            !(render.depth_control.compare_function == 7 and !render.depth_control.write_enabled);
+        if (depth_active) {
             const depth = render.depth_target orelse return error.MissingDepthTarget;
             const writable = render.depth_control.write_enabled and !depth.depth_read_only;
             const layout = try surfaces.depthLayout(depth, target.width, target.height, writable);
@@ -426,7 +472,7 @@ pub const Renderer = struct {
         if (render.viewport) |vp| {
             if (vp.x_scale <= 0 or vp.y_scale >= 0) return error.PositiveYOrMirroredViewportNotImplemented;
             const position_z_enabled = ((state.readRegister(.context, 0x1b4) orelse 0) & (state.readRegister(.context, 0x1b3) orelse 0)) & (1 << 10) != 0;
-            const depth = try graphics.viewportDepth(state, vp, render.raster.zero_to_one_depth, render.depth_control.test_enabled, position_z_enabled);
+            const depth = try graphics.viewportDepth(state, vp, render.raster.zero_to_one_depth, depth_active, position_z_enabled);
             depth_transform = depth.transform;
             draw_state.depth_clip_enabled = @intFromBool(depth_transform == null);
             draw_state.viewport = .{ vp.x_offset - vp.x_scale, vp.y_offset + vp.y_scale, vp.x_scale * 2, -vp.y_scale * 2, depth.range[0], depth.range[1] };
@@ -524,7 +570,7 @@ pub const Renderer = struct {
                 pending.bytes + additional > draw_batch_bytes) try self.flushDraws();
         }
         if (self.pending_draws == null) {
-            var color = try surfaces.Staged.readCached(self.allocator, &self.staging_pool, &self.conversion_cache, self.memory, target.address, target_layout);
+            var color = try surfaces.Staged.readColor(self.allocator, &self.staging_pool, &self.conversion_cache, self.memory, target.address, target_layout, surfaces.colorDcc(target));
             errdefer color.deinit();
             var depth: ?surfaces.Staged = null;
             if (depth_key) |key| depth = try surfaces.Staged.readCached(self.allocator, &self.staging_pool, &self.conversion_cache, self.memory, key.address, key.layout);
@@ -579,8 +625,8 @@ pub const Renderer = struct {
                 attachments.misses,    attachments.avoided_bytes / 1024, attachments.pairs,
             });
             const uploads = self.device.uploadStats();
-            std.debug.print("[d3d12 uploads] flip={d} buffer_hit={d} image_hit={d} miss={d} avoided_kib={d} evict={d} bypass={d} kib={d}/{d}\n", .{
-                self.presented_frames, uploads.buffer_hits, uploads.image_hits,   uploads.misses,       uploads.avoided_bytes / 1024,
+            std.debug.print("[d3d12 uploads] flip={d} buffer_hit={d} image_hit={d} content_hit={d} miss={d} avoided_kib={d} evict={d} bypass={d} kib={d}/{d}\n", .{
+                self.presented_frames, uploads.buffer_hits, uploads.image_hits,   uploads.content_hits, uploads.misses, uploads.avoided_bytes / 1024,
                 uploads.evictions,     uploads.bypasses,    uploads.bytes / 1024, uploads.limit / 1024,
             });
             const scratch = &self.staging_pool;
@@ -751,35 +797,101 @@ const Storage = struct {
     addresses: [64]u64 = undefined,
     sizes: [64]usize = undefined,
     writable: [64]bool = undefined,
+    /// SMEM pointer snapshots begin with an 8-byte guest base address.
+    headers: [64]bool = undefined,
     count: usize = 0,
     total: u64 = 0,
     mappings: std.ArrayList(rdna2.spirv.StorageBufferBinding) = .empty,
+    pointers: std.ArrayList(rdna2.spirv.ScalarMemoryBinding) = .empty,
 
     fn deinit(self: *Storage) void {
         for (self.data[0..self.count]) |bytes| self.allocator.free(bytes);
         self.mappings.deinit(self.allocator);
+        self.pointers.deinit(self.allocator);
     }
-    fn stage(self: *Storage, memory: Memory, address: u64, size: u64, writable: bool) !u32 {
+    /// Identical views share one slot. Overlapping read-only snapshots are
+    /// independent copies, but a writable view may not overlap another view:
+    /// one of the two copies would publish or observe stale bytes.
+    fn stage(self: *Storage, memory: Memory, address: u64, size: u64, writable: bool, header: bool) !u32 {
         const end = try std.math.add(u64, address, size);
         for (0..self.count) |i| {
-            if (address == self.addresses[i] and size == self.sizes[i]) {
+            if (address == self.addresses[i] and size == self.sizes[i] and header == self.headers[i] and !(header and writable)) {
                 self.writable[i] = self.writable[i] or writable;
                 return @intCast(i);
             }
-            if (address < self.addresses[i] + self.sizes[i] and self.addresses[i] < end) return error.OverlappingBufferViewsNotImplemented;
+            if (address < self.addresses[i] + self.sizes[i] and self.addresses[i] < end and (writable or self.writable[i]))
+                return error.OverlappingBufferViewsNotImplemented;
         }
+        const prefix: usize = if (header) 8 else 0;
         if (size == 0 or size > 256 * 1024 * 1024 or self.total + size > 256 * 1024 * 1024 or self.count == self.data.len) return error.StorageBudgetExceeded;
-        const bytes = try self.allocator.alloc(u8, std.mem.alignForward(usize, @intCast(size), 4));
+        const bytes = try self.allocator.alloc(u8, std.mem.alignForward(usize, prefix + @as(usize, @intCast(size)), 4));
         errdefer self.allocator.free(bytes);
         @memset(bytes, 0);
-        if (!memory.read(memory.context, address, bytes[0..@intCast(size)])) return error.GuestReadFailed;
+        if (header) std.mem.writeInt(u64, bytes[0..8], address, .little);
+        if (!memory.read(memory.context, address, bytes[prefix..][0..@intCast(size)])) return error.GuestReadFailed;
         const slot = self.count;
         self.data[slot] = bytes;
         self.addresses[slot] = address;
         self.sizes[slot] = @intCast(size);
         self.writable[slot] = writable;
+        self.headers[slot] = header;
         self.count += 1;
         self.total += size;
         return @intCast(slot);
     }
+    /// Scalar loads read through the same storage array as vector buffers:
+    /// S_BUFFER_LOAD with its three-word descriptor, S_LOAD through a pointer
+    /// snapshot. Both pointers and descriptors must be statically proven.
+    fn stageScalar(self: *Storage, memory: Memory, resolver: *gpu.scalar_resources.Resolver, inst: gpu.ShaderInstruction) !void {
+        switch (inst.opcode) {
+            .s_load_dword, .s_load_dwordx2, .s_load_dwordx4, .s_load_dwordx8, .s_load_dwordx16 => {
+                const reg = gpu.scalar_provenance.scalarRegisterIndex(inst.src0) orelse return error.InvalidScalarPointer;
+                var base: [2]u32 = undefined;
+                if (!try resolver.words(@intCast(reg), inst.pc, &base) or base[1] > 0xffff or inst.memory_offset < 0)
+                    return error.DynamicScalarPointerNotImplemented;
+                const offset = try scalarOffset(resolver, inst.src1, inst.pc);
+                var address = try std.math.add(u64, @as(u64, base[0]) | (@as(u64, base[1]) << 32), offset);
+                address = (try std.math.add(u64, address, @intCast(inst.memory_offset))) & ~@as(u64, 3);
+                const size = @as(u64, inst.data_words) * 4;
+                const end = try std.math.add(u64, address, size);
+                if (address == 0 or size == 0 or size > 64 or address >> 32 != (end - 1) >> 32) return error.UnsupportedScalarPointerRange;
+                const slot = try self.stage(memory, address, size, false, true);
+                try self.pointers.append(self.allocator, .{ .resource_sgpr = @intCast(reg), .instruction_pc = inst.pc, .descriptor_index = slot });
+            },
+            .s_buffer_load_dword, .s_buffer_load_dwordx2, .s_buffer_load_dwordx4, .s_buffer_load_dwordx8, .s_buffer_load_dwordx16 => {
+                const reg = gpu.scalar_provenance.scalarRegisterIndex(inst.src0) orelse return error.InvalidBufferDescriptor;
+                var words: [4]u32 = @splat(0);
+                if (!try resolver.words(@intCast(reg), inst.pc, words[0..3])) return error.DynamicBufferDescriptorNotImplemented;
+                const descriptor = try gpu.resources.decodeScalarBufferDescriptor(&words);
+                if (descriptor.out_of_bounds_select == 2 or descriptor.add_thread_id or descriptor.address == 0 or descriptor.size_bytes == 0)
+                    return error.UnsupportedBufferDescriptor;
+                const slot = try self.stage(memory, descriptor.address, descriptor.size_bytes, false, false);
+                try self.mappings.append(self.allocator, .{
+                    .resource_sgpr = @intCast(reg),
+                    .instruction_pc = inst.pc,
+                    .descriptor_index = slot,
+                    .stride = descriptor.stride,
+                    .swizzled = descriptor.swizzle_enabled,
+                    .index_stride = descriptor.index_stride,
+                    .unified_format = descriptor.unified_format,
+                    .dst_select = descriptor.dst_select,
+                    .extent_bytes = @intCast(descriptor.size_bytes),
+                });
+            },
+            else => return error.ComputeScalarMemoryOperationNotImplemented,
+        }
+    }
 };
+
+fn scalarOffset(resolver: *gpu.scalar_resources.Resolver, operand: gpu.ShaderOperand, pc: u32) !u32 {
+    if (gpu.scalar_provenance.scalarRegisterIndex(operand)) |reg| {
+        var value: [1]u32 = undefined;
+        if (!try resolver.words(@intCast(reg), pc, &value)) return error.DynamicScalarOffsetNotImplemented;
+        return value[0];
+    }
+    return switch (operand.kind) {
+        .null => 0,
+        .integer_inline_constant, .literal_constant => operand.value,
+        else => error.InvalidScalarOffset,
+    };
+}

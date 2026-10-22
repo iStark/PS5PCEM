@@ -5,6 +5,7 @@
 //! through the ordered guest reader; leases survive invalidation and eviction.
 const std = @import("std");
 const gpu = @import("gpu");
+const rdna2 = @import("rdna2");
 
 const Entry = struct {
     allocator: std.mem.Allocator,
@@ -34,6 +35,11 @@ pub const Lease = struct {
 pub const Cache = struct {
     entries: [64]?*Entry = @splat(null),
     enabled: bool = true,
+    /// Matches the Vulkan default: the decoded instruction stream. The typed
+    /// IR's SSA dead-definition pass does not yet model every implicit read;
+    /// it dropped `v_mul v0, s27, v0` ahead of `v_mac_f32 v0` (which reads
+    /// its destination) and collapsed Terminator 2D's NGG vertex positions.
+    pipeline_options: rdna2.ir.PipelineOptions = .{ .enable_typed_ir = false, .enable_ssa_optimization = false },
     clock: u64 = 0,
     hits: u64 = 0,
     misses: u64 = 0,
@@ -71,7 +77,7 @@ pub const Cache = struct {
         self.misses += 1;
         const entry = try allocator.create(Entry);
         errdefer allocator.destroy(entry);
-        entry.* = .{ .allocator = allocator, .address = address, .analysis = try gpu.shader_analysis.decode(allocator, reader, address, 4096), .stamp = self.clock };
+        entry.* = .{ .allocator = allocator, .address = address, .analysis = try gpu.shader_analysis.decodeWithOptions(allocator, reader, address, 4096, self.pipeline_options), .stamp = self.clock };
         errdefer entry.analysis.deinit(allocator);
         entry.analysis.discardDiagnosticIr(allocator);
         try entry.analysis.enableTranslationKey(allocator);

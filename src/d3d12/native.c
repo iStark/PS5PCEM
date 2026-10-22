@@ -21,6 +21,9 @@
 #include "native.h"
 #include "dxc.h"
 
+/* rdna2.spirv.gds_descriptor_binding; backend.zig asserts the same value. */
+#define PS5_GDS_BINDING 38u
+
 extern int ps5_d3d12_equal_bytes(const uint8_t *a, const uint8_t *b, size_t size);
 
 typedef HRESULT (WINAPI *CreateFactoryFn)(REFIID, void **);
@@ -32,7 +35,11 @@ typedef HRESULT (WINAPI *CreateBlobFn)(SIZE_T, ID3DBlob **);
 
 enum { BACK_BUFFERS = 3, OFFSCREEN_RTV = 3 };
 enum { SHADER_CACHE_CAPACITY = 256, PIPELINE_CACHE_CAPACITY = 512, SHADER_CACHE_BYTES = 32 * 1024 * 1024 };
-enum { RESOURCE_POOL_CAPACITY = 2048, RESOURCE_POOL_BYTES = 256 * 1024 * 1024 };
+enum { RESOURCE_POOL_CAPACITY = 2048 };
+/* Large sprite atlases (4096x4096 RGBA8 is 64 MiB) must stay resident. */
+#define RESOURCE_POOL_BYTES (UINT64_C(1024) * 1024 * 1024)
+/* PS5_D3D12_RESOURCE_POOL_MIB may raise the budget up to this bound. */
+#define RESOURCE_POOL_MAX_BYTES (UINT64_C(4096) * 1024 * 1024)
 enum { UPLOAD_CACHE_BYTES = 128 * 1024 * 1024 };
 typedef struct ResourceEntry {
     ID3D12Resource *resource;
@@ -47,6 +54,9 @@ typedef struct ResourceEntry {
     /* Symmetric, non-owning pair inside the fixed pool: texture and its latest
      * completed readback. Reuse/eviction of either member breaks both links. */
     struct ResourceEntry *attachment_peer;
+    /* A completed upload of the immutable snapshot with this ID. Generic
+     * reuse clears it; a failed draw evicts the resource with it. */
+    uint64_t content_id;
 } ResourceEntry;
 typedef struct ShaderEntry {
     uint32_t *words;
@@ -192,7 +202,7 @@ int32_t ps5_d3d12_upload_cache_limit(Ps5D3D12 *c, uint64_t bytes) {
     return S_OK;
 }
 int32_t ps5_d3d12_resource_pool_limit(Ps5D3D12 *c, uint64_t bytes) {
-    if (!c || bytes > RESOURCE_POOL_BYTES) return E_INVALIDARG;
+    if (!c || bytes > RESOURCE_POOL_MAX_BYTES) return E_INVALIDARG;
     HRESULT hr = wait_idle(c);
     if (FAILED(hr)) return hr;
     for (UINT i = 0; i < RESOURCE_POOL_CAPACITY; ++i) evict_resource(c, &c->resource_pool[i]);
@@ -217,19 +227,21 @@ static HRESULT acquire_resource(Ps5D3D12 *c, const D3D12_RESOURCE_DESC *desc,
         ResourceEntry *entry = &c->resource_pool[i];
         if (!entry->resource || entry->busy || entry->heap != type || entry->initial_state != initial_state ||
             !same_resource(&entry->desc, desc)) continue;
-        if (!entry->snapshot_valid || !preserve_snapshots) { reusable = entry; break; }
+        const int proven = entry->snapshot_valid || entry->content_id;
+        if (!proven || !preserve_snapshots) { reusable = entry; break; }
         if (!reusable || entry->used < reusable->used) reusable = entry;
     }
     // Spare GPU/CPU capacity can retain different sampled images with the same
     // shape. Do not evict other resources just to admit another content version.
     // Raw buffers use ordinary reuse to avoid accumulating changing small uniforms.
-    if (reusable && preserve_snapshots && reusable->snapshot_valid &&
+    if (reusable && preserve_snapshots && (reusable->snapshot_valid || reusable->content_id) &&
         c->resource_stats.entries < RESOURCE_POOL_CAPACITY &&
         reusable->bytes <= c->resource_stats.limit - c->resource_stats.bytes) reusable = NULL;
     if (reusable) {
         invalidate_attachment(reusable);
         reusable->busy = 1;
         reusable->snapshot_valid = 0;
+        reusable->content_id = 0;
         *out = reusable->resource;
         IUnknown_AddRef((IUnknown *)*out);
         ++c->resource_stats.hits;
@@ -275,10 +287,35 @@ static HRESULT acquire_resource(Ps5D3D12 *c, const D3D12_RESOURCE_DESC *desc,
  * successful completion returns it in the declared initial state. Attachments
  * and generic storage never consume this proof, and invalidate it on acquisition. */
 static HRESULT acquire_snapshot_resource(Ps5D3D12 *c, const D3D12_RESOURCE_DESC *desc,
-    D3D12_RESOURCE_STATES initial_state, const uint8_t *bytes, size_t size,
+    D3D12_RESOURCE_STATES initial_state, const uint8_t *bytes, size_t size, uint64_t content_id,
     ID3D12Resource **out, int *reused) {
     if (c->pending || c->poisoned) return failure(c, E_FAIL, "upload reuse after incomplete GPU work");
     *reused = 0;
+    if (content_id && c->resource_stats.limit) {
+        /* An immutable snapshot ID proves the contents without a CPU copy or
+         * comparison; this works even when the byte-proven cache is off. */
+        for (UINT i = 0; i < RESOURCE_POOL_CAPACITY; ++i) {
+            ResourceEntry *entry = &c->resource_pool[i];
+            if (!entry->resource || entry->busy || entry->content_id != content_id ||
+                entry->heap != D3D12_HEAP_TYPE_DEFAULT || entry->initial_state != initial_state ||
+                !same_resource(&entry->desc, desc)) continue;
+            entry->busy = 1;
+            entry->used = ++c->resource_clock;
+            *out = entry->resource;
+            IUnknown_AddRef((IUnknown *)*out);
+            ++c->resource_stats.hits;
+            ++c->upload_stats.content_hits;
+            c->upload_stats.avoided_bytes += size;
+            *reused = 1;
+            return S_OK;
+        }
+        ++c->upload_stats.misses;
+        HRESULT hr = acquire_resource(c, desc, D3D12_HEAP_TYPE_DEFAULT, initial_state, 1, out);
+        if (FAILED(hr)) return hr;
+        for (UINT i = 0; i < RESOURCE_POOL_CAPACITY; ++i)
+            if (c->resource_pool[i].resource == *out) { c->resource_pool[i].content_id = content_id; break; }
+        return S_OK;
+    }
     if (!c->upload_stats.limit || size > c->upload_stats.limit) {
         ++c->upload_stats.misses;
         ++c->upload_stats.bypasses;
@@ -535,6 +572,12 @@ int32_t ps5_d3d12_create(Ps5D3D12 **out, Ps5D3D12Info *info, int debug, char *er
     char pool_option[8] = {0};
     if (GetEnvironmentVariableA("PS5_D3D12_RESOURCE_POOL", pool_option, sizeof(pool_option)) == 1 && pool_option[0] == '0')
         c->resource_stats.limit = 0;
+    char pool_mib[16] = {0};
+    const DWORD pool_mib_length = GetEnvironmentVariableA("PS5_D3D12_RESOURCE_POOL_MIB", pool_mib, sizeof(pool_mib));
+    if (pool_mib_length && pool_mib_length < sizeof(pool_mib) && c->resource_stats.limit) {
+        const uint64_t mib = strtoull(pool_mib, NULL, 10);
+        if (mib) c->resource_stats.limit = mib * 1024 * 1024 < RESOURCE_POOL_MAX_BYTES ? mib * 1024 * 1024 : RESOURCE_POOL_MAX_BYTES;
+    }
     char upload_option[8] = {0};
     if (GetEnvironmentVariableA("PS5_D3D12_UPLOAD_CACHE", upload_option, sizeof(upload_option)) == 1 && upload_option[0] == '1')
         c->upload_stats.limit = UPLOAD_CACHE_BYTES;
@@ -801,6 +844,8 @@ static HRESULT compile_spirv_uncached(Ps5D3D12 *c, const uint32_t *words, size_t
         const int storage = kind == SPVC_RESOURCE_TYPE_STORAGE_BUFFER;
         const int sampled = kind == SPVC_RESOURCE_TYPE_SAMPLED_IMAGE;
         const uint32_t expected_count = storage ? buffer_count : sampled ? image_count : 0;
+        // For compute, `scalars` instead selects the persistent GDS block,
+        // bound as one UAV immediately after the guest storage array.
         if ((!storage && !sampled) || count > (storage && scalars ? 2u : 1u)) {
             snprintf(c->error, sizeof(c->error), "D3D12 shader resource kind %u/count %zu is not supported by this pipeline", kind, count);
             goto done;
@@ -810,7 +855,8 @@ static HRESULT compile_spirv_uncached(Ps5D3D12 *c, const uint32_t *words, size_t
             const unsigned binding = spvc_compiler_get_decoration(compiler, list[resource].id, SpvDecorationBinding);
             spvc_type type = spvc_compiler_get_type_handle(compiler, list[resource].type_id);
             const int scalar = storage && scalars && binding == 10 && stage != SpvExecutionModelGLCompute;
-            if (set != 0 || (scalar ? spvc_type_get_num_array_dimensions(type) != 0 :
+            const int global = storage && scalars && binding == PS5_GDS_BINDING && stage == SpvExecutionModelGLCompute;
+            if (set != 0 || (scalar || global ? spvc_type_get_num_array_dimensions(type) != 0 :
                 (!expected_count || binding != (storage ? 0u : 1u) || spvc_type_get_num_array_dimensions(type) != 1 ||
                 !spvc_type_array_dimension_is_literal(type, 0) || spvc_type_get_array_dimension(type, 0) != expected_count))) {
                 snprintf(c->error, sizeof(c->error), "D3D12 descriptor array mismatch: kind %u, binding %u, expected %u elements", kind, binding, expected_count);
@@ -833,6 +879,7 @@ static HRESULT compile_spirv_uncached(Ps5D3D12 *c, const uint32_t *words, size_t
                 spvc_compiler_set_decoration(compiler, list[resource].id, SpvDecorationNonWritable, 0);
             if (sampled) remap.srv.register_binding = buffer_count;
             if (scalar) remap.srv.register_space = 1;
+            if (global) remap.uav.register_binding = buffer_count;
             CROSS(spvc_compiler_hlsl_add_resource_binding(compiler, &remap));
         }
     }
@@ -951,8 +998,10 @@ static HRESULT guest_graphics_root(Ps5D3D12 *c, uint32_t buffers, uint32_t image
 }
 
 int32_t ps5_d3d12_dispatch_spirv(Ps5D3D12 *c, const uint32_t *words, size_t word_count,
-    const Ps5D3D12Buffer *buffers, uint32_t count, const uint32_t groups[3]) {
-    if (!c || !words || word_count < 5 || count > 64 || (count && !buffers) || !groups) return E_INVALIDARG;
+    const Ps5D3D12Buffer *buffers, uint32_t count, const uint32_t groups[3], uint32_t gds) {
+    // With `gds`, the final buffer is the GDS block at u(array_count); the
+    // guest storage array keeps u0..u(array_count - 1).
+    if (!c || !words || word_count < 5 || gds > 1 || count > 64 + gds || (gds && !count) || (count && !buffers) || !groups) return E_INVALIDARG;
     for (UINT axis = 0; axis < 3; ++axis) if (!groups[axis] || groups[axis] > 65535) return E_INVALIDARG;
     for (UINT i = 0; i < count; ++i) if (!buffers[i].bytes || !buffers[i].size || buffers[i].size % 4 || buffers[i].size > 256 * 1024 * 1024) return E_INVALIDARG;
     HRESULT hr;
@@ -960,9 +1009,9 @@ int32_t ps5_d3d12_dispatch_spirv(Ps5D3D12 *c, const uint32_t *words, size_t word
     ID3D12RootSignature *root = NULL;
     ID3D12PipelineState *pipeline = NULL;
     ID3D12DescriptorHeap *heap = NULL;
-    ID3D12Resource *gpu[64] = {0}, *upload[64] = {0}, *readback[64] = {0};
+    ID3D12Resource *gpu[65] = {0}, *upload[65] = {0}, *readback[65] = {0};
     uint64_t shader_id;
-    TRY(compile_spirv(c, words, word_count, SpvExecutionModelGLCompute, count, 0, 0, &code, &shader_id));
+    TRY(compile_spirv(c, words, word_count, SpvExecutionModelGLCompute, count - gds, 0, gds, &code, &shader_id));
     const PipelineKey key = {{1, shader_id, 0, count}};
     if (!cached_pipeline(c, &key, &root, &pipeline)) {
         const ULONGLONG started = GetTickCount64();
@@ -1268,7 +1317,7 @@ static HRESULT prepare_graphics_resources(Ps5D3D12 *c, DrawBatch *batch, Graphic
         r->buffers[i] = batch_buffer(batch, &buffers[i]);
         r->buffer_shared[i] = r->buffers[i] != NULL;
         if (!r->buffers[i]) TRY(acquire_snapshot_resource(c, &buffer_desc, D3D12_RESOURCE_STATE_COMMON,
-            buffers[i].bytes, buffers[i].size, &r->buffers[i], &reused));
+            buffers[i].bytes, buffers[i].size, 0, &r->buffers[i], &reused));
         if (!reused) {
             TRY(graphics_buffer(c, buffers[i].size, D3D12_HEAP_TYPE_UPLOAD, &r->buffer_uploads[i]));
             void *mapped;
@@ -1293,7 +1342,7 @@ static HRESULT prepare_graphics_resources(Ps5D3D12 *c, DrawBatch *batch, Graphic
         int reused = 1;
         r->images[i] = batch_image(batch, image);
         if (!r->images[i]) TRY(acquire_snapshot_resource(c, &desc, D3D12_RESOURCE_STATE_COPY_DEST,
-            image->pixels, image->size, &r->images[i], &reused));
+            image->pixels, image->size, image->content_id, &r->images[i], &reused));
         UINT64 size, row_bytes;
         UINT rows;
         ID3D12Device_GetCopyableFootprints(c->device, &desc, 0, 1, 0, &r->footprints[i], &rows, &row_bytes, &size);
@@ -1458,7 +1507,8 @@ static ID3D12Resource *batch_image(DrawBatch *batch, const Ps5D3D12Image *image)
             if (previous->width == image->width && previous->height == image->height &&
                 previous->format == image->format && previous->srgb == image->srgb &&
                 previous->size == image->size &&
-                ps5_d3d12_equal_bytes(previous->pixels, image->pixels, image->size)) {
+                ((previous->content_id && previous->content_id == image->content_id) || previous->pixels == image->pixels ||
+                 ps5_d3d12_equal_bytes(previous->pixels, image->pixels, image->size))) {
                 ID3D12Resource_AddRef(l->resources.images[i]);
                 return l->resources.images[i];
             }

@@ -11,6 +11,7 @@ const native = @import("root.zig");
 const staging = @import("staging.zig");
 const surface_cache = @import("surface_cache.zig");
 const texture_cache = @import("texture_cache.zig");
+const surfaces = @import("surfaces.zig");
 
 /// Count immutable image storage once per batch. Sampler/view differences
 /// still occupy independent descriptors, but do not duplicate the CPU pixels.
@@ -27,7 +28,9 @@ pub const ImageBudget = struct {
     pub fn additional(self: *const ImageBudget, total: usize, images: []const native.SampledImage) usize {
         var bytes = total;
         for (images, 0..) |image, i| {
-            if (contains(self.images[0..self.count], image) or contains(images[0..i], image))
+            // A cache-retained snapshot is pinned by the texture cache anyway;
+            // holding it for the group adds no CPU memory and no native upload.
+            if (image.content_id != 0 or contains(self.images[0..self.count], image) or contains(images[0..i], image))
                 bytes -= image.size;
         }
         return bytes;
@@ -232,10 +235,15 @@ pub const DrawResources = struct {
         const single_layer = descriptor.depth_or_layers == 1 and descriptor.base_array == 0;
         const view_2d = descriptor.image_type == .color_2d or (descriptor.image_type == .color_2d_array and single_layer);
         const compressed = format == 71 or format == 74 or format == 77;
+        // A DCC-compressed RGBA8 view (for example a render target the guest
+        // samples next) resolves its fast-clear keys before detiling. CMASK
+        // and FMASK compression remain unsupported.
+        const dcc: ?surfaces.Dcc = if (descriptor.dccMetadataAddress()) |address| .{ .address = address, .clear_word = null } else null;
         if (!view_2d or !single_layer or format == 0 or descriptor.viewBaseLevel() != 0 or
             descriptor.viewMipLevels() != 1 or descriptor.max_mip != 0 or descriptor.base_array != 0 or
             descriptor.min_lod != 0 or (compressed and descriptor.bc_swizzle != 0) or
-            descriptor.dccMetadataAddress() != null or gpu.MetadataSurface.fromImage(descriptor).hasAny())
+            descriptor.cmask_fast_clear or descriptor.fmask_compression or (dcc != null and format != 28) or
+            (dcc == null and gpu.MetadataSurface.fromImage(descriptor).hasAny()))
         {
             std.debug.print("[d3d12 image] program=0x{x} pc=0x{x} descriptor={any}\n", .{ resolver.bindings.program_address, inst.pc, descriptor });
             return error.GraphicsTextureFormatOrMipNotImplemented;
@@ -259,14 +267,21 @@ pub const DrawResources = struct {
         _ = try layout.sourceRange(descriptor.address);
         var retained: ?texture_cache.Lease = null;
         var pixel_lease: staging.Lease = undefined;
-        const pixels: []const u8 = if (self.textures) |textures| blk: {
-            retained = try textures.acquire(self.allocator, self.reader, self.tracking, descriptor.address, layout);
+        // DCC keys are not covered by the texture cache's page proof, so a
+        // compressed view always takes the fresh read path.
+        const pixels: []const u8 = if (self.textures != null and dcc == null) blk: {
+            retained = try self.textures.?.acquire(self.allocator, self.reader, self.tracking, descriptor.address, layout);
             break :blk retained.?.pixels();
         } else blk: {
             var backing_lease = try staging.Lease.alloc(self.allocator, self.pool, @intCast(layout.required_source_bytes));
             defer backing_lease.deinit();
             const backing = backing_lease.bytes;
             try self.reader.read(descriptor.address, backing);
+            if (dcc) |metadata| {
+                const keys = try self.allocator.alloc(u8, std.math.divCeil(usize, backing.len, surfaces.Dcc.block_bytes) catch unreachable);
+                defer self.allocator.free(keys);
+                try metadata.expand(.{ .context = self.reader.context, .read = self.reader.read_fn }, backing, keys);
+            }
             pixel_lease = try staging.Lease.alloc(self.allocator, self.pool, @intCast(layout.staging_bytes));
             errdefer pixel_lease.deinit();
             if (self.cache) |c| try c.detile(descriptor.address, layout, backing, pixel_lease.bytes) else try layout.detile(backing, pixel_lease.bytes);
@@ -293,6 +308,7 @@ pub const DrawResources = struct {
         try self.images.append(self.allocator, .{
             .pixels = pixels.ptr,
             .size = pixels.len,
+            .content_id = if (retained) |lease| lease.contentId() else 0,
             .width = descriptor.width,
             .height = descriptor.height,
             .format = format,

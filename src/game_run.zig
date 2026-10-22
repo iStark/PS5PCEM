@@ -997,6 +997,14 @@ fn run(init: std.process.Init) !bool {
             defer allocator.free(value);
             if (std.mem.eql(u8, value, "0")) directx.textures.limit = 0;
         } else |_| {}
+        if (init.minimal.environ.getAlloc(allocator, "PS5_D3D12_TEXTURE_CACHE_MIB")) |value| {
+            defer allocator.free(value);
+            directx.textures.limit = @as(usize, @min(std.fmt.parseInt(usize, value, 10) catch 128, 8192)) * 1024 * 1024;
+        } else |_| {}
+        if (init.minimal.environ.getAlloc(allocator, "PS5_D3D12_TEXTURE_REPORTS")) |value| {
+            defer allocator.free(value);
+            directx.textures.miss_reports = std.fmt.parseInt(u32, value, 10) catch 0;
+        } else |_| {}
         if (init.minimal.environ.getAlloc(allocator, "PS5_D3D12_GUEST_SHADER_CACHE")) |value| {
             defer allocator.free(value);
             if (std.mem.eql(u8, value, "0")) {
@@ -1004,6 +1012,8 @@ fn run(init: std.process.Init) !bool {
                 directx.translations.maximum_entries = 0;
             }
         } else |_| {}
+        // Same shader lowering as the Vulkan renderer selects.
+        directx.shader_analyses.pipeline_options = .{ .enable_typed_ir = enable_shader_ir, .enable_ssa_optimization = enable_shader_ssa };
         directx.draw_batch_limit = d3d12.max_draw_batch;
         if (init.minimal.environ.getAlloc(allocator, "PS5_D3D12_DRAW_BATCH")) |value| {
             defer allocator.free(value);

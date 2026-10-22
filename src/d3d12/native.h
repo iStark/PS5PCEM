@@ -28,6 +28,8 @@ typedef struct Ps5D3D12ResourceStats {
 
 typedef struct Ps5D3D12UploadStats {
     uint64_t limit, bytes, buffer_hits, image_hits, misses, avoided_bytes, evictions, bypasses;
+    /* Uploads skipped by an immutable snapshot ID, independent of `limit`. */
+    uint64_t content_hits;
 } Ps5D3D12UploadStats;
 
 typedef struct Ps5D3D12AttachmentStats {
@@ -44,6 +46,9 @@ typedef struct Ps5D3D12Image {
     size_t size;
     uint32_t width, height, format, srgb, components, filter, address_u, address_v, address_w;
     float min_lod, max_lod, lod_bias, border[4];
+    /* Nonzero identifies an immutable pixel snapshot. Equal IDs always hold
+     * equal pixels, so a completed GPU copy with that ID needs no upload. */
+    uint64_t content_id;
 } Ps5D3D12Image;
 
 typedef struct Ps5D3D12Blend {
@@ -97,14 +102,14 @@ int32_t ps5_d3d12_attachment_cache(Ps5D3D12 *context, int enabled);
 /* Exact CPU snapshots prove completed read-only GPU contents; zero disables
  * upload reuse. GPU storage remains subject to the resource-pool budget. */
 int32_t ps5_d3d12_upload_cache_limit(Ps5D3D12 *context, uint64_t bytes);
-/* Flush completed pooled storage; zero disables pooling. Maximum 256 MiB. */
+/* Flush completed pooled storage; zero disables pooling. Maximum 4 GiB. */
 int32_t ps5_d3d12_resource_pool_limit(Ps5D3D12 *context, uint64_t bytes);
 /* Clears cached objects after completion; limits are bounded by the built-in
  * budgets. Zero entries disables caching (also PS5_D3D12_CACHE=0 at creation).
  * Used by the hardware probe to exercise eviction and uncached equivalence. */
 int32_t ps5_d3d12_cache_limits(Ps5D3D12 *context, uint32_t shaders, uint32_t pipelines);
 int32_t ps5_d3d12_dispatch_spirv(Ps5D3D12 *context, const uint32_t *words, size_t word_count,
-    const Ps5D3D12Buffer *buffers, uint32_t buffer_count, const uint32_t groups[3]);
+    const Ps5D3D12Buffer *buffers, uint32_t buffer_count, const uint32_t groups[3], uint32_t gds);
 int32_t ps5_d3d12_draw_spirv(Ps5D3D12 *context, const uint32_t *vs, size_t vs_count,
     const uint32_t *ps, size_t ps_count, const Ps5D3D12Draw *draw, const uint8_t *indices, size_t index_bytes,
     const Ps5D3D12Buffer *buffers, uint32_t buffer_count, const Ps5D3D12Image *images, uint32_t image_count, uint8_t *rgba,
