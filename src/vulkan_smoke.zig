@@ -15421,7 +15421,7 @@ pub fn main(init: std.process.Init) !void {
             try renderer.probeColorInitializationPadded();
             try renderer.probeColorZeroFills();
         };
-        std.debug.print("colour initialization passed: alias publication, padded-pitch GPU producers, retained pixels, CPU replacement and exact RGBA8/FP16/UNORM16 initial and resident DCC clears with tracked/untracked pages and synchronous/timeline submissions\n", .{});
+        std.debug.print("colour initialization passed: alias publication, padded-pitch GPU producers, retained pixels, CPU replacement and exact RGBA8/RG16F/RGBA16F/UNORM16 initial and resident DCC clears with tracked/untracked pages and synchronous/timeline submissions\n", .{});
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--buffer-target-coherence")) {

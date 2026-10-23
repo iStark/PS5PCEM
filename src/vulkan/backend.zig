@@ -18601,8 +18601,9 @@ pub const Renderer = struct {
                 vk.format_r16g16b16a16_unorm => {
                     for (0..4) |channel| clear.float32[channel] = @as(f32, @floatFromInt(std.mem.readInt(u16, texel.bytes[channel * 2 ..][0..2], .little))) / 65535.0;
                 },
-                vk.format_r16g16b16a16_sfloat => {
-                    for (0..4) |channel| clear.float32[channel] = @as(f16, @bitCast(std.mem.readInt(u16, texel.bytes[channel * 2 ..][0..2], .little)));
+                vk.format_r16g16_sfloat, vk.format_r16g16b16a16_sfloat => {
+                    const channels: usize = if (target.format.vulkan == vk.format_r16g16_sfloat) 2 else 4;
+                    for (0..channels) |channel| clear.float32[channel] = @as(f16, @bitCast(std.mem.readInt(u16, texel.bytes[channel * 2 ..][0..2], .little)));
                 },
                 vk.format_r8g8b8a8_unorm, vk.format_r8g8b8a8_srgb, vk.format_b8g8r8a8_unorm => {
                     for (0..4) |channel| clear.float32[channel] = @as(f32, @floatFromInt(texel.bytes[channel])) / 255.0;
@@ -22061,7 +22062,7 @@ pub const Renderer = struct {
 
     pub fn probeColorDccNativeClears(self: *Renderer) anyerror!void {
         const memory = self.guest_memory.?;
-        for ([_][2]u8{ .{ 10, 0 }, .{ 12, 7 }, .{ 12, 0 } }) |encoding| {
+        for ([_][2]u8{ .{ 10, 0 }, .{ 5, 7 }, .{ 12, 7 }, .{ 12, 0 } }) |encoding| {
             var color = std.mem.zeroes(gpu.resources.ColorTarget);
             color.address = 0x1a000;
             color.width = 16;
@@ -30960,7 +30961,14 @@ pub const Renderer = struct {
         };
         std.mem.sort(usize, selected, self, Order.older);
         for (self.storage_image_cache.items) |cached| {
-            if (cached.valid and cached.gpu_dirty and byteRangesOverlap(backing_address, backing_bytes, cached.descriptor.address, cached.allocation_bytes)) {
+            // A clean pinned image may already be prepared for this dispatch.
+            // Publishing this conversion's outer bytes would change that
+            // binding's CPU baseline before its GPU write is committed. The
+            // later replacement guard would then discard the new GPU output
+            // as if those older raster bytes were a subsequent CPU write.
+            if (cached.valid and (cached.gpu_dirty or cached.pin_count != 0) and
+                byteRangesOverlap(backing_address, backing_bytes, cached.descriptor.address, cached.allocation_bytes))
+            {
                 if (self.traceCurrentGraphicsFrame()) std.debug.print("[gpu layout reject] storage @0x{x} bytes={d} image @0x{x}\n", .{ cached.descriptor.address, cached.allocation_bytes, descriptor.address });
                 return null;
             }
@@ -31602,6 +31610,22 @@ pub const Renderer = struct {
                 const expected = all_expected[prefix_bytes..];
                 @memset(all_expected, 0xa5);
                 if (!memory.write(memory.context, descriptor.address - prefix_bytes, all_expected)) return Error.GuestMemoryWriteFailed;
+                // A sibling binding can already own a CPU-change baseline
+                // while this dispatch's other images are still being staged.
+                // Test both an outer tail and an outer prefix publication.
+                var pinned_neighbor: ?usize = null;
+                defer if (pinned_neighbor) |neighbor| self.releaseStorageImage(neighbor);
+                if (phase == 6 or phase == 12) {
+                    var neighbor = descriptor;
+                    neighbor.address = if (phase == 6) descriptor.address + image_bytes else descriptor.address - prefix_bytes;
+                    neighbor.width = 32;
+                    neighbor.height = 1;
+                    neighbor.pitch = 32;
+                    neighbor.tile_mode = .linear;
+                    const binding = try self.stageStorageImageRaw(neighbor, 1, true);
+                    pinned_neighbor = binding.cache_index.?;
+                    try std.testing.expect(!self.storage_image_cache.items[pinned_neighbor.?].gpu_dirty);
+                }
                 const initial = try self.allocator.alloc(u8, @intCast(target.layout.staging_bytes));
                 defer self.allocator.free(initial);
                 for (0..initial.len / 4) |i| std.mem.writeInt(u32, initial[i * 4 ..][0..4], 0x3c003c00 ^ @as(u32, @truncate(i *% 29)), .little);
@@ -31737,6 +31761,22 @@ pub const Renderer = struct {
                     prefix_color_storage_layout = true;
                 }
                 const prefix_conversions = self.storage_layout_prefix_conversions;
+                if (pinned_neighbor) |neighbor| {
+                    const before = try self.allocator.alloc(u8, all_expected.len);
+                    defer self.allocator.free(before);
+                    const after = try self.allocator.alloc(u8, all_expected.len);
+                    defer self.allocator.free(after);
+                    try std.testing.expect(memory.read(memory.context, descriptor.address - prefix_bytes, before));
+                    try std.testing.expect(try self.tryStageColorStorageLayout(descriptor, 0, false, view, storageImageFormat(descriptor.unified_format).?, image_bytes, @intCast(try view.stagingBytes()), null, 0) == null);
+                    try std.testing.expectEqual(conversions, self.storage_layout_conversions);
+                    try std.testing.expect(self.render_targets.items[source].initialized);
+                    try std.testing.expect(memory.read(memory.context, descriptor.address - prefix_bytes, after));
+                    try std.testing.expectEqualSlices(u8, before, after);
+                    self.releaseStorageImage(neighbor);
+                    pinned_neighbor = null;
+                    // Retire the upload's queue pin as well as the binding.
+                    try self.waitForSubmittedWork();
+                }
                 const resources = try ComputeResources.acquire(self);
                 defer resources.deinit(self);
                 resources.storage_images[0] = try self.stageStorageImageRaw(descriptor, 0, phase == 1 or phase == 15);
@@ -31819,7 +31859,7 @@ pub const Renderer = struct {
             try std.testing.expectEqualSlices(u8, baseline[0..508], actual[0..508]);
             try std.testing.expectEqualSlices(u8, &.{ 0x22, 0x33, 0x44, 0x55 }, actual[508..]);
         }
-        std.debug.print("color/storage layout conversion passed: native bits, contained/partial/interior/prefix producers, preserved outer bytes and CPU replacement\n", .{});
+        std.debug.print("color/storage layout conversion passed: native bits, contained/partial/interior/prefix producers, preserved outer bytes, pinned sibling baselines and CPU replacement\n", .{});
     }
 
     fn createCachedStorageImage(
@@ -43402,24 +43442,23 @@ fn colorDccClearTexel(code: u8, descriptor: gpu.resources.ColorTarget) ?DccClear
             result.bytes[0..4].* = rgba;
             result.length = 4;
         },
-        12 => {
+        5, 12 => {
             if ((descriptor.number_type != 7 and descriptor.number_type != 0) or descriptor.component_swap != 0) return null;
-            result.length = 8;
+            if (descriptor.format == 5 and descriptor.number_type != 7) return null;
+            const channels: usize = if (descriptor.format == 5) 2 else 4;
+            result.length = @intCast(channels * 2);
             if (code == 0x20) {
                 std.mem.writeInt(u32, result.bytes[0..4], descriptor.clear_words[0], .little);
-                std.mem.writeInt(u32, result.bytes[4..8], descriptor.clear_words[1], .little);
+                if (channels == 4) std.mem.writeInt(u32, result.bytes[4..8], descriptor.clear_words[1], .little);
                 return result;
             }
+            if (code != 0 and code != 0x40 and code != 0x80 and code != 0xc0) return null;
             const one: u16 = if (descriptor.number_type == 0) 0xffff else 0x3c00;
-            const channels: [4]u16 = switch (code) {
-                0x00 => .{ 0x0000, 0x0000, 0x0000, 0x0000 },
-                0x40 => .{ 0x0000, 0x0000, 0x0000, one },
-                0x80 => .{ one, one, one, 0x0000 },
-                0xc0 => .{ one, one, one, one },
-                else => return null,
-            };
-            for (channels, 0..) |channel, index| {
-                std.mem.writeInt(u16, result.bytes[index * 2 ..][0..2], channel, .little);
+            // With the standard component swap, DCC's alpha bit belongs to
+            // the last physical channel, including G in a two-channel target.
+            for (0..channels) |channel| {
+                const bit: u8 = if (channel + 1 == channels) 0x40 else 0x80;
+                std.mem.writeInt(u16, result.bytes[channel * 2 ..][0..2], if (code & bit != 0) one else 0, .little);
             }
         },
         else => return null,
@@ -43439,11 +43478,13 @@ fn sampledDccFixedClearTexel(code: u8, descriptor: gpu.ImageDescriptor) ?DccClea
             for (0..4) |channel| result.bytes[channel] =
                 if (if (channel == alpha_channel) alpha_one else rgb_one) 255 else 0;
         },
-        65, 71 => {
-            result.length = 8;
+        29, 65, 71 => {
+            const channels: usize = if (descriptor.unified_format == 29) 2 else 4;
+            result.length = @intCast(channels * 2);
             const one: u16 = if (descriptor.unified_format == 65) 0xffff else 0x3c00;
-            for (0..4) |channel| {
-                std.mem.writeInt(u16, result.bytes[channel * 2 ..][0..2], if (if (channel == alpha_channel) alpha_one else rgb_one) one else 0, .little);
+            const physical_alpha = @min(alpha_channel, channels - 1);
+            for (0..channels) |channel| {
+                std.mem.writeInt(u16, result.bytes[channel * 2 ..][0..2], if (if (channel == physical_alpha) alpha_one else rgb_one) one else 0, .little);
             }
         },
         else => return null,
@@ -47776,6 +47817,36 @@ test "RGBA16F color targets and DCC clears preserve native half-float texels" {
         registers.bytes[0..registers.length],
     );
     try std.testing.expect(colorDccClearTexel(0xff, descriptor) == null);
+}
+
+test "RG16F DCC clears retain both channels and sampled alpha placement" {
+    var color = std.mem.zeroes(gpu.resources.ColorTarget);
+    color.format = 5;
+    color.number_type = 7;
+    color.clear_words = .{ 0xb4003800, 0xdeadbeef };
+    var sampled = std.mem.zeroInit(gpu.ImageDescriptor, .{ .image_type = .color_2d });
+    sampled.unified_format = 29;
+    sampled.descriptor_flags = 1 << 22;
+    for ([_]u8{ 0, 0x40, 0x80, 0xc0 }, [_]u32{ 0, 0x3c000000, 0x00003c00, 0x3c003c00 }) |code, expected| {
+        const texel = colorDccClearTexel(code, color).?;
+        try std.testing.expectEqual(@as(u8, 4), texel.length);
+        try std.testing.expectEqual(expected, std.mem.readInt(u32, texel.bytes[0..4], .little));
+        const sampled_texel = sampledDccFixedClearTexel(code, sampled).?;
+        try std.testing.expectEqualSlices(u8, texel.bytes[0..4], sampled_texel.bytes[0..4]);
+        sampled.descriptor_flags = 0;
+        const reversed = sampledDccFixedClearTexel(code, sampled).?;
+        try std.testing.expectEqual(std.math.rotl(u32, expected, 16), std.mem.readInt(u32, reversed.bytes[0..4], .little));
+        sampled.descriptor_flags = 1 << 22;
+    }
+    const registers = colorDccClearTexel(0x20, color).?;
+    try std.testing.expectEqual(@as(u8, 4), registers.length);
+    try std.testing.expectEqualSlices(f32, &.{ 0.5, -0.25, 0, 0 }, &nativeDccClearColor(vk.format_r16g16_sfloat, registers).?.float32);
+    for ([_]u8{ 0x10, 0x60, 0xff }) |code| {
+        try std.testing.expectEqual(null, colorDccClearTexel(code, color));
+        try std.testing.expectEqual(null, sampledDccFixedClearTexel(code, sampled));
+    }
+    color.component_swap = 2;
+    try std.testing.expectEqual(null, colorDccClearTexel(0x40, color));
 }
 
 test "GFX10 DCC comp-to-single materializes a uniform native texel" {
