@@ -79,6 +79,63 @@ Signed SHA-256:
 
 `3DAB6870872369A535B23730F497E3D5EDEF768A7099FB6233584E71D837B5B4`
 
+## Follow-up: zero first dword — October 23, 2026
+
+With d959b86, the reporter's PPSA21567 build stops at the first submission:
+
+```text
+[apr] invalid native packet cb=0x300aa78a0 offset=0x0 header=0x0
+[apr] submit failed cb=0x300aa78a0 offset=0x0: InvalidCommandBuffer
+ASSERT: D:\asobi\6.0\source\engine\app\Module\System\AprFile.cpp:84
+Apr submitCommandBufferAndGetResult failed : 0x80020016
+```
+
+The 24-byte header passed every check: a non-zero, dword-aligned byte count
+within capacity, a positive command count and a readable stream. Only the
+first stream dword is zero. The reporter later forced
+`sceKernelAprWaitCommandBuffer` to succeed and describes the title as
+clearing "the APR initialization gates", which suggests an early, nearly
+empty submission. The attached log is no longer downloadable, so the header
+values and following words are unknown.
+
+What was ruled out, from the reporter's earlier log and public references:
+
+- The earlier log loads `fakelib\libSceAmpr.sprx` (with
+  `fakelib\libScePlayGo.sprx`). Its unresolved imports, the kernel AMM writers
+  and indirect-buffer submissions, are used both by the retail library and by
+  the [ampr_emu](https://github.com/drakmor/ampr_emu) replacement that some
+  backports ship. Either records the same packed format into the same
+  24-byte header, so the analysis below applies to both.
+- No known packed form starts with a zero dword. ampr_emu's NOP writes
+  `0x5452000F | ((n - 1) << 8)` and leaves the payload unwritten; markers use
+  the same tag. Its decoder, like ours, rejects a zero opcode.
+- The kernel AMM writers already write the packet when `dst` is non-null and
+  report only the size when it is null, which is how libSceAmpr measures and
+  then records a command.
+- The eboot binds to the guest module, not to our HLE libSceAmpr: both export
+  `libSceAmpr` version 1, and an exact guest export takes precedence. Our HLE
+  header layout therefore cannot be mixed into these objects.
+
+Kyty measures `nop(0)` as one dword although no reference encodes it (ampr_emu
+writes no bytes for it). A library that reserves and counts such a dword
+without writing it would produce exactly this stream. Native streams now accept a zero dword as a
+one-dword no-op, but only when counting it that way reproduces the header's
+command count; uncounted zero padding, a stream that was never written and
+all other unknown forms are still rejected before any command runs. The
+first acceptance in a process is logged. Every rejection now prints the
+header fields (kind, bytes, commands, capacity, storage) and the first eight
+stream dwords, so a further report identifies the actual form.
+
+This is **not confirmed on the reporter's build**. The real encoding of the
+reserved dword is unknown, and the black screen reported with the wait
+bypass may have other causes.
+
+- A new regression test covers a counted zero dword followed by a write, the
+  same stream with an uncounted zero (rejected at the final count, without
+  side effects), and a submission holding only the no-op.
+- 15 APR, 23 AMPR and 11 AMM tests pass; the complete HLE suite passes
+  709 tests.
+
 ## Reference
 
 Native packet layouts were cross-checked against the GPL-3.0

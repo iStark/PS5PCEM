@@ -209,6 +209,7 @@ var auto_pool: [maximum_auto_pool]AutoPoolRange = [_]AutoPoolRange{.{}} ** maxim
 var auto_pool_count: usize = 0;
 var counter_bank = counters.Bank{};
 var stopping = std.atomic.Value(bool).init(false);
+var reported_zero_words = std.atomic.Value(bool).init(false);
 
 pub fn attachCompletionSink(sink: ?CompletionSink) void {
     lock.lock();
@@ -585,11 +586,21 @@ fn snapshotNative(address: u64, error_offset: *u32) Error!CommandBuffer {
     var pending: CommandBuffer = .{ .address = address };
     errdefer pending.deinit();
     var offset: usize = 0;
+    var zero_words: u32 = 0;
     while (offset < bytes.len) {
         error_offset.* = @intCast(offset);
+        // No packed command starts with a zero dword. A newer guest
+        // libSceAmpr may reserve one for a command it leaves unwritten (as a
+        // data-less no-op), so read it as a counted one-dword no-op: the
+        // stream is accepted only if that reproduces the header's count.
+        if (std.mem.readInt(u32, bytes[offset..][0..4], .little) == 0) {
+            offset += 4;
+            pending.command_count += 1;
+            zero_words += 1;
+            continue;
+        }
         const decoded = packets.decode(bytes[offset..]) catch {
-            const opcode = std.mem.readInt(u32, bytes[offset..][0..4], .little);
-            std.debug.print("[apr] invalid native packet cb=0x{x} offset=0x{x} header=0x{x}\n", .{ address, offset, opcode });
+            reportNative(address, header, bytes, offset, "invalid native packet");
             return error.InvalidCommandBuffer;
         };
         const op: ?Op = switch (decoded.command) {
@@ -651,8 +662,27 @@ fn snapshotNative(address: u64, error_offset: *u32) Error!CommandBuffer {
         pending.command_count += 1;
     }
     error_offset.* = @intCast(offset);
-    if (pending.command_count != @as(u32, @intCast(header.count)) or pending.map_active) return error.InvalidCommandBuffer;
+    if (pending.command_count != @as(u32, @intCast(header.count)) or pending.map_active) {
+        reportNative(address, header, bytes, offset, if (pending.map_active) "unterminated native map" else "native command count mismatch");
+        return error.InvalidCommandBuffer;
+    }
+    if (zero_words != 0 and !reported_zero_words.swap(true, .monotonic)) {
+        std.debug.print("[apr] accepted {d} zero dword(s) as counted no-ops in native cb=0x{x} ({d} commands)\n", .{ zero_words, address, header.count });
+    }
     return pending;
+}
+
+/// A rejected guest stream is otherwise undiagnosable from a user log: the
+/// header and leading words distinguish an unknown packet form from storage
+/// the guest never filled.
+fn reportNative(address: u64, header: packets.Header, bytes: []const u8, offset: usize, reason: []const u8) void {
+    std.debug.print("[apr] {s} cb=0x{x} offset=0x{x} kind=0x{x} bytes=0x{x} commands={d} capacity=0x{x} storage=0x{x} words=", .{
+        reason, address, offset, header.kind, header.offset, header.count, header.capacity, header.storage,
+    });
+    var index: usize = 0;
+    while (index < 8 and (index + 1) * 4 <= bytes.len) : (index += 1) std.debug.print(" {x:0>8}", .{std.mem.readInt(u32, bytes[index * 4 ..][0..4], .little)});
+    if (offset >= 32 and offset + 4 <= bytes.len) std.debug.print(" ... at offset {x:0>8}", .{std.mem.readInt(u32, bytes[offset..][0..4], .little)});
+    std.debug.print("\n", .{});
 }
 
 pub fn submitCommandBufferWithOffset(address: u64, error_offset: *u32) Error!u32 {
@@ -1245,6 +1275,29 @@ test "native APR validates whole streams before side effects" {
     words = .{ 0x2f, 0x129, 3 };
     header = nativeTestHeader(&words, 2);
     try std.testing.expectError(error.InvalidCommandBuffer, submitCommandBuffer(@intFromPtr(&header)));
+}
+
+test "native APR accepts zero dwords only as counted no-ops" {
+    reset();
+    defer reset();
+    var value: u64 = 0;
+    const address = @intFromPtr(&value);
+    const words = [_]u32{ 0, 0x1105 | @as(u32, @truncate((address >> 16) & 0xffff0000)), @truncate(address) };
+    // Counted as a command, the zero dword precedes a write that still runs.
+    var header = nativeTestHeader(&words, 2);
+    try waitCommandBuffer(try submitCommandBuffer(@intFromPtr(&header)));
+    try std.testing.expectEqual(@as(u64, 1), value);
+    // Uncounted padding is not this form: the whole stream is rejected first.
+    value = 0;
+    header.count = 1;
+    var offset: u32 = 0;
+    try std.testing.expectError(error.InvalidCommandBuffer, submitCommandBufferWithOffset(@intFromPtr(&header), &offset));
+    try std.testing.expectEqual(@as(u32, 12), offset);
+    try std.testing.expectEqual(@as(u64, 0), value);
+    // A submission holding only such a no-op completes without side effects.
+    header = nativeTestHeader(words[0..1], 1);
+    try waitCommandBuffer(try submitCommandBuffer(@intFromPtr(&header)));
+    try std.testing.expectEqual(@as(u64, 0), value);
 }
 
 test "native APR waiting submissions own their decoded commands" {
