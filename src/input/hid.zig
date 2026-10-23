@@ -14,6 +14,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const dualshock = @import("dualshock.zig");
+const motion_sensors = @import("motion.zig");
 const Mutex = @import("memory").HostMutex;
 var mutex: Mutex = .{};
 
@@ -29,8 +30,14 @@ pub const Presence = struct {
 
 /// How many queued reports one poll will consume before settling for what it
 /// has. A driver that is producing faster than the caller polls must not turn
-/// this into an unbounded loop.
-const maximum_drained_reports = 32;
+/// this into an unbounded loop. Every report is still integrated into the
+/// orientation, so this matches the driver queue requested below: a title
+/// polling a few times a second must not lose most of its motion samples.
+const maximum_drained_reports = 512;
+
+/// HidD_SetNumInputBuffers accepts at most 512; Windows defaults to 32, about
+/// a tenth of a second of reports from a Bluetooth DualSense.
+const input_buffer_reports = 512;
 
 /// Polls between attempts to find a controller. Enumerating the HID tree is far
 /// more expensive than a read, so a host with no pad attached must not pay for
@@ -45,6 +52,10 @@ const maximum_report_bytes = 1024;
 var device: Device = .{};
 var polls_since_search: u32 = rediscovery_interval;
 var latest: ?dualshock.Pad = null;
+/// Orientation persists across reconnects, like the guest's own state; only
+/// a guest reset clears it.
+var fusion: motion_sensors.Fusion = .{};
+var latest_motion: ?motion_sensors.Sample = null;
 var write_event: ?*anyopaque = null;
 var completed_reports: u64 = 0;
 
@@ -116,11 +127,49 @@ const Device = struct {
     in_flight_output: dualshock.Output = .{},
     sequence: u4 = 0,
     light_bar_setup: LightBarSetup = .{},
+    calibration: motion_sensors.Calibration = .{},
+    sensor_clock: ?u32 = null,
 
     fn isOpen(self: Device) bool {
         return self.handle != null;
     }
 };
+
+/// The newest fused motion sample, or null while the pad sends no sensors.
+/// Valid after `poll`, which drains the reports it is integrated from.
+pub fn motion() ?motion_sensors.Sample {
+    if (comptime !supported) return null;
+    mutex.lock();
+    defer mutex.unlock();
+    return latest_motion;
+}
+
+pub fn resetOrientation() void {
+    mutex.lock();
+    defer mutex.unlock();
+    fusion.resetOrientation();
+    if (latest_motion != null) latest_motion = fusion.last;
+}
+
+pub fn setTiltCorrection(enabled: bool) void {
+    mutex.lock();
+    defer mutex.unlock();
+    fusion.tilt_correction = enabled;
+}
+
+pub fn setAngularVelocityDeadband(enabled: bool) void {
+    mutex.lock();
+    defer mutex.unlock();
+    fusion.deadband = enabled;
+}
+
+/// Forgets orientation and sensor settings with the guest session.
+pub fn resetMotion() void {
+    mutex.lock();
+    defer mutex.unlock();
+    fusion = .{};
+    if (latest_motion != null) latest_motion = fusion.last;
+}
 
 /// The newest controller state, or null when no supported pad is attached.
 pub fn poll() ?dualshock.Pad {
@@ -405,6 +454,7 @@ fn closeDevice() void {
     if (device.event) |event| _ = Win32.CloseHandle(event);
     device = .{};
     latest = null;
+    latest_motion = null;
 }
 
 /// Consumes every report the driver has ready, keeping the last one.
@@ -428,7 +478,21 @@ fn accept(transferred: u32) void {
     if (transferred == 0) return;
     const report = device.buffer[0..transferred];
     if (device.family == .dual_sense and dualshock.bluetoothLightBarReady(report)) device.light_bar_setup.ready = true;
-    if (dualshock.parse(device.family, report)) |pad| latest = pad;
+    const pad = dualshock.parse(device.family, report) orelse return;
+    latest = pad;
+    if (pad.motion) |raw| integrate(raw);
+}
+
+/// Feeds one report's sensors into the orientation, timed by the pad's own
+/// clock so that a burst drained at once still spans its real interval.
+fn integrate(raw: dualshock.RawMotion) void {
+    const interval_s: f32 = if (device.sensor_clock) |previous|
+        @as(f32, @floatFromInt(motion_sensors.sensorIntervalNanoseconds(device.family, previous, raw.timestamp))) / std.time.ns_per_s
+    else
+        0;
+    device.sensor_clock = raw.timestamp;
+    fusion.update(device.calibration.gyro(raw.gyro), device.calibration.accel(raw.accel), interval_s);
+    latest_motion = fusion.last;
 }
 
 /// Starts one overlapped read. Returns false when the device is gone.
@@ -528,21 +592,35 @@ fn tryOpen(path: [*:0]const u16) bool {
     const event = Win32.CreateEventW(null, 1, 0, null);
     if (event == null) return false;
 
+    const transport = dualshock.transportFromOutputLength(lengths.output);
+    _ = Win32.HidD_SetNumInputBuffers(handle, input_buffer_reports);
     write_event = Win32.CreateEventW(null, 1, 0, null);
     device = .{
         .handle = handle,
         .event = event,
         .family = family,
-        .transport = dualshock.transportFromOutputLength(lengths.output),
+        .transport = transport,
         .input_length = lengths.input,
         .output_length = lengths.output,
         .writable = writable and drivable and write_event != null,
+        .calibration = readCalibration(handle, family, transport, lengths.feature),
     };
     keep = true;
     return true;
 }
 
-const ReportLengths = struct { input: u32, output: u32 };
+/// The factory sensor calibration, or the nominal scales when the pad does
+/// not answer. Reading it also switches a Bluetooth pad to the full report
+/// that carries the sensors.
+fn readCalibration(handle: *anyopaque, family: dualshock.Family, transport: dualshock.Transport, length: u32) motion_sensors.Calibration {
+    var buffer: [maximum_report_bytes]u8 = @splat(0);
+    const size = @max(@as(u32, 41), @min(length, maximum_report_bytes));
+    buffer[0] = motion_sensors.calibrationReportId(family, transport);
+    if (Win32.HidD_GetFeature(handle, &buffer, size) == 0) return .{};
+    return motion_sensors.parseCalibration(family, transport, buffer[0..size]) orelse .{};
+}
+
+const ReportLengths = struct { input: u32, output: u32, feature: u32 };
 
 fn reportLengths(handle: *anyopaque) ?ReportLengths {
     var preparsed: ?*anyopaque = null;
@@ -551,7 +629,7 @@ fn reportLengths(handle: *anyopaque) ?ReportLengths {
     defer _ = Win32.HidD_FreePreparsedData(data);
     var caps = Win32.HidpCaps{};
     if (Win32.HidP_GetCaps(data, &caps) != Win32.hidp_status_success) return null;
-    return .{ .input = caps.input_report_byte_length, .output = caps.output_report_byte_length };
+    return .{ .input = caps.input_report_byte_length, .output = caps.output_report_byte_length, .feature = caps.feature_report_byte_length };
 }
 
 const Overlapped = extern struct {
@@ -643,6 +721,8 @@ const Win32 = if (builtin.os.tag == .windows) struct {
     extern "hid" fn HidD_GetPreparsedData(*anyopaque, *?*anyopaque) callconv(.winapi) u8;
     extern "hid" fn HidD_FreePreparsedData(*anyopaque) callconv(.winapi) u8;
     extern "hid" fn HidP_GetCaps(*anyopaque, *HidpCaps) callconv(.winapi) i32;
+    extern "hid" fn HidD_GetFeature(*anyopaque, [*]u8, u32) callconv(.winapi) u8;
+    extern "hid" fn HidD_SetNumInputBuffers(*anyopaque, u32) callconv(.winapi) u8;
     extern "kernel32" fn CreateFileW([*:0]const u16, u32, u32, ?*anyopaque, u32, u32, ?*anyopaque) callconv(.winapi) *anyopaque;
     extern "kernel32" fn CreateEventW(?*anyopaque, i32, i32, ?[*:0]const u16) callconv(.winapi) ?*anyopaque;
     extern "kernel32" fn ReadFile(*anyopaque, [*]u8, u32, ?*u32, ?*Overlapped) callconv(.winapi) i32;
@@ -731,3 +811,4 @@ test "an unsupported host reports no controller" {
     try std.testing.expect(poll() == null);
     try std.testing.expect(!presence().connected);
 }
+

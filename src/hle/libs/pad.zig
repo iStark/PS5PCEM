@@ -75,8 +75,9 @@ const PadData = extern struct {
     orientation_y: f32 = 0,
     orientation_z: f32 = 0,
     orientation_w: f32 = 1,
+    // A pad at rest measures one g upwards, along +Y.
     acceleration_x: f32 = 0,
-    acceleration_y: f32 = 0,
+    acceleration_y: f32 = 1,
     acceleration_z: f32 = 0,
     angular_velocity_x: f32 = 0,
     angular_velocity_y: f32 = 0,
@@ -112,7 +113,9 @@ comptime {
 
 var initialized: std.atomic.Value(u8) = .init(0);
 var open: std.atomic.Value(u8) = .init(0);
-var motion_sensor_enabled: std.atomic.Value(u8) = .init(0);
+/// Motion sensors report from the start; scePadSetMotionSensorState can stop
+/// them, after which the pad reads as resting.
+var motion_sensor_enabled: std.atomic.Value(u8) = .init(1);
 var feedback_lock: @import("memory").HostMutex = .{};
 
 const VibrationParam = extern struct {
@@ -132,7 +135,7 @@ pub fn reset() void {
     defer feedback_lock.unlock();
     initialized.store(0, .release);
     open.store(0, .release);
-    motion_sensor_enabled.store(0, .release);
+    motion_sensor_enabled.store(1, .release);
     auto_input_origin_us.store(0, .release);
     diagnostics_enabled.store(0, .release);
     diagnostic_last_buttons.store(std.math.maxInt(u32), .release);
@@ -242,6 +245,18 @@ fn fillPadData(output: *PadData) void {
     output.right_stick_y = host.right_stick_y;
     output.analog_l2 = host.analog_l2;
     output.analog_r2 = host.analog_r2;
+    if (motion_sensor_enabled.load(.acquire) != 0) if (host.motion) |sample| {
+        output.orientation_x = sample.orientation[0];
+        output.orientation_y = sample.orientation[1];
+        output.orientation_z = sample.orientation[2];
+        output.orientation_w = sample.orientation[3];
+        output.acceleration_x = sample.acceleration[0];
+        output.acceleration_y = sample.acceleration[1];
+        output.acceleration_z = sample.acceleration[2];
+        output.angular_velocity_x = sample.angular_velocity[0];
+        output.angular_velocity_y = sample.angular_velocity[1];
+        output.angular_velocity_z = sample.angular_velocity[2];
+    };
 
     // Scripted checks use the same pulses with a neutral host state, so typing
     // in another application cannot move the title into a different scene.
@@ -358,12 +373,22 @@ fn setMotionSensorState(handle: i32, enabled: bool) callconv(abi.guest) i32 {
     return errno.ok;
 }
 
-fn acceptHandleState(handle: i32, _: bool) callconv(abi.guest) i32 {
-    return if (validHandle(handle)) errno.ok else error_invalid_handle;
+fn setAngularVelocityDeadbandState(handle: i32, enabled: bool) callconv(abi.guest) i32 {
+    if (!validHandle(handle)) return error_invalid_handle;
+    host_input.setAngularVelocityDeadband(enabled);
+    return errno.ok;
+}
+
+fn setTiltCorrectionState(handle: i32, enabled: bool) callconv(abi.guest) i32 {
+    if (!validHandle(handle)) return error_invalid_handle;
+    host_input.setTiltCorrection(enabled);
+    return errno.ok;
 }
 
 fn resetOrientation(handle: i32) callconv(abi.guest) i32 {
-    return if (validHandle(handle)) errno.ok else error_invalid_handle;
+    if (!validHandle(handle)) return error_invalid_handle;
+    host_input.resetOrientation();
+    return errno.ok;
 }
 
 fn acceptPointerState(handle: i32, parameter: ?*const anyopaque) callconv(abi.guest) i32 {
@@ -427,8 +452,8 @@ pub const exports = [_]symbols.Export{
     .{ .name = "scePadDeviceClassGetExtendedInformation", .function = trace.wrap("scePadDeviceClassGetExtendedInformation", &deviceClassGetExtendedInformation), .expect_id = "AcslpN1jHR8" },
     .{ .name = "scePadDeviceClassParseData", .function = trace.wrap("scePadDeviceClassParseData", &deviceClassParseData), .expect_id = "IHPqcbc0zCA" },
     .{ .name = "scePadSetMotionSensorState", .function = trace.wrap("scePadSetMotionSensorState", &setMotionSensorState), .expect_id = "clVvL4ZDntw" },
-    .{ .name = "scePadSetAngularVelocityDeadbandState", .function = trace.wrap("scePadSetAngularVelocityDeadbandState", &acceptHandleState), .expect_id = "r44mAxdSG+U" },
-    .{ .name = "scePadSetTiltCorrectionState", .function = trace.wrap("scePadSetTiltCorrectionState", &acceptHandleState), .expect_id = "vDLMoJLde8I" },
+    .{ .name = "scePadSetAngularVelocityDeadbandState", .function = trace.wrap("scePadSetAngularVelocityDeadbandState", &setAngularVelocityDeadbandState), .expect_id = "r44mAxdSG+U" },
+    .{ .name = "scePadSetTiltCorrectionState", .function = trace.wrap("scePadSetTiltCorrectionState", &setTiltCorrectionState), .expect_id = "vDLMoJLde8I" },
     .{ .name = "scePadResetOrientation", .function = trace.wrap("scePadResetOrientation", &resetOrientation), .expect_id = "rIZnR6eSpvk" },
     .{ .name = "scePadSetTriggerEffect", .function = trace.wrap("scePadSetTriggerEffect", &acceptPointerState), .expect_id = "2JgFB2n9oUM" },
     .{ .name = "scePadSetVibration", .function = trace.wrap("scePadSetVibration", &setVibration), .expect_id = "yFVnOdGxvZY" },
@@ -467,6 +492,29 @@ test "pad opens the primary user's PS5 special controller port" {
     var data: [1]PadData = .{.{}};
     try std.testing.expectEqual(@as(i32, 1), padRead(primary_handle, &data, 1));
     try std.testing.expectEqual(@as(u8, 1), data[0].connected);
+}
+
+test "pad motion defaults to a resting pad and its controls validate the handle" {
+    reset();
+    defer reset();
+    _ = padInit();
+    try std.testing.expectEqual(error_invalid_handle, resetOrientation(primary_handle));
+    try std.testing.expectEqual(error_invalid_handle, setTiltCorrectionState(primary_handle, false));
+    const handle = padOpen(user_service.primary_user_id, 0, 0, null);
+    var data = PadData{ .acceleration_y = 0 };
+    try std.testing.expectEqual(errno.ok, padReadState(handle, &data));
+    // A physical pad with sensors attached to the test host reports live data.
+    if (host_input.read().motion == null) {
+        try std.testing.expectEqual(@as(f32, 1), data.orientation_w);
+        try std.testing.expectEqual(@as(f32, 1), data.acceleration_y);
+        try std.testing.expectEqual(@as(f32, 0), data.angular_velocity_x);
+    }
+    try std.testing.expectEqual(errno.ok, setMotionSensorState(handle, false));
+    try std.testing.expectEqual(errno.ok, setTiltCorrectionState(handle, false));
+    try std.testing.expectEqual(errno.ok, setAngularVelocityDeadbandState(handle, true));
+    try std.testing.expectEqual(errno.ok, resetOrientation(handle));
+    try std.testing.expectEqual(errno.ok, padReadState(handle, &data));
+    try std.testing.expectEqual(@as(f32, 1), data.acceleration_y);
 }
 
 test "vibration mode accepts the global sentinel handle" {

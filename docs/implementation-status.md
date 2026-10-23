@@ -83,6 +83,16 @@ behind them.
   haptics remain unimplemented. See the
   [controller vibration report](development/controller-vibration-2026-10-16.md)
   and its [Bluetooth follow-up](development/controller-bluetooth-output-2026-10-16.md).
+- DualSense and DualShock 4 motion sensors now reach `scePadReadState`:
+  calibrated acceleration in g, angular velocity in radians per second, and an
+  orientation integrated from every report by a gravity-corrected filter that
+  also learns the resting gyroscope offset. Orientation reset, tilt correction,
+  the angular-velocity deadband and the motion-sensor switch are honored; pads
+  without sensors report rest. A wired DualSense was read physically at rest
+  (about 1.00 g, matching tilt and no heading drift after the offset was
+  learned); Bluetooth, the DualShock 4 and in-game tilt control have automated
+  coverage only. Titles such as ASTRO BOT that prompt for tilting the
+  controller depend on this; pads without a gyroscope cannot tilt yet.
 - Game-controlled LightBar now forwards RGB and reset requests to Sony HID
   output. Color and motors share a coalesced state without overwriting each
   other; light-only reports leave motor control untouched. Reset and pad close

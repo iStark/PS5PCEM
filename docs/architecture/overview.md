@@ -171,6 +171,23 @@ driver's queue and keeps the newest report, because the queue holds several
 samples once a frame runs long and answering with the oldest would make the
 sticks lag by however far behind the emulator had fallen.
 
+The full reports also carry the motion sensors, which libScePad reports on the
+pad's own axes (X right, Y up, Z towards the player): acceleration in g,
+angular velocity in radians per second and an orientation quaternion. Opening
+the pad reads its factory calibration from a feature report, which is also what
+moves a Bluetooth pad onto the full report; scales and layouts follow Linux's
+hid-playstation driver, with nominal scales when the pad does not answer. Every
+drained report is integrated by a Mahony filter timed by the pad's own sensor
+clock, so the orientation does not depend on how often the title polls, and the
+driver queue is enlarged to 512 reports to keep a slowly polling title from
+losing samples. Gravity corrects pitch and roll. The gyroscope's resting offset
+is learned after a second of stillness, since the factory bias no longer matches
+once the sensor warms up and nothing else can correct the heading.
+`scePadResetOrientation` makes the current attitude the identity and its gravity
+reading the reference; tilt correction, the one-degree-per-second deadband and
+the motion sensors themselves follow their libScePad switches. A controller
+without sensors reports a resting pad: identity orientation and one g along +Y.
+
 The same path drives the pad. Output reports carry both motors and the light
 bar, and over Bluetooth they are shifted along and end in a checksum the pad
 verifies before acting, so a report built for the cable is ignored over the air.

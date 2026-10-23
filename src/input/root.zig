@@ -13,6 +13,7 @@ const builtin = @import("builtin");
 pub const dualshock = @import("dualshock.zig");
 pub const hid = @import("hid.zig");
 pub const feedback = @import("feedback.zig");
+pub const motion = @import("motion.zig");
 
 pub const Mode = enum {
     /// Preserve the old unattended bring-up behaviour when game-run is invoked
@@ -34,6 +35,8 @@ pub const State = struct {
     analog_l2: u8 = 0,
     analog_r2: u8 = 0,
     connected: bool = false,
+    /// Present only while a pad with sensors is attached; others report rest.
+    motion: ?motion.Sample = null,
 };
 
 pub const Button = struct {
@@ -209,10 +212,24 @@ pub fn clearKeyboardPresses() void {
 pub fn reset() void {
     feedback.reset();
     if (!builtin.is_test) hid.close();
+    hid.resetMotion();
     clearKeyboardPresses();
     cached_mode = null;
     cached_mapping = null;
     cached_controller_index = null;
+}
+
+/// libScePad's motion controls, applied to the attached pad's sensors.
+pub fn resetOrientation() void {
+    hid.resetOrientation();
+}
+
+pub fn setTiltCorrection(enabled: bool) void {
+    hid.setTiltCorrection(enabled);
+}
+
+pub fn setAngularVelocityDeadband(enabled: bool) void {
+    hid.setAngularVelocityDeadband(enabled);
 }
 
 pub fn setVibration(large: u8, small: u8) void {
@@ -335,7 +352,11 @@ fn mergeController(state: *State) void {
     // Sony's own pads are not XInput devices, so they are read straight from
     // HID and take precedence. XInput remains the path for Xbox-compatible
     // controllers and for anything presenting itself as one.
-    if (hid.poll()) |pad| return mergeSonyPad(state, pad);
+    if (hid.poll()) |pad| {
+        mergeSonyPad(state, pad);
+        state.motion = hid.motion();
+        return;
+    }
     var native: Win32.XInputState = .{};
     if (Win32.XInputGetState(controllerIndex(), &native) != 0) return;
     const pad = native.gamepad;
@@ -575,6 +596,7 @@ test {
     _ = dualshock;
     _ = hid;
     _ = feedback;
+    _ = motion;
 }
 
 test "keyboard and scripted sessions do not drive a physical controller" {

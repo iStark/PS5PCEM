@@ -59,6 +59,28 @@ pub const Pad = struct {
     right_y: u8 = 128,
     analog_l2: u8 = 0,
     analog_r2: u8 = 0,
+    /// Present when the report carries the inertial sensors.
+    motion: ?RawMotion = null,
+};
+
+/// Gyroscope and accelerometer counts on the pad's own axes (X right, Y up,
+/// Z towards the player), stamped with the pad's free-running sensor clock.
+pub const RawMotion = struct {
+    gyro: [3]i16,
+    accel: [3]i16,
+    timestamp: u32,
+};
+
+/// Where the sensors sit in a report that carries them. The six gyroscope
+/// and accelerometer words are adjacent; the clock is placed differently.
+const MotionLayout = struct {
+    gyro: usize,
+    timestamp: usize,
+    timestamp_bytes: usize,
+
+    fn minimumLength(self: MotionLayout) usize {
+        return @max(self.gyro + 12, self.timestamp + self.timestamp_bytes);
+    }
 };
 
 /// Where each field sits inside one report.
@@ -76,6 +98,7 @@ const Layout = struct {
     buttons_system: usize,
     analog_l2: usize,
     analog_r2: usize,
+    motion: ?MotionLayout = null,
 
     fn minimumLength(self: Layout) usize {
         var highest = self.buttons_system;
@@ -95,6 +118,8 @@ const Layout = struct {
 /// it sends over Bluetooth before a host asks for the full one.
 fn compactLayout(base: usize) Layout {
     return .{
+        // Only the DualShock 4 form continues with a 16-bit sensor clock, a
+        // temperature byte and the sensors; see `withMotion`.
         .left_x = base,
         .left_y = base + 1,
         .right_x = base + 2,
@@ -120,7 +145,16 @@ fn extendedLayout(base: usize) Layout {
         .buttons_face = base + 7,
         .buttons_shoulder = base + 8,
         .buttons_system = base + 9,
+        // A reserved word follows the buttons, then the sensors and a 32-bit
+        // clock.
+        .motion = .{ .gyro = base + 15, .timestamp = base + 27, .timestamp_bytes = 4 },
     };
+}
+
+fn withMotion(layout: Layout, base: usize) Layout {
+    var result = layout;
+    result.motion = .{ .gyro = base + 12, .timestamp = base + 9, .timestamp_bytes = 2 };
+    return result;
 }
 
 /// The smallest DualSense report that still carries the full layout. Its
@@ -145,9 +179,9 @@ fn layoutFor(family: Family, report: []const u8) ?Layout {
             else => null,
         },
         .dual_shock_4 => switch (report[0]) {
-            0x01 => compactLayout(1),
+            0x01 => withMotion(compactLayout(1), 1),
             // Bluetooth prefixes two bytes before the wired payload.
-            0x11 => compactLayout(3),
+            0x11 => withMotion(compactLayout(3), 3),
             else => null,
         },
     };
@@ -185,6 +219,19 @@ pub fn parse(family: Family, report: []const u8) ?Pad {
         .touch_pad = system & 0x02 != 0,
     };
     applyHat(&pad, face & 0x0f);
+    // A Bluetooth pad still on its short report simply has no sensors yet.
+    if (layout.motion) |motion| if (report.len >= motion.minimumLength()) {
+        var raw = RawMotion{ .gyro = undefined, .accel = undefined, .timestamp = 0 };
+        for (0..3) |axis| {
+            raw.gyro[axis] = std.mem.readInt(i16, report[motion.gyro + axis * 2 ..][0..2], .little);
+            raw.accel[axis] = std.mem.readInt(i16, report[motion.gyro + 6 + axis * 2 ..][0..2], .little);
+        }
+        raw.timestamp = if (motion.timestamp_bytes == 4)
+            std.mem.readInt(u32, report[motion.timestamp..][0..4], .little)
+        else
+            std.mem.readInt(u16, report[motion.timestamp..][0..2], .little);
+        pad.motion = raw;
+    };
     return pad;
 }
 
@@ -577,6 +624,53 @@ test "the compact DualSense report is told apart by its length" {
     try std.testing.expect(pad.cross);
     try std.testing.expectEqual(@as(u8, 0x33), pad.analog_l2);
     try std.testing.expect(!pad.up and !pad.down and !pad.left and !pad.right);
+}
+
+test "full reports carry the gyroscope, accelerometer and sensor clock" {
+    const gyro = [3]i16{ 120, -340, 5 };
+    const accel = [3]i16{ -15, 8190, 260 };
+    const fill = struct {
+        fn sensors(report: []u8, offset: usize, g: [3]i16, a: [3]i16) void {
+            for (0..3) |axis| {
+                std.mem.writeInt(i16, report[offset + axis * 2 ..][0..2], g[axis], .little);
+                std.mem.writeInt(i16, report[offset + 6 + axis * 2 ..][0..2], a[axis], .little);
+            }
+        }
+    };
+
+    var wired = [_]u8{0} ** dual_sense_extended_length;
+    wired[0] = 0x01;
+    fill.sensors(&wired, 16, gyro, accel);
+    std.mem.writeInt(u32, wired[28..32], 0x1234_5678, .little);
+    var wireless = [_]u8{0} ** 78;
+    wireless[0] = 0x31;
+    @memcpy(wireless[2..34], wired[1..33]);
+    for ([_][]const u8{ &wired, &wireless }) |report| {
+        const motion = (parse(.dual_sense, report) orelse return error.TestFailed).motion orelse return error.TestFailed;
+        try std.testing.expectEqual(gyro, motion.gyro);
+        try std.testing.expectEqual(accel, motion.accel);
+        try std.testing.expectEqual(@as(u32, 0x1234_5678), motion.timestamp);
+    }
+
+    var ds4 = [_]u8{0} ** 64;
+    ds4[0] = 0x01;
+    std.mem.writeInt(u16, ds4[10..12], 0xbeef, .little);
+    fill.sensors(&ds4, 13, gyro, accel);
+    var ds4_wireless = [_]u8{0} ** 78;
+    ds4_wireless[0] = 0x11;
+    @memcpy(ds4_wireless[3..27], ds4[1..25]);
+    for ([_][]const u8{ &ds4, &ds4_wireless }) |report| {
+        const motion = (parse(.dual_shock_4, report) orelse return error.TestFailed).motion orelse return error.TestFailed;
+        try std.testing.expectEqual(gyro, motion.gyro);
+        try std.testing.expectEqual(accel, motion.accel);
+        try std.testing.expectEqual(@as(u32, 0xbeef), motion.timestamp);
+    }
+
+    // The short Bluetooth forms have no sensors yet.
+    var compact = [_]u8{0} ** 10;
+    compact[0] = 0x01;
+    try std.testing.expect(parse(.dual_sense, &compact).?.motion == null);
+    try std.testing.expect(parse(.dual_shock_4, &compact).?.motion == null);
 }
 
 test "reports that are unknown or too short are refused" {
