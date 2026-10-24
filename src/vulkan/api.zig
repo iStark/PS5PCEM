@@ -542,6 +542,12 @@ pub const PhysicalDeviceFragmentShaderBarycentricFeaturesKHR = extern struct {
     fragment_shader_barycentric: Bool32 = 0,
 };
 
+pub const PhysicalDeviceImageViewMinLodFeaturesEXT = extern struct {
+    s_type: u32 = 1000391000,
+    p_next: ?*anyopaque = null,
+    min_lod: Bool32 = 0,
+};
+
 pub const PhysicalDeviceRasterizationOrderAttachmentAccessFeaturesEXT = extern struct {
     s_type: u32 = structure_type_physical_device_rasterization_order_attachment_access_features_ext,
     p_next: ?*anyopaque = null,
@@ -710,6 +716,12 @@ pub const ImageViewUsageCreateInfo = extern struct {
     s_type: u32 = 1000117002,
     p_next: ?*const anyopaque = null,
     usage: Flags,
+};
+
+pub const ImageViewMinLodCreateInfoEXT = extern struct {
+    s_type: u32 = 1000391001,
+    p_next: ?*const anyopaque = null,
+    min_lod: f32 = 0,
 };
 
 pub const MemoryRequirements = extern struct {

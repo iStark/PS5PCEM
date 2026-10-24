@@ -4365,6 +4365,7 @@ const SampledViewPlan = struct {
     texture: gpu.TextureLayout,
     base_level: u8,
     level_count: u8,
+    first_resident_level: u8 = 0,
     first_layer: u32,
     layer_count: u32,
     texel_width: u32,
@@ -4399,6 +4400,7 @@ const SampledViewPlan = struct {
             .texture = texture,
             .base_level = base_level,
             .level_count = level_count,
+            .first_resident_level = @intFromFloat(@floor(sampledImageMinimumLod(descriptor, level_count))),
             .first_layer = 0,
             .layer_count = layer_count,
             .texel_width = shiftTexels(descriptor.width, base_level),
@@ -4432,7 +4434,7 @@ const SampledViewPlan = struct {
 
     fn requiredSourceBytes(self: *const SampledViewPlan) gpu.tiling.Error!u64 {
         var total: u64 = 0;
-        for (0..self.level_count) |index| {
+        for (self.first_resident_level..self.level_count) |index| {
             total = @max(total, (try self.view(@intCast(index))).required_source_bytes);
         }
         return total;
@@ -4445,7 +4447,7 @@ const SampledViewPlan = struct {
         // mips are absent. Copy only the blocks addressed by this view. The
         // intervening bytes are never sampled or used by the detiler.
         @memset(destination, 0);
-        for (0..self.level_count) |index| {
+        for (self.first_resident_level..self.level_count) |index| {
             const mip = self.texture.levels[self.base_level + index];
             for (0..self.layer_count) |layer| {
                 const start: usize = @intCast((self.texture.first_slice + self.first_layer + layer) *
@@ -5988,6 +5990,7 @@ const CachedResidentImageView = struct {
     aspect_mask: vk.Flags,
     layer_count: u32,
     level_count: u32,
+    minimum_lod: f32 = 0,
     view: vk.ImageView,
 };
 
@@ -6261,6 +6264,7 @@ pub const Renderer = struct {
     shader_float64_available: bool,
     image_float32_atomic_min_max_available: bool,
     fragment_barycentric_available: bool,
+    image_view_min_lod_available: bool = false,
     /// VK_EXT_rasterization_order_attachment_access. Queried, but packed
     /// UNORM blends use a storage-buffer copy because this GPU does not
     /// expose the extension.
@@ -6918,6 +6922,8 @@ pub const Renderer = struct {
             candidate.physical_device,
             "VK_EXT_rasterization_order_attachment_access",
         );
+        const image_view_min_lod_extension = physicalDeviceSupportsExtension(allocator, &instance_functions, candidate.physical_device, "VK_EXT_image_view_min_lod");
+        var image_view_min_lod_support = vk.PhysicalDeviceImageViewMinLodFeaturesEXT{};
         var barycentric_support = vk.PhysicalDeviceFragmentShaderBarycentricFeaturesKHR{};
         var shader_atomic_float2_support = vk.PhysicalDeviceShaderAtomicFloat2FeaturesEXT{
             .p_next = if (barycentric_extension) &barycentric_support else null,
@@ -6931,8 +6937,9 @@ pub const Renderer = struct {
         var raster_order_support = vk.PhysicalDeviceRasterizationOrderAttachmentAccessFeaturesEXT{
             .p_next = &timeline_support,
         };
+        image_view_min_lod_support.p_next = if (raster_order_extension) &raster_order_support else &timeline_support;
         var supported_features_2 = vk.PhysicalDeviceFeatures2{
-            .p_next = if (raster_order_extension) &raster_order_support else &timeline_support,
+            .p_next = if (image_view_min_lod_extension) &image_view_min_lod_support else image_view_min_lod_support.p_next,
         };
         instance_functions.get_physical_device_features_2(candidate.physical_device, &supported_features_2);
         if (timeline_support.timeline_semaphore == 0) return Error.TimelineSemaphoreUnavailable;
@@ -6951,6 +6958,7 @@ pub const Renderer = struct {
             shader_atomic_float2_support.shader_image_float32_atomic_min_max != 0;
         const supported_features = supported_features_2.features;
         const fragment_barycentric = barycentric_extension and barycentric_support.fragment_shader_barycentric != 0;
+        const image_view_min_lod = image_view_min_lod_extension and image_view_min_lod_support.min_lod != 0;
         const rasterization_order_color = raster_order_extension and
             raster_order_support.rasterization_order_color_attachment_access != 0;
         var enabled_features = vk.PhysicalDeviceFeatures{};
@@ -7055,8 +7063,16 @@ pub const Renderer = struct {
             .p_next = &timeline_enable,
             .rasterization_order_color_attachment_access = if (rasterization_order_color) vk.true_value else 0,
         };
-        var device_extension_names: [9][*:0]const u8 = undefined;
+        var image_view_min_lod_enable = vk.PhysicalDeviceImageViewMinLodFeaturesEXT{
+            .p_next = if (rasterization_order_color) &raster_order_enable else &timeline_enable,
+            .min_lod = if (image_view_min_lod) vk.true_value else 0,
+        };
+        var device_extension_names: [10][*:0]const u8 = undefined;
         var device_extension_count: u32 = 0;
+        if (image_view_min_lod) {
+            device_extension_names[device_extension_count] = "VK_EXT_image_view_min_lod";
+            device_extension_count += 1;
+        }
         if (calibrated_timestamps) {
             device_extension_names[device_extension_count] = "VK_EXT_calibrated_timestamps";
             device_extension_count += 1;
@@ -7090,7 +7106,7 @@ pub const Renderer = struct {
             device_extension_count += 1;
         }
         const device_info = vk.DeviceCreateInfo{
-            .p_next = if (rasterization_order_color) &raster_order_enable else &timeline_enable,
+            .p_next = if (image_view_min_lod) &image_view_min_lod_enable else image_view_min_lod_enable.p_next,
             .queue_create_info_count = 1,
             .queue_create_infos = @ptrCast(&queue_info),
             .enabled_extension_count = device_extension_count,
@@ -7383,6 +7399,7 @@ pub const Renderer = struct {
             .shader_float64_available = shader_float64,
             .image_float32_atomic_min_max_available = image_float32_atomic_min_max,
             .fragment_barycentric_available = fragment_barycentric,
+            .image_view_min_lod_available = image_view_min_lod,
             .rasterization_order_color = rasterization_order_color,
             .validation_enabled = validation_enabled,
             .graphics_probe_enabled = options.enable_graphics_probe,
@@ -17606,7 +17623,7 @@ pub const Renderer = struct {
             chain.last_used_batch = self.sampled_image_batch;
             return .{
                 .image = chain.image,
-                .view = try self.residentImageViewLevels(chain.image.handle, vk.image_view_type_2d, image_format, try sampledImageComponents(descriptor.dst_select, descriptor.unified_format), vk.image_aspect_color_bit, 1, levels),
+                .view = try self.residentImageViewLevelsMinLod(chain.image.handle, vk.image_view_type_2d, image_format, try sampledImageComponents(descriptor.dst_select, descriptor.unified_format), vk.image_aspect_color_bit, 1, levels, sampledImageMinimumLod(descriptor, levels)),
                 .sampler = try self.residentSampler(sampler_descriptor),
             };
         }
@@ -33135,7 +33152,7 @@ pub const Renderer = struct {
             chain.last_used_batch = self.sampled_image_batch;
             return .{
                 .image = chain.image,
-                .view = try self.residentImageViewLevels(chain.image.handle, vk.image_view_type_2d, image_format, try sampledImageComponents(descriptor.dst_select, descriptor.unified_format), vk.image_aspect_color_bit, 1, levels),
+                .view = try self.residentImageViewLevelsMinLod(chain.image.handle, vk.image_view_type_2d, image_format, try sampledImageComponents(descriptor.dst_select, descriptor.unified_format), vk.image_aspect_color_bit, 1, levels, sampledImageMinimumLod(descriptor, levels)),
                 .sampler = try self.residentSampler(sampler_descriptor),
             };
         }
@@ -33313,7 +33330,7 @@ pub const Renderer = struct {
         // drain per pyramid per frame.
 
         const components = try sampledImageComponents(descriptor.dst_select, descriptor.unified_format);
-        const view = try self.residentImageViewLevels(
+        const view = try self.residentImageViewLevelsMinLod(
             destination.handle,
             vk.image_view_type_2d,
             image_format,
@@ -33321,6 +33338,7 @@ pub const Renderer = struct {
             vk.image_aspect_color_bit,
             1,
             levels,
+            sampledImageMinimumLod(descriptor, levels),
         );
         if (self.reported_mip_assemblies < 8) {
             self.reported_mip_assemblies += 1;
@@ -33714,6 +33732,8 @@ pub const Renderer = struct {
         dimension: rdna2.spirv.SampledImageDimension,
         render_target_write: ?GuestColorTarget,
     ) anyerror!PreparedSampledImage {
+        if (sampledImageMinimumLod(descriptor, descriptor.viewMipLevels()) > 0 and !self.image_view_min_lod_available)
+            return error.ImageViewMinLodUnavailable;
         if (self.sampled_address_census.count() < 32768) {
             if (self.sampled_address_census.getOrPut(self.allocator, descriptor.address)) |entry| {
                 if (!entry.found_existing) entry.value_ptr.* = .{};
@@ -34007,7 +34027,7 @@ pub const Renderer = struct {
             self.frame_profile.texture_hits +|= 1;
             return .{
                 .image = item.image,
-                .view = if (item.image_state_hash == image_state_hash) item.view else try self.residentImageViewLevels(
+                .view = if (item.image_state_hash == image_state_hash) item.view else try self.residentImageViewLevelsMinLod(
                     item.image.handle,
                     switch (dimension) {
                         .two_d => vk.image_view_type_2d,
@@ -34020,6 +34040,7 @@ pub const Renderer = struct {
                     vk.image_aspect_color_bit,
                     if (is_cube or is_2d_array) available_layers else 1,
                     item.mip_levels,
+                    sampledImageMinimumLod(descriptor, item.mip_levels),
                 ),
                 .sampler = try self.residentSampler(sampler_descriptor),
             };
@@ -34212,7 +34233,7 @@ pub const Renderer = struct {
                 if (descriptor.tile_mode != .depth) return Error.GuestMemoryReadFailed;
                 source_available = false;
                 fillUnbackedDepthSample(descriptor.unified_format, linear);
-            } else if (self.computeDetileBuffer(plan, tiled, byte_count) catch |err| fallback: {
+            } else if ((if (plan.first_resident_level == 0) self.computeDetileBuffer(plan, tiled, byte_count) else null) catch |err| fallback: {
                 if (self.detile_fallback_reports < 4) {
                     self.detile_fallback_reports += 1;
                     std.debug.print("[vulkan detile] CPU fallback after {s}: input={d} output={d}\n", .{ @errorName(err), tiled.len, byte_count });
@@ -34234,7 +34255,12 @@ pub const Renderer = struct {
                 while (level_index < plan.level_count) : (level_index += 1) {
                     const level = try plan.view(level_index);
                     const packed_bytes: usize = @intCast(try level.stagingBytes());
-                    try level.detile(tiled, linear[cursor..][0..packed_bytes]);
+                    // MIN_LOD excludes unresident high mips. Keep the full
+                    // Vulkan dimensions, but never read those guest bytes.
+                    if (level_index < plan.first_resident_level)
+                        @memset(linear[cursor..][0..packed_bytes], 0)
+                    else
+                        try level.detile(tiled, linear[cursor..][0..packed_bytes]);
                     cursor += std.mem.alignForward(usize, packed_bytes, 16);
                 }
             }
@@ -34556,7 +34582,9 @@ pub const Renderer = struct {
             self.frame_profile.texture_upload_bytes +%= byte_count;
         }
 
+        const minimum_lod = vk.ImageViewMinLodCreateInfoEXT{ .min_lod = sampledImageMinimumLod(descriptor, mip_levels) };
         const view_info = vk.ImageViewCreateInfo{
+            .p_next = if (minimum_lod.min_lod > 0) &minimum_lod else null,
             .image = image.handle,
             .view_type = switch (dimension) {
                 .two_d => vk.image_view_type_2d,
@@ -34913,11 +34941,27 @@ pub const Renderer = struct {
         layer_count: u32,
         level_count: u32,
     ) anyerror!vk.ImageView {
+        return self.residentImageViewLevelsMinLod(image, view_type, format, components, aspect_mask, layer_count, level_count, 0);
+    }
+
+    fn residentImageViewLevelsMinLod(
+        self: *Renderer,
+        image: vk.Image,
+        view_type: u32,
+        format: u32,
+        components: vk.ComponentMapping,
+        aspect_mask: vk.Flags,
+        layer_count: u32,
+        level_count: u32,
+        minimum_lod: f32,
+    ) anyerror!vk.ImageView {
+        if (minimum_lod > 0 and !self.image_view_min_lod_available) return error.ImageViewMinLodUnavailable;
         for (self.resident_image_views.items) |cached| {
             if (cached.image == image and cached.view_type == view_type and
                 cached.format == format and cached.aspect_mask == aspect_mask and
                 cached.layer_count == layer_count and
                 cached.level_count == level_count and
+                cached.minimum_lod == minimum_lod and
                 std.meta.eql(cached.components, components))
             {
                 return cached.view;
@@ -34927,8 +34971,12 @@ pub const Renderer = struct {
         // Its sRGB sampled view cannot inherit STORAGE usage: sRGB formats do
         // not support typed image stores (VUID-usage-02275).
         const sampled_usage = vk.ImageViewUsageCreateInfo{ .usage = vk.image_usage_sampled_bit };
-        const info = vk.ImageViewCreateInfo{
+        const min_lod_info = vk.ImageViewMinLodCreateInfoEXT{
             .p_next = if (format == vk.format_r8g8b8a8_srgb) &sampled_usage else null,
+            .min_lod = minimum_lod,
+        };
+        const info = vk.ImageViewCreateInfo{
+            .p_next = if (minimum_lod > 0) &min_lod_info else min_lod_info.p_next,
             .image = image,
             .view_type = view_type,
             .format = format,
@@ -34948,6 +34996,7 @@ pub const Renderer = struct {
             .aspect_mask = aspect_mask,
             .layer_count = layer_count,
             .level_count = level_count,
+            .minimum_lod = minimum_lod,
             .view = view,
         });
         return view;
@@ -43289,6 +43338,7 @@ fn sampledImageStateHash(
         descriptor.descriptor_flags & (3 << 21),
         descriptor.unified_format,
         descriptor.base_array,
+        descriptor.min_lod,
         @as(u32, descriptor.base_level) |
             (@as(u32, descriptor.last_level) << 8) |
             (@as(u32, descriptor.max_mip) << 16) |
@@ -43312,6 +43362,14 @@ fn sampledImageStateHash(
         @bitCast(sampler.lod_bias),
     };
     return std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(&words));
+}
+
+/// T# MIN_LOD is U4.8 in resource space, unlike S# LOD bounds, which
+/// are relative to BASE_LEVEL. Uploaded views rebase their first mip to zero.
+fn sampledImageMinimumLod(descriptor: gpu.ImageDescriptor, levels: u32) f32 {
+    const absolute = @as(f32, @floatFromInt(descriptor.min_lod)) / 256.0;
+    const base: f32 = @floatFromInt(descriptor.viewBaseLevel());
+    return std.math.clamp(absolute - base, 0, @as(f32, @floatFromInt(levels -| 1)));
 }
 
 fn sampledImageLinearFormat(format: u16) u16 {
@@ -43338,6 +43396,9 @@ fn sampledImageUploadStateHash(descriptor: gpu.resources.ImageDescriptor) u64 {
     // and floating-point formats retain their own decoding and allocation.
     storage_descriptor.unified_format = sampledImageLinearFormat(descriptor.unified_format);
     storage_descriptor.dst_select = .{ 4, 5, 6, 7 };
+    // Fractional clamp changes share bytes. Crossing an integer boundary
+    // changes the resident mip set, so newly available levels must be uploaded.
+    storage_descriptor.min_lod &= 0xff00;
     return sampledImageViewStateHash(storage_descriptor, false);
 }
 
@@ -43351,6 +43412,7 @@ fn sampledImageViewStateHash(
         descriptor.descriptor_flags & (3 << 21),
         descriptor.unified_format,
         descriptor.base_array,
+        descriptor.min_lod,
         @as(u32, descriptor.base_level) |
             (@as(u32, descriptor.last_level) << 8) |
             (@as(u32, descriptor.max_mip) << 16) |
@@ -48207,6 +48269,7 @@ test "submission polling preserves unfinished tickets and never waits for later 
     renderer.pending_sampled_fault_checks = .initEmpty();
     renderer.deferred_vulkan_objects = .empty;
     renderer.guest_buffers = .empty;
+    renderer.storage_image_cache = .empty;
     renderer.deferred_internal_release_count = 0;
     Mock.tick = 6;
     try std.testing.expectEqual(gpu.DcbBackend.CompletionStatus.pending, try renderer.pollSubmission(7, false));

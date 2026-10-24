@@ -371,7 +371,7 @@ test "overlap level bounds follow replacement across empty and reused classes" {
     }) |replacement| {
         index.replace(0, entries[0].guest_address, entries[0].size, replacement.guest_address, replacement.size);
         entries[0] = replacement;
-        var found = index.candidates(&entries, replacement.guest_address + replacement.size - 1, 1);
+        var found = index.candidates(&entries, replacement.guest_address + (replacement.size - 1), 1);
         try std.testing.expectEqual(@as(?usize, 0), found.next());
         var outside = index.candidates(&entries, 0x80000000, 4);
         try std.testing.expectEqual(null, outside.next());

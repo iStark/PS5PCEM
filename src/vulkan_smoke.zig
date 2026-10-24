@@ -10633,6 +10633,82 @@ fn runStreamedMipProbe(allocator: std.mem.Allocator) !void {
     std.debug.print("streamed mip probe passed: absent high mips and visible base-level sampling\n", .{});
 }
 
+fn runImageMinLodProbe(allocator: std.mem.Allocator) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{});
+    defer renderer.deinit();
+    if (!renderer.image_view_min_lod_available) return error.ImageViewMinLodUnavailable;
+    const Memory = struct {
+        guest: GuestMemory = .{},
+        resident_end: u64 = 0,
+        fn read(context: ?*anyopaque, address: u64, bytes: []u8) bool {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            if (address >= 0x12000 and address + bytes.len > self.resident_end) return false;
+            return GuestMemory.read(&self.guest, address, bytes);
+        }
+        fn write(context: ?*anyopaque, address: u64, bytes: []const u8) bool {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            return GuestMemory.write(&self.guest, address, bytes);
+        }
+    };
+    var memory = Memory{};
+    const guest = &memory.guest;
+    _ = renderer.dcbBackend(.{ .context = &memory, .read = Memory.read, .write = Memory.write });
+    // Sample LOD zero: the image clamp must win even when S# MAX_LOD is zero.
+    const code = [_]u32{
+        vop1(1, 0, 255), 0x3e80_0000, vop1(1, 1, 255), 0x3e80_0000,
+        0xf09c_010a,     0x0040_0200, 1,               0xe070_0000,
+        0x8003_0200,     0xbf81_0000,
+    };
+    for (code, 0..) |word, index| guest.word(0x100 + index * 4, word);
+    var image = sampledImageDescriptorWords(0x12000, 256, 256);
+    image[3] |= (8 << 16) | (@as(u32, @intFromEnum(gpu.resources.TileMode.standard_4kb)) << 20);
+    image[5] = 8 << 4;
+    const texture = try gpu.TextureLayout.fromImage(try gpu.resources.decodeImageDescriptor(&image));
+    memory.resident_end = 0x12000 + (try texture.subresource(2, 0, 1)).required_source_bytes;
+    // Mips zero and one are deliberately absent, not silently zero-filled RAM.
+    try std.testing.expect(memory.resident_end < 0x12000 + texture.required_source_bytes);
+    for (2..texture.mip_levels) |level| {
+        const view = try texture.subresource(@intCast(level), 0, 1);
+        for (0..view.height) |y| for (0..view.width) |x| {
+            const address = 0x12000 + @as(usize, @intCast(try view.sourceByteOffset(@intCast(x), @intCast(y), 0, 0)));
+            guest.word(address, 0xff00_0000 | (@as(u32, @intCast(level)) * 24));
+        };
+    }
+    var state = gpu.State{};
+    const compute = gpu.resources.ShaderStage.compute;
+    try state.writeRegister(.shader, compute.programRegisterBase(), 1);
+    try state.writeRegister(.shader, compute.programRegisterBase() + 1, 0);
+    try state.writeRegister(.shader, 0x213, 16 << 1);
+    // Repeat a descriptor after changing both its clamp and BASE_LEVEL. This
+    // exercises the exact hit, alternate-view and re-upload cache paths.
+    const Case = struct { base: u32, min_lod: u32, expected: f32 };
+    for ([_]Case{
+        .{ .base = 0, .min_lod = 0x200, .expected = 48 },
+        .{ .base = 0, .min_lod = 0x200, .expected = 48 },
+        .{ .base = 0, .min_lod = 0x240, .expected = 54 },
+        .{ .base = 0, .min_lod = 0x300, .expected = 72 },
+        .{ .base = 1, .min_lod = 0x200, .expected = 48 },
+        .{ .base = 2, .min_lod = 0x100, .expected = 48 },
+        .{ .base = 0, .min_lod = 0xfff, .expected = 192 },
+        .{ .base = 0, .min_lod = 0x200, .expected = 48 },
+    }) |case| {
+        image[1] = (image[1] & ~@as(u32, 0xfff00)) | (case.min_lod << 8);
+        image[3] = (image[3] & ~@as(u32, 0xf000)) | (case.base << 12);
+        var userdata: [16]u32 = @splat(0);
+        @memcpy(userdata[0..8], &image);
+        userdata[8] = 0x92;
+        userdata[10] = 2 << 26; // linear mip interpolation
+        @memcpy(userdata[12..16], &[_]u32{ 0x10000, 4 << 16, 1, 0 });
+        for (userdata, 0..) |word, index| try state.writeRegister(.shader, compute.userDataBase() + @as(u32, @intCast(index)), word);
+        _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
+        var bytes: [4]u8 = undefined;
+        try renderer.readbackGuestStorageBuffer(0x10000, &bytes);
+        const actual: f32 = @bitCast(std.mem.readInt(u32, &bytes, .little));
+        try std.testing.expectApproxEqAbs(case.expected / 255.0, actual, 0.0001);
+    }
+    std.debug.print("image MIN_LOD passed: missing high mips, fractional clamp, sampler maximum, rebased views and cache reuse\n", .{});
+}
+
 fn runBc4Probe(allocator: std.mem.Allocator) !void {
     for ([_]u16{ 175, 176 }) |format| {
         var renderer = try vulkan.Renderer.init(allocator, .{});
@@ -15221,6 +15297,10 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--streamed-mips")) {
         try runStreamedMipProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--image-min-lod")) {
+        try runImageMinLodProbe(allocator);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--indirect-images")) {
