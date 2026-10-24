@@ -3420,7 +3420,7 @@ fn runDispatcherBudgetProbe(allocator: std.mem.Allocator) !void {
     var guest = GuestMemory{};
     _ = renderer.dcbBackend(guest.interface());
     const store = mubuf(0x1c, 0, 0, 1, 4);
-    const code = [_]u32{
+    const base_code = [_]u32{
         sop1(3, 0, 128), vop1(1, 1, 128), // Counter and output offset.
         0xbf0a_ff00, 512, // s_cmp_lt_u32 s0, 512
         0xbf84_0008, // Exit at pc 52.
@@ -3434,13 +3434,35 @@ fn runDispatcherBudgetProbe(allocator: std.mem.Allocator) !void {
         0xbf82_fff5, // Back to pc 8.
         0xbf81_0000,
     };
-    for (code, 0..) |word, index| guest.word(0x100 + index * 4, word);
-    var analysis = try gpu.shader_analysis.decode(allocator, .{ .context = &guest, .read_fn = GuestMemory.read }, 0x100, 64);
-    defer analysis.deinit(allocator);
-    for ([_][2]u32{ .{ 8, 2 }, .{ 2048, 512 }, .{ 4096, 512 }, .{ 8, 2 } }) |test_case| {
+    // Loop iterations, dispatcher block budget, completed stores, selections.
+    // The nested selection visits three blocks per iteration. Real particle
+    // initialization also has more block visits than elements to initialize.
+    for ([_][4]u32{
+        .{ 512, 8, 2, 1 },
+        .{ 512, 256, 84, 1 },
+        .{ 512, 2048, 512, 1 },
+        .{ 2048, 4096, 1364, 1 },
+        .{ 2048, vulkan.backend.compute_dispatcher_budget, 2048, 1 },
+        .{ 5000, vulkan.backend.compute_dispatcher_budget, 5000, 1 },
+        .{ 5550, 65536, std.math.maxInt(u32), 16 },
+        .{ 5550, vulkan.backend.compute_dispatcher_budget, 5550, 16 },
+        .{ 512, 8, 2, 1 },
+    }) |test_case| {
+        var code: std.ArrayList(u32) = .empty;
+        defer code.deinit(allocator);
+        try code.appendSlice(allocator, base_code[0..7]);
+        for (0..test_case[3]) |_| try code.appendSlice(allocator, base_code[7..9]);
+        try code.appendSlice(allocator, base_code[9..]);
+        code.items[3] = test_case[0];
+        code.items[4] = 0xbf84_0000 | @as(u32, @intCast(code.items.len - 6));
+        const back: i16 = @intCast(3 - @as(i32, @intCast(code.items.len)));
+        code.items[code.items.len - 2] = 0xbf82_0000 | @as(u32, @as(u16, @bitCast(back)));
+        for (code.items, 0..) |word, index| guest.word(0x100 + index * 4, word);
+        var analysis = try gpu.shader_analysis.decode(allocator, .{ .context = &guest, .read_fn = GuestMemory.read }, 0x100, 256);
+        defer analysis.deinit(allocator);
         var module = try analysis.translateSpirv(allocator, .{
             .stage = .compute,
-            .maximum_dispatcher_iterations = test_case[0],
+            .maximum_dispatcher_iterations = test_case[1],
             .report_dispatcher_exhaustion = true,
             .storage_buffers = &.{.{ .resource_sgpr = 4, .descriptor_index = 0, .extent_bytes = 4 }},
             .flat_memories = &.{.{ .descriptor_index = 1, .fault_record_word = 8 }},
@@ -3454,16 +3476,20 @@ fn runDispatcherBudgetProbe(allocator: std.mem.Allocator) !void {
         _ = try renderer.dispatchSpirv(module.words, .{ 1, 1, 1 });
         var output: [4]u8 = undefined;
         try renderer.readbackGuestStorageBuffer(0x10000, &output);
-        try std.testing.expectEqual(test_case[1], std.mem.readInt(u32, &output, .little));
+        const completed = std.mem.readInt(u32, &output, .little);
+        if (test_case[2] == std.math.maxInt(u32)) {
+            try std.testing.expect(completed > 0 and completed < test_case[0]);
+        } else try std.testing.expectEqual(test_case[2], completed);
         var fault: [48]u8 = undefined;
         try renderer.readbackGuestStorageBuffer(0x12000, &fault);
-        try std.testing.expectEqual(@as(u32, if (test_case[0] == 8) 1 else 0), std.mem.readInt(u32, fault[8..12], .little));
-        if (test_case[0] == 8) {
+        const truncated = test_case[2] != test_case[0];
+        try std.testing.expectEqual(@as(u32, if (truncated) 1 else 0), std.mem.readInt(u32, fault[8..12], .little));
+        if (truncated) {
             try std.testing.expectEqual(@as(u32, 0xffffffff), std.mem.readInt(u32, fault[32..36], .little));
-            try std.testing.expectEqual(@as(u32, 8), std.mem.readInt(u32, fault[40..44], .little));
+            try std.testing.expectEqual(test_case[1], std.mem.readInt(u32, fault[40..44], .little));
         }
     }
-    std.debug.print("dispatcher budgets passed: bounded early exit, 512 complete iterations and pipeline reuse\n", .{});
+    std.debug.print("dispatcher budgets passed: bounded early exit, 512/2048/5000/5550 complete iterations, wide loop bodies and pipeline reuse\n", .{});
 }
 
 fn runWave64BallotsProbe(allocator: std.mem.Allocator) !void {

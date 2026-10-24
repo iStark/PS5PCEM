@@ -46,6 +46,11 @@ pub export var checked_bvh_diagnostics: bool = true;
 /// scene exhausts 4,096 blocks in 13 invocations and completes at 16,384.
 /// Exhaustion remains an explicit failure at any budget.
 pub export var checked_bvh_diagnostic_iterations: u32 = 16384;
+/// Block visits, not guest instructions or loop iterations. Particle emission
+/// visits many branches per element: a captured 4,000-element loop is still
+/// unfinished after 65,536 visits. Allow long bounded kernels to complete.
+/// Retain a finite guard and include changes in the translation cache key.
+pub export var compute_dispatcher_budget: u32 = 1048576;
 pub export var capture_storage_image_address: u64 = 0;
 pub export var capture_vertex_program: u64 = 0;
 pub export var capture_vertex_flip: u64 = 0;
@@ -10902,6 +10907,13 @@ pub const Renderer = struct {
         } else false);
         if (checked_bvh and resources.flat_memory_count == 0)
             try self.prepareCheckedBvhMemory(resources, reader, analysis);
+        // A dispatcher that reaches its guard must not silently leave a
+        // partly written image for subsequent passes. Reuse the checked
+        // memory fault record for programs that may need bounded control flow.
+        // An empty region contributes no readable guest-memory range.
+        const report_compute_exhaustion = checked_bvh or analysis.graph.back_edge_count != 0 or analysis.graph.blocks.items.len > 256;
+        if (report_compute_exhaustion and resources.flat_memory_count == 0)
+            try self.stageFlatMaterialPage(resources, 0, &.{});
         // Query inputs change which branch provenance visits first. The same
         // producer/register set must still use the same dynamic uniform words,
         // or its large SPIR-V module recompiles solely because discovery order
@@ -10940,8 +10952,8 @@ pub const Renderer = struct {
             .program_address = if (gpu.resource_checkpoints.hasStaticCalls(analysis.program.instructions.items, if (analysis.resource_checkpoints) |*plan| plan else null)) bindings.program_address else 0,
             .local_size = local_size,
             .physical_local_size = try @import("compute_shape.zig").fit(local_size, self.device_info.max_compute_work_group_size, self.device_info.max_compute_work_group_invocations),
-            .maximum_dispatcher_iterations = if (checked_bvh) (if (@atomicLoad(bool, &checked_bvh_diagnostics, .monotonic)) std.math.clamp(@atomicLoad(u32, &checked_bvh_diagnostic_iterations, .monotonic), 4096, 65536) else 4096) else if (yotei_environment_lighting) 2048 else if (yotei_atmosphere_multiscatter) 1024 else if (yotei_atmosphere_precompute) 512 else 256,
-            .report_dispatcher_exhaustion = checked_bvh,
+            .maximum_dispatcher_iterations = if (checked_bvh) (if (@atomicLoad(bool, &checked_bvh_diagnostics, .monotonic)) std.math.clamp(@atomicLoad(u32, &checked_bvh_diagnostic_iterations, .monotonic), 4096, 65536) else 4096) else @max(std.math.clamp(@atomicLoad(u32, &compute_dispatcher_budget, .monotonic), 256, 1048576), if (yotei_environment_lighting) @as(u32, 2048) else if (yotei_atmosphere_multiscatter) @as(u32, 1024) else if (yotei_atmosphere_precompute) @as(u32, 512) else @as(u32, 256)),
+            .report_dispatcher_exhaustion = report_compute_exhaustion,
             .wave32 = initiator & (1 << 15) != 0,
             .wave_exchange_double_buffer = wave_exchange_double_buffer,
             .storage_buffers = resources.mappings[0..resources.mapping_count],

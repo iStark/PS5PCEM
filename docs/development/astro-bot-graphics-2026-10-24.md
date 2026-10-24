@@ -118,3 +118,104 @@ Local evidence: `.codex-astro24-coherence-visible.{out,err}.log`,
 `.codex-astro24-storage-layout.log`, `.codex-astro24-covered-raster.log` and
 `.codex-astro24-overwrite.log`. These diagnostic files and raw texture dumps
 remain local; only the selected screenshots are published.
+
+## Follow-up: compute control flow and motion input
+
+The next investigation found partially written depth-of-field output. In a
+captured dispatch of program `0x5007a7600`, all 77 output texels containing
+non-finite half-float values were bit-for-bit unchanged from the input backing.
+The translated program used a 256-block dispatcher limit. This is evidence of
+missing writes; it does not by itself establish why each write was missed.
+
+A first development candidate allowed 65,536 dispatcher block visits and reported
+unfinished compute control flow through the existing deferred shader-fault
+record. The finite guard remains enabled. An intermediate 4,096-visit candidate
+reported three unfinished invocations in particle program `0x555f4f500` and
+stopped the graphics queue. A later captured particle table contains three
+2,048-element definitions; such a loop can exceed 4,096 block visits. The
+65,536-visit run passes the previous stop and reaches the animated title screen
+without a recorded shader fault.
+
+Native GPU tests verify complete 512-, 2,048- and 5,000-iteration loops, explicit
+failure records at deliberately insufficient budgets, and pipeline reuse.
+The original 256-visit limit completes only 84 stores in the nested-loop probe.
+**A matched gameplay comparison is still pending.** Neither the depth-of-field
+artifacts nor the remaining material/color defects are declared fixed by this
+title-screen result. No new gameplay FPS result is claimed.
+
+The reported missing motion input had two confirmed session-level causes:
+the earlier executable predated commit `593935b`, and that diagnostic run used
+`PS5_INPUT_MODE=keyboard`, which deliberately excludes physical controllers.
+The restarted candidate includes the motion implementation and uses `hybrid`.
+Live process samples show enabled motion sensors, calibrated acceleration,
+angular velocity and changing orientation. **ASTRO BOT's tilt tutorial has not
+yet been reached again**, so its response remains unverified.
+
+Additional local evidence: `.codex-astro24-dispatch-visible.err.log`,
+`.codex-astro24-dispatch64-visible.{out,err}.log`,
+`.codex-astro24-dispatch64-probe.log`, and
+`.codex-astro24-motion-samples.log`.
+
+That intermediate executable and matching PDB were rebuilt and installed without
+closing the running test. Installed executable SHA-256:
+`A6797E735B81CCB09533E2914C49AEDE6409F1E66469B9F65847CE2E2987B1CA`.
+The live title-screen check used the preceding diagnostic executable with its
+exported compute budget set to the same 65,536 value before shader compilation.
+
+### Afternoon follow-up: reproduce the particle loop before raising the guard
+
+A fresh launch of that executable reached the opening cinematic. At flip 4520,
+both captured outputs of the depth-of-field producer contained no NaN/Inf and
+its shader fault record was clear. This is a different shot from the earlier
+77-texel capture, so it does not establish a matched visual fix. Frame 4736 still
+shows noisy surfaces and excessive color/glow.
+
+![Intermediate ASTRO BOT cinematic with robots; noisy panels and excessive colored glow remain](../images/astro-bot-compute-investigation-2026-10-24.png)
+
+This is an unretouched renderer capture of the **intermediate** executable,
+not evidence that the subsequent change fixes every visual defect.
+
+At flip 5049, the same run stopped after particle program `0x555f4f500`
+exhausted 65,536 block visits in block 122. The deferred fault check prevented
+the incomplete result from being silently treated as successful work.
+
+An isolated Vulkan replay made the cause testable without another full intro:
+
+- Replaying the earlier frame-1093 capture reproduced all six captured output
+  buffers byte for byte, including the empty fault record.
+- A diagnostic fixture then used emitter, definition and parameter snapshots
+  from the stopped scene and covered all emitter slots. This is a reconstructed
+  workload, **not an exact replay of the failing frame**.
+- With 65,536 block visits, it reproduced the same particle-loop failure.
+  Register instrumentation recorded **2,340 completed iterations against a
+  finite bound of 4,000**. The loop increments its counter by one and has many
+  conditional blocks per particle; it was not simply stuck at a fixed counter.
+- With budgets of **262,144 and 1,048,576**, the fault records were clear and
+  all six output buffers matched byte for byte between those two runs.
+
+The follow-up changes the ordinary compute dispatcher guard to **1,048,576
+block visits**, retaining the finite bound and explicit exhaustion error.
+The separate checked-BVH budget is unchanged. The value is part of the shader
+translation key. No guest shader, effect or draw is disabled.
+
+The native regression now also exercises 5,550 iterations through a wide loop
+body, alongside the shorter loops, intentionally insufficient budgets and
+pipeline reuse. This addresses a real long-loop workload; it does not promise
+that every future kernel will fit the guard or that the remaining material
+defects are fixed. A fresh end-to-end gameplay check is still required.
+
+Local follow-up evidence: `.codex-astro24-noon-visible.{out,err}.log`,
+`.codex-astro24-replay-original.log`, `.codex-astro24-replay-params.log`,
+`.codex-astro24-replay-budget262k.log` and
+`.codex-astro24-replay-budget1m.log`. Replay fixtures and guest shader binaries
+remain local.
+
+The final follow-up builds successfully (**18/18 build steps**). The native
+dispatcher regression passes with `VK_LAYER_KHRONOS_validation` requested and
+no reported validation errors; formatting and whitespace checks pass.
+`game-run.exe` and its matching PDB are installed. Executable SHA-256:
+`EFDC38BB5DE1F3E59855F5F10394C90E586DAEEE3075752E848FE34296DC939C`.
+The new live run uses the normal Vulkan path and hybrid controller input.
+Logs: `.codex-astro24-dispatch1m-build-final.log`,
+`.codex-astro24-dispatch1m-probe.log` and
+`.codex-astro24-dispatch1m-visible.{out,err}.log`.
