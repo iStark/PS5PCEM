@@ -1167,6 +1167,7 @@ const DeferredVulkanObject = union(enum) {
     framebuffer: vk.Framebuffer,
     pipeline: vk.Pipeline,
     shader_module: vk.ShaderModule,
+    descriptor_pool: vk.DescriptorPool,
     storage_image_release: usize,
 };
 
@@ -1250,6 +1251,10 @@ const dynamic_scalar_buffer_bytes = dynamic_scalar_buffer_words * @sizeOf(u32);
 /// draw-heavy 2D titles such as Jets 'n' Guns 2, which regularly exceeds 256
 /// draws in one guest frame.
 pub export var retain_compatible_render_passes: bool = true;
+/// Avoid NVIDIA's expensive RGB-only RGBA16F attachment path when the
+/// programmed alpha blend preserves the destination. An integer GPU snapshot
+/// restores alpha bits which floating-point blending can otherwise clamp.
+pub export var full_mask_preserve_alpha: bool = true;
 pub export var retained_render_pass_draws: u64 = 0;
 const maximum_frame_descriptor_sets = 512;
 const descriptor_scalar_stride = std.mem.alignForward(usize, dynamic_scalar_buffer_bytes, 256);
@@ -3073,6 +3078,14 @@ fn displayColorTarget(buffer: DisplayBuffer) ?gpu.resources.ColorTarget {
     return target;
 }
 
+/// Per-target integer alpha snapshot used by the native RGB mask workaround.
+const AlphaPreserveResources = struct {
+    view: vk.ImageView,
+    buffer: OwnedBuffer,
+    pool: vk.DescriptorPool,
+    set: vk.DescriptorSet,
+};
+
 /// One guest color allocation kept resident as a Vulkan attachment across
 /// draws.  The old path recreated this entire object graph and round-tripped
 /// every pixel through the CPU after each draw, which both destroyed
@@ -3085,6 +3098,7 @@ const CachedRenderTarget = struct {
     render_pass: vk.RenderPass,
     framebuffer: vk.Framebuffer,
     depth_pass: ?DepthPass = null,
+    alpha_preserve: ?AlphaPreserveResources = null,
     initialized: bool = false,
     /// Capture residency when the attachment is created, before a later
     /// eviction/readback can outlive the title's allocation.
@@ -6138,6 +6152,11 @@ pub const Renderer = struct {
     /// Device copy of packed 11/11/10 attachments. One allocation is reused
     /// and grown; a later submission waits until the previous reader finishes.
     packed_unorm_feedback: ?OwnedBuffer = null,
+    alpha_preserve_set_layout: vk.DescriptorSetLayout = 0,
+    alpha_preserve_pipeline_layout: vk.PipelineLayout = 0,
+    alpha_preserve_pipeline: vk.Pipeline = 0,
+    alpha_preserve_unavailable: bool = false,
+    alpha_preserve_draws: u64 = 0,
     packed_feedback_tick: u64 = 0,
     packed_feedback_pending: bool = false,
     packed_feedback_slot: ?usize = null,
@@ -7572,6 +7591,9 @@ pub const Renderer = struct {
         self.resident_samplers = .empty;
         for (self.render_targets.items) |target| self.destroyCachedRenderTarget(target);
         self.render_targets.deinit(self.allocator);
+        if (self.alpha_preserve_pipeline != 0) self.device_functions.destroy_pipeline(self.device, self.alpha_preserve_pipeline, null);
+        if (self.alpha_preserve_pipeline_layout != 0) self.device_functions.destroy_pipeline_layout(self.device, self.alpha_preserve_pipeline_layout, null);
+        if (self.alpha_preserve_set_layout != 0) self.device_functions.destroy_descriptor_set_layout(self.device, self.alpha_preserve_set_layout, null);
         self.pending_video_rgba.deinit(self.allocator);
         self.video_upload_rgba.deinit(self.allocator);
         for (self.depth_targets.items) |target| self.destroyCachedDepthTarget(target);
@@ -17328,6 +17350,11 @@ pub const Renderer = struct {
     }
 
     fn destroyCachedRenderTarget(self: *Renderer, target: CachedRenderTarget) void {
+        if (target.alpha_preserve) |alpha| {
+            self.deferVulkanObject(.{ .descriptor_pool = alpha.pool });
+            self.destroyImageView(alpha.view);
+            self.destroyBuffer(alpha.buffer);
+        }
         self.image_aliases.unregister(target.alias_token);
         self.image_states.forgetImage(target.image.handle);
         self.invalidateResidentImageViews(target.image.handle);
@@ -19398,6 +19425,91 @@ pub const Renderer = struct {
         return cache.infer(instructions, plan, components, output, layered);
     }
 
+    fn ensureAlphaPreservePass(self: *Renderer) Error!void {
+        if (self.alpha_preserve_pipeline != 0) return;
+        const bindings = [_]vk.DescriptorSetLayoutBinding{
+            .{ .binding = 0, .descriptor_type = vk.descriptor_type_storage_image, .descriptor_count = 1, .stage_flags = vk.shader_stage_compute_bit },
+            .{ .binding = 1, .descriptor_type = vk.descriptor_type_storage_buffer, .descriptor_count = 1, .stage_flags = vk.shader_stage_compute_bit },
+        };
+        const set_info = vk.DescriptorSetLayoutCreateInfo{ .binding_count = bindings.len, .bindings = &bindings };
+        var set_layout: vk.DescriptorSetLayout = 0;
+        if (self.device_functions.create_descriptor_set_layout(self.device, &set_info, null, &set_layout) != vk.success) return Error.DescriptorSetLayoutCreationFailed;
+        errdefer self.device_functions.destroy_descriptor_set_layout(self.device, set_layout, null);
+        const push = vk.PushConstantRange{ .stage_flags = vk.shader_stage_compute_bit, .offset = 0, .size = 4 };
+        const layout_info = vk.PipelineLayoutCreateInfo{ .set_layout_count = 1, .set_layouts = @ptrCast(&set_layout), .push_constant_range_count = 1, .push_constant_ranges = &push };
+        var layout: vk.PipelineLayout = 0;
+        if (self.device_functions.create_pipeline_layout(self.device, &layout_info, null, &layout) != vk.success) return Error.PipelineLayoutCreationFailed;
+        errdefer self.device_functions.destroy_pipeline_layout(self.device, layout, null);
+        const shader = try self.createShader(&@import("alpha_preserve_spirv.zig").words);
+        defer self.device_functions.destroy_shader_module(self.device, shader, null);
+        const info = vk.ComputePipelineCreateInfo{ .stage = .{ .stage = vk.shader_stage_compute_bit, .module = shader, .name = "main" }, .layout = layout };
+        var pipeline: vk.Pipeline = 0;
+        if (self.device_functions.create_compute_pipelines(self.device, self.driver_pipeline_cache, 1, @ptrCast(&info), null, @ptrCast(&pipeline)) != vk.success) return Error.ComputePipelineCreationFailed;
+        self.alpha_preserve_set_layout = set_layout;
+        self.alpha_preserve_pipeline_layout = layout;
+        self.alpha_preserve_pipeline = pipeline;
+    }
+
+    fn ensureAlphaPreserveResources(self: *Renderer, index: usize) Error!void {
+        if (self.render_targets.items[index].alpha_preserve != null) return;
+        try self.ensureAlphaPreservePass();
+        const target = self.render_targets.items[index];
+        const view_info = vk.ImageViewCreateInfo{
+            .image = target.image.handle,
+            .view_type = vk.image_view_type_2d,
+            .format = vk.format_r16g16b16a16_uint,
+            .subresource_range = .{ .aspect_mask = vk.image_aspect_color_bit },
+        };
+        var view: vk.ImageView = 0;
+        if (self.device_functions.create_image_view(self.device, &view_info, null, &view) != vk.success) return Error.ImageViewCreationFailed;
+        errdefer self.device_functions.destroy_image_view(self.device, view, null);
+        const bytes = @as(u64, target.target.descriptor.width) * target.target.descriptor.height * 4;
+        const buffer = try self.createBuffer(bytes, vk.buffer_usage_storage_buffer_bit, vk.memory_property_device_local_bit);
+        errdefer self.destroyBuffer(buffer);
+        const sizes = [_]vk.DescriptorPoolSize{
+            .{ .descriptor_type = vk.descriptor_type_storage_image, .descriptor_count = 1 },
+            .{ .descriptor_type = vk.descriptor_type_storage_buffer, .descriptor_count = 1 },
+        };
+        const pool_info = vk.DescriptorPoolCreateInfo{ .max_sets = 1, .pool_size_count = sizes.len, .pool_sizes = &sizes };
+        var pool: vk.DescriptorPool = 0;
+        if (self.device_functions.create_descriptor_pool(self.device, &pool_info, null, &pool) != vk.success) return Error.DescriptorPoolCreationFailed;
+        errdefer self.device_functions.destroy_descriptor_pool(self.device, pool, null);
+        const allocate = vk.DescriptorSetAllocateInfo{ .descriptor_pool = pool, .descriptor_set_count = 1, .set_layouts = @ptrCast(&self.alpha_preserve_set_layout) };
+        var set: vk.DescriptorSet = 0;
+        if (self.device_functions.allocate_descriptor_sets(self.device, &allocate, @ptrCast(&set)) != vk.success) return Error.DescriptorSetAllocationFailed;
+        const image_info = vk.DescriptorImageInfo{ .sampler = 0, .image_view = view, .image_layout = vk.image_layout_general };
+        const buffer_info = vk.DescriptorBufferInfo{ .buffer = buffer.handle, .offset = 0, .range = bytes };
+        const writes = [_]vk.WriteDescriptorSet{
+            .{ .destination_set = set, .destination_binding = 0, .destination_array_element = 0, .descriptor_count = 1, .descriptor_type = vk.descriptor_type_storage_image, .image_info = @ptrCast(&image_info), .buffer_info = null },
+            .{ .destination_set = set, .destination_binding = 1, .destination_array_element = 0, .descriptor_count = 1, .descriptor_type = vk.descriptor_type_storage_buffer, .image_info = null, .buffer_info = @ptrCast(&buffer_info) },
+        };
+        self.device_functions.update_descriptor_sets(self.device, writes.len, &writes, 0, null);
+        self.render_targets.items[index].alpha_preserve = .{ .view = view, .buffer = buffer, .pool = pool, .set = set };
+    }
+
+    fn recordAlphaPreservation(self: *Renderer, command: vk.CommandBuffer, index: usize, restore: bool) Error!void {
+        const target = self.render_targets.items[index];
+        const resources = target.alpha_preserve.?;
+        const range = vk.ImageSubresourceRange{ .aspect_mask = vk.image_aspect_color_bit };
+        // Each target owns its descriptor snapshot and alpha buffer. No update
+        // can change a set already referenced by an earlier queued draw.
+        try self.transitionTrackedImage(command, target.image.handle, range, image_state.storage_usage);
+        const barrier = vk.BufferMemoryBarrier{
+            .source_access_mask = if (restore) vk.access_shader_write_bit else vk.access_shader_read_bit,
+            .destination_access_mask = if (restore) vk.access_shader_read_bit else vk.access_shader_write_bit,
+            .buffer = resources.buffer.handle,
+            .offset = 0,
+            .size = resources.buffer.size,
+        };
+        self.device_functions.cmd_pipeline_barrier(command, vk.pipeline_stage_compute_shader_bit, vk.pipeline_stage_compute_shader_bit, 0, 0, null, 1, @ptrCast(&barrier), 0, null);
+        self.device_functions.cmd_bind_pipeline(command, vk.pipeline_bind_point_compute, self.alpha_preserve_pipeline);
+        self.device_functions.cmd_bind_descriptor_sets(command, vk.pipeline_bind_point_compute, self.alpha_preserve_pipeline_layout, 0, 1, @ptrCast(&resources.set), 0, null);
+        const mode: u32 = @intFromBool(restore);
+        self.device_functions.cmd_push_constants(command, self.alpha_preserve_pipeline_layout, vk.shader_stage_compute_bit, 0, 4, &mode);
+        self.device_functions.cmd_dispatch(command, (target.target.descriptor.width + 7) / 8, (target.target.descriptor.height + 7) / 8, 1);
+        try self.transitionTrackedImage(command, target.image.handle, range, image_state.color_attachment_usage);
+    }
+
     fn drawPersistentGraphicsShaders(
         self: *Renderer,
         vertex_words: []const u32,
@@ -19572,10 +19684,26 @@ pub const Renderer = struct {
         else
             cached_snapshot.framebuffer;
         self.frame_profile.graphics_setup_ns +|= elapsedHostNanoseconds(setup_started);
+        var native_state = pipeline_state;
+        var preserve_alpha = false;
+        if (!self.alpha_preserve_unavailable and target.layout.layers == 1) {
+            const promoted = nativeColorWriteState(pipeline_state, self.device_info.vendor_id, @atomicLoad(bool, &full_mask_preserve_alpha, .monotonic));
+            if (promoted.color_write_masks[0] != pipeline_state.color_write_masks[0]) {
+                if (self.ensureAlphaPreserveResources(target_index)) |_| {
+                    preserve_alpha = true;
+                    native_state = promoted;
+                } else |err| {
+                    // Keep the exact original draw when this optional native
+                    // path cannot allocate its backup; never drop guest work.
+                    self.alpha_preserve_unavailable = true;
+                    std.debug.print("[vulkan] RGB alpha preservation unavailable: {s}; retaining native channel mask\n", .{@errorName(err)});
+                }
+            }
+        }
         const pipeline_lookup_started = self.resourceTimestampNs();
         const pipeline = try self.getGraphicsPipeline(
             pass_handle,
-            pipeline_state,
+            native_state,
             vertex_words,
             fragment_words,
             modules,
@@ -19590,7 +19718,7 @@ pub const Renderer = struct {
         self.frame_profile.graphics_scalar_upload_ns +|= elapsedHostNanoseconds(scalar_upload_started);
         if (report_checkpoints) std.debug.print("[vulkan dcb] first graphics draw: pipeline ready\n", .{});
         const record_started = self.resourceTimestampNs();
-        const keep_pass = @atomicLoad(bool, &retain_compatible_render_passes, .monotonic) and self.draw_batch_active and pipeline_state.programmable_blend == 0;
+        const keep_pass = !preserve_alpha and @atomicLoad(bool, &retain_compatible_render_passes, .monotonic) and self.draw_batch_active and pipeline_state.programmable_blend == 0;
         const has_extra_upload = for (extra_uploads[0..extra_colors.len]) |upload| {
             if (upload != null) break true;
         } else false;
@@ -19666,6 +19794,7 @@ pub const Renderer = struct {
                 extra_indices[0..extra_colors.len],
             );
         }
+        if (preserve_alpha) try self.recordAlphaPreservation(command_buffer, target_index, false);
         const begin_info = vk.RenderPassBeginInfo{
             .render_pass = pass_handle,
             .framebuffer = framebuffer_handle,
@@ -19724,6 +19853,10 @@ pub const Renderer = struct {
             );
         }
         if (!keep_pass) self.endRetainedRenderPass();
+        if (preserve_alpha) {
+            try self.recordAlphaPreservation(command_buffer, target_index, true);
+            self.alpha_preserve_draws +|= 1;
+        }
         try self.submitOneShot(command_buffer);
         if (initial_upload) |upload| upload.commit(self);
         for (extra_uploads[0..extra_colors.len]) |maybe_upload| if (maybe_upload) |upload| upload.commit(self);
@@ -22925,6 +23058,101 @@ pub const Renderer = struct {
                 try std.testing.expectEqual(@as(u8, 0), pixels[center]);
             }
         }
+    }
+
+    /// Compare every half-float alpha bit pattern, including signed zero,
+    /// denormals, infinities and NaN payloads, with a real masked draw.
+    pub fn probeRgbPreserveAlpha(self: *Renderer) anyerror!void {
+        const previous = @atomicLoad(bool, &full_mask_preserve_alpha, .monotonic);
+        defer @atomicStore(bool, &full_mask_preserve_alpha, previous, .monotonic);
+        // An odd width exercises the final partial compute workgroup too.
+        const width = 257;
+        const height = 256;
+        const pixels = width * height;
+        const byte_count = pixels * 8;
+        const seed = try self.allocator.alloc(u8, byte_count);
+        defer self.allocator.free(seed);
+        const reference = try self.allocator.alloc(u8, byte_count);
+        defer self.allocator.free(reference);
+        const actual = try self.allocator.alloc(u8, byte_count);
+        defer self.allocator.free(actual);
+        for (0..pixels) |i| {
+            std.mem.writeInt(u16, seed[i * 8 ..][0..2], 0x3800, .little);
+            std.mem.writeInt(u16, seed[i * 8 + 2 ..][0..2], 0x3000, .little);
+            std.mem.writeInt(u16, seed[i * 8 + 4 ..][0..2], 0x3a00, .little);
+            std.mem.writeInt(u16, seed[i * 8 + 6 ..][0..2], @truncate(i), .little);
+        }
+        var color = std.mem.zeroes(gpu.resources.ColorTarget);
+        color.address = 0x100000;
+        color.width = width;
+        color.height = height;
+        color.pitch = width;
+        color.depth = 1;
+        color.format = 12;
+        color.number_type = 7;
+        color.tile_mode = .linear;
+        color.write_mask = 7;
+        const target = try guestColorTarget(color);
+        const index = try self.acquireRenderTarget(target);
+        const image = self.render_targets.items[index].image.handle;
+        const upload = try self.createBuffer(byte_count, vk.buffer_usage_transfer_src_bit, vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit);
+        defer self.destroyBuffer(upload);
+        const readback = try self.createBuffer(byte_count, vk.buffer_usage_transfer_dst_bit, vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit);
+        defer self.destroyBuffer(readback);
+        try self.writeMapped(upload, seed);
+        var state = GraphicsPipelineState.default(width, height);
+        state.topology = 4; // TRIANGLE_STRIP
+        state.color_attachment_formats[0] = vk.format_r16g16b16a16_sfloat;
+        state.color_write_masks[0] = 7;
+        state.blend_enables[0] = 1;
+        state.source_color_blend_factors[0] = 1;
+        state.destination_color_blend_factors[0] = 10; // CONSTANT_COLOR, zero here
+        state.source_alpha_blend_factors[0] = 0;
+        state.destination_alpha_blend_factors[0] = 1;
+        state.alpha_blend_operations[0] = 0;
+        var vertex = try buildFullscreenProbeVertexSpirv(self.allocator, false, 1, 1);
+        defer vertex.deinit(self.allocator);
+        const range = vk.ImageSubresourceRange{ .aspect_mask = vk.image_aspect_color_bit };
+        const copy = vk.BufferImageCopy{ .image_subresource = .{ .aspect_mask = vk.image_aspect_color_bit }, .image_extent = .{ .width = width, .height = height, .depth = 1 } };
+        for ([_]u32{ 0x3f800000, 0x7f800000, 0x7fc01234, 0x80000000 }) |source_bits| {
+            var fragment = graphics_probe_fragment_spirv;
+            for (&fragment) |*word| if (word.* == 0x3f800000) {
+                word.* = source_bits;
+            };
+            for ([_]bool{ false, true }) |optimized| {
+                @atomicStore(bool, &full_mask_preserve_alpha, optimized, .monotonic);
+                try self.beginFrameDraw();
+                {
+                    const command = try self.beginOneShot();
+                    defer self.releaseOneShot(command);
+                    try self.transitionTrackedImage(command, image, range, image_state.transfer_destination_usage);
+                    self.device_functions.cmd_copy_buffer_to_image(command, upload.handle, image, vk.image_layout_transfer_dst_optimal, 1, @ptrCast(&copy));
+                    try self.transitionTrackedImage(command, image, range, image_state.color_attachment_usage);
+                    try self.submitOneShot(command);
+                }
+                self.render_targets.items[index].initialized = true;
+                try self.drawGraphicsShaders(vertex.words, &fragment, &.{}, &.{}, state, target, &.{}, null, false, false, false, .{ .vertex_count = 4 });
+                {
+                    const command = try self.beginOneShot();
+                    defer self.releaseOneShot(command);
+                    try self.transitionTrackedImage(command, image, range, image_state.transfer_source_usage);
+                    self.device_functions.cmd_copy_image_to_buffer(command, image, vk.image_layout_transfer_src_optimal, readback.handle, 1, @ptrCast(&copy));
+                    const host = vk.BufferMemoryBarrier{ .source_access_mask = vk.access_transfer_write_bit, .destination_access_mask = vk.access_host_read_bit, .buffer = readback.handle, .offset = 0, .size = byte_count };
+                    self.device_functions.cmd_pipeline_barrier(command, vk.pipeline_stage_transfer_bit, vk.pipeline_stage_host_bit, 0, 0, null, 1, @ptrCast(&host), 0, null);
+                    try self.submitOneShot(command);
+                }
+                const bytes = if (optimized) actual else reference;
+                try self.readMapped(readback, bytes);
+                for (0..pixels) |i| try std.testing.expectEqual(@as(u16, @truncate(i)), std.mem.readInt(u16, bytes[i * 8 + 6 ..][0..2], .little));
+                // A rendered channel proves this is not a vacuous scissor/VS test.
+                try std.testing.expectEqual(@as(u16, 0x3400), std.mem.readInt(u16, bytes[2..][0..2], .little));
+                try std.testing.expectEqual(@as(u16, 0x3400), std.mem.readInt(u16, bytes[(pixels - 1) * 8 + 2 ..][0..2], .little));
+                if (optimized) try std.testing.expectEqualSlices(u8, reference, actual);
+            }
+        }
+        try self.finishDrawBatch();
+        if (self.device_info.vendor_id == 0x10de) try std.testing.expectEqual(@as(u64, 4), self.alpha_preserve_draws);
+        std.debug.print("RGB alpha-preserve passed: 65536 half-float alpha bit patterns, four source values, byte-identical RGBA results, optimized_draws={d} on {s}\n", .{ self.alpha_preserve_draws, self.device_info.name() });
     }
 
     pub fn probeRetainedGraphicsPass(self: *Renderer) anyerror!u64 {
@@ -36121,6 +36349,7 @@ pub const Renderer = struct {
             .framebuffer => |framebuffer| self.device_functions.destroy_framebuffer(self.device, framebuffer, null),
             .pipeline => |pipeline| self.device_functions.destroy_pipeline(self.device, pipeline, null),
             .shader_module => |shader| self.device_functions.destroy_shader_module(self.device, shader, null),
+            .descriptor_pool => |pool| self.device_functions.destroy_descriptor_pool(self.device, pool, null),
             .storage_image_release => |index| {
                 if (index < self.storage_image_cache.items.len) {
                     self.storage_image_cache.items[index].pin_count -= 1;
@@ -46532,6 +46761,73 @@ test "readback memory prefers host caching without weakening required flags" {
     try std.testing.expectEqual(@as(?u32, 1), findBufferMemoryTypeIn(properties, 0x17, required, storage, cached));
     try std.testing.expectEqual(@as(?u32, 4), findBufferMemoryTypeIn(properties, 0x1f, required | vk.memory_property_device_local_bit, storage, cached));
     try std.testing.expectEqual(@as(?u32, null), findBufferMemoryTypeIn(properties, 1 << 2, required, storage, cached));
+}
+
+fn nativeColorWriteState(state: GraphicsPipelineState, vendor_id: u32, enabled: bool) GraphicsPipelineState {
+    var result = state;
+    if (!enabled or vendor_id != 0x10de or state.programmable_blend != 0 or
+        state.color_attachment_count != 1 or state.rasterization_samples != 1) return result;
+    // The caller must bracket this native draw with integer alpha save/restore.
+    // Identity floating-point blending alone clamps infinities and loses NaN
+    // payloads. Keep the guest mask for coherence and draw coverage. A captured
+    // RGB-only RGBA16F pass measured ~155 ms versus ~1 ms with a full mask.
+    for (0..@min(state.color_attachment_count, gpu.resources.color_target_count)) |slot| {
+        if (state.color_attachment_formats[slot] == vk.format_r16g16b16a16_sfloat and
+            state.color_write_masks[slot] == 7 and state.blend_enables[slot] != 0 and
+            state.source_alpha_blend_factors[slot] == 0 and
+            state.destination_alpha_blend_factors[slot] == 1 and
+            state.alpha_blend_operations[slot] == 0 and
+            !blendFactorReadsDestinationAlpha(state.source_color_blend_factors[slot]) and
+            !blendFactorReadsDestinationAlpha(state.destination_color_blend_factors[slot]))
+        {
+            result.color_write_masks[slot] = vk.color_component_rgba_bits;
+        }
+    }
+    return result;
+}
+
+fn blendFactorReadsDestinationAlpha(factor: u32) bool {
+    // Alpha is restored after the whole draw. A masked infinity/NaN may be
+    // temporarily clamped during overdraw, so RGB must not observe that value.
+    return factor == 8 or factor == 9 or factor == 14; // DST_ALPHA, ONE_MINUS_DST_ALPHA, SRC_ALPHA_SATURATE
+}
+
+test "native RGB mask promotion requires an existing destination alpha identity blend" {
+    var state = GraphicsPipelineState.default(32, 32);
+    state.color_attachment_formats[0] = vk.format_r16g16b16a16_sfloat;
+    state.color_write_masks[0] = 7;
+    state.blend_enables[0] = 1;
+    state.source_color_blend_factors[0] = 6;
+    state.destination_color_blend_factors[0] = 7;
+    state.source_alpha_blend_factors[0] = 0;
+    state.destination_alpha_blend_factors[0] = 1;
+    state.alpha_blend_operations[0] = 0;
+    var expected = state;
+    expected.color_write_masks[0] = 15;
+    try std.testing.expectEqualDeep(expected, nativeColorWriteState(state, 0x10de, true));
+    try std.testing.expectEqualDeep(state, nativeColorWriteState(state, 0x10de, false));
+    try std.testing.expectEqualDeep(state, nativeColorWriteState(state, 0x1002, true));
+    inline for (.{ "source_alpha_blend_factors", "destination_alpha_blend_factors", "alpha_blend_operations", "blend_enables", "color_write_masks", "color_attachment_formats" }) |field| {
+        var changed = state;
+        @field(changed, field)[0] ^= 1;
+        try std.testing.expectEqualDeep(changed, nativeColorWriteState(changed, 0x10de, true));
+    }
+    state.programmable_blend = 1;
+    try std.testing.expectEqualDeep(state, nativeColorWriteState(state, 0x10de, true));
+    state.programmable_blend = 0;
+    for ([_]u32{ 8, 9, 14 }) |factor| {
+        var changed = state;
+        changed.source_color_blend_factors[0] = factor;
+        try std.testing.expectEqualDeep(changed, nativeColorWriteState(changed, 0x10de, true));
+        changed = state;
+        changed.destination_color_blend_factors[0] = factor;
+        try std.testing.expectEqualDeep(changed, nativeColorWriteState(changed, 0x10de, true));
+    }
+    state.color_attachment_count = 2;
+    try std.testing.expectEqualDeep(state, nativeColorWriteState(state, 0x10de, true));
+    state.color_attachment_count = 1;
+    state.rasterization_samples = 4;
+    try std.testing.expectEqualDeep(state, nativeColorWriteState(state, 0x10de, true));
 }
 
 fn findImageMemoryTypeIn(properties: vk.PhysicalDeviceMemoryProperties, supported_bits: u32, prefer_nonlocal: bool) ?u32 {

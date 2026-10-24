@@ -14957,6 +14957,12 @@ pub fn main(init: std.process.Init) !void {
         }
         return;
     }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--rgb-alpha-preserve")) {
+        var renderer = try vulkan.Renderer.init(allocator, .{ .enable_validation = true });
+        defer renderer.deinit();
+        try renderer.probeRgbPreserveAlpha();
+        return;
+    }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--retained-render-pass")) {
         const original = vulkan.backend.retain_compatible_render_passes;
         defer vulkan.backend.retain_compatible_render_passes = original;
