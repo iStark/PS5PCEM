@@ -744,6 +744,24 @@ fn aprStatusError(status: KernelError) i32 {
     return status.raw();
 }
 
+fn aprSubmitCommandBuffer(
+    command_buffer: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+) callconv(abi.guest) i32 {
+    if (command_buffer == 0) return aprStatusError(.einval);
+    // Extra arguments are scheduling hints; the plain entry publishes no
+    // identifier, so untracked execution frees or reclaims its own slot.
+    apr.submitCommandBufferUntracked(command_buffer) catch |err| {
+        std.debug.print("[apr] submit failed cb=0x{x}: {s}\n", .{ command_buffer, @errorName(err) });
+        return aprKernelError(err);
+    };
+    return 0;
+}
+
 fn aprSubmitCommandBufferAndGetResult(
     command_buffer: u64,
     _: u64,
@@ -808,6 +826,14 @@ test "native APR kernel errors publish a packet offset and cannot become success
 fn aprWaitCommandBuffer(identifier: u32) callconv(abi.guest) i32 {
     apr.waitCommandBuffer(identifier) catch |err| return aprKernelError(err);
     return 0;
+}
+
+test "plain APR submit rejects a null buffer and executes like AndGetResult" {
+    apr.reset();
+    defer apr.reset();
+    try std.testing.expectEqual(KernelError.einval.raw(), aprSubmitCommandBuffer(0, 0, 0, 0, 0, 0));
+    // Never registered: InvalidCommandBuffer maps to einval, same as AndGetResult.
+    try std.testing.expectEqual(KernelError.einval.raw(), aprSubmitCommandBuffer(0x1000, 3, 0x14, 1, 0, 0));
 }
 
 fn syncCompareBytes(size: u64) usize {
@@ -2479,7 +2505,7 @@ pub const exports = [_]symbols.Export{
     .{ .name = "sceKernelAprResolveFilepathsWithPrefixToIdsForEach", .function = trace.wrap("sceKernelAprResolveFilepathsWithPrefixToIdsForEach", &kernelUnsupported), .expect_id = "VB-BtuIW8Xc" },
     .{ .name = "sceKernelAprResolveFilepathsWithPrefixToIdsAndFileSizes", .function = trace.wrap("sceKernelAprResolveFilepathsWithPrefixToIdsAndFileSizes", &kernelUnsupported), .expect_id = "w5fcCG+t31g" },
     .{ .name = "sceKernelAprResolveFilepathsWithPrefixToIdsAndFileSizesForEach", .function = trace.wrap("sceKernelAprResolveFilepathsWithPrefixToIdsAndFileSizesForEach", &kernelUnsupported), .expect_id = "C+Khtbbx2g8" },
-    .{ .name = "sceKernelAprSubmitCommandBuffer", .function = trace.wrap("sceKernelAprSubmitCommandBuffer", &kernelUnsupported), .expect_id = "eE4Szl8sil8" },
+    .{ .name = "sceKernelAprSubmitCommandBuffer", .function = trace.wrap("sceKernelAprSubmitCommandBuffer", &aprSubmitCommandBuffer), .expect_id = "eE4Szl8sil8" },
     .{ .name = "sceKernelAprSubmitCommandBufferAndGetId", .function = trace.wrap("sceKernelAprSubmitCommandBufferAndGetId", &kernelUnsupported), .expect_id = "qvMUCyyaCSI" },
 };
 

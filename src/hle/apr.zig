@@ -179,6 +179,9 @@ const Submission = struct {
     complete: bool = false,
     failure: ?Error = null,
     worker: ?std.Thread = null,
+    // Plain submits publish no identifier, so no waiter can exist.
+    // Only these may be reclaimed by a later submit.
+    reclaimable: bool = false,
 };
 
 const Lock = struct {
@@ -701,10 +704,41 @@ fn reportNative(address: u64, header: packets.Header, bytes: []const u8, offset:
 }
 
 pub fn submitCommandBufferWithOffset(address: u64, error_offset: *u32) Error!u32 {
+    return submitInner(address, error_offset, true);
+}
+
+/// Plain kernel submits publish no identifier, so no waiter can free them.
+/// Untracked work still reserves a slot while a worker runs it, marked for
+/// later reclaim; synchronous work takes no slot at all.
+pub fn submitCommandBufferUntracked(address: u64) Error!void {
+    var error_offset: u32 = 0;
+    _ = try submitInner(address, &error_offset, false);
+}
+
+fn submitInner(address: u64, error_offset: *u32, tracked: bool) Error!u32 {
     error_offset.* = 0;
     var pending: CommandBuffer = .{};
     defer pending.deinit();
     var sink: ?CompletionSink = null;
+    // Plain submits carry no identifier, so nothing can ever wait on them.
+    // Reclaim finished slots first or fire-and-forget readers fill the table
+    // with done work and later submits fail with SubmissionTableFull.
+    // Workers set complete under the lock as their last touch, so clearing
+    // here then joining below cannot race them. Same pattern as the waiter.
+    lock.lock();
+    var joined: [maximum_submissions]?std.Thread = .{null} ** maximum_submissions;
+    var join_count: usize = 0;
+    for (&submissions) |*submission| {
+        // Only untracked plain submits: tracked ones may have a waiter
+        // arriving after the sweep.
+        if (submission.active and submission.complete and submission.reclaimable) {
+            joined[join_count] = submission.worker;
+            join_count += 1;
+            submission.* = .{};
+        }
+    }
+    lock.unlock();
+    for (joined[0..join_count]) |maybe| if (maybe) |worker| worker.join();
     const slot = blk: {
         lock.lock();
         defer lock.unlock();
@@ -726,7 +760,7 @@ pub fn submitCommandBufferWithOffset(address: u64, error_offset: *u32) Error!u32
         const identifier = next_submission_identifier;
         next_submission_identifier +%= 1;
         if (next_submission_identifier == 0) next_submission_identifier = 1;
-        submissions[index] = .{ .active = true, .identifier = identifier };
+        submissions[index] = .{ .active = true, .identifier = identifier, .reclaimable = !tracked };
         sink = completion_sink;
         break :blk index;
     };
@@ -744,6 +778,9 @@ pub fn submitCommandBufferWithOffset(address: u64, error_offset: *u32) Error!u32
     defer lock.unlock();
     if (complete) {
         submissions[slot].complete = true;
+        // Untracked synchronous work needs no slot: no identifier was ever
+        // published, so no waiter can arrive. Free it inline.
+        if (!tracked) submissions[slot] = .{};
     } else {
         // Only blocked submissions launch a worker. Common APR reads retain
         // the synchronous fast path. The snapshot outlives a
@@ -1079,6 +1116,17 @@ test "AMPR large file batches honor byte capacity and own deferred commands" {
     try std.testing.expectEqualSlices(u8, &payload, &destination);
     try std.testing.expectEqual(payload.len, Sink.count);
     try std.testing.expect(Sink.ordered);
+}
+
+test "AMPR completed submissions recycle without waiting" {
+    reset();
+    defer reset();
+    try constructCommandBuffer(0x1000);
+    try appendCounter(0x1000, .{ .write = .{ .counter = 0, .access = .word, .value = 1, .operation = .add } }, 32);
+    // File readers fire plain submits with completion counters and never wait:
+    // untracked synchronous work takes no slot, so the table cannot fill.
+    for (0..maximum_submissions + 1) |_| try submitCommandBufferUntracked(0x1000);
+    try std.testing.expectEqual(@as(u64, maximum_submissions + 1), counter_bank.read(0, .word));
 }
 
 test "AMPR table exhaustion has no counter side effects" {
