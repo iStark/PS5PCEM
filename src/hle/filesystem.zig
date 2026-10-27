@@ -1566,7 +1566,8 @@ fn readArchiveFile(archive: *zarchive.Reader, node: u32, io: std.Io, buffer: []u
     return archive.readAt(node, offset, buffer) catch Error.IoFailed;
 }
 
-fn readHostFile(file: std.Io.File, io: std.Io, buffer: []u8, offset: u64) Error!usize {    if (buffer.len == 0) return 0;
+fn readHostFile(file: std.Io.File, io: std.Io, buffer: []u8, offset: u64) Error!usize {
+    if (buffer.len == 0) return 0;
     if (@atomicLoad(?*guest_memory.AddressSpace, &guest_address_space, .acquire)) |space| {
         if (space.isWritable(@intFromPtr(buffer.ptr), buffer.len)) {
             return readGuestFile(space, file, io, buffer, offset);
@@ -1740,6 +1741,7 @@ fn fillStat(out: *Stat, size: u64, is_directory: bool) void {
     out.mode = (if (is_directory) mode_ifdir else mode_ifreg) | mode_read_only;
     // Archives name files up to 2^48-1 bytes; saturate rather than trap.
     const clamped = @min(size, std.math.maxInt(i64));
+    // clamped fits i64 by the min above; blocks cannot overflow u64 from it.
     out.size = @intCast(clamped);
     out.blksize = 512;
     out.blocks = @intCast((clamped + 511) / 512);
@@ -1945,12 +1947,15 @@ pub fn getDents(descriptor: i32, buffer: []u8, base_position: ?*u64) Error!usize
                     }
                     if (entry.archive_dir) |node| {
                         const archive = title_archive orelse return Error.NotAttached;
-                        const at: u32 = @intCast(entry.directory_index - 2);
-                        if (at >= archive.dirChildCount(node)) break;
-                        const child = archive.dirChild(node, at);
-                        is_directory = !child.is_file;
-                        const length = @min(child.name.len, maximum_name);
-                        @memcpy(name_storage[0..length], child.name[0..length]);
+                        // directory_index counts ".", "..", then children;
+                        // indices past u32 range cannot name a child.
+                        const child = std.math.sub(u64, entry.directory_index, 2) catch break;
+                        if (child > std.math.maxInt(u32)) break;
+                        if (child >= archive.dirChildCount(node)) break;
+                        const listed = archive.dirChild(node, @intCast(child));
+                        is_directory = !listed.is_file;
+                        const length = @min(listed.name.len, maximum_name);
+                        @memcpy(name_storage[0..length], listed.name[0..length]);
                         break :blk name_storage[0..length];
                     }
                     const iterator = if (entry.directory_iterator) |*value| value else return Error.IoFailed;

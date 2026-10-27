@@ -410,7 +410,8 @@ fn optParamInitialize(option: ?*anyopaque) callconv(abi.guest) i32 {
     return 0;
 }
 
-fn finalize(fiber: ?*Fiber) callconv(abi.guest) i32 {    const value = fiber orelse return error_null;
+fn finalize(fiber: ?*Fiber) callconv(abi.guest) i32 {
+    const value = fiber orelse return error_null;
     if (!validFiber(value)) return error_invalid;
 
     registry_lock.lock();
@@ -811,6 +812,7 @@ test "fiber option parameters initialize from their size field" {
     try std.testing.expectEqual(error_null, init(null));
     var storage: [64]u8 = @splat(0xa5);
     std.mem.writeInt(u32, storage[0..4], 16, .little);
+    // A host stack buffer; accessible() permits it with no space attached.
     try std.testing.expectEqual(@as(i32, 0), init(@ptrCast(&storage)));
     try std.testing.expectEqualSlices(u8, &([_]u8{0} ** 16), storage[0..16]);
     try std.testing.expectEqualSlices(u8, &([_]u8{0xa5} ** 48), storage[16..64]);

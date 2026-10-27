@@ -260,11 +260,13 @@ pub const Reader = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         var remaining: usize = @intCast(@min(@as(u64, buffer.len), entry.file_size - offset));
+        // remaining is bounded by buffer.len above.
         var pos = offset;
         var done: usize = 0;
         while (remaining != 0) {
             const raw: u64 = std.math.add(u64, entry.file_offset, pos) catch return error.CorruptArchive;
             const block_index = raw / block_size;
+            // A remainder below the 64 KiB block size.
             const at: usize = @intCast(raw % block_size);
             const step: usize = @min(remaining, block_size - at);
             const data = try self.blockLocked(block_index);
@@ -279,6 +281,7 @@ pub const Reader = struct {
     pub fn readAlloc(self: *Reader, node: u32, allocator: std.mem.Allocator, maximum: usize) ![]u8 {
         const size = self.fileSize(node);
         if (size > maximum) return error.FileTooBig;
+        // Checked against maximum (a usize) just above.
         const out = try allocator.alloc(u8, @intCast(size));
         errdefer allocator.free(out);
         var done: usize = 0;
@@ -323,9 +326,13 @@ pub const Reader = struct {
     }
 
     fn loadBlock(self: *Reader, index: u64, out: []u8) !void {
-        const record_index: usize = @intCast(index / entries_per_record);
+        // Index first in u64 so a hostile block number cannot truncate
+        // before the range check below.
+        const record_number = index / entries_per_record;
+        if (record_number >= self.offset_records.len) return error.CorruptArchive;
+        const record_index: usize = @intCast(record_number);
+        // A remainder below ENTRIES_PER_OFFSETRECORD (16).
         const sub: usize = @intCast(index % entries_per_record);
-        if (record_index >= self.offset_records.len) return error.CorruptArchive;
         const record = &self.offset_records[record_index];
         var offset = record.base;
         for (record.sizes[0..sub]) |size| {
@@ -338,6 +345,8 @@ pub const Reader = struct {
             try readExact(self, absolute, out);
             return;
         }
+        // Below block_size here: the equal case took the raw branch above,
+        // and a u16 range plus one cannot exceed it.
         try readExact(self, absolute, self.comp_scratch[0..@intCast(size)]);
         var in: std.Io.Reader = .fixed(self.comp_scratch[0..@intCast(size)]);
         var decoder = std.compress.zstd.Decompress.init(&in, &.{}, .{});
@@ -533,6 +542,9 @@ pub fn writeTestArchiveRaw(io: std.Io, dir: std.Io.Dir, name: []const u8, files:
     if (files.len > block_lengths.len) return error.TooManyFiles;
     for (files, 0..) |file, i| {
         if (file.compressed) {
+            // An on-disk block never exceeds one block, as the writer stores
+            // incompressible blocks raw instead.
+            if (file.data.len == 0 or file.data.len > block_size) return error.FileTooBig;
             block_lengths[i] = file.data.len;
             try out.writer.writeAll(file.data);
         } else {
@@ -559,6 +571,7 @@ pub fn writeTestArchiveRaw(io: std.Io, dir: std.Io.Dir, name: []const u8, files:
             const index = r * entries_per_record + j;
             const len: u64 = if (index < files.len) block_lengths[index] else 1;
             if (index < files.len) block_cursor += len;
+            // A block holds at most block_size bytes, so minus one fits u16.
             try writeU16(&out.writer, @intCast(len - 1));
         }
     }
@@ -593,9 +606,11 @@ pub fn writeTestArchiveRaw(io: std.Io, dir: std.Io.Dir, name: []const u8, files:
     for (names[0..name_count], 0..) |part, i| {
         name_offsets[i] = cursor;
         if (part.len >= 0x80) return error.NameTooLong;
+        // Single-byte header: length just checked below 0x80.
         try out.writer.writeByte(@intCast(part.len));
         cursor += 1;
         try out.writer.writeAll(part);
+        // Test tables hold a handful of short names, far below u32 range.
         cursor += @intCast(part.len);
     }
 
@@ -618,6 +633,7 @@ pub fn writeTestArchiveRaw(io: std.Io, dir: std.Io.Dir, name: []const u8, files:
             var name_index: u32 = 0;
             for (names[0..name_count], 0..) |known, i| {
                 if (std.mem.eql(u8, known, part)) {
+                    // i counts found names, at most the 16 collected above.
                     name_index = @intCast(i);
                     break;
                 }
@@ -631,6 +647,7 @@ pub fn writeTestArchiveRaw(io: std.Io, dir: std.Io.Dir, name: []const u8, files:
             }
             if (child == null) {
                 if (node_count >= nodes.len) return error.TooManyNodes;
+                if (nodes[parent].child_count >= nodes[parent].children.len) return error.TooManyNodes;
                 child = node_count;
                 node_count += 1;
                 const size: u64 = if (last) (if (file.compressed) file_size else file.data.len) else 0;
@@ -642,6 +659,7 @@ pub fn writeTestArchiveRaw(io: std.Io, dir: std.Io.Dir, name: []const u8, files:
                     .children = undefined,
                     .child_count = 0,
                 };
+                // child was just allocated below nodes.len (24).
                 nodes[parent].children[nodes[parent].child_count] = @intCast(child.?);
                 nodes[parent].child_count += 1;
             }
@@ -670,6 +688,7 @@ pub fn writeTestArchiveRaw(io: std.Io, dir: std.Io.Dir, name: []const u8, files:
         }
     }
     var at_layout: [24]u32 = undefined;
+    // li counts laid-out nodes, at most the 24 allocated above.
     for (layout[0..li], 0..) |n, i| at_layout[n] = @intCast(i);
 
     for (layout[0..li]) |n| {

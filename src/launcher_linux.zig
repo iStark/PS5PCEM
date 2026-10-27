@@ -2290,6 +2290,7 @@ fn launchGame() void {
     if (!isZarPath(executable[0..executable.len])) {
         argv_storage[argv_len] = "--app0";
         argv_len += 1;
+        // NUL-terminated at game_folder_length just above.
         argv_storage[argv_len] = @ptrCast(&folder_storage);
         argv_len += 1;
     }
@@ -2297,6 +2298,7 @@ fn launchGame() void {
     var failure: ?*GError = null;
     // Without DO_NOT_REAP_CHILD GLib reaps the runner itself, so a game that
     // exits leaves no zombie behind the launcher.
+    // home_storage is NUL-terminated where the home path is built.
     if (native.g_spawn_async(@ptrCast(&home_storage), &argv_storage, null, 0, null, null, null, &failure) == 0) {
         var line: [256]u8 = undefined;
         const reason: []const u8 = if (failure) |value| std.mem.span(value.message orelse "") else "";

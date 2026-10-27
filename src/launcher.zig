@@ -2632,15 +2632,17 @@ fn launchGame(owner: Win32.Window) void {
     var length: usize = 0;
     appendWide(&command, &length, w("\""));
     appendWideSlice(&command, &length, runner[0..runner_len]);
+    // findGameExecutable returns NUL-terminated paths.
+    const executable_length = wideLength(@ptrCast(&executable));
     // Archive dumps run as a single argument; directories keep --app0.
-    if (wideEndsWithZar(executable[0..wideLength(@ptrCast(&executable))])) {
+    if (wideEndsWithZar(executable[0..executable_length])) {
         appendWide(&command, &length, w("\" \""));
-        appendWideSlice(&command, &length, executable[0..wideLength(@ptrCast(&executable))]);
+        appendWideSlice(&command, &length, executable[0..executable_length]);
     } else {
         appendWide(&command, &length, w("\" --app0 \""));
         appendWideSlice(&command, &length, game_folder[0..game_folder_length]);
         appendWide(&command, &length, w("\" \""));
-        appendWideSlice(&command, &length, executable[0..wideLength(@ptrCast(&executable))]);
+        appendWideSlice(&command, &length, executable[0..executable_length]);
     }
     appendWide(&command, &length, w("\""));
     command[length] = 0;
@@ -2763,6 +2765,7 @@ fn findArchiveInFolder(output: *[1024]u16) bool {
     search[length] = 0;
 
     var found: Win32.FindData = undefined;
+    // search is NUL-terminated at length, bounds-checked above.
     const handle = Win32.FindFirstFileW(@ptrCast(&search), &found);
     if (@intFromPtr(handle) == Win32.invalid_handle) return false;
     defer _ = Win32.FindClose(handle);
@@ -2772,6 +2775,7 @@ fn findArchiveInFolder(output: *[1024]u16) bool {
     var count: usize = 0;
     while (true) {
         const is_directory = found.attributes & Win32.file_attribute_directory != 0;
+        // The OS NUL-terminates the fixed FindData name buffer.
         const entry_length = wideLength(@ptrCast(&found.name));
         if (!is_directory and entry_length != 0 and wideEndsWithZar(found.name[0..entry_length])) {
             count += 1;
@@ -2809,11 +2813,13 @@ fn findGameExecutable(output: *[1024]u16) bool {
         @memcpy(output[length..][0..suffix_length], converted[0..suffix_length]);
         length += suffix_length;
         output[length] = 0;
+        // output is NUL-terminated at length just above.
         if (Win32.GetFileAttributesW(@ptrCast(output)) != Win32.invalid_file_attributes) return true;
     }
     // No extracted executable: the selection itself may be an archive dump,
     // or the folder holds exactly one. game-run reports a missing eboot.
     if (wideEndsWithZar(game_folder[0..game_folder_length])) {
+        // game_folder stays NUL-terminated through length-checked writes.
         if (Win32.GetFileAttributesW(@ptrCast(&game_folder)) == Win32.invalid_file_attributes) return false;
         @memset(output, 0);
         @memcpy(output[0..game_folder_length], game_folder[0..game_folder_length]);

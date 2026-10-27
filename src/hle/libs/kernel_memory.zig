@@ -1920,6 +1920,7 @@ fn sceKernelSetPrtAperture(index: i32, address: u64, len: u64) callconv(abi.gues
     }
     pool_lock.lock();
     defer pool_lock.unlock();
+    // index validated 0..maximum_prt_aperture above.
     prt_apertures[@intCast(index)] = if (len == 0) .{} else .{ .address = address, .size = len };
     return errno.ok;
 }
