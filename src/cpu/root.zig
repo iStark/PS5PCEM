@@ -1943,7 +1943,13 @@ const WindowsX64Machine = struct {
             fault.memory_address = record.ExceptionInformation[1];
         }
         frame.fault = fault;
-        const fault_code: [*]const u8 = @ptrFromInt(fault.instruction_address);
+        // Diagnostics only: a wild Rip is not host-readable, and printing the
+        // fault bytes must not abort the host. Substitute zeros.
+        var fault_bytes: [16]u8 = .{0} ** 16;
+        if (memory.isHostRangeReadable(fault.instruction_address, fault_bytes.len)) {
+            const fault_code: [*]const u8 = @ptrFromInt(fault.instruction_address);
+            @memcpy(&fault_bytes, fault_code[0..fault_bytes.len]);
+        }
         std.debug.print(
             "[cpu] contained guest fault thread=0x{x} kind={s} rip=0x{x} exception=0x{x} target=0x{x} access={s} " ++
                 "rax=0x{x} rbx=0x{x} rcx=0x{x} rdx=0x{x} rsi=0x{x} rdi=0x{x} " ++
@@ -1979,22 +1985,22 @@ const WindowsX64Machine = struct {
                 "{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}" ++
                 "{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}\n",
             .{
-                fault_code[0],
-                fault_code[1],
-                fault_code[2],
-                fault_code[3],
-                fault_code[4],
-                fault_code[5],
-                fault_code[6],
-                fault_code[7],
-                fault_code[8],
-                fault_code[9],
-                fault_code[10],
-                fault_code[11],
-                fault_code[12],
-                fault_code[13],
-                fault_code[14],
-                fault_code[15],
+                fault_bytes[0],
+                fault_bytes[1],
+                fault_bytes[2],
+                fault_bytes[3],
+                fault_bytes[4],
+                fault_bytes[5],
+                fault_bytes[6],
+                fault_bytes[7],
+                fault_bytes[8],
+                fault_bytes[9],
+                fault_bytes[10],
+                fault_bytes[11],
+                fault_bytes[12],
+                fault_bytes[13],
+                fault_bytes[14],
+                fault_bytes[15],
             },
         );
 
@@ -2020,6 +2026,9 @@ const WindowsX64Machine = struct {
     /// re-executes the faulting instruction against real memory.
     fn tryRedirectNullBaseRegister(context: *std.os.windows.CONTEXT, memory_address: u64) bool {
         if (memory_address == 0 or memory_address >= lost_base_window) return false;
+        // Same wild-Rip hazard as the null-object compare: opcode bytes must
+        // come from host-readable code or the host aborts instead of the guest.
+        if (!memory.isHostRangeReadable(context.Rip, 15)) return false;
         const code: [*]const u8 = @ptrFromInt(context.Rip);
         var offset: usize = 0;
         var rex: u8 = 0;
@@ -3389,6 +3398,7 @@ test "fault emulation refuses a faulting Rip outside host-readable code" {
         context.Rcx = 0;
         try std.testing.expect(!WindowsX64Machine.tryEmulateNullObjectCompare(&context, 0x20));
         try std.testing.expect(!WindowsX64Machine.tryEmulateNullMemoryLoad(&context, 0x20));
+        try std.testing.expect(!WindowsX64Machine.tryRedirectNullBaseRegister(&context, 0x20));
         try std.testing.expect(!WindowsX64Machine.tryEmulateUnmappedOptionalPointerLoad(&context, context.Rdx + 8));
         try std.testing.expect(!WindowsX64Machine.tryEmulateNullSentinelPointerLoad(&context, 8));
         try std.testing.expectEqual(std.math.maxInt(u64) & ~@as(u64, 0xfff), context.Rip);
