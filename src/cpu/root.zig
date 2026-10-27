@@ -2067,6 +2067,10 @@ const WindowsX64Machine = struct {
     /// Returns true when the instruction was stepped past with flags updated.
     fn tryEmulateNullObjectCompare(context: *std.os.windows.CONTEXT, memory_address: u64) bool {
         if (memory_address == 0 or memory_address >= lost_base_window) return false;
+        // The faulting Rip itself may point outside host-readable code (a wild
+        // guest jump faulting on fetch, or reclaimed pages). Reading the opcode
+        // bytes unchecked turns a contained guest fault into a host abort.
+        if (!memory.isHostRangeReadable(context.Rip, 15)) return false;
         // Do not require isGuestAddress: the VEH already established this thread
         // is in a guest call, and some titles map PRX outside the nominal
         // ranges during bring-up.
@@ -2120,6 +2124,8 @@ const WindowsX64Machine = struct {
     /// read memory (`add/sub/cmp/and/or/xor/test reg, [null+disp]`).
     fn tryEmulateNullMemoryLoad(context: *std.os.windows.CONTEXT, memory_address: u64) bool {
         if (memory_address == 0 or memory_address >= lost_base_window) return false;
+        // Same wild-Rip hazard as the null-object compare above.
+        if (!memory.isHostRangeReadable(context.Rip, 15)) return false;
         const code: [*]const u8 = @ptrFromInt(context.Rip);
         var offset: usize = 0;
         var rex: u8 = 0;
@@ -2223,6 +2229,9 @@ const WindowsX64Machine = struct {
             context.Rdx != 0 and
             !isCanonicalX64Address(context.Rdx);
         if (!unmapped_guest_address and !poisoned_address) return false;
+        // Same wild-Rip hazard as the null-object compare: the pattern read
+        // below must not turn a contained guest fault into a host abort.
+        if (!memory.isHostRangeReadable(context.Rip, 15)) return false;
         const code: [*]const u8 = @ptrFromInt(context.Rip);
         const pattern = [_]u8{
             0x48, 0x8b, 0x42, 0x08, // mov rax, qword ptr [rdx+8]
@@ -2258,6 +2267,8 @@ const WindowsX64Machine = struct {
             isGuestAddress(context.Rdx) and
             memory_address == context.Rcx +% 8;
         if ((!null_link and !poisoned_link and !stale_link) or context.Rdx == 0) return false;
+        // Same wild-Rip hazard as the null-object compare.
+        if (!memory.isHostRangeReadable(context.Rip, 15)) return false;
         const code: [*]const u8 = @ptrFromInt(context.Rip);
         const pattern = [_]u8{
             0x48, 0x8b, 0x49, 0x08, // mov rcx, qword ptr [rcx+8]
@@ -3363,6 +3374,24 @@ test "execution of the synthetic null object returns through the guest stack" {
         try std.testing.expectEqual(return_address, context.Rip);
         try std.testing.expectEqual(@as(u64, @intFromPtr(&stack) + 8), context.Rsp);
         try std.testing.expectEqual(@as(u64, 0), context.Rax);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
+test "fault emulation refuses a faulting Rip outside host-readable code" {
+    if (can_use_native_bridge) {
+        // A wild guest jump faulting on fetch must stay a contained guest
+        // fault: decoding opcodes from an unreadable Rip aborted the host.
+        var context = std.mem.zeroes(std.os.windows.CONTEXT);
+        context.Rip = std.math.maxInt(u64) & ~@as(u64, 0xfff);
+        context.Rdx = 0x1_0078_5a4d;
+        context.Rcx = 0;
+        try std.testing.expect(!WindowsX64Machine.tryEmulateNullObjectCompare(&context, 0x20));
+        try std.testing.expect(!WindowsX64Machine.tryEmulateNullMemoryLoad(&context, 0x20));
+        try std.testing.expect(!WindowsX64Machine.tryEmulateUnmappedOptionalPointerLoad(&context, context.Rdx + 8));
+        try std.testing.expect(!WindowsX64Machine.tryEmulateNullSentinelPointerLoad(&context, 8));
+        try std.testing.expectEqual(std.math.maxInt(u64) & ~@as(u64, 0xfff), context.Rip);
     } else {
         return error.SkipZigTest;
     }

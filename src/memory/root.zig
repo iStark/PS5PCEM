@@ -181,7 +181,10 @@ fn linuxProbeReadable(address: u64, end: u64) ?bool {
         while (count < batch and cursor < end) : (count += 1) {
             local[count] = .{ .base = @ptrCast(&scratch[count]), .len = 1 };
             remote[count] = .{ .base = @ptrFromInt(cursor), .len = 1 };
-            cursor = std.mem.alignForward(u64, cursor + 1, std.heap.page_size_min);
+            // alignForward adds before masking and traps near maxInt; a query
+            // must answer false for hostile addresses, never panic.
+            const page: u64 = std.heap.page_size_min;
+            cursor = std.math.add(u64, cursor & ~(page - 1), page) catch return false;
         }
         const result = linux.process_vm_readv(pid, local[0..count], remote[0..count], 0);
         switch (linux.errno(result)) {

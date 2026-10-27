@@ -20,7 +20,6 @@ const mapper = @import("libs/kernel_mapper.zig");
 pub const counters = @import("ampr_counters.zig");
 
 pub const maximum_path: usize = 1024;
-pub const maximum_command_buffers: usize = 32;
 pub const maximum_auto_pool: usize = 8;
 pub const maximum_submissions: usize = 64;
 pub const maximum_cached_files: usize = 64;
@@ -204,7 +203,7 @@ var files: std.ArrayList(FileEntry) = .empty;
 var file_paths: std.StringHashMapUnmanaged(u32) = .empty;
 var path_arena = std.heap.ArenaAllocator.init(file_allocator);
 var cached_file_count: usize = 0;
-var command_buffers: [maximum_command_buffers]CommandBuffer = [_]CommandBuffer{.{}} ** maximum_command_buffers;
+var command_buffers: std.ArrayList(CommandBuffer) = .empty;
 var submissions: [maximum_submissions]Submission = [_]Submission{.{}} ** maximum_submissions;
 var next_submission_identifier: u32 = 1;
 var completion_sink: ?CompletionSink = null;
@@ -243,7 +242,9 @@ pub fn reset() void {
     files.deinit(file_allocator);
     files = .empty;
     cached_file_count = 0;
-    for (&command_buffers) |*buffer| buffer.deinit();
+    for (command_buffers.items) |*buffer| buffer.deinit();
+    command_buffers.deinit(file_allocator);
+    command_buffers = .empty;
     submissions = [_]Submission{.{}} ** maximum_submissions;
     next_submission_identifier = 1;
     auto_pool = [_]AutoPoolRange{.{}} ** maximum_auto_pool;
@@ -376,12 +377,16 @@ pub fn constructCommandBuffer(address: u64) Error!void {
         buffer.* = .{ .active = true, .address = address };
         return;
     }
-    for (&command_buffers) |*buffer| {
-        if (buffer.active) continue;
-        buffer.* = .{ .active = true, .address = address };
-        return;
+    // Firmware holds dozens of file-read buffers at once (40 observed);
+    // grow instead of capping at a guessed size. Reuse dead slots first so
+    // tens of thousands of short-lived buffers do not grow the list forever.
+    for (command_buffers.items) |*buffer| {
+        if (!buffer.active) {
+            buffer.* = .{ .active = true, .address = address };
+            return;
+        }
     }
-    return error.CommandBufferTableFull;
+    try command_buffers.append(file_allocator, .{ .active = true, .address = address });
 }
 
 pub fn destroyCommandBuffer(address: u64) Error!void {
@@ -976,7 +981,7 @@ fn applyAmmMap(command: AmmMapCommand) Error!void {
 }
 
 fn findCommandBufferLocked(address: u64) ?*CommandBuffer {
-    for (&command_buffers) |*buffer| {
+    for (command_buffers.items) |*buffer| {
         if (buffer.active and buffer.address == address) return buffer;
     }
     return null;
