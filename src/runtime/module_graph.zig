@@ -8,6 +8,7 @@ const memory = @import("memory");
 const loader = @import("loader");
 const diag = @import("diag");
 const hle = @import("hle");
+const zarchive = @import("zarchive");
 
 pub const Options = struct {
     /// The executable is relocatable in practice even though titles commonly
@@ -311,6 +312,96 @@ pub fn loadFromDir(
     resolver: ?loader.Resolver,
     options: Options,
 ) !ModuleGraph {
+    return loadFromSource(
+        gpa,
+        .{ .dir = .{ .io = io, .directory = directory } },
+        executable_name,
+        address_space,
+        tls_registry,
+        guest_exports,
+        resolver,
+        options,
+    );
+}
+
+/// Loads the same graph from a ZArchive dump, streaming module bytes without
+/// extracting. Candidate paths use `/` separators, as the archive does.
+pub fn loadFromArchive(
+    gpa: std.mem.Allocator,
+    reader: *zarchive.Reader,
+    executable_name: []const u8,
+    address_space: *memory.AddressSpace,
+    tls_registry: *loader.TlsRegistry,
+    guest_exports: *loader.GuestExportRegistry,
+    resolver: ?loader.Resolver,
+    options: Options,
+) !ModuleGraph {
+    return loadFromSource(
+        gpa,
+        .{ .archive = reader },
+        executable_name,
+        address_space,
+        tls_registry,
+        guest_exports,
+        resolver,
+        options,
+    );
+}
+
+/// Title content behind either a host directory or an archive dump.
+const Source = union(enum) {
+    dir: struct { io: std.Io, directory: std.Io.Dir },
+    archive: *zarchive.Reader,
+
+    fn readAlloc(self: Source, path: []const u8, gpa: std.mem.Allocator, maximum: usize) ![]u8 {
+        switch (self) {
+            .dir => |d| return d.directory.readFileAlloc(d.io, path, gpa, .limited(maximum)),
+            .archive => |reader| {
+                const node = reader.lookup(path) orelse return error.FileNotFound;
+                if (!reader.isFile(node)) return error.IsDir;
+                return reader.readAlloc(node, gpa, maximum) catch |err| switch (err) {
+                    error.OutOfMemory, error.FileTooBig => err,
+                    else => error.IoFailed,
+                };
+            },
+        }
+    }
+
+    fn collectCandidates(self: Source, gpa: std.mem.Allocator, executable_name: []const u8, out: *std.ArrayList(Candidate)) !void {
+        switch (self) {
+            .dir => |d| {
+                var walker = try d.directory.walk(gpa);
+                defer walker.deinit();
+                while (try walker.next(d.io)) |entry| {
+                    if (entry.kind != .file or std.ascii.eqlIgnoreCase(entry.path, executable_name)) continue;
+                    const extension = std.fs.path.extension(entry.basename);
+                    if (!std.ascii.eqlIgnoreCase(extension, ".prx") and
+                        !std.ascii.eqlIgnoreCase(extension, ".sprx")) continue;
+                    try out.append(gpa, .{ .path = try gpa.dupe(u8, entry.path) });
+                }
+            },
+            .archive => |reader| {
+                var path: std.ArrayList(u8) = .empty;
+                defer path.deinit(gpa);
+                const root = reader.lookup("") orelse return;
+                try collectArchiveChildren(reader, gpa, root, &path, executable_name, out, 0);
+            },
+        }
+        std.mem.sort(Candidate, out.items, {}, candidateLessThan);
+    }
+};
+
+/// Shared graph assembly behind both content sources.
+fn loadFromSource(
+    gpa: std.mem.Allocator,
+    source: Source,
+    executable_name: []const u8,
+    address_space: *memory.AddressSpace,
+    tls_registry: *loader.TlsRegistry,
+    guest_exports: *loader.GuestExportRegistry,
+    resolver: ?loader.Resolver,
+    options: Options,
+) !ModuleGraph {
     var graph = ModuleGraph{ .allocator = gpa };
     errdefer graph.deinit();
 
@@ -319,13 +410,12 @@ pub fn loadFromDir(
         for (candidates.items) |*candidate| candidate.deinit(gpa);
         candidates.deinit(gpa);
     }
-    try collectCandidates(gpa, io, directory, executable_name, &candidates);
+    try source.collectCandidates(gpa, executable_name, &candidates);
 
-    const root_bytes = try directory.readFileAlloc(
-        io,
+    const root_bytes = try source.readAlloc(
         executable_name,
         gpa,
-        .limited(options.maximum_file_size),
+        options.maximum_file_size,
     );
     try appendNode(&graph, executable_name, root_bytes);
 
@@ -338,8 +428,7 @@ pub fn loadFromDir(
             return error.FileNotFound;
         const dependency = try ensureNode(
             &graph,
-            io,
-            directory,
+            source,
             candidates.items[candidate_index].path,
             options.maximum_file_size,
         );
@@ -355,8 +444,7 @@ pub fn loadFromDir(
             return error.FileNotFound;
         const dependency = try ensureNode(
             &graph,
-            io,
-            directory,
+            source,
             candidates.items[candidate_index].path,
             options.maximum_file_size,
         );
@@ -374,8 +462,7 @@ pub fn loadFromDir(
             if (findCandidate(candidates.items, needed, true)) |candidate_index| {
                 const dependency = try ensureNode(
                     &graph,
-                    io,
-                    directory,
+                    source,
                     candidates.items[candidate_index].path,
                     options.maximum_file_size,
                 );
@@ -388,8 +475,7 @@ pub fn loadFromDir(
             if (findCandidate(candidates.items, needed.name, false)) |candidate_index| {
                 const dependency = try ensureNode(
                     &graph,
-                    io,
-                    directory,
+                    source,
                     candidates.items[candidate_index].path,
                     options.maximum_file_size,
                 );
@@ -425,25 +511,6 @@ fn resolvePublishedExport(context: *anyopaque, module_id: u64, name: []const u8)
         registry.resolveInModule(module_id, &id, .no_type);
 }
 
-fn collectCandidates(
-    gpa: std.mem.Allocator,
-    io: std.Io,
-    directory: std.Io.Dir,
-    executable_name: []const u8,
-    out: *std.ArrayList(Candidate),
-) !void {
-    var walker = try directory.walk(gpa);
-    defer walker.deinit();
-    while (try walker.next(io)) |entry| {
-        if (entry.kind != .file or std.ascii.eqlIgnoreCase(entry.path, executable_name)) continue;
-        const extension = std.fs.path.extension(entry.basename);
-        if (!std.ascii.eqlIgnoreCase(extension, ".prx") and
-            !std.ascii.eqlIgnoreCase(extension, ".sprx")) continue;
-        try out.append(gpa, .{ .path = try gpa.dupe(u8, entry.path) });
-    }
-    std.mem.sort(Candidate, out.items, {}, candidateLessThan);
-}
-
 fn candidateLessThan(_: void, left: Candidate, right: Candidate) bool {
     return std.ascii.lessThanIgnoreCase(left.path, right.path);
 }
@@ -475,17 +542,50 @@ fn appendNode(graph: *ModuleGraph, path: []const u8, bytes: []u8) !void {
 
 fn ensureNode(
     graph: *ModuleGraph,
-    io: std.Io,
-    directory: std.Io.Dir,
+    source: Source,
     path: []const u8,
     maximum_file_size: usize,
 ) !usize {
     for (graph.nodes.items, 0..) |node, index| {
         if (std.ascii.eqlIgnoreCase(node.path, path)) return index;
     }
-    const bytes = try directory.readFileAlloc(io, path, graph.allocator, .limited(maximum_file_size));
+    const bytes = try source.readAlloc(path, graph.allocator, maximum_file_size);
     try appendNode(graph, path, bytes);
     return graph.nodes.items.len - 1;
+}
+
+/// Depth-first PRX/SRPX discovery inside an archive dump.
+fn collectArchiveChildren(
+    reader: *zarchive.Reader,
+    gpa: std.mem.Allocator,
+    node: u32,
+    path: *std.ArrayList(u8),
+    executable_name: []const u8,
+    out: *std.ArrayList(Candidate),
+    depth: usize,
+) !void {
+    // Hostile archives nest without bound; game trees stay shallow.
+    if (depth > 64) return;
+    const count = reader.dirChildCount(node);
+    var i: u32 = 0;
+    while (i < count) : (i += 1) {
+        const child = reader.dirChild(node, i);
+        if (child.name.len == 0 or child.name.len > 256) continue;
+        const base = path.items.len;
+        if (base != 0) try path.append(gpa, '/');
+        try path.appendSlice(gpa, child.name);
+        defer path.shrinkRetainingCapacity(base);
+        const child_node = reader.dirChildNode(node, i);
+        if (!child.is_file) {
+            try collectArchiveChildren(reader, gpa, child_node, path, executable_name, out, depth + 1);
+            continue;
+        }
+        if (std.ascii.eqlIgnoreCase(path.items, executable_name)) continue;
+        const extension = std.fs.path.extension(child.name);
+        if (!std.ascii.eqlIgnoreCase(extension, ".prx") and
+            !std.ascii.eqlIgnoreCase(extension, ".sprx")) continue;
+        try out.append(gpa, .{ .path = try gpa.dupe(u8, path.items) });
+    }
 }
 
 fn appendDependency(graph: *ModuleGraph, owner: usize, dependency: usize) !void {

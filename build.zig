@@ -145,6 +145,14 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    // ZArchive (.zar) game dumps: zstd-compressed blocks, a file tree, and a
+    // big-endian footer, reimplemented in pure Zig. No third-party code.
+    const zarchive = b.addModule("zarchive", .{
+        .root_source_file = b.path("src/zarchive/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     // Firmware emulation: identifier derivation, the symbol registry, and the
     // guest-facing libraries. Thread bootstrap consumes immutable TLS
     // templates from the loader without introducing a dependency back into it.
@@ -157,6 +165,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "loader", .module = loader },
             .{ .name = "gpu", .module = gpu },
             .{ .name = "input", .module = input },
+            .{ .name = "zarchive", .module = zarchive },
         },
     });
     hle.addIncludePath(libatrac9.path("C/src"));
@@ -488,6 +497,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "hle", .module = hle },
             .{ .name = "cpu", .module = cpu },
             .{ .name = "diag", .module = diag },
+            .{ .name = "zarchive", .module = zarchive },
         },
     });
 
@@ -609,6 +619,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "vulkan", .module = vulkan },
                 .{ .name = "window", .module = window },
                 .{ .name = "d3d12", .module = d3d12 },
+                .{ .name = "zarchive", .module = zarchive },
             },
         }),
     });
@@ -737,6 +748,7 @@ pub fn build(b: *std.Build) void {
                 .imports = &.{
                     .{ .name = "input", .module = input },
                     .{ .name = "build_options", .module = launcher_options.createModule() },
+                    .{ .name = "zarchive", .module = zarchive },
                 },
             }),
         });
@@ -874,6 +886,7 @@ pub fn build(b: *std.Build) void {
         window,
         input,
         pkg,
+        zarchive,
         hle,
         cpu,
         loader,

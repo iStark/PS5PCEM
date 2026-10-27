@@ -156,7 +156,9 @@ limitations. The Windows game measurements do not establish Linux performance.
 1. Install the per-user build or extract the portable ZIP.
 2. Start `ps5pcem.exe`.
 3. Choose a directory containing a decrypted title you are legally allowed to
-   use, then select **Launch game**.
+   use, then select **Launch game**. A folder holding a single ZArchive dump
+   (`.zar`) runs it directly, streamed read-only without extracting; from a
+   command prompt, `game-run game.zar` does the same.
 
 Games, firmware, keys, system libraries, and console software are not included.
 
