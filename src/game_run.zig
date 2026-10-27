@@ -18,6 +18,8 @@ const display_mode = @import("display_mode.zig");
 const performance_mode = @import("performance_mode.zig");
 const frame_limit = @import("frame_limit.zig");
 
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+
 fn acquireHostMemory(context: ?*anyopaque, address: u64, size: usize, identity: u64) ?vulkan.GuestMemory.HostMapping {
     const view = runtime.firmware.libs.agc_submit.pinDirectMemory(context, address, size, identity) orelse return null;
     return .{ .bytes = view.bytes, .offset = view.offset, .identity = identity, .release = runtime.firmware.libs.agc_submit.releaseDirectMemory };
@@ -865,6 +867,22 @@ fn run(init: std.process.Init) !bool {
     } else |_| default_batch_age_us) * std.time.ns_per_us;
     const dump_compute_spirv = init.minimal.environ.containsUnempty(allocator, "PS5_DUMP_COMPUTE_SPIRV") catch false;
     const dump_graphics_spirv = init.minimal.environ.containsUnempty(allocator, "PS5_DUMP_GRAPHICS_SPIRV") catch false;
+    const renderdoc_flips: struct { first: u64 = 0, last: u64 = 0 } = if (init.minimal.environ.getAlloc(allocator, "PS5_RENDERDOC_FLIPS")) |text| parse: {
+        defer allocator.free(text);
+        const trimmed = std.mem.trim(u8, text, " \t\r\n");
+        if (std.mem.indexOfScalar(u8, trimmed, '-')) |dash| {
+            const first = std.fmt.parseInt(u64, trimmed[0..dash], 10) catch break :parse .{};
+            const last = std.fmt.parseInt(u64, trimmed[dash + 1 ..], 10) catch break :parse .{};
+            if (first == 0 or last < first) break :parse .{};
+            break :parse .{ .first = first, .last = last };
+        }
+        const single = std.fmt.parseInt(u64, trimmed, 10) catch break :parse .{};
+        if (single == 0) break :parse .{};
+        break :parse .{ .first = single, .last = single };
+    } else |_| .{};
+    // The implicit layer only hooks instance creation with this set, and the
+    // in-app start call below matches nothing without the layer in the chain.
+    if (renderdoc_flips.first != 0) _ = setenv("ENABLE_VULKAN_RENDERDOC_CAPTURE", "1", 1);
     const trace_resource_failures = init.minimal.environ.containsUnempty(allocator, "PS5_TRACE_RESOURCE_FAILURES") catch false;
     const trace_buffer_range: struct { address: u64 = 0, size: usize = 0 } = if (init.minimal.environ.getAlloc(allocator, "PS5_TRACE_BUFFER_RANGE")) |text| parse: {
         defer allocator.free(text);
@@ -1215,6 +1233,8 @@ fn run(init: std.process.Init) !bool {
             .prefer_integrated_gpu = prefer_integrated_gpu,
             .dump_compute_spirv = dump_compute_spirv,
             .dump_graphics_spirv = dump_graphics_spirv,
+            .renderdoc_first_flip = renderdoc_flips.first,
+            .renderdoc_last_flip = renderdoc_flips.last,
             .trace_resource_failures = trace_resource_failures,
             .trace_buffer_address = trace_buffer_range.address,
             .trace_buffer_size = trace_buffer_range.size,

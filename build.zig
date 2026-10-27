@@ -66,6 +66,13 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    // RenderDoc capture adapter. Only std; loaded by the renderer on demand.
+    const renderdoc = b.addModule("renderdoc", .{
+        .root_source_file = b.path("src/diag/renderdoc.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     // Host renderer foundation. Vulkan is loaded dynamically at runtime, so
     // compiling the emulator does not require SDK headers or loader libraries.
     const vulkan = b.addModule("vulkan", .{
@@ -75,6 +82,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "gpu", .module = gpu },
             .{ .name = "rdna2", .module = mod },
+            .{ .name = "renderdoc", .module = renderdoc },
         },
     });
 
@@ -891,6 +899,7 @@ pub fn build(b: *std.Build) void {
         cpu,
         loader,
         diag,
+        renderdoc,
         runtime,
         exe.root_module,
         module_info.root_module,

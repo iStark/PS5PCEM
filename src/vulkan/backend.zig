@@ -26,6 +26,7 @@ const pipeline_cache_save = @import("pipeline_cache_save.zig");
 const pipeline_warmup = @import("pipeline_warmup.zig");
 const spirv_cache = rdna2.translation_cache;
 const tessellation_spirv = @import("tessellation_spirv.zig");
+const renderdoc = @import("renderdoc");
 // Kept opt-in while the live LS/HS resource path is being validated.
 pub export var native_tessellation: bool = false;
 pub export var graphics_uniform_specialization: bool = false;
@@ -357,6 +358,10 @@ pub const Options = struct {
     dump_compute_spirv: bool = false,
     /// Writes translated guest graphics modules to `out` for offline validation.
     dump_graphics_spirv: bool = false,
+    /// RenderDoc capture flip range, from PS5_RENDERDOC_FLIPS ("2" or "1-2").
+    /// Zero disables; the library loads only when armed.
+    renderdoc_first_flip: u64 = 0,
+    renderdoc_last_flip: u64 = 0,
     /// Dumps the first failing descriptor snapshot at each program/PC.
     trace_resource_failures: bool = false,
     /// Opt-in small-buffer lifecycle snapshots inside this guest address range.
@@ -6308,6 +6313,10 @@ pub const Renderer = struct {
     translate_compute_only: bool,
     dump_compute_spirv: bool,
     dump_graphics_spirv: bool,
+    /// RenderDoc capture flip range, from PS5_RENDERDOC_FLIPS ("2" or "1-2").
+    /// Zero disables; the library loads only when armed.
+    renderdoc_first_flip: u64 = 0,
+    renderdoc_last_flip: u64 = 0,
     trace_resource_failures: bool,
     trace_buffer_address: u64 = 0,
     trace_buffer_size: usize = 0,
@@ -7441,6 +7450,8 @@ pub const Renderer = struct {
             .translate_compute_only = options.translate_compute_only,
             .dump_compute_spirv = options.dump_compute_spirv,
             .dump_graphics_spirv = options.dump_graphics_spirv,
+            .renderdoc_first_flip = options.renderdoc_first_flip,
+            .renderdoc_last_flip = options.renderdoc_last_flip,
             .trace_resource_failures = options.trace_resource_failures,
             .trace_buffer_address = options.trace_buffer_address,
             .trace_buffer_size = options.trace_buffer_size,
@@ -7482,6 +7493,14 @@ pub const Renderer = struct {
             .window_presentation = window_presentation,
         };
         renderer.image_aliases.enabled = options.enable_canonical_image_aliases;
+        // RenderDoc loads only when a flip range is armed; failure stays silent.
+        if (renderer.renderdoc_first_flip != 0) {
+            std.debug.print("[renderdoc] arming flips {d}-{d}\n", .{ renderer.renderdoc_first_flip, renderer.renderdoc_last_flip });
+            if (!renderdoc.arm(renderer.renderdoc_first_flip, renderer.renderdoc_last_flip)) {
+                renderer.renderdoc_first_flip = 0;
+                renderer.renderdoc_last_flip = 0;
+            }
+        }
         renderer.image_aliases.canonical_authority_enabled = options.enable_canonical_image_aliases;
         renderer.image_states.optimize_barriers = options.enable_image_state_optimization;
         renderer.dynamic_scalar_buffer = try renderer.createBuffer(
@@ -19596,7 +19615,7 @@ pub const Renderer = struct {
             .{ vertex_words.len, fragment_words.len },
         );
         if (report_checkpoints) std.debug.print(
-            "[vulkan dcb] first graphics draw: viewport={d}x{d} scissor={d}x{d} discard={d} colors={d} write=0x{x} blend={d} extras={d}\n",
+            "[vulkan dcb] first graphics draw: viewport={d}x{d} scissor={d}x{d} discard={d} colors={d} write=0x{x} blend={d} extras={d} topo={d} cull={d} front={d} depth={d} dfunc={d}\n",
             .{
                 @as(f32, @bitCast(pipeline_state.viewport_width_bits)),
                 @as(f32, @bitCast(pipeline_state.viewport_height_bits)),
@@ -19607,6 +19626,11 @@ pub const Renderer = struct {
                 pipeline_state.color_write_masks[0],
                 pipeline_state.blend_enables[0],
                 extra_colors.len,
+                pipeline_state.topology,
+                pipeline_state.cull_mode,
+                pipeline_state.front_face,
+                pipeline_state.depth_test_enable,
+                pipeline_state.depth_compare_operation,
             },
         );
         if (report_checkpoints) {
@@ -39403,6 +39427,13 @@ pub const Renderer = struct {
         defer self.restoreReanimalTimelineSchedulerAfterFlip();
         const flip_started = hostTimestampNs();
         defer self.reportFrameProfile();
+        // RenderDoc brackets whole flips: start before the first armed flip
+        // records, end once the last armed flip is presented.
+        if (self.renderdoc_first_flip != 0) {
+            const table = @as(*const ?*anyopaque, @ptrCast(&self.instance_handle)).*;
+            if (self.flip_callbacks == self.renderdoc_first_flip) renderdoc.noteFlip(table, self.flip_callbacks);
+            defer if (self.flip_callbacks == self.renderdoc_last_flip) renderdoc.noteFlip(table, self.flip_callbacks);
+        }
         // Declared after the report so that it runs before it: the time this
         // flip spends belongs to the frame being reported, not the next one.
         defer self.frame_profile.flip_ns +|= elapsedHostNanoseconds(flip_started);
