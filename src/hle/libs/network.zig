@@ -409,6 +409,7 @@ const ssl_exports = [_]symbols.Export{
     .{ .name = "sceSslGetSubjectName", .function = trace.wrap("sceSslGetSubjectName", &sslUnavailable), .expect_id = "dQReuBX9sD8" },
     .{ .name = "sceSslGetSerialNumber", .function = trace.wrap("sceSslGetSerialNumber", &sslUnavailable), .expect_id = "DOwXL+FQMEY" },
     .{ .name = "sceSslGetPem", .function = trace.wrap("sceSslGetPem", &sslUnavailable), .expect_id = "kLB5aGoUJXg" },
+    .{ .name = "sceSslClose", .function = trace.wrap("sceSslClose", &sslUnavailable), .expect_id = "viRXSHZYd0c" },
 };
 
 // libSceHttp URI parsing and lifecycle -------------------------------------
@@ -1019,4 +1020,14 @@ test "network families register the title import surface" {
     }) |id| {
         try std.testing.expect(db.findById(id, .function) != null);
     }
+}
+
+test "closing an SSL session reports it missing without touching memory" {
+    var db = symbols.Database{};
+    defer db.deinit(std.testing.allocator);
+    try register(&db, std.testing.allocator);
+    const symbol = db.findById("viRXSHZYd0c", .function) orelse return error.MissingSslClose;
+    try std.testing.expectEqualStrings("libSceSsl", symbol.key.library.name);
+    const close: *const fn (u64, u64, u64, u64, u64, u64) callconv(abi.guest) i32 = @ptrFromInt(symbol.address);
+    try std.testing.expectEqual(ssl_error_not_found, close(7, 0, 0, 0, 0, 0));
 }

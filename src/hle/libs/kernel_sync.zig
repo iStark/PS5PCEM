@@ -1777,10 +1777,33 @@ pub const exports = [_]symbols.Export{
     .{ .name = "scePthreadBarrierWait", .function = trace.wrap("scePthreadBarrierWait", &scePthreadBarrierWait), .expect_id = "t9vVyTglqHQ" },
     .{ .name = "scePthreadBarrierDestroy", .function = trace.wrap("scePthreadBarrierDestroy", &scePthreadBarrierDestroy), .expect_id = "HudB2Jv2MPY" },
     .{ .name = "scePthreadBarrierInit", .function = trace.wrap("scePthreadBarrierInit", &scePthreadBarrierInit), .expect_id = "5dgOEPsEGqw" },
+
+    .{ .name = "unknownSceLibcAtomicWait8", .function = trace.wrap("unknownSceLibcAtomicWait8", &unknownSceLibcAtomicWait8), .id_override = "dFym5b41JLU" },
+    .{ .name = "unknownSceLibcAtomicWait16", .function = trace.wrap("unknownSceLibcAtomicWait16", &unknownSceLibcAtomicWait16), .id_override = "XgVs4jRehcY" },
 };
 
 pub const library = symbols.Library{ .name = "libkernel", .version = 1 };
 pub const module = symbols.Module{ .name = "libkernel", .version_major = 1, .version_minor = 1 };
+
+/// Sony libc's `SceLibcV2AtomicWait` backends, imported by its bundled
+/// `libc.prx` (seen in Demon's Souls) as two `libkernel` functions.
+///
+/// Observed contract, from the two libc wrappers that call them: three
+/// arguments — a name tag (`"SceLibcV2AtomicWait"`), a small selector (one
+/// wrapper passes 8 bits, the other 16), and either null or a pointer to a
+/// microsecond timeout converted from milliseconds with saturation. The
+/// wrappers discard the result and report success themselves, and the only
+/// known caller set ignores it, so answering success changes nothing
+/// observable there; any direct caller sees a wait that never blocks.
+pub fn unknownSceLibcAtomicWait8(_: u64, _: u64, _: u64) callconv(abi.guest) i32 {
+    return errno.ok;
+}
+
+/// Second width of the facility above. Kept apart because the two have
+/// distinct identifiers and may yet turn out to differ.
+pub fn unknownSceLibcAtomicWait16(_: u64, _: u64, _: u64) callconv(abi.guest) i32 {
+    return errno.ok;
+}
 
 pub fn register(db: *symbols.Database, gpa: std.mem.Allocator) symbols.Error!void {
     try db.addLibrary(gpa, library, module, &exports);
@@ -1840,6 +1863,33 @@ const TestWaitBackend = struct {
         };
     }
 };
+
+test "unnamed SceLibcV2AtomicWait backends resolve Demon's Souls libc imports" {
+    var db = symbols.Database{};
+    defer db.deinit(testing.allocator);
+    try register(&db, testing.allocator);
+    for ([_]struct {
+        id: *const [11:0]u8,
+        address: *const fn (u64, u64, u64) callconv(abi.guest) i32,
+    }{
+        .{ .id = "dFym5b41JLU", .address = &unknownSceLibcAtomicWait8 },
+        .{ .id = "XgVs4jRehcY", .address = &unknownSceLibcAtomicWait16 },
+    }) |case| {
+        const symbol = db.find(.{
+            .id = case.id.*,
+            .library = library,
+            .module = module,
+            .type = .function,
+        }) orelse return error.MissingAtomicWaitBackend;
+        // The libc wrappers discard the result and report success themselves,
+        // so answering success changes nothing observable for them. The
+        // registered address is the trace wrapper, so exercise it rather
+        // than comparing it to the raw implementation.
+        const entry: *const fn (u64, u64, u64) callconv(abi.guest) i32 = @ptrFromInt(symbol.address);
+        try testing.expectEqual(errno.ok, entry(0, 0, 0));
+        try testing.expectEqual(errno.ok, case.address(0, 0, 0));
+    }
+}
 
 test "recursive mutexes preserve ownership and reject busy destruction" {
     var context = TestContext{};
