@@ -408,6 +408,21 @@ pub fn resetCommandBuffer(address: u64) Error!void {
     buffer.map_active = false;
 }
 
+pub fn clearCommandBuffer(address: u64) Error!void {
+    lock.lock();
+    defer lock.unlock();
+    const buffer = findCommandBufferLocked(address) orelse return error.InvalidCommandBuffer;
+    // Clear detaches storage and recorded ops but keeps the registration alive:
+    // firmware reuses a buffer across files without reconstructing it.
+    buffer.ops.clearRetainingCapacity();
+    buffer.record_bytes = 0;
+    buffer.command_count = 0;
+    buffer.storage_address = 0;
+    buffer.storage_size = 0;
+    buffer.cursor = null;
+    buffer.map_active = false;
+}
+
 pub fn commandBufferInfo(address: u64) Error!CommandBufferInfo {
     lock.lock();
     defer lock.unlock();
@@ -979,6 +994,20 @@ test "AMPR waits defer later writes and events and survive buffer reuse" {
     try waitCommandBuffer(waiting);
     try std.testing.expectEqual(@as(u64, 0x900000007), Sink.published.load(.acquire));
     try std.testing.expectError(error.UnknownSubmission, waitCommandBuffer(waiting));
+}
+
+test "AMPR cleared buffers accept new storage without reconstruction" {
+    reset();
+    defer reset();
+    try constructCommandBuffer(0x1000);
+    try setCommandBufferStorage(0x1000, 0x2000, 0x100);
+    try clearCommandBuffer(0x1000);
+    // Clearing detaches storage but keeps the object: reattaching works,
+    // which is what file readers do on every open.
+    try setCommandBufferStorage(0x1000, 0x3000, 0x100);
+    const info = try commandBufferInfo(0x1000);
+    try std.testing.expectEqual(@as(u64, 0x3000), info.storage_address);
+    try std.testing.expectEqual(@as(usize, 0x100), info.storage_size);
 }
 
 test "AMPR pending reset cancels writes and clears process counters" {

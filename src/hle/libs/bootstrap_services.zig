@@ -108,7 +108,7 @@ fn amprCommandBufferReset(address: u64) callconv(abi.guest) i32 {
 fn amprCommandBufferClearBuffer(address: u64) callconv(abi.guest) u64 {
     if (!kernel_memory.isGuestRangeAccessible(address, ampr_command_buffer_header_size)) return 0;
     const storage_address = readGuestU64(address + 0x08);
-    apr.destroyCommandBuffer(address) catch {};
+    apr.clearCommandBuffer(address) catch {};
     writeGuestU64(address + 0x00, address);
     writeGuestU64(address + 0x08, 0);
     writeGuestU64(address + 0x10, 0);
