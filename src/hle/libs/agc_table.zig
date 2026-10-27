@@ -138,6 +138,11 @@ pub const exports = [_]symbols.Export{
     .{ .name = "sceAgcUnknownRTpjTIlvZc", .function = trace.wrap("sceAgcUnknownRTpjTIlvZc", &agc.accept), .id_override = "RTpj-tIlvZc" },
     .{ .name = "sceAgcUnknownSwI6QxqwAC0", .function = trace.wrap("sceAgcUnknownSwI6QxqwAC0", &agc.accept), .id_override = "SwI6QxqwAC0" },
     .{ .name = "sceAgcUnknownD4NZIlguzv0", .function = trace.wrap("sceAgcUnknownD4NZIlguzv0", &agc.accept), .id_override = "d4NZIlguzv0" },
+    // Demon's Souls imports these two from its bundled shadows without ever
+    // calling them directly; accepting lets linking reach firmware instead of
+    // dead driver code. No published name hashes to them.
+    .{ .name = "sceAgcUnknownV3G+IipShZs", .function = trace.wrap("sceAgcUnknownV3G+IipShZs", &agc.accept), .id_override = "v3G+IipShZs" },
+    .{ .name = "sceAgcUnknownVieBRwlh1Lw", .function = trace.wrap("sceAgcUnknownVieBRwlh1Lw", &agc.accept), .id_override = "vieBRwlh1Lw" },
 };
 
 pub const driver_exports = [_]symbols.Export{
@@ -178,6 +183,9 @@ pub const driver_exports = [_]symbols.Export{
     .{ .name = "sceAgcDriverUnknownWHIOMbbIIU", .function = trace.wrap("sceAgcDriverUnknownWHIOMbbIIU", &agc.accept), .id_override = "WHIOMbb+iIU" },
     .{ .name = "sceAgcDriverUnknownChJWZcNSzjk", .function = trace.wrap("sceAgcDriverUnknownChJWZcNSzjk", &agc.accept), .id_override = "chJWZcNSzjk" },
     .{ .name = "sceAgcDriverUnknownIAOE3jCnkk", .function = trace.wrap("sceAgcDriverUnknownIAOE3jCnkk", &agc.accept), .id_override = "+iAOE3jCnkk" },
+    // Demon's Souls twin of the libSceAgc pair above: imported from its
+    // bundled shadow, never called directly.
+    .{ .name = "sceAgcDriverUnknownJQc0956gCf0", .function = trace.wrap("sceAgcDriverUnknownJQc0956gCf0", &agc.accept), .id_override = "JQc0956gCf0" },
     // Dreaming Sarah imports these three. The jump patch is the one with
     // known behaviour -- it points an INDIRECT_BUFFER at the buffer it should
     // run -- so it is implemented rather than accepted; a jump left unpatched

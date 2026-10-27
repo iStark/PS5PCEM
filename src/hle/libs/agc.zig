@@ -1221,6 +1221,25 @@ test "Rita's Rewind AGC 1.1 imports resolve" {
     }
 }
 
+test "Demon's Souls bundled-driver callbacks resolve to firmware" {
+    var db = symbols.Database{};
+    defer db.deinit(testing.allocator);
+    try register(&db, testing.allocator);
+    // Imported by eboot from the bundled shadows, never called directly;
+    // the entries exist so linking reaches firmware instead of dead driver
+    // code. Each answers success without handing back anything followed.
+    for ([_]struct { id: *const [11:0]u8, library: []const u8 }{
+        .{ .id = "v3G+IipShZs", .library = "libSceAgc" },
+        .{ .id = "vieBRwlh1Lw", .library = "libSceAgc" },
+        .{ .id = "JQc0956gCf0", .library = "libSceAgcDriver" },
+    }) |case| {
+        const symbol = db.findById(case.id, .function) orelse return error.MissingBundledDriverCallback;
+        try testing.expectEqualStrings(case.library, symbol.key.library.name);
+        const entry: *const fn (u64, u64, u64, u64, u64, u64) callconv(abi.guest) i32 = @ptrFromInt(symbol.address);
+        try testing.expectEqual(errno.ok, entry(0, 0, 0, 0, 0, 0));
+    }
+}
+
 test "a buffer with no room left says so instead of writing past its end" {
     var storage: [command_words]u32 = @splat(0);
     var buffer = fixture(&storage);

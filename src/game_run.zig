@@ -91,6 +91,7 @@ const save_data_home = "savedata";
 const download_data_home = "out/download0";
 const temporary_data_home = "out/temp0";
 const terminator_2d_title_id = "PPSA25872";
+const demons_souls_title_id = "PPSA01341";
 const tetris_effect_connected_title_id = "PPSA07923";
 const little_nightmares_enhanced_title_id = "PPSA10737";
 const yotei_title_id = "PPSA26344";
@@ -510,6 +511,36 @@ fn run(init: std.process.Init) !bool {
         try out.flush();
     }
 
+    // The directory holding the executable is what a title sees as /app0.
+    // An archive dump serves the same mount, streamed without extracting.
+    // Opened here (rather than after the graph) because the title identity
+    // below feeds graph construction for driver-routed titles.
+    var content: ?std.Io.Dir = null;
+    defer if (content) |*directory| directory.close(io);
+    if (archive_reader == null) {
+        content = std.Io.Dir.cwd().openDir(io, title_root, .{}) catch |err| {
+            try stderr.print("cannot open {s}: {s}\n", .{ title_root, @errorName(err) });
+            try stderr.flush();
+            return false;
+        };
+    }
+
+    var title_identifier_storage: [runtime.firmware.savedata.maximum_slot_name]u8 = undefined;
+    const title_identifier = if (archive_reader) |reader|
+        readTitleIdentifierArchive(reader, &title_identifier_storage) orelse ""
+    else if (content) |directory|
+        readTitleIdentifier(io, directory, &title_identifier_storage) orelse ""
+    else
+        "";
+    // Demon's Souls ships link-time driver shadows its bundled initializer
+    // cannot satisfy; route it to the live firmware path instead. See
+    // ModuleGraphOptions.ignore_bundled_drivers: big, per-title, deliberate.
+    const ignore_bundled_drivers = std.ascii.eqlIgnoreCase(title_identifier, demons_souls_title_id);
+    if (ignore_bundled_drivers) {
+        try out.print("  Drivers  bundled shadows ignored, firmware path\n", .{});
+        try out.flush();
+    }
+
     var preload_modules: std.ArrayList([]const u8) = .empty;
     defer preload_modules.deinit(allocator);
     var preload_text: ?[]u8 = null;
@@ -551,6 +582,7 @@ fn run(init: std.process.Init) !bool {
         emu.loadModuleGraphArchive(io, reader, archive_executable, .{
             .preload_modules = preload_modules.items,
             .deferred_modules = deferred_modules.items,
+            .ignore_bundled_drivers = ignore_bundled_drivers,
             .diagnostics = .{ .context = stderr, .unresolved_fn = &reportUnresolvedImport },
         }) catch |err| {
             try stderr.print("cannot link {s} in {s}: {s}\n", .{ archive_executable, archive_path.?, @errorName(err) });
@@ -561,6 +593,7 @@ fn run(init: std.process.Init) !bool {
         emu.loadModuleGraph(io, executable_path, .{
             .preload_modules = preload_modules.items,
             .deferred_modules = deferred_modules.items,
+            .ignore_bundled_drivers = ignore_bundled_drivers,
             .diagnostics = .{ .context = stderr, .unresolved_fn = &reportUnresolvedImport },
         }) catch |err| {
             try stderr.print("cannot link {s}: {s}\n", .{ executable_path, @errorName(err) });
@@ -586,18 +619,9 @@ fn run(init: std.process.Init) !bool {
         allocator.free(loaded_modules);
     }
 
-    // The directory holding the executable is what a title sees as /app0.
-    // An archive dump serves the same mount, streamed without extracting.
-    var content: ?std.Io.Dir = null;
-    defer if (content) |*directory| directory.close(io);
     if (archive_reader) |reader| {
         runtime.firmware.filesystem.attachArchive(io, reader);
     } else {
-        content = std.Io.Dir.cwd().openDir(io, title_root, .{}) catch |err| {
-            try stderr.print("cannot open {s}: {s}\n", .{ title_root, @errorName(err) });
-            try stderr.flush();
-            return false;
-        };
         runtime.firmware.filesystem.attach(io, content.?);
     }
     if (try runtime.firmware.filesystem.configureDisplay(output_mode.width(), output_mode.height())) {
@@ -641,13 +665,6 @@ fn run(init: std.process.Init) !bool {
         allocator,
         "PS5_PAD_DIAGNOSTICS",
     ) catch false);
-    var title_identifier_storage: [runtime.firmware.savedata.maximum_slot_name]u8 = undefined;
-    const title_identifier = if (archive_reader) |reader|
-        readTitleIdentifierArchive(reader, &title_identifier_storage) orelse ""
-    else if (content) |directory|
-        readTitleIdentifier(io, directory, &title_identifier_storage) orelse ""
-    else
-        "";
     var saves = openSaveDataHome(io, title_identifier) catch null;
     defer if (saves) |*directory| directory.close(io);
     defer runtime.firmware.filesystem.unmountSaveData();

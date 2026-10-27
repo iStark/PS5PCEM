@@ -28,6 +28,18 @@ pub const Options = struct {
     /// Unity native plug-ins receive their startup argument through that call
     /// and are not valid during the process' dependency initialization phase.
     deferred_modules: []const []const u8 = &.{},
+    /// Leave bundled `fakelib/` shadow drivers unmapped so their imports
+    /// resolve to firmware instead.
+    ///
+    /// This is driver-routing policy, not a loader convenience, and it is a
+    /// big change in a small flag: on hardware these shadows never run — the
+    /// kernel loads the real system modules — while mapping them here runs
+    /// their initializers natively. A title whose bundled driver cannot
+    /// initialize (Demon's Souls' AgcDriver needs direct memory its own boot
+    /// already tiled wall-to-wall) must use the live firmware path instead.
+    /// Titles whose bundled drivers do run (Little Nightmares) keep the
+    /// default. Prefer extending firmware coverage over widening this flag.
+    ignore_bundled_drivers: bool = false,
     diagnostics: ?Diagnostics = null,
 };
 
@@ -367,13 +379,14 @@ const Source = union(enum) {
         }
     }
 
-    fn collectCandidates(self: Source, gpa: std.mem.Allocator, executable_name: []const u8, out: *std.ArrayList(Candidate)) !void {
+    fn collectCandidates(self: Source, gpa: std.mem.Allocator, executable_name: []const u8, ignore_bundled_drivers: bool, out: *std.ArrayList(Candidate)) !void {
         switch (self) {
             .dir => |d| {
                 var walker = try d.directory.walk(gpa);
                 defer walker.deinit();
                 while (try walker.next(d.io)) |entry| {
                     if (entry.kind != .file or std.ascii.eqlIgnoreCase(entry.path, executable_name)) continue;
+                    if (ignore_bundled_drivers and isBundledShadow(entry.path)) continue;
                     const extension = std.fs.path.extension(entry.basename);
                     if (!std.ascii.eqlIgnoreCase(extension, ".prx") and
                         !std.ascii.eqlIgnoreCase(extension, ".sprx")) continue;
@@ -384,12 +397,22 @@ const Source = union(enum) {
                 var path: std.ArrayList(u8) = .empty;
                 defer path.deinit(gpa);
                 const root = reader.lookup("") orelse return;
-                try collectArchiveChildren(reader, gpa, root, &path, executable_name, out, 0);
+                try collectArchiveChildren(reader, gpa, root, &path, executable_name, ignore_bundled_drivers, out, 0);
             },
         }
         std.mem.sort(Candidate, out.items, {}, candidateLessThan);
     }
 };
+
+/// Link-time shadows the kernel replaces with real system modules at runtime.
+/// Skipped only under explicit driver-routing policy (see Options).
+fn isBundledShadow(path: []const u8) bool {
+    var rest = path;
+    while (rest.len != 0 and (rest[0] == '/' or rest[0] == '\\')) rest = rest[1..];
+    var end: usize = 0;
+    while (end < rest.len and rest[end] != '/' and rest[end] != '\\') end += 1;
+    return std.ascii.eqlIgnoreCase(rest[0..end], "fakelib");
+}
 
 /// Shared graph assembly behind both content sources.
 fn loadFromSource(
@@ -410,7 +433,7 @@ fn loadFromSource(
         for (candidates.items) |*candidate| candidate.deinit(gpa);
         candidates.deinit(gpa);
     }
-    try source.collectCandidates(gpa, executable_name, &candidates);
+    try source.collectCandidates(gpa, executable_name, options.ignore_bundled_drivers, &candidates);
 
     const root_bytes = try source.readAlloc(
         executable_name,
@@ -561,6 +584,7 @@ fn collectArchiveChildren(
     node: u32,
     path: *std.ArrayList(u8),
     executable_name: []const u8,
+    ignore_bundled_drivers: bool,
     out: *std.ArrayList(Candidate),
     depth: usize,
 ) !void {
@@ -577,10 +601,11 @@ fn collectArchiveChildren(
         defer path.shrinkRetainingCapacity(base);
         const child_node = reader.dirChildNode(node, i);
         if (!child.is_file) {
-            try collectArchiveChildren(reader, gpa, child_node, path, executable_name, out, depth + 1);
+            try collectArchiveChildren(reader, gpa, child_node, path, executable_name, ignore_bundled_drivers, out, depth + 1);
             continue;
         }
         if (std.ascii.eqlIgnoreCase(path.items, executable_name)) continue;
+        if (ignore_bundled_drivers and isBundledShadow(path.items)) continue;
         const extension = std.fs.path.extension(child.name);
         if (!std.ascii.eqlIgnoreCase(extension, ".prx") and
             !std.ascii.eqlIgnoreCase(extension, ".sprx")) continue;
@@ -827,6 +852,67 @@ test "a needed module is discovered recursively and initialized before the execu
     try testing.expectEqualStrings("leaf.prx", graph.nodes.items[2].path);
     try testing.expect(graph.modules()[0] == &graph.nodes.items[2].mapped.?);
     try testing.expect(graph.modules()[1] == &graph.nodes.items[1].mapped.?);
+}
+
+test "bundled shadow drivers are left for firmware when asked" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    var dependency = try minimalImage(testing.allocator, .sce_dynamic, null);
+    defer dependency.deinit(testing.allocator);
+    var executable = try minimalImage(testing.allocator, .sce_dynexec, "dependency");
+    defer executable.deinit(testing.allocator);
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "eboot.bin", .data = executable.bytes() });
+    try tmp.dir.createDirPath(testing.io, "fakelib");
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "fakelib/dependency.prx", .data = dependency.bytes() });
+
+    {
+        var address_space = try memory.AddressSpace.init(testing.allocator);
+        defer address_space.deinit();
+        var tls_registry = loader.TlsRegistry{};
+        defer tls_registry.deinit(testing.allocator);
+        var guest_exports = loader.GuestExportRegistry{};
+        defer guest_exports.deinit(testing.allocator);
+        var graph = try loadFromDir(
+            testing.allocator,
+            testing.io,
+            tmp.dir,
+            "eboot.bin",
+            &address_space,
+            &tls_registry,
+            &guest_exports,
+            null,
+            .{},
+        );
+        defer graph.deinit();
+        try testing.expectEqual(@as(usize, 1), graph.moduleCount());
+        try testing.expectEqualStrings("fakelib/dependency.prx", graph.nodes.items[1].path);
+    }
+
+    // Excluded, the shadow reads as a firmware dependency: the graph holds
+    // only the executable, and the missing import resolves through the
+    // runtime resolver (firmware) instead of a mapped module.
+    {
+        var address_space = try memory.AddressSpace.init(testing.allocator);
+        defer address_space.deinit();
+        var tls_registry = loader.TlsRegistry{};
+        defer tls_registry.deinit(testing.allocator);
+        var guest_exports = loader.GuestExportRegistry{};
+        defer guest_exports.deinit(testing.allocator);
+        var excluded = try loadFromDir(
+            testing.allocator,
+            testing.io,
+            tmp.dir,
+            "eboot.bin",
+            &address_space,
+            &tls_registry,
+            &guest_exports,
+            null,
+            .{ .ignore_bundled_drivers = true },
+        );
+        defer excluded.deinit();
+        try testing.expectEqual(@as(usize, 0), excluded.moduleCount());
+    }
 }
 
 test "a deferred module is linked but omitted from process initialization" {
