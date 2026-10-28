@@ -6647,6 +6647,10 @@ pub const Renderer = struct {
     last_resident_reject: u8 = 0,
     last_rt_reject: u8 = 0,
     last_depth_reject: u8 = 0,
+    /// Which branch the latest readbackRenderTarget took: 0 real transfer,
+    /// 1 replaced-target discard, 2 uninitialized, 3 multisample resolve,
+    /// 4 generation-skip layout transition, 5 index out of bounds.
+    last_readback_outcome: u8 = 0,
     assembled_mip_chains: std.ArrayList(AssembledMipChain) = .empty,
     color_volume_snapshots: std.ArrayList(ColorVolumeSnapshot) = .empty,
     color_volume_snapshot_bytes: u64 = 0,
@@ -18978,13 +18982,25 @@ pub const Renderer = struct {
     fn readbackRenderTarget(self: *Renderer, index: usize, require_cached_frame: bool) anyerror!void {
         const profile_started = hostTimestampNs();
         defer self.frame_profile.target_materialize_ns +|= elapsedHostNanoseconds(profile_started);
-        if (index >= self.render_targets.items.len) return Error.MissingPresentedFrame;
-        if (!require_cached_frame and self.discardReplacedRenderTarget(index)) return;
+        if (index >= self.render_targets.items.len) {
+            self.last_readback_outcome = 5;
+            return Error.MissingPresentedFrame;
+        }
+        if (!require_cached_frame and self.discardReplacedRenderTarget(index)) {
+            self.last_readback_outcome = 1;
+            return;
+        }
         const snapshot = self.render_targets.items[index];
-        if (!snapshot.initialized) return;
+        if (!snapshot.initialized) {
+            self.last_readback_outcome = 2;
+            return;
+        }
         // Multisampled attachments cannot be copied to a linear buffer. The
         // guest resolve packet publishes the 1x destination instead.
-        if (snapshot.target.descriptor.fragments_log2 != 0) return;
+        if (snapshot.target.descriptor.fragments_log2 != 0) {
+            self.last_readback_outcome = 3;
+            return;
+        }
         if (snapshot.gpu_generation == snapshot.host_generation) {
             // A published generation can outlive its entry in the bounded
             // completed-frame cache. Presentation still needs those pixels;
@@ -18997,12 +19013,14 @@ pub const Renderer = struct {
             } else false;
             if (!require_cached_frame or cached_frame_available) {
                 try self.transitionRenderTargetToColorAttachment(index);
+                self.last_readback_outcome = 4;
                 return;
             }
         }
         // Past the generation check is the only place a readback is real. The
         // call counter above cannot tell one from a layout transition, and the
         // difference is the whole question.
+        self.last_readback_outcome = 0;
         self.frame_profile.target_readbacks +|= 1;
         const frame_bytes = try colorTargetFrameBytes(snapshot.target);
         // Reserve the final host snapshot before recording the transfer.
@@ -19143,12 +19161,13 @@ pub const Renderer = struct {
         } else if (log_verbose_gpu or self.reported_non_rgba_materializations < 4) {
             self.reported_non_rgba_materializations += 1;
             std.debug.print(
-                "[vulkan dcb] materialized color target @0x{x} fmt={d} nonzero_texels={d}/{d}\n",
+                "[vulkan dcb] materialized color target @0x{x} fmt={d} nonzero_texels={d}/{d} peak={d}\n",
                 .{
                     snapshot.target.descriptor.address,
                     snapshot.target.descriptor.format,
                     colored,
                     snapshot.target.descriptor.width * snapshot.target.descriptor.height,
+                    peakColorValue(frame, snapshot.target.format),
                 },
             );
         }
@@ -19636,10 +19655,14 @@ pub const Renderer = struct {
             .{ vertex_words.len, fragment_words.len },
         );
         if (report_checkpoints) std.debug.print(
-            "[vulkan dcb] first graphics draw: viewport={d}x{d} scissor={d}x{d} discard={d} colors={d} write=0x{x} blend={d} extras={d} topo={d} cull={d} front={d} depth={d} dfunc={d}\n",
+            "[vulkan dcb] first graphics draw: viewport=({d},{d}){d}x{d} scissor=({d},{d}){d}x{d} discard={d} colors={d} write=0x{x} blend={d} extras={d} topo={d} cull={d} front={d} depth={d} dfunc={d} bsrc={d}/{d} bdst={d}/{d}\n",
             .{
+                @as(f32, @bitCast(pipeline_state.viewport_x_bits)),
+                @as(f32, @bitCast(pipeline_state.viewport_y_bits)),
                 @as(f32, @bitCast(pipeline_state.viewport_width_bits)),
                 @as(f32, @bitCast(pipeline_state.viewport_height_bits)),
+                pipeline_state.scissor_x,
+                pipeline_state.scissor_y,
                 pipeline_state.scissor_width,
                 pipeline_state.scissor_height,
                 pipeline_state.rasterizer_discard,
@@ -19652,6 +19675,10 @@ pub const Renderer = struct {
                 pipeline_state.front_face,
                 pipeline_state.depth_test_enable,
                 pipeline_state.depth_compare_operation,
+                pipeline_state.source_color_blend_factors[0],
+                pipeline_state.source_alpha_blend_factors[0],
+                pipeline_state.destination_color_blend_factors[0],
+                pipeline_state.destination_alpha_blend_factors[0],
             },
         );
         if (report_checkpoints) {
@@ -19936,8 +19963,8 @@ pub const Renderer = struct {
         if (report_checkpoints and self.capture_first_graphics_frame) {
             try self.materializeRenderTarget(target_index);
             std.debug.print(
-                "[vulkan dcb] first graphics draw: readback colored_pixels={d}\n",
-                .{self.graphics_probe_colored_pixels},
+                "[vulkan dcb] first graphics draw: readback colored_pixels={d} outcome={d}\n",
+                .{ self.graphics_probe_colored_pixels, self.last_readback_outcome },
             );
         }
     }
