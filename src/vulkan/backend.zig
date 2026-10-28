@@ -6579,6 +6579,7 @@ pub const Renderer = struct {
     recent_texture_content_next: usize = 0,
     changed_content_reports: usize = 0,
     scanout_content_reports: usize = 0,
+    storage_stage_reports: usize = 0,
     /// Dispatches this ran on the CPU instead of the GPU. They are not lost
     /// work, so counting them as elided would report a frame discarding
     /// compute it actually performed.
@@ -11822,6 +11823,21 @@ pub const Renderer = struct {
         if (!memory.read(memory.context, descriptor.address, backing_scratch.bytes)) return Error.GuestMemoryReadFailed;
         const guest_texel_hash = try self.storageGuestTexelHash(subresource, staging_bytes, backing_scratch.bytes);
         const guest_backing_hash = gpu.parallel_copy.fingerprint(backing_scratch.bytes);
+        // Zero-vs-data split for black-frame debugging: a zero texel hash
+        // here means the guest source itself is empty, not the GPU path.
+        if (self.storage_stage_reports < 12) {
+            self.storage_stage_reports += 1;
+            std.debug.print("[vulkan dcb] storage stage @0x{x} {d}x{d} fmt={d} levels={d}..{d} texel_hash={x} backing_hash={x}\n", .{
+                descriptor.address,
+                descriptor.width,
+                descriptor.height,
+                descriptor.unified_format,
+                descriptor.base_level,
+                descriptor.last_level,
+                guest_texel_hash,
+                guest_backing_hash,
+            });
+        }
 
         self.storage_image_sequence +%= 1;
         var candidates = self.storage_image_address_index.candidatesBy(self.storage_image_cache.items, descriptor.address, CachedStorageImage.address);
@@ -30177,15 +30193,45 @@ pub const Renderer = struct {
             descriptor.image_type == .color_2d) and texture.layers == 1;
         const is_2d_array = descriptor.image_type == .color_2d_array and
             texture.layers <= 256;
+        const format = storageImageFormat(descriptor.unified_format) orelse
+            return Error.UnsupportedStorageImage;
+        // A multi-level view still image_load/stores one level: the base, and
+        // everything below stages exactly that level (viewBaseLevel). Blocking
+        // the range here also blocks the storage-image cache behind it, so a
+        // compute-produced chain stays cold forever and its targets stay black.
+        const multi_level_2d = descriptor.viewMipLevels() != 1 and
+            (is_single_layer_2d or (descriptor.image_type == .color_2d and descriptor.depth_or_layers <= 1));
         if ((!is_3d and !is_single_layer_2d and !is_2d_array) or descriptor.samplesLog2() != 0 or
-            descriptor.viewMipLevels() != 1 or
+            (descriptor.viewMipLevels() != 1 and !multi_level_2d) or
             descriptor.dcc_enabled or
             descriptor.cmask_fast_clear or descriptor.fmask_compression)
         {
+            // Multi-level views name their level range; report what lived at
+            // the address so a missing producer reads differently from a
+            // rejected alias.
+            if (multi_level_2d and self.resident_rt_storage_reports < 8) {
+                self.resident_rt_storage_reports += 1;
+                var at_address: u32 = 0;
+                var initialized_count: u32 = 0;
+                for (self.render_targets.items) |cached| {
+                    if (cached.target.descriptor.address != descriptor.address) continue;
+                    at_address += 1;
+                    if (cached.initialized) initialized_count += 1;
+                }
+                std.debug.print("[vulkan dcb] storage image multi-level without resident alias @0x{x} {d}x{d} fmt={d} levels={d}..{d} rt_reject={d} rt_at_address={d} rt_initialized={d}\n", .{
+                    descriptor.address,
+                    descriptor.width,
+                    descriptor.height,
+                    descriptor.unified_format,
+                    descriptor.base_level,
+                    descriptor.last_level,
+                    self.last_rt_reject,
+                    at_address,
+                    initialized_count,
+                });
+            }
             return Error.UnsupportedStorageImage;
         }
-        const format = storageImageFormat(descriptor.unified_format) orelse
-            return Error.UnsupportedStorageImage;
         const subresource = texture.subresource(
             descriptor.viewBaseLevel(),
             0,
