@@ -1835,6 +1835,7 @@ fn outputZero64(_: i32, output: ?*u64) callconv(abi.guest) i32 {
 /// retrying its startup flow indefinitely.
 const np_state_signed_in: u32 = 2;
 const np_reachability_unavailable: u32 = 0;
+const np_error_invalid_argument: i32 = @bitCast(@as(u32, 0x8055_0003));
 
 fn npGetAccountId(user_id: i32, output: ?*u64) callconv(abi.guest) i32 {
     if (user_id == -1) return invalid_argument;
@@ -1869,6 +1870,52 @@ fn npGetReachabilityState(user_id: i32, output: ?*u32) callconv(abi.guest) i32 {
 fn npSetNpTitleId(title_id: ?*const anyopaque, secret: ?*const anyopaque) callconv(abi.guest) i32 {
     // Offline registration is a no-op: no PSN session exists to attach the id to.
     if (title_id == null or secret == null) return invalid_argument;
+    return errno.ok;
+}
+
+/// Offline async requests complete immediately. A title that creates one and
+/// polls it advances instead of waiting for a network round trip that can
+/// never arrive; the request id only has to be positive and unique-ish.
+var np_next_request_id: u32 = 1;
+
+fn npCreateAsyncRequest(parameter: ?*const anyopaque) callconv(abi.guest) i32 {
+    // The firmware rejects a null or undersized parameter block. The offline
+    // path never reads its contents, so only presence is checked.
+    if (parameter == null) return np_error_invalid_argument;
+    const identifier = np_next_request_id;
+    np_next_request_id +%= 1;
+    if (np_next_request_id == 0) np_next_request_id = 1;
+    return @bitCast(identifier);
+}
+
+fn npPollAsync(_: i32, result: ?*i32) callconv(abi.guest) i32 {
+    const output = result orelse return np_error_invalid_argument;
+    // The request is already finished, and an offline operation succeeded.
+    output.* = 0;
+    return errno.ok;
+}
+
+fn npAbortRequest(_: i32) callconv(abi.guest) i32 {
+    return errno.ok;
+}
+
+fn npDeleteRequest(_: i32) callconv(abi.guest) i32 {
+    return errno.ok;
+}
+
+fn npGetAccountLanguage(user_id: i32, output: ?*i32) callconv(abi.guest) i32 {
+    if (user_id == -1) return invalid_argument;
+    const language = output orelse return invalid_argument;
+    // 0 is the first supported language code; the offline profile is en-US.
+    language.* = 0;
+    return errno.ok;
+}
+
+fn npUniversalDataSystemMemoryStat(stat: ?*anyopaque) callconv(abi.guest) i32 {
+    // No telemetry is buffered offline, so the reported usage is zero.
+    const output = stat orelse return invalid_argument;
+    const bytes: [*]u8 = @ptrCast(output);
+    @memset(bytes[0..@sizeOf(u64)], 0);
     return errno.ok;
 }
 
@@ -2469,6 +2516,15 @@ const np_manager_exports = [_]symbols.Export{
     .{ .name = "sceNpGetState", .function = trace.wrap("sceNpGetState", &npGetState), .expect_id = "eQH7nWPcAgc" },
     .{ .name = "sceNpGetNpReachabilityState", .function = trace.wrap("sceNpGetNpReachabilityState", &npGetReachabilityState), .expect_id = "e-ZuhGEoeC4" },
     .{ .name = "sceNpSetNpTitleId", .function = trace.wrap("sceNpSetNpTitleId", &npSetNpTitleId), .expect_id = "Ec63y59l9tw" },
+    .{ .name = "sceNpCreateAsyncRequest", .function = trace.wrap("sceNpCreateAsyncRequest", &npCreateAsyncRequest), .expect_id = "eiqMCt9UshI" },
+    .{ .name = "sceNpPollAsync", .function = trace.wrap("sceNpPollAsync", &npPollAsync), .expect_id = "uqcPJLWL08M" },
+    .{ .name = "sceNpAbortRequest", .function = trace.wrap("sceNpAbortRequest", &npAbortRequest), .expect_id = "OzKvTvg3ZYU" },
+    .{ .name = "sceNpDeleteRequest", .function = trace.wrap("sceNpDeleteRequest", &npDeleteRequest), .expect_id = "S7QTn72PrDw" },
+    .{ .name = "sceNpGetAccountLanguage2", .function = trace.wrap("sceNpGetAccountLanguage2", &npGetAccountLanguage), .expect_id = "3Tcz5bNCfZQ" },
+};
+
+const np_universal_data_system_exports = [_]symbols.Export{
+    .{ .name = "sceNpUniversalDataSystemGetMemoryStat", .function = trace.wrap("sceNpUniversalDataSystemGetMemoryStat", &npUniversalDataSystemMemoryStat), .expect_id = "su7jW3VDDb4" },
 };
 
 const remoteplay_exports = [_]symbols.Export{
@@ -5311,6 +5367,7 @@ pub fn register(db: *symbols.Database, gpa: std.mem.Allocator) symbols.Error!voi
     try db.addLibrary(gpa, .{ .name = "libSceAvPlayer" }, .{ .name = "libSceAvPlayer", .version_minor = 0 }, &av_player.exports);
     try db.addLibrary(gpa, .{ .name = "libSceAppContent" }, .{ .name = "libSceAppContentUtil" }, &app_content_exports);
     try db.addLibrary(gpa, .{ .name = "libSceNpManager" }, .{ .name = "libSceNpManager" }, &np_manager_exports);
+    try db.addLibrary(gpa, .{ .name = "libSceNpUniversalDataSystem" }, .{ .name = "libSceNpUniversalDataSystem" }, &np_universal_data_system_exports);
     try db.addLibrary(gpa, .{ .name = "libSceRemoteplay" }, .{ .name = "libSceRemoteplay" }, &remoteplay_exports);
     try db.addLibrary(gpa, .{ .name = "libSceMouse" }, .{ .name = "libSceMouse" }, &mouse_exports);
     try db.addLibrary(gpa, .{ .name = "libSceSaveData_native" }, .{ .name = "libSceSaveData_native" }, &save_data_exports);
@@ -6279,6 +6336,27 @@ test "fuse shader halves patches ES program and keeps front header lookup" {
         @as(?u64, front_address),
         agc_shader_registry.find(front_code_address),
     );
+}
+
+test "offline NP async requests complete without a network round trip" {
+    var parameter: [24]u8 = @splat(0);
+    // A null parameter block is refused exactly like the firmware does.
+    try std.testing.expectEqual(np_error_invalid_argument, npCreateAsyncRequest(null));
+    const identifier = npCreateAsyncRequest(&parameter);
+    try std.testing.expect(identifier > 0);
+    var result: i32 = -1;
+    try std.testing.expectEqual(errno.ok, npPollAsync(identifier, &result));
+    try std.testing.expectEqual(@as(i32, 0), result);
+    // A missing result pointer must not be written through.
+    try std.testing.expectEqual(np_error_invalid_argument, npPollAsync(identifier, null));
+    try std.testing.expectEqual(errno.ok, npAbortRequest(identifier));
+    try std.testing.expectEqual(errno.ok, npDeleteRequest(identifier));
+    var language: i32 = -1;
+    try std.testing.expectEqual(errno.ok, npGetAccountLanguage(1, &language));
+    try std.testing.expectEqual(@as(i32, 0), language);
+    var stat: [8]u8 = @splat(0xff);
+    try std.testing.expectEqual(errno.ok, npUniversalDataSystemMemoryStat(&stat));
+    try std.testing.expectEqualSlices(u8, &([_]u8{0} ** 8), &stat);
 }
 
 test "NP manager exposes a consistent local offline profile" {
