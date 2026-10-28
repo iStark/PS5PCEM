@@ -470,16 +470,255 @@ fn guestGraphicsProbe(allocator: std.mem.Allocator, device: *d3d12.Device) !void
     try guestViewportDepthProbe(allocator, &vertex_words, &pixel_words);
     try guestVaryingProbe(allocator, &vertex_words);
     try guestFanProbe(allocator);
+    try guestRectangleProbe(allocator);
+    try guestStencilProbe(device, vertex.words, fragment.words);
+    try guestStencilCommandProbe(allocator, &vertex_words, &pixel_words);
     var resource_reference: [5][0x3000]u8 = undefined;
     for ([_]usize{ 0, 128 * 1024 * 1024, 32 }) |limit|
         try guestResourcesProbe(allocator, if (limit == 0) 0 else d3d12.staging.Pool.default_limit, limit, &resource_reference);
     try guestDynamicScalarsProbe(allocator, &vertex_words);
+    try guestForwardBranchesProbe(allocator, &vertex_words);
     try guestBlendingProbe(allocator, &vertex_words);
     try guestCacheProbe(allocator, device, vertex.words, fragment.words);
     try guestResourcePoolProbe(allocator, device, vertex.words, fragment.words);
     try guestUploadPressureProbe(device, vertex.words, fragment.words);
     try guestAttachmentProbe(allocator, device, vertex.words, fragment.words);
     try guestBatchProbe(device, vertex.words, fragment.words);
+}
+
+fn guestStencilProbe(device: *d3d12.Device, vertex: []const u32, fragment: []const u32) !void {
+    const count = 65 * 37;
+    var coverage: [count * 4]u8 = @splat(0);
+    var draw = try d3d12.Draw.fullTarget(65, 37);
+    draw.scissor = .{ 9, 3, 51, 31 };
+    try device.drawSpirv(vertex, fragment, draw, &coverage);
+    var cases: usize = 0;
+    for ([_]u32{ 55, 40 }) |format| {
+        var depth: [count * 4]u8 = undefined;
+        var stencil: [count]u8 = undefined;
+        var color: [count * 4]u8 = undefined;
+        draw.depth_format = format;
+        draw.stencil_pixels = &stencil;
+        draw.stencil_bytes = stencil.len;
+        const size = try d3d12.depthSize(65, 37, format);
+        for (1..9) |op| for (0..3) |path| for ([_]u8{ 0xff, 0x35 }) |mask| {
+            @memset(&color, 0);
+            for (&stencil, 0..) |*s, i| s.* = @truncate(i * 17);
+            const original = stencil;
+            @memset(&depth, 0xff);
+            if (format == 40) for (0..count) |i| std.mem.writeInt(u32, depth[i * 4 ..][0..4], @bitCast(@as(f32, 1)), .little);
+            const original_depth = depth;
+            draw.depth_compare = if (path == 1) 1 else 8;
+            draw.stencil = .{ .enabled = 1, .write_mask = mask, .reference = 0x6a, .front = .{ 1, 1, 1, if (path == 0) 1 else 8 } };
+            draw.stencil.front[path] = @intCast(op);
+            draw.stencil.back = draw.stencil.front;
+            try device.drawDepthResourcesSpirv(vertex, fragment, draw, &.{}, &.{}, &.{}, &color, depth[0..size]);
+            if (!std.mem.eql(u8, &original_depth, &depth)) return error.StencilChangedReadOnlyDepth;
+            for (original, stencil, 0..) |old, actual, i| {
+                const covered = coverage[i * 4] != 0;
+                const value: u8 = switch (op) {
+                    1 => old,
+                    2 => 0,
+                    3 => 0x6a,
+                    4 => old +| 1,
+                    5 => old -| 1,
+                    6 => ~old,
+                    7 => old +% 1,
+                    8 => old -% 1,
+                    else => unreachable,
+                };
+                const expected = if (covered) (old & ~mask) | (value & mask) else old;
+                if (actual != expected) {
+                    std.debug.print("stencil mismatch format={d} op={d} path={d} mask={x} pixel={d} actual={x} expected={x}\n", .{ format, op, path, mask, i, actual, expected });
+                    return error.StencilReadbackMismatch;
+                }
+                if (color[i * 4] != @as(u8, if (covered and path == 2) 255 else 0)) return error.StencilColorMismatch;
+            }
+            cases += 1;
+        };
+        // Full clears are independent of the previous scissor and color mask.
+        draw.stencil = .{};
+        draw.write_mask = 0;
+        draw.clear_flags = 3;
+        draw.clear_depth = 0.25;
+        draw.clear_stencil = 0x5a;
+        @memset(&color, 0x91);
+        try device.drawDepthResourcesSpirv(vertex, fragment, draw, &.{}, &.{}, &.{}, &color, depth[0..size]);
+        for (color) |byte| if (byte != 0x91) return error.StencilClearChangedColor;
+        for (stencil) |byte| if (byte != 0x5a) return error.StencilClearMismatch;
+        for (0..count) |i| {
+            if (format == 55) {
+                if (std.mem.readInt(u16, depth[i * 2 ..][0..2], .little) != 16384) return error.DepthStencilClearMismatch;
+            } else if (std.mem.readInt(u32, depth[i * 4 ..][0..4], .little) != @as(u32, @bitCast(@as(f32, 0.25)))) return error.DepthStencilClearMismatch;
+        }
+        draw.clear_flags = 0;
+        draw.write_mask = 15;
+        draw.depth_compare = 8;
+        draw.stencil = .{ .enabled = 1, .write_mask = 255, .front = .{ 1, 1, 7, 8 }, .back = .{ 1, 1, 7, 8 } };
+        var jobs: [3]d3d12.DrawJob = @splat(.{ .vertex = vertex, .fragment = fragment, .draw = draw });
+        for (&jobs, 0..) |*job, i| job.draw.scissor[0] += @intCast(i * 3);
+        const initial = stencil;
+        for (jobs) |job| try device.drawDepthResourcesSpirv(vertex, fragment, job.draw, &.{}, &.{}, &.{}, &color, depth[0..size]);
+        const expected = stencil;
+        stencil = initial;
+        try device.drawBatchSpirv(&jobs, &color, depth[0..size]);
+        if (!std.mem.eql(u8, &expected, &stencil)) return error.BatchedStencilMismatch;
+        const saved_color = color;
+        const saved_depth = depth;
+        const saved_stencil = stencil;
+        jobs[1].fragment = &.{ 0x07230203, 0x10000, 0, 1, 0, 0 };
+        if (device.drawBatchSpirv(&jobs, &color, depth[0..size])) |_| return error.InvalidStencilBatchAccepted else |_| {}
+        if (!std.mem.eql(u8, &saved_color, &color) or !std.mem.eql(u8, &saved_depth, &depth) or !std.mem.eql(u8, &saved_stencil, &stencil))
+            return error.FailedStencilBatchPublishedPlanes;
+        if (format == 55) {
+            draw.depth_compare = 2;
+            if (device.drawDepthResourcesSpirv(vertex, fragment, draw, &.{}, &.{}, &.{}, &color, depth[0..size])) |_| return error.UnquantizedD16StencilAccepted else |_| {}
+            if (!std.mem.eql(u8, &saved_stencil, &stencil)) return error.RejectedD16StencilPublishedPixels;
+        } else {
+            draw.depth_write = 1;
+            draw.depth_compare = 8;
+            try device.drawDepthResourcesSpirv(vertex, fragment, draw, &.{}, &.{}, &.{}, &color, depth[0..size]);
+            for (0..count) |i| {
+                const covered = coverage[i * 4] != 0;
+                const expected_depth: u32 = if (covered) 0 else std.mem.readInt(u32, saved_depth[i * 4 ..][0..4], .little);
+                if (std.mem.readInt(u32, depth[i * 4 ..][0..4], .little) != expected_depth or
+                    stencil[i] != saved_stencil[i] +% @as(u8, if (covered) 1 else 0)) return error.CombinedDepthStencilWriteMismatch;
+            }
+            draw.depth_write = 0;
+        }
+    }
+    std.debug.print("PASS {d} native stencil cases: all operations, stencil/depth fail paths, masks, scissor preservation, D16/D32 planes, clears and ordered batches\n", .{cases});
+}
+
+fn guestStencilCommandProbe(allocator: std.mem.Allocator, vertex: []const u32, fragment: []const u32) !void {
+    const memory = try allocator.create(GraphicsMemory);
+    defer allocator.destroy(memory);
+    memory.* = .{};
+    @memcpy(memory.data[0x200..][0 .. vertex.len * 4], std.mem.sliceAsBytes(vertex));
+    @memcpy(memory.data[0x400..][0 .. fragment.len * 4], std.mem.sliceAsBytes(fragment));
+    var state = try graphicsState(65, 37, 72);
+    try state.writeRegister(.context, 0x007, 64 | (36 << 16));
+    try state.writeRegister(.context, 0x010, 3 | (24 << 4) | (1 << 29)); // GFX10 depth tile, HTILE.
+    try state.writeRegister(.context, 0x011, 1 | (24 << 4));
+    try state.writeRegister(.context, 0x012, 0x200);
+    try state.writeRegister(.context, 0x014, 0x200);
+    try state.writeRegister(.context, 0x013, 0x300);
+    try state.writeRegister(.context, 0x015, 0x300);
+    try state.writeRegister(.context, 0x005, 0x400);
+    try state.writeRegister(.context, 0x2af, 1 << 18);
+    try state.writeRegister(.context, 0x00a, 0x35);
+    try state.writeRegister(.context, 0x000, 2); // Stencil clear, no depth write.
+    try state.writeRegister(.context, 0x200, 1 | (7 << 8));
+    try state.writeRegister(.context, 0x10c, 0x00ffff00);
+    const target = gpu.resources.decodeDepthTarget(&state).?;
+    const htile = try gpu.HtileLayout.fromDepthTarget(target);
+    const keys = memory.data[0x40000..][0..@intCast(htile.required_bytes)];
+    var offset: usize = 0;
+    while (offset < keys.len) : (offset += 4) std.mem.writeInt(u32, keys[offset..][0..4], 0xfffc00f0, .little);
+    var renderer = try d3d12.Renderer.init(allocator, memory.access(), false);
+    defer renderer.deinit();
+    renderer.draw_batch_limit = 8;
+    var executor = gpu.DcbExecutor{ .state = &state, .backend = renderer.dcbBackend(), .allocator = allocator };
+    _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 2 });
+    try state.writeRegister(.context, 0x000, 0);
+    try state.writeRegister(.context, 0x10b, 8 << 4); // Increment covered stencil pixels.
+    _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 2 });
+    try renderer.flushDraws();
+    var stencil = try d3d12.surfaces.Staged.read(allocator, memory.access(), 0x30000, try d3d12.surfaces.stencilLayout(target, 65, 37, true));
+    defer stencil.deinit();
+    var depth = try d3d12.surfaces.Staged.read(allocator, memory.access(), 0x20000, try d3d12.surfaces.depthLayout(target, 65, 37, true));
+    defer depth.deinit();
+    for (0..65 * 37) |i| {
+        const color_offset = 0x2000 + ((i / 65) * 72 + i % 65) * 4;
+        const covered = memory.data[color_offset] == 255;
+        if (stencil.pixels[i] != @as(u8, if (covered) 0x36 else 0x35)) return error.GuestStencilCommandMismatch;
+        if (std.mem.readInt(u32, depth.pixels[i * 4 ..][0..4], .little) != 0x3f800000) return error.GuestHtileDepthLost;
+    }
+    if (try htile.word(keys, 0, 0, 0) != gpu.HtileLayout.expanded_depth_stencil) return error.GuestHtileNotPublished;
+    // Quake II uses a vertex-only compress-disable rectangle with all tests
+    // disabled. It still has to materialize the metadata into BOTH planes.
+    const utility_vs = [_]u32{ vop1(1, 0, 128), vop1(1, 1, 255), 0x3f800000, 0xf80008cf, 0x01000000, 0xbf810000 };
+    @memcpy(memory.data[0x200..][0..@sizeOf(@TypeOf(utility_vs))], std.mem.asBytes(&utility_vs));
+    try state.writeRegister(.shader, 0x008, 0);
+    try state.writeRegister(.context, 0x318, 0);
+    try state.writeRegister(.context, 0x000, 0x60);
+    try state.writeRegister(.context, 0x200, 0);
+    offset = 0;
+    while (offset < keys.len) : (offset += 4) std.mem.writeInt(u32, keys[offset..][0..4], 0xf0, .little);
+    const previous_color = memory.data[0x2000..0x5000].*;
+    _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 2 });
+    if (renderer.metadata_expands != 1 or !std.mem.eql(u8, &previous_color, memory.data[0x2000..0x5000])) return error.DepthUtilityNotExecuted;
+    try depth.layout.detile(memory.data[0x20000..][0..depth.backing.len], depth.pixels);
+    try stencil.layout.detile(memory.data[0x30000..][0..stencil.backing.len], stencil.pixels);
+    for (depth.pixels) |byte| if (byte != 0) return error.DepthUtilityDidNotExpandDepth;
+    for (stencil.pixels) |byte| if (byte != 0) return error.DepthUtilityDidNotExpandStencil;
+    if (try htile.word(keys, 0, 0, 0) != gpu.HtileLayout.expanded_depth_stencil) return error.DepthUtilityDidNotExpandMetadata;
+    // A system interrupt must never be classified as harmless vertex work.
+    std.mem.writeInt(u32, memory.data[0x200..][0..4], 0xbf900001, .little);
+    const packet: gpu.pm4.Packet = .{ .kind = .command, .header = command(gpu.pm4.draw_index_auto, 2), .opcode = gpu.pm4.draw_index_auto, .body = &.{ 3, 2 } };
+    if (renderer.draw(&state, packet)) |_| return error.VertexSystemMessageIgnored else |err| if (err != error.MissingColorTarget) return err;
+    std.debug.print("PASS PM4 stencil clear/increment, HTILE persistence, PS-less compression-disable materialization of both planes, system-message rejection\n", .{});
+}
+
+fn guestRectangleProbe(allocator: std.mem.Allocator) !void {
+    const memory = try allocator.create(GraphicsMemory);
+    defer allocator.destroy(memory);
+    memory.* = .{};
+    const vs = [_]u32{ 0xe0382000, 0x80000005, 0xe0382010, 0x80000805, 0xf80000cf, 0x03020100, 0xf8000a0f, 0x0b0a0908, 0xbf810000 };
+    const ps = [_]u32{ 0xc8000000, 0xc8010001, 0xc8040100, 0xc8050101, 0xc8080200, 0xc8090201, 0xc80c0300, 0xc80d0301, 0xf800080f, 0x03020100, 0xbf810000 };
+    @memcpy(memory.data[0x200..][0..@sizeOf(@TypeOf(vs))], std.mem.asBytes(&vs));
+    @memcpy(memory.data[0x400..][0..@sizeOf(@TypeOf(ps))], std.mem.asBytes(&ps));
+    const vertices = [_][8]f32{
+        .{ -0.75, -0.75, 0, 1, 0, 0, 0.25, 1 },
+        .{ 0.75, 0.75, 0, 1, 1, 1, 0.25, 1 },
+        .{ -0.75, 0.75, 0, 1, 0, 1, 0.25, 1 },
+        .{ 0.75, -0.75, 0, 1, 1, 0, 0.25, 1 },
+    };
+    @memcpy(memory.data[0x1000..][0..@sizeOf(@TypeOf(vertices))], std.mem.asBytes(&vertices));
+    var state = try graphicsState(65, 37, 72);
+    try state.writeRegister(.shader, 0x04b, 4 << 1);
+    for ([_]u32{ 0x1000, 32 << 16, 4, 0xfac }, 0..) |word, i| try state.writeRegister(.shader, 0x04c + @as(u32, @intCast(i)), word);
+    var renderer = try d3d12.Renderer.init(allocator, memory.access(), false);
+    defer renderer.deinit();
+    var executor = gpu.DcbExecutor{ .state = &state, .backend = renderer.dcbBackend(), .allocator = allocator };
+    for ([_]u32{ 0, 1, 2, 4, 5, 6 }) |raster| {
+        try state.writeRegister(.context, 0x205, raster);
+        try state.writeRegister(.uconfig, 0x242, 4);
+        for ([_]u16{ 0, 1, 2, 2, 1, 3 }, 0..) |index, i| std.mem.writeInt(u16, memory.data[0x600 + i * 2 ..][0..2], index, .little);
+        @memset(memory.data[0x2000..0x5000], 0xa7);
+        _ = try executor.execute(&.{ command(gpu.pm4.index_type, 1), 0, command(gpu.pm4.draw_index_2, 5), 6, 0x600, 0, 6, 0 });
+        const expected = memory.data[0x2000..0x5000].*;
+        @memset(memory.data[0x2000..0x5000], 0xa7);
+        try state.writeRegister(.uconfig, 0x242, 7);
+        _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 2 });
+        if (!std.mem.eql(u8, &expected, memory.data[0x2000..0x5000])) return error.RectangleImageMismatch;
+    }
+    // NGG auto rectangles invoke a fourth guest vertex, including attributes
+    // that cannot be recovered by affine completion of the first three.
+    var ngg_vs = vs;
+    ngg_vs[1] = 0x80020005;
+    ngg_vs[3] = 0x80020805;
+    @memcpy(memory.data[0x200..][0..@sizeOf(@TypeOf(ngg_vs))], std.mem.asBytes(&ngg_vs));
+    var strip_vertices = [4][8]f32{ vertices[0], vertices[3], vertices[2], vertices[1] };
+    strip_vertices[3][6] = 0.875;
+    @memcpy(memory.data[0x1000..][0..@sizeOf(@TypeOf(strip_vertices))], std.mem.asBytes(&strip_vertices));
+    try state.writeRegister(.context, 0x2d5, 0x02002000);
+    try state.writeRegister(.context, 0x205, 0);
+    try state.writeRegister(.shader, 0x0c8, 2);
+    try state.writeRegister(.shader, 0x0c9, 0);
+    try state.writeRegister(.shader, 0x08b, 4 << 1);
+    for ([_]u32{ 0x1000, 32 << 16, 4, 0xfac }, 0..) |word, i| try state.writeRegister(.shader, 0x08c + @as(u32, @intCast(i)), word);
+    @memset(memory.data[0x2000..0x5000], 0xa7);
+    try state.writeRegister(.uconfig, 0x242, 6);
+    _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 4, 2 });
+    const expected_ngg = memory.data[0x2000..0x5000].*;
+    for ([_]u32{ 1, 3, 4 }) |count| {
+        @memset(memory.data[0x2000..0x5000], 0xa7);
+        try state.writeRegister(.uconfig, 0x242, 7);
+        _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), count, 2 });
+        if (!std.mem.eql(u8, &expected_ngg, memory.data[0x2000..0x5000])) return error.NggRectangleFourthInvocationLost;
+    }
+    std.debug.print("PASS RECT_LIST: legacy completion matches two explicit triangles, NGG 1/3/4 counts invoke the fourth guest vertex, full interpolation/coverage/padding comparisons\n", .{});
 }
 
 fn guestBatchProbe(device: *d3d12.Device, vertex: []const u32, fragment: []const u32) !void {
@@ -762,6 +1001,65 @@ fn guestResourcePoolProbe(allocator: std.mem.Allocator, device: *d3d12.Device, v
         });
     }
     std.debug.print("PASS resource pooling: 24 full color/depth references across disabled/normal/256KiB budgets, changed extents/formats/bytes, simultaneous equal-size leases, eviction/bypass and zero warm allocations\n", .{});
+}
+
+fn guestForwardBranchesProbe(allocator: std.mem.Allocator, vertex_words: []const u32) !void {
+    const memory = try allocator.create(GraphicsMemory);
+    defer allocator.destroy(memory);
+    memory.* = .{};
+    var renderer = try d3d12.Renderer.init(allocator, memory.access(), false);
+    defer renderer.deinit();
+    var state = try graphicsState(65, 37, 72);
+    var executor = gpu.DcbExecutor{ .state = &state, .backend = renderer.dcbBackend(), .allocator = allocator };
+    @memcpy(memory.data[0x200..][0 .. vertex_words.len * 4], std.mem.sliceAsBytes(vertex_words));
+    const branches = [_]u32{
+        vop1(1, 0, 255), 0x3f800000, vop1(1, 1, 128), vop1(1, 2, 128), vop1(1, 3, 255), 0x3f800000,
+        0xbf068000, // s_cmp_eq_u32 s0, 0
+        0xbf85000c, // s_cbranch_scc1 -> shared export (word 20)
+        vop1(1, 0, 128),
+        vop1(1, 1, 255),
+        0x3f800000,
+        0xbf068001, // s_cmp_eq_u32 s1, 0
+        0xbf850007, // s_cbranch_scc1 -> shared export
+        vop1(1, 1, 128),
+        vop1(1, 2, 255),
+        0x3f800000,
+        0xbefe0480, // s_mov_b64 exec, 0
+        0xf8001890, // Null EXP.VM: terminal path discards its pixels.
+        0,
+        0xbf810000,
+        0xf800180f, // EXP.VM publishes live pixels.
+        0x03020100,
+        0xbf810000,
+    };
+    var program = try rdna2.decodeProgram(allocator, &branches);
+    defer program.deinit(allocator);
+    const scalars = [_]rdna2.spirv.ScalarRegister{ .{ .register = 0, .value = 0 }, .{ .register = 1, .value = 0 } };
+    var translated = try rdna2.translateProgramSpirv(allocator, &program, .{ .stage = .fragment, .scalar_registers = &scalars, .dynamic_scalar_binding = .{ .binding = 10 }, .allow_control_flow_fallback = false });
+    defer translated.deinit(allocator);
+    if (!translated.used_dispatcher) return error.ForwardDispatcherProbeNotExercised;
+    try state.writeRegister(.shader, 0x00b, 4);
+    const target = memory.data[0x2000..][0 .. 72 * 37 * 4];
+    var references: [2][72 * 37 * 4]u8 = undefined;
+    for (0..2) |component| {
+        var literal = [_]u32{ vop1(1, 0, 128), vop1(1, 1, 128), vop1(1, 2, 128), vop1(1, 3, 242), 0xf800080f, 0x03020100, 0xbf810000 };
+        literal[component] = vop1(1, @intCast(component), 242); // inline 1.0
+        @memcpy(memory.data[0x400..][0..@sizeOf(@TypeOf(literal))], std.mem.asBytes(&literal));
+        @memset(target, 0xa7);
+        _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 2 });
+        @memcpy(&references[component], target);
+    }
+    @memcpy(memory.data[0x400..][0..@sizeOf(@TypeOf(branches))], std.mem.asBytes(&branches));
+    for ([_][2]u32{ .{ 0, 0 }, .{ 0, 1 }, .{ 1, 0 }, .{ 1, 1 } }, 0..) |inputs, variant| {
+        try state.writeRegister(.shader, 0x00c, inputs[0]);
+        try state.writeRegister(.shader, 0x00d, inputs[1]);
+        @memset(target, 0xa7);
+        _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 2 });
+        if (variant == 3) {
+            if (!std.mem.allEqual(u8, target, 0xa7)) return error.TerminalDispatcherModifiedTarget;
+        } else if (!std.mem.eql(u8, target, &references[if (variant == 2) 1 else 0])) return error.ForwardDispatcherRasterMismatch;
+    }
+    std.debug.print("PASS forward-only dispatcher: nested terminal selections, dynamic conditions and complete literal-reference images\n", .{});
 }
 
 fn guestDynamicScalarsProbe(allocator: std.mem.Allocator, vertex_words: []const u32) !void {
@@ -1176,6 +1474,18 @@ fn guestDepthProbe(allocator: std.mem.Allocator, vertex: []const u32, fragment: 
     _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 2 });
     if (!std.mem.eql(u8, color, reference)) return error.DisabledDepthDrawMismatch;
     try state.writeRegister(.context, 0x200, 2 | 4);
+    // A depth fast clear must retain CLEAR_DEPTH, even if the utility draw's
+    // ordinary write-enable bit is set and its vertex Z is different.
+    try state.writeRegister(.context, 0x000, 1);
+    try state.writeRegister(.context, 0x00b, @bitCast(@as(f32, 0.75)));
+    try state.writeRegister(.context, 0x200, 2 | 4 | (7 << 4));
+    _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 2 });
+    const clear_target = gpu.resources.decodeDepthTarget(&state).?;
+    var clear_depth = try d3d12.surfaces.Staged.read(allocator, memory.access(), clear_target.read_address, try d3d12.surfaces.depthLayout(clear_target, 65, 37, true));
+    defer clear_depth.deinit();
+    for (0..65 * 37) |i| if (std.mem.readInt(u32, clear_depth.pixels[i * 4 ..][0..4], .little) != 0x3f400000) return error.GuestDepthClearOverwritten;
+    try state.writeRegister(.context, 0x000, 0);
+    try state.writeRegister(.context, 0x200, 2 | 4);
     // Error paths must leave both attachment planes and guest labels intact.
     const before = try allocator.dupe(u8, &memory.data);
     defer allocator.free(before);
@@ -1188,13 +1498,10 @@ fn guestDepthProbe(allocator: std.mem.Allocator, vertex: []const u32, fragment: 
     if (renderer.draw(&state, packet)) |_| return error.DepthColorAliasAccepted else |err| if (err != error.DepthColorAliasNotImplemented) return err;
     try state.writeRegister(.context, 0x012, 0x200);
     try state.writeRegister(.context, 0x014, 0x200);
-    try state.writeRegister(.context, 0x000, 1);
-    if (renderer.draw(&state, packet)) |_| return error.DepthClearAccepted else |err| if (err != error.DepthClearStencilAndBoundsNotImplemented) return err;
-    try state.writeRegister(.context, 0x000, 0);
     try state.writeRegister(.context, 0x200, 3 | 4);
-    if (renderer.draw(&state, packet)) |_| return error.StencilAccepted else |err| if (err != error.DepthClearStencilAndBoundsNotImplemented) return err;
+    if (renderer.draw(&state, packet)) |_| return error.MissingStencilAccepted else |err| if (err != error.UnsupportedStencilLayout) return err;
     try state.writeRegister(.context, 0x200, 2 | 4 | (1 << 3));
-    if (renderer.draw(&state, packet)) |_| return error.DepthBoundsAccepted else |err| if (err != error.DepthClearStencilAndBoundsNotImplemented) return err;
+    if (renderer.draw(&state, packet)) |_| return error.DepthBoundsAccepted else |err| if (err != error.DepthBoundsNotImplemented) return err;
     try state.writeRegister(.context, 0x200, 2 | 4);
     try state.writeRegister(.context, 0x010, 3 | (24 << 4) | (1 << 29));
     if (executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 2 })) |_| return error.DepthMetadataAccepted else |err| if (err != error.BackendRejected) return err;
@@ -1409,7 +1716,23 @@ fn guestSurfaceProbe(allocator: std.mem.Allocator, vertex: []const u32, fragment
             if (!std.mem.eql(u8, reference.?, presented.pixels)) return error.ScanoutLayoutMismatch;
         }
     }
-    std.debug.print("PASS six guest surface layouts: identical D3D12 pixels, macro-tile XOR, padding and tiled/linear scanout staging\n", .{});
+    // BGRA guest storage carries the same logical RGBA shader outputs. Test
+    // destination-dependent blending too, so upload and readback must both swap.
+    try state.writeRegister(.context, 0x31c, (10 << 2) | (1 << 11));
+    try state.writeRegister(.context, 0x1e0, (1 << 30) | 8); // src * destination color.
+    const bgra_target = gpu.resources.decodeColorTarget(&state, 0, 15).?;
+    const bgra_layout = try d3d12.surfaces.colorLayout(bgra_target);
+    var logical = try d3d12.surfaces.Staged.readColor(allocator, null, null, memory.access(), bgra_target.address, bgra_layout, null, true);
+    defer logical.deinit();
+    for (0..259 * 145) |i| logical.pixels[i * 4 ..][0..4].* = .{ 51, 102, 153, 255 };
+    try logical.write(memory.access());
+    _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 2 });
+    var bgra = try d3d12.surfaces.Staged.read(allocator, memory.access(), bgra_target.address, bgra_layout);
+    defer bgra.deinit();
+    const center = (72 * 259 + 129) * 4;
+    if (!std.mem.eql(u8, bgra.pixels[center..][0..4], &.{ 0, 0, 51, 255 }) or
+        !std.mem.eql(u8, bgra.pixels[0..4], &.{ 153, 102, 51, 255 })) return error.BgraTargetBlendMismatch;
+    std.debug.print("PASS six guest surface layouts, BGRA destination blending, macro-tile XOR, padding and tiled/linear scanout staging\n", .{});
 }
 
 fn guestVaryingProbe(allocator: std.mem.Allocator, vertex: []const u32) !void {
@@ -1583,6 +1906,7 @@ fn guestResourcesProbe(allocator: std.mem.Allocator, staging_limit: usize, uploa
     const vs = [_]u32{
         0xf4080200, 0xfa000000, // s_load_dwordx4 s8, [s0:s1]
         0xbf06830a, // s_cmp_eq_u32 s10, 3: true.
+        0xbe980380, // s_mov_b32 s24, 0 preserves SCC (Quake II fetch shader scheduling).
         vop1(0x01, 30, 128), // Vector work between CMP/CSELECT preserves SCC.
         sop2(0x0a, 11, 11, 128), // Keep the descriptor's format word.
         0xbf06800a, // s_cmp_eq_u32 s10, 0: false.
@@ -1600,8 +1924,8 @@ fn guestResourcesProbe(allocator: std.mem.Allocator, staging_limit: usize, uploa
         0xc8000000, 0xc8010001,
         0xc8040100, 0xc8050101,
         0xf0800f08,                               0x00400400, // sample T=s0 S=s8 -> v4
-        // A second sampling instruction forces a two-element descriptor
-        // array; the complete draw also shares three SSBO slots across VS/PS.
+        // Repeated sampling must share its freshly validated identical native
+        // view; the complete draw also shares SSBO slots across VS/PS.
         0xf0800f08,                               0x00400400,
         (0x08 << 25) | (0 << 17) | (4 << 9) | 16, (0x08 << 25) | (1 << 17) | (5 << 9) | 17,
         (0x08 << 25) | (2 << 17) | (6 << 9) | 18, (0x08 << 25) | (3 << 17) | (7 << 9) | 19,
@@ -1668,6 +1992,16 @@ fn guestResourcesProbe(allocator: std.mem.Allocator, staging_limit: usize, uploa
         }
     }
     if (!std.mem.eql(u8, memory.data[0x1000..][0..@sizeOf(@TypeOf(positions))], std.mem.asBytes(&positions))) return error.ReadOnlyVertexDataModified;
+    var repeated_samples: [ps.len + 78]u32 = undefined;
+    @memcpy(repeated_samples[0..6], ps[0..6]);
+    for (0..40) |i| @memcpy(repeated_samples[6 + i * 2 ..][0..2], ps[6..8]);
+    @memcpy(repeated_samples[86..], ps[8..]);
+    @memcpy(memory.data[0x400..][0..@sizeOf(@TypeOf(repeated_samples))], std.mem.asBytes(&repeated_samples));
+    @memset(memory.data[0x2000..0x5000], 0);
+    _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 2 });
+    if (!std.mem.eql(u8, &reference[4], memory.data[0x2000..0x5000])) return error.RepeatedSampleViewMismatch;
+    @memcpy(memory.data[0x400..][0..@sizeOf(@TypeOf(ps))], std.mem.asBytes(&ps));
+    std.debug.print("PASS 41 sampling instructions reuse one proven native view without exhausting the 32-view limit\n", .{});
     const saved_state = state;
     const saved_memory = memory.*;
     var batch_reference: [0x3000]u8 = undefined;

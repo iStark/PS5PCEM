@@ -76,6 +76,14 @@ pub const Draw = extern struct {
     depth_write: u32 = 0,
     depth_compare: u32 = 8,
     depth_clip_enabled: u32 = 1,
+    rectangle_completion: u32 = 0,
+    rectangle_mask: u32 = 0,
+    stencil: Stencil = .{},
+    stencil_pixels: ?[*]u8 = null,
+    stencil_bytes: usize = 0,
+    clear_flags: u32 = 0,
+    clear_depth: f32 = 0,
+    clear_stencil: u32 = 0,
     viewport: [6]f32,
     scissor: [4]i32,
     // A separate read-only root SRV keeps per-draw SGPR values out of shaders.
@@ -86,6 +94,15 @@ pub const Draw = extern struct {
         _ = try rgbaSize(width, height);
         return .{ .width = width, .height = height, .viewport = .{ 0, 0, @floatFromInt(width), @floatFromInt(height), 0, 1 }, .scissor = .{ 0, 0, @intCast(width), @intCast(height) } };
     }
+};
+pub const Stencil = extern struct {
+    enabled: u32 = 0,
+    read_mask: u32 = 255,
+    write_mask: u32 = 0,
+    reference: u32 = 0,
+    // Native D3D12 op order: fail, depth fail, pass, compare.
+    front: [4]u32 = .{ 1, 1, 1, 8 },
+    back: [4]u32 = .{ 1, 1, 1, 8 },
 };
 pub const DeviceInfo = extern struct {
     adapter: [128]u8,

@@ -380,6 +380,8 @@ pub const Resolver = struct {
             switch (inst.opcode) {
                 .s_nop,
                 .s_waitcnt,
+                .s_mov_b32,
+                .s_mov_b64,
                 .s_load_dword,
                 .s_load_dwordx2,
                 .s_load_dwordx4,
@@ -456,7 +458,7 @@ test "packed vertex format recovery proves CSELECT and refuses unknown or clobbe
     bindings.user_data_count = 4;
     bindings.user_data[2] = 0x022c0204;
     bindings.user_data[3] = 0x0fac03ac;
-    for (0..10) |variant| {
+    for (0..12) |variant| {
         var instructions = original;
         bindings.user_data[0] = if (variant == 0) 0 else if (variant == 2) 0xa0 else 0x80;
         if (variant == 3) instructions[7] = .{ .pc = 28, .opcode = .s_and_b32, .dst = M.reg(30), .src0 = M.imm(0), .src1 = M.imm(0) };
@@ -466,11 +468,15 @@ test "packed vertex format recovery proves CSELECT and refuses unknown or clobbe
         if (variant == 7) instructions[7] = .{ .pc = 28, .family = .vop1, .opcode = .v_mov_b32, .dst = .{ .kind = .vgpr, .reg = 1 }, .src0 = M.reg(14) };
         if (variant == 8) instructions[7] = .{ .pc = 28, .family = .vop2, .opcode = .unknown };
         if (variant == 9) instructions[7] = .{ .pc = 28, .family = .vop3, .opcode = .v_sub_f32, .dst = .{ .kind = .scc } };
+        // MOV preserves SCC, including when it overwrites the comparison's
+        // input afterward. Recover the input at the comparison, not CSELECT.
+        if (variant == 10) instructions[7] = .{ .pc = 28, .opcode = .s_mov_b32, .dst = M.reg(4), .src0 = M.imm(0) };
+        if (variant == 11) instructions[7] = .{ .pc = 28, .opcode = .s_mov_b64, .dst = M.reg(20), .src0 = M.imm(0) };
         var graph = try rdna2.control_flow.buildInstructions(std.testing.allocator, &instructions);
         defer graph.deinit(std.testing.allocator);
         var resolver = Resolver{ .bindings = &bindings, .reader = .{ .context = null, .read_fn = M.read }, .instructions = &instructions, .graph = &graph, .snapshot = &unknown_registers };
         var words: [1]u32 = undefined;
-        const recoverable = variant < 3 or variant == 6 or variant == 7;
+        const recoverable = variant < 3 or variant == 6 or variant == 7 or variant >= 10;
         try std.testing.expectEqual(recoverable, try resolver.words(11, 36, &words));
         if (recoverable) try std.testing.expectEqual(([_]u32{ 0xfac, 0x1204, 0x122c })[if (variant >= 6) 1 else variant], words[0]);
     }

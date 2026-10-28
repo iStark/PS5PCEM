@@ -6,6 +6,138 @@
 const std = @import("std");
 const gpu = @import("gpu");
 const rdna2 = @import("rdna2");
+const native = @import("root.zig");
+
+/// A dispatcher does not imply a guest loop: nested selections with terminal
+/// exits can require it too. With only forward edges and no indirect calls,
+/// each guest block can execute at most once. Reserve one visit per instruction
+/// (a conservative upper bound on blocks), so the safety cap cannot truncate it.
+pub fn forwardDispatcherBudget(program: *const rdna2.Program, graph: *const rdna2.control_flow.Graph) ?u32 {
+    if (program.instructions.items.len == 0 or program.instructions.items.len > 65536 or graph.back_edge_count != 0) return null;
+    for (graph.edges.items) |edge| if (edge.to <= edge.from) return null;
+    for (program.instructions.items) |inst| {
+        if (inst.opcode.isCall() or inst.opcode == .s_setpc_b64) return null;
+    }
+    return @intCast(@max(256, program.instructions.items.len));
+}
+
+test "forward dispatcher budget never admits a guest cycle or indirect call" {
+    var program = try rdna2.decodeProgram(std.testing.allocator, &.{ 0xbf068000, 0xbf850001, 0xbf810000, 0xbf810000 });
+    defer program.deinit(std.testing.allocator);
+    var graph = try rdna2.control_flow.build(std.testing.allocator, &program);
+    defer graph.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(?u32, 256), forwardDispatcherBudget(&program, &graph));
+    graph.back_edge_count = 1;
+    try std.testing.expect(forwardDispatcherBudget(&program, &graph) == null);
+    graph.back_edge_count = 0;
+    program.instructions.items[0].opcode = .s_setpc_b64;
+    try std.testing.expect(forwardDispatcherBudget(&program, &graph) == null);
+    program.instructions.items[0].opcode = .s_call_b64;
+    try std.testing.expect(forwardDispatcherBudget(&program, &graph) == null);
+}
+
+/// D3D12 shares reference/read/write masks between faces. Reject combinations
+/// that cannot be represented, rather than changing the guest stencil test.
+pub fn stencilState(render: gpu.resources.RenderState) !native.Stencil {
+    var result = native.Stencil{};
+    if (!render.depth_control.stencil_enabled) return result;
+    const clear = render.depth_control.stencil_clear_enabled;
+    const front = try stencilFace(render.stencil.front, render.depth_control.stencil_compare, clear);
+    const back = if (render.depth_control.backface_enabled)
+        try stencilFace(render.stencil.back, render.depth_control.stencil_compare_back, clear)
+    else
+        front;
+    const common = if (render.raster.cull_front) back else front;
+    if (!render.raster.cull_front and !render.raster.cull_back and
+        (front.read_mask != back.read_mask or front.write_mask != back.write_mask or front.reference != back.reference))
+        return error.IndependentStencilMasksNotImplemented;
+    result.enabled = 1;
+    result.read_mask = common.read_mask;
+    result.write_mask = common.write_mask;
+    result.reference = common.reference;
+    result.front = front.front;
+    result.back = back.front;
+    return result;
+}
+
+fn stencilFace(face: gpu.resources.StencilFace, compare: u8, clear: bool) !native.Stencil {
+    var result = native.Stencil{ .read_mask = face.compare_mask, .write_mask = if (clear) 0 else face.write_mask, .reference = face.reference };
+    const operations = [_]u8{ face.fail, face.depth_fail, face.pass };
+    var replacement: ?u8 = null;
+    for (operations, 0..) |op, i| {
+        if (result.write_mask == 0) continue;
+        result.front[i] = switch (op) {
+            0 => 1,
+            1 => 2,
+            2, 3, 4 => 3,
+            5 => 4,
+            6 => 5,
+            7 => 6,
+            8 => 7,
+            9 => 8,
+            12 => if (face.write_mask & ~face.op_value == 0) 6 else return error.StencilOperationNotImplemented,
+            else => return error.StencilOperationNotImplemented,
+        };
+        if (op >= 2 and op <= 4) {
+            const value = (if (op == 2) @as(u8, 255) else if (op == 3) face.reference else face.op_value) & face.write_mask;
+            if (replacement) |previous| {
+                if (previous != value) return error.StencilReplacementNotImplemented;
+            }
+            replacement = value;
+        }
+    }
+    result.front[3] = @as(u32, compare) + 1;
+    if (replacement) |value| {
+        const ref = (face.reference & ~face.write_mask) | value;
+        if (compare != 0 and compare != 7 and (ref ^ face.reference) & face.compare_mask != 0) return error.StencilReplacementNotImplemented;
+        result.reference = ref;
+    }
+    return result;
+}
+
+test "stencil maps hardware operations without losing replacement/test reference semantics" {
+    var face = gpu.resources.StencilFace{ .reference = 0x32, .compare_mask = 0xff, .write_mask = 0xff, .op_value = 0x64 };
+    for ([_]u8{ 0, 1, 3, 5, 6, 7, 8, 9 }, [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8 }) |guest, host| {
+        face.pass = guest;
+        const result = try stencilFace(face, 2, false);
+        try std.testing.expectEqual(host, result.front[2]);
+        try std.testing.expectEqual(@as(u32, 3), result.front[3]);
+        try std.testing.expectEqual(@as(u32, 0x32), result.reference);
+    }
+    face.pass = 4;
+    try std.testing.expectError(error.StencilReplacementNotImplemented, stencilFace(face, 2, false));
+    try std.testing.expectEqual(@as(u32, 0x64), (try stencilFace(face, 7, false)).reference);
+    face.compare_mask = 0x0f;
+    face.write_mask = 0xf0;
+    try std.testing.expectEqual(@as(u32, 0x62), (try stencilFace(face, 2, false)).reference);
+    face.fail = 2;
+    try std.testing.expectError(error.StencilReplacementNotImplemented, stencilFace(face, 7, false));
+    face.fail = 0;
+    face.pass = 12;
+    face.op_value = 0xff;
+    try std.testing.expectEqual(@as(u32, 6), (try stencilFace(face, 2, false)).front[2]);
+    face.op_value = 1;
+    try std.testing.expectError(error.StencilOperationNotImplemented, stencilFace(face, 2, false));
+    try std.testing.expectEqual(@as(u32, 0), (try stencilFace(face, 2, true)).write_mask);
+}
+
+test "stencil back faces share only representable native masks and references" {
+    var state: gpu.State = .{};
+    var render = gpu.resources.decodeRenderState(&state);
+    render.depth_control.stencil_enabled = true;
+    render.depth_control.backface_enabled = true;
+    render.stencil.front.reference = 3;
+    render.stencil.back.reference = 5;
+    try std.testing.expectError(error.IndependentStencilMasksNotImplemented, stencilState(render));
+    render.raster.cull_front = true;
+    try std.testing.expectEqual(@as(u32, 5), (try stencilState(render)).reference);
+    render.raster.cull_front = false;
+    render.raster.cull_back = true;
+    try std.testing.expectEqual(@as(u32, 3), (try stencilState(render)).reference);
+    render.depth_control.backface_enabled = false;
+    const same = try stencilState(render);
+    try std.testing.expectEqual(same.front, same.back);
+}
 
 pub const Routing = struct {
     stage: gpu.resources.ShaderStage,
@@ -23,7 +155,7 @@ pub const Interface = struct {
 /// guest 5 is a fan and guest 6 is a strip; D3D12 uses 5 for a strip.
 pub fn nativeTopology(guest: u32) !u32 {
     return switch (guest) {
-        4, 5 => 4, // List, or fan expanded to a list before submission.
+        4, 5, 7 => 4, // List, expanded fan, or RECT_LIST completed by the GS.
         6 => 5, // DI_PT_TRISTRIP -> D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP
         else => error.UnsupportedPrimitive,
     };
@@ -33,7 +165,8 @@ test "guest primitive numbers map explicitly and fans never masquerade as strips
     try std.testing.expectEqual(@as(u32, 4), try nativeTopology(4));
     try std.testing.expectEqual(@as(u32, 5), try nativeTopology(6));
     try std.testing.expectEqual(@as(u32, 4), try nativeTopology(5));
-    try std.testing.expectError(error.UnsupportedPrimitive, nativeTopology(7));
+    try std.testing.expectEqual(@as(u32, 4), try nativeTopology(7));
+    try std.testing.expectError(error.UnsupportedPrimitive, nativeTopology(8));
 }
 
 /// Fan triangles share the first index. Cyclic rotation preserves winding and

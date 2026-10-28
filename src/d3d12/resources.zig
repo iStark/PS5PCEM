@@ -118,7 +118,11 @@ pub const DrawResources = struct {
             if (offset == size) return @intCast(i);
         }
         if (self.buffers.items.len >= 64 or bytes_needed > 256 * 1024 * 1024 or
-            self.total + bytes_needed > 256 * 1024 * 1024) return error.GraphicsSnapshotBudgetExceeded;
+            self.total + bytes_needed > 256 * 1024 * 1024)
+        {
+            std.debug.print("[d3d12 resource budget] buffer address=0x{x} bytes={d} total={d} buffers={d} images={d}\n", .{ address, bytes_needed, self.total, self.buffers.items.len, self.images.items.len });
+            return error.GraphicsSnapshotBudgetExceeded;
+        }
         var lease = try staging.Lease.alloc(self.allocator, self.pool, bytes_needed);
         errdefer lease.deinit();
         const bytes = lease.bytes;
@@ -188,6 +192,10 @@ pub const DrawResources = struct {
         var words: [4]u32 = @splat(0);
         if (!try resolver.words(@intCast(reg), inst.pc, words[0..if (scalar) @as(usize, 3) else 4])) {
             std.debug.print("[d3d12 resources] unresolved buffer program=0x{x} pc=0x{x} op={s} s{d}\n", .{ resolver.bindings.program_address, inst.pc, @tagName(inst.opcode), reg });
+            for (resolver.instructions) |producer| {
+                if (producer.pc >= inst.pc or producer.pc + 128 < inst.pc) continue;
+                std.debug.print("  descriptor 0x{x}: {s} dst={s}{d} src={s}{d}/0x{x},{s}{d}/0x{x}\n", .{ producer.pc, @tagName(producer.opcode), @tagName(producer.dst.kind), producer.dst.reg, @tagName(producer.src0.kind), producer.src0.reg, producer.src0.value, @tagName(producer.src1.kind), producer.src1.reg, producer.src1.value });
+            }
             return error.DynamicGraphicsBufferNotImplemented;
         }
         const descriptor = if (scalar) try gpu.resources.decodeScalarBufferDescriptor(&words) else try gpu.resources.decodeBufferDescriptor(&words);
@@ -262,8 +270,7 @@ pub const DrawResources = struct {
             sampler.minification_filter != sampler.magnification_filter)) return error.GraphicsSamplerModeNotImplemented;
         const layout = try gpu.SurfaceLayout.fromImage(descriptor);
         if (layout.staging_bytes != expected_bytes) return error.GraphicsImageFootprintMismatch;
-        if (self.images.items.len >= 32 or layout.required_source_bytes > 256 * 1024 * 1024 or
-            self.total + layout.staging_bytes > 256 * 1024 * 1024) return error.GraphicsSnapshotBudgetExceeded;
+        if (layout.required_source_bytes > 256 * 1024 * 1024 or layout.staging_bytes > 256 * 1024 * 1024) return error.GraphicsSnapshotBudgetExceeded;
         _ = try layout.sourceRange(descriptor.address);
         var retained: ?texture_cache.Lease = null;
         var pixel_lease: staging.Lease = undefined;
@@ -304,8 +311,7 @@ pub const DrawResources = struct {
             };
             components |= mapped << @intCast(i * 3);
         }
-        const slot: u32 = @intCast(self.images.items.len);
-        try self.images.append(self.allocator, .{
+        const image = native.SampledImage{
             .pixels = pixels.ptr,
             .size = pixels.len,
             .content_id = if (retained) |lease| lease.contentId() else 0,
@@ -327,16 +333,29 @@ pub const DrawResources = struct {
                 2 => .{ 1, 1, 1, 1 },
                 else => unreachable,
             },
-        });
-        owns_pixels = false;
-        if (retained) |lease| {
-            self.texture_leases[self.texture_lease_count] = lease;
-            self.texture_lease_count += 1;
-        } else {
-            self.leases[self.lease_count] = pixel_lease;
-            self.lease_count += 1;
+        };
+        const slot = matchingImage(self.images.items, image) orelse fresh: {
+            if (self.images.items.len >= 32 or self.total + pixels.len > 256 * 1024 * 1024) {
+                std.debug.print("[d3d12 resource budget] image program=0x{x} pc=0x{x} bytes={d} total={d} buffers={d} images={d}\n", .{ resolver.bindings.program_address, inst.pc, pixels.len, self.total, self.buffers.items.len, self.images.items.len });
+                return error.GraphicsSnapshotBudgetExceeded;
+            }
+            const index: u32 = @intCast(self.images.items.len);
+            try self.images.append(self.allocator, image);
+            owns_pixels = false;
+            if (retained) |lease| {
+                self.texture_leases[self.texture_lease_count] = lease;
+                self.texture_lease_count += 1;
+            } else {
+                self.leases[self.lease_count] = pixel_lease;
+                self.lease_count += 1;
+            }
+            self.total += pixels.len;
+            break :fresh index;
+        };
+        if (owns_pixels) {
+            if (retained) |lease| lease.release() else pixel_lease.deinit();
+            owns_pixels = false;
         }
-        self.total += pixels.len;
         try stage.images.append(self.allocator, .{
             .resource_sgpr = inst.src1.reg,
             .sampler_sgpr = inst.src2.reg,
@@ -348,6 +367,41 @@ pub const DrawResources = struct {
         });
     }
 };
+
+/// Instruction count is not descriptor count. Reuse an identical native view
+/// only after acquiring a fresh, validated immutable snapshot for this read.
+fn matchingImage(images: []const native.SampledImage, candidate: native.SampledImage) ?u32 {
+    for (images, 0..) |previous, index| {
+        var view = candidate;
+        view.pixels = previous.pixels;
+        view.content_id = previous.content_id;
+        if (!std.meta.eql(previous, view)) continue;
+        if ((candidate.content_id != 0 and candidate.content_id == previous.content_id) or
+            std.mem.eql(u8, previous.pixels[0..previous.size], candidate.pixels[0..candidate.size])) return @intCast(index);
+    }
+    return null;
+}
+
+test "sampled instructions share only matching views with freshly proven complete contents" {
+    var a: [64]u8 = @splat(0x41);
+    var b = a;
+    const previous = [_]native.SampledImage{.{ .pixels = &a, .size = a.len, .width = 4, .height = 4 }};
+    var candidate = previous[0];
+    candidate.pixels = &b;
+    try std.testing.expectEqual(@as(?u32, 0), matchingImage(&previous, candidate));
+    b[b.len - 1] ^= 1;
+    try std.testing.expect(matchingImage(&previous, candidate) == null);
+    b = a;
+    candidate.filter = 0x15;
+    try std.testing.expect(matchingImage(&previous, candidate) == null);
+    candidate = previous[0];
+    candidate.components ^= 7;
+    try std.testing.expect(matchingImage(&previous, candidate) == null);
+    candidate = previous[0];
+    candidate.width = 8;
+    candidate.height = 2;
+    try std.testing.expect(matchingImage(&previous, candidate) == null);
+}
 
 test "duplicate instruction snapshots compare all current bytes and keep changed versions" {
     const Memory = struct {

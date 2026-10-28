@@ -9,7 +9,7 @@ const staging = @import("staging.zig");
 const surface_cache = @import("surface_cache.zig");
 
 pub fn colorLayout(target: gpu.resources.ColorTarget) !gpu.SurfaceLayout {
-    if (target.format != 10 or target.number_type != 0 or target.component_swap != 0 or
+    if (target.format != 10 or target.number_type != 0 or target.component_swap > 1 or
         target.samples_log2 != 0 or target.fragments_log2 != 0 or target.mip_level != 0 or
         target.maximum_mip != 0 or target.resource_type == 2 or target.depth > 1 or
         target.base_array_slice != 0 or target.last_array_slice != 0 or
@@ -29,11 +29,28 @@ pub fn colorDcc(target: gpu.resources.ColorTarget) ?Dcc {
 pub fn depthLayout(target: gpu.resources.DepthTarget, width: u32, height: u32, writable: bool) !gpu.SurfaceLayout {
     if ((target.format != 1 and target.format != 3) or target.width != width or target.height != height or
         target.samples_log2 != 0 or target.maximum_mip != 0 or target.mip_level != 0 or
-        target.base_array_slice != 0 or target.last_array_slice != 0 or target.htile_enabled)
+        target.base_array_slice != 0 or target.last_array_slice != 0)
         return error.UnsupportedDepthLayout;
     if (target.read_address == 0 or (writable and target.write_address != target.read_address)) return error.SeparateDepthAddressesNotImplemented;
+    if (target.htile_enabled) _ = try Htile.layoutFor(target);
     const layout = try gpu.SurfaceLayout.fromDepthTarget(target);
     try validate(layout, target.read_address);
+    return layout;
+}
+
+pub fn stencilLayout(target: gpu.resources.DepthTarget, width: u32, height: u32, writable: bool) !gpu.SurfaceLayout {
+    if (target.stencil_format != 1 or target.width != width or target.height != height or target.samples_log2 != 0 or
+        target.maximum_mip != 0 or target.mip_level != 0 or target.base_array_slice != 0 or target.last_array_slice != 0)
+        return error.UnsupportedStencilLayout;
+    if (target.stencil_read_address == 0 or (writable and target.stencil_read_address != target.stencil_write_address))
+        return error.SeparateStencilAddressesNotImplemented;
+    const layout = try gpu.SurfaceLayout.init(.{
+        .tile_mode = target.stencil_tile_mode,
+        .width = width,
+        .height = height,
+        .row_pitch_elements = if (target.stencil_tile_mode.isLinear()) std.mem.alignForward(u32, width, 256) else width,
+    }, 1);
+    try validate(layout, target.stencil_read_address);
     return layout;
 }
 
@@ -71,7 +88,7 @@ test "VideoOut RGBA8 and BGRA8 select the correct byte order without accepting H
 
 fn validate(layout: gpu.SurfaceLayout, address: u64) !void {
     if (layout.width == 0 or layout.height == 0 or layout.width > 16384 or layout.height > 16384 or
-        layout.layers != 1 or (layout.block.bytes_per_element != 4 and layout.block.bytes_per_element != 2) or
+        layout.layers != 1 or (layout.block.bytes_per_element != 4 and layout.block.bytes_per_element != 2 and layout.block.bytes_per_element != 1) or
         layout.required_source_bytes > 256 * 1024 * 1024 or layout.staging_bytes > 256 * 1024 * 1024)
         return error.SurfaceBudgetExceeded;
     _ = try layout.sourceRange(address);
@@ -161,6 +178,86 @@ test "DCC fast-clear keys expand into the tiled backing and unknown codes are re
     try std.testing.expectError(error.CompressedColorTargetNotImplemented, dcc.expand(memory.access(), &backing, &keys));
 }
 
+/// HTILE fast clears override the bytes in the depth/stencil allocations.
+/// Keep the metadata snapshot with both planes until their completed writes
+/// can be published together. The non-pipe-aligned SDK layout is accepted
+/// only for a uniform key, where the address permutation cannot matter.
+pub const Htile = struct {
+    lease: staging.Lease,
+    layout: gpu.HtileLayout,
+    address: u64,
+    uniform: bool,
+    stencil_disabled: bool,
+
+    fn layoutFor(target: gpu.resources.DepthTarget) !gpu.HtileLayout {
+        if (target.htile_address == 0 or target.tile_mode != .depth or target.maximum_mip != 0 or target.mip_level != 0 or
+            target.samples_log2 != 0 or target.base_array_slice != 0 or target.last_array_slice != 0 or
+            (!target.htile_pipe_aligned and !target.tile_stencil_disabled)) return error.UnsupportedMetadataLayout;
+        const layout = try gpu.HtileLayout.init(target.width, target.height, 1, 0, target.width);
+        _ = try std.math.add(u64, target.htile_address, layout.required_bytes);
+        return layout;
+    }
+
+    pub fn read(allocator: std.mem.Allocator, pool: ?*staging.Pool, memory: anytype, target: gpu.resources.DepthTarget) !Htile {
+        const layout = try layoutFor(target);
+        var lease = try staging.Lease.alloc(allocator, pool, @intCast(layout.required_bytes));
+        errdefer lease.deinit();
+        if (!memory.read(memory.context, target.htile_address, lease.bytes)) return error.GuestReadFailed;
+        if (!target.htile_pipe_aligned) {
+            var offset: usize = 4;
+            while (offset < lease.bytes.len) : (offset += 4)
+                if (!std.mem.eql(u8, lease.bytes[0..4], lease.bytes[offset..][0..4])) return error.UnsupportedMetadataLayout;
+        }
+        return .{ .lease = lease, .layout = layout, .address = target.htile_address, .uniform = !target.htile_pipe_aligned, .stencil_disabled = target.tile_stencil_disabled };
+    }
+
+    pub fn deinit(self: *Htile) void {
+        self.lease.deinit();
+    }
+
+    pub fn expand(self: Htile, depth: *Staged, stencil: ?*Staged) !void {
+        if (!self.stencil_disabled and stencil == null) return error.MissingStencilTarget;
+        var y: u32 = 0;
+        while (y < self.layout.height) : (y += 8) {
+            var x: u32 = 0;
+            while (x < self.layout.width) : (x += 8) {
+                const word = if (self.uniform) std.mem.readInt(u32, self.lease.bytes[0..4], .little) else try self.layout.word(self.lease.bytes, x, y, 0);
+                if (word == gpu.HtileLayout.expandedWord(self.stencil_disabled)) continue;
+                const value = gpu.HtileLayout.fastClearDepth(word, self.stencil_disabled) orelse return error.CompressedDepthTargetNotImplemented;
+                var py = y;
+                while (py < @min(y + 8, self.layout.height)) : (py += 1) {
+                    var px = x;
+                    while (px < @min(x + 8, self.layout.width)) : (px += 1) {
+                        const index = @as(usize, py) * self.layout.width + px;
+                        if (depth.layout.block.bytes_per_element == 2)
+                            std.mem.writeInt(u16, depth.pixels[index * 2 ..][0..2], if (value == 0) 0 else 65535, .little)
+                        else
+                            std.mem.writeInt(u32, depth.pixels[index * 4 ..][0..4], @bitCast(value), .little);
+                        if (!self.stencil_disabled) stencil.?.pixels[index] = 0;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Called only after BOTH materialized planes have reached guest memory.
+    pub fn publish(self: *Htile, memory: anytype) !void {
+        const expanded = gpu.HtileLayout.expandedWord(self.stencil_disabled);
+        if (self.uniform) {
+            var offset: usize = 0;
+            while (offset < self.lease.bytes.len) : (offset += 4) std.mem.writeInt(u32, self.lease.bytes[offset..][0..4], expanded, .little);
+        } else {
+            // Preserve metadata outside the view, including padded regions.
+            var y: u32 = 0;
+            while (y < self.layout.height) : (y += 8) {
+                var x: u32 = 0;
+                while (x < self.layout.width) : (x += 8) try self.layout.setWord(self.lease.bytes, x, y, 0, expanded);
+            }
+        }
+        if (!memory.write(memory.context, self.address, self.lease.bytes)) return error.GuestWriteFailed;
+    }
+};
+
 pub const Staged = struct {
     backing_lease: staging.Lease,
     pixel_lease: staging.Lease,
@@ -170,6 +267,7 @@ pub const Staged = struct {
     pixels: []u8,
     cache: ?*surface_cache.Cache = null,
     dcc: ?Dcc = null,
+    swap_red_blue: bool = false,
     allocator: ?std.mem.Allocator = null,
 
     pub fn read(allocator: std.mem.Allocator, memory: anytype, address: u64, layout: gpu.SurfaceLayout) !Staged {
@@ -181,12 +279,13 @@ pub const Staged = struct {
     }
 
     pub fn readCached(allocator: std.mem.Allocator, pool: ?*staging.Pool, cache: ?*surface_cache.Cache, memory: anytype, address: u64, layout: gpu.SurfaceLayout) !Staged {
-        return readColor(allocator, pool, cache, memory, address, layout, null);
+        return readColor(allocator, pool, cache, memory, address, layout, null, false);
     }
 
     /// Reads a surface, resolving DCC fast clears first when `dcc` is set.
-    pub fn readColor(allocator: std.mem.Allocator, pool: ?*staging.Pool, cache: ?*surface_cache.Cache, memory: anytype, address: u64, layout: gpu.SurfaceLayout, dcc: ?Dcc) !Staged {
+    pub fn readColor(allocator: std.mem.Allocator, pool: ?*staging.Pool, cache: ?*surface_cache.Cache, memory: anytype, address: u64, layout: gpu.SurfaceLayout, dcc: ?Dcc, swap_red_blue: bool) !Staged {
         try validate(layout, address);
+        if (swap_red_blue and layout.block.bytes_per_element != 4) return error.UnsupportedRenderTargetLayout;
         var backing_lease = try staging.Lease.alloc(allocator, pool, @intCast(layout.required_source_bytes));
         errdefer backing_lease.deinit();
         var pixel_lease = try staging.Lease.alloc(allocator, pool, @intCast(layout.staging_bytes));
@@ -196,7 +295,8 @@ pub const Staged = struct {
         if (!memory.read(memory.context, address, backing)) return error.GuestReadFailed;
         if (dcc) |metadata| try expandDcc(allocator, metadata, memory, backing);
         if (cache) |c| try c.detile(address, layout, backing, pixels) else try layout.detile(backing, pixels);
-        return .{ .backing_lease = backing_lease, .pixel_lease = pixel_lease, .layout = layout, .address = address, .backing = backing, .pixels = pixels, .cache = cache, .dcc = dcc, .allocator = allocator };
+        if (swap_red_blue) swapChannels(pixels);
+        return .{ .backing_lease = backing_lease, .pixel_lease = pixel_lease, .layout = layout, .address = address, .backing = backing, .pixels = pixels, .cache = cache, .dcc = dcc, .swap_red_blue = swap_red_blue, .allocator = allocator };
     }
 
     fn expandDcc(allocator: std.mem.Allocator, dcc: Dcc, memory: anytype, backing: []u8) !void {
@@ -218,6 +318,8 @@ pub const Staged = struct {
         // Materialize fast clears in the padding too, then publish every
         // block as plain texels so later readers use the bytes written here.
         if (self.dcc) |metadata| try expandDcc(self.allocator.?, metadata, memory, self.backing);
+        if (self.swap_red_blue) swapChannels(self.pixels);
+        defer if (self.swap_red_blue) swapChannels(self.pixels);
         if (self.cache) |c| try c.tile(self.address, self.layout, self.pixels, self.backing) else try self.layout.tile(self.pixels, self.backing);
         if (!memory.write(memory.context, self.address, self.backing)) return error.GuestWriteFailed;
         if (self.dcc) |metadata| try publishDcc(self.allocator.?, metadata, memory, self.backing.len);
@@ -229,6 +331,12 @@ pub const Staged = struct {
         self.* = undefined;
     }
 };
+
+fn swapChannels(pixels: []u8) void {
+    std.debug.assert(pixels.len % 4 == 0);
+    var offset: usize = 0;
+    while (offset < pixels.len) : (offset += 4) std.mem.swap(u8, &pixels[offset], &pixels[offset + 2]);
+}
 
 test "color layout derives tiled and absent linear pitches without accepting compression" {
     var target = std.mem.zeroes(gpu.resources.ColorTarget);
@@ -273,7 +381,7 @@ test "depth layouts validate address and subresource contracts before staging" {
     _ = try depthLayout(target, 65, 37, false);
     target.write_address = target.read_address;
     target.htile_enabled = true;
-    try std.testing.expectError(error.UnsupportedDepthLayout, depthLayout(target, 65, 37, true));
+    try std.testing.expectError(error.UnsupportedMetadataLayout, depthLayout(target, 65, 37, true));
     target.htile_enabled = false;
     target.samples_log2 = 1;
     try std.testing.expectError(error.UnsupportedDepthLayout, depthLayout(target, 65, 37, true));
@@ -283,6 +391,75 @@ test "depth layouts validate address and subresource contracts before staging" {
     target.mip_level = 0;
     target.read_address = std.math.maxInt(u64) - 32;
     try std.testing.expectError(error.ArithmeticOverflow, depthLayout(target, 65, 37, false));
+}
+
+test "HTILE clear materialization preserves both planes and publishes expanded metadata after writeback" {
+    const Memory = struct {
+        data: [0x40000]u8 = @splat(0xcd),
+        fn read(context: ?*anyopaque, address: u64, bytes: []u8) bool {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            if (address > self.data.len or bytes.len > self.data.len - address) return false;
+            @memcpy(bytes, self.data[@intCast(address)..][0..bytes.len]);
+            return true;
+        }
+        fn write(context: ?*anyopaque, address: u64, bytes: []const u8) bool {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            if (address > self.data.len or bytes.len > self.data.len - address) return false;
+            @memcpy(self.data[@intCast(address)..][0..bytes.len], bytes);
+            return true;
+        }
+        fn access(self: *@This()) @import("backend.zig").Memory {
+            return .{ .context = self, .read = read, .write = write };
+        }
+    };
+    var memory = Memory{};
+    for ([_]u8{ 1, 3 }) |format| for ([_]bool{ false, true }) |no_stencil| {
+        @memset(&memory.data, 0xcd);
+        var target = std.mem.zeroes(gpu.resources.DepthTarget);
+        target.read_address = 0x10000;
+        target.write_address = 0x10000;
+        target.stencil_read_address = 0x20000;
+        target.stencil_write_address = 0x20000;
+        target.width = 65;
+        target.height = 37;
+        target.format = @intCast(format);
+        target.stencil_format = 1;
+        target.tile_mode = .depth;
+        target.stencil_tile_mode = .depth;
+        target.htile_enabled = true;
+        target.htile_address = 0x30000;
+        target.htile_pipe_aligned = !no_stencil;
+        target.tile_stencil_disabled = no_stencil;
+        const layout = try Htile.layoutFor(target);
+        const keys = memory.data[0x30000..][0..@intCast(layout.required_bytes)];
+        var offset: usize = 0;
+        while (offset < keys.len) : (offset += 4) std.mem.writeInt(u32, keys[offset..][0..4], if (no_stencil) 0xfffffff0 else 0xfffc00f0, .little);
+        var depth = try Staged.read(std.testing.allocator, memory.access(), target.read_address, try depthLayout(target, 65, 37, true));
+        defer depth.deinit();
+        var stencil = try Staged.read(std.testing.allocator, memory.access(), target.stencil_read_address, try stencilLayout(target, 65, 37, true));
+        defer stencil.deinit();
+        var htile = try Htile.read(std.testing.allocator, null, memory.access(), target);
+        defer htile.deinit();
+        try htile.expand(&depth, &stencil);
+        for (0..65 * 37) |i| {
+            if (format == 1) try std.testing.expectEqual(@as(u16, 65535), std.mem.readInt(u16, depth.pixels[i * 2 ..][0..2], .little)) else try std.testing.expectEqual(@as(u32, 0x3f800000), std.mem.readInt(u32, depth.pixels[i * 4 ..][0..4], .little));
+            try std.testing.expectEqual(@as(u8, if (no_stencil) 0xcd else 0), stencil.pixels[i]);
+        }
+        try depth.write(memory.access());
+        try stencil.write(memory.access());
+        try htile.publish(memory.access());
+        try std.testing.expectEqual(gpu.HtileLayout.expandedWord(no_stencil), try layout.word(keys, 0, 0, 0));
+        // Subsequent reads must retain new depth/stencil writes, not replay the clear.
+        @memset(depth.pixels, 0x39);
+        @memset(stencil.pixels, 0x71);
+        var second = try Htile.read(std.testing.allocator, null, memory.access(), target);
+        defer second.deinit();
+        try second.expand(&depth, &stencil);
+        for (depth.pixels) |byte| try std.testing.expectEqual(@as(u8, 0x39), byte);
+        for (stencil.pixels) |byte| try std.testing.expectEqual(@as(u8, 0x71), byte);
+        std.mem.writeInt(u32, second.lease.bytes[0..4], 0xdeadbeef, .little);
+        if (no_stencil) try std.testing.expectError(error.CompressedDepthTargetNotImplemented, second.expand(&depth, &stencil));
+    };
 }
 
 test "pooled surfaces refresh guest bytes, preserve newly changed padding and release failed reads" {

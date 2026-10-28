@@ -69,7 +69,7 @@ typedef struct ShaderEntry {
 /* Fixed-size words, not a native descriptor with pointers/padding. All other
  * PSO state is fixed by graphics_desc; dynamic constants/resources are rebound
  * on every draw and are deliberately absent from this key. */
-typedef struct PipelineKey { uint64_t words[20]; } PipelineKey;
+typedef struct PipelineKey { uint64_t words[34]; } PipelineKey;
 typedef struct PipelineEntry {
     PipelineKey key;
     uint64_t used;
@@ -1449,6 +1449,11 @@ struct DrawBatch {
     ID3D12Resource *color, *upload, *readback, *depth, *depth_upload, *depth_readback;
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint, depth_footprint;
     UINT64 bytes, depth_bytes;
+    ID3D12Resource *stencil_upload, *stencil_readback;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT stencil_footprint;
+    UINT64 stencil_copy_bytes;
+    uint8_t *stencil_pixels;
+    int stencil_write, needs_stencil_readback, has_stencil;
 };
 
 /* Each draw owns a disjoint descriptor range until batch completion. The
@@ -1532,6 +1537,7 @@ static void cleanup_batch(Ps5D3D12 *c, DrawBatch *batch, int complete) {
     }
     return_resource(c, batch->color, complete); return_resource(c, batch->upload, complete); return_resource(c, batch->readback, complete);
     return_resource(c, batch->depth, complete); return_resource(c, batch->depth_upload, complete); return_resource(c, batch->depth_readback, complete);
+    return_resource(c, batch->stencil_upload, complete); return_resource(c, batch->stencil_readback, complete);
 }
 
 static HRESULT finish_batch(Ps5D3D12 *c, DrawBatch *b, uint8_t *rgba, uint8_t *depth_pixels) {
@@ -1543,17 +1549,24 @@ static HRESULT finish_batch(Ps5D3D12 *c, DrawBatch *b, uint8_t *rgba, uint8_t *d
     ID3D12GraphicsCommandList_CopyTextureRegion(c->commands, &destination, 0, 0, 0, &source, NULL);
     transition(c, b->color, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
     if (b->depth) {
-        if (b->depth_write) {
+        if (b->depth_write || b->stencil_write) {
             transition(c, b->depth, b->depth_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
             source.pResource = b->depth;
-            destination.pResource = b->depth_readback; destination.PlacedFootprint = b->depth_footprint;
-            ID3D12GraphicsCommandList_CopyTextureRegion(c->commands, &destination, 0, 0, 0, &source, NULL);
+            if (b->depth_write) {
+                destination.pResource = b->depth_readback; destination.PlacedFootprint = b->depth_footprint;
+                ID3D12GraphicsCommandList_CopyTextureRegion(c->commands, &destination, 0, 0, 0, &source, NULL);
+            }
+            if (b->stencil_write) {
+                source.SubresourceIndex = 1;
+                destination.pResource = b->stencil_readback; destination.PlacedFootprint = b->stencil_footprint;
+                ID3D12GraphicsCommandList_CopyTextureRegion(c->commands, &destination, 0, 0, 0, &source, NULL);
+            }
         }
-        transition(c, b->depth, b->depth_write ? D3D12_RESOURCE_STATE_COPY_SOURCE : b->depth_state, D3D12_RESOURCE_STATE_COPY_DEST);
+        transition(c, b->depth, (b->depth_write || b->stencil_write) ? D3D12_RESOURCE_STATE_COPY_SOURCE : b->depth_state, D3D12_RESOURCE_STATE_COPY_DEST);
     }
     b->recording = 0;
     TRY(submit(c));
-    void *mapped, *depth_mapped = NULL;
+    void *mapped, *depth_mapped = NULL, *stencil_mapped = NULL;
     D3D12_RANGE entire = {0, (SIZE_T)b->bytes}, empty = {0, 0};
     /* Map both outputs before modifying caller storage. A second Map failure
      * must not expose a partly completed group to the guest. */
@@ -1563,18 +1576,55 @@ static HRESULT finish_batch(Ps5D3D12 *c, DrawBatch *b, uint8_t *rgba, uint8_t *d
         hr = ID3D12Resource_Map(b->depth_readback, 0, &range, &depth_mapped);
         if (FAILED(hr)) { ID3D12Resource_Unmap(b->readback, 0, &empty); failure(c, hr, "batch depth readback Map"); goto done; }
     }
+    if (b->stencil_write) {
+        D3D12_RANGE range = {0, (SIZE_T)b->stencil_copy_bytes};
+        hr = ID3D12Resource_Map(b->stencil_readback, 0, &range, &stencil_mapped);
+        if (FAILED(hr)) {
+            if (depth_mapped) ID3D12Resource_Unmap(b->depth_readback, 0, &empty);
+            ID3D12Resource_Unmap(b->readback, 0, &empty);
+            failure(c, hr, "batch stencil readback Map"); goto done;
+        }
+    }
     for (UINT y = 0; y < b->height; ++y) {
         memcpy(rgba + (size_t)y * b->width * 4,
             (uint8_t *)mapped + b->footprint.Offset + (size_t)y * b->footprint.Footprint.RowPitch, (size_t)b->width * 4);
-        if (depth_mapped) memcpy(depth_pixels + (size_t)y * b->width * b->depth_bpp,
-            (uint8_t *)depth_mapped + b->depth_footprint.Offset + (size_t)y * b->depth_footprint.Footprint.RowPitch, (size_t)b->width * b->depth_bpp);
+        if (depth_mapped) {
+            const uint8_t *row = (uint8_t *)depth_mapped + b->depth_footprint.Offset + (size_t)y * b->depth_footprint.Footprint.RowPitch;
+            if (b->has_stencil && b->depth_bpp == 2) {
+                for (UINT x = 0; x < b->width; ++x) {
+                    float value; memcpy(&value, row + x * 4, 4);
+                    uint16_t result = (uint16_t)(fminf(1, fmaxf(0, value)) * 65535.0f + 0.5f);
+                    memcpy(depth_pixels + ((size_t)y * b->width + x) * 2, &result, 2);
+                }
+            } else memcpy(depth_pixels + (size_t)y * b->width * b->depth_bpp, row, (size_t)b->width * b->depth_bpp);
+        }
+        if (stencil_mapped) memcpy(b->stencil_pixels + (size_t)y * b->width,
+            (uint8_t *)stencil_mapped + b->stencil_footprint.Offset + (size_t)y * b->stencil_footprint.Footprint.RowPitch, b->width);
     }
     ID3D12Resource_Unmap(b->readback, 0, &empty);
     if (depth_mapped) ID3D12Resource_Unmap(b->depth_readback, 0, &empty);
+    if (stencil_mapped) ID3D12Resource_Unmap(b->stencil_readback, 0, &empty);
     remember_attachment(c, b->color, b->readback);
-    if (b->depth_write) remember_attachment(c, b->depth, b->depth_readback);
+    if (b->depth_write && !b->has_stencil) remember_attachment(c, b->depth, b->depth_readback);
 done:
     return hr;
+}
+
+/* Complete each guest RECT_LIST primitive after vertex execution. The fourth
+ * position and every interpolant belong to the same affine plane. TEXCOORDn
+ * matches SPIRV-Cross's default mapping of Location n. */
+static HRESULT rectangle_shader(Ps5D3D12 *c, uint32_t mask, ID3DBlob **code) {
+    char source[8192]; size_t used = 0;
+    used += snprintf(source + used, sizeof(source) - used, "struct V {");
+    for (UINT i = 0; i < 32; ++i) if (mask & (1u << i))
+        used += snprintf(source + used, sizeof(source) - used, "float4 a%u : TEXCOORD%u;", i, i);
+    used += snprintf(source + used, sizeof(source) - used,
+        "float4 p : SV_Position; }; [maxvertexcount(4)] void main(triangle V v[3], inout TriangleStream<V> s) {"
+        "s.Append(v[0]); s.Append(v[1]); s.Append(v[2]); V q; q.p=v[0].p+v[1].p-v[2].p;");
+    for (UINT i = 0; i < 32; ++i) if (mask & (1u << i))
+        used += snprintf(source + used, sizeof(source) - used, "q.a%u=v[0].a%u+v[1].a%u-v[2].a%u;", i, i, i, i);
+    snprintf(source + used, sizeof(source) - used, "s.Append(q); s.RestartStrip(); }");
+    return compile_dxil(c, source, "gs_6_0", code);
 }
 
 static HRESULT record_draw(Ps5D3D12 *c, DrawBatch *batch, const uint32_t *vertex, size_t vertex_count,
@@ -1586,6 +1636,24 @@ static HRESULT record_draw(Ps5D3D12 *c, DrawBatch *batch, const uint32_t *vertex
         (d->topology != D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST && d->topology != D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP) ||
         d->cull_mode < D3D12_CULL_MODE_NONE || d->cull_mode > D3D12_CULL_MODE_BACK || d->write_mask > 15 || d->dynamic_scalars > 1) return E_INVALIDARG;
     const UINT depth_bpp = d->depth_format == DXGI_FORMAT_D16_UNORM ? 2 : 4;
+    const int has_stencil = d->stencil_pixels != NULL;
+    /* D3D12 has no D16+S8 format. D32+S8 preserves D16 storage during
+       stencil-only passes, but general D16 comparisons need fragment-depth
+       quantization before the native test and cannot use this conversion. */
+    if (has_stencil && d->depth_format == DXGI_FORMAT_D16_UNORM &&
+        (d->depth_write || (d->depth_compare != D3D12_COMPARISON_FUNC_ALWAYS && d->depth_compare != D3D12_COMPARISON_FUNC_NEVER)))
+        return failure(c, E_NOTIMPL, "D16 stencil with active depth requires fragment-depth quantization");
+    const int stencil_write = has_stencil && ((d->stencil.enabled && d->stencil.write_mask) || (d->clear_flags & 2));
+    const int depth_write = d->depth_write || (d->clear_flags & 1);
+    const int attachment_write = depth_write || stencil_write;
+    const DXGI_FORMAT dsv_format = has_stencil ? DXGI_FORMAT_D32_FLOAT_S8X24_UINT : d->depth_format;
+    if (d->stencil.enabled > 1 || d->stencil.read_mask > 255 || d->stencil.write_mask > 255 || d->stencil.reference > 255 ||
+        d->rectangle_completion > 1 || d->clear_flags > 3 || d->clear_stencil > 255 ||
+        (has_stencil ? (!d->depth_format || d->stencil_bytes != (uint64_t)d->width * d->height) :
+        (d->stencil.enabled || d->stencil_bytes || (d->clear_flags & 2)))) return E_INVALIDARG;
+    for (UINT i = 0; i < 4; ++i) if (d->stencil.front[i] < 1 || d->stencil.front[i] > 8 ||
+        d->stencil.back[i] < 1 || d->stencil.back[i] > 8) return E_INVALIDARG;
+    if ((d->clear_flags & 1) && (!d->depth_format || !isfinite(d->clear_depth) || d->clear_depth < 0 || d->clear_depth > 1)) return E_INVALIDARG;
     if (d->depth_write > 1 || d->depth_clip_enabled > 1 || d->depth_compare < 1 || d->depth_compare > 8 ||
         (d->depth_format == 0 ? (depth_bytes != 0 || d->depth_write != 0) :
         ((d->depth_format != DXGI_FORMAT_D16_UNORM && d->depth_format != DXGI_FORMAT_D32_FLOAT) || !depth_pixels ||
@@ -1610,7 +1678,7 @@ static HRESULT record_draw(Ps5D3D12 *c, DrawBatch *batch, const uint32_t *vertex
     for (UINT i = 0; i < image_count; ++i) if (!valid_sampled_image(&images[i])) return E_INVALIDARG;
     HRESULT hr;
     GraphicsResources resources = {0};
-    ID3DBlob *vs = NULL, *ps = NULL;
+    ID3DBlob *vs = NULL, *ps = NULL, *gs = NULL;
     ID3D12RootSignature *root = NULL;
     ID3D12PipelineState *pipeline = NULL;
     ID3D12Resource *color = NULL, *upload = NULL, *readback = NULL, *index_upload = NULL;
@@ -1624,15 +1692,29 @@ static HRESULT record_draw(Ps5D3D12 *c, DrawBatch *batch, const uint32_t *vertex
     const PipelineKey key = {{2, vs_id, ps_id, buffer_count, image_count, d->cull_mode, d->front_ccw != 0,
         d->write_mask, blend->enabled, blend->source_color, blend->destination_color, blend->color_operation,
         blend->source_alpha, blend->destination_alpha, blend->alpha_operation, strip_cut,
-        d->depth_format, d->depth_write, d->depth_compare, d->depth_clip_enabled}};
+        d->depth_format, d->depth_write, d->depth_compare, d->depth_clip_enabled,
+        d->rectangle_completion, d->rectangle_mask, has_stencil, d->stencil.enabled,
+        d->stencil.read_mask, d->stencil.write_mask,
+        d->stencil.front[0], d->stencil.front[1], d->stencil.front[2], d->stencil.front[3],
+        d->stencil.back[0], d->stencil.back[1], d->stencil.back[2], d->stencil.back[3]}};
     if (!cached_pipeline(c, &key, &root, &pipeline)) {
         const ULONGLONG started = GetTickCount64();
         TRY(guest_graphics_root(c, buffer_count, image_count, d->dynamic_scalars, &root));
         D3D12_GRAPHICS_PIPELINE_STATE_DESC pipeline_desc = graphics_desc(root, vs, ps, 0);
-        pipeline_desc.DSVFormat = d->depth_format;
+        if (d->rectangle_completion) {
+            TRY(rectangle_shader(c, d->rectangle_mask, &gs));
+            pipeline_desc.GS.pShaderBytecode = ID3D10Blob_GetBufferPointer(gs);
+            pipeline_desc.GS.BytecodeLength = ID3D10Blob_GetBufferSize(gs);
+        }
+        pipeline_desc.DSVFormat = dsv_format;
         pipeline_desc.DepthStencilState.DepthEnable = d->depth_format != 0;
         pipeline_desc.DepthStencilState.DepthWriteMask = d->depth_write ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
         pipeline_desc.DepthStencilState.DepthFunc = d->depth_compare;
+        pipeline_desc.DepthStencilState.StencilEnable = d->stencil.enabled;
+        pipeline_desc.DepthStencilState.StencilReadMask = (UINT8)d->stencil.read_mask;
+        pipeline_desc.DepthStencilState.StencilWriteMask = (UINT8)d->stencil.write_mask;
+        pipeline_desc.DepthStencilState.FrontFace = (D3D12_DEPTH_STENCILOP_DESC){d->stencil.front[0], d->stencil.front[1], d->stencil.front[2], d->stencil.front[3]};
+        pipeline_desc.DepthStencilState.BackFace = (D3D12_DEPTH_STENCILOP_DESC){d->stencil.back[0], d->stencil.back[1], d->stencil.back[2], d->stencil.back[3]};
         pipeline_desc.RasterizerState.CullMode = d->cull_mode;
         pipeline_desc.RasterizerState.DepthClipEnable = d->depth_clip_enabled != 0;
         pipeline_desc.RasterizerState.FrontCounterClockwise = d->front_ccw != 0;
@@ -1688,21 +1770,44 @@ static HRESULT record_draw(Ps5D3D12 *c, DrawBatch *batch, const uint32_t *vertex
     UINT64 depth_copy_bytes = 0;
     if (d->depth_format) {
         D3D12_RESOURCE_DESC depth_desc = desc;
-        depth_desc.Format = d->depth_format;
+        depth_desc.Format = dsv_format;
         depth_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
         ID3D12Device_GetCopyableFootprints(c->device, &depth_desc, 0, 1, 0, &depth_footprint, NULL, NULL, &depth_copy_bytes);
         int depth_reused;
         if (!batch->count) {
-            TRY(acquire_attachment(c, &depth_desc, &depth_footprint, depth_copy_bytes, depth_pixels, d->width * depth_bpp,
+            depth_reused = 0;
+            if (has_stencil) {
+                /* A depth-only retention proof cannot prove the stencil plane. */
+                TRY(acquire_resource(c, &depth_desc, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST, 0, &depth));
+            } else TRY(acquire_attachment(c, &depth_desc, &depth_footprint, depth_copy_bytes, depth_pixels, d->width * depth_bpp,
                 &depth, &depth_readback, &depth_reused));
             if (!depth_reused) TRY(graphics_buffer(c, depth_copy_bytes, D3D12_HEAP_TYPE_UPLOAD, &depth_upload));
             if (batch->needs_depth_readback && !depth_readback) TRY(graphics_buffer(c, depth_copy_bytes, D3D12_HEAP_TYPE_READBACK, &depth_readback));
             if (depth_upload) {
                 TRY(ID3D12Resource_Map(depth_upload, 0, &empty, &mapped));
-                for (UINT y = 0; y < d->height; ++y) memcpy((uint8_t *)mapped + depth_footprint.Offset + (size_t)y * depth_footprint.Footprint.RowPitch,
-                    depth_pixels + (size_t)y * d->width * depth_bpp, (size_t)d->width * depth_bpp);
+                for (UINT y = 0; y < d->height; ++y) {
+                    uint8_t *row = (uint8_t *)mapped + depth_footprint.Offset + (size_t)y * depth_footprint.Footprint.RowPitch;
+                    if (has_stencil && depth_bpp == 2) {
+                        for (UINT x = 0; x < d->width; ++x) {
+                            uint16_t value; memcpy(&value, depth_pixels + ((size_t)y * d->width + x) * 2, 2);
+                            float normalized = value / 65535.0f; memcpy(row + x * 4, &normalized, 4);
+                        }
+                    } else memcpy(row, depth_pixels + (size_t)y * d->width * depth_bpp, (size_t)d->width * depth_bpp);
+                }
                 D3D12_RANGE depth_written = {0, (SIZE_T)depth_copy_bytes};
                 ID3D12Resource_Unmap(depth_upload, 0, &depth_written);
+            }
+            if (has_stencil) {
+                ID3D12Device_GetCopyableFootprints(c->device, &depth_desc, 1, 1, 0, &batch->stencil_footprint, NULL, NULL, &batch->stencil_copy_bytes);
+                TRY(graphics_buffer(c, batch->stencil_copy_bytes, D3D12_HEAP_TYPE_UPLOAD, &batch->stencil_upload));
+                if (batch->needs_stencil_readback) TRY(graphics_buffer(c, batch->stencil_copy_bytes, D3D12_HEAP_TYPE_READBACK, &batch->stencil_readback));
+                TRY(ID3D12Resource_Map(batch->stencil_upload, 0, &empty, &mapped));
+                for (UINT y = 0; y < d->height; ++y) memcpy((uint8_t *)mapped + batch->stencil_footprint.Offset + (size_t)y * batch->stencil_footprint.Footprint.RowPitch,
+                    d->stencil_pixels + (size_t)y * d->width, d->width);
+                D3D12_RANGE written = {0, (SIZE_T)batch->stencil_copy_bytes};
+                ID3D12Resource_Unmap(batch->stencil_upload, 0, &written);
+                batch->stencil_pixels = d->stencil_pixels;
+                batch->has_stencil = 1;
             }
         } else {
             depth = batch->depth; depth_readback = batch->depth_readback;
@@ -1710,8 +1815,9 @@ static HRESULT record_draw(Ps5D3D12 *c, DrawBatch *batch, const uint32_t *vertex
         }
         depth_view = ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(c->dsv_heap);
         D3D12_DEPTH_STENCIL_VIEW_DESC dsv = {0};
-        dsv.Format = d->depth_format; dsv.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
-        dsv.Flags = d->depth_write ? D3D12_DSV_FLAG_NONE : D3D12_DSV_FLAG_READ_ONLY_DEPTH;
+        dsv.Format = dsv_format; dsv.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+        dsv.Flags = (depth_write ? 0 : D3D12_DSV_FLAG_READ_ONLY_DEPTH) |
+            (has_stencil && !stencil_write ? D3D12_DSV_FLAG_READ_ONLY_STENCIL : 0);
         ID3D12Device_CreateDepthStencilView(c->device, depth, &dsv, depth_view);
     }
     if (d->index_count) {
@@ -1735,7 +1841,14 @@ static HRESULT record_draw(Ps5D3D12 *c, DrawBatch *batch, const uint32_t *vertex
         depth_destination.pResource = depth; depth_destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
         /* Depth copies must cover the complete subresource, with no box. */
         if (depth_upload) ID3D12GraphicsCommandList_CopyTextureRegion(c->commands, &depth_destination, 0, 0, 0, &depth_source, NULL);
-        transition(c, depth, batch->count ? batch->depth_state : D3D12_RESOURCE_STATE_COPY_DEST, d->depth_write ? D3D12_RESOURCE_STATE_DEPTH_WRITE : D3D12_RESOURCE_STATE_DEPTH_READ);
+        if (has_stencil && !batch->count) {
+            depth_source.pResource = batch->stencil_upload; depth_source.PlacedFootprint = batch->stencil_footprint;
+            depth_destination.SubresourceIndex = 1;
+            ID3D12GraphicsCommandList_CopyTextureRegion(c->commands, &depth_destination, 0, 0, 0, &depth_source, NULL);
+        }
+        transition(c, depth, batch->count ? batch->depth_state : D3D12_RESOURCE_STATE_COPY_DEST, attachment_write ? D3D12_RESOURCE_STATE_DEPTH_WRITE : D3D12_RESOURCE_STATE_DEPTH_READ);
+        if (d->clear_flags) ID3D12GraphicsCommandList_ClearDepthStencilView(c->commands, depth_view,
+            (D3D12_CLEAR_FLAGS)d->clear_flags, d->clear_depth, (UINT8)d->clear_stencil, 0, NULL);
     }
     ID3D12GraphicsCommandList_SetPipelineState(c->commands, pipeline);
     ID3D12GraphicsCommandList_SetGraphicsRootSignature(c->commands, root);
@@ -1745,6 +1858,7 @@ static HRESULT record_draw(Ps5D3D12 *c, DrawBatch *batch, const uint32_t *vertex
     if (scalar_upload) ID3D12GraphicsCommandList_SetGraphicsRootShaderResourceView(c->commands,
         1 + (buffer_count != 0) + 2 * (image_count != 0), ID3D12Resource_GetGPUVirtualAddress(scalar_upload));
     ID3D12GraphicsCommandList_OMSetBlendFactor(c->commands, blend->constants);
+    ID3D12GraphicsCommandList_OMSetStencilRef(c->commands, d->stencil.reference);
     ID3D12GraphicsCommandList_OMSetRenderTargets(c->commands, 1, &view, FALSE, depth ? &depth_view : NULL);
     D3D12_VIEWPORT viewport = {d->viewport[0], d->viewport[1], d->viewport[2], d->viewport[3], d->viewport[4], d->viewport[5]};
     D3D12_RECT scissor = {d->scissor[0], d->scissor[1], d->scissor[2], d->scissor[3]};
@@ -1783,8 +1897,9 @@ static HRESULT record_draw(Ps5D3D12 *c, DrawBatch *batch, const uint32_t *vertex
         release(color); color = NULL; release(readback); readback = NULL;
         release(depth); depth = NULL; release(depth_readback); depth_readback = NULL;
     }
-    batch->depth_state = d->depth_write ? D3D12_RESOURCE_STATE_DEPTH_WRITE : D3D12_RESOURCE_STATE_DEPTH_READ;
-    batch->depth_write |= d->depth_write;
+    batch->depth_state = attachment_write ? D3D12_RESOURCE_STATE_DEPTH_WRITE : D3D12_RESOURCE_STATE_DEPTH_READ;
+    batch->depth_write |= depth_write;
+    batch->stencil_write |= stencil_write;
     hr = S_OK;
 done:
     if (FAILED(hr) && batch->recording) {
@@ -1800,7 +1915,7 @@ done:
     return_resource(c, depth_readback, SUCCEEDED(hr)); return_resource(c, depth_upload, SUCCEEDED(hr)); return_resource(c, depth, SUCCEEDED(hr));
     return_resource(c, scalar_upload, SUCCEEDED(hr)); return_resource(c, index_upload, SUCCEEDED(hr));
     return_resource(c, readback, SUCCEEDED(hr)); return_resource(c, upload, SUCCEEDED(hr)); return_resource(c, color, SUCCEEDED(hr));
-    retire(c, pipeline); retire(c, root); release(ps); release(vs);
+    retire(c, pipeline); retire(c, root); release(gs); release(ps); release(vs);
     return hr;
 }
 
@@ -1811,10 +1926,14 @@ int32_t ps5_d3d12_draw_batch(Ps5D3D12 *c, const Ps5D3D12DrawJob *jobs, uint32_t 
     const Ps5D3D12Draw *first = jobs[0].draw;
     for (UINT i = 0; i < count; ++i) {
         const Ps5D3D12Draw *d = jobs[i].draw;
-        if (!d || d->width != first->width || d->height != first->height || d->depth_format != first->depth_format) return E_INVALIDARG;
+        if (!d || d->width != first->width || d->height != first->height || d->depth_format != first->depth_format ||
+            d->stencil_pixels != first->stencil_pixels || d->stencil_bytes != first->stencil_bytes) return E_INVALIDARG;
     }
     DrawBatch batch = {0};
-    for (UINT i = 0; i < count; ++i) batch.needs_depth_readback |= jobs[i].draw->depth_write;
+    for (UINT i = 0; i < count; ++i) {
+        batch.needs_depth_readback |= jobs[i].draw->depth_write || (jobs[i].draw->clear_flags & 1);
+        batch.needs_stencil_readback |= (jobs[i].draw->stencil.enabled && jobs[i].draw->stencil.write_mask) || (jobs[i].draw->clear_flags & 2);
+    }
     HRESULT hr = S_OK;
     for (UINT i = 0; i < count; ++i) {
         const Ps5D3D12DrawJob *j = &jobs[i];

@@ -57,6 +57,11 @@ typedef struct Ps5D3D12Blend {
     float constants[4];
 } Ps5D3D12Blend;
 
+typedef struct Ps5D3D12Stencil {
+    uint32_t enabled, read_mask, write_mask, reference;
+    uint32_t front[4], back[4];
+} Ps5D3D12Stencil;
+
 typedef struct Ps5D3D12Draw {
     uint32_t width, height, vertex_count, instance_count, first_vertex, first_instance;
     uint32_t topology, cull_mode, front_ccw, write_mask;
@@ -64,6 +69,10 @@ typedef struct Ps5D3D12Draw {
     int32_t base_vertex;
     Ps5D3D12Blend blend;
     uint32_t depth_format, depth_write, depth_compare, depth_clip_enabled;
+    uint32_t rectangle_completion, rectangle_mask;
+    Ps5D3D12Stencil stencil;
+    uint8_t *stencil_pixels; size_t stencil_bytes;
+    uint32_t clear_flags; float clear_depth; uint32_t clear_stencil;
     float viewport[6];
     int32_t scissor[4];
     uint32_t dynamic_scalars;
