@@ -6681,6 +6681,8 @@ pub const Renderer = struct {
     captured_planar_video_pass: bool = false,
     reported_crt_composite_fallback: bool = false,
     reported_first_scissor_state: bool = false,
+    draw_audit_flip: u64 = 0,
+    draw_audit_count: u32 = 0,
     reported_draw_errors: [16]?anyerror = @splat(null),
     reported_compute_shader_failures: [32]?ComputeShaderFailure = @splat(null),
     reported_compute_resource_programs: [8]u64 = @splat(0),
@@ -19655,7 +19657,7 @@ pub const Renderer = struct {
             .{ vertex_words.len, fragment_words.len },
         );
         if (report_checkpoints) std.debug.print(
-            "[vulkan dcb] first graphics draw: viewport=({d},{d}){d}x{d} scissor=({d},{d}){d}x{d} discard={d} colors={d} write=0x{x} blend={d} extras={d} topo={d} cull={d} front={d} depth={d} dfunc={d} bsrc={d}/{d} bdst={d}/{d}\n",
+            "[vulkan dcb] first graphics draw: viewport=({d},{d}){d}x{d} scissor=({d},{d}){d}x{d} discard={d} colors={d} write=0x{x} blend={d} extras={d} topo={d} cull={d} front={d} depth={d} dfunc={d} bsrc={d}/{d} bdst={d}/{d} sten={d} sfunc={d}\n",
             .{
                 @as(f32, @bitCast(pipeline_state.viewport_x_bits)),
                 @as(f32, @bitCast(pipeline_state.viewport_y_bits)),
@@ -19679,6 +19681,8 @@ pub const Renderer = struct {
                 pipeline_state.source_alpha_blend_factors[0],
                 pipeline_state.destination_color_blend_factors[0],
                 pipeline_state.destination_alpha_blend_factors[0],
+                pipeline_state.stencil_test_enable,
+                pipeline_state.stencil_front_compare,
             },
         );
         if (report_checkpoints) {
@@ -25068,6 +25072,23 @@ pub const Renderer = struct {
         vertex_stage: gpu.resources.ShaderStage,
         target_override: ?gpu.resources.ColorTarget,
     ) anyerror!void {
+        // Per-draw audit: program pair plus submitted counts, sampled flips.
+        // Capped first-occurrence logs hide whether a scene pass ever runs.
+        if (self.draw_audit_flip != self.flip_callbacks) {
+            self.draw_audit_flip = self.flip_callbacks;
+            self.draw_audit_count = 0;
+        }
+        if (self.flip_callbacks % 5 == 1 and self.draw_audit_count < 20) {
+            self.draw_audit_count += 1;
+            std.debug.print("[vulkan dcb] draw audit flip={d} vs=0x{x} ps=0x{x} verts={d} idx={?d} inst={d}\n", .{
+                self.flip_callbacks,
+                vertex_stage.programAddress(state) orelse 0,
+                gpu.resources.ShaderStage.pixel.programAddress(state) orelse 0,
+                guest_draw.vertex_count,
+                guest_draw.index_count,
+                guest_draw.instance_count,
+            });
+        }
         if (guest_draw.index_count) |count|
             try self.flushGuestIndexRange(guest_draw.index_address, @as(usize, count) * @as(usize, if (guest_draw.index_uint32) 4 else 2));
         const tessellation = try self.prepareTessellation(state, guest_draw);
