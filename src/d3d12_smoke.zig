@@ -472,6 +472,8 @@ fn guestGraphicsProbe(allocator: std.mem.Allocator, device: *d3d12.Device) !void
     try guestFanProbe(allocator);
     try guestRectangleProbe(allocator);
     try guestStencilProbe(device, vertex.words, fragment.words);
+    try guestDepthOnlyProbe(allocator, device, vertex.words, fragment.words);
+    try guestCheckedLoopsProbe(allocator, device, vertex.words, fragment.words);
     try guestStencilCommandProbe(allocator, &vertex_words, &pixel_words);
     var resource_reference: [5][0x3000]u8 = undefined;
     for ([_]usize{ 0, 128 * 1024 * 1024, 32 }) |limit|
@@ -484,6 +486,188 @@ fn guestGraphicsProbe(allocator: std.mem.Allocator, device: *d3d12.Device) !void
     try guestUploadPressureProbe(device, vertex.words, fragment.words);
     try guestAttachmentProbe(allocator, device, vertex.words, fragment.words);
     try guestBatchProbe(device, vertex.words, fragment.words);
+}
+
+fn guestDepthOnlyProbe(allocator: std.mem.Allocator, device: *d3d12.Device, vertex: []const u32, fragment: []const u32) !void {
+    const count = 65 * 37;
+    var null_program = try rdna2.decodeProgram(allocator, &.{ 0xf8001890, 0, 0xbf810000 });
+    defer null_program.deinit(allocator);
+    var null_fragment = try rdna2.translateProgramSpirv(allocator, &null_program, .{ .stage = .fragment });
+    defer null_fragment.deinit(allocator);
+    var kill_program = try rdna2.decodeProgram(allocator, &.{ 0xbefe0480, 0xf8001890, 0, 0xbf810000 });
+    defer kill_program.deinit(allocator);
+    var kill_fragment = try rdna2.translateProgramSpirv(allocator, &kill_program, .{ .stage = .fragment });
+    defer kill_fragment.deinit(allocator);
+    for (0..3) |mode| {
+        const format: u32 = if (mode == 0) 55 else 40;
+        const size = try d3d12.depthSize(65, 37, format);
+        var depth: [count * 4]u8 = @splat(0xff);
+        if (format == 40) for (0..count) |i| std.mem.writeInt(u32, depth[i * 4 ..][0..4], @bitCast(@as(f32, 1)), .little);
+        var stencil: [count]u8 = @splat(0x27);
+        var color: [count * 4]u8 = @splat(0xa7);
+        const initial_depth = depth;
+        const initial_stencil = stencil;
+        var draw = try d3d12.Draw.fullTarget(65, 37);
+        draw.write_mask = 0;
+        draw.depth_format = format;
+        draw.depth_write = 1;
+        draw.depth_compare = 2;
+        draw.scissor = .{ 7, 3, 51, 32 };
+        if (mode == 2) {
+            draw.stencil_pixels = &stencil;
+            draw.stencil_bytes = stencil.len;
+            draw.stencil = .{ .enabled = 1, .write_mask = 0x6a, .reference = 0x53, .front = .{ 1, 1, 3, 8 }, .back = .{ 1, 1, 3, 8 } };
+        }
+        try device.drawDepthResourcesSpirv(vertex, fragment, draw, &.{}, &.{}, &.{}, &color, depth[0..size]);
+        const expected_depth = depth;
+        const expected_stencil = stencil;
+        if (std.mem.eql(u8, &initial_depth, &depth)) return error.DepthOnlyReferenceDidNotWrite;
+        depth = initial_depth;
+        stencil = initial_stencil;
+        draw.color_attachment = 0;
+        try device.drawDepthResourcesSpirv(vertex, null_fragment.words, draw, &.{}, &.{}, &.{}, &.{}, depth[0..size]);
+        if (!std.mem.eql(u8, &depth, &expected_depth) or !std.mem.eql(u8, &stencil, &expected_stencil)) return error.DepthOnlyOutputMismatch;
+        depth = initial_depth;
+        stencil = initial_stencil;
+        // The fragment stage must still run: killed samples cannot write depth/stencil.
+        try device.drawDepthResourcesSpirv(vertex, kill_fragment.words, draw, &.{}, &.{}, &.{}, &.{}, depth[0..size]);
+        if (!std.mem.eql(u8, &depth, &initial_depth) or !std.mem.eql(u8, &stencil, &initial_stencil)) return error.DepthOnlyDiscardIgnored;
+        var jobs: [3]d3d12.DrawJob = @splat(.{ .vertex = vertex, .fragment = null_fragment.words, .draw = draw });
+        jobs[1].fragment = kill_fragment.words;
+        jobs[2].draw.depth_compare = 8;
+        jobs[2].draw.scissor[0] += 9;
+        for (jobs) |job| try device.drawDepthResourcesSpirv(vertex, job.fragment, job.draw, &.{}, &.{}, &.{}, &.{}, depth[0..size]);
+        const batched_depth = depth;
+        const batched_stencil = stencil;
+        depth = initial_depth;
+        stencil = initial_stencil;
+        try device.drawBatchSpirv(&jobs, &.{}, depth[0..size]);
+        if (!std.mem.eql(u8, &depth, &batched_depth) or !std.mem.eql(u8, &stencil, &batched_stencil)) return error.DepthOnlyBatchMismatch;
+        jobs[1].draw.color_attachment = 1;
+        try std.testing.expectError(error.InvalidArgument, device.drawBatchSpirv(&jobs, &.{}, depth[0..size]));
+        // Revisit the color PSO after the depth-only PSO, exercising cache separation.
+        draw.color_attachment = 1;
+        depth = initial_depth;
+        stencil = initial_stencil;
+        try device.drawDepthResourcesSpirv(vertex, fragment, draw, &.{}, &.{}, &.{}, &color, depth[0..size]);
+        if (!std.mem.eql(u8, &depth, &expected_depth) or !std.mem.eql(u8, &stencil, &expected_stencil) or
+            !std.mem.allEqual(u8, &color, 0xa7)) return error.DepthOnlyPipelineCacheMismatch;
+    }
+    std.debug.print("PASS depth-only D16/D32/DSV: full reference planes, null exports, fragment discard, scissor, ordered batches and color/depth PSO separation\n", .{});
+}
+
+fn guestCheckedLoopsProbe(allocator: std.mem.Allocator, device: *d3d12.Device, vertex: []const u32, plain_fragment: []const u32) !void {
+    const op = struct {
+        fn s(reg: u8) rdna2.Operand {
+            return .{ .kind = .sgpr, .reg = reg };
+        }
+        fn v(reg: u8) rdna2.Operand {
+            return .{ .kind = .vgpr, .reg = reg };
+        }
+        fn u(value: u32) rdna2.Operand {
+            return .{ .kind = .integer_inline_constant, .value = value };
+        }
+        fn f(value: f32) rdna2.Operand {
+            return .{ .kind = .literal_constant, .value = @bitCast(value) };
+        }
+    };
+    var program = rdna2.Program{ .code = &.{}, .instructions = .empty };
+    defer program.deinit(allocator);
+    try program.instructions.appendSlice(allocator, &.{
+        .{ .opcode = .s_mov_b32, .dst = op.s(1), .src0 = op.u(0) },
+        .{ .opcode = .v_mov_b32, .dst = op.v(0), .src0 = op.f(0) },
+        .{ .opcode = .v_mov_b32, .dst = op.v(1), .src0 = op.f(0.25) },
+        .{ .opcode = .s_cmp_eq_u32, .src0 = op.s(0), .src1 = op.u(0) },
+        .{ .opcode = .s_cbranch_scc1, .branch_target = 13 * 8 },
+        .{ .opcode = .s_cmp_ge_u32, .src0 = op.s(1), .src1 = op.s(0) },
+        .{ .opcode = .s_cbranch_scc1, .branch_target = 13 * 8 },
+        .{ .opcode = .v_add_f32, .dst = op.v(0), .src0 = op.v(0), .src1 = op.f(1.0 / 1024.0) },
+        .{ .opcode = .s_add_u32, .dst = op.s(1), .src0 = op.s(1), .src1 = op.u(1) },
+        .{ .opcode = .s_cmp_eq_u32, .src0 = op.s(1), .src1 = op.u(2) },
+        .{ .opcode = .s_cbranch_scc1, .branch_target = 12 * 8 },
+        .{ .opcode = .v_mov_b32, .dst = op.v(2), .src0 = op.f(0) },
+        .{ .opcode = .s_branch, .branch_target = 5 * 8 },
+        .{ .opcode = .exp, .src0 = op.v(0), .src1 = op.v(1), .src2 = op.v(1), .src3 = op.v(1), .export_enable = 15, .export_done = true },
+        .{ .opcode = .s_endpgm },
+    });
+    for (program.instructions.items, 0..) |*inst, i| {
+        inst.pc = @intCast(i * 8);
+        inst.word_count = 2;
+    }
+    const scalars = [_]rdna2.spirv.ScalarRegister{.{ .register = 0, .value = 0 }};
+    const options = rdna2.spirv.Options{ .stage = .fragment, .allow_control_flow_fallback = false, .graphics_dispatcher_status = true, .maximum_dispatcher_iterations = 16384, .scalar_registers = &scalars, .dynamic_scalar_binding = .{ .binding = 10 } };
+    var fragment = try rdna2.translateSpirv(allocator, &program, options);
+    defer fragment.deinit(allocator);
+    if (!fragment.used_dispatcher or fragment.used_control_flow_fallback) return error.CheckedDispatcherNotExercised;
+    var exhausted_options = options;
+    exhausted_options.maximum_dispatcher_iterations = 2;
+    var exhausted = try rdna2.translateSpirv(allocator, &program, exhausted_options);
+    defer exhausted.deinit(allocator);
+    var draw = try d3d12.Draw.fullTarget(65, 37);
+    draw.dynamic_scalars = 1;
+    draw.check_dispatcher = 1;
+    var pixels: [65 * 37 * 4]u8 = undefined;
+    var reference: @TypeOf(pixels) = undefined;
+    for ([_]u32{ 0, 1, 64, 129, 511, 900 }) |count| {
+        var literal = rdna2.Program{ .code = &.{}, .instructions = .empty };
+        defer literal.deinit(allocator);
+        try literal.instructions.appendSlice(allocator, &.{
+            .{ .opcode = .v_mov_b32, .dst = op.v(0), .src0 = op.f(@as(f32, @floatFromInt(count)) / 1024) },
+            .{ .opcode = .v_mov_b32, .dst = op.v(1), .src0 = op.f(0.25) },
+            program.instructions.items[13],
+            program.instructions.items[14],
+        });
+        for (literal.instructions.items, 0..) |*inst, i| {
+            inst.pc = @intCast(i * 8);
+            inst.word_count = 2;
+        }
+        var expected = try rdna2.translateSpirv(allocator, &literal, .{ .stage = .fragment });
+        defer expected.deinit(allocator);
+        @memset(&pixels, 0xa7);
+        @memset(&reference, 0xa7);
+        var ordinary = draw;
+        ordinary.check_dispatcher = 0;
+        try device.drawSpirv(vertex, expected.words, ordinary, &reference);
+        draw.scalar_values[0] = count;
+        try device.drawSpirv(vertex, fragment.words, draw, &pixels);
+        if (!std.mem.eql(u8, &pixels, &reference)) return error.CheckedLoopRasterMismatch;
+    }
+    // A later failed draw must also withhold an earlier draw's attachment writes.
+    var depth: [65 * 37 * 4]u8 = @splat(0x41);
+    var stencil: [65 * 37]u8 = @splat(0x72);
+    const before_depth = depth;
+    const before_stencil = stencil;
+    draw.depth_format = 40;
+    draw.depth_write = 1;
+    draw.depth_compare = 8;
+    draw.stencil_pixels = &stencil;
+    draw.stencil_bytes = stencil.len;
+    draw.stencil = .{ .enabled = 1, .write_mask = 255, .reference = 0x38, .front = .{ 1, 1, 3, 8 }, .back = .{ 1, 1, 3, 8 } };
+    var ordinary = draw;
+    ordinary.check_dispatcher = 0;
+    var jobs = [_]d3d12.DrawJob{
+        .{ .vertex = vertex, .fragment = plain_fragment, .draw = ordinary },
+        .{ .vertex = vertex, .fragment = exhausted.words, .draw = draw },
+    };
+    @memset(&pixels, 0xa7);
+    try std.testing.expectError(error.ShaderLoopBudgetExceeded, device.drawBatchSpirv(&jobs, &pixels, &depth));
+    if (!std.mem.allEqual(u8, &pixels, 0xa7) or !std.mem.eql(u8, &depth, &before_depth) or !std.mem.eql(u8, &stencil, &before_stencil)) return error.ExhaustedLoopPublishedAttachments;
+    jobs[1].fragment = fragment.words;
+    try device.drawBatchSpirv(&jobs, &pixels, &depth);
+    if (std.mem.allEqual(u8, &pixels, 0xa7) or std.mem.eql(u8, &stencil, &before_stencil)) return error.CheckedLoopRecoveryFailed;
+    for (&jobs) |*job| {
+        job.draw.color_attachment = 0;
+        job.draw.write_mask = 0;
+    }
+    depth = before_depth;
+    stencil = before_stencil;
+    jobs[1].fragment = exhausted.words;
+    try std.testing.expectError(error.ShaderLoopBudgetExceeded, device.drawBatchSpirv(&jobs, &.{}, &depth));
+    if (!std.mem.eql(u8, &depth, &before_depth) or !std.mem.eql(u8, &stencil, &before_stencil)) return error.ExhaustedDepthOnlyLoopPublishedAttachments;
+    jobs[1].fragment = fragment.words;
+    try device.drawBatchSpirv(&jobs, &.{}, &depth);
+    if (std.mem.eql(u8, &depth, &before_depth) or std.mem.eql(u8, &stencil, &before_stencil)) return error.CheckedDepthOnlyLoopRecoveryFailed;
+    std.debug.print("PASS checked fragment loops: 0..900 iterations, complete reference images, exhaustion withholds all batched color/depth/stencil writes, later submission resets status\n", .{});
 }
 
 fn guestStencilProbe(device: *d3d12.Device, vertex: []const u32, fragment: []const u32) !void {
@@ -656,7 +840,7 @@ fn guestStencilCommandProbe(allocator: std.mem.Allocator, vertex: []const u32, f
     // A system interrupt must never be classified as harmless vertex work.
     std.mem.writeInt(u32, memory.data[0x200..][0..4], 0xbf900001, .little);
     const packet: gpu.pm4.Packet = .{ .kind = .command, .header = command(gpu.pm4.draw_index_auto, 2), .opcode = gpu.pm4.draw_index_auto, .body = &.{ 3, 2 } };
-    if (renderer.draw(&state, packet)) |_| return error.VertexSystemMessageIgnored else |err| if (err != error.MissingColorTarget) return err;
+    if (renderer.draw(&state, packet)) |_| return error.VertexSystemMessageIgnored else |err| if (err != error.MissingAttachment) return err;
     std.debug.print("PASS PM4 stencil clear/increment, HTILE persistence, PS-less compression-disable materialization of both planes, system-message rejection\n", .{});
 }
 
@@ -1455,6 +1639,21 @@ fn guestDepthProbe(allocator: std.mem.Allocator, vertex: []const u32, fragment: 
                         break;
                     };
                     return error.DepthWritebackOrPaddingMismatch;
+                }
+                if (incoming == 0.25 and stored == 1 and compare == 1 and write_mode == 1) {
+                    // Disable the real guest color descriptor, preserving the
+                    // same depth rasterization and all tiled/row padding.
+                    @memset(backing, 0x5d);
+                    for (0..37) |y| for (0..65) |x| {
+                        const offset: usize = @intCast(try layout.sourceByteOffset(@intCast(x), @intCast(y), 0));
+                        if (bpp == 2) std.mem.writeInt(u16, backing[offset..][0..2], 65535, .little) else std.mem.writeInt(u32, backing[offset..][0..4], @bitCast(@as(f32, 1)), .little);
+                    };
+                    @memset(color, 0xa7);
+                    try state.writeRegister(.context, 0x31c, 0);
+                    if (gpu.resources.decodeRenderState(&state).color_count != 0) return error.DepthOnlyGuestProbeHasColor;
+                    _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 2 });
+                    if (!std.mem.eql(u8, backing, expected) or !std.mem.allEqual(u8, color, 0xa7)) return error.GuestDepthOnlyWritebackMismatch;
+                    try state.writeRegister(.context, 0x31c, 10 << 2);
                 }
                 cases += 1;
             };

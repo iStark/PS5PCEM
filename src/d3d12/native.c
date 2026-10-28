@@ -23,6 +23,7 @@
 
 /* rdna2.spirv.gds_descriptor_binding; backend.zig asserts the same value. */
 #define PS5_GDS_BINDING 38u
+#define PS5_SHADER_LOOP_BUDGET_EXCEEDED ((HRESULT)0x80040201u)
 
 extern int ps5_d3d12_equal_bytes(const uint8_t *a, const uint8_t *b, size_t size);
 
@@ -69,7 +70,7 @@ typedef struct ShaderEntry {
 /* Fixed-size words, not a native descriptor with pointers/padding. All other
  * PSO state is fixed by graphics_desc; dynamic constants/resources are rebound
  * on every draw and are deliberately absent from this key. */
-typedef struct PipelineKey { uint64_t words[34]; } PipelineKey;
+typedef struct PipelineKey { uint64_t words[36]; } PipelineKey;
 typedef struct PipelineEntry {
     PipelineKey key;
     uint64_t used;
@@ -846,7 +847,7 @@ static HRESULT compile_spirv_uncached(Ps5D3D12 *c, const uint32_t *words, size_t
         const uint32_t expected_count = storage ? buffer_count : sampled ? image_count : 0;
         // For compute, `scalars` instead selects the persistent GDS block,
         // bound as one UAV immediately after the guest storage array.
-        if ((!storage && !sampled) || count > (storage && scalars ? 2u : 1u)) {
+        if ((!storage && !sampled) || count > (storage ? 1u + (scalars != 0) + (stage == SpvExecutionModelFragment) : 1u)) {
             snprintf(c->error, sizeof(c->error), "D3D12 shader resource kind %u/count %zu is not supported by this pipeline", kind, count);
             goto done;
         }
@@ -856,7 +857,8 @@ static HRESULT compile_spirv_uncached(Ps5D3D12 *c, const uint32_t *words, size_t
             spvc_type type = spvc_compiler_get_type_handle(compiler, list[resource].type_id);
             const int scalar = storage && scalars && binding == 10 && stage != SpvExecutionModelGLCompute;
             const int global = storage && scalars && binding == PS5_GDS_BINDING && stage == SpvExecutionModelGLCompute;
-            if (set != 0 || (scalar || global ? spvc_type_get_num_array_dimensions(type) != 0 :
+            const int status = storage && stage == SpvExecutionModelFragment && set == 1 && binding == 0;
+            if ((!status && set != 0) || (scalar || global || status ? spvc_type_get_num_array_dimensions(type) != 0 :
                 (!expected_count || binding != (storage ? 0u : 1u) || spvc_type_get_num_array_dimensions(type) != 1 ||
                 !spvc_type_array_dimension_is_literal(type, 0) || spvc_type_get_array_dimension(type, 0) != expected_count))) {
                 snprintf(c->error, sizeof(c->error), "D3D12 descriptor array mismatch: kind %u, binding %u, expected %u elements", kind, binding, expected_count);
@@ -875,11 +877,12 @@ static HRESULT compile_spirv_uncached(Ps5D3D12 *c, const uint32_t *words, size_t
             // Graphics capture rejects writes before translation. Expose those
             // snapshots as read-only raw SRVs, including in the vertex stage.
             // Compute retains writable UAVs and its existing writeback path.
-            if (storage && stage != SpvExecutionModelGLCompute)
+            if (storage && !status && stage != SpvExecutionModelGLCompute)
                 spvc_compiler_set_decoration(compiler, list[resource].id, SpvDecorationNonWritable, 0);
             if (sampled) remap.srv.register_binding = buffer_count;
             if (scalar) remap.srv.register_space = 1;
             if (global) remap.uav.register_binding = buffer_count;
+            if (status) remap.uav.register_space = 2;
             CROSS(spvc_compiler_hlsl_add_resource_binding(compiler, &remap));
         }
     }
@@ -961,12 +964,12 @@ static HRESULT storage_root(Ps5D3D12 *c, uint32_t count, ID3D12RootSignature **r
     return hr;
 }
 
-static HRESULT guest_graphics_root(Ps5D3D12 *c, uint32_t buffers, uint32_t images, uint32_t scalars, ID3D12RootSignature **root) {
+static HRESULT guest_graphics_root(Ps5D3D12 *c, uint32_t buffers, uint32_t images, uint32_t scalars, uint32_t status, ID3D12RootSignature **root) {
     // VertexInfo occupies b0. Guest snapshots start at t0, followed by
     // sampled images; samplers start at s0. Both stages share these indices.
     // D3D's SV_VertexID/InstanceID exclude the draw's base values; Vulkan's
     // VertexIndex/InstanceIndex (used by the shared translator) include them.
-    D3D12_ROOT_PARAMETER parameters[5] = {0};
+    D3D12_ROOT_PARAMETER parameters[6] = {0};
     D3D12_DESCRIPTOR_RANGE ranges[3] = {0};
     parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     parameters[0].Constants.Num32BitValues = 2;
@@ -985,6 +988,12 @@ static HRESULT guest_graphics_root(Ps5D3D12 *c, uint32_t buffers, uint32_t image
     if (scalars) {
         parameters[parameter_count].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
         parameters[parameter_count].Descriptor.RegisterSpace = 1;
+        ++parameter_count;
+    }
+    if (status) {
+        parameters[parameter_count].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+        parameters[parameter_count].Descriptor.RegisterSpace = 2;
+        parameters[parameter_count].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
         ++parameter_count;
     }
     D3D12_ROOT_SIGNATURE_DESC desc = {0};
@@ -1454,6 +1463,8 @@ struct DrawBatch {
     UINT64 stencil_copy_bytes;
     uint8_t *stencil_pixels;
     int stencil_write, needs_stencil_readback, has_stencil;
+    int needs_status;
+    ID3D12Resource *status, *status_upload, *status_readback;
 };
 
 /* Each draw owns a disjoint descriptor range until batch completion. The
@@ -1538,16 +1549,21 @@ static void cleanup_batch(Ps5D3D12 *c, DrawBatch *batch, int complete) {
     return_resource(c, batch->color, complete); return_resource(c, batch->upload, complete); return_resource(c, batch->readback, complete);
     return_resource(c, batch->depth, complete); return_resource(c, batch->depth_upload, complete); return_resource(c, batch->depth_readback, complete);
     return_resource(c, batch->stencil_upload, complete); return_resource(c, batch->stencil_readback, complete);
+    return_resource(c, batch->status, complete); return_resource(c, batch->status_upload, complete); return_resource(c, batch->status_readback, complete);
 }
 
 static HRESULT finish_batch(Ps5D3D12 *c, DrawBatch *b, uint8_t *rgba, uint8_t *depth_pixels) {
     HRESULT hr;
     D3D12_TEXTURE_COPY_LOCATION source = {0}, destination = {0};
-    transition(c, b->color, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
-    source.pResource = b->color; source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-    destination.pResource = b->readback; destination.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; destination.PlacedFootprint = b->footprint;
-    ID3D12GraphicsCommandList_CopyTextureRegion(c->commands, &destination, 0, 0, 0, &source, NULL);
-    transition(c, b->color, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+    source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    destination.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    if (b->color) {
+        transition(c, b->color, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        source.pResource = b->color;
+        destination.pResource = b->readback; destination.PlacedFootprint = b->footprint;
+        ID3D12GraphicsCommandList_CopyTextureRegion(c->commands, &destination, 0, 0, 0, &source, NULL);
+        transition(c, b->color, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+    }
     if (b->depth) {
         if (b->depth_write || b->stencil_write) {
             transition(c, b->depth, b->depth_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -1564,29 +1580,44 @@ static HRESULT finish_batch(Ps5D3D12 *c, DrawBatch *b, uint8_t *rgba, uint8_t *d
         }
         transition(c, b->depth, (b->depth_write || b->stencil_write) ? D3D12_RESOURCE_STATE_COPY_SOURCE : b->depth_state, D3D12_RESOURCE_STATE_COPY_DEST);
     }
+    if (b->status) {
+        transition(c, b->status, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        ID3D12GraphicsCommandList_CopyBufferRegion(c->commands, b->status_readback, 0, b->status, 0, 4);
+    }
     b->recording = 0;
     TRY(submit(c));
-    void *mapped, *depth_mapped = NULL, *stencil_mapped = NULL;
+    void *mapped = NULL, *depth_mapped = NULL, *stencil_mapped = NULL;
     D3D12_RANGE entire = {0, (SIZE_T)b->bytes}, empty = {0, 0};
+    /* Check completion before publishing ANY color/depth/stencil pixels,
+       including earlier draws in this group. An exhausted shader is an error,
+       never a partially rendered success. Default buffers decay to COMMON. */
+    if (b->status) {
+        D3D12_RANGE range = {0, 4};
+        uint32_t *status;
+        TRY(ID3D12Resource_Map(b->status_readback, 0, &range, (void **)&status));
+        const uint32_t exhausted = *status;
+        ID3D12Resource_Unmap(b->status_readback, 0, &empty);
+        if (exhausted) return failure(c, PS5_SHADER_LOOP_BUDGET_EXCEEDED, "fragment loop budget exhausted; attachment writes rejected");
+    }
     /* Map both outputs before modifying caller storage. A second Map failure
      * must not expose a partly completed group to the guest. */
-    TRY(ID3D12Resource_Map(b->readback, 0, &entire, &mapped));
+    if (b->readback) TRY(ID3D12Resource_Map(b->readback, 0, &entire, &mapped));
     if (b->depth_write) {
         D3D12_RANGE range = {0, (SIZE_T)b->depth_bytes};
         hr = ID3D12Resource_Map(b->depth_readback, 0, &range, &depth_mapped);
-        if (FAILED(hr)) { ID3D12Resource_Unmap(b->readback, 0, &empty); failure(c, hr, "batch depth readback Map"); goto done; }
+        if (FAILED(hr)) { if (mapped) ID3D12Resource_Unmap(b->readback, 0, &empty); failure(c, hr, "batch depth readback Map"); goto done; }
     }
     if (b->stencil_write) {
         D3D12_RANGE range = {0, (SIZE_T)b->stencil_copy_bytes};
         hr = ID3D12Resource_Map(b->stencil_readback, 0, &range, &stencil_mapped);
         if (FAILED(hr)) {
             if (depth_mapped) ID3D12Resource_Unmap(b->depth_readback, 0, &empty);
-            ID3D12Resource_Unmap(b->readback, 0, &empty);
+            if (mapped) ID3D12Resource_Unmap(b->readback, 0, &empty);
             failure(c, hr, "batch stencil readback Map"); goto done;
         }
     }
     for (UINT y = 0; y < b->height; ++y) {
-        memcpy(rgba + (size_t)y * b->width * 4,
+        if (mapped) memcpy(rgba + (size_t)y * b->width * 4,
             (uint8_t *)mapped + b->footprint.Offset + (size_t)y * b->footprint.Footprint.RowPitch, (size_t)b->width * 4);
         if (depth_mapped) {
             const uint8_t *row = (uint8_t *)depth_mapped + b->depth_footprint.Offset + (size_t)y * b->depth_footprint.Footprint.RowPitch;
@@ -1601,10 +1632,10 @@ static HRESULT finish_batch(Ps5D3D12 *c, DrawBatch *b, uint8_t *rgba, uint8_t *d
         if (stencil_mapped) memcpy(b->stencil_pixels + (size_t)y * b->width,
             (uint8_t *)stencil_mapped + b->stencil_footprint.Offset + (size_t)y * b->stencil_footprint.Footprint.RowPitch, b->width);
     }
-    ID3D12Resource_Unmap(b->readback, 0, &empty);
+    if (mapped) ID3D12Resource_Unmap(b->readback, 0, &empty);
     if (depth_mapped) ID3D12Resource_Unmap(b->depth_readback, 0, &empty);
     if (stencil_mapped) ID3D12Resource_Unmap(b->stencil_readback, 0, &empty);
-    remember_attachment(c, b->color, b->readback);
+    if (b->color) remember_attachment(c, b->color, b->readback);
     if (b->depth_write && !b->has_stencil) remember_attachment(c, b->depth, b->depth_readback);
 done:
     return hr;
@@ -1631,10 +1662,11 @@ static HRESULT record_draw(Ps5D3D12 *c, DrawBatch *batch, const uint32_t *vertex
     const uint32_t *fragment, size_t fragment_count, const Ps5D3D12Draw *d, const uint8_t *indices, size_t index_bytes,
     const Ps5D3D12Buffer *buffers, uint32_t buffer_count, const Ps5D3D12Image *images, uint32_t image_count, uint8_t *rgba,
     uint8_t *depth_pixels, size_t depth_bytes) {
-    if (!c || !vertex || !fragment || vertex_count < 5 || fragment_count < 5 || !d || !rgba ||
+    if (!c || !vertex || !fragment || vertex_count < 5 || fragment_count < 5 || !d || (d->color_attachment && !rgba) ||
         !d->width || !d->height || d->width > 16384 || d->height > 16384 || (!d->vertex_count && !d->index_count) || !d->instance_count ||
         (d->topology != D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST && d->topology != D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP) ||
-        d->cull_mode < D3D12_CULL_MODE_NONE || d->cull_mode > D3D12_CULL_MODE_BACK || d->write_mask > 15 || d->dynamic_scalars > 1) return E_INVALIDARG;
+        d->cull_mode < D3D12_CULL_MODE_NONE || d->cull_mode > D3D12_CULL_MODE_BACK || d->write_mask > 15 || d->dynamic_scalars > 1 || d->check_dispatcher > 1 ||
+        d->color_attachment > 1 || (!d->color_attachment && (!d->depth_format || d->write_mask || d->blend.enabled))) return E_INVALIDARG;
     const UINT depth_bpp = d->depth_format == DXGI_FORMAT_D16_UNORM ? 2 : 4;
     const int has_stencil = d->stencil_pixels != NULL;
     /* D3D12 has no D16+S8 format. D32+S8 preserves D16 storage during
@@ -1696,11 +1728,13 @@ static HRESULT record_draw(Ps5D3D12 *c, DrawBatch *batch, const uint32_t *vertex
         d->rectangle_completion, d->rectangle_mask, has_stencil, d->stencil.enabled,
         d->stencil.read_mask, d->stencil.write_mask,
         d->stencil.front[0], d->stencil.front[1], d->stencil.front[2], d->stencil.front[3],
-        d->stencil.back[0], d->stencil.back[1], d->stencil.back[2], d->stencil.back[3]}};
+        d->stencil.back[0], d->stencil.back[1], d->stencil.back[2], d->stencil.back[3], d->check_dispatcher, d->color_attachment}};
     if (!cached_pipeline(c, &key, &root, &pipeline)) {
         const ULONGLONG started = GetTickCount64();
-        TRY(guest_graphics_root(c, buffer_count, image_count, d->dynamic_scalars, &root));
+        TRY(guest_graphics_root(c, buffer_count, image_count, d->dynamic_scalars, d->check_dispatcher, &root));
         D3D12_GRAPHICS_PIPELINE_STATE_DESC pipeline_desc = graphics_desc(root, vs, ps, 0);
+        pipeline_desc.NumRenderTargets = d->color_attachment;
+        pipeline_desc.RTVFormats[0] = d->color_attachment ? DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_UNKNOWN;
         if (d->rectangle_completion) {
             TRY(rectangle_shader(c, d->rectangle_mask, &gs));
             pipeline_desc.GS.pShaderBytecode = ID3D10Blob_GetBufferPointer(gs);
@@ -1739,15 +1773,15 @@ static HRESULT record_draw(Ps5D3D12 *c, DrawBatch *batch, const uint32_t *vertex
     desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     desc.SampleDesc.Count = 1;
     desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
-    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint;
-    UINT64 bytes;
-    ID3D12Device_GetCopyableFootprints(c->device, &desc, 0, 1, 0, &footprint, NULL, NULL, &bytes);
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint = {0};
+    UINT64 bytes = 0;
+    if (d->color_attachment) ID3D12Device_GetCopyableFootprints(c->device, &desc, 0, 1, 0, &footprint, NULL, NULL, &bytes);
     int color_reused;
-    if (!batch->count) {
+    if (d->color_attachment && !batch->count) {
         TRY(acquire_attachment(c, &desc, &footprint, bytes, rgba, d->width * 4, &color, &readback, &color_reused));
         if (!color_reused) TRY(graphics_buffer(c, bytes, D3D12_HEAP_TYPE_UPLOAD, &upload));
         if (!readback) TRY(graphics_buffer(c, bytes, D3D12_HEAP_TYPE_READBACK, &readback));
-    } else {
+    } else if (d->color_attachment) {
         color = batch->color; readback = batch->readback;
         IUnknown_AddRef((IUnknown *)color); IUnknown_AddRef((IUnknown *)readback);
     }
@@ -1828,13 +1862,30 @@ static HRESULT record_draw(Ps5D3D12 *c, DrawBatch *batch, const uint32_t *vertex
         ID3D12Resource_Unmap(index_upload, 0, &written);
     }
     D3D12_CPU_DESCRIPTOR_HANDLE view = rtv(c, OFFSCREEN_RTV);
-    ID3D12Device_CreateRenderTargetView(c->device, color, NULL, view);
-    if (!batch->count) { TRY(begin(c)); batch->recording = 1; }
+    if (color) ID3D12Device_CreateRenderTargetView(c->device, color, NULL, view);
+    if (!batch->count) {
+        if (batch->needs_status) {
+            D3D12_RESOURCE_DESC status_desc = graphics_buffer_desc(4);
+            status_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+            TRY(acquire_resource(c, &status_desc, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, 0, &batch->status));
+            TRY(graphics_buffer(c, 4, D3D12_HEAP_TYPE_UPLOAD, &batch->status_upload));
+            TRY(graphics_buffer(c, 4, D3D12_HEAP_TYPE_READBACK, &batch->status_readback));
+            TRY(ID3D12Resource_Map(batch->status_upload, 0, &empty, &mapped));
+            memset(mapped, 0, 4);
+            D3D12_RANGE written = {0, 4};
+            ID3D12Resource_Unmap(batch->status_upload, 0, &written);
+        }
+        TRY(begin(c)); batch->recording = 1;
+        if (batch->status) {
+            ID3D12GraphicsCommandList_CopyBufferRegion(c->commands, batch->status, 0, batch->status_upload, 0, 4);
+            transition(c, batch->status, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        }
+    }
     D3D12_TEXTURE_COPY_LOCATION source = {0}, destination = {0};
     source.pResource = upload; source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; source.PlacedFootprint = footprint;
     destination.pResource = color; destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
     if (upload) ID3D12GraphicsCommandList_CopyTextureRegion(c->commands, &destination, 0, 0, 0, &source, NULL);
-    if (!batch->count) transition(c, color, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    if (color && !batch->count) transition(c, color, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_RENDER_TARGET);
     if (depth) {
         D3D12_TEXTURE_COPY_LOCATION depth_source = {0}, depth_destination = {0};
         depth_source.pResource = depth_upload; depth_source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; depth_source.PlacedFootprint = depth_footprint;
@@ -1857,9 +1908,11 @@ static HRESULT record_draw(Ps5D3D12 *c, DrawBatch *batch, const uint32_t *vertex
     bind_graphics_resources(c, &resources, buffers, buffer_count, image_count);
     if (scalar_upload) ID3D12GraphicsCommandList_SetGraphicsRootShaderResourceView(c->commands,
         1 + (buffer_count != 0) + 2 * (image_count != 0), ID3D12Resource_GetGPUVirtualAddress(scalar_upload));
+    if (d->check_dispatcher) ID3D12GraphicsCommandList_SetGraphicsRootUnorderedAccessView(c->commands,
+        1 + (buffer_count != 0) + 2 * (image_count != 0) + (d->dynamic_scalars != 0), ID3D12Resource_GetGPUVirtualAddress(batch->status));
     ID3D12GraphicsCommandList_OMSetBlendFactor(c->commands, blend->constants);
     ID3D12GraphicsCommandList_OMSetStencilRef(c->commands, d->stencil.reference);
-    ID3D12GraphicsCommandList_OMSetRenderTargets(c->commands, 1, &view, FALSE, depth ? &depth_view : NULL);
+    ID3D12GraphicsCommandList_OMSetRenderTargets(c->commands, d->color_attachment, color ? &view : NULL, FALSE, depth ? &depth_view : NULL);
     D3D12_VIEWPORT viewport = {d->viewport[0], d->viewport[1], d->viewport[2], d->viewport[3], d->viewport[4], d->viewport[5]};
     D3D12_RECT scissor = {d->scissor[0], d->scissor[1], d->scissor[2], d->scissor[3]};
     ID3D12GraphicsCommandList_RSSetViewports(c->commands, 1, &viewport);
@@ -1926,13 +1979,14 @@ int32_t ps5_d3d12_draw_batch(Ps5D3D12 *c, const Ps5D3D12DrawJob *jobs, uint32_t 
     const Ps5D3D12Draw *first = jobs[0].draw;
     for (UINT i = 0; i < count; ++i) {
         const Ps5D3D12Draw *d = jobs[i].draw;
-        if (!d || d->width != first->width || d->height != first->height || d->depth_format != first->depth_format ||
+        if (!d || d->width != first->width || d->height != first->height || d->depth_format != first->depth_format || d->color_attachment != first->color_attachment ||
             d->stencil_pixels != first->stencil_pixels || d->stencil_bytes != first->stencil_bytes) return E_INVALIDARG;
     }
     DrawBatch batch = {0};
     for (UINT i = 0; i < count; ++i) {
         batch.needs_depth_readback |= jobs[i].draw->depth_write || (jobs[i].draw->clear_flags & 1);
         batch.needs_stencil_readback |= (jobs[i].draw->stencil.enabled && jobs[i].draw->stencil.write_mask) || (jobs[i].draw->clear_flags & 2);
+        batch.needs_status |= jobs[i].draw->check_dispatcher;
     }
     HRESULT hr = S_OK;
     for (UINT i = 0; i < count; ++i) {

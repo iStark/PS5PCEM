@@ -52,10 +52,10 @@ const PreparedDraw = struct {
     }
 };
 const PendingDraws = struct {
-    color: surfaces.Staged,
+    color: ?surfaces.Staged,
     depth: ?surfaces.Staged,
     stencil: ?surfaces.Staged = null,
-    color_key: TargetKey,
+    color_key: ?TargetKey,
     depth_key: ?TargetKey,
     stencil_key: ?TargetKey = null,
     depth_descriptor: ?gpu.resources.DepthTarget = null,
@@ -68,7 +68,7 @@ const PendingDraws = struct {
     stencil_write: bool = false,
     fn deinit(self: *PendingDraws, allocator: std.mem.Allocator) void {
         for (self.draws[0..self.count]) |*draw| draw.deinit(allocator);
-        self.color.deinit();
+        if (self.color) |*color| color.deinit();
         if (self.depth) |*depth| depth.deinit();
         if (self.stencil) |*stencil| stencil.deinit();
         if (self.htile) |*htile| htile.deinit();
@@ -76,11 +76,13 @@ const PendingDraws = struct {
     fn overlaps(self: *const PendingDraws, address: u64, size: usize) bool {
         if (size == 0) return false;
         const end = address +| size;
-        if (address < self.color.address + self.color.backing.len and self.color.address < end) return true;
-        // The pending flush also rewrites the colour target's DCC keys.
-        if (self.color.dcc) |dcc| {
-            const keys = std.math.divCeil(usize, self.color.backing.len, surfaces.Dcc.block_bytes) catch unreachable;
-            if (address < dcc.address + keys and dcc.address < end) return true;
+        if (self.color) |color| {
+            if (address < color.address + color.backing.len and color.address < end) return true;
+            // The pending flush also rewrites the colour target's DCC keys.
+            if (color.dcc) |dcc| {
+                const keys = std.math.divCeil(usize, color.backing.len, surfaces.Dcc.block_bytes) catch unreachable;
+                if (address < dcc.address + keys and dcc.address < end) return true;
+            }
         }
         if (self.depth) |depth| if (address < depth.address + depth.backing.len and depth.address < end) return true;
         if (self.stencil) |stencil| if (address < stencil.address + stencil.backing.len and stencil.address < end) return true;
@@ -243,8 +245,8 @@ pub const Renderer = struct {
             job.draw.stencil_pixels = stencil.pixels.ptr;
             job.draw.stencil_bytes = stencil.pixels.len;
         };
-        try self.device.drawBatchSpirv(jobs[0..pending.count], pending.color.pixels, if (pending.depth) |depth| depth.pixels else &.{});
-        try pending.color.write(self.memory);
+        try self.device.drawBatchSpirv(jobs[0..pending.count], if (pending.color) |color| color.pixels else &.{}, if (pending.depth) |depth| depth.pixels else &.{});
+        if (pending.color) |*color| try color.write(self.memory);
         if (pending.depth_write or pending.htile != null) if (pending.depth) |*depth| try depth.write(self.memory);
         if (pending.stencil_write or pending.htile != null) if (pending.stencil) |*stencil| try stencil.write(self.memory);
         if (pending.htile) |*htile| try htile.publish(self.memory);
@@ -452,14 +454,18 @@ pub const Renderer = struct {
         const render = gpu.resources.decodeRenderState(state);
         if (render.color_count == 0 and try self.depthUtilityDraw(state, render, routing)) return;
         if ((state.readRegister(.context, 0) orelse 0) & ~@as(u32, 0x63) != 0) return error.DepthMetadataOperationNotImplemented;
-        const target = render.color_targets[0] orelse return error.MissingColorTarget;
-        if (render.color_count != 1) return error.MultipleTargetsNotImplemented;
+        if (render.color_count > 1 or (render.color_count == 1 and render.color_targets[0] == null)) return error.MultipleTargetsNotImplemented;
+        const target = render.color_targets[0];
+        const extent: [2]u32 = if (target) |color| .{ color.width, color.height } else if (render.depth_target) |depth| .{ depth.width, depth.height } else return error.MissingAttachment;
         if ((state.readRegister(.context, 0x200) orelse 0) & (1 << 3) != 0) return error.DepthBoundsNotImplemented;
-        const target_layout = try surfaces.colorLayout(target);
-        if (render.color_control.isMetadataOperation() or (state.readRegister(.context, 0x202) != null and !render.color_control.allowsAttachmentWrites(render.target_mask)) or render.color_control.logic_operation != 0xcc) return error.ColorMetadataAndLogicOpsNotImplemented;
+        const color_key: ?TargetKey = if (target) |color| .{ .address = color.address, .layout = try surfaces.colorLayout(color), .swap_red_blue = color.component_swap == 1 } else null;
+        const color_dcc = if (target) |color| surfaces.colorDcc(color) else null;
+        if (render.color_control.isMetadataOperation() or (target != null and
+            ((state.readRegister(.context, 0x202) != null and !render.color_control.allowsAttachmentWrites(render.target_mask)) or render.color_control.logic_operation != 0xcc))) return error.ColorMetadataAndLogicOpsNotImplemented;
         if (render.raster.rasterizer_discard or render.raster.polygon_mode != 0 or render.raster.depth_bias_front or render.raster.depth_bias_back or (render.raster.cull_front and render.raster.cull_back)) return error.UnsupportedRasterState;
         const topology = try graphics.nativeTopology(render.primitive_type);
-        var draw_state = try native.Draw.fullTarget(target.width, target.height);
+        var draw_state = try native.Draw.fullTarget(extent[0], extent[1]);
+        draw_state.color_attachment = @intFromBool(target != null);
         var depth_key: ?TargetKey = null;
         var stencil_key: ?TargetKey = null;
         draw_state.stencil = try graphics.stencilState(render);
@@ -470,10 +476,12 @@ pub const Renderer = struct {
         if (depth_active or draw_state.stencil.enabled != 0 or render.depth_control.clear_enabled or render.depth_control.stencil_clear_enabled) {
             const depth = render.depth_target orelse return error.MissingDepthTarget;
             const writable = (depth_active and render.depth_control.write_enabled or render.depth_control.clear_enabled) and !depth.depth_read_only;
-            const layout = try surfaces.depthLayout(depth, target.width, target.height, writable);
-            const color_end = try std.math.add(u64, target.address, target_layout.required_source_bytes);
+            const layout = try surfaces.depthLayout(depth, extent[0], extent[1], writable);
             const depth_end = try std.math.add(u64, depth.read_address, layout.required_source_bytes);
-            if (depth.read_address < color_end and target.address < depth_end) return error.DepthColorAliasNotImplemented;
+            if (color_key) |key| {
+                const color_end = try std.math.add(u64, key.address, key.layout.required_source_bytes);
+                if (depth.read_address < color_end and key.address < depth_end) return error.DepthColorAliasNotImplemented;
+            }
             draw_state.depth_format = if (depth.format == 1) 55 else 40;
             // The native clear supplies CLEAR_DEPTH. Replaying the utility
             // triangle's interpolated Z afterward must not overwrite it.
@@ -484,10 +492,13 @@ pub const Renderer = struct {
             if (draw_state.stencil.enabled != 0 or render.depth_control.stencil_clear_enabled or (depth.htile_enabled and !depth.tile_stencil_disabled)) {
                 if (depth.stencil_read_only) draw_state.stencil.write_mask = 0;
                 const stencil_writable = !depth.stencil_read_only and (draw_state.stencil.write_mask != 0 or render.depth_control.stencil_clear_enabled);
-                const stencil_layout = try surfaces.stencilLayout(depth, target.width, target.height, stencil_writable);
+                const stencil_layout = try surfaces.stencilLayout(depth, extent[0], extent[1], stencil_writable);
                 const stencil_end = try std.math.add(u64, depth.stencil_read_address, stencil_layout.required_source_bytes);
-                if ((depth.stencil_read_address < color_end and target.address < stencil_end) or
-                    (depth.stencil_read_address < depth_end and depth.read_address < stencil_end)) return error.StencilAttachmentAliasNotImplemented;
+                if (depth.stencil_read_address < depth_end and depth.read_address < stencil_end) return error.StencilAttachmentAliasNotImplemented;
+                if (color_key) |key| {
+                    const color_end = try std.math.add(u64, key.address, key.layout.required_source_bytes);
+                    if (depth.stencil_read_address < color_end and key.address < stencil_end) return error.StencilAttachmentAliasNotImplemented;
+                }
                 stencil_key = .{ .address = depth.stencil_read_address, .layout = stencil_layout };
                 if (render.depth_control.stencil_clear_enabled and !depth.stencil_read_only) draw_state.clear_flags |= 2;
                 draw_state.clear_stencil = depth.clear_stencil;
@@ -496,7 +507,8 @@ pub const Renderer = struct {
             }
             depth_key = .{ .address = depth.read_address, .layout = layout };
         }
-        draw_state.blend = try native.blending.decode(state, render.blends[0]);
+        if (target == null and depth_key == null) return error.MissingAttachment;
+        if (target != null) draw_state.blend = try native.blending.decode(state, render.blends[0]);
         draw_state.vertex_count = if (args.index_bytes == 0) args.count else 0;
         draw_state.instance_count = state.instance_count;
         draw_state.first_vertex = state.readRegister(.uconfig, 0x24a) orelse 0;
@@ -516,7 +528,7 @@ pub const Renderer = struct {
         if (render.primitive_type == 5 and indices.len == 0) return;
         draw_state.cull_mode = if (render.raster.cull_front) 2 else if (render.raster.cull_back) 3 else 1;
         draw_state.front_ccw = @intFromBool(!render.raster.clockwise_front_face);
-        draw_state.write_mask = target.write_mask & (render.shader_mask & 0xf);
+        draw_state.write_mask = if (target) |color| color.write_mask & (render.shader_mask & 0xf) else 0;
         var depth_transform: ?rdna2.spirv.VertexDepthTransform = null;
         if (render.viewport) |vp| {
             if (vp.x_scale <= 0 or vp.y_scale >= 0) return error.PositiveYOrMirroredViewportNotImplemented;
@@ -595,10 +607,11 @@ pub const Renderer = struct {
         const fragment = try self.translations.acquirePrepared(self.allocator, &ps.program, .{
             .stage = .fragment,
             .wave32 = routing.fragment_wave32,
-            .maximum_dispatcher_iterations = ps_dispatch_budget orelse 256,
+            .maximum_dispatcher_iterations = ps_dispatch_budget orelse 4096,
+            .graphics_dispatcher_status = ps_dispatch_budget == null,
             .scalarize_ballot_first = true,
             .program_address = ps_bindings.program_address,
-            .fragment_extent = .{ target.width, target.height },
+            .fragment_extent = extent,
             .scalar_registers = ps_scalar[0..ps_scalar_count],
             .dynamic_scalar_binding = .{ .binding = 10, .value_base = 65 },
             .allow_control_flow_fallback = false,
@@ -618,21 +631,24 @@ pub const Renderer = struct {
             },
         }, ps.pipeline_options, ps.translation_key);
         defer if (!queued) fragment.release();
-        if ((vertex.view().used_dispatcher and vs_dispatch_budget == null) or (fragment.view().used_dispatcher and ps_dispatch_budget == null)) {
+        draw_state.check_dispatcher = @intFromBool(fragment.view().used_dispatcher and ps_dispatch_budget == null);
+        if (vertex.view().used_dispatcher and vs_dispatch_budget == null) {
             std.debug.print("[d3d12 control flow] VS dispatcher={} blocks={d} back_edges={d}; PS dispatcher={} blocks={d} back_edges={d}\n", .{ vertex.view().used_dispatcher, vs.graph.blocks.items.len, vs.graph.back_edge_count, fragment.view().used_dispatcher, ps.graph.blocks.items.len, ps.graph.back_edge_count });
+            if (vertex.view().used_dispatcher and vs_dispatch_budget == null) reportControlFlow("vertex", vs);
+            if (fragment.view().used_dispatcher and ps_dispatch_budget == null) reportControlFlow("pixel", ps);
             return error.UnboundedControlFlowNotImplemented;
         }
-        const color_key = TargetKey{ .address = target.address, .layout = target_layout, .swap_red_blue = target.component_swap == 1 };
         const owned_bytes = draw_resources.total + indices.len + 4 * (vertex.view().words.len + fragment.view().words.len);
         if (self.pending_draws) |*pending| {
             const additional = pending.image_budget.additional(owned_bytes, draw_resources.images.items);
-            if (!std.meta.eql(pending.color_key, color_key) or !std.meta.eql(pending.color.dcc, surfaces.colorDcc(target)) or !std.meta.eql(pending.depth_key, depth_key) or !std.meta.eql(pending.stencil_key, stencil_key) or !std.meta.eql(pending.depth_descriptor, render.depth_target) or
+            if (!std.meta.eql(pending.color_key, color_key) or !std.meta.eql(if (pending.color) |color| color.dcc else null, color_dcc) or !std.meta.eql(pending.depth_key, depth_key) or !std.meta.eql(pending.stencil_key, stencil_key) or !std.meta.eql(pending.depth_descriptor, render.depth_target) or
                 pending.count >= @min(native.max_draw_batch, @max(1, self.draw_batch_limit)) or
                 pending.bytes + additional > draw_batch_bytes) try self.flushDraws();
         }
         if (self.pending_draws == null) {
-            var color = try surfaces.Staged.readColor(self.allocator, &self.staging_pool, &self.conversion_cache, self.memory, target.address, target_layout, surfaces.colorDcc(target), color_key.swap_red_blue);
-            errdefer color.deinit();
+            var color: ?surfaces.Staged = null;
+            if (color_key) |key| color = try surfaces.Staged.readColor(self.allocator, &self.staging_pool, &self.conversion_cache, self.memory, key.address, key.layout, color_dcc, key.swap_red_blue);
+            errdefer if (color) |*value| value.deinit();
             var depth: ?surfaces.Staged = null;
             if (depth_key) |key| depth = try surfaces.Staged.readCached(self.allocator, &self.staging_pool, &self.conversion_cache, self.memory, key.address, key.layout);
             errdefer if (depth) |*value| value.deinit();
@@ -926,6 +942,21 @@ const DrawArguments = struct {
 fn entryScalars(bindings: gpu.ShaderBindings, output: []rdna2.spirv.ScalarRegister) usize {
     for (bindings.user_data[0..bindings.user_data_count], 0..) |value, index| output[index] = .{ .register = @as(u32, @intCast(index)) + bindings.scalar_user_data_base, .value = value };
     return bindings.user_data_count;
+}
+
+/// Preserve the rejected control-flow program in the diagnostic log. A short
+/// prefix omits loop latches and makes a cyclic failure impossible to reproduce.
+fn reportControlFlow(stage: []const u8, analysis: *const gpu.ShaderAnalysis) void {
+    std.debug.print("[d3d12 rejected code] stage={s} words={d} irreducible={}\n", .{ stage, analysis.code.items.len, analysis.graph.irreducible });
+    for (analysis.code.items, 0..) |word, i| {
+        if (i % 16 == 0) std.debug.print("  code+0x{x}: ", .{i * 4});
+        std.debug.print("{x:0>8}{s}", .{ word, if (i % 16 == 15 or i + 1 == analysis.code.items.len) "\n" else " " });
+    }
+    for (analysis.graph.edges.items) |edge| if (edge.to <= edge.from) {
+        const from = analysis.graph.blocks.items[edge.from];
+        const to = analysis.graph.blocks.items[edge.to];
+        std.debug.print("[d3d12 loop] block={d}->{} pc=0x{x}->0x{x}\n", .{ edge.from, edge.to, from.end_pc, to.start_pc });
+    };
 }
 
 const Storage = struct {

@@ -420,6 +420,10 @@ pub const Options = struct {
     /// Report an exhausted dispatcher through the FLAT fault record, using
     /// PC=0xffffffff and address=(iteration << 32) | guest block index.
     report_dispatcher_exhaustion: bool = false,
+    /// Fragment-only host status UAV (set 1, binding 0). Atomically sets bit 0
+    /// if the dispatcher stops before END. The host must check it after the
+    /// fence and reject all attachment writes on exhaustion.
+    graphics_dispatcher_status: bool = false,
     /// Guest wave32 mode limits VALU scalar masks and EXEC lane indexing to
     /// the low word, independently of the host workgroup size.
     wave32: bool = false,
@@ -1190,6 +1194,8 @@ const Builder = struct {
     private_memory_words: u32 = 0,
     gds_memory: u32 = 0,
     gds_word_pointer_type: u32 = 0,
+    dispatcher_status: u32 = 0,
+    dispatcher_status_pointer_type: u32 = 0,
     /// GLSL.std.450 extended instruction set (PackHalf2x16, etc.). 0 = unused.
     glsl_std_450: u32 = 0,
     uses_image_query: bool = false,
@@ -1352,6 +1358,24 @@ const Builder = struct {
             try self.emit(&self.declarations, 32, &.{ storage_pointer, 12, storage_block }); // ptr StorageBuffer
             try self.emit(&self.declarations, 32, &.{ self.scalar_word_pointer_type, 12, self.bits_type });
             try self.emit(&self.declarations, 59, &.{ storage_pointer, self.scalar_buffer, 12 }); // OpVariable
+        }
+        if (options.graphics_dispatcher_status) {
+            if (options.stage != .fragment) return Error.InvalidStageInterface;
+            const words = self.id();
+            const block = self.id();
+            const pointer = self.id();
+            self.dispatcher_status_pointer_type = self.id();
+            self.dispatcher_status = self.id();
+            try self.emit(&self.annotations, 71, &.{ words, 6, 4 });
+            try self.emit(&self.annotations, 72, &.{ block, 0, 35, 0 });
+            try self.emit(&self.annotations, 71, &.{ block, 2 });
+            try self.emit(&self.annotations, 71, &.{ self.dispatcher_status, 34, 1 });
+            try self.emit(&self.annotations, 71, &.{ self.dispatcher_status, 33, 0 });
+            try self.emit(&self.declarations, 29, &.{ words, self.bits_type });
+            try self.emit(&self.declarations, 30, &.{ block, words });
+            try self.emit(&self.declarations, 32, &.{ pointer, 12, block });
+            try self.emit(&self.declarations, 32, &.{ self.dispatcher_status_pointer_type, 12, self.bits_type });
+            try self.emit(&self.declarations, 59, &.{ pointer, self.dispatcher_status, 12 });
         }
         if (options.gds_storage) {
             if (options.stage != .compute) return Error.InvalidStageInterface;
@@ -13166,6 +13190,22 @@ fn translateDispatcher(builder: *Builder, instructions: []const instruction.Inst
         try builder.emit(&builder.body, 171, &.{ builder.bool_type, unfinished, pc, try builder.constant(.bits32, dispatch_sentinel) });
         try builder.recordFlatFaultPredicate(.{ .pc = 0xffff_ffff }, .{ pc, iteration }, builder.maximum_dispatcher_iterations, unfinished);
     }
+    if (builder.dispatcher_status != 0) {
+        const unfinished = builder.id();
+        const failed = builder.id();
+        const complete = builder.id();
+        const zero = try builder.constant(.bits32, 0);
+        try builder.emit(&builder.body, 171, &.{ builder.bool_type, unfinished, pc, try builder.constant(.bits32, dispatch_sentinel) });
+        try builder.emit(&builder.body, 247, &.{ complete, 0 });
+        try builder.emit(&builder.body, 250, &.{ unfinished, failed, complete });
+        try builder.emit(&builder.body, 248, &.{failed});
+        const pointer = builder.id();
+        const previous = builder.id();
+        try builder.emit(&builder.body, 65, &.{ builder.dispatcher_status_pointer_type, pointer, builder.dispatcher_status, zero, zero });
+        try builder.emit(&builder.body, 241, &.{ builder.bits_type, previous, pointer, try builder.constant(.bits32, 1), zero, try builder.constant(.bits32, 1) }); // OpAtomicOr
+        try builder.emit(&builder.body, 249, &.{complete});
+        try builder.emit(&builder.body, 248, &.{complete});
+    }
     try builder.returnFromShader(); // OpReturn
     builder.used_dispatcher = true;
 }
@@ -13518,6 +13558,7 @@ fn assemble(allocator: std.mem.Allocator, builder: *Builder, options: Options) E
     if (builder.storage_array != 0) try entry_point.append(allocator, builder.storage_array);
     if (builder.scalar_buffer != 0) try entry_point.append(allocator, builder.scalar_buffer);
     if (builder.gds_memory != 0) try entry_point.append(allocator, builder.gds_memory);
+    if (builder.dispatcher_status != 0) try entry_point.append(allocator, builder.dispatcher_status);
     for (builder.sampled_image_arrays) |sampled_image_array| {
         if (sampled_image_array != 0) try entry_point.append(allocator, sampled_image_array);
     }
@@ -17974,6 +18015,21 @@ test "dispatcher reuses invariant state along arithmetic runs" {
             try std.testing.expectEqual(short_loads, loads);
         }
     }
+}
+
+test "fragment dispatcher status reports exhaustion without changing default translations" {
+    var program = try @import("decoder.zig").decodeProgram(std.testing.allocator, &.{ 0xbf80_0000, 0xbf82_fffe, 0xbf81_0000 });
+    defer program.deinit(std.testing.allocator);
+    for ([_]bool{ false, true }) |checked| {
+        var module = try translate(std.testing.allocator, &program, .{ .stage = .fragment, .graphics_dispatcher_status = checked });
+        defer module.deinit(std.testing.allocator);
+        try std.testing.expect(module.used_dispatcher);
+        try std.testing.expectEqual(checked, containsOpcode(module.words, 241)); // OpAtomicOr
+        try std.testing.expectEqual(checked, containsDecoration(module.words, 34, 1)); // DescriptorSet 1
+        try expectPhiParentsArePredecessors(module.words);
+    }
+    for ([_]Stage{ .vertex, .compute }) |stage|
+        try std.testing.expectError(Error.InvalidStageInterface, translate(std.testing.allocator, &program, .{ .stage = stage, .graphics_dispatcher_status = true }));
 }
 
 test "unstructured back edges lower through a dispatcher" {

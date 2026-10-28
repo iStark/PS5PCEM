@@ -88,6 +88,9 @@ pub const Draw = extern struct {
     scissor: [4]i32,
     // A separate read-only root SRV keeps per-draw SGPR values out of shaders.
     dynamic_scalars: u32 = 0,
+    check_dispatcher: u32 = 0,
+    // Zero binds only a DSV, without allocating a dummy color surface.
+    color_attachment: u32 = 1,
     scalar_values: [129]u32 = @splat(0),
 
     pub fn fullTarget(width: u32, height: u32) Error!Draw {
@@ -120,7 +123,7 @@ pub const DeviceInfo = extern struct {
     }
 };
 
-pub const Error = error{ UnsupportedPlatform, InvalidArgument, NativeFailure };
+pub const Error = error{ UnsupportedPlatform, InvalidArgument, NativeFailure, ShaderLoopBudgetExceeded };
 
 // Native readback proofs need equality, not lexicographic ordering. Keep the
 // exact comparison on Zig's vector/word path rather than the CRT's memcmp.
@@ -196,6 +199,7 @@ pub const Device = struct {
     fn check(self: *Device, hr: i32) Error!void {
         if (hr >= 0) return;
         std.log.err("[d3d12] {s} (0x{x})", .{ ps5_d3d12_error(self.handle), @as(u32, @bitCast(hr)) });
+        if (@as(u32, @bitCast(hr)) == 0x80040201) return error.ShaderLoopBudgetExceeded;
         return error.NativeFailure;
     }
 
@@ -315,7 +319,7 @@ pub const Device = struct {
         var native_jobs: [max_draw_batch]NativeDrawJob = undefined;
         for (jobs, native_jobs[0..jobs.len]) |*job, *out| {
             if (job.draw.width != jobs[0].draw.width or job.draw.height != jobs[0].draw.height or
-                job.draw.depth_format != jobs[0].draw.depth_format) return error.InvalidArgument;
+                job.draw.depth_format != jobs[0].draw.depth_format or job.draw.color_attachment != jobs[0].draw.color_attachment) return error.InvalidArgument;
             try validateDraw(job.vertex, job.fragment, job.draw, job.indices, job.buffers, job.images, rgba, depth);
             out.* = .{ .vertex = job.vertex.ptr, .vertex_count = job.vertex.len, .fragment = job.fragment.ptr, .fragment_count = job.fragment.len, .draw = &job.draw, .indices = job.indices.ptr, .index_bytes = job.indices.len, .buffers = job.buffers.ptr, .buffer_count = @intCast(job.buffers.len), .images = job.images.ptr, .image_count = @intCast(job.images.len) };
         }
@@ -324,7 +328,9 @@ pub const Device = struct {
     }
 
     fn validateDraw(vertex: []const u32, fragment: []const u32, draw: Draw, indices: []const u8, buffers: []const Buffer, images: []const SampledImage, rgba: []u8, depth: []u8) Error!void {
-        if (draw.dynamic_scalars > 1) return error.InvalidArgument;
+        if (draw.dynamic_scalars > 1 or draw.check_dispatcher > 1) return error.InvalidArgument;
+        if (draw.color_attachment > 1 or (draw.color_attachment == 0 and
+            (draw.depth_format == 0 or draw.write_mask != 0 or draw.blend.enabled != 0))) return error.InvalidArgument;
         if (depth.len != try depthSize(draw.width, draw.height, draw.depth_format) or draw.depth_write > 1 or draw.depth_clip_enabled > 1 or
             draw.depth_compare < 1 or draw.depth_compare > 8 or (draw.depth_format == 0 and draw.depth_write != 0)) return error.InvalidArgument;
         if (!draw.blend.valid()) return error.InvalidArgument;
@@ -343,7 +349,8 @@ pub const Device = struct {
                 @as(u64, draw.index_count) * draw.index_element_bytes != indices.len or indices.len > 64 * 1024 * 1024) return error.InvalidArgument;
         } else if (indices.len != 0 or draw.index_element_bytes != 0 or draw.primitive_restart != 0) return error.InvalidArgument;
         if (draw.primitive_restart > 1 or (draw.primitive_restart != 0 and draw.topology != 5)) return error.InvalidArgument;
-        if (rgba.len != try rgbaSize(draw.width, draw.height) or vertex.len < 5 or fragment.len < 5 or
+        const color_bytes = if (draw.color_attachment != 0) try rgbaSize(draw.width, draw.height) else 0;
+        if (rgba.len != color_bytes or vertex.len < 5 or fragment.len < 5 or
             vertex[0] != 0x07230203 or fragment[0] != 0x07230203 or (draw.vertex_count == 0 and draw.index_count == 0) or draw.instance_count == 0 or
             (draw.topology != 4 and draw.topology != 5) or draw.cull_mode < 1 or draw.cull_mode > 3 or draw.write_mask > 15) return error.InvalidArgument;
         for (draw.viewport) |value| if (!std.math.isFinite(value)) return error.InvalidArgument;

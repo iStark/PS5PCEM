@@ -76,6 +76,8 @@ typedef struct Ps5D3D12Draw {
     float viewport[6];
     int32_t scissor[4];
     uint32_t dynamic_scalars;
+    uint32_t check_dispatcher;
+    uint32_t color_attachment;
     uint32_t scalar_values[129]; /* VS 0..64, PS 65..128; binding 10. */
 } Ps5D3D12Draw;
 
