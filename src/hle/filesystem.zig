@@ -100,6 +100,13 @@ fn isDevlogFile(path: []const u8) bool {
     return std.ascii.eqlIgnoreCase(path, devlog_file);
 }
 
+/// Whether `path` names something inside the title's writable diagnostic tree.
+fn isDevlogTree(path: []const u8) bool {
+    if (path.len <= devlog_app.len) return false;
+    if (!std.ascii.eqlIgnoreCase(path[0..devlog_app.len], devlog_app)) return false;
+    return path[devlog_app.len] == '/';
+}
+
 /// Fills a buffer from the entropy device, and says how much it wrote.
 ///
 /// Genuinely unpredictable rather than a fixed sequence. A title seeds its own
@@ -1034,6 +1041,7 @@ pub fn open(path: []const u8, flags: i32) Error!i32 {
         return openDevlogDirectory(path);
     }
     if (isDevlogFile(path)) return openDevlog(path, flags);
+    if (isDevlogTree(path)) return openDevlogTree(path, flags);
 
     if (deviceForPath(path)) |device| {
         // A title asking to create `/dev/gc` has misunderstood something, and
@@ -1155,6 +1163,40 @@ fn openDevlogDirectory(path: []const u8) Error!i32 {
     table_lock.lock();
     defer table_lock.unlock();
     var entry = OpenFile{ .diagnostic_directory = true, .directory_index = 0 };
+    entry.path_length = @min(path.len, maximum_path);
+    @memcpy(entry.path_buffer[0..entry.path_length], path[0..entry.path_length]);
+    return insertFileLocked(entry);
+}
+
+/// `/devlog/app/<sub path>` is the title's diagnostic tree. Real hardware
+/// accepts these writes, and a title that cannot open its own log may stop a
+/// bring-up step that depends on it. Keep each name under `out/devlog`.
+fn openDevlogTree(path: []const u8, flags: i32) Error!i32 {
+    const io = active_io orelse return Error.NotAttached;
+    if (flags & O.accmode == O.rdonly) return Error.ReadOnly;
+    if (path.len <= devlog_app.len) return Error.InvalidArgument;
+    const relative = path[devlog_app.len + 1 ..];
+    if (relative.len == 0 or std.mem.indexOf(u8, relative, "..") != null) return Error.InvalidArgument;
+    var host_storage: [maximum_path]u8 = undefined;
+    const host = std.fmt.bufPrint(&host_storage, "out/devlog/{s}", .{relative}) catch return Error.InvalidArgument;
+    const cwd = std.Io.Dir.cwd();
+    if (std.fs.path.dirname(host)) |parent| cwd.createDirPath(io, parent) catch return Error.IoFailed;
+    const truncate = flags & O.trunc != 0;
+    const file = cwd.createFile(io, host, .{
+        .read = flags & O.accmode == O.rdwr,
+        .truncate = truncate,
+    }) catch return Error.IoFailed;
+    errdefer file.close(io);
+    const size = if (truncate) 0 else file.length(io) catch return Error.IoFailed;
+
+    table_lock.lock();
+    defer table_lock.unlock();
+    var entry = OpenFile{
+        .file = file,
+        .diagnostic_log = true,
+        .offset = if (flags & O.append != 0) size else 0,
+        .size = size,
+    };
     entry.path_length = @min(path.len, maximum_path);
     @memcpy(entry.path_buffer[0..entry.path_length], path[0..entry.path_length]);
     return insertFileLocked(entry);
@@ -2798,4 +2840,14 @@ test "nested paths resolve" {
     var buffer: [5]u8 = undefined;
     try testing.expectEqual(@as(usize, 5), try read(fd, &buffer));
     try testing.expectEqualStrings("inner", &buffer);
+}
+
+test "the whole devlog tree is writable, not just its known files" {
+    // The engine names its log after the run, so an exact-path allowlist
+    // refuses the write and the title loses its diagnostics.
+    try testing.expect(isDevlogTree("/devlog/app/logs/demonssoul_ps5_x_0.log"));
+    try testing.expect(isDevlogTree("/devlog/app/commandlineargs.txt"));
+    try testing.expect(!isDevlogTree("/devlog/app"));
+    try testing.expect(!isDevlogTree("/devlog/appx/file.log"));
+    try testing.expect(!isDevlogTree("/app0/logs/file.log"));
 }
