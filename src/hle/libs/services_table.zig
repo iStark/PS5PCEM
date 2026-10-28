@@ -355,13 +355,14 @@ pub const jpegdec_exports = [_]symbols.Export{
     .{ .name = "sceJpegDecDelete", .function = trace.wrap("sceJpegDecDelete", &services.accept), .expect_id = "Hwh11+m5KoI" },
 };
 
-/// Encoder twin of the decoder table above: lifecycle bookkeeping answers
-/// success, while producing bytes is refused rather than invented.
+/// Import coverage only: no encoder context or memory requirements are
+/// implemented yet. Report unavailability instead of successful creation
+/// with an uninitialized output handle.
 pub const jpegenc_exports = [_]symbols.Export{
-    .{ .name = "sceJpegEncQueryMemorySize", .function = trace.wrap("sceJpegEncQueryMemorySize", &services.accept), .expect_id = "o6ZgXfFdWXQ" },
-    .{ .name = "sceJpegEncCreate", .function = trace.wrap("sceJpegEncCreate", &services.accept), .expect_id = "K+rocojkr-I" },
+    .{ .name = "sceJpegEncQueryMemorySize", .function = trace.wrap("sceJpegEncQueryMemorySize", &services.absent), .expect_id = "o6ZgXfFdWXQ" },
+    .{ .name = "sceJpegEncCreate", .function = trace.wrap("sceJpegEncCreate", &services.absent), .expect_id = "K+rocojkr-I" },
     .{ .name = "sceJpegEncEncode", .function = trace.wrap("sceJpegEncEncode", &services.absent), .expect_id = "QbrU0cUghEM" },
-    .{ .name = "sceJpegEncDelete", .function = trace.wrap("sceJpegEncDelete", &services.accept), .expect_id = "j1LyMdaM+C0" },
+    .{ .name = "sceJpegEncDelete", .function = trace.wrap("sceJpegEncDelete", &services.absent), .expect_id = "j1LyMdaM+C0" },
 };
 
 pub const convert_keycode_exports = [_]symbols.Export{

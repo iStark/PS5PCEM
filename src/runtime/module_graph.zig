@@ -886,7 +886,8 @@ test "bundled shadow drivers are left for firmware when asked" {
         );
         defer graph.deinit();
         try testing.expectEqual(@as(usize, 1), graph.moduleCount());
-        try testing.expectEqualStrings("fakelib/dependency.prx", graph.nodes.items[1].path);
+        try testing.expect(isBundledShadow(graph.nodes.items[1].path));
+        try testing.expectEqualStrings("dependency.prx", std.fs.path.basename(graph.nodes.items[1].path));
     }
 
     // Excluded, the shadow reads as a firmware dependency: the graph holds

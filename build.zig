@@ -628,6 +628,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "window", .module = window },
                 .{ .name = "d3d12", .module = d3d12 },
                 .{ .name = "zarchive", .module = zarchive },
+                .{ .name = "renderdoc", .module = renderdoc },
             },
         }),
     });

@@ -2033,8 +2033,13 @@ fn refreshTitleIdentifier() void {
     title_identifier_length = 0;
     invalidateSaves();
     if (game_folder_length == 0) return;
+    // Use metadata from the same source selected by findGameExecutable:
+    // extracted titles take precedence over an archive in the same folder.
+    var executable_storage: [1100]u8 = undefined;
+    const executable = findGameExecutable(&executable_storage) orelse return;
     var archive_storage: [1100]u8 = undefined;
-    if (resolveGameArchive(&archive_storage)) |archive| {
+    if (isZarPath(executable)) {
+        const archive = resolveGameArchive(&archive_storage) orelse return;
         var document: [8192]u8 = undefined;
         const bytes = readArchiveParam(archive, &document) orelse return;
         const value = common.jsonStringValue(bytes, "\"titleId\"") orelse return;

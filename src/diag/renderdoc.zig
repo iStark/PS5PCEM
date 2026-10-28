@@ -3,7 +3,7 @@
 
 //! RenderDoc frame capture for any title's GPU debugging.
 //!
-//! RenderDoc is an optional diagnostic: `librenderdoc.so` is opened at runtime
+//! RenderDoc is an optional diagnostic: its native library is opened at runtime
 //! only when `PS5_RENDERDOC_FLIPS` names flips to capture (`"2"` or `"1-2"`).
 //! Nothing is linked, nothing runs without the variable, and the render path
 //! never calls here on a hot path — only flip boundaries do.
@@ -12,9 +12,46 @@
 //! ABI, so a comptime offset check pins StartFrameCapture below.
 
 const std = @import("std");
+const builtin = @import("builtin");
 
-pub const library_name = "librenderdoc.so";
+pub const library_name = if (builtin.os.tag == .windows) "renderdoc.dll" else "librenderdoc.so";
 pub const api_version_1_6_0: c_int = 10600;
+
+const WindowsLibrary = struct {
+    handle: *anyopaque,
+    extern "kernel32" fn LoadLibraryA([*:0]const u8) callconv(.winapi) ?*anyopaque;
+    extern "kernel32" fn FreeLibrary(*anyopaque) callconv(.winapi) i32;
+    extern "kernel32" fn GetProcAddress(*anyopaque, [*:0]const u8) callconv(.winapi) ?*const anyopaque;
+
+    fn open(name: [:0]const u8) !WindowsLibrary {
+        return .{ .handle = LoadLibraryA(name) orelse return error.FileNotFound };
+    }
+    fn close(self: *WindowsLibrary) void {
+        _ = FreeLibrary(self.handle);
+    }
+    fn lookup(self: *WindowsLibrary, comptime T: type, name: [:0]const u8) ?T {
+        return @ptrCast(GetProcAddress(self.handle, name) orelse return null);
+    }
+};
+const NativeLibrary = if (builtin.os.tag == .windows) WindowsLibrary else std.DynLib;
+
+extern "c" fn setenv([*:0]const u8, [*:0]const u8, c_int) c_int;
+extern "kernel32" fn SetEnvironmentVariableA([*:0]const u8, ?[*:0]const u8) callconv(.winapi) i32;
+
+/// Enable the implicit layer before Vulkan instance creation.
+pub fn prepareEnvironment() bool {
+    if (comptime builtin.os.tag == .windows) {
+        return SetEnvironmentVariableA("ENABLE_VULKAN_RENDERDOC_CAPTURE", "1") != 0;
+    } else if (comptime builtin.os.tag == .linux) {
+        return setenv("ENABLE_VULKAN_RENDERDOC_CAPTURE", "1", 1) == 0;
+    } else return false;
+}
+
+/// RenderDoc expects the first dispatch-table pointer in the VkInstance,
+/// not the handle value itself (RENDERDOC_DEVICEPOINTER_FROM_VKINSTANCE).
+pub fn vulkanDevice(instance: *anyopaque) ?*anyopaque {
+    return @as(*const ?*anyopaque, @ptrCast(@alignCast(instance))).*;
+}
 
 const DevicePointer = ?*anyopaque;
 const WindowHandle = ?*anyopaque;
@@ -73,7 +110,7 @@ pub fn parseRange(text: []const u8) ?Range {
     return .{ .first = single, .last = single };
 }
 
-var library: ?std.DynLib = null;
+var library: ?NativeLibrary = null;
 var api: ?*const Api = null;
 var armed_first: u64 = 0;
 var armed_last: u64 = 0;
@@ -81,8 +118,13 @@ var capturing = false;
 
 /// Opens the library and arms [first, last]. False keeps everything disabled.
 pub fn arm(first: u64, last: u64) bool {
-    if (first == 0 or last < first or api != null) return api != null;
-    var opened = std.DynLib.open(library_name) catch |err| {
+    if (first == 0 or last < first or capturing) return false;
+    if (api != null) {
+        armed_first = first;
+        armed_last = last;
+        return true;
+    }
+    var opened = NativeLibrary.open(library_name) catch |err| {
         std.debug.print("[renderdoc] cannot open {s}: {s}\n", .{ library_name, @errorName(err) });
         return false;
     };
@@ -104,9 +146,9 @@ pub fn arm(first: u64, last: u64) bool {
     return true;
 }
 
-/// Call at a flip boundary with the flip about to be presented (1-based).
-/// Starts before the first armed flip, ends after the last armed flip.
-pub fn noteFlip(device_dispatch_table: ?*anyopaque, flip: u64) void {
+/// Start before recording work for a selected frame. At renderer startup this
+/// is frame 1; subsequent frames start after the previous flip completes.
+pub fn beginFrame(device_dispatch_table: ?*anyopaque, flip: u64) void {
     const table = api orelse return;
     if (!capturing and flip == armed_first) {
         std.debug.print("[renderdoc] starting capture at flip {d} (device=0x{x})\n", .{ flip, @intFromPtr(device_dispatch_table) });
@@ -115,11 +157,27 @@ pub fn noteFlip(device_dispatch_table: ?*anyopaque, flip: u64) void {
         capturing = table.IsFrameCapturing() != 0;
         if (capturing) std.debug.print("[renderdoc] capturing from flip {d}\n", .{flip});
     }
+}
+
+/// Called after presentation, outside any inner scope's defer. Ending and
+/// starting are separate phases so a one-frame range includes actual work.
+pub fn afterFlip(device_dispatch_table: ?*anyopaque, flip: u64) void {
+    const table = api orelse return;
     if (capturing and flip == armed_last) {
         const saved = table.EndFrameCapture(device_dispatch_table, null);
         capturing = false;
         std.debug.print("[renderdoc] capture ended at flip {d}: {s}\n", .{ flip, if (saved != 0) "saved" else "failed" });
     }
+    if (flip != std.math.maxInt(u64)) beginFrame(device_dispatch_table, flip + 1);
+}
+
+pub fn disarm(device_dispatch_table: ?*anyopaque) void {
+    if (api) |table| {
+        if (capturing) _ = table.DiscardFrameCapture(device_dispatch_table, null);
+    }
+    capturing = false;
+    armed_first = 0;
+    armed_last = 0;
 }
 
 test "RenderDoc flip ranges parse single, span, and garbage" {
@@ -133,4 +191,68 @@ test "RenderDoc flip ranges parse single, span, and garbage" {
 
 test {
     _ = Api;
+}
+
+test "capture boundaries include one frame or an inclusive range and can rearm" {
+    const Fake = struct {
+        var active: bool = false;
+        var starts: usize = 0;
+        var ends: usize = 0;
+        var discards: usize = 0;
+        fn path(_: ?[*:0]const u8) callconv(.c) void {}
+        fn start(_: DevicePointer, _: WindowHandle) callconv(.c) void {
+            active = true;
+            starts += 1;
+        }
+        fn isActive() callconv(.c) u32 {
+            return @intFromBool(active);
+        }
+        fn end(_: DevicePointer, _: WindowHandle) callconv(.c) u32 {
+            active = false;
+            ends += 1;
+            return 1;
+        }
+        fn discard(_: DevicePointer, _: WindowHandle) callconv(.c) u32 {
+            active = false;
+            discards += 1;
+            return 1;
+        }
+    };
+    var callbacks: Api = undefined;
+    callbacks.SetCaptureFilePathTemplate = Fake.path;
+    callbacks.StartFrameCapture = Fake.start;
+    callbacks.IsFrameCapturing = Fake.isActive;
+    callbacks.EndFrameCapture = Fake.end;
+    callbacks.DiscardFrameCapture = Fake.discard;
+    api = &callbacks;
+    defer {
+        disarm(null);
+        api = null;
+    }
+    Fake.active = false;
+    Fake.starts = 0;
+    Fake.ends = 0;
+    Fake.discards = 0;
+    for ([_]Range{ .{ .first = 1, .last = 1 }, .{ .first = 2, .last = 2 }, .{ .first = 2, .last = 4 } }) |range| {
+        try std.testing.expect(arm(range.first, range.last));
+        beginFrame(null, 1);
+        for (1..6) |flip| {
+            // This is where scene commands and presentation execute.
+            try std.testing.expectEqual(flip >= range.first and flip <= range.last, Fake.active);
+            afterFlip(null, flip);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 3), Fake.starts);
+    try std.testing.expectEqual(@as(usize, 3), Fake.ends);
+    try std.testing.expect(arm(1, 2));
+    beginFrame(null, 1);
+    disarm(null);
+    try std.testing.expect(!Fake.active);
+    try std.testing.expectEqual(@as(usize, 1), Fake.discards);
+}
+
+test "Vulkan capture device is the instance dispatch table" {
+    var dispatch: usize = 42;
+    var instance: ?*anyopaque = &dispatch;
+    try std.testing.expectEqual(@as(?*anyopaque, &dispatch), vulkanDevice(@ptrCast(&instance)));
 }

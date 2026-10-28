@@ -7494,14 +7494,18 @@ pub const Renderer = struct {
             .window_presentation = window_presentation,
         };
         renderer.image_aliases.enabled = options.enable_canonical_image_aliases;
-        // RenderDoc loads only when a flip range is armed; failure stays silent.
+        // Start frame 1 before recording its work; later frames begin after
+        // the preceding flip. Capture remains an optional diagnostic.
         if (renderer.renderdoc_first_flip != 0) {
             std.debug.print("[renderdoc] arming flips {d}-{d}\n", .{ renderer.renderdoc_first_flip, renderer.renderdoc_last_flip });
             if (!renderdoc.arm(renderer.renderdoc_first_flip, renderer.renderdoc_last_flip)) {
                 renderer.renderdoc_first_flip = 0;
                 renderer.renderdoc_last_flip = 0;
+            } else {
+                renderdoc.beginFrame(renderdoc.vulkanDevice(renderer.instance_handle), 1);
             }
         }
+        errdefer if (renderer.renderdoc_first_flip != 0) renderdoc.disarm(renderdoc.vulkanDevice(renderer.instance_handle));
         renderer.image_aliases.canonical_authority_enabled = options.enable_canonical_image_aliases;
         renderer.image_states.optimize_barriers = options.enable_image_state_optimization;
         renderer.dynamic_scalar_buffer = try renderer.createBuffer(
@@ -7576,6 +7580,7 @@ pub const Renderer = struct {
     }
 
     pub fn deinit(self: *Renderer) void {
+        if (self.renderdoc_first_flip != 0) renderdoc.disarm(renderdoc.vulkanDevice(self.instance_handle));
         // Teardown must free both the spare pool and subsequently retired work.
         self.buffer_recycle_budget_bytes = 0;
         self.clearRecycledBuffers();
@@ -39473,13 +39478,10 @@ pub const Renderer = struct {
         defer self.restoreReanimalTimelineSchedulerAfterFlip();
         const flip_started = hostTimestampNs();
         defer self.reportFrameProfile();
-        // RenderDoc brackets whole flips: start before the first armed flip
-        // records, end once the last armed flip is presented.
-        if (self.renderdoc_first_flip != 0) {
-            const table = @as(*const ?*anyopaque, @ptrCast(&self.instance_handle)).*;
-            if (self.flip_callbacks == self.renderdoc_first_flip) renderdoc.noteFlip(table, self.flip_callbacks);
-            defer if (self.flip_callbacks == self.renderdoc_last_flip) renderdoc.noteFlip(table, self.flip_callbacks);
-        }
+        // Function-scope defer: finish the capture after presentation, then
+        // arm the next frame before any of its scene commands are recorded.
+        defer if (self.renderdoc_first_flip != 0)
+            renderdoc.afterFlip(renderdoc.vulkanDevice(self.instance_handle), self.flip_callbacks);
         // Declared after the report so that it runs before it: the time this
         // flip spends belongs to the frame being reported, not the next one.
         defer self.frame_profile.flip_ns +|= elapsedHostNanoseconds(flip_started);

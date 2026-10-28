@@ -568,27 +568,16 @@ test "an absent service reports absence rather than success" {
     try testing.expectEqual(errno.ok, accept(0, 0, 0, 0, 0, 0));
 }
 
-test "JpegEnc lifecycle links while encoding stays unavailable" {
+test "JpegEnc imports link without reporting nonexistent encoder contexts" {
     var db = symbols.Database{};
     defer db.deinit(testing.allocator);
     try register(&db, testing.allocator);
-    // Lifecycle bookkeeping answers success, mirroring the decoder table;
-    // producing bytes is refused rather than invented.
-    for ([_]struct { id: *const [11:0]u8, ok: bool }{
-        .{ .id = "o6ZgXfFdWXQ", .ok = true },
-        .{ .id = "K+rocojkr-I", .ok = true },
-        .{ .id = "j1LyMdaM+C0", .ok = true },
-        .{ .id = "QbrU0cUghEM", .ok = false },
-    }) |case| {
-        const symbol = db.findById(case.id, .function) orelse return error.MissingJpegEncExport;
+    for ([_]*const [11:0]u8{ "o6ZgXfFdWXQ", "K+rocojkr-I", "j1LyMdaM+C0", "QbrU0cUghEM" }) |id| {
+        const symbol = db.findById(id, .function) orelse return error.MissingJpegEncExport;
         try testing.expectEqualStrings("libSceJpegEnc", symbol.key.library.name);
         try testing.expectEqualStrings("libSceJpegEnc", symbol.key.module.name);
         const entry: *const @TypeOf(accept) = @ptrFromInt(symbol.address);
-        if (case.ok) {
-            try testing.expectEqual(errno.ok, entry(0, 0, 0, 0, 0, 0));
-        } else {
-            try testing.expect(entry(0, 0, 0, 0, 0, 0) < 0);
-        }
+        try testing.expect(entry(0, 0, 0, 0, 0, 0) < 0);
     }
 }
 

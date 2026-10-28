@@ -2750,10 +2750,10 @@ fn wideEndsWithZar(name: []const u16) bool {
 /// A folder holding exactly one top-level `.zar` dump runs it. Anything else
 /// keeps the classic layout: an extracted title wins over an archive.
 fn findArchiveInFolder(output: *[1024]u16) bool {
-    const pattern = w("\\*.zar");
+    const pattern = w("*.zar");
     const pattern_length = wideLength(pattern);
     var search: [1024]u16 = @splat(0);
-    if (game_folder_length + pattern_length >= search.len) return false;
+    if (game_folder_length + 1 + pattern_length >= search.len) return false;
     @memcpy(search[0..game_folder_length], game_folder[0..game_folder_length]);
     var length = game_folder_length;
     if (length == 0 or (search[length - 1] != '\\' and search[length - 1] != '/')) {

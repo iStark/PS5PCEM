@@ -319,6 +319,10 @@ pub const Reader = struct {
         for (&self.cache_tick, 0..) |*tick, i| {
             if (tick.* < self.cache_tick[victim]) victim = i;
         }
+        // A failed read/decode may have overwritten part of the victim. Never
+        // return those bytes as a hit for the old block on a later read.
+        self.cache_index[victim] = invalid_block;
+        self.cache_tick[victim] = 0;
         try self.loadBlock(index, self.cache_data[victim * block_size ..][0..block_size]);
         self.cache_index[victim] = index;
         self.cache_tick[victim] = self.clock;
@@ -356,8 +360,8 @@ pub const Reader = struct {
     }
 
     fn readExact(self: *Reader, offset: u64, buffer: []u8) !void {
-        // shortcut: no size cap on metadata reads; sections are range-checked
-        // against the file size at open, so a hostile footer cannot OOM here.
+        // Section bounds are checked at open; allocation errors propagate
+        // from the caller, and short reads are rejected here.
         const got = try self.file.readPositionalAll(self.io, buffer, offset);
         if (got != buffer.len) return error.CorruptArchive;
     }
@@ -462,6 +466,53 @@ test "archive rejects a bad magic" {
     defer tmp.cleanup();
     try tmp.dir.writeFile(testing.io, .{ .sub_path = "bad.zar", .data = "not a zarchive" });
     try testing.expectError(error.NotArchive, Reader.open(testing.io, tmp.dir, "bad.zar", testing.allocator));
+}
+
+test "archive finds nested siblings regardless of insertion order" {
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const files = [_]TestFile{
+        .{ .path = "sce_sys/nested/a.bin", .data = "first" },
+        .{ .path = "eboot.bin", .data = "elf" },
+        .{ .path = "sce_module/libc.prx", .data = "module" },
+        .{ .path = "sce_sys/param.json", .data = "{}" },
+    };
+    try writeTestArchive(testing.io, tmp.dir, "game.zar", &files);
+    var reader = try Reader.open(testing.io, tmp.dir, "game.zar", testing.allocator);
+    defer reader.close();
+    try testing.expectEqual(@as(u32, 3), reader.dirChildCount(0));
+    for (files) |file| {
+        const node = reader.lookup(file.path) orelse return error.FileNotFound;
+        var out: [16]u8 = undefined;
+        const count = try reader.readAt(node, 0, &out);
+        try testing.expectEqualStrings(file.data, out[0..count]);
+    }
+}
+
+test "failed block decoding cannot expose a partially overwritten cache victim" {
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // Valid compressed payload with a truncated checksum: decoding can write
+    // its output before discovering the missing end of the frame.
+    var frame: [23]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&frame, "28b52ffd6400ff4d000008410100fc7f742704cf99e954");
+    try writeTestArchiveRaw(testing.io, tmp.dir, "game.zar", &.{
+        .{ .path = "good.bin", .data = "original" },
+        .{ .path = "bad.bin", .data = frame[0 .. frame.len - 1], .compressed = true },
+    }, block_size);
+    var reader = try Reader.open(testing.io, tmp.dir, "game.zar", testing.allocator);
+    defer reader.close();
+    const good = reader.lookup("good.bin").?;
+    const bad = reader.lookup("bad.bin").?;
+    var out: [8]u8 = undefined;
+    _ = try reader.readAt(good, 0, &out);
+    // Force eviction of the occupied first slot without needing 64 files.
+    @memset(&reader.cache_tick, reader.clock);
+    try testing.expectError(error.CorruptArchive, reader.readAt(bad, 0, &out));
+    _ = try reader.readAt(good, 0, &out);
+    try testing.expectEqualStrings("original", &out);
 }
 
 test "archive rejects overlapping sections" {
@@ -669,22 +720,17 @@ pub fn writeTestArchiveRaw(io: std.Io, dir: std.Io.Dir, name: []const u8, files:
         file_block_base += 1;
     }
 
-    // Pre-order layout keeps each directory's children contiguous: a
-    // node's direct children follow it before any grandchildren.
+    // Breadth-first layout keeps direct children contiguous even when a
+    // directory precedes a sibling file or another nested directory.
     var layout: [24]usize = undefined;
-    var li: usize = 0;
-    var stack: [24]usize = .{0} ++ .{0} ** 23;
-    var top: usize = 1;
-    while (top != 0) {
-        top -= 1;
-        const n = stack[top];
-        layout[li] = n;
-        li += 1;
-        var c = nodes[n].child_count;
-        while (c != 0) {
-            c -= 1;
-            stack[top] = nodes[n].children[c];
-            top += 1;
+    layout[0] = 0;
+    var li: usize = 1;
+    var next: usize = 0;
+    while (next < li) : (next += 1) {
+        const n = layout[next];
+        for (nodes[n].children[0..nodes[n].child_count]) |child| {
+            layout[li] = child;
+            li += 1;
         }
     }
     var at_layout: [24]u32 = undefined;
@@ -704,7 +750,7 @@ pub fn writeTestArchiveRaw(io: std.Io, dir: std.Io.Dir, name: []const u8, files:
             const hi: u32 = (@as(u32, @truncate(node.size >> 32)) << 16) | @as(u32, @truncate(abs_off >> 32));
             try writeU32(&out.writer, hi);
         } else {
-            try writeU32(&out.writer, if (node.child_count == 0) 0 else at_layout[n] + 1);
+            try writeU32(&out.writer, if (node.child_count == 0) 0 else at_layout[node.children[0]]);
             try writeU32(&out.writer, node.child_count);
             try writeU32(&out.writer, 0);
         }

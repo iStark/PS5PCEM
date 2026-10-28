@@ -1792,16 +1792,27 @@ pub const module = symbols.Module{ .name = "libkernel", .version_major = 1, .ver
 /// arguments — a name tag (`"SceLibcV2AtomicWait"`), a small selector (one
 /// wrapper passes 8 bits, the other 16), and either null or a pointer to a
 /// microsecond timeout converted from milliseconds with saturation. The
-/// wrappers discard the result and report success themselves, and the only
-/// known caller set ignores it, so answering success changes nothing
-/// observable there; any direct caller sees a wait that never blocks.
+/// contributor reports that the wrappers discard the result. This does NOT
+/// establish that blocking or wake-up side effects are optional. These are
+/// provisional, non-blocking import bridges, not an AtomicWait implementation;
+/// their ABI and synchronization semantics still need the actual libc callers.
+var warned_unknown_atomic_wait = std.atomic.Value(bool).init(false);
+
+fn warnUnknownAtomicWait() void {
+    if (!warned_unknown_atomic_wait.swap(true, .monotonic)) {
+        std.debug.print("[kernel] provisional SceLibcV2AtomicWait imports: blocking semantics are not implemented\n", .{});
+    }
+}
+
 pub fn unknownSceLibcAtomicWait8(_: u64, _: u64, _: u64) callconv(abi.guest) i32 {
+    warnUnknownAtomicWait();
     return errno.ok;
 }
 
 /// Second width of the facility above. Kept apart because the two have
 /// distinct identifiers and may yet turn out to differ.
 pub fn unknownSceLibcAtomicWait16(_: u64, _: u64, _: u64) callconv(abi.guest) i32 {
+    warnUnknownAtomicWait();
     return errno.ok;
 }
 
