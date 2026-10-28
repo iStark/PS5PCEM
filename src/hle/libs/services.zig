@@ -273,35 +273,87 @@ pub fn gameUpdateGetAddcontLatestVersion(
 }
 
 const np_entitlement_error_parameter: i32 = @bitCast(@as(u32, 0x817d_0002));
-var np_next_request = std.atomic.Value(u32).init(1);
-var np_requests = std.atomic.Value(u64).init(0);
+pub const np_error_invalid_argument: i32 = @bitCast(@as(u32, 0x8055_0003));
+pub const np_error_out_of_memory: i32 = @bitCast(@as(u32, 0x8055_0005));
+pub const np_error_signed_out: i32 = @bitCast(@as(u32, 0x8055_0006));
+pub const np_error_request_not_found: i32 = @bitCast(@as(u32, 0x8055_0014));
+
+// Sync and async requests share sceNpDeleteRequest and therefore one registry.
+// Keep IDs positive, serialize allocation/deletion, and do not immediately
+// reuse a deleted ID when its slot is allocated again.
+const NpRequests = struct {
+    lock: @import("memory").HostMutex = .{},
+    next_id: i32 = 1,
+    slots: [64]i32 = @splat(0),
+
+    fn create(self: *NpRequests) i32 {
+        self.lock.lock();
+        defer self.lock.unlock();
+        for (&self.slots) |*slot| {
+            if (slot.* != 0) continue;
+            while (std.mem.indexOfScalar(i32, &self.slots, self.next_id) != null) self.advance();
+            slot.* = self.next_id;
+            self.advance();
+            return slot.*;
+        }
+        return np_error_out_of_memory;
+    }
+
+    fn advance(self: *NpRequests) void {
+        self.next_id = if (self.next_id == std.math.maxInt(i32)) 1 else self.next_id + 1;
+    }
+
+    fn check(self: *NpRequests, request_id: i32, remove: bool) i32 {
+        self.lock.lock();
+        defer self.lock.unlock();
+        if (request_id <= 0) return np_error_request_not_found;
+        const index = std.mem.indexOfScalar(i32, &self.slots, request_id) orelse return np_error_request_not_found;
+        if (remove) self.slots[index] = 0;
+        return errno.ok;
+    }
+};
+var np_requests: NpRequests = .{};
 var np_trophy_next_context = std.atomic.Value(i32).init(1);
 var np_trophy_next_handle = std.atomic.Value(i32).init(1);
 var np_webapi_next_push_handle = std.atomic.Value(i32).init(1);
 
-fn npRequestBit(request_id: i32) ?u64 {
-    if (request_id < 1 or request_id >= 64) return null;
-    return @as(u64, 1) << @intCast(request_id);
-}
-
 /// NP requests are local bookkeeping objects. Creating one does not contact
 /// PSN, so an offline console still returns a usable request identifier.
 pub fn npCreateRequest() callconv(abi.guest) i32 {
-    var attempts: usize = 0;
-    while (attempts < 63) : (attempts += 1) {
-        const raw = np_next_request.fetchAdd(1, .acq_rel);
-        const request_id: u32 = (raw -% 1) % 63 + 1;
-        const bit = @as(u64, 1) << @intCast(request_id);
-        const previous = np_requests.fetchOr(bit, .acq_rel);
-        if (previous & bit == 0) return @intCast(request_id);
-    }
-    return errno.KernelError.enospc.raw();
+    return np_requests.create();
 }
 
 pub fn npDeleteRequest(request_id: i32) callconv(abi.guest) i32 {
-    const bit = npRequestBit(request_id) orelse return errno.KernelError.einval.raw();
-    const previous = np_requests.fetchAnd(~bit, .acq_rel);
-    return if (previous & bit != 0) errno.ok else errno.KernelError.enoent.raw();
+    return np_requests.check(request_id, true);
+}
+
+pub fn npCreateAsyncRequest(_: ?*const anyopaque) callconv(abi.guest) i32 {
+    // No worker is needed for immediately completed offline operations. Like
+    // the reference implementations, accept absent optional worker parameters.
+    return npCreateRequest();
+}
+
+pub fn npPollAsync(request_id: i32, result: ?*i32) callconv(abi.guest) i32 {
+    const output = result orelse return np_error_invalid_argument;
+    const status = np_requests.check(request_id, false);
+    if (status != errno.ok) return status;
+    // Zero means polling has finished, NOT that a PSN operation succeeded.
+    output.* = np_error_signed_out;
+    return errno.ok;
+}
+
+pub fn npAbortRequest(request_id: i32) callconv(abi.guest) i32 {
+    // All offline requests are already complete; abort still validates the ID.
+    return np_requests.check(request_id, false);
+}
+
+pub fn npGetAccountLanguage2(request_id: i32, user_id: i32, output: ?*anyopaque) callconv(abi.guest) i32 {
+    if (user_id == -1 or output == null) return np_error_invalid_argument;
+    const status = np_requests.check(request_id, false);
+    if (status != errno.ok) return status;
+    // Account language is server-backed. Do not fabricate a successful result
+    // or write through the second argument, which is a user ID, not a pointer.
+    return np_error_signed_out;
 }
 
 /// Entitlement and signaling libraries have useful offline bootstrap states.
@@ -628,16 +680,59 @@ test "offline NP profile exposes a stable online id" {
 }
 
 test "offline NP requests have a local lifecycle" {
-    np_next_request.store(1, .release);
-    np_requests.store(0, .release);
     const first = npCreateRequest();
     const second = npCreateRequest();
-    try testing.expectEqual(@as(i32, 1), first);
-    try testing.expectEqual(@as(i32, 2), second);
+    try testing.expect(first > 0 and second > 0 and first != second);
     try testing.expectEqual(errno.ok, npDeleteRequest(first));
-    try testing.expectEqual(errno.KernelError.enoent.raw(), npDeleteRequest(first));
-    try testing.expectEqual(errno.KernelError.einval.raw(), npDeleteRequest(0));
+    try testing.expectEqual(np_error_request_not_found, npDeleteRequest(first));
+    try testing.expectEqual(np_error_request_not_found, npDeleteRequest(0));
     try testing.expectEqual(errno.ok, npDeleteRequest(second));
+}
+
+test "offline NP async requests share lifecycle and report a failed operation" {
+    const sync_id = npCreateRequest();
+    defer _ = npDeleteRequest(sync_id);
+    var parameters: [64]u8 = @splat(0);
+    const async_id = npCreateAsyncRequest(&parameters);
+    try testing.expect(async_id > 0 and async_id != sync_id);
+    var result: i32 = 123;
+    try testing.expectEqual(errno.ok, npPollAsync(async_id, &result));
+    try testing.expectEqual(np_error_signed_out, result);
+    try testing.expectEqual(np_error_invalid_argument, npPollAsync(async_id, null));
+    try testing.expectEqual(errno.ok, npAbortRequest(async_id));
+    var language: [16]u8 = @splat(0xa5);
+    try testing.expectEqual(np_error_signed_out, npGetAccountLanguage2(async_id, 1, &language));
+    try testing.expectEqualSlices(u8, &([_]u8{0xa5} ** 16), &language);
+    try testing.expectEqual(np_error_invalid_argument, npGetAccountLanguage2(async_id, -1, &language));
+    try testing.expectEqual(np_error_invalid_argument, npGetAccountLanguage2(async_id, 1, null));
+    try testing.expectEqual(errno.ok, npDeleteRequest(async_id));
+    result = 123;
+    try testing.expectEqual(np_error_request_not_found, npPollAsync(async_id, &result));
+    try testing.expectEqual(@as(i32, 123), result);
+    try testing.expectEqual(np_error_request_not_found, npAbortRequest(async_id));
+    try testing.expectEqual(np_error_request_not_found, npGetAccountLanguage2(async_id, 1, &language));
+    try testing.expectEqual(np_error_request_not_found, npPollAsync(-1, &result));
+    const default_id = npCreateAsyncRequest(null);
+    try testing.expect(default_id > 0 and default_id != sync_id and default_id != async_id);
+    try testing.expectEqual(errno.ok, npDeleteRequest(default_id));
+}
+
+test "offline NP request pool handles capacity and positive ID wrap" {
+    var requests: NpRequests = .{};
+    var ids: [64]i32 = undefined;
+    for (&ids) |*id| id.* = requests.create();
+    try testing.expectEqual(np_error_out_of_memory, requests.create());
+    try testing.expectEqual(errno.ok, requests.check(ids[0], true));
+    requests.next_id = std.math.maxInt(i32);
+    const high = requests.create();
+    try testing.expectEqual(std.math.maxInt(i32), high);
+    try testing.expectEqual(errno.ok, requests.check(high, true));
+    const wrapped = requests.create();
+    try testing.expectEqual(@as(i32, 1), wrapped);
+    try testing.expectEqual(errno.ok, requests.check(ids[1], true));
+    const reused_slot = requests.create();
+    try testing.expect(reused_slot > 0 and reused_slot != wrapped);
+    try testing.expectEqual(np_error_out_of_memory, requests.create());
 }
 
 test "offline trophy profile returns initialized game metadata" {

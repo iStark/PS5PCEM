@@ -100,6 +100,13 @@ fn isDevlogFile(path: []const u8) bool {
     return std.ascii.eqlIgnoreCase(path, devlog_file);
 }
 
+/// Whether `path` names something inside the title's writable diagnostic tree.
+fn isDevlogTree(path: []const u8) bool {
+    if (path.len <= devlog_app.len) return false;
+    if (!std.ascii.eqlIgnoreCase(path[0..devlog_app.len], devlog_app)) return false;
+    return path[devlog_app.len] == '/';
+}
+
 /// Fills a buffer from the entropy device, and says how much it wrote.
 ///
 /// Genuinely unpredictable rather than a fixed sequence. A title seeds its own
@@ -1034,6 +1041,7 @@ pub fn open(path: []const u8, flags: i32) Error!i32 {
         return openDevlogDirectory(path);
     }
     if (isDevlogFile(path)) return openDevlog(path, flags);
+    if (isDevlogTree(path)) return openDevlogTree(path, flags);
 
     if (deviceForPath(path)) |device| {
         // A title asking to create `/dev/gc` has misunderstood something, and
@@ -1158,6 +1166,44 @@ fn openDevlogDirectory(path: []const u8) Error!i32 {
     entry.path_length = @min(path.len, maximum_path);
     @memcpy(entry.path_buffer[0..entry.path_length], path[0..entry.path_length]);
     return insertFileLocked(entry);
+}
+
+/// `/devlog/app/<sub path>` is redirected to `out/devlog`. Keep guest
+/// components relative on both Windows and Linux; Windows also treats colons,
+/// backslashes, device names and trailing dots/spaces specially.
+fn devlogRelative(path: []const u8) Error![]const u8 {
+    if (!isDevlogTree(path) or path.len > maximum_path) return Error.InvalidArgument;
+    const relative = path[devlog_app.len + 1 ..];
+    var parts = std.mem.splitScalar(u8, relative, '/');
+    while (parts.next()) |part| {
+        if (part.len == 0 or std.mem.eql(u8, part, ".") or std.mem.eql(u8, part, "..")) return Error.InvalidArgument;
+        if (part[part.len - 1] == '.' or part[part.len - 1] == ' ') return Error.InvalidArgument;
+        for (part) |byte| {
+            if (byte < 32 or std.mem.indexOfScalar(u8, "\\:<>\"|?*", byte) != null) return Error.InvalidArgument;
+        }
+        const base = part[0 .. std.mem.indexOfScalar(u8, part, '.') orelse part.len];
+        for ([_][]const u8{ "CON", "PRN", "AUX", "NUL" }) |device| {
+            if (std.ascii.eqlIgnoreCase(base, device)) return Error.InvalidArgument;
+        }
+        if (base.len == 4 and (std.ascii.eqlIgnoreCase(base[0..3], "COM") or std.ascii.eqlIgnoreCase(base[0..3], "LPT")) and
+            base[3] >= '1' and base[3] <= '9') return Error.InvalidArgument;
+    }
+    return relative;
+}
+
+fn openDevlogTree(path: []const u8, flags: i32) Error!i32 {
+    const io = active_io orelse return Error.NotAttached;
+    return openDevlogTreeAt(path, flags, io, .cwd());
+}
+
+fn openDevlogTreeAt(path: []const u8, flags: i32, io: std.Io, directory: std.Io.Dir) Error!i32 {
+    const relative = try devlogRelative(path);
+    if (flags & O.accmode == O.accmode) return Error.InvalidArgument;
+    if (flags & O.accmode == O.rdonly and flags & O.trunc != 0) return Error.ReadOnly;
+    var host_storage: [maximum_path]u8 = undefined;
+    const host = std.fmt.bufPrint(&host_storage, "out/devlog/{s}", .{relative}) catch return Error.InvalidArgument;
+    if (flags & O.directory != 0) return openDirectory(path, host, io, directory);
+    return openWritableFile(path, host, flags, io, directory);
 }
 
 fn openDevlog(path: []const u8, flags: i32) Error!i32 {
@@ -2798,4 +2844,49 @@ test "nested paths resolve" {
     var buffer: [5]u8 = undefined;
     try testing.expectEqual(@as(usize, 5), try read(fd, &buffer));
     try testing.expectEqualStrings("inner", &buffer);
+}
+
+test "devlog recognizes nested paths without confusing other mounts" {
+    // The engine names its log after the run, so an exact-path allowlist
+    // refuses the write and the title loses its diagnostics.
+    try testing.expect(isDevlogTree("/devlog/app/logs/demonssoul_ps5_x_0.log"));
+    try testing.expect(isDevlogTree("/devlog/app/commandlineargs.txt"));
+    try testing.expect(!isDevlogTree("/devlog/app"));
+    try testing.expect(!isDevlogTree("/devlog/appx/file.log"));
+    try testing.expect(!isDevlogTree("/app0/logs/file.log"));
+}
+
+test "devlog paths reject host traversal and accept dots inside filenames" {
+    try testing.expectEqualStrings("logs/run..1.log", try devlogRelative("/devlog/app/logs/run..1.log"));
+    for ([_][]const u8{
+        "/devlog/app/",                  "/devlog/app/../outside",       "/devlog/app/logs/../../outside",
+        "/devlog/app//root",             "/devlog/app/logs/.. /outside", "/devlog/app/logs./x",
+        "/devlog/app/logs\\..\\outside", "/devlog/app/C:/outside",       "/devlog/app/a:stream",
+        "/devlog/app/NUL.txt",           "/devlog/app/logs/com1",        "/devlog/appx/outside",
+    }) |path| try testing.expectError(Error.InvalidArgument, devlogRelative(path));
+}
+
+test "devlog files honor create exclusive append truncate and read-only flags" {
+    var fixture = try Fixture.init("title content");
+    defer fixture.deinit();
+    const path = "/devlog/app/logs/run..1.log";
+    try testing.expectError(Error.NotFound, openDevlogTreeAt(path, O.wronly, testing.io, fixture.tmp.dir));
+    var fd = try openDevlogTreeAt(path, O.creat | O.excl | O.rdwr, testing.io, fixture.tmp.dir);
+    try testing.expectEqual(@as(usize, 3), try write(fd, "abc"));
+    try close(fd);
+    try testing.expectError(Error.Exists, openDevlogTreeAt(path, O.creat | O.excl | O.wronly, testing.io, fixture.tmp.dir));
+    fd = try openDevlogTreeAt(path, O.append | O.wronly, testing.io, fixture.tmp.dir);
+    try testing.expectEqual(@as(usize, 1), try write(fd, "d"));
+    try close(fd);
+    fd = try openDevlogTreeAt(path, O.rdonly, testing.io, fixture.tmp.dir);
+    var buffer: [4]u8 = undefined;
+    try testing.expectEqual(@as(usize, 4), try read(fd, &buffer));
+    try testing.expectEqualStrings("abcd", &buffer);
+    try testing.expectError(Error.ReadOnly, write(fd, "x"));
+    try close(fd);
+    try testing.expectError(Error.ReadOnly, openDevlogTreeAt(path, O.rdonly | O.trunc, testing.io, fixture.tmp.dir));
+    fd = try openDevlogTreeAt(path, O.wronly | O.trunc, testing.io, fixture.tmp.dir);
+    try testing.expectEqual(@as(i64, 0), try seek(fd, 0, Seek.end));
+    try close(fd);
+    try testing.expectError(Error.ReadOnly, open("/app0/data.bin", O.wronly));
 }

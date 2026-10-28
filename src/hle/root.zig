@@ -201,6 +201,33 @@ fn agcDriverEntryPoint(
     return firmwareEntryPoint(db, "libSceAgcDriver", id, Signature);
 }
 
+test "NP async and sync imports resolve to the same request lifecycle" {
+    const std = @import("std");
+    const testing = std.testing;
+    const services = @import("libs/services.zig");
+    var db = Database{};
+    defer db.deinit(testing.allocator);
+    try registerAll(&db, testing.allocator);
+    const create = try firmwareEntryPoint(&db, "libSceNpManager", "GpLQDNKICac", fn () callconv(abi.guest) i32);
+    const create_async = try firmwareEntryPoint(&db, "libSceNpManager", "eiqMCt9UshI", fn (?*const anyopaque) callconv(abi.guest) i32);
+    const delete = try firmwareEntryPoint(&db, "libSceNpManager", "S7QTn72PrDw", fn (i32) callconv(abi.guest) i32);
+    const poll = try firmwareEntryPoint(&db, "libSceNpManager", "uqcPJLWL08M", fn (i32, ?*i32) callconv(abi.guest) i32);
+    const language = try firmwareEntryPoint(&db, "libSceNpManager", "3Tcz5bNCfZQ", fn (i32, i32, ?*anyopaque) callconv(abi.guest) i32);
+    const sync_id = create();
+    defer _ = delete(sync_id);
+    const async_id = create_async(null);
+    try testing.expect(sync_id > 0 and async_id > 0 and sync_id != async_id);
+    var output: [16]u8 = @splat(0xa5);
+    try testing.expectEqual(services.np_error_signed_out, language(async_id, 1, &output));
+    try testing.expectEqualSlices(u8, &([_]u8{0xa5} ** 16), &output);
+    var result: i32 = 123;
+    try testing.expectEqual(errno.ok, poll(async_id, &result));
+    try testing.expectEqual(services.np_error_signed_out, result);
+    try testing.expectEqual(errno.ok, delete(async_id));
+    try testing.expectEqual(services.np_error_request_not_found, poll(async_id, &result));
+    try testing.expectEqual(services.np_error_request_not_found, delete(async_id));
+}
+
 test "register-indirect count patches reach the handler that edits the packet" {
     const std = @import("std");
     const gpu = @import("gpu");

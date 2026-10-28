@@ -1872,6 +1872,21 @@ fn npSetNpTitleId(title_id: ?*const anyopaque, secret: ?*const anyopaque) callco
     return errno.ok;
 }
 
+const NpUniversalDataSystemMemoryStat = extern struct {
+    pool_size: u64,
+    max_inuse_size: u64,
+    current_inuse_size: u64,
+};
+const uds_error_invalid_argument: i32 = @bitCast(@as(u32, 0x8055_3102));
+
+fn npUniversalDataSystemMemoryStat(stat: ?*NpUniversalDataSystemMemoryStat) callconv(abi.guest) i32 {
+    // No telemetry pool is allocated offline. The ABI has three size_t
+    // counters; clearing only the first leaves the usage values uninitialized.
+    const output = stat orelse return uds_error_invalid_argument;
+    output.* = std.mem.zeroes(NpUniversalDataSystemMemoryStat);
+    return errno.ok;
+}
+
 fn availableSpace(_: u32, output: ?*u64) callconv(abi.guest) i32 {
     const value = output orelse return invalid_argument;
     value.* = 1024 * 1024;
@@ -2469,6 +2484,15 @@ const np_manager_exports = [_]symbols.Export{
     .{ .name = "sceNpGetState", .function = trace.wrap("sceNpGetState", &npGetState), .expect_id = "eQH7nWPcAgc" },
     .{ .name = "sceNpGetNpReachabilityState", .function = trace.wrap("sceNpGetNpReachabilityState", &npGetReachabilityState), .expect_id = "e-ZuhGEoeC4" },
     .{ .name = "sceNpSetNpTitleId", .function = trace.wrap("sceNpSetNpTitleId", &npSetNpTitleId), .expect_id = "Ec63y59l9tw" },
+    .{ .name = "sceNpCreateAsyncRequest", .function = trace.wrap("sceNpCreateAsyncRequest", &services.npCreateAsyncRequest), .expect_id = "eiqMCt9UshI" },
+    .{ .name = "sceNpPollAsync", .function = trace.wrap("sceNpPollAsync", &services.npPollAsync), .expect_id = "uqcPJLWL08M" },
+    .{ .name = "sceNpAbortRequest", .function = trace.wrap("sceNpAbortRequest", &services.npAbortRequest), .expect_id = "OzKvTvg3ZYU" },
+    // sceNpDeleteRequest is registered once by services_table for both kinds.
+    .{ .name = "sceNpGetAccountLanguage2", .function = trace.wrap("sceNpGetAccountLanguage2", &services.npGetAccountLanguage2), .expect_id = "3Tcz5bNCfZQ" },
+};
+
+const np_universal_data_system_exports = [_]symbols.Export{
+    .{ .name = "sceNpUniversalDataSystemGetMemoryStat", .function = trace.wrap("sceNpUniversalDataSystemGetMemoryStat", &npUniversalDataSystemMemoryStat), .expect_id = "su7jW3VDDb4" },
 };
 
 const remoteplay_exports = [_]symbols.Export{
@@ -5311,6 +5335,7 @@ pub fn register(db: *symbols.Database, gpa: std.mem.Allocator) symbols.Error!voi
     try db.addLibrary(gpa, .{ .name = "libSceAvPlayer" }, .{ .name = "libSceAvPlayer", .version_minor = 0 }, &av_player.exports);
     try db.addLibrary(gpa, .{ .name = "libSceAppContent" }, .{ .name = "libSceAppContentUtil" }, &app_content_exports);
     try db.addLibrary(gpa, .{ .name = "libSceNpManager" }, .{ .name = "libSceNpManager" }, &np_manager_exports);
+    try db.addLibrary(gpa, .{ .name = "libSceNpUniversalDataSystem" }, .{ .name = "libSceNpUniversalDataSystem" }, &np_universal_data_system_exports);
     try db.addLibrary(gpa, .{ .name = "libSceRemoteplay" }, .{ .name = "libSceRemoteplay" }, &remoteplay_exports);
     try db.addLibrary(gpa, .{ .name = "libSceMouse" }, .{ .name = "libSceMouse" }, &mouse_exports);
     try db.addLibrary(gpa, .{ .name = "libSceSaveData_native" }, .{ .name = "libSceSaveData_native" }, &save_data_exports);
@@ -6279,6 +6304,17 @@ test "fuse shader halves patches ES program and keeps front header lookup" {
         @as(?u64, front_address),
         agc_shader_registry.find(front_code_address),
     );
+}
+
+test "offline NP telemetry memory statistics fill the complete ABI structure" {
+    var guarded = [_]u64{0xfeed_face_cafe_beef} ** 5;
+    try std.testing.expectEqual(@as(usize, 24), @sizeOf(NpUniversalDataSystemMemoryStat));
+    const stat: *NpUniversalDataSystemMemoryStat = @ptrCast(&guarded[1]);
+    try std.testing.expectEqual(errno.ok, npUniversalDataSystemMemoryStat(stat));
+    try std.testing.expectEqualSlices(u64, &.{ 0, 0, 0 }, guarded[1..4]);
+    try std.testing.expectEqual(@as(u64, 0xfeed_face_cafe_beef), guarded[0]);
+    try std.testing.expectEqual(@as(u64, 0xfeed_face_cafe_beef), guarded[4]);
+    try std.testing.expectEqual(uds_error_invalid_argument, npUniversalDataSystemMemoryStat(null));
 }
 
 test "NP manager exposes a consistent local offline profile" {
