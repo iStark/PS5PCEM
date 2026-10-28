@@ -26,6 +26,7 @@ const pipeline_cache_save = @import("pipeline_cache_save.zig");
 const pipeline_warmup = @import("pipeline_warmup.zig");
 const spirv_cache = rdna2.translation_cache;
 const tessellation_spirv = @import("tessellation_spirv.zig");
+const renderdoc = @import("renderdoc");
 // Kept opt-in while the live LS/HS resource path is being validated.
 pub export var native_tessellation: bool = false;
 pub export var graphics_uniform_specialization: bool = false;
@@ -357,6 +358,10 @@ pub const Options = struct {
     dump_compute_spirv: bool = false,
     /// Writes translated guest graphics modules to `out` for offline validation.
     dump_graphics_spirv: bool = false,
+    /// RenderDoc capture flip range, from PS5_RENDERDOC_FLIPS ("2" or "1-2").
+    /// Zero disables; the library loads only when armed.
+    renderdoc_first_flip: u64 = 0,
+    renderdoc_last_flip: u64 = 0,
     /// Dumps the first failing descriptor snapshot at each program/PC.
     trace_resource_failures: bool = false,
     /// Opt-in small-buffer lifecycle snapshots inside this guest address range.
@@ -6308,6 +6313,10 @@ pub const Renderer = struct {
     translate_compute_only: bool,
     dump_compute_spirv: bool,
     dump_graphics_spirv: bool,
+    /// RenderDoc capture flip range, from PS5_RENDERDOC_FLIPS ("2" or "1-2").
+    /// Zero disables; the library loads only when armed.
+    renderdoc_first_flip: u64 = 0,
+    renderdoc_last_flip: u64 = 0,
     trace_resource_failures: bool,
     trace_buffer_address: u64 = 0,
     trace_buffer_size: usize = 0,
@@ -6570,6 +6579,7 @@ pub const Renderer = struct {
     recent_texture_content_next: usize = 0,
     changed_content_reports: usize = 0,
     scanout_content_reports: usize = 0,
+    storage_stage_reports: usize = 0,
     /// Dispatches this ran on the CPU instead of the GPU. They are not lost
     /// work, so counting them as elided would report a frame discarding
     /// compute it actually performed.
@@ -7441,6 +7451,8 @@ pub const Renderer = struct {
             .translate_compute_only = options.translate_compute_only,
             .dump_compute_spirv = options.dump_compute_spirv,
             .dump_graphics_spirv = options.dump_graphics_spirv,
+            .renderdoc_first_flip = options.renderdoc_first_flip,
+            .renderdoc_last_flip = options.renderdoc_last_flip,
             .trace_resource_failures = options.trace_resource_failures,
             .trace_buffer_address = options.trace_buffer_address,
             .trace_buffer_size = options.trace_buffer_size,
@@ -7482,6 +7494,18 @@ pub const Renderer = struct {
             .window_presentation = window_presentation,
         };
         renderer.image_aliases.enabled = options.enable_canonical_image_aliases;
+        // Start frame 1 before recording its work; later frames begin after
+        // the preceding flip. Capture remains an optional diagnostic.
+        if (renderer.renderdoc_first_flip != 0) {
+            std.debug.print("[renderdoc] arming flips {d}-{d}\n", .{ renderer.renderdoc_first_flip, renderer.renderdoc_last_flip });
+            if (!renderdoc.arm(renderer.renderdoc_first_flip, renderer.renderdoc_last_flip)) {
+                renderer.renderdoc_first_flip = 0;
+                renderer.renderdoc_last_flip = 0;
+            } else {
+                renderdoc.beginFrame(renderdoc.vulkanDevice(renderer.instance_handle), 1);
+            }
+        }
+        errdefer if (renderer.renderdoc_first_flip != 0) renderdoc.disarm(renderdoc.vulkanDevice(renderer.instance_handle));
         renderer.image_aliases.canonical_authority_enabled = options.enable_canonical_image_aliases;
         renderer.image_states.optimize_barriers = options.enable_image_state_optimization;
         renderer.dynamic_scalar_buffer = try renderer.createBuffer(
@@ -7556,6 +7580,7 @@ pub const Renderer = struct {
     }
 
     pub fn deinit(self: *Renderer) void {
+        if (self.renderdoc_first_flip != 0) renderdoc.disarm(renderdoc.vulkanDevice(self.instance_handle));
         // Teardown must free both the spare pool and subsequently retired work.
         self.buffer_recycle_budget_bytes = 0;
         self.clearRecycledBuffers();
@@ -11803,6 +11828,21 @@ pub const Renderer = struct {
         if (!memory.read(memory.context, descriptor.address, backing_scratch.bytes)) return Error.GuestMemoryReadFailed;
         const guest_texel_hash = try self.storageGuestTexelHash(subresource, staging_bytes, backing_scratch.bytes);
         const guest_backing_hash = gpu.parallel_copy.fingerprint(backing_scratch.bytes);
+        // Zero-vs-data split for black-frame debugging: a zero texel hash
+        // here means the guest source itself is empty, not the GPU path.
+        if (self.storage_stage_reports < 12) {
+            self.storage_stage_reports += 1;
+            std.debug.print("[vulkan dcb] storage stage @0x{x} {d}x{d} fmt={d} levels={d}..{d} texel_hash={x} backing_hash={x}\n", .{
+                descriptor.address,
+                descriptor.width,
+                descriptor.height,
+                descriptor.unified_format,
+                descriptor.base_level,
+                descriptor.last_level,
+                guest_texel_hash,
+                guest_backing_hash,
+            });
+        }
 
         self.storage_image_sequence +%= 1;
         var candidates = self.storage_image_address_index.candidatesBy(self.storage_image_cache.items, descriptor.address, CachedStorageImage.address);
@@ -19596,7 +19636,7 @@ pub const Renderer = struct {
             .{ vertex_words.len, fragment_words.len },
         );
         if (report_checkpoints) std.debug.print(
-            "[vulkan dcb] first graphics draw: viewport={d}x{d} scissor={d}x{d} discard={d} colors={d} write=0x{x} blend={d} extras={d}\n",
+            "[vulkan dcb] first graphics draw: viewport={d}x{d} scissor={d}x{d} discard={d} colors={d} write=0x{x} blend={d} extras={d} topo={d} cull={d} front={d} depth={d} dfunc={d}\n",
             .{
                 @as(f32, @bitCast(pipeline_state.viewport_width_bits)),
                 @as(f32, @bitCast(pipeline_state.viewport_height_bits)),
@@ -19607,6 +19647,11 @@ pub const Renderer = struct {
                 pipeline_state.color_write_masks[0],
                 pipeline_state.blend_enables[0],
                 extra_colors.len,
+                pipeline_state.topology,
+                pipeline_state.cull_mode,
+                pipeline_state.front_face,
+                pipeline_state.depth_test_enable,
+                pipeline_state.depth_compare_operation,
             },
         );
         if (report_checkpoints) {
@@ -30153,15 +30198,45 @@ pub const Renderer = struct {
             descriptor.image_type == .color_2d) and texture.layers == 1;
         const is_2d_array = descriptor.image_type == .color_2d_array and
             texture.layers <= 256;
+        const format = storageImageFormat(descriptor.unified_format) orelse
+            return Error.UnsupportedStorageImage;
+        // A multi-level view still image_load/stores one level: the base, and
+        // everything below stages exactly that level (viewBaseLevel). Blocking
+        // the range here also blocks the storage-image cache behind it, so a
+        // compute-produced chain stays cold forever and its targets stay black.
+        const multi_level_2d = descriptor.viewMipLevels() != 1 and
+            (is_single_layer_2d or (descriptor.image_type == .color_2d and descriptor.depth_or_layers <= 1));
         if ((!is_3d and !is_single_layer_2d and !is_2d_array) or descriptor.samplesLog2() != 0 or
-            descriptor.viewMipLevels() != 1 or
+            (descriptor.viewMipLevels() != 1 and !multi_level_2d) or
             descriptor.dcc_enabled or
             descriptor.cmask_fast_clear or descriptor.fmask_compression)
         {
+            // Multi-level views name their level range; report what lived at
+            // the address so a missing producer reads differently from a
+            // rejected alias.
+            if (multi_level_2d and self.resident_rt_storage_reports < 8) {
+                self.resident_rt_storage_reports += 1;
+                var at_address: u32 = 0;
+                var initialized_count: u32 = 0;
+                for (self.render_targets.items) |cached| {
+                    if (cached.target.descriptor.address != descriptor.address) continue;
+                    at_address += 1;
+                    if (cached.initialized) initialized_count += 1;
+                }
+                std.debug.print("[vulkan dcb] storage image multi-level without resident alias @0x{x} {d}x{d} fmt={d} levels={d}..{d} rt_reject={d} rt_at_address={d} rt_initialized={d}\n", .{
+                    descriptor.address,
+                    descriptor.width,
+                    descriptor.height,
+                    descriptor.unified_format,
+                    descriptor.base_level,
+                    descriptor.last_level,
+                    self.last_rt_reject,
+                    at_address,
+                    initialized_count,
+                });
+            }
             return Error.UnsupportedStorageImage;
         }
-        const format = storageImageFormat(descriptor.unified_format) orelse
-            return Error.UnsupportedStorageImage;
         const subresource = texture.subresource(
             descriptor.viewBaseLevel(),
             0,
@@ -39403,6 +39478,10 @@ pub const Renderer = struct {
         defer self.restoreReanimalTimelineSchedulerAfterFlip();
         const flip_started = hostTimestampNs();
         defer self.reportFrameProfile();
+        // Function-scope defer: finish the capture after presentation, then
+        // arm the next frame before any of its scene commands are recorded.
+        defer if (self.renderdoc_first_flip != 0)
+            renderdoc.afterFlip(renderdoc.vulkanDevice(self.instance_handle), self.flip_callbacks);
         // Declared after the report so that it runs before it: the time this
         // flip spends belongs to the frame being reported, not the next one.
         defer self.frame_profile.flip_ns +|= elapsedHostNanoseconds(flip_started);

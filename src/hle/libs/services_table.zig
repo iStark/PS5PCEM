@@ -355,6 +355,16 @@ pub const jpegdec_exports = [_]symbols.Export{
     .{ .name = "sceJpegDecDelete", .function = trace.wrap("sceJpegDecDelete", &services.accept), .expect_id = "Hwh11+m5KoI" },
 };
 
+/// Import coverage only: no encoder context or memory requirements are
+/// implemented yet. Report unavailability instead of successful creation
+/// with an uninitialized output handle.
+pub const jpegenc_exports = [_]symbols.Export{
+    .{ .name = "sceJpegEncQueryMemorySize", .function = trace.wrap("sceJpegEncQueryMemorySize", &services.absent), .expect_id = "o6ZgXfFdWXQ" },
+    .{ .name = "sceJpegEncCreate", .function = trace.wrap("sceJpegEncCreate", &services.absent), .expect_id = "K+rocojkr-I" },
+    .{ .name = "sceJpegEncEncode", .function = trace.wrap("sceJpegEncEncode", &services.absent), .expect_id = "QbrU0cUghEM" },
+    .{ .name = "sceJpegEncDelete", .function = trace.wrap("sceJpegEncDelete", &services.absent), .expect_id = "j1LyMdaM+C0" },
+};
+
 pub const convert_keycode_exports = [_]symbols.Export{
     .{ .name = "libSceConvertKeycode:mUuUOWI-C+0", .function = trace.wrap("libSceConvertKeycode:mUuUOWI-C+0", &services.accept), .id_override = "mUuUOWI-C+0" },
     .{ .name = "sceConvertKeycodeGetVirtualKeycode", .function = trace.wrap("sceConvertKeycodeGetVirtualKeycode", &services.accept), .expect_id = "vIsoJsLvvlM" },
@@ -678,6 +688,7 @@ pub const all = [_]Table{
     .{ .library = "libSceIpmi", .module = "libSceIpmi", .exports = &ipmi_exports },
     .{ .library = "libSceJson2", .module = "libSceJson", .exports = &json2_exports },
     .{ .library = "libSceJpegDec", .module = "libSceJpegDec", .exports = &jpegdec_exports },
+    .{ .library = "libSceJpegEnc", .module = "libSceJpegEnc", .exports = &jpegenc_exports },
     .{ .library = "libSceNet", .module = "libSceNet", .exports = &net_exports },
     .{ .library = "libSceNpAuth", .module = "libSceNpAuth", .exports = &npauth_exports },
     .{ .library = "libSceNpCommerce", .module = "libSceNpCommerce", .exports = &npcommerce_exports },

@@ -18,6 +18,7 @@ const font_substitutes = @import("font_substitutes.zig");
 const savedata = @import("savedata.zig");
 const boot_config = @import("boot_config.zig");
 const guest_memory = @import("memory");
+const zarchive = @import("zarchive");
 
 /// Descriptors below this belong to the standard streams.
 pub const first_descriptor: i32 = 3;
@@ -415,6 +416,11 @@ const OpenFile = struct {
     /// Directory descriptors retain their iterator between getdents calls.
     directory: ?std.Io.Dir = null,
     directory_iterator: ?std.Io.Dir.Iterator = null,
+    /// Archive node behind a directory descriptor on a `.zar` title mount.
+    archive_dir: ?u32 = null,
+    /// Archive node behind a file descriptor on a `.zar` title mount.
+    /// Reads go through the reader's block cache; nothing is extracted.
+    archive_node: ?u32 = null,
     /// The first two directory entries are synthesized as `.` and `..`.
     directory_index: u64 = 0,
     /// An entry taken from the iterator that did not fit the caller's buffer.
@@ -469,6 +475,9 @@ const Lock = struct {
 
 var active_io: ?std.Io = null;
 var root: ?std.Io.Dir = null;
+/// A ZArchive dump serving `/app0` instead of a host directory. Borrowed for
+/// the mount lifetime; the opener (game-run, tests) owns and closes it.
+var title_archive: ?*zarchive.Reader = null;
 /// Where `/savedata0` resolves. Absent until a title's save directory has been
 /// prepared, which is what keeps a title without one from writing into its own
 /// installation.
@@ -504,6 +513,21 @@ var boot_override_length: usize = 0;
 /// launch document, including positional reads and independently opened FDs.
 pub fn configureDisplay(width: u32, height: u32) Error!bool {
     const io = active_io orelse return Error.NotAttached;
+    if (title_archive) |archive| {
+        const node = archive.lookup(boot_config.path) orelse return false;
+        if (!archive.isFile(node)) return false;
+        var original: [boot_config.maximum_bytes]u8 = undefined;
+        const size = archive.readAt(node, 0, &original) catch return false;
+        // A boot document larger than the rewrite buffer cannot be overlaid;
+        // run without the override rather than with a truncated one.
+        if (size == original.len and archive.fileSize(node) > original.len) return false;
+        table_lock.lock();
+        defer table_lock.unlock();
+        boot_override_length = 0;
+        const replacement = boot_config.rewrite(original[0..size], &boot_override, width, height) catch return Error.IoFailed;
+        if (replacement) |bytes| boot_override_length = bytes.len;
+        return replacement != null;
+    }
     const directory = root orelse return Error.NotAttached;
     var original: [boot_config.maximum_bytes]u8 = undefined;
     const source = directory.readFile(io, boot_config.path, &original) catch return false;
@@ -521,8 +545,33 @@ pub fn attach(io: std.Io, directory: std.Io.Dir) void {
     defer table_lock.unlock();
     active_io = io;
     root = directory;
+    clearArchiveDescriptorsLocked();
+    title_archive = null;
     boot_override_length = 0;
     virtual_socket_signal.store(0, .release);
+}
+
+/// Makes a ZArchive dump visible to the title as `/app0`, streamed read-only
+/// without extracting. The reader is borrowed, not owned.
+pub fn attachArchive(io: std.Io, reader: *zarchive.Reader) void {
+    table_lock.lock();
+    defer table_lock.unlock();
+    active_io = io;
+    root = null;
+    clearArchiveDescriptorsLocked();
+    title_archive = reader;
+    boot_override_length = 0;
+    virtual_socket_signal.store(0, .release);
+}
+
+/// Drops descriptors bound to an archive dump. Node indexes name entries in
+/// one reader; a mount switch must not let them address another.
+fn clearArchiveDescriptorsLocked() void {
+    for (&open_files) |*slot| {
+        if (slot.*) |entry| {
+            if (entry.archive_node != null or entry.archive_dir != null) slot.* = null;
+        }
+    }
 }
 
 /// Makes a host directory visible to the title as `/savedata0`.
@@ -898,6 +947,7 @@ pub fn detach() void {
     active_io = null;
     next_descriptor = first_descriptor;
     root = null;
+    title_archive = null;
     boot_override_length = 0;
     download_root = null;
     temporary_root = null;
@@ -906,12 +956,16 @@ pub fn detach() void {
 }
 
 pub fn isAttached() bool {
-    return root != null;
+    return root != null or title_archive != null;
 }
 
 /// Index FSB banks and preseed host mix as soon as `/app0` is mounted.
 /// Safe to call repeatedly; no-ops when detached or already indexed.
+/// shortcut: banked FSB audio inside archives is not indexed yet; loose
+/// files stream normally. Upgrade by teaching audio_fs to read through
+/// the archive instead of a host directory.
 pub fn ensureAudioIndexed() void {
+    if (title_archive != null) return;
     const io = active_io orelse return;
     const directory = root orelse return;
     audio_fs.ensureIndexed(directory, io);
@@ -919,6 +973,7 @@ pub fn ensureAudioIndexed() void {
 
 /// After the first VideoOut present, load a short attract bed into the host mix.
 pub fn ensureAudioMixAfterPresent() void {
+    if (title_archive != null) return;
     const io = active_io orelse return;
     const directory = root orelse return;
     audio_fs.noteFirstPresent();
@@ -989,16 +1044,16 @@ pub fn open(path: []const u8, flags: i32) Error!i32 {
 
     const io = active_io orelse return Error.NotAttached;
     const mount = mountOf(path);
-    const directory = rootFor(mount) orelse return Error.NotAttached;
-
-    // Everything a title ships stays read-only. Save and download mounts are
-    // explicitly writable storage owned by the running title.
     if (mount == .title) {
         if (flags & (O.creat | O.trunc | O.excl) != 0) return Error.ReadOnly;
         if (flags & O.accmode != O.rdonly) return Error.ReadOnly;
         if (flags & O.append != 0) return Error.ReadOnly;
+        if (title_archive) |archive| return openArchive(path, flags, archive);
     }
+    const directory = rootFor(mount) orelse return Error.NotAttached;
 
+    // Everything a title ships stays read-only. Save and download mounts are
+    // explicitly writable storage owned by the running title.
     var relative_storage: [maximum_path]u8 = undefined;
     const relative = hostRelative(path, &relative_storage, io, directory) orelse return Error.NotFound;
 
@@ -1043,6 +1098,54 @@ pub fn open(path: []const u8, flags: i32) Error!i32 {
     defer table_lock.unlock();
 
     var entry = OpenFile{ .file = file, .size = size };
+    entry.path_length = @min(path.len, maximum_path);
+    @memcpy(entry.path_buffer[0..entry.path_length], path[0..entry.path_length]);
+    return insertFileLocked(entry);
+}
+
+/// Opens a title file inside an attached ZArchive dump. The archive is
+/// already case-insensitive, so no host-case matching applies.
+fn openArchive(path: []const u8, flags: i32, archive: *zarchive.Reader) Error!i32 {
+    var relative_storage: [maximum_path]u8 = undefined;
+    const relative = normalizedMountRelative(path, &relative_storage) orelse return Error.NotFound;
+
+    if (flags & O.directory != 0) {
+        const node = archive.lookup(relative) orelse return Error.NotFound;
+        if (!archive.isDirectory(node)) return Error.NotDirectory;
+        return openArchiveDirectory(path, node);
+    }
+
+    if (std.ascii.eqlIgnoreCase(relative, boot_config.path)) {
+        table_lock.lock();
+        defer table_lock.unlock();
+        if (boot_override_length != 0) {
+            const bytes = std.heap.page_allocator.dupe(u8, boot_override[0..boot_override_length]) catch return Error.IoFailed;
+            errdefer std.heap.page_allocator.free(bytes);
+            var entry = OpenFile{ .memory = bytes, .size = bytes.len };
+            entry.path_length = @min(path.len, maximum_path);
+            @memcpy(entry.path_buffer[0..entry.path_length], path[0..entry.path_length]);
+            return insertFileLocked(entry);
+        }
+    }
+
+    const node = archive.lookup(relative) orelse {
+        if (font_substitutes.forPath(relative)) |substitute| return openSubstituteFont(path, substitute);
+        return Error.NotFound;
+    };
+    if (!archive.isFile(node)) return openArchiveDirectory(path, node);
+
+    table_lock.lock();
+    defer table_lock.unlock();
+    var entry = OpenFile{ .archive_node = node, .size = archive.fileSize(node) };
+    entry.path_length = @min(path.len, maximum_path);
+    @memcpy(entry.path_buffer[0..entry.path_length], path[0..entry.path_length]);
+    return insertFileLocked(entry);
+}
+
+fn openArchiveDirectory(path: []const u8, node: u32) Error!i32 {
+    table_lock.lock();
+    defer table_lock.unlock();
+    var entry = OpenFile{ .archive_dir = node };
     entry.path_length = @min(path.len, maximum_path);
     @memcpy(entry.path_buffer[0..entry.path_length], path[0..entry.path_length]);
     return insertFileLocked(entry);
@@ -1334,7 +1437,7 @@ pub fn read(descriptor: i32, buffer: []u8) Error!usize {
     const offset = slot.*.?.offset;
     const device = slot.*.?.device;
     const virtual_socket = slot.*.?.virtual_socket;
-    if (slot.*.?.directory != null or slot.*.?.diagnostic_directory) {
+    if (slot.*.?.directory != null or slot.*.?.archive_dir != null or slot.*.?.diagnostic_directory) {
         table_lock.unlock();
         return Error.NotSupported;
     }
@@ -1358,6 +1461,21 @@ pub fn read(descriptor: i32, buffer: []u8) Error!usize {
         return count;
     }
     const file = slot.*.?.file orelse {
+        // Archive descriptors stream through the reader's block cache. The
+        // mount globals are copied under the lock; the read itself runs
+        // outside it, as host file reads do.
+        if (slot.*.?.archive_node) |node| {
+            const archive = title_archive;
+            const io = active_io;
+            table_lock.unlock();
+            const count = try readArchiveFile(archive orelse return Error.NotAttached, node, io orelse return Error.NotAttached, buffer, offset);
+            table_lock.lock();
+            defer table_lock.unlock();
+            if (slot.*) |*entry| {
+                if (entry.descriptor == descriptor and entry.archive_node == node) entry.offset = offset + count;
+            }
+            return count;
+        }
         table_lock.unlock();
         // The entropy device is read like a file even though nothing is stored
         // behind it, which is the one exception to a device having no contents.
@@ -1395,15 +1513,20 @@ pub fn pread(descriptor: i32, buffer: []u8, offset: u64) Error!usize {
         table_lock.unlock();
         return Error.BadDescriptor;
     };
+    const archive = title_archive;
+    const reader_io = active_io;
     table_lock.unlock();
 
-    if (entry.directory != null or entry.diagnostic_directory) return Error.NotSupported;
+    if (entry.directory != null or entry.archive_dir != null or entry.diagnostic_directory) return Error.NotSupported;
     if (entry.memory) |memory| {
         if (offset >= memory.len) return 0;
         const available = memory.len - offset;
         const count = @min(buffer.len, available);
         @memcpy(buffer[0..count], memory[offset .. offset + count]);
         return count;
+    }
+    if (entry.archive_node) |node| {
+        return readArchiveFile(archive orelse return Error.NotAttached, node, reader_io orelse return Error.NotAttached, buffer, offset);
     }
     const file = entry.file orelse {
         // Reading entropy at an offset is the same as reading it anywhere: the
@@ -1419,6 +1542,30 @@ pub fn pread(descriptor: i32, buffer: []u8, offset: u64) Error!usize {
 /// tracking. Read mapped guest destinations through host scratch, then publish
 /// each chunk with AddressSpace.write. Merely unprotecting before ReadFile is
 /// insufficient: another GPU read can rearm the page while the I/O is pending.
+/// Archive reads bounce through the same scratch path when the destination is
+/// GPU-watched guest memory.
+fn readArchiveFile(archive: *zarchive.Reader, node: u32, io: std.Io, buffer: []u8, offset: u64) Error!usize {
+    if (buffer.len == 0) return 0;
+    if (@atomicLoad(?*guest_memory.AddressSpace, &guest_address_space, .acquire)) |space| {
+        if (space.isWritable(@intFromPtr(buffer.ptr), buffer.len)) {
+            const scratch = &host_file_read_scratch;
+            var total: usize = 0;
+            while (total < buffer.len) {
+                const chunk = @min(scratch.len, buffer.len - total);
+                const position = std.math.add(u64, offset, total) catch return Error.InvalidArgument;
+                const count = archive.readAt(node, position, scratch[0..chunk]) catch return Error.IoFailed;
+                if (count == 0) break;
+                space.write(@intFromPtr(buffer.ptr) + total, scratch[0..count]) catch return Error.IoFailed;
+                total += count;
+                if (count < chunk) break;
+            }
+            return total;
+        }
+    }
+    _ = io;
+    return archive.readAt(node, offset, buffer) catch Error.IoFailed;
+}
+
 fn readHostFile(file: std.Io.File, io: std.Io, buffer: []u8, offset: u64) Error!usize {
     if (buffer.len == 0) return 0;
     if (@atomicLoad(?*guest_memory.AddressSpace, &guest_address_space, .acquire)) |space| {
@@ -1555,7 +1702,7 @@ pub fn descriptorReadiness(descriptor: i32, low_water: u64) Error!DescriptorRead
         .writable = true,
         .bytes = if (virtualSocketReadable()) 1 else 0,
     };
-    if (entry.file == null and entry.memory == null) return Error.InvalidArgument;
+    if (entry.file == null and entry.memory == null and entry.archive_node == null) return Error.InvalidArgument;
     const remaining = entry.size -| entry.offset;
     return .{
         .readable = remaining >= @max(low_water, 1) or remaining == 0,
@@ -1572,7 +1719,7 @@ pub fn seek(descriptor: i32, offset: i64, whence: i32) Error!i64 {
     const slot = slotOf(descriptor) orelse return Error.BadDescriptor;
     const entry = if (slot.*) |*value| value else return Error.BadDescriptor;
     // A device has no contents to hold a position in.
-    if (entry.device != null or entry.directory != null or entry.diagnostic_directory) return Error.NotSupported;
+    if (entry.device != null or entry.directory != null or entry.archive_dir != null or entry.diagnostic_directory) return Error.NotSupported;
 
     const base: i64 = switch (whence) {
         Seek.set => 0,
@@ -1592,9 +1739,12 @@ pub fn seek(descriptor: i32, offset: i64, whence: i32) Error!i64 {
 fn fillStat(out: *Stat, size: u64, is_directory: bool) void {
     out.* = .{};
     out.mode = (if (is_directory) mode_ifdir else mode_ifreg) | mode_read_only;
-    out.size = @intCast(size);
+    // Archives name files up to 2^48-1 bytes; saturate rather than trap.
+    const clamped = @min(size, std.math.maxInt(i64));
+    // clamped fits i64 by the min above; blocks cannot overflow u64 from it.
+    out.size = @intCast(clamped);
     out.blksize = 512;
-    out.blocks = @intCast((size + 511) / 512);
+    out.blocks = @intCast((clamped + 511) / 512);
 }
 
 fn guestTimespec(timestamp: std.Io.Timestamp) Timespec {
@@ -1643,6 +1793,9 @@ pub fn stat(path: []const u8, out: *Stat) Error!void {
     // Saves resolve against their own root. Asking the title's directory about
     // a save path finds nothing, which is how a title checking whether its save
     // exists was told it did not.
+    if (mountOf(path) == .title) {
+        if (title_archive) |archive| return statArchive(path, out, archive);
+    }
     const directory = rootFor(mountOf(path)) orelse return Error.NotAttached;
 
     var relative_storage: [maximum_path]u8 = undefined;
@@ -1676,6 +1829,35 @@ pub fn stat(path: []const u8, out: *Stat) Error!void {
     fillHostStat(out, info);
 }
 
+/// Stats a title path inside an attached ZArchive dump. Archives carry no
+/// timestamps, so only size and kind are reported.
+fn statArchive(path: []const u8, out: *Stat, archive: *zarchive.Reader) Error!void {
+    var relative_storage: [maximum_path]u8 = undefined;
+    const relative = normalizedMountRelative(path, &relative_storage) orelse return Error.NotFound;
+
+    if (std.ascii.eqlIgnoreCase(relative, boot_config.path)) {
+        table_lock.lock();
+        defer table_lock.unlock();
+        if (boot_override_length != 0) {
+            fillStat(out, boot_override_length, false);
+            return;
+        }
+    }
+
+    const node = archive.lookup(relative) orelse {
+        if (font_substitutes.forPath(relative)) |substitute| {
+            fillStat(out, substitute.bytes.len, false);
+            return;
+        }
+        return Error.NotFound;
+    };
+    if (archive.isDirectory(node)) {
+        fillStat(out, 0, true);
+    } else {
+        fillStat(out, archive.fileSize(node), false);
+    }
+}
+
 pub fn fstat(descriptor: i32, out: *Stat) Error!void {
     table_lock.lock();
     defer table_lock.unlock();
@@ -1692,6 +1874,8 @@ pub fn fstat(descriptor: i32, out: *Stat) Error!void {
     } else if (entry.directory) |directory| {
         const io = active_io orelse return Error.NotAttached;
         fillHostStat(out, directory.stat(io) catch return Error.IoFailed);
+    } else if (entry.archive_dir != null) {
+        fillStat(out, 0, true);
     } else {
         fillStat(out, entry.size, entry.diagnostic_directory);
     }
@@ -1729,7 +1913,7 @@ pub fn getDents(descriptor: i32, buffer: []u8, base_position: ?*u64) Error!usize
     defer table_lock.unlock();
     const slot = slotOf(descriptor) orelse return Error.BadDescriptor;
     const entry = if (slot.*) |*value| value else return Error.BadDescriptor;
-    if (entry.directory == null and !entry.diagnostic_directory) return Error.InvalidArgument;
+    if (entry.directory == null and entry.archive_dir == null and !entry.diagnostic_directory) return Error.InvalidArgument;
     if (base_position) |position| position.* = entry.directory_index;
 
     // Pack as many entries as the caller's buffer holds, each `d_reclen` long.
@@ -1760,6 +1944,19 @@ pub fn getDents(descriptor: i32, buffer: []u8, base_position: ?*u64) Error!usize
                         const devlog = std.ascii.eqlIgnoreCase(entry.path(), devlog_root);
                         is_directory = devlog;
                         break :blk if (devlog) "app" else "debug.log";
+                    }
+                    if (entry.archive_dir) |node| {
+                        const archive = title_archive orelse return Error.NotAttached;
+                        // directory_index counts ".", "..", then children;
+                        // indices past u32 range cannot name a child.
+                        const child = std.math.sub(u64, entry.directory_index, 2) catch break;
+                        if (child > std.math.maxInt(u32)) break;
+                        if (child >= archive.dirChildCount(node)) break;
+                        const listed = archive.dirChild(node, @intCast(child));
+                        is_directory = !listed.is_file;
+                        const length = @min(listed.name.len, maximum_name);
+                        @memcpy(name_storage[0..length], listed.name[0..length]);
+                        break :blk name_storage[0..length];
                     }
                     const iterator = if (entry.directory_iterator) |*value| value else return Error.IoFailed;
                     const child = iterator.next(io) catch return Error.IoFailed;
@@ -2420,6 +2617,104 @@ test "missing files and bad descriptors are reported precisely" {
     try testing.expectError(Error.BadDescriptor, close(99));
     // The standard streams are not filesystem descriptors.
     try testing.expectError(Error.BadDescriptor, read(1, &buffer));
+}
+
+test "an attached archive serves title content read-only" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try zarchive.writeTestArchive(testing.io, tmp.dir, "game.zar", &.{
+        .{ .path = "eboot.bin", .data = "fake-elf" },
+        .{ .path = "sce_sys/param.json", .data = "{\"titleId\":\"PPSA00001\"}" },
+    });
+    var reader = try zarchive.Reader.open(testing.io, tmp.dir, "game.zar", testing.allocator);
+    defer reader.close();
+    attachArchive(testing.io, reader);
+    defer detach();
+
+    const fd = try open("/app0/eboot.bin", O.rdonly);
+    defer close(fd) catch {};
+    var bytes: [8]u8 = undefined;
+    try testing.expectEqual(bytes.len, try read(fd, &bytes));
+    try testing.expectEqualStrings("fake-elf", &bytes);
+    try testing.expectEqual(@as(usize, 0), try read(fd, &bytes));
+
+    var info: Stat = undefined;
+    try stat("/app0/sce_sys/param.json", &info);
+    try testing.expectEqual(@as(i64, "{\"titleId\":\"PPSA00001\"}".len), info.size);
+    try fstat(fd, &info);
+    try testing.expectEqual(@as(i64, "fake-elf".len), info.size);
+
+    // The archive is case-insensitive; the mount stays read-only.
+    const upper = try open("/APP0/EBOOT.BIN", O.rdonly);
+    defer close(upper) catch {};
+    try testing.expectEqual(@as(usize, 3), try pread(upper, bytes[0..3], 5));
+    try testing.expectEqualStrings("elf", bytes[0..3]);
+    try testing.expectError(Error.ReadOnly, open("/app0/eboot.bin", O.wronly));
+    try testing.expectError(Error.ReadOnly, open("/app0/new.bin", O.rdonly | O.creat));
+    try testing.expectError(Error.NotFound, open("/app0/absent.bin", O.rdonly));
+
+    // Polling sees archive files as immediately readable regular files.
+    const probe = try open("/app0/eboot.bin", O.rdonly);
+    defer close(probe) catch {};
+    const readiness = try descriptorReadiness(probe, 1);
+    try testing.expect(readiness.readable);
+    try testing.expect(!readiness.eof);
+    try testing.expectEqual(@as(u64, "fake-elf".len), readiness.bytes);
+}
+
+test "switching mounts drops stale archive descriptors" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try zarchive.writeTestArchive(testing.io, tmp.dir, "a.zar", &.{.{ .path = "eboot.bin", .data = "elf-a" }});
+    try zarchive.writeTestArchive(testing.io, tmp.dir, "b.zar", &.{.{ .path = "eboot.bin", .data = "elf-b" }});
+    var first = try zarchive.Reader.open(testing.io, tmp.dir, "a.zar", testing.allocator);
+    defer first.close();
+    attachArchive(testing.io, first);
+    const fd = try open("/app0/eboot.bin", O.rdonly);
+
+    var second = try zarchive.Reader.open(testing.io, tmp.dir, "b.zar", testing.allocator);
+    defer second.close();
+    attachArchive(testing.io, second);
+    defer detach();
+    // The old descriptor named a node in another reader; it must not read.
+    var bytes: [5]u8 = undefined;
+    try testing.expectError(Error.BadDescriptor, read(fd, &bytes));
+    try testing.expectError(Error.BadDescriptor, close(fd));
+
+    const current = try open("/app0/eboot.bin", O.rdonly);
+    defer close(current) catch {};
+    try testing.expectEqual(@as(usize, 5), try read(current, &bytes));
+    try testing.expectEqualStrings("elf-b", &bytes);
+}
+
+test "an attached archive enumerates directories" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try zarchive.writeTestArchive(testing.io, tmp.dir, "game.zar", &.{
+        .{ .path = "eboot.bin", .data = "elf" },
+        .{ .path = "sce_sys/param.json", .data = "{}" },
+    });
+    var reader = try zarchive.Reader.open(testing.io, tmp.dir, "game.zar", testing.allocator);
+    defer reader.close();
+    attachArchive(testing.io, reader);
+    defer detach();
+
+    const fd = try open("/app0", O.rdonly | O.directory);
+    defer close(fd) catch {};
+    var buffer: [512]u8 = undefined;
+    const written = try getDents(fd, &buffer, null);
+    var seen_eboot = false;
+    var seen_sce_sys = false;
+    var offset: usize = 0;
+    while (offset < written) {
+        const record = std.mem.readInt(u16, buffer[offset + 4 ..][0..2], .little);
+        const name_len: usize = buffer[offset + 7];
+        const name = buffer[offset + 8 ..][0..name_len];
+        if (std.mem.eql(u8, name, "eboot.bin")) seen_eboot = true;
+        if (std.mem.eql(u8, name, "sce_sys")) seen_sce_sys = true;
+        offset += record;
+    }
+    try testing.expect(seen_eboot and seen_sce_sys);
 }
 
 test "directory descriptors enumerate BSD dirent records" {

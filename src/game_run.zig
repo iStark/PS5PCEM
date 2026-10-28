@@ -11,6 +11,8 @@ const runtime = @import("runtime");
 const loader = @import("loader");
 const vulkan = @import("vulkan");
 const d3d12 = @import("d3d12");
+const zarchive = @import("zarchive");
+const renderdoc = @import("renderdoc");
 const graphics_api = @import("graphics_api.zig");
 const window = @import("window");
 const display_mode = @import("display_mode.zig");
@@ -24,6 +26,9 @@ fn acquireHostMemory(context: ?*anyopaque, address: u64, size: usize, identity: 
 
 comptime {
     @import("host_memory.zig").exportRuntime();
+    // The native D3D12 object also calls this module's exported byte comparator
+    // in test builds, where main() is not analyzed.
+    _ = d3d12;
 }
 
 /// Guest-created threads may not have a stack the host unwinder can traverse.
@@ -38,14 +43,36 @@ fn reportPanic(message: []const u8, return_address: ?usize) noreturn {
 
 const usage =
     \\game-run [--app0 <content-directory>] <eboot.bin>
+    \\game-run <game.zar>
     \\
     \\Loads and relocates the adjacent PRX graph, runs its initializers, then
     \\enters the title process. --app0 supplies full game content when eboot.bin
-    \\comes from a sparse patch directory. Direct execution requires Windows or Linux x86-64.
+    \\comes from a sparse patch directory. A ZArchive dump (.zar) streams
+    \\read-only without extracting; --app0 also accepts one, with the
+    \\archive-relative executable as the last argument. Direct execution requires Windows or Linux x86-64.
     \\PS5_GRAPHICS_API=vulkan|d3d12 selects the renderer. D3D12 is experimental and Windows-only.
     \\PS5_FPS_LIMIT=30|60|120|0 caps completed flips; 0 or unset leaves them uncapped.
     \\
 ;
+
+/// Whether a path names a ZArchive dump, by extension.
+fn isArchivePath(path: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(std.fs.path.extension(path), ".zar");
+}
+
+test "archive paths are detected by extension" {
+    try std.testing.expect(isArchivePath("game.zar"));
+    try std.testing.expect(isArchivePath("GAME.ZAR"));
+    try std.testing.expect(isArchivePath("/games/dir/game.zar"));
+    try std.testing.expect(!isArchivePath("eboot.bin"));
+    try std.testing.expect(!isArchivePath("game.pkg"));
+    try std.testing.expect(!isArchivePath("zar"));
+}
+
+test "only real directories count as directories" {
+    try std.testing.expect(isDirectoryPath(std.testing.io, "."));
+    try std.testing.expect(!isDirectoryPath(std.testing.io, "ps5pcem-no-such-entry-12345"));
+}
 
 /// Prepares the directory a title's saved games live in and tells the firmware
 /// which title is running.
@@ -55,11 +82,8 @@ const usage =
 /// replaced wholesale when it is patched; a save must outlive all three. The
 /// identifier comes from what the title publishes about itself, so two dumps of
 /// the same game share their saves and two different games never do.
-fn openSaveDataHome(io: std.Io, content: std.Io.Dir) !std.Io.Dir {
-    var identifier_storage: [runtime.firmware.savedata.maximum_slot_name]u8 = undefined;
-    const identifier = readTitleIdentifier(io, content, &identifier_storage) orelse
-        "unknown-title";
-
+fn openSaveDataHome(io: std.Io, title_identifier: []const u8) !std.Io.Dir {
+    const identifier = if (title_identifier.len == 0) "unknown-title" else title_identifier;
     const cwd = std.Io.Dir.cwd();
     cwd.createDirPath(io, save_data_home) catch {};
     const home = try cwd.openDir(io, save_data_home, .{});
@@ -71,6 +95,7 @@ const save_data_home = "savedata";
 const download_data_home = "out/download0";
 const temporary_data_home = "out/temp0";
 const terminator_2d_title_id = "PPSA25872";
+const demons_souls_title_id = "PPSA01341";
 const tetris_effect_connected_title_id = "PPSA07923";
 const little_nightmares_enhanced_title_id = "PPSA10737";
 const yotei_title_id = "PPSA26344";
@@ -113,6 +138,57 @@ fn readTitleIdentifier(io: std.Io, content: std.Io.Dir, storage: []u8) ?[]const 
     var document: [8192]u8 = undefined;
     const text = content.readFile(io, savedata.title_parameter_path, &document) catch return null;
     return savedata.findJsonString(text, "titleId", storage);
+}
+
+/// Reads the same product code from an archive dump.
+fn readTitleIdentifierArchive(reader: *zarchive.Reader, storage: []u8) ?[]const u8 {
+    const savedata = runtime.firmware.savedata;
+    const node = reader.lookup(savedata.title_parameter_path) orelse return null;
+    if (!reader.isFile(node)) return null;
+    if (reader.fileSize(node) > 8192) return null;
+    var document: [8192]u8 = undefined;
+    const size = reader.readAt(node, 0, &document) catch return null;
+    return savedata.findJsonString(document[0..size], "titleId", storage);
+}
+
+/// Whether a path names an existing host directory.
+fn isDirectoryPath(io: std.Io, path: []const u8) bool {
+    const info = std.Io.Dir.cwd().statFile(io, path, .{}) catch return false;
+    return info.kind == .directory;
+}
+
+/// Opens a ZArchive dump, splitting the path so absolute locations work.
+fn openTitleArchive(io: std.Io, archive_path: []const u8) !*zarchive.Reader {
+    const dirname = std.fs.path.dirname(archive_path) orelse ".";
+    const basename = std.fs.path.basename(archive_path);
+    var directory = if (std.fs.path.isAbsolute(archive_path))
+        try std.Io.Dir.openDirAbsolute(io, dirname, .{})
+    else
+        try std.Io.Dir.cwd().openDir(io, dirname, .{});
+    defer directory.close(io);
+    return zarchive.Reader.open(io, directory, basename, std.heap.smp_allocator);
+}
+
+/// Archive twin of the Unity plug-in probe: names a deferred module only
+/// when the archive actually ships it.
+fn appendUnityDeferredModulesArchive(
+    allocator: std.mem.Allocator,
+    reader: *zarchive.Reader,
+    modules: *std.ArrayList([]const u8),
+) !void {
+    const candidates = [_][]const u8{
+        "Media/Plugins/lib_burst_generated.prx",
+        "Media/Plugins/SaveData.prx",
+        "Media/Plugins/PSN.prx",
+        "Media/Plugins/PSNCore.prx",
+        "Media/Plugins/libfmod.prx",
+        "Media/Plugins/libfmodstudio.prx",
+    };
+    for (candidates) |path| {
+        const node = reader.lookup(path) orelse continue;
+        if (!reader.isFile(node)) continue;
+        try modules.append(allocator, path);
+    }
 }
 
 /// Prepares writable, per-title generated/downloaded data. Unreal titles use
@@ -330,6 +406,15 @@ fn run(init: std.process.Init) !bool {
         return false;
     }
     const executable_path = if (has_app0_override) args[3] else args[1];
+    // A `.zar` input streams the title read-only: either directly, with
+    // `eboot.bin` at the archive root, or through --app0 with an
+    // archive-relative executable. A directory that merely ends in `.zar`
+    // stays a directory.
+    const archive_path: ?[]const u8 = if (has_app0_override)
+        (if (isArchivePath(args[2]) and !isDirectoryPath(io, args[2])) args[2] else null)
+    else
+        (if (isArchivePath(executable_path) and !isDirectoryPath(io, executable_path)) executable_path else null);
+    const archive_executable: []const u8 = if (has_app0_override) args[3] else "eboot.bin";
     const selected_api = if (init.minimal.environ.getAlloc(allocator, graphics_api.environment_name)) |value| api: {
         defer allocator.free(value);
         break :api graphics_api.Api.parse(value) orelse {
@@ -406,6 +491,60 @@ fn run(init: std.process.Init) !bool {
     try out.print("  Game preference  {s}; applied by titles that read system game presets\n", .{game_preset.label()});
     try out.flush();
 
+    // Archive dumps stay mounted for the whole run: the module graph copies
+    // what it maps, but title file I/O streams from the reader.
+    var archive_reader: ?*zarchive.Reader = null;
+    defer if (archive_reader) |reader| reader.close();
+    if (archive_path) |path| {
+        archive_reader = openTitleArchive(io, path) catch |err| {
+            try stderr.print("cannot open {s}: {s}\n", .{ path, @errorName(err) });
+            try stderr.flush();
+            return false;
+        };
+        const executable = archive_reader.?.lookup(archive_executable) orelse {
+            try stderr.print("{s} not found in {s}\n", .{ archive_executable, path });
+            try stderr.flush();
+            return false;
+        };
+        if (!archive_reader.?.isFile(executable)) {
+            try stderr.print("{s} in {s} is not a file\n", .{ archive_executable, path });
+            try stderr.flush();
+            return false;
+        }
+        try out.print("  Archive  {s}\n", .{path});
+        try out.flush();
+    }
+
+    // The directory holding the executable is what a title sees as /app0.
+    // An archive dump serves the same mount, streamed without extracting.
+    // Opened here (rather than after the graph) because the title identity
+    // below feeds graph construction for driver-routed titles.
+    var content: ?std.Io.Dir = null;
+    defer if (content) |*directory| directory.close(io);
+    if (archive_reader == null) {
+        content = std.Io.Dir.cwd().openDir(io, title_root, .{}) catch |err| {
+            try stderr.print("cannot open {s}: {s}\n", .{ title_root, @errorName(err) });
+            try stderr.flush();
+            return false;
+        };
+    }
+
+    var title_identifier_storage: [runtime.firmware.savedata.maximum_slot_name]u8 = undefined;
+    const title_identifier = if (archive_reader) |reader|
+        readTitleIdentifierArchive(reader, &title_identifier_storage) orelse ""
+    else if (content) |directory|
+        readTitleIdentifier(io, directory, &title_identifier_storage) orelse ""
+    else
+        "";
+    // Demon's Souls ships link-time driver shadows its bundled initializer
+    // cannot satisfy; route it to the live firmware path instead. See
+    // ModuleGraphOptions.ignore_bundled_drivers: big, per-title, deliberate.
+    const ignore_bundled_drivers = std.ascii.eqlIgnoreCase(title_identifier, demons_souls_title_id);
+    if (ignore_bundled_drivers) {
+        try out.print("  Drivers  bundled shadows ignored, firmware path\n", .{});
+        try out.flush();
+    }
+
     var preload_modules: std.ArrayList([]const u8) = .empty;
     defer preload_modules.deinit(allocator);
     var preload_text: ?[]u8 = null;
@@ -436,18 +575,35 @@ fn run(init: std.process.Init) !bool {
         // their constructors deferred until LoadStartModule supplies the real
         // argument block. The environment variable remains the override for
         // uncommon title-specific modules.
-        try appendUnityDeferredModules(allocator, io, title_root, &deferred_modules);
+        if (archive_reader) |reader| {
+            try appendUnityDeferredModulesArchive(allocator, reader, &deferred_modules);
+        } else {
+            try appendUnityDeferredModules(allocator, io, title_root, &deferred_modules);
+        }
     }
 
-    var graph = emu.loadModuleGraph(io, executable_path, .{
-        .preload_modules = preload_modules.items,
-        .deferred_modules = deferred_modules.items,
-        .diagnostics = .{ .context = stderr, .unresolved_fn = &reportUnresolvedImport },
-    }) catch |err| {
-        try stderr.print("cannot link {s}: {s}\n", .{ executable_path, @errorName(err) });
-        try stderr.flush();
-        return false;
-    };
+    var graph = if (archive_reader) |reader|
+        emu.loadModuleGraphArchive(io, reader, archive_executable, .{
+            .preload_modules = preload_modules.items,
+            .deferred_modules = deferred_modules.items,
+            .ignore_bundled_drivers = ignore_bundled_drivers,
+            .diagnostics = .{ .context = stderr, .unresolved_fn = &reportUnresolvedImport },
+        }) catch |err| {
+            try stderr.print("cannot link {s} in {s}: {s}\n", .{ archive_executable, archive_path.?, @errorName(err) });
+            try stderr.flush();
+            return false;
+        }
+    else
+        emu.loadModuleGraph(io, executable_path, .{
+            .preload_modules = preload_modules.items,
+            .deferred_modules = deferred_modules.items,
+            .ignore_bundled_drivers = ignore_bundled_drivers,
+            .diagnostics = .{ .context = stderr, .unresolved_fn = &reportUnresolvedImport },
+        }) catch |err| {
+            try stderr.print("cannot link {s}: {s}\n", .{ executable_path, @errorName(err) });
+            try stderr.flush();
+            return false;
+        };
     defer graph.deinit();
 
     // Must precede any guest execution: a throwing title asks the kernel which
@@ -467,14 +623,11 @@ fn run(init: std.process.Init) !bool {
         allocator.free(loaded_modules);
     }
 
-    // The directory holding the executable is what a title sees as /app0.
-    var content = std.Io.Dir.cwd().openDir(io, title_root, .{}) catch |err| {
-        try stderr.print("cannot open {s}: {s}\n", .{ title_root, @errorName(err) });
-        try stderr.flush();
-        return false;
-    };
-    defer content.close(io);
-    runtime.firmware.filesystem.attach(io, content);
+    if (archive_reader) |reader| {
+        runtime.firmware.filesystem.attachArchive(io, reader);
+    } else {
+        runtime.firmware.filesystem.attach(io, content.?);
+    }
     if (try runtime.firmware.filesystem.configureDisplay(output_mode.width(), output_mode.height())) {
         try out.print("  Unity startup render size {d}x{d} (virtual boot.config)\n", .{ output_mode.width(), output_mode.height() });
         try out.flush();
@@ -516,12 +669,9 @@ fn run(init: std.process.Init) !bool {
         allocator,
         "PS5_PAD_DIAGNOSTICS",
     ) catch false);
-    var saves = openSaveDataHome(io, content) catch null;
+    var saves = openSaveDataHome(io, title_identifier) catch null;
     defer if (saves) |*directory| directory.close(io);
     defer runtime.firmware.filesystem.unmountSaveData();
-
-    var title_identifier_storage: [runtime.firmware.savedata.maximum_slot_name]u8 = undefined;
-    const title_identifier = readTitleIdentifier(io, content, &title_identifier_storage) orelse "";
 
     var download_data: ?std.Io.Dir = openWritableTitleData(io, download_data_home, title_identifier) catch |err| blk: {
         try stderr.print("cannot prepare /download0: {s}\n", .{@errorName(err)});
@@ -719,6 +869,16 @@ fn run(init: std.process.Init) !bool {
     } else |_| default_batch_age_us) * std.time.ns_per_us;
     const dump_compute_spirv = init.minimal.environ.containsUnempty(allocator, "PS5_DUMP_COMPUTE_SPIRV") catch false;
     const dump_graphics_spirv = init.minimal.environ.containsUnempty(allocator, "PS5_DUMP_GRAPHICS_SPIRV") catch false;
+    var renderdoc_flips: renderdoc.Range = if (init.minimal.environ.getAlloc(allocator, "PS5_RENDERDOC_FLIPS")) |text| parse: {
+        defer allocator.free(text);
+        break :parse renderdoc.parseRange(text) orelse .{ .first = 0, .last = 0 };
+    } else |_| .{ .first = 0, .last = 0 };
+    // The implicit layer only hooks instance creation with this set, and the
+    // in-app start call below matches nothing without the layer in the chain.
+    if (renderdoc_flips.first != 0 and !renderdoc.prepareEnvironment()) {
+        std.debug.print("[renderdoc] cannot enable the capture layer; capture disabled\n", .{});
+        renderdoc_flips = .{ .first = 0, .last = 0 };
+    }
     const trace_resource_failures = init.minimal.environ.containsUnempty(allocator, "PS5_TRACE_RESOURCE_FAILURES") catch false;
     const trace_buffer_range: struct { address: u64 = 0, size: usize = 0 } = if (init.minimal.environ.getAlloc(allocator, "PS5_TRACE_BUFFER_RANGE")) |text| parse: {
         defer allocator.free(text);
@@ -1069,6 +1229,8 @@ fn run(init: std.process.Init) !bool {
             .prefer_integrated_gpu = prefer_integrated_gpu,
             .dump_compute_spirv = dump_compute_spirv,
             .dump_graphics_spirv = dump_graphics_spirv,
+            .renderdoc_first_flip = renderdoc_flips.first,
+            .renderdoc_last_flip = renderdoc_flips.last,
             .trace_resource_failures = trace_resource_failures,
             .trace_buffer_address = trace_buffer_range.address,
             .trace_buffer_size = trace_buffer_range.size,
@@ -1243,7 +1405,7 @@ fn run(init: std.process.Init) !bool {
         prepared,
         graph.executable(),
         .{
-            .entry = .{ .image_name = std.fs.path.basename(executable_path) },
+            .entry = .{ .image_name = if (archive_path != null) std.fs.path.basename(archive_executable) else std.fs.path.basename(executable_path) },
             .modules = graph.modules(),
         },
     ) catch |err| {

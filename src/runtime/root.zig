@@ -14,6 +14,7 @@ const loader = @import("loader");
 const hle = @import("hle");
 const cpu = @import("cpu");
 const diag = @import("diag");
+const zarchive = @import("zarchive");
 /// Re-exported so callers composing a process do not need a separate dependency
 /// on the firmware layer just to publish or tear down what the runtime wires.
 pub const firmware = hle;
@@ -544,6 +545,36 @@ pub const Runtime = struct {
         var directory = try std.Io.Dir.cwd().openDir(io, directory_name, .{ .iterate = true });
         defer directory.close(io);
 
+        return self.loadGraph(io, .{ .dir = directory }, executable_name, options);
+    }
+
+    /// Streams the module graph from a ZArchive dump instead of a directory.
+    /// The caller owns `reader` for the whole run; the graph copies the
+    /// bytes it maps. `executable_name` is the archive-relative executable,
+    /// usually `eboot.bin`.
+    pub fn loadModuleGraphArchive(
+        self: *Runtime,
+        io: std.Io,
+        reader: *zarchive.Reader,
+        executable_name: []const u8,
+        options: ModuleGraphOptions,
+    ) !ModuleGraph {
+        if (!self.initialized) return Error.NotInitialized;
+        return self.loadGraph(io, .{ .archive = reader }, executable_name, options);
+    }
+
+    const GraphSource = union(enum) {
+        dir: std.Io.Dir,
+        archive: *zarchive.Reader,
+    };
+
+    fn loadGraph(
+        self: *Runtime,
+        io: std.Io,
+        source: GraphSource,
+        executable_name: []const u8,
+        options: ModuleGraphOptions,
+    ) !ModuleGraph {
         var resolver_context = ResolverContext{
             .database = &self.database,
             .tls_registry = &self.tls_registry,
@@ -555,17 +586,29 @@ pub const Runtime = struct {
             .resolve_tls_fn = resolveTlsImport,
         };
         hle.libs.kernel_runtime.attachIo(io);
-        var graph = try module_graph.loadFromDir(
-            self.allocator.?,
-            io,
-            directory,
-            executable_name,
-            &self.address_space.?,
-            &self.tls_registry,
-            &self.guest_exports,
-            resolver,
-            options,
-        );
+        var graph = switch (source) {
+            .dir => |directory| try module_graph.loadFromDir(
+                self.allocator.?,
+                io,
+                directory,
+                executable_name,
+                &self.address_space.?,
+                &self.tls_registry,
+                &self.guest_exports,
+                resolver,
+                options,
+            ),
+            .archive => |reader| try module_graph.loadFromArchive(
+                self.allocator.?,
+                reader,
+                executable_name,
+                &self.address_space.?,
+                &self.tls_registry,
+                &self.guest_exports,
+                resolver,
+                options,
+            ),
+        };
         if (graph.executable().process_param_range) |range| {
             hle.libs.kernel_runtime.attachProcessParam(range.start);
         }

@@ -20,7 +20,6 @@ const mapper = @import("libs/kernel_mapper.zig");
 pub const counters = @import("ampr_counters.zig");
 
 pub const maximum_path: usize = 1024;
-pub const maximum_command_buffers: usize = 32;
 pub const maximum_auto_pool: usize = 8;
 pub const maximum_submissions: usize = 64;
 pub const maximum_cached_files: usize = 64;
@@ -179,6 +178,9 @@ const Submission = struct {
     complete: bool = false,
     failure: ?Error = null,
     worker: ?std.Thread = null,
+    // Plain submits publish no identifier, so no waiter can exist.
+    // Only these may be reclaimed by a later submit.
+    reclaimable: bool = false,
 };
 
 const Lock = struct {
@@ -201,7 +203,7 @@ var files: std.ArrayList(FileEntry) = .empty;
 var file_paths: std.StringHashMapUnmanaged(u32) = .empty;
 var path_arena = std.heap.ArenaAllocator.init(file_allocator);
 var cached_file_count: usize = 0;
-var command_buffers: [maximum_command_buffers]CommandBuffer = [_]CommandBuffer{.{}} ** maximum_command_buffers;
+var command_buffers: std.ArrayList(CommandBuffer) = .empty;
 var submissions: [maximum_submissions]Submission = [_]Submission{.{}} ** maximum_submissions;
 var next_submission_identifier: u32 = 1;
 var completion_sink: ?CompletionSink = null;
@@ -240,7 +242,9 @@ pub fn reset() void {
     files.deinit(file_allocator);
     files = .empty;
     cached_file_count = 0;
-    for (&command_buffers) |*buffer| buffer.deinit();
+    for (command_buffers.items) |*buffer| buffer.deinit();
+    command_buffers.deinit(file_allocator);
+    command_buffers = .empty;
     submissions = [_]Submission{.{}} ** maximum_submissions;
     next_submission_identifier = 1;
     auto_pool = [_]AutoPoolRange{.{}} ** maximum_auto_pool;
@@ -373,12 +377,16 @@ pub fn constructCommandBuffer(address: u64) Error!void {
         buffer.* = .{ .active = true, .address = address };
         return;
     }
-    for (&command_buffers) |*buffer| {
-        if (buffer.active) continue;
-        buffer.* = .{ .active = true, .address = address };
-        return;
+    // Firmware holds dozens of file-read buffers at once (40 observed);
+    // grow instead of capping at a guessed size. Reuse dead slots first so
+    // tens of thousands of short-lived buffers do not grow the list forever.
+    for (command_buffers.items) |*buffer| {
+        if (!buffer.active) {
+            buffer.* = .{ .active = true, .address = address };
+            return;
+        }
     }
-    return error.CommandBufferTableFull;
+    try command_buffers.append(file_allocator, .{ .active = true, .address = address });
 }
 
 pub fn destroyCommandBuffer(address: u64) Error!void {
@@ -404,6 +412,21 @@ pub fn resetCommandBuffer(address: u64) Error!void {
     buffer.ops.clearRetainingCapacity();
     buffer.record_bytes = 0;
     buffer.command_count = 0;
+    buffer.cursor = null;
+    buffer.map_active = false;
+}
+
+pub fn clearCommandBuffer(address: u64) Error!void {
+    lock.lock();
+    defer lock.unlock();
+    const buffer = findCommandBufferLocked(address) orelse return error.InvalidCommandBuffer;
+    // Clear detaches storage and recorded ops but keeps the registration alive:
+    // firmware reuses a buffer across files without reconstructing it.
+    buffer.ops.clearRetainingCapacity();
+    buffer.record_bytes = 0;
+    buffer.command_count = 0;
+    buffer.storage_address = 0;
+    buffer.storage_size = 0;
     buffer.cursor = null;
     buffer.map_active = false;
 }
@@ -686,10 +709,41 @@ fn reportNative(address: u64, header: packets.Header, bytes: []const u8, offset:
 }
 
 pub fn submitCommandBufferWithOffset(address: u64, error_offset: *u32) Error!u32 {
+    return submitInner(address, error_offset, true);
+}
+
+/// Plain kernel submits publish no identifier, so no waiter can free them.
+/// Untracked work still reserves a slot while a worker runs it, marked for
+/// later reclaim; synchronous work takes no slot at all.
+pub fn submitCommandBufferUntracked(address: u64) Error!void {
+    var error_offset: u32 = 0;
+    _ = try submitInner(address, &error_offset, false);
+}
+
+fn submitInner(address: u64, error_offset: *u32, tracked: bool) Error!u32 {
     error_offset.* = 0;
     var pending: CommandBuffer = .{};
     defer pending.deinit();
     var sink: ?CompletionSink = null;
+    // Plain submits carry no identifier, so nothing can ever wait on them.
+    // Reclaim finished slots first or fire-and-forget readers fill the table
+    // with done work and later submits fail with SubmissionTableFull.
+    // Workers set complete under the lock as their last touch, so clearing
+    // here then joining below cannot race them. Same pattern as the waiter.
+    lock.lock();
+    var joined: [maximum_submissions]?std.Thread = .{null} ** maximum_submissions;
+    var join_count: usize = 0;
+    for (&submissions) |*submission| {
+        // Only untracked plain submits: tracked ones may have a waiter
+        // arriving after the sweep.
+        if (submission.active and submission.complete and submission.reclaimable) {
+            joined[join_count] = submission.worker;
+            join_count += 1;
+            submission.* = .{};
+        }
+    }
+    lock.unlock();
+    for (joined[0..join_count]) |maybe| if (maybe) |worker| worker.join();
     const slot = blk: {
         lock.lock();
         defer lock.unlock();
@@ -711,7 +765,7 @@ pub fn submitCommandBufferWithOffset(address: u64, error_offset: *u32) Error!u32
         const identifier = next_submission_identifier;
         next_submission_identifier +%= 1;
         if (next_submission_identifier == 0) next_submission_identifier = 1;
-        submissions[index] = .{ .active = true, .identifier = identifier };
+        submissions[index] = .{ .active = true, .identifier = identifier, .reclaimable = !tracked };
         sink = completion_sink;
         break :blk index;
     };
@@ -729,6 +783,9 @@ pub fn submitCommandBufferWithOffset(address: u64, error_offset: *u32) Error!u32
     defer lock.unlock();
     if (complete) {
         submissions[slot].complete = true;
+        // Untracked synchronous work needs no slot: no identifier was ever
+        // published, so no waiter can arrive. Free it inline.
+        if (!tracked) submissions[slot] = .{};
     } else {
         // Only blocked submissions launch a worker. Common APR reads retain
         // the synchronous fast path. The snapshot outlives a
@@ -924,7 +981,7 @@ fn applyAmmMap(command: AmmMapCommand) Error!void {
 }
 
 fn findCommandBufferLocked(address: u64) ?*CommandBuffer {
-    for (&command_buffers) |*buffer| {
+    for (command_buffers.items) |*buffer| {
         if (buffer.active and buffer.address == address) return buffer;
     }
     return null;
@@ -979,6 +1036,20 @@ test "AMPR waits defer later writes and events and survive buffer reuse" {
     try waitCommandBuffer(waiting);
     try std.testing.expectEqual(@as(u64, 0x900000007), Sink.published.load(.acquire));
     try std.testing.expectError(error.UnknownSubmission, waitCommandBuffer(waiting));
+}
+
+test "AMPR cleared buffers accept new storage without reconstruction" {
+    reset();
+    defer reset();
+    try constructCommandBuffer(0x1000);
+    try setCommandBufferStorage(0x1000, 0x2000, 0x100);
+    try clearCommandBuffer(0x1000);
+    // Clearing detaches storage but keeps the object: reattaching works,
+    // which is what file readers do on every open.
+    try setCommandBufferStorage(0x1000, 0x3000, 0x100);
+    const info = try commandBufferInfo(0x1000);
+    try std.testing.expectEqual(@as(u64, 0x3000), info.storage_address);
+    try std.testing.expectEqual(@as(usize, 0x100), info.storage_size);
 }
 
 test "AMPR pending reset cancels writes and clears process counters" {
@@ -1050,6 +1121,17 @@ test "AMPR large file batches honor byte capacity and own deferred commands" {
     try std.testing.expectEqualSlices(u8, &payload, &destination);
     try std.testing.expectEqual(payload.len, Sink.count);
     try std.testing.expect(Sink.ordered);
+}
+
+test "AMPR completed submissions recycle without waiting" {
+    reset();
+    defer reset();
+    try constructCommandBuffer(0x1000);
+    try appendCounter(0x1000, .{ .write = .{ .counter = 0, .access = .word, .value = 1, .operation = .add } }, 32);
+    // File readers fire plain submits with completion counters and never wait:
+    // untracked synchronous work takes no slot, so the table cannot fill.
+    for (0..maximum_submissions + 1) |_| try submitCommandBufferUntracked(0x1000);
+    try std.testing.expectEqual(@as(u64, maximum_submissions + 1), counter_bank.read(0, .word));
 }
 
 test "AMPR table exhaustion has no counter side effects" {

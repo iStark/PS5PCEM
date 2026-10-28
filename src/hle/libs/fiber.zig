@@ -394,6 +394,18 @@ fn initialize(
     return 0;
 }
 
+/// SceFiberOptParam is a fixed 128-byte opaque option record. Its initial
+/// contents are not a caller-provided size; initialization must also work on
+/// an uninitialized or already-zeroed record. Matches the fixed option block
+/// used by the reference Fiber implementation.
+fn optParamInitialize(option: ?*anyopaque) callconv(abi.guest) i32 {
+    const base = @intFromPtr(option orelse return error_null);
+    const size = 128;
+    if (!accessible(base, size)) return error_invalid;
+    @memset(@as([*]u8, @ptrFromInt(base))[0..size], 0);
+    return 0;
+}
+
 fn finalize(fiber: ?*Fiber) callconv(abi.guest) i32 {
     const value = fiber orelse return error_null;
     if (!validFiber(value)) return error_invalid;
@@ -574,6 +586,7 @@ pub fn reset() void {
 
 pub const exports = [_]symbols.Export{
     .{ .name = "_sceFiberInitializeImpl", .function = trace.wrap("_sceFiberInitializeImpl", &initialize), .expect_id = "hVYD7Ou2pCQ" },
+    .{ .name = "sceFiberOptParamInitialize", .function = trace.wrap("sceFiberOptParamInitialize", &optParamInitialize), .expect_id = "asjUJJ+aa8s" },
     .{ .name = "sceFiberFinalize", .function = trace.wrap("sceFiberFinalize", &finalize), .expect_id = "JeNX5F-NzQU" },
     .{ .name = "sceFiberGetSelf", .function = trace.wrap("sceFiberGetSelf", &getSelf), .expect_id = "p+zLIOg27zU" },
     .{ .name = "sceFiberGetInfo", .function = trace.wrap("sceFiberGetInfo", &getInfo), .expect_id = "uq2Y5BFz0PE" },
@@ -783,4 +796,22 @@ test "fibers migrate between live threads after direct switches and yields" {
     second.join();
     try std.testing.expectEqual(@as(u32, 0), probe.failures.load(.acquire));
     for (&probe.fibers) |*fiber| try std.testing.expectEqual(@as(i32, 0), finalize(fiber));
+}
+
+test "fiber options initialize an opaque record regardless of previous contents" {
+    var db = symbols.Database{};
+    defer db.deinit(std.testing.allocator);
+    try register(&db, std.testing.allocator);
+    const symbol = db.findById("asjUJJ+aa8s", .function) orelse return error.MissingFiberOptParamInit;
+    try std.testing.expectEqualStrings("libSceFiber", symbol.key.library.name);
+    const init: *const fn (?*anyopaque) callconv(abi.guest) i32 = @ptrFromInt(symbol.address);
+    try std.testing.expectEqual(error_null, init(null));
+    var storage: [160]u8 align(8) = @splat(0xa5);
+    // A host stack buffer; accessible() permits it with no space attached.
+    try std.testing.expectEqual(@as(i32, 0), init(@ptrCast(&storage)));
+    try std.testing.expectEqualSlices(u8, &([_]u8{0} ** 128), storage[0..128]);
+    try std.testing.expectEqualSlices(u8, &([_]u8{0xa5} ** 32), storage[128..]);
+    try std.testing.expectEqual(@as(i32, 0), init(@ptrCast(&storage)));
+    try std.testing.expectEqualSlices(u8, &([_]u8{0} ** 128), storage[0..128]);
+    try std.testing.expectEqualSlices(u8, &([_]u8{0xa5} ** 32), storage[128..]);
 }

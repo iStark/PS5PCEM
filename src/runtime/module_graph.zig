@@ -8,6 +8,7 @@ const memory = @import("memory");
 const loader = @import("loader");
 const diag = @import("diag");
 const hle = @import("hle");
+const zarchive = @import("zarchive");
 
 pub const Options = struct {
     /// The executable is relocatable in practice even though titles commonly
@@ -27,6 +28,18 @@ pub const Options = struct {
     /// Unity native plug-ins receive their startup argument through that call
     /// and are not valid during the process' dependency initialization phase.
     deferred_modules: []const []const u8 = &.{},
+    /// Leave bundled `fakelib/` shadow drivers unmapped so their imports
+    /// resolve to firmware instead.
+    ///
+    /// This is driver-routing policy, not a loader convenience, and it is a
+    /// big change in a small flag: on hardware these shadows never run — the
+    /// kernel loads the real system modules — while mapping them here runs
+    /// their initializers natively. A title whose bundled driver cannot
+    /// initialize (Demon's Souls' AgcDriver needs direct memory its own boot
+    /// already tiled wall-to-wall) must use the live firmware path instead.
+    /// Titles whose bundled drivers do run (Little Nightmares) keep the
+    /// default. Prefer extending firmware coverage over widening this flag.
+    ignore_bundled_drivers: bool = false,
     diagnostics: ?Diagnostics = null,
 };
 
@@ -311,6 +324,107 @@ pub fn loadFromDir(
     resolver: ?loader.Resolver,
     options: Options,
 ) !ModuleGraph {
+    return loadFromSource(
+        gpa,
+        .{ .dir = .{ .io = io, .directory = directory } },
+        executable_name,
+        address_space,
+        tls_registry,
+        guest_exports,
+        resolver,
+        options,
+    );
+}
+
+/// Loads the same graph from a ZArchive dump, streaming module bytes without
+/// extracting. Candidate paths use `/` separators, as the archive does.
+pub fn loadFromArchive(
+    gpa: std.mem.Allocator,
+    reader: *zarchive.Reader,
+    executable_name: []const u8,
+    address_space: *memory.AddressSpace,
+    tls_registry: *loader.TlsRegistry,
+    guest_exports: *loader.GuestExportRegistry,
+    resolver: ?loader.Resolver,
+    options: Options,
+) !ModuleGraph {
+    return loadFromSource(
+        gpa,
+        .{ .archive = reader },
+        executable_name,
+        address_space,
+        tls_registry,
+        guest_exports,
+        resolver,
+        options,
+    );
+}
+
+/// Title content behind either a host directory or an archive dump.
+const Source = union(enum) {
+    dir: struct { io: std.Io, directory: std.Io.Dir },
+    archive: *zarchive.Reader,
+
+    fn readAlloc(self: Source, path: []const u8, gpa: std.mem.Allocator, maximum: usize) ![]u8 {
+        switch (self) {
+            .dir => |d| return d.directory.readFileAlloc(d.io, path, gpa, .limited(maximum)),
+            .archive => |reader| {
+                const node = reader.lookup(path) orelse return error.FileNotFound;
+                if (!reader.isFile(node)) return error.IsDir;
+                return reader.readAlloc(node, gpa, maximum) catch |err| switch (err) {
+                    error.OutOfMemory, error.FileTooBig => err,
+                    else => error.IoFailed,
+                };
+            },
+        }
+    }
+
+    fn collectCandidates(self: Source, gpa: std.mem.Allocator, executable_name: []const u8, ignore_bundled_drivers: bool, out: *std.ArrayList(Candidate)) !void {
+        switch (self) {
+            .dir => |d| {
+                var walker = try d.directory.walk(gpa);
+                defer walker.deinit();
+                while (try walker.next(d.io)) |entry| {
+                    if (entry.kind != .file or std.ascii.eqlIgnoreCase(entry.path, executable_name)) continue;
+                    if (ignore_bundled_drivers and isBundledShadow(entry.path)) continue;
+                    const extension = std.fs.path.extension(entry.basename);
+                    if (!std.ascii.eqlIgnoreCase(extension, ".prx") and
+                        !std.ascii.eqlIgnoreCase(extension, ".sprx")) continue;
+                    try out.append(gpa, .{ .path = try gpa.dupe(u8, entry.path) });
+                }
+            },
+            .archive => |reader| {
+                var path: std.ArrayList(u8) = .empty;
+                defer path.deinit(gpa);
+                const root = reader.lookup("") orelse return;
+                try collectArchiveChildren(reader, gpa, root, &path, executable_name, ignore_bundled_drivers, out, 0);
+            },
+        }
+        std.mem.sort(Candidate, out.items, {}, candidateLessThan);
+    }
+};
+
+/// Link-time shadows the kernel replaces with real system modules at runtime.
+/// Skipped only under explicit driver-routing policy (see Options).
+fn isBundledShadow(path: []const u8) bool {
+    var rest = path;
+    while (rest.len != 0 and (rest[0] == '/' or rest[0] == '\\')) rest = rest[1..];
+    var end: usize = 0;
+    while (end < rest.len and rest[end] != '/' and rest[end] != '\\') end += 1;
+    return std.ascii.eqlIgnoreCase(rest[0..end], "fakelib");
+}
+
+/// Shared graph assembly behind both content sources.
+fn loadFromSource(
+    gpa: std.mem.Allocator,
+    source: Source,
+    executable_name: []const u8,
+    address_space: *memory.AddressSpace,
+    tls_registry: *loader.TlsRegistry,
+    guest_exports: *loader.GuestExportRegistry,
+    resolver: ?loader.Resolver,
+    options: Options,
+) !ModuleGraph {
     var graph = ModuleGraph{ .allocator = gpa };
     errdefer graph.deinit();
 
@@ -319,13 +433,12 @@ pub fn loadFromDir(
         for (candidates.items) |*candidate| candidate.deinit(gpa);
         candidates.deinit(gpa);
     }
-    try collectCandidates(gpa, io, directory, executable_name, &candidates);
+    try source.collectCandidates(gpa, executable_name, options.ignore_bundled_drivers, &candidates);
 
-    const root_bytes = try directory.readFileAlloc(
-        io,
+    const root_bytes = try source.readAlloc(
         executable_name,
         gpa,
-        .limited(options.maximum_file_size),
+        options.maximum_file_size,
     );
     try appendNode(&graph, executable_name, root_bytes);
 
@@ -338,8 +451,7 @@ pub fn loadFromDir(
             return error.FileNotFound;
         const dependency = try ensureNode(
             &graph,
-            io,
-            directory,
+            source,
             candidates.items[candidate_index].path,
             options.maximum_file_size,
         );
@@ -355,8 +467,7 @@ pub fn loadFromDir(
             return error.FileNotFound;
         const dependency = try ensureNode(
             &graph,
-            io,
-            directory,
+            source,
             candidates.items[candidate_index].path,
             options.maximum_file_size,
         );
@@ -374,8 +485,7 @@ pub fn loadFromDir(
             if (findCandidate(candidates.items, needed, true)) |candidate_index| {
                 const dependency = try ensureNode(
                     &graph,
-                    io,
-                    directory,
+                    source,
                     candidates.items[candidate_index].path,
                     options.maximum_file_size,
                 );
@@ -388,8 +498,7 @@ pub fn loadFromDir(
             if (findCandidate(candidates.items, needed.name, false)) |candidate_index| {
                 const dependency = try ensureNode(
                     &graph,
-                    io,
-                    directory,
+                    source,
                     candidates.items[candidate_index].path,
                     options.maximum_file_size,
                 );
@@ -425,25 +534,6 @@ fn resolvePublishedExport(context: *anyopaque, module_id: u64, name: []const u8)
         registry.resolveInModule(module_id, &id, .no_type);
 }
 
-fn collectCandidates(
-    gpa: std.mem.Allocator,
-    io: std.Io,
-    directory: std.Io.Dir,
-    executable_name: []const u8,
-    out: *std.ArrayList(Candidate),
-) !void {
-    var walker = try directory.walk(gpa);
-    defer walker.deinit();
-    while (try walker.next(io)) |entry| {
-        if (entry.kind != .file or std.ascii.eqlIgnoreCase(entry.path, executable_name)) continue;
-        const extension = std.fs.path.extension(entry.basename);
-        if (!std.ascii.eqlIgnoreCase(extension, ".prx") and
-            !std.ascii.eqlIgnoreCase(extension, ".sprx")) continue;
-        try out.append(gpa, .{ .path = try gpa.dupe(u8, entry.path) });
-    }
-    std.mem.sort(Candidate, out.items, {}, candidateLessThan);
-}
-
 fn candidateLessThan(_: void, left: Candidate, right: Candidate) bool {
     return std.ascii.lessThanIgnoreCase(left.path, right.path);
 }
@@ -475,17 +565,52 @@ fn appendNode(graph: *ModuleGraph, path: []const u8, bytes: []u8) !void {
 
 fn ensureNode(
     graph: *ModuleGraph,
-    io: std.Io,
-    directory: std.Io.Dir,
+    source: Source,
     path: []const u8,
     maximum_file_size: usize,
 ) !usize {
     for (graph.nodes.items, 0..) |node, index| {
         if (std.ascii.eqlIgnoreCase(node.path, path)) return index;
     }
-    const bytes = try directory.readFileAlloc(io, path, graph.allocator, .limited(maximum_file_size));
+    const bytes = try source.readAlloc(path, graph.allocator, maximum_file_size);
     try appendNode(graph, path, bytes);
     return graph.nodes.items.len - 1;
+}
+
+/// Depth-first PRX/SRPX discovery inside an archive dump.
+fn collectArchiveChildren(
+    reader: *zarchive.Reader,
+    gpa: std.mem.Allocator,
+    node: u32,
+    path: *std.ArrayList(u8),
+    executable_name: []const u8,
+    ignore_bundled_drivers: bool,
+    out: *std.ArrayList(Candidate),
+    depth: usize,
+) !void {
+    // Hostile archives nest without bound; game trees stay shallow.
+    if (depth > 64) return;
+    const count = reader.dirChildCount(node);
+    var i: u32 = 0;
+    while (i < count) : (i += 1) {
+        const child = reader.dirChild(node, i);
+        if (child.name.len == 0 or child.name.len > 256) continue;
+        const base = path.items.len;
+        if (base != 0) try path.append(gpa, '/');
+        try path.appendSlice(gpa, child.name);
+        defer path.shrinkRetainingCapacity(base);
+        const child_node = reader.dirChildNode(node, i);
+        if (!child.is_file) {
+            try collectArchiveChildren(reader, gpa, child_node, path, executable_name, ignore_bundled_drivers, out, depth + 1);
+            continue;
+        }
+        if (std.ascii.eqlIgnoreCase(path.items, executable_name)) continue;
+        if (ignore_bundled_drivers and isBundledShadow(path.items)) continue;
+        const extension = std.fs.path.extension(child.name);
+        if (!std.ascii.eqlIgnoreCase(extension, ".prx") and
+            !std.ascii.eqlIgnoreCase(extension, ".sprx")) continue;
+        try out.append(gpa, .{ .path = try gpa.dupe(u8, path.items) });
+    }
 }
 
 fn appendDependency(graph: *ModuleGraph, owner: usize, dependency: usize) !void {
@@ -727,6 +852,68 @@ test "a needed module is discovered recursively and initialized before the execu
     try testing.expectEqualStrings("leaf.prx", graph.nodes.items[2].path);
     try testing.expect(graph.modules()[0] == &graph.nodes.items[2].mapped.?);
     try testing.expect(graph.modules()[1] == &graph.nodes.items[1].mapped.?);
+}
+
+test "bundled shadow drivers are left for firmware when asked" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    var dependency = try minimalImage(testing.allocator, .sce_dynamic, null);
+    defer dependency.deinit(testing.allocator);
+    var executable = try minimalImage(testing.allocator, .sce_dynexec, "dependency");
+    defer executable.deinit(testing.allocator);
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "eboot.bin", .data = executable.bytes() });
+    try tmp.dir.createDirPath(testing.io, "fakelib");
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "fakelib/dependency.prx", .data = dependency.bytes() });
+
+    {
+        var address_space = try memory.AddressSpace.init(testing.allocator);
+        defer address_space.deinit();
+        var tls_registry = loader.TlsRegistry{};
+        defer tls_registry.deinit(testing.allocator);
+        var guest_exports = loader.GuestExportRegistry{};
+        defer guest_exports.deinit(testing.allocator);
+        var graph = try loadFromDir(
+            testing.allocator,
+            testing.io,
+            tmp.dir,
+            "eboot.bin",
+            &address_space,
+            &tls_registry,
+            &guest_exports,
+            null,
+            .{},
+        );
+        defer graph.deinit();
+        try testing.expectEqual(@as(usize, 1), graph.moduleCount());
+        try testing.expect(isBundledShadow(graph.nodes.items[1].path));
+        try testing.expectEqualStrings("dependency.prx", std.fs.path.basename(graph.nodes.items[1].path));
+    }
+
+    // Excluded, the shadow reads as a firmware dependency: the graph holds
+    // only the executable, and the missing import resolves through the
+    // runtime resolver (firmware) instead of a mapped module.
+    {
+        var address_space = try memory.AddressSpace.init(testing.allocator);
+        defer address_space.deinit();
+        var tls_registry = loader.TlsRegistry{};
+        defer tls_registry.deinit(testing.allocator);
+        var guest_exports = loader.GuestExportRegistry{};
+        defer guest_exports.deinit(testing.allocator);
+        var excluded = try loadFromDir(
+            testing.allocator,
+            testing.io,
+            tmp.dir,
+            "eboot.bin",
+            &address_space,
+            &tls_registry,
+            &guest_exports,
+            null,
+            .{ .ignore_bundled_drivers = true },
+        );
+        defer excluded.deinit();
+        try testing.expectEqual(@as(usize, 0), excluded.moduleCount());
+    }
 }
 
 test "a deferred module is linked but omitted from process initialization" {

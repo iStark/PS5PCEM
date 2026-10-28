@@ -14,6 +14,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const input = @import("input");
 const build_options = @import("build_options");
+const zarchive = @import("zarchive");
 const common = @import("launcher_common.zig");
 const display_mode = @import("display_mode.zig");
 const performance_mode = @import("performance_mode.zig");
@@ -1826,6 +1827,86 @@ fn readSmallFile(path: []const u8, buffer: []u8) ?[]const u8 {
     return std.Io.Dir.cwd().readFile(app_io, path, buffer) catch null;
 }
 
+/// Whether a path names a ZArchive dump, by extension.
+fn isZarPath(path: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(std.fs.path.extension(path), ".zar");
+}
+
+/// Opens an archive for a short metadata read. Caller closes.
+fn openHelperArchive(path: []const u8) ?*zarchive.Reader {
+    const dirname = std.fs.path.dirname(path) orelse ".";
+    const basename = std.fs.path.basename(path);
+    var directory = if (std.fs.path.isAbsolute(path))
+        std.Io.Dir.openDirAbsolute(app_io, dirname, .{}) catch return null
+    else
+        std.Io.Dir.cwd().openDir(app_io, dirname, .{}) catch return null;
+    defer directory.close(app_io);
+    return zarchive.Reader.open(app_io, directory, basename, std.heap.smp_allocator) catch null;
+}
+
+/// Whether an archive ships an executable at its root.
+fn archiveHasEboot(path: []const u8) bool {
+    var reader = openHelperArchive(path) orelse return false;
+    defer reader.close();
+    const node = reader.lookup("eboot.bin") orelse return false;
+    return reader.isFile(node);
+}
+
+/// Reads a title parameter document out of an archive dump.
+fn readArchiveParam(path: []const u8, buffer: []u8) ?[]const u8 {
+    var reader = openHelperArchive(path) orelse return null;
+    defer reader.close();
+    const node = reader.lookup("sce_sys/param.json") orelse return null;
+    if (!reader.isFile(node)) return null;
+    if (reader.fileSize(node) > buffer.len) return null;
+    const size = reader.readAt(node, 0, buffer) catch return null;
+    return buffer[0..size];
+}
+
+/// Resolves the current selection to an archive dump: either the selection
+/// itself or the single `.zar` inside the selected folder.
+fn resolveGameArchive(output: []u8) ?[]const u8 {
+    if (game_folder_length == 0) return null;
+    const folder = game_folder[0..game_folder_length];
+    if (isZarPath(folder)) {
+        if (folder.len + 1 > output.len) return null;
+        @memcpy(output[0..folder.len], folder);
+        output[folder.len] = 0;
+        return output[0..folder.len];
+    }
+    return findArchiveInFolder(folder, output);
+}
+
+/// A folder holding exactly one top-level `.zar` dump runs it. Anything else
+/// keeps the classic layout: an extracted title wins over an archive.
+fn findArchiveInFolder(folder: []const u8, output: []u8) ?[]const u8 {
+    var directory = if (std.fs.path.isAbsolute(folder))
+        std.Io.Dir.openDirAbsolute(app_io, folder, .{ .iterate = true }) catch return null
+    else
+        std.Io.Dir.cwd().openDir(app_io, folder, .{ .iterate = true }) catch return null;
+    defer directory.close(app_io);
+    var iterator = directory.iterate();
+    var name_storage: [256]u8 = undefined;
+    var name_length: usize = 0;
+    var count: usize = 0;
+    while (iterator.next(app_io) catch null) |entry| {
+        if (entry.kind != .file or !isZarPath(entry.name)) continue;
+        count += 1;
+        if (count > 1 or entry.name.len > name_storage.len) return null;
+        // entry.name borrows the iterator; copy before continuing.
+        @memcpy(name_storage[0..entry.name.len], entry.name);
+        name_length = entry.name.len;
+    }
+    if (count != 1) return null;
+    const name = name_storage[0..name_length];
+    if (folder.len + 1 + name.len + 1 > output.len) return null;
+    @memcpy(output[0..folder.len], folder);
+    output[folder.len] = '/';
+    @memcpy(output[folder.len + 1 ..][0..name.len], name);
+    output[folder.len + 1 + name.len] = 0;
+    return output[0 .. folder.len + 1 + name.len];
+}
+
 fn pathExists(path: []const u8) bool {
     std.Io.Dir.cwd().access(app_io, path, .{}) catch return false;
     return true;
@@ -1858,6 +1939,18 @@ fn loadRecentGame(folder: []const u8) ?RecentGame {
         if (readSmallFile(parameters, &document)) |bytes| {
             if (common.jsonStringValue(bytes, "\"titleName\"")) |value| game.title_length = copyUtf8(&game.title, value);
             if (common.jsonStringValue(bytes, "\"titleId\"")) |value| game.identifier_length = copyUtf8(&game.identifier, value);
+        }
+    }
+    if (game.identifier_length == 0) {
+        var archive_storage: [1100]u8 = undefined;
+        // A remembered folder may hold an archive instead of an extract.
+        const probe = if (isZarPath(folder)) folder else findArchiveInFolder(folder, &archive_storage);
+        if (probe) |archive| {
+            var document: [8192]u8 = undefined;
+            if (readArchiveParam(archive, &document)) |bytes| {
+                if (common.jsonStringValue(bytes, "\"titleName\"")) |value| game.title_length = copyUtf8(&game.title, value);
+                if (common.jsonStringValue(bytes, "\"titleId\"")) |value| game.identifier_length = copyUtf8(&game.identifier, value);
+            }
         }
     }
     if (game.title_length == 0) game.title_length = copyUtf8(&game.title, folder[baseNameStart(folder)..]);
@@ -1940,6 +2033,19 @@ fn refreshTitleIdentifier() void {
     title_identifier_length = 0;
     invalidateSaves();
     if (game_folder_length == 0) return;
+    // Use metadata from the same source selected by findGameExecutable:
+    // extracted titles take precedence over an archive in the same folder.
+    var executable_storage: [1100]u8 = undefined;
+    const executable = findGameExecutable(&executable_storage) orelse return;
+    var archive_storage: [1100]u8 = undefined;
+    if (isZarPath(executable)) {
+        const archive = resolveGameArchive(&archive_storage) orelse return;
+        var document: [8192]u8 = undefined;
+        const bytes = readArchiveParam(archive, &document) orelse return;
+        const value = common.jsonStringValue(bytes, "\"titleId\"") orelse return;
+        title_identifier_length = copyUtf8(title_identifier[0 .. title_identifier.len - 1], value);
+        return;
+    }
     var path: [1100]u8 = undefined;
     const parameters = childPath(&path, game_folder[0..game_folder_length], "/sce_sys/param.json") orelse return;
     var document: [8192]u8 = undefined;
@@ -1954,7 +2060,15 @@ fn findGameExecutable(output: []u8) ?[:0]const u8 {
         const path = childPath(output, game_folder[0..game_folder_length], suffix) orelse continue;
         if (pathExists(path)) return path;
     }
-    return null;
+    // No extracted executable: a lone archive dump in the folder runs
+    // directly, after proving it ships an executable.
+    var archive_storage: [1100]u8 = undefined;
+    const archive = resolveGameArchive(&archive_storage) orelse return null;
+    if (!archiveHasEboot(archive)) return null;
+    if (archive.len + 1 > output.len) return null;
+    @memcpy(output[0..archive.len], archive);
+    output[archive.len] = 0;
+    return output[0..archive.len :0];
 }
 
 // ---------------------------------------------------------------------------
@@ -2175,11 +2289,22 @@ fn launchGame() void {
     var folder_storage: [1025]u8 = undefined;
     @memcpy(folder_storage[0..game_folder_length], game_folder[0..game_folder_length]);
     folder_storage[game_folder_length] = 0;
-    const argv = [_:null]?[*:0]const u8{ runner.ptr, "--app0", @ptrCast(&folder_storage), executable.ptr };
+    // Archive dumps run as a single argument; directories keep --app0.
+    var argv_storage: [4:null]?[*:0]const u8 = .{ runner.ptr, null, null, null };
+    var argv_len: usize = 1;
+    if (!isZarPath(executable[0..executable.len])) {
+        argv_storage[argv_len] = "--app0";
+        argv_len += 1;
+        // NUL-terminated at game_folder_length just above.
+        argv_storage[argv_len] = @ptrCast(&folder_storage);
+        argv_len += 1;
+    }
+    argv_storage[argv_len] = executable.ptr;
     var failure: ?*GError = null;
     // Without DO_NOT_REAP_CHILD GLib reaps the runner itself, so a game that
     // exits leaves no zombie behind the launcher.
-    if (native.g_spawn_async(@ptrCast(&home_storage), &argv, null, 0, null, null, null, &failure) == 0) {
+    // home_storage is NUL-terminated where the home path is built.
+    if (native.g_spawn_async(@ptrCast(&home_storage), &argv_storage, null, 0, null, null, null, &failure) == 0) {
         var line: [256]u8 = undefined;
         const reason: []const u8 = if (failure) |value| std.mem.span(value.message orelse "") else "";
         setStatus(std.fmt.bufPrint(&line, "{s} · {s}", .{ tr(.status_launch_failed), reason }) catch tr(.status_launch_failed), true);

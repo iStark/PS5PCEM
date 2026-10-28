@@ -1895,6 +1895,36 @@ fn sceKernelClearVirtualRangeName(address: u64, len: u64) callconv(abi.guest) i3
     return sceKernelSetVirtualRangeName(address, len, "");
 }
 
+/// Sparse PRT windows published per index, mirroring the validation in the
+/// reference kernel: indexes 0..2, 16 KiB-aligned address and length inside
+/// the GPU window. Nothing consumes them yet; recording keeps a later sparse
+/// mapper from guessing what the title chose.
+const prt_page_size: u64 = 0x4000;
+const prt_aperture_start: u64 = 0x0f00000000;
+const prt_aperture_end: u64 = 0xfc00000000;
+const maximum_prt_aperture: usize = 3;
+
+const PrtAperture = struct { address: u64 = 0, size: u64 = 0 };
+
+var prt_apertures: [maximum_prt_aperture]PrtAperture = .{ .{}, .{}, .{} };
+
+fn sceKernelSetPrtAperture(index: i32, address: u64, len: u64) callconv(abi.guest) i32 {
+    if (index < 0 or index >= maximum_prt_aperture) return KernelError.einval.raw();
+    if (len != 0) {
+        if (address == 0 or
+            address & (prt_page_size - 1) != 0 or
+            len & (prt_page_size - 1) != 0 or
+            address < prt_aperture_start or
+            address >= prt_aperture_end or
+            len > prt_aperture_end - address) return KernelError.einval.raw();
+    }
+    pool_lock.lock();
+    defer pool_lock.unlock();
+    // index validated 0..maximum_prt_aperture above.
+    prt_apertures[@intCast(index)] = if (len == 0) .{} else .{ .address = address, .size = len };
+    return errno.ok;
+}
+
 fn sceKernelReserveVirtualRange(
     out_address: ?*u64,
     len: u64,
@@ -2400,6 +2430,11 @@ pub const exports = [_]symbols.Export{
         .name = "sceKernelReserveVirtualRange",
         .function = trace.wrap("sceKernelReserveVirtualRange", &sceKernelReserveVirtualRange),
         .expect_id = "7oxv3PPCumo",
+    },
+    .{
+        .name = "sceKernelSetPrtAperture",
+        .function = trace.wrap("sceKernelSetPrtAperture", &sceKernelSetPrtAperture),
+        .expect_id = "BohYr-F7-is",
     },
 };
 
@@ -3997,4 +4032,22 @@ test "contiguous runs stop at every discontinuity a combined mapping would hide"
     // A run of one is what a lone entry reports, and the length never exceeds
     // the slice it was given.
     try std.testing.expectEqual(@as(usize, 1), contiguousRun(adjacent[2..]));
+}
+
+test "PRT aperture validates and records the sparse window" {
+    var db = symbols.Database{};
+    defer db.deinit(testing.allocator);
+    try register(&db, testing.allocator);
+    const symbol = db.findById("BohYr-F7-is", .function) orelse return error.MissingPrtAperture;
+    try testing.expectEqualStrings("libkernel", symbol.key.library.name);
+    const set: *const fn (i32, u64, u64) callconv(abi.guest) i32 = @ptrFromInt(symbol.address);
+    try testing.expectEqual(KernelError.einval.raw(), set(-1, 0x1000000000, 0x4000));
+    try testing.expectEqual(KernelError.einval.raw(), set(3, 0x1000000000, 0x4000));
+    try testing.expectEqual(KernelError.einval.raw(), set(0, 0x1000000001, 0x4000));
+    try testing.expectEqual(KernelError.einval.raw(), set(0, 0x1000000000, 0x4001));
+    // The exact window Demon's Souls publishes at startup.
+    try testing.expectEqual(errno.ok, set(0, 0x1000000000, 0xec00000000));
+    try testing.expectEqual(errno.ok, set(0, 0, 0));
+    try testing.expectEqual(errno.ok, set(2, 0x0f00000000, 0x4000));
+    try testing.expectEqual(errno.ok, set(2, 0, 0));
 }

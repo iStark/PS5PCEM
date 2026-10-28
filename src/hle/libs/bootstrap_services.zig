@@ -108,7 +108,7 @@ fn amprCommandBufferReset(address: u64) callconv(abi.guest) i32 {
 fn amprCommandBufferClearBuffer(address: u64) callconv(abi.guest) u64 {
     if (!kernel_memory.isGuestRangeAccessible(address, ampr_command_buffer_header_size)) return 0;
     const storage_address = readGuestU64(address + 0x08);
-    apr.destroyCommandBuffer(address) catch {};
+    apr.clearCommandBuffer(address) catch {};
     writeGuestU64(address + 0x00, address);
     writeGuestU64(address + 0x08, 0);
     writeGuestU64(address + 0x10, 0);
@@ -1866,6 +1866,12 @@ fn npGetReachabilityState(user_id: i32, output: ?*u32) callconv(abi.guest) i32 {
     return errno.ok;
 }
 
+fn npSetNpTitleId(title_id: ?*const anyopaque, secret: ?*const anyopaque) callconv(abi.guest) i32 {
+    // Offline registration is a no-op: no PSN session exists to attach the id to.
+    if (title_id == null or secret == null) return invalid_argument;
+    return errno.ok;
+}
+
 fn availableSpace(_: u32, output: ?*u64) callconv(abi.guest) i32 {
     const value = output orelse return invalid_argument;
     value.* = 1024 * 1024;
@@ -2462,6 +2468,7 @@ const np_manager_exports = [_]symbols.Export{
     .{ .name = "sceNpGetAccountCountryA", .function = trace.wrap("sceNpGetAccountCountryA", &npGetAccountCountry), .expect_id = "JT+t00a3TxA" },
     .{ .name = "sceNpGetState", .function = trace.wrap("sceNpGetState", &npGetState), .expect_id = "eQH7nWPcAgc" },
     .{ .name = "sceNpGetNpReachabilityState", .function = trace.wrap("sceNpGetNpReachabilityState", &npGetReachabilityState), .expect_id = "e-ZuhGEoeC4" },
+    .{ .name = "sceNpSetNpTitleId", .function = trace.wrap("sceNpSetNpTitleId", &npSetNpTitleId), .expect_id = "Ec63y59l9tw" },
 };
 
 const remoteplay_exports = [_]symbols.Export{
@@ -6293,6 +6300,11 @@ test "NP manager exposes a consistent local offline profile" {
     try std.testing.expectEqual(invalid_argument, npGetAccountCountry(-1, &country));
     try std.testing.expectEqual(invalid_argument, npGetState(1, null));
     try std.testing.expectEqual(invalid_argument, npGetReachabilityState(-1, &reachability));
+    var title_id: u8 = 0;
+    var secret: u8 = 0;
+    try std.testing.expectEqual(errno.ok, npSetNpTitleId(&title_id, &secret));
+    try std.testing.expectEqual(invalid_argument, npSetNpTitleId(null, &secret));
+    try std.testing.expectEqual(invalid_argument, npSetNpTitleId(&title_id, null));
 }
 
 test "bootstrap service libraries register the title link surface" {

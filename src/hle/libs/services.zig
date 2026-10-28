@@ -568,6 +568,19 @@ test "an absent service reports absence rather than success" {
     try testing.expectEqual(errno.ok, accept(0, 0, 0, 0, 0, 0));
 }
 
+test "JpegEnc imports link without reporting nonexistent encoder contexts" {
+    var db = symbols.Database{};
+    defer db.deinit(testing.allocator);
+    try register(&db, testing.allocator);
+    for ([_]*const [11:0]u8{ "o6ZgXfFdWXQ", "K+rocojkr-I", "j1LyMdaM+C0", "QbrU0cUghEM" }) |id| {
+        const symbol = db.findById(id, .function) orelse return error.MissingJpegEncExport;
+        try testing.expectEqualStrings("libSceJpegEnc", symbol.key.library.name);
+        try testing.expectEqualStrings("libSceJpegEnc", symbol.key.module.name);
+        const entry: *const @TypeOf(accept) = @ptrFromInt(symbol.address);
+        try testing.expect(entry(0, 0, 0, 0, 0, 0) < 0);
+    }
+}
+
 test "VoiceQoS connection attributes link and preserve caller memory while offline" {
     var db = symbols.Database{};
     defer db.deinit(testing.allocator);

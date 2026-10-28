@@ -2632,10 +2632,18 @@ fn launchGame(owner: Win32.Window) void {
     var length: usize = 0;
     appendWide(&command, &length, w("\""));
     appendWideSlice(&command, &length, runner[0..runner_len]);
-    appendWide(&command, &length, w("\" --app0 \""));
-    appendWideSlice(&command, &length, game_folder[0..game_folder_length]);
-    appendWide(&command, &length, w("\" \""));
-    appendWideSlice(&command, &length, executable[0..wideLength(@ptrCast(&executable))]);
+    // findGameExecutable returns NUL-terminated paths.
+    const executable_length = wideLength(@ptrCast(&executable));
+    // Archive dumps run as a single argument; directories keep --app0.
+    if (wideEndsWithZar(executable[0..executable_length])) {
+        appendWide(&command, &length, w("\" \""));
+        appendWideSlice(&command, &length, executable[0..executable_length]);
+    } else {
+        appendWide(&command, &length, w("\" --app0 \""));
+        appendWideSlice(&command, &length, game_folder[0..game_folder_length]);
+        appendWide(&command, &length, w("\" \""));
+        appendWideSlice(&command, &length, executable[0..executable_length]);
+    }
     appendWide(&command, &length, w("\""));
     command[length] = 0;
 
@@ -2730,6 +2738,70 @@ fn appendUtf8(output: []u16, length: *usize, value: []const u8) void {
     length.* += written;
 }
 
+fn wideEndsWithZar(name: []const u16) bool {
+    if (name.len < 4) return false;
+    const tail = name[name.len - 4 ..];
+    return (tail[0] == '.' and
+        (tail[1] == 'z' or tail[1] == 'Z') and
+        (tail[2] == 'a' or tail[2] == 'A') and
+        (tail[3] == 'r' or tail[3] == 'R'));
+}
+
+/// A folder holding exactly one top-level `.zar` dump runs it. Anything else
+/// keeps the classic layout: an extracted title wins over an archive.
+fn findArchiveInFolder(output: *[1024]u16) bool {
+    const pattern = w("*.zar");
+    const pattern_length = wideLength(pattern);
+    var search: [1024]u16 = @splat(0);
+    if (game_folder_length + 1 + pattern_length >= search.len) return false;
+    @memcpy(search[0..game_folder_length], game_folder[0..game_folder_length]);
+    var length = game_folder_length;
+    if (length == 0 or (search[length - 1] != '\\' and search[length - 1] != '/')) {
+        search[length] = '\\';
+        length += 1;
+    }
+    @memcpy(search[length..][0..pattern_length], pattern[0..pattern_length]);
+    length += pattern_length;
+    search[length] = 0;
+
+    var found: Win32.FindData = undefined;
+    // search is NUL-terminated at length, bounds-checked above.
+    const handle = Win32.FindFirstFileW(@ptrCast(&search), &found);
+    if (@intFromPtr(handle) == Win32.invalid_handle) return false;
+    defer _ = Win32.FindClose(handle);
+
+    var name: [260]u16 = @splat(0);
+    var name_length: usize = 0;
+    var count: usize = 0;
+    while (true) {
+        const is_directory = found.attributes & Win32.file_attribute_directory != 0;
+        // The OS NUL-terminates the fixed FindData name buffer.
+        const entry_length = wideLength(@ptrCast(&found.name));
+        if (!is_directory and entry_length != 0 and wideEndsWithZar(found.name[0..entry_length])) {
+            count += 1;
+            if (count > 1) return false;
+            @memcpy(name[0..entry_length], found.name[0..entry_length]);
+            name[entry_length] = 0;
+            name_length = entry_length;
+        }
+        if (Win32.FindNextFileW(handle, &found) == 0) break;
+    }
+    if (count != 1) return false;
+
+    @memset(output, 0);
+    @memcpy(output[0..game_folder_length], game_folder[0..game_folder_length]);
+    var out_length = game_folder_length;
+    if (out_length == 0 or (output[out_length - 1] != '\\' and output[out_length - 1] != '/')) {
+        output[out_length] = '\\';
+        out_length += 1;
+    }
+    if (out_length + name_length >= output.len) return false;
+    @memcpy(output[out_length..][0..name_length], name[0..name_length]);
+    out_length += name_length;
+    output[out_length] = 0;
+    return true;
+}
+
 fn findGameExecutable(output: *[1024]u16) bool {
     const suffixes = [_][]const u8{ "\\eboot.bin", "\\decrypted\\eboot.bin", "\\sce_sys\\eboot.bin" };
     for (suffixes) |suffix| {
@@ -2741,9 +2813,20 @@ fn findGameExecutable(output: *[1024]u16) bool {
         @memcpy(output[length..][0..suffix_length], converted[0..suffix_length]);
         length += suffix_length;
         output[length] = 0;
+        // output is NUL-terminated at length just above.
         if (Win32.GetFileAttributesW(@ptrCast(output)) != Win32.invalid_file_attributes) return true;
     }
-    return false;
+    // No extracted executable: the selection itself may be an archive dump,
+    // or the folder holds exactly one. game-run reports a missing eboot.
+    if (wideEndsWithZar(game_folder[0..game_folder_length])) {
+        // game_folder stays NUL-terminated through length-checked writes.
+        if (Win32.GetFileAttributesW(@ptrCast(&game_folder)) == Win32.invalid_file_attributes) return false;
+        @memset(output, 0);
+        @memcpy(output[0..game_folder_length], game_folder[0..game_folder_length]);
+        output[game_folder_length] = 0;
+        return true;
+    }
+    return findArchiveInFolder(output);
 }
 
 fn openGithub(owner: Win32.Window) void {
