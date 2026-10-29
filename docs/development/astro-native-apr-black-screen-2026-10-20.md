@@ -1,5 +1,11 @@
 # ASTRO BOT: native APR asset loading — October 20, 2026
 
+**October 29 update:** the latest report disproves the counted-zero-word
+assumption below. The native buffer contains 20 zero bytes for one announced
+command. Zero storage is no longer accepted as NOPs. A selective HLE comparison
+is available; **PPSA21567 startup is still unconfirmed**. See the
+[follow-up and retest instructions](astro-native-apr-followup-2026-10-29.md).
+
 Follow-up to [issue #8](https://github.com/iStark/PS5PCEM/issues/8) and the
 [AMPR kernel import fix](astro-ampr-kernel-imports-2026-10-20.md).
 The reporter confirmed that PPSA21567 now links, but provided a log in which

@@ -52,6 +52,7 @@ const usage =
     \\archive-relative executable as the last argument. Direct execution requires Windows or Linux x86-64.
     \\PS5_GRAPHICS_API=vulkan|d3d12 selects the renderer. D3D12 is experimental and Windows-only.
     \\PS5_FPS_LIMIT=30|60|120|0 caps completed flips; 0 or unset leaves them uncapped.
+    \\PS5_HLE_BUNDLED_MODULES=libSceAmpr.sprx selects firmware for named fakelib modules (semicolon-separated).
     \\
 ;
 
@@ -585,6 +586,30 @@ fn run(init: std.process.Init) !bool {
         try out.flush();
     }
 
+    var firmware_bundled_modules: std.ArrayList([]const u8) = .empty;
+    defer firmware_bundled_modules.deinit(allocator);
+    var firmware_modules_text: ?[]u8 = null;
+    defer if (firmware_modules_text) |text| allocator.free(text);
+    if (init.minimal.environ.getAlloc(allocator, "PS5_HLE_BUNDLED_MODULES")) |text| {
+        firmware_modules_text = text;
+        var parts = std.mem.splitScalar(u8, text, ';');
+        while (parts.next()) |part| {
+            const name = std.mem.trim(u8, part, " \t\r\n");
+            if (name.len == 0) continue;
+            const extension = std.fs.path.extension(name);
+            if (std.mem.indexOfAny(u8, name, "/\\:") != null or
+                (!std.ascii.eqlIgnoreCase(extension, ".prx") and !std.ascii.eqlIgnoreCase(extension, ".sprx")))
+            {
+                try stderr.print("Invalid PS5_HLE_BUNDLED_MODULES entry '{s}': use a .prx/.sprx basename\n", .{name});
+                try stderr.flush();
+                return false;
+            }
+            try firmware_bundled_modules.append(allocator, name);
+            try out.print("  Drivers  firmware requested for fakelib/{s}\n", .{name});
+        }
+        try out.flush();
+    } else |_| {}
+
     var preload_modules: std.ArrayList([]const u8) = .empty;
     defer preload_modules.deinit(allocator);
     var preload_text: ?[]u8 = null;
@@ -627,6 +652,7 @@ fn run(init: std.process.Init) !bool {
             .preload_modules = preload_modules.items,
             .deferred_modules = deferred_modules.items,
             .ignore_bundled_drivers = ignore_bundled_drivers,
+            .firmware_bundled_modules = firmware_bundled_modules.items,
             .diagnostics = .{ .context = stderr, .unresolved_fn = &reportUnresolvedImport },
         }) catch |err| {
             try stderr.print("cannot link {s} in {s}: {s}\n", .{ archive_executable, archive_path.?, @errorName(err) });
@@ -638,6 +664,7 @@ fn run(init: std.process.Init) !bool {
             .preload_modules = preload_modules.items,
             .deferred_modules = deferred_modules.items,
             .ignore_bundled_drivers = ignore_bundled_drivers,
+            .firmware_bundled_modules = firmware_bundled_modules.items,
             .diagnostics = .{ .context = stderr, .unresolved_fn = &reportUnresolvedImport },
         }) catch |err| {
             try stderr.print("cannot link {s}: {s}\n", .{ executable_path, @errorName(err) });

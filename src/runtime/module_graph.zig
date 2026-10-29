@@ -40,6 +40,10 @@ pub const Options = struct {
     /// Titles whose bundled drivers do run (Little Nightmares) keep the
     /// default. Prefer extending firmware coverage over widening this flag.
     ignore_bundled_drivers: bool = false,
+    /// Explicit basenames of individual fakelib modules to resolve through
+    /// firmware. Other bundled drivers and title-owned modules stay mapped.
+    /// An uncovered import still fails linking; this does not invent exports.
+    firmware_bundled_modules: []const []const u8 = &.{},
     diagnostics: ?Diagnostics = null,
 };
 
@@ -379,14 +383,14 @@ const Source = union(enum) {
         }
     }
 
-    fn collectCandidates(self: Source, gpa: std.mem.Allocator, executable_name: []const u8, ignore_bundled_drivers: bool, out: *std.ArrayList(Candidate)) !void {
+    fn collectCandidates(self: Source, gpa: std.mem.Allocator, executable_name: []const u8, options: Options, out: *std.ArrayList(Candidate)) !void {
         switch (self) {
             .dir => |d| {
                 var walker = try d.directory.walk(gpa);
                 defer walker.deinit();
                 while (try walker.next(d.io)) |entry| {
                     if (entry.kind != .file or std.ascii.eqlIgnoreCase(entry.path, executable_name)) continue;
-                    if (ignore_bundled_drivers and isBundledShadow(entry.path)) continue;
+                    if (useFirmwareForShadow(entry.path, options)) continue;
                     const extension = std.fs.path.extension(entry.basename);
                     if (!std.ascii.eqlIgnoreCase(extension, ".prx") and
                         !std.ascii.eqlIgnoreCase(extension, ".sprx")) continue;
@@ -397,7 +401,7 @@ const Source = union(enum) {
                 var path: std.ArrayList(u8) = .empty;
                 defer path.deinit(gpa);
                 const root = reader.lookup("") orelse return;
-                try collectArchiveChildren(reader, gpa, root, &path, executable_name, ignore_bundled_drivers, out, 0);
+                try collectArchiveChildren(reader, gpa, root, &path, executable_name, options, out, 0);
             },
         }
         std.mem.sort(Candidate, out.items, {}, candidateLessThan);
@@ -412,6 +416,17 @@ fn isBundledShadow(path: []const u8) bool {
     var end: usize = 0;
     while (end < rest.len and rest[end] != '/' and rest[end] != '\\') end += 1;
     return std.ascii.eqlIgnoreCase(rest[0..end], "fakelib");
+}
+
+fn useFirmwareForShadow(path: []const u8, options: Options) bool {
+    if (!isBundledShadow(path)) return false;
+    if (options.ignore_bundled_drivers) return true;
+    const last_separator = std.mem.lastIndexOfAny(u8, path, "/\\") orelse return false;
+    const basename = path[last_separator + 1 ..];
+    for (options.firmware_bundled_modules) |name| {
+        if (std.ascii.eqlIgnoreCase(basename, name)) return true;
+    }
+    return false;
 }
 
 /// Shared graph assembly behind both content sources.
@@ -433,7 +448,7 @@ fn loadFromSource(
         for (candidates.items) |*candidate| candidate.deinit(gpa);
         candidates.deinit(gpa);
     }
-    try source.collectCandidates(gpa, executable_name, options.ignore_bundled_drivers, &candidates);
+    try source.collectCandidates(gpa, executable_name, options, &candidates);
 
     const root_bytes = try source.readAlloc(
         executable_name,
@@ -584,7 +599,7 @@ fn collectArchiveChildren(
     node: u32,
     path: *std.ArrayList(u8),
     executable_name: []const u8,
-    ignore_bundled_drivers: bool,
+    options: Options,
     out: *std.ArrayList(Candidate),
     depth: usize,
 ) !void {
@@ -601,11 +616,11 @@ fn collectArchiveChildren(
         defer path.shrinkRetainingCapacity(base);
         const child_node = reader.dirChildNode(node, i);
         if (!child.is_file) {
-            try collectArchiveChildren(reader, gpa, child_node, path, executable_name, ignore_bundled_drivers, out, depth + 1);
+            try collectArchiveChildren(reader, gpa, child_node, path, executable_name, options, out, depth + 1);
             continue;
         }
         if (std.ascii.eqlIgnoreCase(path.items, executable_name)) continue;
-        if (ignore_bundled_drivers and isBundledShadow(path.items)) continue;
+        if (useFirmwareForShadow(path.items, options)) continue;
         const extension = std.fs.path.extension(child.name);
         if (!std.ascii.eqlIgnoreCase(extension, ".prx") and
             !std.ascii.eqlIgnoreCase(extension, ".sprx")) continue;
@@ -893,7 +908,10 @@ test "bundled shadow drivers are left for firmware when asked" {
     // Excluded, the shadow reads as a firmware dependency: the graph holds
     // only the executable, and the missing import resolves through the
     // runtime resolver (firmware) instead of a mapped module.
-    {
+    for ([_]Options{
+        .{ .ignore_bundled_drivers = true },
+        .{ .firmware_bundled_modules = &.{"dependency.prx"} },
+    }) |options| {
         var address_space = try memory.AddressSpace.init(testing.allocator);
         defer address_space.deinit();
         var tls_registry = loader.TlsRegistry{};
@@ -909,11 +927,21 @@ test "bundled shadow drivers are left for firmware when asked" {
             &tls_registry,
             &guest_exports,
             null,
-            .{ .ignore_bundled_drivers = true },
+            options,
         );
         defer excluded.deinit();
         try testing.expectEqual(@as(usize, 0), excluded.moduleCount());
     }
+}
+
+test "individual firmware shadow selection preserves other drivers and title modules" {
+    const options: Options = .{ .firmware_bundled_modules = &.{"libSceAmpr.sprx"} };
+    try testing.expect(useFirmwareForShadow("fakelib/libSceAmpr.sprx", options));
+    try testing.expect(useFirmwareForShadow("FAKELIB\\LIBSCEAMPR.SPRX", options));
+    try testing.expect(!useFirmwareForShadow("fakelib/libSceAgcDriver.sprx", options));
+    try testing.expect(!useFirmwareForShadow("sce_module/libSceAmpr.sprx", options));
+    try testing.expect(!useFirmwareForShadow("plugins/fakelib/libSceAmpr.sprx", options));
+    try testing.expect(!useFirmwareForShadow("fakelib/libSceAmpr.sprx", .{}));
 }
 
 test "a deferred module is linked but omitted from process initialization" {

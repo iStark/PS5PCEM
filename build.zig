@@ -920,6 +920,12 @@ pub fn build(b: *std.Build) void {
     }
 
     const test_filter = b.option([]const u8, "test-filter", "Run only tests whose names contain this text");
+    const runtime_tests = b.addTest(.{
+        .root_module = runtime,
+        .filters = if (test_filter) |filter| &.{filter} else &.{},
+    });
+    if (target.result.os.tag == .linux) runtime_tests.pie = true;
+    b.step("test-runtime", "Run runtime and module graph tests").dependOn(&b.addRunArtifact(runtime_tests).step);
     const hle_tests = b.addTest(.{
         .root_module = hle,
         .filters = if (test_filter) |filter| &.{filter} else &.{},
