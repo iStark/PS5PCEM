@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Artur Strazewicz
 
-//! Extracts metadata from a PS5 debug package (FPKG / `\x7FFIH`).
+//! Extracts PS5 debug packages (FPKG / `\x7FFIH`) and ZArchive game dumps.
 //!
 //! Usage:
-//!   pkgextractor <game.pkg> [-o <output-dir>]
+//!   pkgextractor <game.pkg|game.zar> [-o <output-dir>]
 //!
 //! Unencrypted CNT entries (param.json, icons, PlayGo tables, trophies) are
 //! written under `sce_sys/`. Debug / passcode packages also unpack
@@ -14,16 +14,41 @@
 
 const std = @import("std");
 const pkg = @import("pkg");
+const zarchive = @import("zarchive");
 
 const usage =
-    \\pkgextractor <game.pkg> [-o <output-dir>]
+    \\pkgextractor <game.pkg|game.zar> [-o <output-dir>]
     \\
     \\Reads a PS5 debug package (FIH FPKG) and writes unencrypted metadata
     \\into output-dir/sce_sys plus inner application files (eboot.bin,
     \\sce_module/*.prx, keystone, and uroot payloads) from the nested PFS.
     \\Retail packages cannot be extracted.
+    \\ZAR archives are streamed into a new output directory (no overwrite).
     \\
 ;
+
+fn extractZar(io: std.Io, input: []const u8, output: []const u8) !void {
+    const reader = zarchive.Reader.open(io, .cwd(), input, std.heap.page_allocator) catch |err| {
+        std.debug.print("cannot open ZAR {s}: {s}\n", .{ input, @errorName(err) });
+        return err;
+    };
+    defer reader.close();
+    var context: u8 = 0;
+    const result = reader.extract(.cwd(), output, .{ .context = &context, .update = zarProgress }) catch |err| {
+        if (err == error.PathAlreadyExists) {
+            std.debug.print("ZAR output already exists: {s}\nChoose a new output directory with -o; existing files are not overwritten.\n", .{output});
+        } else {
+            std.debug.print("ZAR extraction failed ({s}); output at {s} may be incomplete\n", .{ @errorName(err), output });
+        }
+        return err;
+    };
+    std.debug.print("extracted {d} file(s), {d} bytes to {s}\n", .{ result.files, result.bytes, output });
+}
+
+fn zarProgress(_: *anyopaque, path: []const u8, done: u64, total: u64) void {
+    if (path.len != 0) std.debug.print("  {s}\n", .{path});
+    std.debug.print("progress {d} {d}\n", .{ done, total });
+}
 
 const WriteCtx = struct {
     dest: std.Io.Dir,
@@ -110,6 +135,9 @@ pub fn main(init: std.process.Init) !void {
         return error.InvalidUsage;
     };
     const dest_path = out_path orelse try defaultOutputPath(arena, input);
+    if (std.ascii.eqlIgnoreCase(std.fs.path.extension(input), ".zar")) {
+        return extractZar(io, input, dest_path);
+    }
 
     var file = std.Io.Dir.cwd().openFile(io, input, .{ .mode = .read_only }) catch |err| {
         try stderr.print("cannot open {s}: {s}\n", .{ input, @errorName(err) });

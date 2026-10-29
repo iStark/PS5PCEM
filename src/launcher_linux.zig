@@ -517,9 +517,10 @@ const nav_rects = [_]Rect{
     .{ .left = 20, .top = 680, .right = 202, .bottom = 724 },
 };
 
-const library_browse_rect = Rect{ .left = 282, .top = 646, .right = 500, .bottom = 700 };
-const library_extract_rect = Rect{ .left = 516, .top = 646, .right = 760, .bottom = 700 };
-const library_launch_rect = Rect{ .left = 776, .top = 646, .right = 1086, .bottom = 700 };
+const library_browse_rect = Rect{ .left = 282, .top = 646, .right = 474, .bottom = 700 };
+const library_extract_rect = Rect{ .left = 486, .top = 646, .right = 678, .bottom = 700 };
+const library_extract_zar_rect = Rect{ .left = 690, .top = 646, .right = 882, .bottom = 700 };
+const library_launch_rect = Rect{ .left = 894, .top = 646, .right = 1086, .bottom = 700 };
 // Same groups as the Windows library card: folder, graphics API, frame limit.
 const library_frame_limit_rects = [_]Rect{
     .{ .left = 764, .top = 571, .right = 814, .bottom = 611 },
@@ -723,6 +724,7 @@ fn clickableAt(x: i32, y: i32) bool {
             libraryDotAt(x, y) != null or
             library_browse_rect.contains(x, y) or
             (extract_state != .running and library_extract_rect.contains(x, y)) or
+            (extract_state != .running and library_extract_zar_rect.contains(x, y)) or
             (extractFinished() and extract_panel_rect.contains(x, y)) or
             (extract_state != .idle and extract_copy_rect.contains(x, y)) or
             library_launch_rect.contains(x, y),
@@ -980,7 +982,8 @@ fn handleLibraryClick(x: i32, y: i32) void {
         return;
     }
     if (library_browse_rect.contains(x, y)) chooseGameFolder();
-    if (library_extract_rect.contains(x, y) and extract_state != .running) extractPackage();
+    if (library_extract_rect.contains(x, y) and extract_state != .running) extractPackage(.pkg);
+    if (library_extract_zar_rect.contains(x, y) and extract_state != .running) extractPackage(.zar);
     if (library_launch_rect.contains(x, y)) launchGame();
 }
 
@@ -1243,6 +1246,7 @@ fn drawLibrary(cr: *anyopaque) void {
 
     button(cr, library_browse_rect, .choose_folder, false);
     button(cr, library_extract_rect, .extract_pkg, extract_state == .running);
+    button(cr, library_extract_zar_rect, .extract_zar, extract_state == .running);
     drawLegalNotice(cr);
     button(cr, library_launch_rect, .launch_game, game_folder_length == 0);
 }
@@ -2210,9 +2214,10 @@ fn chooseFile(title: Phrase, action: c_int, pattern: ?[*:0]const u8, output: []u
     defer native.g_object_unref(dialog);
     if (pattern) |glob| {
         if (native.gtk_file_filter_new()) |filter| {
-            native.gtk_file_filter_set_name(filter, "PS5 PKG (*.pkg)");
+            const zar = title == .extract_zar_dialog;
+            native.gtk_file_filter_set_name(filter, if (zar) "ZArchive (*.zar)" else "PS5 PKG (*.pkg)");
             native.gtk_file_filter_add_pattern(filter, glob);
-            native.gtk_file_filter_add_pattern(filter, "*.PKG");
+            native.gtk_file_filter_add_pattern(filter, if (zar) "*.[zZ][aA][rR]" else "*.[pP][kK][gG]");
             native.gtk_file_chooser_add_filter(dialog, filter);
         }
     }
@@ -2342,7 +2347,7 @@ fn buildKeymap(output: *[512]u8) ?[:0]const u8 {
 // ---------------------------------------------------------------------------
 // Package extraction.
 
-fn extractPackage() void {
+fn extractPackage(format: common.ExtractFormat) void {
     var extractor_storage: [1100]u8 = undefined;
     const extractor = siblingExecutable("pkgextractor", &extractor_storage) orelse {
         setStatusPhrase(.status_extractor_missing, true);
@@ -2353,7 +2358,7 @@ fn extractPackage() void {
         return;
     }
     var package_storage: [1024]u8 = undefined;
-    const package = chooseFile(.extract_pkg_dialog, file_chooser_open, "*.pkg", &package_storage) orelse return;
+    const package = chooseFile(format.dialog(), file_chooser_open, if (format == .zar) "*.zar" else "*.pkg", &package_storage) orelse return;
 
     // The output folder is the package path without its extension.
     const dot = std.mem.lastIndexOfScalar(u8, package, '.');

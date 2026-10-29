@@ -50,6 +50,29 @@ the publishing script requires all six packages and matching SHA-256 entries.
 
 ## Usage
 
+### Extracting game content
+
+Both launchers have separate **Extract PKG** and **Extract ZAR** buttons in the
+library. Each opens a file chooser for that format and runs `pkgextractor` with
+live progress and a copyable log. Successful extraction selects the output
+folder and adds it to the library; a missing `eboot.bin` is reported explicitly.
+
+```sh
+pkgextractor game.pkg
+pkgextractor game.zar
+pkgextractor game.zar -o another-output-folder
+```
+
+The default output is beside the input, with its extension removed. ZAR files
+are streamed in 64 KiB chunks, including raw and zstd-compressed blocks. ZAR
+extraction requires a new output directory: existing files are not overwritten,
+and malformed paths or trees are rejected before writing. A later decode or
+disk error reports failure and may leave partial output; choose a new directory
+for a retry. This extracts the archive as stored and does not decrypt content.
+Direct read-only launch with `game-run game.zar` remains available.
+
+### Shader tools
+
 The input is a raw shader binary: a sequence of little-endian 32-bit words, with
 no container or header.
 

@@ -293,6 +293,106 @@ pub const Reader = struct {
         return out;
     }
 
+    pub const ExtractResult = struct { files: usize = 0, bytes: u64 = 0 };
+    pub const ExtractProgress = struct {
+        context: *anyopaque,
+        update: *const fn (*anyopaque, []const u8, u64, u64) void,
+    };
+
+    /// Extract into a NEW directory. Preflight the complete tree before any
+    /// writes, then stream through a single 64 KiB buffer. Existing output
+    /// directories are refused, including symlinks and earlier partial runs.
+    pub fn extract(self: *Reader, parent: std.Io.Dir, output: []const u8, progress: ?ExtractProgress) !ExtractResult {
+        const Item = struct { node: u32, path: []const u8 };
+        const gpa = self.allocator;
+        var plan: std.ArrayList(Item) = .empty;
+        defer {
+            for (plan.items) |item| gpa.free(item.path);
+            plan.deinit(gpa);
+        }
+        var paths: std.StringHashMap(void) = .init(gpa);
+        defer {
+            var keys = paths.keyIterator();
+            while (keys.next()) |key| gpa.free(key.*);
+            paths.deinit();
+        }
+        const visited = try gpa.alloc(bool, self.entries.len);
+        defer gpa.free(visited);
+        @memset(visited, false);
+        visited[0] = true;
+        var total: u64 = 0;
+        var cursor: usize = 0;
+        // Include the root only in the traversal, never as an output entry.
+        const root_path = try gpa.dupe(u8, "");
+        plan.append(gpa, .{ .node = 0, .path = root_path }) catch |err| {
+            gpa.free(root_path);
+            return err;
+        };
+        while (cursor < plan.items.len) : (cursor += 1) {
+            const item = plan.items[cursor];
+            for (0..self.dirChildCount(item.node)) |i| {
+                const child = self.dirChildNode(item.node, @intCast(i));
+                if (visited[child]) return error.CorruptArchive;
+                visited[child] = true;
+                const info = self.dirChild(item.node, @intCast(i));
+                if (!safeExtractName(info.name)) return error.UnsafeArchivePath;
+                const path = if (item.path.len == 0)
+                    try gpa.dupe(u8, info.name)
+                else
+                    try std.fmt.allocPrint(gpa, "{s}/{s}", .{ item.path, info.name });
+                plan.append(gpa, .{ .node = child, .path = path }) catch |err| {
+                    gpa.free(path);
+                    return err;
+                };
+                if (path.len > 4096) return error.NameTooLong;
+                const folded = try std.ascii.allocLowerString(gpa, path);
+                const entry = paths.getOrPut(folded) catch |err| {
+                    gpa.free(folded);
+                    return err;
+                };
+                if (entry.found_existing) {
+                    gpa.free(folded);
+                    return error.DuplicateArchivePath;
+                }
+                total = std.math.add(u64, total, info.size) catch return error.CorruptArchive;
+            }
+        }
+        // Orphan entries are malformed too: do not silently omit content.
+        for (visited) |seen| if (!seen) return error.CorruptArchive;
+
+        try parent.createDir(self.io, output, .default_dir);
+        var dest = try parent.openDir(self.io, output, .{ .follow_symlinks = false });
+        defer dest.close(self.io);
+        var result: ExtractResult = .{};
+        var buffer: [block_size]u8 = undefined;
+        var reported: u64 = 0;
+        if (progress) |p| p.update(p.context, "", 0, total);
+        for (plan.items[1..]) |item| {
+            if (self.isDirectory(item.node)) {
+                try dest.createDir(self.io, item.path, .default_dir);
+                continue;
+            }
+            const file = try dest.createFile(self.io, item.path, .{ .exclusive = true });
+            defer file.close(self.io);
+            var offset: u64 = 0;
+            const size = self.fileSize(item.node);
+            while (offset < size) {
+                const count = try self.readAt(item.node, offset, &buffer);
+                if (count == 0) return error.CorruptArchive;
+                try file.writePositionalAll(self.io, buffer[0..count], offset);
+                offset += count;
+                result.bytes += count;
+                if (result.bytes - reported >= 16 * 1024 * 1024) {
+                    if (progress) |p| p.update(p.context, "", result.bytes, total);
+                    reported = result.bytes;
+                }
+            }
+            result.files += 1;
+            if (progress) |p| p.update(p.context, item.path, result.bytes, total);
+        }
+        return result;
+    }
+
     fn nameAt(self: *Reader, offset: u32) []const u8 {
         if (offset == 0x7fffffff or offset >= self.name_table.len) return "";
         var len: usize = self.name_table[offset] & 0x7f;
@@ -366,6 +466,22 @@ pub const Reader = struct {
         if (got != buffer.len) return error.CorruptArchive;
     }
 };
+
+/// One portable path component, never a path or a Windows device/ADS alias.
+fn safeExtractName(name: []const u8) bool {
+    if (name.len == 0 or name.len > 255 or !std.unicode.utf8ValidateSlice(name)) return false;
+    if (name[name.len - 1] == '.' or name[name.len - 1] == ' ') return false;
+    for (name) |byte| {
+        if (byte < 32 or std.mem.indexOfScalar(u8, "/\\:\"<>|?*", byte) != null) return false;
+    }
+    const stem = name[0 .. std.mem.indexOfScalar(u8, name, '.') orelse name.len];
+    for ([_][]const u8{ "CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$" }) |device| {
+        if (std.ascii.eqlIgnoreCase(stem, device)) return false;
+    }
+    if (stem.len == 4 and (std.ascii.eqlIgnoreCase(stem[0..3], "COM") or std.ascii.eqlIgnoreCase(stem[0..3], "LPT")) and
+        stem[3] >= '0' and stem[3] <= '9') return false;
+    return true;
+}
 
 fn namesEqual(a: []const u8, b: []const u8) bool {
     if (a.len != b.len) return false;
@@ -570,6 +686,94 @@ test "archive reads a zstd-compressed block" {
     var out: [8]u8 = undefined;
     try testing.expectEqual(@as(usize, 8), try reader.readAt(node, 65500, &out));
     try testing.expectEqualStrings("AAAAAAAA", &out);
+}
+
+test "extraction streams nested raw and zstd files with progress" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var frame: [23]u8 = undefined;
+    const bytes = try std.fmt.hexToBytes(&frame, "28b52ffd6400ff4d000008410100fc7f742704cf99e954");
+    try writeTestArchiveRaw(t.io, tmp.dir, "game.zar", &.{
+        .{ .path = "eboot.bin", .data = "elf" },
+        .{ .path = "sce_sys/param.json", .data = "{}" },
+        .{ .path = "data/large.bin", .data = bytes, .compressed = true },
+        .{ .path = "data/empty.bin", .data = "" },
+    }, block_size);
+    const reader = try Reader.open(t.io, tmp.dir, "game.zar", t.allocator);
+    defer reader.close();
+    const Progress = struct {
+        done: u64 = 0,
+        total: u64 = 0,
+        files: usize = 0,
+        fn update(ctx: *anyopaque, path: []const u8, done: u64, total: u64) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            std.debug.assert(done >= self.done and done <= total);
+            self.done = done;
+            self.total = total;
+            if (path.len != 0) self.files += 1;
+        }
+    };
+    var progress: Progress = .{};
+    const result = try reader.extract(tmp.dir, "output", .{ .context = &progress, .update = Progress.update });
+    try t.expectEqual(@as(usize, 4), result.files);
+    try t.expectEqual(@as(u64, block_size + 5), result.bytes);
+    try t.expectEqual(result.files, progress.files);
+    try t.expectEqual(result.bytes, progress.done);
+    try t.expectEqual(result.bytes, progress.total);
+    var out = try tmp.dir.openDir(t.io, "output", .{});
+    defer out.close(t.io);
+    for ([_][]const u8{ "eboot.bin", "sce_sys/param.json", "data/large.bin", "data/empty.bin" }) |path| {
+        const actual = try out.readFileAlloc(t.io, path, t.allocator, .limited(block_size + 1));
+        defer t.allocator.free(actual);
+        const expected = try reader.readAlloc(reader.lookup(path).?, t.allocator, block_size);
+        defer t.allocator.free(expected);
+        try t.expectEqualSlices(u8, expected, actual);
+    }
+    // Never truncate either an existing extraction or the input archive.
+    try t.expectError(error.PathAlreadyExists, reader.extract(tmp.dir, "output", null));
+    try t.expectError(error.PathAlreadyExists, reader.extract(tmp.dir, "game.zar", null));
+}
+
+test "extraction rejects traversal duplicate paths and cycles before writing" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestArchive(t.io, tmp.dir, "unsafe.zar", &.{.{ .path = "../escape.bin", .data = "bad" }});
+    const unsafe_reader = try Reader.open(t.io, tmp.dir, "unsafe.zar", t.allocator);
+    defer unsafe_reader.close();
+    try t.expectError(error.UnsafeArchivePath, unsafe_reader.extract(tmp.dir, "unsafe", null));
+    try t.expectError(error.FileNotFound, tmp.dir.openDir(t.io, "unsafe", .{}));
+    for ([_][]const u8{ "..", "/absolute", "C:ads", "a\\b", "NUL", "con.txt", "LPT1", "tail.", "tail ", "a\x00b" }) |name| {
+        try t.expect(!safeExtractName(name));
+    }
+    try writeTestArchive(t.io, tmp.dir, "duplicate.zar", &.{
+        .{ .path = "eboot.bin", .data = "first" },
+        .{ .path = "EBOOT.bin", .data = "second" },
+    });
+    const duplicate = try Reader.open(t.io, tmp.dir, "duplicate.zar", t.allocator);
+    defer duplicate.close();
+    try t.expectError(error.DuplicateArchivePath, duplicate.extract(tmp.dir, "duplicate", null));
+    try t.expectError(error.FileNotFound, tmp.dir.openDir(t.io, "duplicate", .{}));
+    duplicate.entries[0].dir_start = 0;
+    duplicate.entries[0].dir_count = 1;
+    try t.expectError(error.CorruptArchive, duplicate.extract(tmp.dir, "cycle", null));
+    try t.expectError(error.FileNotFound, tmp.dir.openDir(t.io, "cycle", .{}));
+}
+
+test "extraction reports damaged compressed data instead of success" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestArchiveRaw(t.io, tmp.dir, "broken.zar", &.{
+        .{ .path = "eboot.bin", .data = "broken zstd frame", .compressed = true },
+    }, block_size);
+    const reader = try Reader.open(t.io, tmp.dir, "broken.zar", t.allocator);
+    defer reader.close();
+    if (reader.extract(tmp.dir, "output", null)) |_| return error.ExpectedDecodeFailure else |_| {}
+    const file = try tmp.dir.openFile(t.io, "output/eboot.bin", .{});
+    defer file.close(t.io);
+    try t.expectEqual(@as(u64, 0), try file.length(t.io));
 }
 
 // --- Synthetic archives for tests. Single block per file. ---

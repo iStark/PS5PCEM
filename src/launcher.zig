@@ -498,9 +498,10 @@ const nav_rects = [_]Rect{
     .{ .left = 20, .top = 680, .right = 202, .bottom = 724 },
 };
 
-const library_browse_rect = Rect{ .left = 282, .top = 646, .right = 500, .bottom = 700 };
-const library_extract_rect = Rect{ .left = 516, .top = 646, .right = 760, .bottom = 700 };
-const library_launch_rect = Rect{ .left = 776, .top = 646, .right = 1086, .bottom = 700 };
+const library_browse_rect = Rect{ .left = 282, .top = 646, .right = 474, .bottom = 700 };
+const library_extract_rect = Rect{ .left = 486, .top = 646, .right = 678, .bottom = 700 };
+const library_extract_zar_rect = Rect{ .left = 690, .top = 646, .right = 882, .bottom = 700 };
+const library_launch_rect = Rect{ .left = 894, .top = 646, .right = 1086, .bottom = 700 };
 
 // The arrows sit in the margins either side of the grid rather than inside
 // it, so a second page costs the artwork none of its width.
@@ -867,6 +868,7 @@ fn clickableAt(x: i32, y: i32) bool {
             libraryDotAt(x, y) != null or
             library_browse_rect.contains(x, y) or
             (extract_state != .running and library_extract_rect.contains(x, y)) or
+            (extract_state != .running and library_extract_zar_rect.contains(x, y)) or
             (extractFinished() and extract_panel_rect.contains(x, y)) or
             (extract_state != .idle and extract_copy_rect.contains(x, y)) or
             library_launch_rect.contains(x, y),
@@ -966,7 +968,8 @@ fn handleLibraryClick(window: Win32.Window, x: i32, y: i32) void {
         return;
     }
     if (library_browse_rect.contains(x, y)) chooseGameFolder(window);
-    if (library_extract_rect.contains(x, y) and extract_state != .running) extractPackage(window);
+    if (library_extract_rect.contains(x, y) and extract_state != .running) extractPackage(window, .pkg);
+    if (library_extract_zar_rect.contains(x, y) and extract_state != .running) extractPackage(window, .zar);
     if (library_launch_rect.contains(x, y)) launchGame(window);
 }
 
@@ -1216,6 +1219,7 @@ fn drawLibrary(dc: Win32.DeviceContext) void {
 
     button(dc, library_browse_rect, .choose_folder, false);
     button(dc, library_extract_rect, .extract_pkg, extract_state == .running);
+    button(dc, library_extract_zar_rect, .extract_zar, extract_state == .running);
     drawLegalNotice(dc);
     button(dc, library_launch_rect, .launch_game, game_folder_length == 0);
 }
@@ -2334,7 +2338,7 @@ fn chooseGameFolder(owner: Win32.Window) void {
     setStatusPhrase(.status_folder_selected, false);
 }
 
-fn extractPackage(owner: Win32.Window) void {
+fn extractPackage(owner: Win32.Window, format: common.ExtractFormat) void {
     var extractor: [1024]u16 = [_]u16{0} ** 1024;
     const extractor_len = siblingExecutable("pkgextractor.exe", &extractor);
     if (extractor_len == 0 or Win32.GetFileAttributesW(@ptrCast(&extractor)) == Win32.invalid_file_attributes) {
@@ -2344,7 +2348,10 @@ fn extractPackage(owner: Win32.Window) void {
 
     var filter: [96]u16 = @splat(0);
     var filter_len: usize = 0;
-    const filter_parts = [_][]const u8{ "PS5 PKG (*.pkg)", "*.pkg" };
+    const filter_parts = switch (format) {
+        .pkg => [_][]const u8{ "PS5 PKG (*.pkg)", "*.pkg" },
+        .zar => [_][]const u8{ "ZArchive (*.zar)", "*.zar" },
+    };
     for (filter_parts) |part| {
         const converted = std.unicode.utf8ToUtf16Le(filter[filter_len..], part) catch return;
         filter_len += converted;
@@ -2353,7 +2360,7 @@ fn extractPackage(owner: Win32.Window) void {
     }
 
     var dialog_title: [256]u16 = @splat(0);
-    const dialog_title_length = std.unicode.utf8ToUtf16Le(&dialog_title, tr(.extract_pkg_dialog)) catch return;
+    const dialog_title_length = std.unicode.utf8ToUtf16Le(&dialog_title, tr(format.dialog())) catch return;
     dialog_title[dialog_title_length] = 0;
 
     var pkg_path: [1024]u16 = @splat(0);
@@ -2365,7 +2372,7 @@ fn extractPackage(owner: Win32.Window) void {
         .max_file = pkg_path.len,
         .title = @ptrCast(&dialog_title),
         .flags = Win32.ofn_explorer | Win32.ofn_file_must_exist | Win32.ofn_path_must_exist | Win32.ofn_hide_readonly,
-        .def_ext = w("pkg"),
+        .def_ext = if (format == .zar) w("zar") else w("pkg"),
     };
     if (Win32.GetOpenFileNameW(&ofn) == 0) return;
 

@@ -686,12 +686,12 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/pkgextractor.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{.{ .name = "pkg", .module = pkg }},
+            .imports = &.{ .{ .name = "pkg", .module = pkg }, .{ .name = "zarchive", .module = zarchive } },
         }),
     });
     const install_pkgextractor = b.addInstallArtifact(pkgextractor, .{});
     b.getInstallStep().dependOn(&install_pkgextractor.step);
-    const build_pkgextractor_step = b.step("build-pkgextractor", "Build only the PS5 package extractor");
+    const build_pkgextractor_step = b.step("build-pkgextractor", "Build only the PKG/ZAR extractor");
     build_pkgextractor_step.dependOn(&install_pkgextractor.step);
 
     // Zero-dependency native launcher. It selects the title directory, stores
@@ -920,6 +920,8 @@ pub fn build(b: *std.Build) void {
     }
 
     const test_filter = b.option([]const u8, "test-filter", "Run only tests whose names contain this text");
+    const zarchive_tests = b.addTest(.{ .root_module = zarchive });
+    b.step("test-zarchive", "Run ZArchive reader and extraction tests").dependOn(&b.addRunArtifact(zarchive_tests).step);
     const runtime_tests = b.addTest(.{
         .root_module = runtime,
         .filters = if (test_filter) |filter| &.{filter} else &.{},

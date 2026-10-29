@@ -40,7 +40,7 @@ tiles or as a table and searchable by title, title ID or folder name. It reads a
 from each title's local `sce_sys/icon0.png`, detects DualSense and DualShock controllers,
 and keeps portable settings and savedata beside the application. It reports
 whether the host can run Vulkan before a title is started, naming the device it
-found, can invoke the package extractor on a debug package directly, and asks
+found, offers separate **Extract PKG** and **Extract ZAR** buttons, and asks
 GitHub Releases whether a newer version is available.
 
 Development builds also offer **Vulkan / DirectX 12** in the Windows library and Settings.
@@ -159,6 +159,11 @@ limitations. The Windows game measurements do not establish Linux performance.
    use, then select **Launch game**. A folder holding a single ZArchive dump
    (`.zar`) runs it directly, streamed read-only without extracting; from a
    command prompt, `game-run game.zar` does the same.
+
+To unpack a dump instead, use **Extract ZAR** (or **Extract PKG** for a debug
+package). The launcher shows extraction progress and adds the resulting folder
+to the library. ZAR extraction creates a new folder beside the archive, using
+its filename without `.zar`; existing output folders are never overwritten.
 
 Games, firmware, keys, system libraries, and console software are not included.
 
