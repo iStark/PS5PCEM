@@ -536,6 +536,10 @@ pub const Options = struct {
     /// five bits select the matching VS PARAM export; bit 10 requests flat
     /// interpolation. An empty slice preserves the identity mapping.
     fragment_input_controls: []const u32 = &.{},
+    /// Explicit hardware defaults for unexported ATTR slots: 0000, 0001,
+    /// 1110, 1111. Only a backend that decoded DEFAULT_VAL enables these;
+    /// null retains the existing interpolation behavior.
+    fragment_default_values: [32]?u2 = @splat(null),
     /// Optional unique host locations for raw PS attributes. Distinct
     /// attributes may interpolate the same PARAM export differently.
     fragment_input_locations: []const u8 = &.{},
@@ -1105,6 +1109,7 @@ const Builder = struct {
     packed_feedback_buffer: u32 = 0,
     packed_feedback_word_pointer: u32 = 0,
     parameter_variables: [32]u32 = @splat(0),
+    fragment_default_values: [32]?u2 = @splat(null),
     fragment_per_vertex_mask: u32 = 0,
     fragment_custom_interpolation_mask: u32 = 0,
     fragment_scalar_input_pointer: u32 = 0,
@@ -1319,6 +1324,7 @@ const Builder = struct {
             .fragment_quad_broadcasts = options.fragment_quad_broadcasts,
             .fragment_per_vertex_mask = options.fragment_per_vertex_mask,
             .fragment_custom_interpolation_mask = options.fragment_custom_interpolation_mask,
+            .fragment_default_values = options.fragment_default_values,
             .scalar_specializations = options.scalar_registers,
             .program_address = options.program_address,
             .dynamic_scalar_binding = options.dynamic_scalar_binding,
@@ -1593,6 +1599,7 @@ const Builder = struct {
                 for (0..32) |location| {
                     const bit = @as(u32, 1) << @intCast(location);
                     if (options.parameter_mask & bit == 0) continue;
+                    if (options.fragment_default_values[location] != null) continue;
                     const variable = self.id();
                     self.parameter_variables[location] = variable;
                     const control = if (location < options.fragment_input_controls.len)
@@ -7264,6 +7271,14 @@ const Builder = struct {
         const component = inst.src2.value;
         if (attribute >= self.parameter_variables.len or component >= 4) {
             return Error.InvalidStageInterface;
+        }
+
+        if (self.fragment_default_values[attribute]) |preset| {
+            if (inst.opcode == .v_interp_mov_f32 and inst.src0.value != 2) return Error.InvalidStageInterface;
+            const one = if (component == 3) preset & 1 != 0 else preset & 2 != 0;
+            const value = try self.constant(.float32, @bitCast(@as(f32, if (one) 1 else 0)));
+            try self.destination(inst.dst, .{ .id = value, .value_type = .float32 });
+            return;
         }
 
         const variable = self.parameter_variables[attribute];
@@ -15334,6 +15349,27 @@ test "pixel input control maps VINTRP attribute to vertex PARAM location" {
     }
     try std.testing.expect(location_variable != 0);
     try std.testing.expect(saw_flat);
+    // Backends opt into explicit hardware defaults. They have no input
+    // Location or rasterizer load, even when standalone inference sees ATTR0.
+    fragment.instructions.items[0].src0.value = 2;
+    for (0..4) |preset| {
+        var defaults: [32]?u2 = @splat(null);
+        defaults[0] = @intCast(preset);
+        var constant_module = try translate(std.testing.allocator, &fragment, .{
+            .stage = .fragment,
+            .fragment_default_values = defaults,
+        });
+        defer constant_module.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(usize, 0), countOpcode(constant_module.words, 61));
+        var cursor: usize = 5;
+        while (cursor < constant_module.words.len) {
+            const count: usize = constant_module.words[cursor] >> 16;
+            try std.testing.expect(count != 0);
+            if (@as(u16, @truncate(constant_module.words[cursor])) == 71 and count == 4)
+                try std.testing.expect(constant_module.words[cursor + 2] != 30);
+            cursor += count;
+        }
+    }
 }
 
 /// One indexed buffer access, encoded the way the hardware spells it.

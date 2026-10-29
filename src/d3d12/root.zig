@@ -43,7 +43,8 @@ pub const SampledImage = extern struct {
     width: u32,
     height: u32,
     layers: u32 = 1,
-    /// 0: Texture2D, 1: TextureCubeArray (six faces per cube), 2: Texture2DArray.
+    /// 0: Texture2D, 1: TextureCubeArray, 2: Texture2DArray, 3: Texture3D.
+    /// For volumes, layers is depth and pixels are mip-major, then Z slices.
     dimension: u32 = 0,
     mip_levels: u32 = 1,
     format: u32 = 28,
@@ -351,9 +352,9 @@ pub const Device = struct {
         if (draw.color_attachment > 1 or (draw.color_attachment == 0 and
             (draw.depth_format == 0 or draw.write_mask != 0 or draw.blend.enabled != 0))) return error.InvalidArgument;
         if (draw.extra_color_count > 7 or (draw.extra_color_count != 0 and draw.color_attachment == 0)) return error.InvalidArgument;
-        if (!validColorFormat(draw.color_format)) return error.InvalidArgument;
+        const target_size = try colorSize(draw.width, draw.height, draw.color_format);
         for (draw.extra_colors[0..draw.extra_color_count]) |color| {
-            if (color.pixels == null or color.size != try rgbaSize(draw.width, draw.height) or !validColorFormat(color.format) or
+            if (color.pixels == null or color.size != try colorSize(draw.width, draw.height, color.format) or
                 color.write_mask > 15 or !color.blend.valid() or !std.meta.eql(color.blend.constants, draw.blend.constants)) return error.InvalidArgument;
         }
         for (draw.extra_colors[0..draw.extra_color_count], 0..) |color, i| {
@@ -373,7 +374,7 @@ pub const Device = struct {
         for (buffers) |buffer| if (buffer.size == 0 or buffer.size % 4 != 0 or buffer.size > 256 * 1024 * 1024) return error.InvalidArgument;
         for (images) |image| {
             if (image.size != try sampledImageMipChainSize(image.width, image.height, image.format, image.layers, image.dimension, image.mip_levels) or image.srgb > 1 or
-                ((image.format == 61 or image.format == 49 or image.format == 115) and image.srgb != 0) or
+                ((image.format == 10 or image.format == 56 or image.format == 61 or image.format == 49 or image.format == 115) and image.srgb != 0) or
                 image.address_u < 1 or image.address_u > 4 or image.address_v < 1 or image.address_v > 4 or
                 image.address_w < 1 or image.address_w > 4 or image.filter & ~@as(u32, 0x15) != 0 or
                 !std.math.isFinite(image.min_lod) or !std.math.isFinite(image.max_lod) or !std.math.isFinite(image.lod_bias) or
@@ -384,7 +385,7 @@ pub const Device = struct {
                 @as(u64, draw.index_count) * draw.index_element_bytes != indices.len or indices.len > 64 * 1024 * 1024) return error.InvalidArgument;
         } else if (indices.len != 0 or draw.index_element_bytes != 0 or draw.primitive_restart != 0) return error.InvalidArgument;
         if (draw.primitive_restart > 1 or (draw.primitive_restart != 0 and draw.topology != 5)) return error.InvalidArgument;
-        const color_bytes = if (draw.color_attachment != 0) try rgbaSize(draw.width, draw.height) else 0;
+        const color_bytes = if (draw.color_attachment != 0) target_size else 0;
         if (rgba.len != color_bytes or vertex.len < 5 or fragment.len < 5 or
             vertex[0] != 0x07230203 or fragment[0] != 0x07230203 or (draw.vertex_count == 0 and draw.index_count == 0) or draw.instance_count == 0 or
             (draw.topology != 4 and draw.topology != 5) or draw.cull_mode < 1 or draw.cull_mode > 3 or draw.write_mask > 15) return error.InvalidArgument;
@@ -430,13 +431,21 @@ pub fn rgbaSize(width: u32, height: u32) Error!usize {
     return @as(usize, width) * height * 4;
 }
 
-fn validColorFormat(format: u32) bool {
-    return format == 28 or format == 31 or format == 34;
+pub fn colorSize(width: u32, height: u32, format: u32) Error!usize {
+    const rgba = try rgbaSize(width, height);
+    const size = switch (format) {
+        10 => rgba * 2, // R16G16B16A16_FLOAT
+        28, 31, 34 => rgba,
+        else => return error.InvalidArgument,
+    };
+    if (size > 256 * 1024 * 1024) return error.InvalidArgument;
+    return size;
 }
 
 pub fn sampledImageMipChainSize(width: u32, height: u32, format: u32, layers: u32, dimension: u32, mip_levels: u32) Error!usize {
     var total = try sampledImageArraySize(width, height, format, layers, dimension);
-    if (mip_levels == 0 or mip_levels > 15 or mip_levels > 1 + std.math.log2_int(u32, @max(width, height))) return error.InvalidArgument;
+    const extent = @max(@max(width, height), if (dimension == 3) layers else 1);
+    if (mip_levels == 0 or mip_levels > 15 or mip_levels > 1 + std.math.log2_int(u32, extent)) return error.InvalidArgument;
     // Guest placement uses ceil dimensions while native mip extents floor.
     // Check the selected chain, not whether the base is a power of two: a
     // 96x32 view with four levels ends at 12x4 and matches exactly.
@@ -444,17 +453,20 @@ pub fn sampledImageMipChainSize(width: u32, height: u32, format: u32, layers: u3
     for (1..mip_levels) |level| {
         const divisor = @as(u32, 1) << @as(u5, @intCast(level));
         if ((width + divisor - 1) / divisor != @max(1, width / divisor) or
-            (height + divisor - 1) / divisor != @max(1, height / divisor)) return error.InvalidArgument;
+            (height + divisor - 1) / divisor != @max(1, height / divisor) or
+            (dimension == 3 and (layers + divisor - 1) / divisor != @max(1, layers / divisor))) return error.InvalidArgument;
         const w = @max(if (compressed) @as(u32, 4) else 1, width >> @as(u5, @intCast(level)));
         const h = @max(if (compressed) @as(u32, 4) else 1, height >> @as(u5, @intCast(level)));
-        total += (try sampledImageSize(w, h, format)) * layers;
+        const depth = if (dimension == 3) @max(1, layers >> @as(u5, @intCast(level))) else layers;
+        total += (try sampledImageSize(w, h, format)) * depth;
     }
     if (total > 256 * 1024 * 1024) return error.InvalidArgument;
     return total;
 }
 
 pub fn sampledImageArraySize(width: u32, height: u32, format: u32, layers: u32, dimension: u32) Error!usize {
-    if (layers == 0 or layers > 2048 or dimension > 2 or (dimension == 0 and layers != 1) or
+    if (layers == 0 or layers > 2048 or dimension > 3 or (dimension == 0 and layers != 1) or
+        (dimension == 3 and (width > 2048 or height > 2048 or format == 71 or format == 74 or format == 77)) or
         (dimension == 1 and (width != height or layers % 6 != 0))) return error.InvalidArgument;
     const size = std.math.mul(usize, try sampledImageSize(width, height, format), layers) catch return error.InvalidArgument;
     if (size > 256 * 1024 * 1024) return error.InvalidArgument;
@@ -464,8 +476,9 @@ pub fn sampledImageArraySize(width: u32, height: u32, format: u32, layers: u32, 
 pub fn sampledImageSize(width: u32, height: u32, format: u32) Error!usize {
     const rgba = try rgbaSize(width, height);
     if (format == 28) return rgba;
+    if (format == 10) return colorSize(width, height, format);
     if (format == 61) return rgba / 4;
-    if (format == 49 or format == 115) return rgba / 2;
+    if (format == 56 or format == 49 or format == 115) return rgba / 2;
     // Native BC base dimensions must be whole 4x4 blocks. Smaller mip levels
     // will need a separate subresource path; never pad and change guest UVs.
     if (width % 4 != 0 or height % 4 != 0) return error.InvalidArgument;
@@ -524,7 +537,30 @@ test "depth footprints accept only native D16 and D32 planes" {
     try std.testing.expectError(error.InvalidArgument, depthSize(0, 37, 40));
 }
 
+test "color footprints preserve half-float storage and reject undersized draw buffers" {
+    try std.testing.expectEqual(@as(usize, 65 * 37 * 8), try colorSize(65, 37, 10));
+    try std.testing.expectEqual(@as(usize, 65 * 37 * 8), try sampledImageSize(65, 37, 10));
+    try std.testing.expectError(error.InvalidArgument, colorSize(16384, 16384, 10));
+    try std.testing.expectError(error.InvalidArgument, colorSize(65, 37, 11));
+    var draw = try Draw.fullTarget(1, 1);
+    draw.color_format = 10;
+    const module = [_]u32{ 0x07230203, 0, 0, 0, 0 };
+    var pixels: [8]u8 = @splat(0);
+    try Device.validateDraw(&module, &module, draw, &.{}, &.{}, &.{}, &pixels, &.{});
+    try std.testing.expectError(error.InvalidArgument, Device.validateDraw(&module, &module, draw, &.{}, &.{}, &.{}, pixels[0..4], &.{}));
+}
+
+test "volume footprints shrink depth per mip and bound native 3D formats" {
+    try std.testing.expectEqual(@as(usize, 300), try sampledImageMipChainSize(8, 4, 28, 2, 3, 4));
+    try std.testing.expectEqual(@as(usize, 60), try sampledImageMipChainSize(1, 1, 28, 8, 3, 4));
+    try std.testing.expectEqual(@as(usize, 840), try sampledImageMipChainSize(5, 3, 10, 7, 3, 1));
+    try std.testing.expectError(error.InvalidArgument, sampledImageMipChainSize(8, 4, 28, 7, 3, 2));
+    try std.testing.expectError(error.InvalidArgument, sampledImageMipChainSize(8, 4, 71, 2, 3, 1));
+    try std.testing.expectError(error.InvalidArgument, sampledImageMipChainSize(4096, 1, 28, 1, 3, 1));
+}
+
 test "sampled BC footprints count blocks and reject unsupported native extents" {
+    try std.testing.expectEqual(@as(usize, 13 * 9 * 2), try sampledImageSize(13, 9, 56));
     try std.testing.expectEqual(@as(usize, 3 * 7), try sampledImageSize(3, 7, 61));
     try std.testing.expectEqual(@as(usize, 3 * 7 * 2), try sampledImageSize(3, 7, 49));
     try std.testing.expectEqual(@as(usize, 3 * 7 * 2), try sampledImageSize(3, 7, 115));
@@ -545,7 +581,7 @@ test "sampled arrays validate shape layers and bounded storage" {
     try std.testing.expectEqual(@as(usize, 13 * 9 * 3), try sampledImageArraySize(13, 9, 61, 3, 2));
     for ([_][5]u32{
         .{ 8, 8, 28, 0, 2 },         .{ 8, 8, 28, 2049, 2 }, .{ 8, 8, 28, 2, 0 },
-        .{ 8, 4, 28, 6, 1 },         .{ 8, 8, 28, 7, 1 },    .{ 8, 8, 28, 1, 3 },
+        .{ 8, 4, 28, 6, 1 },         .{ 8, 8, 28, 7, 1 },    .{ 8, 8, 28, 1, 4 },
         .{ 16384, 16384, 28, 6, 1 },
     }) |shape| try std.testing.expectError(error.InvalidArgument, sampledImageArraySize(shape[0], shape[1], shape[2], shape[3], shape[4]));
 }

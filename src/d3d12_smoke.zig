@@ -521,12 +521,14 @@ fn guestGraphicsProbe(allocator: std.mem.Allocator, device: *d3d12.Device) !void
     std.debug.print("PASS nonzero first vertex and positive indexed base vertex\n", .{});
     try guestCommandProbe(allocator, &vertex_words, &pixel_words);
     try guestMrtProbe(allocator, &vertex_words, &pixel_words);
+    try guestFloatTargetProbe(allocator, &vertex_words);
     try guestSurfaceProbe(allocator, &vertex_words, &pixel_words);
     for ([_]usize{ 0, d3d12.surface_cache.Cache.default_limit }) |limit| try guestDepthProbe(allocator, &vertex_words, &pixel_words, limit);
     try guestDepthBiasProbe(allocator, &vertex_words, &pixel_words);
     try guestViewportDepthProbe(allocator, &vertex_words, &pixel_words);
     try guestVaryingProbe(allocator, &vertex_words);
     try guestMipImageProbe(allocator, &vertex_words, &pixel_words);
+    try guestVolumeImageProbe(allocator, &vertex_words, &pixel_words);
     try guestAnisotropicProbe(allocator);
     try guestFanProbe(allocator);
     try guestRectangleProbe(allocator);
@@ -1710,33 +1712,36 @@ fn guestMrtProbe(allocator: std.mem.Allocator, vertex: []const u32, fragment: []
     };
     // Rotate native formats through slot zero and the extra attachments at the
     // same guest addresses. This also checks batching/PSO/resource cache keys.
-    for (0..3) |rotation| for ([_]usize{ 1, 8 }) |batch_limit| {
+    for (0..4) |rotation| for ([_]usize{ 1, 8 }) |batch_limit| {
+        try renderer.device.attachmentCache(batch_limit == 1);
         var state = initial_state;
         var program: std.ArrayList(u32) = .empty;
         defer program.deinit(allocator);
         for (0..5) |slot| {
             const reg: u32 = @intCast(slot);
-            const kind = (slot + rotation) % 3;
-            const address = 0x2000 + reg * 0x4000;
+            const kind = (slot + rotation) % 4;
+            const address = 0x2000 + reg * 0x8000;
             try state.writeRegister(.context, 0x318 + reg * 15, address >> 8);
             try state.writeRegister(.context, 0x319 + reg * 15, 8);
             try state.writeRegister(.context, 0x31c + reg * 15, switch (kind) {
                 0 => 10 << 2,
                 1 => (5 << 2) | (7 << 8),
-                else => (10 << 2) | (1 << 8),
+                2 => (10 << 2) | (1 << 8),
+                else => (12 << 2) | (7 << 8),
             });
             try state.writeRegister(.context, 0x390 + reg, 0);
             try state.writeRegister(.context, 0x3b0 + reg, (64 << 14) | 36);
             try state.writeRegister(.context, 0x3b8 + reg, 0);
-            try state.writeRegister(.context, 0x1e0 + reg, if (kind == 1) (1 << 30) | 1 | (1 << 8) else 0);
+            try state.writeRegister(.context, 0x1e0 + reg, if (kind == 1 or kind == 3) (1 << 30) | 1 | (1 << 8) else 0);
             const values: [4]f32 = switch (kind) {
                 0 => .{ 0, 1, 0, 1 },
                 1 => .{ -1, 2, 0, 0 },
-                else => .{ -1, 0, 1, 1 },
+                2 => .{ -1, 0, 1, 1 },
+                else => .{ -1, 2, 0.25, 0.5 },
             };
             for (values, 0..) |value, channel| try program.appendSlice(allocator, &.{ vop1(1, @intCast(channel), 255), @bitCast(value) });
             try program.appendSlice(allocator, &.{ 0xf800000f | (reg << 4) | (if (slot == 4) @as(u32, 0x800) else 0), 0x03020100 });
-            @memset(memory.data[address..][0..0x3000], 0);
+            @memset(memory.data[address..][0..0x6000], 0);
         }
         try program.append(allocator, 0xbf810000);
         @memcpy(memory.data[0x400..][0 .. program.items.len * 4], std.mem.sliceAsBytes(program.items));
@@ -1753,20 +1758,77 @@ fn guestMrtProbe(allocator: std.mem.Allocator, vertex: []const u32, fragment: []
             const expected = try allocator.alloc(u8, backing.len);
             defer allocator.free(expected);
             @memset(expected, 0);
-            const value: [4]u8 = switch ((slot + rotation) % 3) {
-                0 => .{ 0, 255, 0, 255 },
-                1 => .{ 0, 0xc0, 0, 0x44 }, // half(-2), half(4), after two additive writes.
-                else => .{ 0x81, 0, 0x7f, 0x7f },
+            const value: []const u8 = switch ((slot + rotation) % 4) {
+                0 => &.{ 0, 255, 0, 255 },
+                1 => &.{ 0, 0xc0, 0, 0x44 }, // half(-2), half(4), after two additive writes.
+                2 => &.{ 0x81, 0, 0x7f, 0x7f },
+                else => &.{ 0, 0xc0, 0, 0x44, 0, 0x38, 0, 0x3c }, // half(-2, 4, 0.5, 1)
             };
             for (0..37) |y| for (0..65) |x| {
                 if (coverage[(y * 72 + x) * 4] != 255) continue;
                 const pos: usize = @intCast(try layout.sourceByteOffset(@intCast(x), @intCast(y), 0));
-                expected[pos..][0..4].* = value;
+                @memcpy(expected[pos..][0..value.len], value);
             };
             if (!std.mem.eql(u8, backing, expected)) return error.MrtMixedFormatMismatch;
         }
     };
-    std.debug.print("PASS 2/5/8 simultaneous targets, mixed RGBA8 UNORM/SNORM and RG16 float, independent masks/blends, exactly-once depth/stencil, immediate/grouped writes, padding and alias rejection\n", .{});
+    std.debug.print("PASS 2/5/8 simultaneous targets, mixed RGBA8 UNORM/SNORM and RG16/RGBA16 float, independent masks/blends, exactly-once depth/stencil, immediate/grouped writes, padding and alias rejection\n", .{});
+}
+
+fn guestFloatTargetProbe(allocator: std.mem.Allocator, vertex: []const u32) !void {
+    const memory = try allocator.create(GraphicsMemory);
+    defer allocator.destroy(memory);
+    memory.* = .{};
+    @memcpy(memory.data[0x200..][0 .. vertex.len * 4], std.mem.sliceAsBytes(vertex));
+    var renderer = try d3d12.Renderer.init(allocator, memory.access(), false);
+    defer renderer.deinit();
+    const packet: gpu.pm4.Packet = .{ .kind = .command, .header = command(gpu.pm4.draw_index_auto, 2), .opcode = gpu.pm4.draw_index_auto, .body = &.{ 3, 2 } };
+    const hdr = [_]u32{
+        vop1(1, 0, 255), @bitCast(@as(f32, -1)),   vop1(1, 1, 255), @bitCast(@as(f32, 2)),
+        vop1(1, 2, 255), @bitCast(@as(f32, 0.25)), vop1(1, 3, 255), @bitCast(@as(f32, 0.5)),
+        0xf800080f,      0x03020100,               0xbf810000,
+    };
+    // Sample the rendered HDR center and transform it into UNORM range. A
+    // clamp or RGBA8 conversion before sampling produces a different result.
+    var sample: std.ArrayList(u32) = .empty;
+    defer sample.deinit(allocator);
+    try sample.appendSlice(allocator, &.{ vop1(1, 0, 255), @bitCast(@as(f32, 0.5)), vop1(1, 1, 255), @bitCast(@as(f32, 0.5)), 0xf0800f08, 0x00400400, vop1(1, 8, 255), @bitCast(@as(f32, 0.25)), vop1(1, 9, 255), @bitCast(@as(f32, 0.5)) });
+    for (0..4) |i| {
+        const r: u8 = @intCast(i);
+        try sample.appendSlice(allocator, &.{ vop2(0x08, r, r + 4, 8), vop2(0x03, r, r, 9) });
+    }
+    try sample.appendSlice(allocator, &.{ 0xf800080f, 0x03020100, 0xbf810000 });
+    for ([_]gpu.resources.TileMode{ .linear, .standard_256b, .standard_4kb, .standard_64kb, .partially_resident, .render_target }) |mode| {
+        var state = try graphicsState(65, 37, 72);
+        try state.writeRegister(.context, 0x318, 0x100);
+        // Linear image views derive their pitch from the 256-byte alignment.
+        try state.writeRegister(.context, 0x319, 0);
+        try state.writeRegister(.context, 0x31c, (12 << 2) | (7 << 8));
+        try state.writeRegister(.context, 0x3b8, @as(u32, @intFromEnum(mode)) << 14);
+        @memcpy(memory.data[0x400..][0..@sizeOf(@TypeOf(hdr))], std.mem.asBytes(&hdr));
+        const target = gpu.resources.decodeColorTarget(&state, 0, 15).?;
+        const layout = try d3d12.surfaces.colorLayout(target);
+        const backing = memory.data[0x10000..][0..@intCast(layout.required_source_bytes)];
+        @memset(backing, 0);
+        try renderer.draw(&state, packet);
+        var staged = try d3d12.surfaces.Staged.read(allocator, memory.access(), target.address, layout);
+        defer staged.deinit();
+        const center = (18 * 65 + 32) * 8;
+        if (!std.mem.eql(u8, staged.pixels[center..][0..8], &.{ 0, 0xbc, 0, 0x40, 0, 0x34, 0, 0x38 })) return error.FloatTargetReadbackMismatch;
+        const original = try allocator.dupe(u8, backing);
+        defer allocator.free(original);
+        @memcpy(memory.data[0x400..][0 .. sample.items.len * 4], std.mem.sliceAsBytes(sample.items));
+        state = try graphicsState(65, 37, 72);
+        try state.writeRegister(.shader, 0x00b, 12 << 1);
+        const words = [_]u32{ 0x100, 71 << 20, 16 | (36 << 14), (9 << 28) | 0xfac | (@as(u32, @intFromEnum(mode)) << 20), 0, 0, 0, 0, 0x92, 0xfff000, 0, 0 };
+        for (words, 0..) |word, i| try state.writeRegister(.shader, 0x00c + @as(u32, @intCast(i)), word);
+        @memset(memory.data[0x2000..0x5000], 0);
+        try renderer.draw(&state, packet);
+        const result = memory.data[0x2000 + (18 * 72 + 32) * 4 ..][0..4];
+        for (result, [_]u8{ 64, 255, 143, 159 }) |a, b| if (@abs(@as(i16, a) - b) > 1) return error.FloatTargetSamplingMismatch;
+        if (!std.mem.eql(u8, backing, original)) return error.FloatSampleSourceModified;
+    }
+    std.debug.print("PASS RGBA16F render/readback/sample across six guest layouts, negative/HDR values and source preservation\n", .{});
 }
 
 fn guestDepthBiasProbe(allocator: std.mem.Allocator, vertex: []const u32, fragment: []const u32) !void {
@@ -2317,6 +2379,30 @@ fn guestVaryingProbe(allocator: std.mem.Allocator, vertex: []const u32) !void {
         }
     };
     std.debug.print("PASS 16 mixed flat/smooth full-frame comparisons: MOV P0/P1-P2, first/last provoking vertices, auto/8/16/32-bit indices, shared PARAM and untouched guest index storage\n", .{});
+    // Hardware default inputs need no matching vertex export. Exercise all
+    // presets and repeat one to check the translation/PSO cache identity.
+    @memcpy(memory.data[0x200..][0 .. vertex.len * 4], std.mem.sliceAsBytes(vertex));
+    for ([_]u32{ 0, 1, 2, 3, 0 }) |preset| for ([_]bool{ false, true }) |mov| {
+        words.clearRetainingCapacity();
+        for (0..4) |component| {
+            const channel: u32 = @intCast(component);
+            if (mov) {
+                try words.append(allocator, 0xc8020002 | (channel << 18) | (channel << 8));
+            } else for (0..2) |phase| try words.append(allocator, 0xc8000000 | (channel << 18) | (@as(u32, @intCast(phase)) << 16) | (channel << 8) | @as(u32, @intCast(phase)));
+        }
+        try words.appendSlice(allocator, &.{ 0xf800080f, 0x03020100, 0xbf810000 });
+        @memcpy(memory.data[0x400..][0 .. words.items.len * 4], std.mem.sliceAsBytes(words.items));
+        try state.writeRegister(.context, 0x191, 0x20 | (preset << 8));
+        @memset(memory.data[0x2000..0x5000], 0xa7);
+        _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 2 });
+        for (memory.data[0x2000..0x5000], 0..) |actual, i| {
+            const covered = i < 37 * 72 * 4 and smooth[i - i % 4 + 3] == 255;
+            const one = if (i % 4 == 3) preset & 1 != 0 else preset & 2 != 0;
+            const expected: u8 = if (!covered) 0xa7 else if (one) 255 else 0;
+            if (actual != expected) return error.FragmentDefaultValueMismatch;
+        }
+    };
+    std.debug.print("PASS constant fragment inputs: four DEFAULT_VAL presets, absent VS exports, P0/P1-P2, full-image/padding and cache reuse\n", .{});
 }
 
 fn mipProbeColor(layer: usize, level: usize, compressed: bool) [4]u8 {
@@ -2400,6 +2486,137 @@ fn guestMipImageProbe(allocator: std.mem.Allocator, vertex: []const u32, solid_p
         if (!std.mem.eql(u8, before, backing)) return error.MipChainSourceModified;
     };
     std.debug.print("PASS {d} mip-chain frame checks: 2D/cube/78-layer arrays, 96x32 partial chains, base slices, all levels and linear LOD blends, RGBA8/BC1 1x1 tails, linear/tiled memory and source preservation\n", .{cases});
+}
+
+fn volumeProbeColor(z: u32, level: u32) [4]u8 {
+    return .{ @intCast(40 + level * 40), @intCast(16 + z * 24), @intCast(200 - level * 20), 255 };
+}
+
+fn volumeProbeExpected(w: f32, depth: u32, level: u32, linear: bool, repeat: bool) [4]f32 {
+    const d: i32 = @intCast(@max(1, depth >> @as(u5, @intCast(level))));
+    const z = w * @as(f32, @floatFromInt(d)) - (if (linear) @as(f32, 0.5) else 0);
+    const low: i32 = @intFromFloat(@floor(z));
+    const fraction = if (linear) z - @floor(z) else 0;
+    var value: [4]f32 = @splat(0);
+    for (0..2) |i| {
+        const index = low + @as(i32, @intCast(i));
+        const slice = if (repeat) @mod(index, d) else std.math.clamp(index, 0, d - 1);
+        const color = volumeProbeColor(@intCast(slice), level);
+        for (&value, color) |*v, c| v.* += @as(f32, @floatFromInt(c)) * (if (i == 0) 1 - fraction else fraction);
+    }
+    return value;
+}
+
+fn guestVolumeImageProbe(allocator: std.mem.Allocator, vertex: []const u32, solid: []const u32) !void {
+    const memory = try allocator.create(GraphicsMemory);
+    defer allocator.destroy(memory);
+    memory.* = .{};
+    @memcpy(memory.data[0x200..][0 .. vertex.len * 4], std.mem.sliceAsBytes(vertex));
+    @memcpy(memory.data[0x400..][0 .. solid.len * 4], std.mem.sliceAsBytes(solid));
+    var state = try graphicsState(65, 37, 72);
+    try state.writeRegister(.shader, 0x00b, 14 << 1);
+    var renderer = try d3d12.Renderer.init(allocator, memory.access(), false);
+    defer renderer.deinit();
+    var executor = gpu.DcbExecutor{ .state = &state, .backend = renderer.dcbBackend(), .allocator = allocator };
+    @memset(memory.data[0x2000..0x5000], 0xa7);
+    _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 2 });
+    const coverage = memory.data[0x2000..0x5000].*;
+    var cases: usize = 0;
+    // Width, height, depth, mip count. Include one-texel fallback volumes,
+    // odd single-level extents and a chain whose largest dimension is Z.
+    for ([_][4]u32{ .{ 1, 1, 1, 1 }, .{ 5, 3, 7, 1 }, .{ 8, 8, 8, 4 }, .{ 1, 1, 8, 4 } }) |shape|
+        for ([_]gpu.resources.TileMode{ .linear, .standard_4kb, .standard_64kb }) |mode|
+            for ([_]u16{ 56, 71 }) |format| {
+                if (mode == .linear and shape[3] > 1) continue; // Shared guest layout rejects linear volume mip chains.
+                const bpp: usize = if (format == 71) 8 else 4;
+                const words = [_]u32{ 0x100, (@as(u32, format) << 20) | (((shape[0] - 1) & 3) << 30), ((shape[0] - 1) >> 2) | ((shape[1] - 1) << 14), (10 << 28) | 0xfac | ((shape[3] - 1) << 16) | (@as(u32, @intFromEnum(mode)) << 20), shape[2] - 1, (shape[3] - 1) << 4, 0, 0 };
+                const texture = try gpu.TextureLayout.fromImage(try gpu.resources.decodeImageDescriptor(&words));
+                const backing = memory.data[0x10000..][0..@intCast(texture.required_source_bytes)];
+                @memset(backing, 0xab);
+                for (0..shape[3]) |level| {
+                    const view = try texture.subresource(@intCast(level), 0, 1);
+                    const pixels = try allocator.alloc(u8, @intCast(try view.stagingBytes()));
+                    defer allocator.free(pixels);
+                    for (0..view.depth_or_layers) |z| {
+                        const color = volumeProbeColor(@intCast(z), @intCast(level));
+                        for (0..view.width * view.height) |xy| {
+                            const texel = pixels[(z * view.width * view.height + xy) * bpp ..][0..bpp];
+                            if (format == 56) {
+                                @memcpy(texel, &color);
+                            } else {
+                                for (color, 0..) |c, channel| {
+                                    const half: f16 = @floatCast(@as(f32, @floatFromInt(c)) / 255);
+                                    std.mem.writeInt(u16, texel[channel * 2 ..][0..2], @bitCast(half), .little);
+                                }
+                            }
+                        }
+                    }
+                    try view.tile(pixels, backing);
+                }
+                const before = try allocator.dupe(u8, backing);
+                defer allocator.free(before);
+                for (words, 0..) |word, i| try state.writeRegister(.shader, 0x00c + @as(u32, @intCast(i)), word);
+                const ps = [_]u32{ vop1(1, 0, 255), @bitCast(@as(f32, 0.5)), vop1(1, 1, 256), vop1(1, 2, 12), vop1(1, 3, 13), 0xf0900f10, 0x00400400, 0xf800080f, 0x07060504, 0xbf810000 };
+                @memcpy(memory.data[0x400..][0..@sizeOf(@TypeOf(ps))], std.mem.asBytes(&ps));
+                for ([_]bool{ false, true }) |linear| for ([_]bool{ false, true }) |repeat| {
+                    try state.writeRegister(.shader, 0x014, if (repeat) 0x12 else 0x92);
+                    try state.writeRegister(.shader, 0x015, 0xfff000);
+                    try state.writeRegister(.shader, 0x016, (2 << 26) | (if (linear) @as(u32, (1 << 20) | (1 << 22) | (2 << 24)) else (1 << 24)));
+                    for ([_]f32{ -0.25, 0.0625, 0.5, 0.9375, 1.25 }) |w| for (0..shape[3] * 2 - 1) |step| {
+                        try state.writeRegister(.shader, 0x018, @bitCast(w));
+                        try state.writeRegister(.shader, 0x019, @bitCast(@as(f32, @floatFromInt(step)) * 0.5));
+                        @memset(memory.data[0x2000..0x5000], 0xa7);
+                        _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 2 });
+                        const low = volumeProbeExpected(w, shape[2], @intCast(step / 2), linear, repeat);
+                        const high = volumeProbeExpected(w, shape[2], @intCast((step + 1) / 2), linear, repeat);
+                        for (memory.data[0x2000..0x5000], 0..) |actual, i| {
+                            const expected: f32 = if (coverage[i - i % 4 + 3] == 255) (low[i % 4] + high[i % 4]) * 0.5 else 0xa7;
+                            if (@abs(@as(f32, @floatFromInt(actual)) - expected) > 2) {
+                                std.debug.print("Volume mismatch shape={any} mode={f} format={d} linear={} repeat={} w={d} lodstep={d} byte={d}: {d} expected {d}\n", .{ shape, mode, format, linear, repeat, w, step, i, actual, expected });
+                                return error.VolumeSamplingMismatch;
+                            }
+                        }
+                        cases += 1;
+                    };
+                };
+                if (!std.mem.eql(u8, before, backing)) return error.VolumeSourceModified;
+            };
+    // Identical bytes/extents do not make a Texture2D and Texture3D the same
+    // native resource. Both directions must remain distinct within one batch.
+    renderer.draw_batch_limit = 2;
+    const packet: gpu.pm4.Packet = .{ .kind = .command, .header = command(gpu.pm4.draw_index_auto, 2), .opcode = gpu.pm4.draw_index_auto, .body = &.{ 3, 2 } };
+    const color = [_]u8{ 20, 60, 180, 255 };
+    @memcpy(memory.data[0x10000..][0..4], &color);
+    for ([_]bool{ false, true }) |reverse| {
+        state = try graphicsState(65, 37, 72);
+        try state.writeRegister(.shader, 0x00b, 12 << 1);
+        @memset(memory.data[0x2000..0x5000], 0xa7);
+        const groups = renderer.batch_groups;
+        for (0..2) |i| {
+            const volume = (i == 0) == reverse;
+            const words = [_]u32{ 0x100, 56 << 20, 0, (@as(u32, if (volume) 10 else 9) << 28) | 0xfac, 0, 0, 0, 0, 0x92, 0xfff000, 1 << 24, 0 };
+            for (words, 0..) |word, j| try state.writeRegister(.shader, 0x00c + @as(u32, @intCast(j)), word);
+            const ps = [_]u32{ vop1(1, 0, 255), @bitCast(@as(f32, 0.5)), vop1(1, 1, 256), vop1(1, 2, 256), 0xf0800f00 | (@as(u32, if (volume) 2 else 1) << 3), 0x00400400, 0xf800080f, 0x07060504, 0xbf810000 };
+            @memcpy(memory.data[0x400..][0..@sizeOf(@TypeOf(ps))], std.mem.asBytes(&ps));
+            try state.writeRegister(.context, 0x08e, if (i == 0) 3 else 12);
+            try renderer.draw(&state, packet);
+        }
+        try renderer.flushDraws();
+        if (renderer.batch_groups != groups + 1) return error.VolumeBatchNotShared;
+        for (memory.data[0x2000..0x5000], 0..) |actual, i| {
+            const expected: u8 = if (coverage[i - i % 4 + 3] == 255) color[i % 4] else 0xa7;
+            if (actual != expected) return error.VolumeBatchDimensionMismatch;
+        }
+    }
+    const unchanged = memory.data[0x2000..0x5000].*;
+    try state.writeRegister(.shader, 0x00f, (10 << 28) | 0xfac);
+    std.mem.writeInt(u32, memory.data[0x410..][0..4], 0xf0800f10, .little);
+    for ([_]u32{ 0, 2 << 24, (1 << 20) | (1 << 24) }) |filter| {
+        try state.writeRegister(.shader, 0x016, filter);
+        if (renderer.draw(&state, packet)) |_| return error.VolumeMixedFilterAccepted else |err| if (err != error.GraphicsSamplerModeNotImplemented) return err;
+    }
+    if (!std.mem.eql(u8, &unchanged, memory.data[0x2000..0x5000])) return error.VolumeRejectedFilterModifiedTarget;
+    std.debug.print("PASS {d} volume frame checks: RGBA8/RGBA16F, 1x1x1/odd extents/Z-major mip chains, linear/tiled layouts, Z clamp/wrap, spatial/LOD filtering, source preservation and 2D/3D batch isolation\n", .{cases});
 }
 
 fn anisoProbeTexel(x: i32, y: i32, level: u32, layer: u32) [4]f32 {
@@ -2927,10 +3144,10 @@ fn guestPackedImageProbe(allocator: std.mem.Allocator, memory: *GraphicsMemory, 
 }
 
 fn guestNarrowImageProbe(allocator: std.mem.Allocator, memory: *GraphicsMemory, state: *gpu.State, executor: *gpu.DcbExecutor, renderer: *d3d12.Renderer) !void {
-    for ([_]u16{ 1, 14 }) |format| for ([_]gpu.resources.TileMode{ .linear, .standard_4kb }) |mode| for ([_]u32{ 9, 13 }) |image_type| {
+    for ([_]u16{ 1, 7, 14 }) |format| for ([_]gpu.resources.TileMode{ .linear, .standard_4kb }) |mode| for ([_]u32{ 9, 13 }) |image_type| {
         const width: u32 = 13;
         const height: u32 = 9;
-        const components: u32 = if (format == 1) 4 | (0 << 3) | (0 << 6) | (1 << 9) else 4 | (5 << 3) | (0 << 6) | (1 << 9);
+        const components: u32 = if (format != 14) 4 | (0 << 3) | (0 << 6) | (1 << 9) else 4 | (5 << 3) | (0 << 6) | (1 << 9);
         const words = [_]u32{ 0x100, (@as(u32, format) << 20) | (((width - 1) & 3) << 30), ((width - 1) >> 2) | ((height - 1) << 14), (image_type << 28) | components | (@as(u32, @intFromEnum(mode)) << 20), 0, 0, 0, 0 };
         for (words, 0..) |word, i| try state.writeRegister(.shader, 0x00c + @as(u32, @intCast(i)), word);
         const descriptor = try gpu.resources.decodeImageDescriptor(&words);
@@ -2954,7 +3171,8 @@ fn guestNarrowImageProbe(allocator: std.mem.Allocator, memory: *GraphicsMemory, 
         for ([_][2]usize{ .{ 30, 23 }, .{ 34, 23 }, .{ 30, 15 }, .{ 34, 15 } }) |point| {
             const tx: usize = @intFromFloat((@as(f32, @floatFromInt(point[0])) + 0.5) / 65 * @as(f32, @floatFromInt(width)));
             const ty: usize = @intFromFloat((1 - (@as(f32, @floatFromInt(point[1])) + 0.5) / 37) * @as(f32, @floatFromInt(height)));
-            const expected = [4]u8{ @intCast(20 + tx * 11), if (bytes == 2) @intCast(40 + ty * 19) else 0, 0, 255 };
+            const red: u8 = if (format == 7) @intCast(((20 + tx * 11 + (40 + ty * 19) * 256) * 255 + 32767) / 65535) else @intCast(20 + tx * 11);
+            const expected = [4]u8{ red, if (format == 14) @intCast(40 + ty * 19) else 0, 0, 255 };
             const actual = memory.data[0x2000 + (point[1] * 72 + point[0]) * 4 ..][0..4];
             for (actual, expected) |a, e| if (@abs(@as(i16, a) - e) > 1) return error.NarrowImageSamplingMismatch;
         }
@@ -2968,7 +3186,7 @@ fn guestNarrowImageProbe(allocator: std.mem.Allocator, memory: *GraphicsMemory, 
     if (renderer.draw(state, packet)) |_| return error.NarrowSrgbAccepted else |err| if (err != error.GraphicsSamplerModeNotImplemented) return err;
     try state.writeRegister(.shader, 0x014, 2 | (2 << 3) | (2 << 6));
     if (!std.mem.eql(u8, &before, memory.data[0x2000..0x5000])) return error.RejectedViewModifiedTarget;
-    std.debug.print("PASS R8/RG8 textures: linear/tiled, narrow upload rows, one-layer array views, components and unchanged source bytes (8 cases); multi-layer/sRGB rejection\n", .{});
+    std.debug.print("PASS R8/R16/RG8 textures: linear/tiled, narrow upload rows, one-layer array views, components and unchanged source bytes (12 cases); multi-layer/sRGB rejection\n", .{});
 }
 
 fn guestArrayImageProbe(allocator: std.mem.Allocator, memory: *GraphicsMemory, state: *gpu.State, executor: *gpu.DcbExecutor, renderer: *d3d12.Renderer) !void {

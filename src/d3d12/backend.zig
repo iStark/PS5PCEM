@@ -685,6 +685,7 @@ pub const Renderer = struct {
             .allow_control_flow_fallback = false,
             .parameter_mask = interface.mask,
             .fragment_input_controls = &interface.controls,
+            .fragment_default_values = interface.defaults,
             .fragment_input_locations = &interface.locations,
             .infer_fragment_parameter_mask = false,
             .storage_buffers = ps_resources.buffers.items,

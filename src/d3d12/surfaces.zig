@@ -21,7 +21,7 @@ pub fn colorLayout(target: gpu.resources.ColorTarget) !gpu.SurfaceLayout {
     return layout;
 }
 
-/// Four-byte native render-target formats; staging preserves the encoded bits.
+/// Native render-target formats; staging preserves the encoded bits.
 /// DCC clear codes below currently describe only unsigned-normalized RGBA8.
 pub fn colorFormat(target: gpu.resources.ColorTarget) !u32 {
     const format: u32 = switch (target.format) {
@@ -31,6 +31,7 @@ pub fn colorFormat(target: gpu.resources.ColorTarget) !u32 {
             else => return error.UnsupportedRenderTargetLayout,
         },
         5 => if (target.number_type == 7 and target.component_swap == 0) 34 else return error.UnsupportedRenderTargetLayout, // R16G16_FLOAT
+        12 => if (target.number_type == 7 and target.component_swap == 0) 10 else return error.UnsupportedRenderTargetLayout, // R16G16B16A16_FLOAT
         else => return error.UnsupportedRenderTargetLayout,
     };
     if (format != 28 and target.dcc_enabled) return error.UnsupportedRenderTargetLayout;
@@ -105,7 +106,7 @@ test "VideoOut RGBA8 and BGRA8 select the correct byte order without accepting H
 
 fn validate(layout: gpu.SurfaceLayout, address: u64) !void {
     if (layout.width == 0 or layout.height == 0 or layout.width > 16384 or layout.height > 16384 or
-        layout.layers != 1 or (layout.block.bytes_per_element != 4 and layout.block.bytes_per_element != 2 and layout.block.bytes_per_element != 1) or
+        layout.layers != 1 or (layout.block.bytes_per_element != 8 and layout.block.bytes_per_element != 4 and layout.block.bytes_per_element != 2 and layout.block.bytes_per_element != 1) or
         layout.required_source_bytes > 256 * 1024 * 1024 or layout.staging_bytes > 256 * 1024 * 1024)
         return error.SurfaceBudgetExceeded;
     _ = try layout.sourceRange(address);
@@ -395,6 +396,13 @@ test "color formats preserve signed and half-float encodings and reject their un
     target.number_type = 7;
     try std.testing.expectEqual(@as(u32, 34), try colorFormat(target));
     try std.testing.expectEqual(@as(u32, 4), (try colorLayout(target)).block.bytes_per_element);
+    target.format = 12;
+    try std.testing.expectEqual(@as(u32, 10), try colorFormat(target));
+    try std.testing.expectEqual(@as(u32, 8), (try colorLayout(target)).block.bytes_per_element);
+    target.dcc_enabled = true;
+    target.dcc_address = 0x900000;
+    try std.testing.expectError(error.UnsupportedRenderTargetLayout, colorLayout(target));
+    target.dcc_enabled = false;
     target.component_swap = 1;
     try std.testing.expectError(error.UnsupportedRenderTargetLayout, colorLayout(target));
     target.component_swap = 0;

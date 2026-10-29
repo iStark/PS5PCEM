@@ -219,6 +219,7 @@ test "depth bias converts matching precision and selects only surviving faces" {
 pub const Interface = struct {
     mask: u32 = 0,
     flat_mask: u32 = 0,
+    defaults: [32]?u2 = @splat(null),
     controls: [32]u32 = undefined,
     locations: [32]u8 = undefined,
 };
@@ -422,8 +423,17 @@ pub fn linkInterface(state: *const gpu.State, vertex: []const gpu.ShaderInstruct
         location.* = @intCast(i);
         control.* = state.readRegister(.context, 0x191 + @as(u32, @intCast(i))) orelse @as(u32, @intCast(i));
         if (inputs.attributes & (@as(u32, 1) << @intCast(i)) == 0) continue;
+        // OFFSET's high bit selects DEFAULT_VAL instead of a VS PARAM. No
+        // producer varying is required; flat+default denotes a different
+        // hardware mode and is deliberately not accepted here.
+        if (control.* & 0x20 != 0) {
+            if (control.* & ~@as(u32, 0x33f) != 0) return error.FragmentInterpolationModeNotImplemented;
+            result.defaults[i] = @truncate(control.* >> 8);
+            result.mask &= ~(@as(u32, 1) << @intCast(i));
+            continue;
+        }
         // Smooth and flat PARAM inputs map to native rasterizer inputs.
-        // Default constants, custom and point-sprite modes still need lowering.
+        // Custom and point-sprite modes still need lowering.
         if (control.* & ~@as(u32, 0x41f) != 0) {
             std.debug.print("[d3d12 interpolation] attr={d} control=0x{x} exports=0x{x}\n", .{ i, control.*, outputs.parameters });
             return error.FragmentInterpolationModeNotImplemented;
@@ -435,7 +445,7 @@ pub fn linkInterface(state: *const gpu.State, vertex: []const gpu.ShaderInstruct
         // MOV P0 on a flat attribute is exactly the provoking vertex value.
         // P10/P20 and smooth/custom per-vertex reads require barycentrics.
         if (inst.src1.value >= 32 or inst.src0.value != 2 or
-            result.flat_mask & (@as(u32, 1) << @intCast(inst.src1.value)) == 0)
+            (result.defaults[inst.src1.value] == null and result.flat_mask & (@as(u32, 1) << @intCast(inst.src1.value)) == 0))
         {
             std.debug.print("[d3d12 interpolation MOV] pc=0x{x} attr={d} source={d} flat=0x{x}\n", .{ inst.pc, inst.src1.value, inst.src0.value, result.flat_mask });
             return error.FragmentPerVertexInterpolationNotImplemented;
@@ -531,6 +541,16 @@ test "fragment interface rejects absent exports and unsupported interpolation in
     mov[0].src0.value = 0;
     try std.testing.expectError(error.FragmentPerVertexInterpolationNotImplemented, linkInterface(&state, &vertex, &mov));
     try state.writeRegister(.context, 0x191, 0x803);
+    try std.testing.expectError(error.FragmentInterpolationModeNotImplemented, linkInterface(&state, &vertex, &fragment));
+    for (0..4) |preset| {
+        try state.writeRegister(.context, 0x191, 0x20 | (@as(u32, @intCast(preset)) << 8));
+        const constants = try linkInterface(&state, &.{}, &fragment);
+        try std.testing.expectEqual(@as(u32, 0), constants.mask);
+        try std.testing.expectEqual(@as(?u2, @intCast(preset)), constants.defaults[0]);
+        mov[0].src0.value = 2;
+        _ = try linkInterface(&state, &.{}, &mov);
+    }
+    try state.writeRegister(.context, 0x191, 0x420);
     try std.testing.expectError(error.FragmentInterpolationModeNotImplemented, linkInterface(&state, &vertex, &fragment));
 }
 

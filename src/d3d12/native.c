@@ -850,7 +850,7 @@ static HRESULT compile_spirv_uncached(Ps5D3D12 *c, const uint32_t *words, size_t
         const uint32_t expected_count = storage ? buffer_count : sampled ? image_count : 0;
         // For compute, `scalars` instead selects the persistent GDS block,
         // bound as one UAV immediately after the guest storage array.
-        if ((!storage && !sampled) || count > (storage ? 1u + (scalars != 0) + (stage == SpvExecutionModelFragment) : 3u)) {
+        if ((!storage && !sampled) || count > (storage ? 1u + (scalars != 0) + (stage == SpvExecutionModelFragment) : 4u)) {
             snprintf(c->error, sizeof(c->error), "D3D12 shader resource kind %u/count %zu is not supported by this pipeline", kind, count);
             goto done;
         }
@@ -861,20 +861,20 @@ static HRESULT compile_spirv_uncached(Ps5D3D12 *c, const uint32_t *words, size_t
             const int scalar = storage && scalars && binding == 10 && stage != SpvExecutionModelGLCompute;
             const int global = storage && scalars && binding == PS5_GDS_BINDING && stage == SpvExecutionModelGLCompute;
             const int status = storage && stage == SpvExecutionModelFragment && set == 1 && binding == 0;
-            // Shared SPIR-V banks: 2D=1, CubeArray=36, 2DArray=37.
+            // Shared SPIR-V banks: 2D=1, CubeArray=36, 2DArray=37, 3D=35.
             // Give each a distinct HLSL register range. The root signature
             // aliases those SRV ranges onto the same proven snapshot slots.
-            const int image_bank = binding == 1 ? 0 : binding == 36 ? 1 : binding == 37 ? 2 : -1;
+            const int image_bank = binding == 1 ? 0 : binding == 36 ? 1 : binding == 37 ? 2 : binding == 35 ? 3 : -1;
             if ((!status && set != 0) || (scalar || global || status ? spvc_type_get_num_array_dimensions(type) != 0 :
                 (!expected_count || (storage ? binding != 0 : image_bank < 0) || spvc_type_get_num_array_dimensions(type) != 1 ||
                 !spvc_type_array_dimension_is_literal(type, 0) || spvc_type_get_array_dimension(type, 0) != expected_count))) {
                 snprintf(c->error, sizeof(c->error), "D3D12 descriptor array mismatch: kind %u, binding %u, expected %u elements", kind, binding, expected_count);
                 goto done;
             }
-            if (sampled && (spvc_type_get_image_dimension(type) != (image_bank == 1 ? SpvDimCube : SpvDim2D) ||
-                !!spvc_type_get_image_arrayed(type) != (image_bank != 0) ||
+            if (sampled && (spvc_type_get_image_dimension(type) != (image_bank == 1 ? SpvDimCube : image_bank == 3 ? SpvDim3D : SpvDim2D) ||
+                !!spvc_type_get_image_arrayed(type) != (image_bank == 1 || image_bank == 2) ||
                 spvc_type_get_image_multisampled(type) || spvc_type_get_image_is_depth(type))) {
-                snprintf(c->error, sizeof(c->error), "D3D12 sampled image requires a matching non-depth, single-sample 2D/cube/array bank");
+                snprintf(c->error, sizeof(c->error), "D3D12 sampled image requires a matching non-depth, single-sample 2D/cube/array/3D bank");
                 goto done;
             }
             spvc_hlsl_resource_binding remap;
@@ -981,7 +981,7 @@ static HRESULT guest_graphics_root(Ps5D3D12 *c, uint32_t buffers, uint32_t image
     // D3D's SV_VertexID/InstanceID exclude the draw's base values; Vulkan's
     // VertexIndex/InstanceIndex (used by the shared translator) include them.
     D3D12_ROOT_PARAMETER parameters[6] = {0};
-    D3D12_DESCRIPTOR_RANGE ranges[3][3] = {0};
+    D3D12_DESCRIPTOR_RANGE ranges[3][4] = {0};
     parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     parameters[0].Constants.Num32BitValues = 2;
     parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
@@ -989,7 +989,7 @@ static HRESULT guest_graphics_root(Ps5D3D12 *c, uint32_t buffers, uint32_t image
     const D3D12_DESCRIPTOR_RANGE_TYPE kinds[3] = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, D3D12_DESCRIPTOR_RANGE_TYPE_SRV, D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER};
     UINT parameter_count = 1;
     for (UINT i = 0; i < 3; ++i) if (counts[i]) {
-        const UINT banks = i == 0 ? 1 : 3;
+        const UINT banks = i == 0 ? 1 : 4;
         for (UINT bank = 0; bank < banks; ++bank) {
             ranges[i][bank].RangeType = kinds[i]; ranges[i][bank].NumDescriptors = counts[i];
             ranges[i][bank].BaseShaderRegister = (i == 1 ? buffers : 0) + bank * counts[i];
@@ -1430,7 +1430,7 @@ static HRESULT prepare_graphics_resources(Ps5D3D12 *c, DrawBatch *batch, Graphic
     for (UINT i = 0; i < image_count; ++i) {
         const Ps5D3D12Image *image = &images[i];
         D3D12_RESOURCE_DESC desc = {0};
-        desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        desc.Dimension = image->dimension == 3 ? D3D12_RESOURCE_DIMENSION_TEXTURE3D : D3D12_RESOURCE_DIMENSION_TEXTURE2D;
         desc.Width = image->width; desc.Height = image->height; desc.MipLevels = (UINT16)image->mip_levels; desc.DepthOrArraySize = (UINT16)image->layers;
         desc.SampleDesc.Count = 1; desc.Format = image->format + (image->srgb ? 1 : 0);
         int reused = 1;
@@ -1441,21 +1441,22 @@ static HRESULT prepare_graphics_resources(Ps5D3D12 *c, DrawBatch *batch, Graphic
         UINT rows[15];
         D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprints[15];
         ID3D12Device_GetCopyableFootprints(c->device, &desc, 0, image->mip_levels, 0, footprints, rows, row_bytes, &size);
-        for (UINT mip = 0; mip < image->mip_levels; ++mip) plane_bytes += row_bytes[mip] * rows[mip];
-        if (plane_bytes * image->layers != image->size) { hr = failure(c, E_INVALIDARG, "sampled texture upload footprint"); goto done; }
-        r->image_layers[i] = image->layers; r->image_mips[i] = image->mip_levels;
+        const UINT array_layers = image->dimension == 3 ? 1 : image->layers;
+        for (UINT mip = 0; mip < image->mip_levels; ++mip) plane_bytes += row_bytes[mip] * rows[mip] * footprints[mip].Footprint.Depth;
+        if (plane_bytes * array_layers != image->size) { hr = failure(c, E_INVALIDARG, "sampled texture upload footprint"); goto done; }
+        r->image_layers[i] = array_layers; r->image_mips[i] = image->mip_levels;
         r->footprints[i] = footprints[0];
         UINT last = image->mip_levels - 1;
-        r->image_layer_stride[i] = (footprints[last].Offset + (UINT64)footprints[last].Footprint.RowPitch * rows[last] + D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1) & ~(UINT64)(D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1);
-        size += r->image_layer_stride[i] * (image->layers - 1);
+        r->image_layer_stride[i] = (footprints[last].Offset + (UINT64)footprints[last].Footprint.RowPitch * rows[last] * footprints[last].Footprint.Depth + D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1) & ~(UINT64)(D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1);
+        size += r->image_layer_stride[i] * (array_layers - 1);
         if (!reused) {
             TRY(graphics_buffer(c, size, D3D12_HEAP_TYPE_UPLOAD, &r->image_uploads[i]));
             void *mapped;
             TRY(ID3D12Resource_Map(r->image_uploads[i], 0, &empty, &mapped));
             size_t input = 0;
-            for (UINT layer = 0; layer < image->layers; ++layer) for (UINT mip = 0; mip < image->mip_levels; ++mip) {
-                for (UINT y = 0; y < rows[mip]; ++y) {
-                    memcpy((uint8_t *)mapped + footprints[mip].Offset + layer * r->image_layer_stride[i] + (size_t)y * footprints[mip].Footprint.RowPitch,
+            for (UINT layer = 0; layer < array_layers; ++layer) for (UINT mip = 0; mip < image->mip_levels; ++mip) {
+                for (UINT z = 0; z < footprints[mip].Footprint.Depth; ++z) for (UINT y = 0; y < rows[mip]; ++y) {
+                    memcpy((uint8_t *)mapped + footprints[mip].Offset + layer * r->image_layer_stride[i] + ((size_t)z * rows[mip] + y) * footprints[mip].Footprint.RowPitch,
                         image->pixels + input, (size_t)row_bytes[mip]);
                     input += (size_t)row_bytes[mip];
                 }
@@ -1471,6 +1472,8 @@ static HRESULT prepare_graphics_resources(Ps5D3D12 *c, DrawBatch *batch, Graphic
         } else if (image->dimension == 2) {
             srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
             srv.Texture2DArray.MipLevels = image->mip_levels; srv.Texture2DArray.ArraySize = image->layers;
+        } else if (image->dimension == 3) {
+            srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D; srv.Texture3D.MipLevels = image->mip_levels;
         } else {
             srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D; srv.Texture2D.MipLevels = image->mip_levels;
         }
@@ -1539,38 +1542,54 @@ static int valid_blend_factor(uint32_t factor, int alpha) {
     }
 }
 
+static UINT color_bytes_per_pixel(uint32_t format) {
+    switch (format) {
+    case DXGI_FORMAT_R16G16B16A16_FLOAT: return 8;
+    case DXGI_FORMAT_R8G8B8A8_UNORM: case DXGI_FORMAT_R8G8B8A8_SNORM: case DXGI_FORMAT_R16G16_FLOAT: return 4;
+    default: return 0;
+    }
+}
+
 static int valid_sampled_image(const Ps5D3D12Image *image) {
     if (!image->pixels || !image->width || !image->height || image->width > 16384 || image->height > 16384 || image->srgb > 1 ||
-        !image->layers || image->layers > 2048 || image->dimension > 2 || image->size > 256u * 1024 * 1024 ||
+        !image->layers || image->layers > 2048 || image->dimension > 3 || image->size > 256u * 1024 * 1024 ||
+        (image->dimension == 3 && (image->width > 2048 || image->height > 2048)) ||
         !image->mip_levels || image->mip_levels > 15 ||
         (image->dimension == 0 && image->layers != 1) ||
         (image->dimension == 1 && (image->width != image->height || image->layers % 6))) return 0;
     UINT maximum = 1;
-    for (UINT extent = image->width > image->height ? image->width : image->height; extent > 1; extent >>= 1) ++maximum;
+    UINT extent = image->width > image->height ? image->width : image->height;
+    if (image->dimension == 3 && image->layers > extent) extent = image->layers;
+    for (; extent > 1; extent >>= 1) ++maximum;
     if (image->mip_levels > maximum) return 0;
     for (UINT mip = 1; mip < image->mip_levels; ++mip) {
         UINT divisor = 1u << mip;
         UINT w = image->width / divisor, h = image->height / divisor;
         if ((image->width + divisor - 1) / divisor != (w ? w : 1) ||
-            (image->height + divisor - 1) / divisor != (h ? h : 1)) return 0;
+            (image->height + divisor - 1) / divisor != (h ? h : 1) ||
+            (image->dimension == 3 && (image->layers + divisor - 1) / divisor != (image->layers / divisor ? image->layers / divisor : 1))) return 0;
     }
     UINT block = 1, bytes;
     switch (image->format) {
     case DXGI_FORMAT_R8G8B8A8_UNORM: bytes = 4; break;
+    case DXGI_FORMAT_R16G16B16A16_FLOAT: bytes = 8; if (image->srgb) return 0; break;
     case DXGI_FORMAT_R8_UNORM: bytes = 1; if (image->srgb) return 0; break;
-    case DXGI_FORMAT_R8G8_UNORM: case DXGI_FORMAT_B4G4R4A4_UNORM: bytes = 2; if (image->srgb) return 0; break;
+    case DXGI_FORMAT_R16_UNORM: case DXGI_FORMAT_R8G8_UNORM: case DXGI_FORMAT_B4G4R4A4_UNORM: bytes = 2; if (image->srgb) return 0; break;
     case DXGI_FORMAT_BC1_UNORM: block = 4; bytes = 8; break;
     case DXGI_FORMAT_BC2_UNORM: case DXGI_FORMAT_BC3_UNORM: block = 4; bytes = 16; break;
     default: return 0;
     }
     if (image->width % block || image->height % block) return 0;
+    if (image->dimension == 3 && block != 1) return 0;
     uint64_t plane = 0;
     for (UINT mip = 0; mip < image->mip_levels; ++mip) {
         UINT w = image->width >> mip, h = image->height >> mip;
         if (!w) w = 1; if (!h) h = 1;
-        plane += (uint64_t)((w + block - 1) / block) * ((h + block - 1) / block) * bytes;
+        UINT depth = image->dimension == 3 ? image->layers >> mip : image->layers;
+        if (!depth) depth = 1;
+        plane += (uint64_t)((w + block - 1) / block) * ((h + block - 1) / block) * bytes * depth;
     }
-    return plane * image->layers == image->size;
+    return plane == image->size;
 }
 
 enum { DRAW_BATCH_CAPACITY = 64 };
@@ -1585,7 +1604,7 @@ typedef struct DrawLease {
 } DrawLease;
 struct DrawBatch {
     DrawLease leases[DRAW_BATCH_CAPACITY];
-    UINT count, width, height, depth_bpp;
+    UINT count, width, height, color_bpp, depth_bpp;
     UINT views, samplers;
     int recording, depth_write, needs_depth_readback;
     D3D12_RESOURCE_STATES depth_state;
@@ -1604,6 +1623,7 @@ struct DrawBatch {
         ID3D12Resource *color, *upload, *readback;
         D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint;
         UINT64 bytes;
+        UINT bpp;
         uint8_t *pixels;
     } extra_colors[7];
 };
@@ -1662,6 +1682,7 @@ static ID3D12Resource *batch_image(DrawBatch *batch, const Ps5D3D12Image *image)
         for (UINT i = 0; i < l->image_count; ++i) {
             const Ps5D3D12Image *previous = &l->image_inputs[i];
             if (previous->width == image->width && previous->height == image->height &&
+                (previous->dimension == 3) == (image->dimension == 3) &&
                 previous->format == image->format && previous->srgb == image->srgb &&
                 previous->layers == image->layers && previous->mip_levels == image->mip_levels && previous->size == image->size &&
                 ((previous->content_id && previous->content_id == image->content_id) || previous->pixels == image->pixels ||
@@ -1783,10 +1804,10 @@ static HRESULT finish_batch(Ps5D3D12 *c, DrawBatch *b, uint8_t *rgba, uint8_t *d
         }
     }
     for (UINT y = 0; y < b->height; ++y) {
-        for (UINT i = 0; i < b->extra_color_count; ++i) memcpy(b->extra_colors[i].pixels + (size_t)y * b->width * 4,
-            (uint8_t *)extra_mapped[i] + b->extra_colors[i].footprint.Offset + (size_t)y * b->extra_colors[i].footprint.Footprint.RowPitch, (size_t)b->width * 4);
-        if (mapped) memcpy(rgba + (size_t)y * b->width * 4,
-            (uint8_t *)mapped + b->footprint.Offset + (size_t)y * b->footprint.Footprint.RowPitch, (size_t)b->width * 4);
+        for (UINT i = 0; i < b->extra_color_count; ++i) memcpy(b->extra_colors[i].pixels + (size_t)y * b->width * b->extra_colors[i].bpp,
+            (uint8_t *)extra_mapped[i] + b->extra_colors[i].footprint.Offset + (size_t)y * b->extra_colors[i].footprint.Footprint.RowPitch, (size_t)b->width * b->extra_colors[i].bpp);
+        if (mapped) memcpy(rgba + (size_t)y * b->width * b->color_bpp,
+            (uint8_t *)mapped + b->footprint.Offset + (size_t)y * b->footprint.Footprint.RowPitch, (size_t)b->width * b->color_bpp);
         if (depth_mapped) {
             const uint8_t *row = (uint8_t *)depth_mapped + b->depth_footprint.Offset + (size_t)y * b->depth_footprint.Footprint.RowPitch;
             if (b->has_stencil && b->depth_bpp == 2) {
@@ -1840,6 +1861,7 @@ static HRESULT record_draw(Ps5D3D12 *c, DrawBatch *batch, const uint32_t *vertex
         d->cull_mode < D3D12_CULL_MODE_NONE || d->cull_mode > D3D12_CULL_MODE_BACK || d->write_mask > 15 || d->dynamic_scalars > 1 || d->check_dispatcher > 1 ||
         d->color_attachment > 1 || (!d->color_attachment && (!d->depth_format || d->write_mask || d->blend.enabled))) return E_INVALIDARG;
     const UINT depth_bpp = d->depth_format == DXGI_FORMAT_D16_UNORM ? 2 : 4;
+    const UINT color_bpp = color_bytes_per_pixel(d->color_format);
     const int has_stencil = d->stencil_pixels != NULL;
     /* D3D12 has no D16+S8 format. D32+S8 preserves D16 storage during
        stencil-only passes, but general D16 comparisons need fragment-depth
@@ -1869,12 +1891,12 @@ static HRESULT record_draw(Ps5D3D12 *c, DrawBatch *batch, const uint32_t *vertex
         blend->color_operation < 1 || blend->color_operation > 5 || blend->alpha_operation < 1 || blend->alpha_operation > 5) return E_INVALIDARG;
     for (UINT i = 0; i < 4; ++i) if (!isfinite(blend->constants[i])) return E_INVALIDARG;
     if (d->extra_color_count > 7 || (d->extra_color_count && !d->color_attachment) ||
-        (d->color_format != DXGI_FORMAT_R8G8B8A8_UNORM && d->color_format != DXGI_FORMAT_R8G8B8A8_SNORM && d->color_format != DXGI_FORMAT_R16G16_FLOAT)) return E_INVALIDARG;
+        !color_bpp || (uint64_t)d->width * d->height * color_bpp > 256u * 1024 * 1024) return E_INVALIDARG;
     for (UINT i = 0; i < d->extra_color_count; ++i) {
         const Ps5D3D12ColorAttachment *a = &d->extra_colors[i];
         const Ps5D3D12Blend *b = &a->blend;
-        if (!a->pixels || a->size != (uint64_t)d->width * d->height * 4 ||
-            (a->format != DXGI_FORMAT_R8G8B8A8_UNORM && a->format != DXGI_FORMAT_R8G8B8A8_SNORM && a->format != DXGI_FORMAT_R16G16_FLOAT) || a->write_mask > 15 ||
+        const UINT bpp = color_bytes_per_pixel(a->format);
+        if (!a->pixels || !bpp || a->size != (uint64_t)d->width * d->height * bpp || a->size > 256u * 1024 * 1024 || a->write_mask > 15 ||
             b->enabled > 1 || !valid_blend_factor(b->source_color, 0) || !valid_blend_factor(b->destination_color, 0) ||
             !valid_blend_factor(b->source_alpha, 1) || !valid_blend_factor(b->destination_alpha, 1) ||
             b->color_operation < 1 || b->color_operation > 5 || b->alpha_operation < 1 || b->alpha_operation > 5 ||
@@ -1991,7 +2013,7 @@ static HRESULT record_draw(Ps5D3D12 *c, DrawBatch *batch, const uint32_t *vertex
     if (d->color_attachment) ID3D12Device_GetCopyableFootprints(c->device, &desc, 0, 1, 0, &footprint, NULL, NULL, &bytes);
     int color_reused;
     if (d->color_attachment && !batch->count) {
-        TRY(acquire_attachment(c, &desc, &footprint, bytes, rgba, d->width * 4, &color, &readback, &color_reused));
+        TRY(acquire_attachment(c, &desc, &footprint, bytes, rgba, d->width * color_bpp, &color, &readback, &color_reused));
         if (!color_reused) TRY(graphics_buffer(c, bytes, D3D12_HEAP_TYPE_UPLOAD, &upload));
         if (!readback) TRY(graphics_buffer(c, bytes, D3D12_HEAP_TYPE_READBACK, &readback));
     } else if (d->color_attachment) {
@@ -2004,16 +2026,18 @@ static HRESULT record_draw(Ps5D3D12 *c, DrawBatch *batch, const uint32_t *vertex
         batch->extra_color_count = d->extra_color_count;
         for (UINT i = 0; i < d->extra_color_count; ++i) {
             desc.Format = d->extra_colors[i].format;
+            const UINT bpp = color_bytes_per_pixel(desc.Format);
+            batch->extra_colors[i].bpp = bpp;
             ID3D12Device_GetCopyableFootprints(c->device, &desc, 0, 1, 0, &batch->extra_colors[i].footprint, NULL, NULL, &batch->extra_colors[i].bytes);
             int reused;
             TRY(acquire_attachment(c, &desc, &batch->extra_colors[i].footprint, batch->extra_colors[i].bytes, d->extra_colors[i].pixels,
-                d->width * 4, &batch->extra_colors[i].color, &batch->extra_colors[i].readback, &reused));
+                d->width * bpp, &batch->extra_colors[i].color, &batch->extra_colors[i].readback, &reused));
             if (!batch->extra_colors[i].readback) TRY(graphics_buffer(c, batch->extra_colors[i].bytes, D3D12_HEAP_TYPE_READBACK, &batch->extra_colors[i].readback));
             if (!reused) {
                 TRY(graphics_buffer(c, batch->extra_colors[i].bytes, D3D12_HEAP_TYPE_UPLOAD, &batch->extra_colors[i].upload));
                 TRY(ID3D12Resource_Map(batch->extra_colors[i].upload, 0, &empty, &mapped));
                 for (UINT y = 0; y < d->height; ++y) memcpy((uint8_t *)mapped + batch->extra_colors[i].footprint.Offset + (size_t)y * batch->extra_colors[i].footprint.Footprint.RowPitch,
-                    d->extra_colors[i].pixels + (size_t)y * d->width * 4, (size_t)d->width * 4);
+                    d->extra_colors[i].pixels + (size_t)y * d->width * bpp, (size_t)d->width * bpp);
                 D3D12_RANGE written = {0, (SIZE_T)batch->extra_colors[i].bytes};
                 ID3D12Resource_Unmap(batch->extra_colors[i].upload, 0, &written);
             }
@@ -2029,7 +2053,7 @@ static HRESULT record_draw(Ps5D3D12 *c, DrawBatch *batch, const uint32_t *vertex
     }
     if (upload) {
         TRY(ID3D12Resource_Map(upload, 0, &empty, &mapped));
-        for (UINT y = 0; y < d->height; ++y) memcpy((uint8_t *)mapped + footprint.Offset + (size_t)y * footprint.Footprint.RowPitch, rgba + (size_t)y * d->width * 4, (size_t)d->width * 4);
+        for (UINT y = 0; y < d->height; ++y) memcpy((uint8_t *)mapped + footprint.Offset + (size_t)y * footprint.Footprint.RowPitch, rgba + (size_t)y * d->width * color_bpp, (size_t)d->width * color_bpp);
         ID3D12Resource_Unmap(upload, 0, &entire);
     }
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT depth_footprint = {0};
@@ -2188,6 +2212,7 @@ static HRESULT record_draw(Ps5D3D12 *c, DrawBatch *batch, const uint32_t *vertex
         batch->footprint = footprint; batch->bytes = bytes;
         batch->depth_footprint = depth_footprint; batch->depth_bytes = depth_copy_bytes;
         batch->width = d->width; batch->height = d->height; batch->depth_bpp = depth_bpp;
+        batch->color_bpp = color_bpp;
     } else {
         /* These are borrowed target references, not completed pool leases. */
         release(color); color = NULL; release(readback); readback = NULL;

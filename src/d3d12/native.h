@@ -44,7 +44,8 @@ typedef struct Ps5D3D12Buffer {
 typedef struct Ps5D3D12Image {
     const uint8_t *pixels;
     size_t size;
-    /* dimension: 0=2D, 1=cube array, 2=2D array. Pixels are layer-major. */
+    /* dimension: 0=2D, 1=cube array, 2=2D array, 3=3D (layers is depth).
+     * Arrays are layer-major/mip-minor; volumes are mip-major/Z-slice-minor. */
     uint32_t width, height, layers, dimension, mip_levels, format, srgb, components, filter, address_u, address_v, address_w;
     float min_lod, max_lod, lod_bias, border[4];
     /* Nonzero identifies an immutable pixel snapshot. Equal IDs always hold

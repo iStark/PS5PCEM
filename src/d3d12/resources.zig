@@ -233,6 +233,7 @@ pub const DrawResources = struct {
             .dim_2d => 0,
             .dim_2d_array => 1,
             .dim_2d_array_alt => 2,
+            .dim_3d => 3,
             else => return error.GraphicsImageOperationNotImplemented,
         };
         const sampler = try gpu.resources.decodeSamplerDescriptor(&sampler_words);
@@ -241,8 +242,10 @@ pub const DrawResources = struct {
         });
         const format: u32 = switch (descriptor.unified_format) {
             1 => 61, // R8_UNORM
+            7 => 56, // R16_UNORM
             14 => 49, // R8G8_UNORM
             56 => 28,
+            71 => 10, // R16G16B16A16_FLOAT, preserving HDR values and signs.
             136 => 115, // B4G4R4A4_UNORM; component mapping restores guest XYZW.
             169, 170 => 71,
             171, 172 => 74,
@@ -255,6 +258,7 @@ pub const DrawResources = struct {
             0 => layers == 1 and (descriptor.image_type == .color_2d or descriptor.image_type == .color_2d_array),
             1 => descriptor.image_type == .cube and descriptor.base_array % 6 == 0 and layers % 6 == 0 and descriptor.width == descriptor.height,
             2 => descriptor.image_type == .color_2d_array or descriptor.image_type == .cube,
+            3 => descriptor.image_type == .color_3d and descriptor.base_array == 0,
             else => unreachable,
         };
         const compressed = format == 71 or format == 74 or format == 77;
@@ -266,28 +270,34 @@ pub const DrawResources = struct {
         const dcc: ?surfaces.Dcc = if (descriptor.dccMetadataAddress()) |address| .{ .address = address, .clear_word = null } else null;
         if (!view_supported or format == 0 or descriptor.viewBaseLevel() != 0 or
             descriptor.min_lod != 0 or (compressed and descriptor.bc_swizzle != 0) or
-            descriptor.cmask_fast_clear or descriptor.fmask_compression or (dcc != null and (format != 28 or layers != 1 or mip_allocation)) or
+            descriptor.cmask_fast_clear or descriptor.fmask_compression or (dcc != null and (format != 28 or layers != 1 or mip_allocation or dimension == 3)) or
             (dcc == null and gpu.MetadataSurface.fromImage(descriptor).hasAny()))
         {
             return error.GraphicsTextureFormatOrMipNotImplemented;
         }
         const expected_bytes = native.sampledImageMipChainSize(descriptor.width, descriptor.height, format, layers, dimension, mips) catch return error.GraphicsTextureFormatOrMipNotImplemented;
         if (dimension == 1 and sampler.disable_cube_wrap) return error.GraphicsSamplerModeNotImplemented;
-        // Narrow and packed formats have no sRGB DXGI variants; adding one
+        // Float, narrow and packed formats have no sRGB DXGI variants; adding one
         // to their enum does not select a gamma-decoding view.
-        if (sampler.force_srgb and (format == 61 or format == 49 or format == 115)) return error.GraphicsSamplerModeNotImplemented;
+        if (sampler.force_srgb and (format == 10 or format == 56 or format == 61 or format == 49 or format == 115)) return error.GraphicsSamplerModeNotImplemented;
         if (sampler.trunc_coordinates or sampler.filter_mode != 0 or sampler.maximum_anisotropy > 4 or
             sampler.mip_filter > 2 or sampler.border_color_type == 3)
             return error.GraphicsSamplerModeNotImplemented;
+        // Native 3D min/mag filtering applies to all axes. Guest Z filtering
+        // is independent; accept only the matching POINT/LINEAR encoding.
+        if (dimension == 3 and (sampler.minification_filter > 1 or
+            sampler.minification_filter != sampler.magnification_filter or
+            sampler.z_filter != sampler.minification_filter + 1)) return error.GraphicsSamplerModeNotImplemented;
         const anisotropy = sampler.maximum_anisotropy != 0 and (sampler.minification_filter >= 2 or sampler.magnification_filter >= 2);
         if (anisotropy and (sampler.minification_filter != sampler.magnification_filter or
-            dimension == 1 or resolver.bindings.stage != .pixel or sampler.unnormalized_coordinates or
+            (dimension != 0 and dimension != 2) or resolver.bindings.stage != .pixel or sampler.unnormalized_coordinates or
             @as(u16, @bitCast(inst.image_sample_flags)) != 0 or sampler.mip_filter == 0)) return error.GraphicsSamplerModeNotImplemented;
         const unnormalized = sampler.unnormalized_coordinates;
         if (unnormalized and (mips != 1 or dimension != 0 or resolver.bindings.stage != .pixel or @as(u16, @bitCast(inst.image_sample_flags)) != 0 or
             sampler.mip_filter != 0 or sampler.minimum_lod != 0 or sampler.lod_bias != 0 or
             sampler.minification_filter != sampler.magnification_filter)) return error.GraphicsSamplerModeNotImplemented;
-        const layout = if (!mip_allocation) try gpu.SurfaceLayout.fromImage(descriptor) else null;
+        const texture_layout = mip_allocation or dimension == 3;
+        const layout = if (!texture_layout) try gpu.SurfaceLayout.fromImage(descriptor) else null;
         if (layout) |single| {
             if (single.staging_bytes != expected_bytes) return error.GraphicsImageFootprintMismatch;
             if (single.required_source_bytes > 256 * 1024 * 1024 or single.staging_bytes > 256 * 1024 * 1024) return error.GraphicsSnapshotBudgetExceeded;
@@ -297,10 +307,12 @@ pub const DrawResources = struct {
         var pixel_lease: staging.Lease = undefined;
         // DCC keys are not covered by the texture cache's page proof, so a
         // compressed view always takes the fresh read path.
-        const pixels: []const u8 = if (mip_allocation) blk: {
+        const pixels: []const u8 = if (texture_layout) blk: {
             const texture = try gpu.TextureLayout.fromImage(descriptor);
+            // A volume has one subresource per mip, containing all Z slices.
+            const array_layers = if (dimension == 3) 1 else layers;
             var required: u64 = 0;
-            for (0..mips) |level| required = @max(required, (try texture.subresource(@intCast(level), 0, layers)).required_source_bytes);
+            for (0..mips) |level| required = @max(required, (try texture.subresource(@intCast(level), 0, array_layers)).required_source_bytes);
             if (required > 256 * 1024 * 1024) return error.GraphicsSnapshotBudgetExceeded;
             _ = try std.math.add(u64, descriptor.address, required);
             var backing = try staging.Lease.alloc(self.allocator, self.pool, @intCast(required));
@@ -310,7 +322,7 @@ pub const DrawResources = struct {
             errdefer pixel_lease.deinit();
             var offset: usize = 0;
             // Native D3D subresource order: mip + layer * mip_count.
-            for (0..layers) |layer| for (0..mips) |level| {
+            for (0..array_layers) |layer| for (0..mips) |level| {
                 const view = try texture.subresource(@intCast(level), @intCast(layer), 1);
                 const size: usize = @intCast(try view.stagingBytes());
                 if (size > pixel_lease.bytes.len - offset) return error.GraphicsImageFootprintMismatch;
@@ -413,6 +425,7 @@ pub const DrawResources = struct {
                 0 => .two_d,
                 1 => .cube,
                 2 => .two_d_array,
+                3 => .three_d,
                 else => unreachable,
             },
             .minimum_lod = sampler.minimum_lod,
