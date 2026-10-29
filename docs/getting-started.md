@@ -71,6 +71,19 @@ disk error reports failure and may leave partial output; choose a new directory
 for a retry. This extracts the archive as stored and does not decrypt content.
 Direct read-only launch with `game-run game.zar` remains available.
 
+### Launcher documentation images
+
+The Windows launcher can export its English library view using the same GDI
+renderer as the interactive window:
+
+```powershell
+.\ps5pcem.exe --export-library library.bmp
+```
+
+This writes a lossless 1180 × 760 client-area image using the actual local
+library and artwork. It does not open a window or change saved preferences.
+Convert the BMP to PNG when adding it to documentation.
+
 ### Shader tools
 
 The input is a raw shader binary: a sequence of little-endian 32-bit words, with

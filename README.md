@@ -30,10 +30,10 @@
 ## Launcher
 
 <p align="center">
-  <img src="docs/images/launcher-library.png" alt="PS5PCEM launcher showing its recent-game library with the game folder, the Vulkan / DirectX 12 choice and a 60 FPS limit selected">
+  <img src="docs/images/launcher-library.png" alt="PS5PCEM launcher in English showing the game library, Vulkan / DirectX 12 selection, FPS limits, and separate Extract PKG and Extract ZAR buttons">
 </p>
 
-<p align="center"><em>A native Windows library with local cover art, per-title saves, input profiles, a graphics API choice, an FPS limit, and direct game launching.</em></p>
+<p align="center"><em>The English Windows launcher with local cover art, Vulkan / DirectX 12 selection, FPS limits, separate PKG / ZAR extraction, and direct game launching.</em></p>
 
 The launcher remembers up to 48 recent titles across pages of eight, shown as cover
 tiles or as a table and searchable by title, title ID or folder name. It reads artwork

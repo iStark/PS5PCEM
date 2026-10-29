@@ -196,8 +196,11 @@ fn tr(phrase: Phrase) []const u8 {
     return common.translate(language, phrase);
 }
 
-pub fn main(_: std.process.Init) !void {
+pub fn main(init: std.process.Init) !void {
     if (builtin.os.tag != .windows) return error.UnsupportedPlatform;
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
+    const exporting = args.len > 1 and std.mem.eql(u8, args[1], "--export-library");
+    if (exporting and args.len != 3) return error.InvalidUsage;
     _ = Win32.SetProcessDpiAwarenessContext(Win32.dpi_awareness_per_monitor_v2);
     _ = Win32.CoInitializeEx(null, Win32.coinit_apartment_threaded);
     defer Win32.CoUninitialize();
@@ -211,7 +214,7 @@ pub fn main(_: std.process.Init) !void {
     };
 
     initializeIniPath();
-    loadSettings();
+    loadSettings(!exporting);
     // Once, before the window exists: the answer never changes while the
     // launcher runs, and asking per repaint would load the loader every frame.
     probeVulkan();
@@ -221,6 +224,13 @@ pub fn main(_: std.process.Init) !void {
 
     const instance = Win32.GetModuleHandleW(null) orelse return error.WindowCreationFailed;
     application_icon = Win32.LoadIconW(instance, Win32.app_icon_resource);
+    if (exporting) {
+        // Documentation capture uses the same drawing code and actual library,
+        // without changing saved preferences or creating an interactive window.
+        language = .english;
+        library_view = .grid;
+        return exportLibrary(init.io, args[2]);
+    }
     const class = Win32.WndClassExW{
         .size = @sizeOf(Win32.WndClassExW),
         .style = Win32.class_redraw,
@@ -1081,9 +1091,13 @@ fn paint(window: Win32.Window) void {
 
     var client: Win32.NativeRect = undefined;
     _ = Win32.GetClientRect(window, &client);
-    fill(dc, .{ .left = 0, .top = 0, .right = client.right, .bottom = client.bottom }, 0x0015110e);
-    fill(dc, .{ .left = 0, .top = 0, .right = sidebar_width, .bottom = client.bottom }, 0x00201915);
-    fill(dc, .{ .left = sidebar_width, .top = 0, .right = sidebar_width + 1, .bottom = client.bottom }, 0x00352b25);
+    drawClient(dc, client.right, client.bottom);
+}
+
+fn drawClient(dc: Win32.DeviceContext, width: i32, height: i32) void {
+    fill(dc, .{ .left = 0, .top = 0, .right = width, .bottom = height }, 0x0015110e);
+    fill(dc, .{ .left = 0, .top = 0, .right = sidebar_width, .bottom = height }, 0x00201915);
+    fill(dc, .{ .left = sidebar_width, .top = 0, .right = sidebar_width + 1, .bottom = height }, 0x00352b25);
 
     drawBrand(dc);
     drawNavigation(dc);
@@ -1094,6 +1108,32 @@ fn paint(window: Win32.Window) void {
         .settings => drawSettings(dc),
     }
     drawFooter(dc);
+}
+
+/// Lossless, top-down 32-bit BMP of the client renderer. This exports our own
+/// UI, not another window or the desktop, and works without desktop capture.
+fn exportLibrary(io: std.Io, path: []const u8) !void {
+    const dc = Win32.CreateCompatibleDC(null) orelse return error.ImageExportFailed;
+    defer _ = Win32.DeleteDC(dc);
+    const info = Win32.BitmapInfoHeader{};
+    var pixels: ?*anyopaque = null;
+    const bitmap = Win32.CreateDIBSection(dc, &info, 0, &pixels, null, 0) orelse return error.ImageExportFailed;
+    defer _ = Win32.DeleteObject(bitmap);
+    const previous = Win32.SelectObject(dc, bitmap);
+    defer _ = Win32.SelectObject(dc, previous);
+    drawClient(dc, window_width, window_height);
+    if (Win32.GdiFlush() == 0) return error.ImageExportFailed;
+    const size = window_width * window_height * 4;
+    const data: [*]const u8 = @ptrCast(pixels orelse return error.ImageExportFailed);
+    var header: [14]u8 = @splat(0);
+    @memcpy(header[0..2], "BM");
+    std.mem.writeInt(u32, header[2..6], 14 + @sizeOf(Win32.BitmapInfoHeader) + size, .little);
+    std.mem.writeInt(u32, header[10..14], 14 + @sizeOf(Win32.BitmapInfoHeader), .little);
+    const file = try std.Io.Dir.cwd().createFile(io, path, .{});
+    defer file.close(io);
+    try file.writeStreamingAll(io, &header);
+    try file.writeStreamingAll(io, std.mem.asBytes(&info));
+    try file.writeStreamingAll(io, data[0..size]);
 }
 
 fn drawBrand(dc: Win32.DeviceContext) void {
@@ -3011,12 +3051,12 @@ fn siblingExecutable(comptime name: []const u8, output: *[1024]u16) usize {
     return length;
 }
 
-fn loadSettings() void {
+fn loadSettings(persist_recent: bool) void {
     if (ini_path_length == 0) return;
     loadRecentGames();
     game_folder_length = Win32.GetPrivateProfileStringW(w("launcher"), w("game_folder"), w(""), &game_folder, game_folder.len, @ptrCast(&ini_path));
     refreshTitleIdentifier();
-    if (game_folder_length != 0) rememberGameFolder(game_folder[0..game_folder_length], true);
+    if (game_folder_length != 0) rememberGameFolder(game_folder[0..game_folder_length], persist_recent);
     sound_enabled = Win32.GetPrivateProfileIntW(w("launcher"), w("sound"), 1, @ptrCast(&ini_path)) != 0;
     show_fps = Win32.GetPrivateProfileIntW(w("launcher"), w("show_fps"), 0, @ptrCast(&ini_path)) != 0;
     output_mode = display_mode.Mode.fromHeight(Win32.GetPrivateProfileIntW(w("launcher"), w("output_resolution"), display_mode.default.height(), @ptrCast(&ini_path))) orelse display_mode.default;
@@ -3448,6 +3488,21 @@ const Win32 = if (builtin.os.tag == .windows) struct {
 
     extern "gdi32" fn CreateSolidBrush(color: u32) callconv(.winapi) Brush;
     extern "gdi32" fn CreateCompatibleDC(DeviceContext) callconv(.winapi) DeviceContext;
+    const BitmapInfoHeader = extern struct {
+        size: u32 = 40,
+        width: i32 = window_width,
+        height: i32 = -window_height,
+        planes: u16 = 1,
+        bits: u16 = 32,
+        compression: u32 = 0,
+        image_size: u32 = window_width * window_height * 4,
+        x_pixels_per_metre: i32 = 0,
+        y_pixels_per_metre: i32 = 0,
+        colors_used: u32 = 0,
+        colors_important: u32 = 0,
+    };
+    extern "gdi32" fn CreateDIBSection(DeviceContext, *const BitmapInfoHeader, u32, *?*anyopaque, Handle, u32) callconv(.winapi) Bitmap;
+    extern "gdi32" fn GdiFlush() callconv(.winapi) i32;
     extern "gdi32" fn DeleteDC(DeviceContext) callconv(.winapi) i32;
     extern "gdi32" fn SetStretchBltMode(DeviceContext, i32) callconv(.winapi) i32;
     extern "gdi32" fn StretchBlt(DeviceContext, i32, i32, i32, i32, DeviceContext, i32, i32, i32, i32, u32) callconv(.winapi) i32;
