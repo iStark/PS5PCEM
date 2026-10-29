@@ -526,6 +526,8 @@ fn guestGraphicsProbe(allocator: std.mem.Allocator, device: *d3d12.Device) !void
     try guestDepthBiasProbe(allocator, &vertex_words, &pixel_words);
     try guestViewportDepthProbe(allocator, &vertex_words, &pixel_words);
     try guestVaryingProbe(allocator, &vertex_words);
+    try guestMipImageProbe(allocator, &vertex_words, &pixel_words);
+    try guestAnisotropicProbe(allocator);
     try guestFanProbe(allocator);
     try guestRectangleProbe(allocator);
     try guestStencilProbe(device, vertex.words, fragment.words);
@@ -2278,6 +2280,239 @@ fn guestVaryingProbe(allocator: std.mem.Allocator, vertex: []const u32) !void {
         };
     }
     std.debug.print("PASS native interpolated RDNA2 PARAM values and two ATTR inputs remapped to PARAM3\n", .{});
+    const smooth = memory.data[0x2000..0x5000].*;
+    try state.writeRegister(.context, 0x191, 0x403); // Flat ATTR0; smooth ATTR4 still aliases PARAM3.
+    for ([_]bool{ false, true }) |mov| for ([_]bool{ false, true }) |last| for ([_]u32{ 0, 1, 2, 4 }) |width| {
+        words.clearRetainingCapacity();
+        for (0..4) |component| {
+            const attr: u32 = if (component % 2 == 0) 0 else 4;
+            if (mov and attr == 0) {
+                try words.append(allocator, 0xc8020002 | (@as(u32, @intCast(component)) << 18) | (@as(u32, @intCast(component)) << 8));
+            } else for (0..2) |phase| try words.append(allocator, 0xc8000000 | (@as(u32, @intCast(component)) << 18) |
+                (@as(u32, @intCast(phase)) << 16) | (attr << 10) | (@as(u32, @intCast(component)) << 8) | @as(u32, @intCast(phase)));
+        }
+        try words.appendSlice(allocator, &.{ 0xf800080f, 0x03020100, 0xbf810000 });
+        @memcpy(memory.data[0x400..][0 .. words.items.len * 4], std.mem.sliceAsBytes(words.items));
+        try state.writeRegister(.context, 0x205, if (last) 1 << 19 else 0);
+        @memset(memory.data[0x2000..0x5000], 0);
+        if (width == 0) {
+            _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 2 });
+        } else {
+            for (0..3) |i| switch (width) {
+                1 => memory.data[0x600 + i] = @intCast(i),
+                2 => std.mem.writeInt(u16, memory.data[0x600 + i * 2 ..][0..2], @intCast(i), .little),
+                else => std.mem.writeInt(u32, memory.data[0x600 + i * 4 ..][0..4], @intCast(i), .little),
+            };
+            const source = memory.data[0x600..0x60c].*;
+            _ = try executor.execute(&.{ command(gpu.pm4.index_type, 1), if (width == 1) 2 else if (width == 2) 0 else 1, command(gpu.pm4.draw_index_2, 5), 3, 0x600, 0, 3, 0 });
+            if (!std.mem.eql(u8, &source, memory.data[0x600..0x60c])) return error.FlatIndicesModified;
+        }
+        for (memory.data[0x2000..0x5000], 0..) |actual, i| {
+            const covered = i < 37 * 72 * 4 and smooth[i - i % 4 + 3] == 255;
+            const expected: u8 = if (covered and i % 4 == 0) (if (last) 223 else 32) else smooth[i];
+            if (@abs(@as(i16, actual) - expected) > 1) {
+                std.debug.print("Flat mismatch MOV={} last={} width={d} byte={d}: {d} expected {d}\n", .{ mov, last, width, i, actual, expected });
+                return error.FlatInterpolationMismatch;
+            }
+        }
+    };
+    std.debug.print("PASS 16 mixed flat/smooth full-frame comparisons: MOV P0/P1-P2, first/last provoking vertices, auto/8/16/32-bit indices, shared PARAM and untouched guest index storage\n", .{});
+}
+
+fn mipProbeColor(layer: usize, level: usize, compressed: bool) [4]u8 {
+    var color = [4]u8{ @intCast(16 + (layer % 60) * 3), @intCast(30 + level * 60), @intCast(40 + level * 40), 255 };
+    if (compressed) {
+        color[0] = @intCast((@as(u32, color[0] >> 3) * 255 + 15) / 31);
+        color[1] = @intCast((@as(u32, color[1] >> 2) * 255 + 31) / 63);
+        color[2] = @intCast((@as(u32, color[2] >> 3) * 255 + 15) / 31);
+    }
+    return color;
+}
+
+fn guestMipImageProbe(allocator: std.mem.Allocator, vertex: []const u32, solid_pixel: []const u32) !void {
+    const memory = try allocator.create(GraphicsMemory);
+    defer allocator.destroy(memory);
+    memory.* = .{};
+    @memcpy(memory.data[0x200..][0 .. vertex.len * 4], std.mem.sliceAsBytes(vertex));
+    @memcpy(memory.data[0x400..][0 .. solid_pixel.len * 4], std.mem.sliceAsBytes(solid_pixel));
+    var state = try graphicsState(65, 37, 72);
+    try state.writeRegister(.shader, 0x00b, 14 << 1);
+    try state.writeRegister(.shader, 0x014, 0x92);
+    try state.writeRegister(.shader, 0x015, 0xfff000);
+    try state.writeRegister(.shader, 0x016, 2 << 26); // Linear mip filtering; point within each mip.
+    var renderer = try d3d12.Renderer.init(allocator, memory.access(), false);
+    defer renderer.deinit();
+    var executor = gpu.DcbExecutor{ .state = &state, .backend = renderer.dcbBackend(), .allocator = allocator };
+    @memset(memory.data[0x2000..0x5000], 0xa7);
+    _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 2 });
+    const coverage = memory.data[0x2000..0x5000].*;
+    var cases: usize = 0;
+    for ([_][2]u32{ .{ 8, 8 }, .{ 96, 32 } }) |shape| for ([_]u32{ 0, 1, 2 }) |dimension| for ([_]u16{ 56, 169 }) |format| for ([_]gpu.resources.TileMode{ .linear, .standard_4kb }) |mode| {
+        if (dimension == 1 and shape[0] != shape[1]) continue;
+        const layers: u32 = if (dimension == 0) 1 else if (dimension == 1) 12 else if (shape[0] == 8) 78 else 2;
+        const first: u32 = if (dimension == 0) 0 else if (dimension == 1) 6 else 2;
+        const image_type: u32 = if (dimension == 0) 9 else if (dimension == 1) 11 else 13;
+        const words = [_]u32{ 0x100, (@as(u32, format) << 20) | (((shape[0] - 1) & 3) << 30), ((shape[0] - 1) >> 2) | ((shape[1] - 1) << 14), (image_type << 28) | 0xfac | (3 << 16) | (@as(u32, @intFromEnum(mode)) << 20), if (dimension == 0) 0 else (layers + first - 1) | (first << 16), 3 << 4, 0, 0 };
+        const layout = try gpu.TextureLayout.fromImage(try gpu.resources.decodeImageDescriptor(&words));
+        const backing = memory.data[0x10000..][0..@intCast(layout.required_source_bytes)];
+        @memset(backing, 0xab);
+        for (0..layers) |layer| for (0..4) |level| {
+            const view = try layout.subresource(@intCast(level), @intCast(layer), 1);
+            const pixels = try allocator.alloc(u8, @intCast(try view.stagingBytes()));
+            defer allocator.free(pixels);
+            const color = mipProbeColor(layer, level, false);
+            if (format == 56) {
+                for (0..pixels.len / 4) |i| @memcpy(pixels[i * 4 ..][0..4], &color);
+            } else {
+                const rgb565 = (@as(u16, color[0] >> 3) << 11) | (@as(u16, color[1] >> 2) << 5) | @as(u16, color[2] >> 3);
+                for (0..pixels.len / 8) |i| {
+                    const block = pixels[i * 8 ..][0..8];
+                    @memset(block, 0);
+                    std.mem.writeInt(u16, block[0..2], rgb565, .little);
+                }
+            }
+            try view.tile(pixels, backing);
+        };
+        const before = try allocator.dupe(u8, backing);
+        defer allocator.free(before);
+        for (words, 0..) |word, i| try state.writeRegister(.shader, 0x00c + @as(u32, @intCast(i)), word);
+        const sample_dim: u32 = if (dimension == 0) 1 else if (dimension == 1) 3 else 5;
+        const ps = [_]u32{ vop1(0x01, 0, 255), @bitCast(@as(f32, if (dimension == 1) 1.5 else 0.5)), vop1(0x01, 1, 256), vop1(0x01, 2, 12), vop1(0x01, 3, 13), 0xf0900f00 | (sample_dim << 3), 0x00400400, 0xf800080f, 0x07060504, 0xbf810000 };
+        @memcpy(memory.data[0x400..][0..@sizeOf(@TypeOf(ps))], std.mem.asBytes(&ps));
+        for ([_]u32{ 0, layers - 1 }) |layer| for (0..7) |step| {
+            const lod: f32 = @as(f32, @floatFromInt(step)) * 0.5;
+            const face: f32 = @floatFromInt(if (dimension == 1) (layer / 6) * 8 + layer % 6 else layer);
+            try state.writeRegister(.shader, 0x018, @bitCast(if (dimension == 0) lod else face));
+            try state.writeRegister(.shader, 0x019, @bitCast(lod));
+            @memset(memory.data[0x2000..0x5000], 0xa7);
+            _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 2 });
+            const low = mipProbeColor(layer, step / 2, format != 56);
+            const high = mipProbeColor(layer, @min(3, (step + 1) / 2), format != 56);
+            for (memory.data[0x2000..0x5000], 0..) |actual, i| {
+                const expected: u8 = if (coverage[i - i % 4 + 3] == 255) @intCast((@as(u16, low[i % 4]) + high[i % 4] + 1) / 2) else 0xa7;
+                if (@abs(@as(i16, actual) - expected) > 2) {
+                    std.debug.print("Mip mismatch dim={d} format={d} tile={f} layer={d} lod={d} byte={d}: {d} expected {d}\n", .{ dimension, format, mode, layer, lod, i, actual, expected });
+                    return error.MipChainSamplingMismatch;
+                }
+            }
+            cases += 1;
+        };
+        if (!std.mem.eql(u8, before, backing)) return error.MipChainSourceModified;
+    };
+    std.debug.print("PASS {d} mip-chain frame checks: 2D/cube/78-layer arrays, 96x32 partial chains, base slices, all levels and linear LOD blends, RGBA8/BC1 1x1 tails, linear/tiled memory and source preservation\n", .{cases});
+}
+
+fn anisoProbeTexel(x: i32, y: i32, level: u32, layer: u32) [4]f32 {
+    const side: i32 = @as(i32, 64) >> @as(u5, @intCast(level));
+    const ix: u32 = @intCast(std.math.clamp(x, 0, side - 1));
+    const iy: u32 = @intCast(std.math.clamp(y, 0, side - 1));
+    return .{ @floatFromInt(if (ix % 4 < 2) @as(u32, 32) else 224), @floatFromInt((iy * 13) % 256), @floatFromInt(level * 40 + layer * 50), 255 };
+}
+
+fn anisoProbeSample(u: f32, v: f32, level: u32, layer: u32, linear: bool) [4]f32 {
+    const side: f32 = @floatFromInt(@as(u32, 64) >> @as(u5, @intCast(level)));
+    if (!linear) return anisoProbeTexel(@intFromFloat(@floor(u * side)), @intFromFloat(@floor(v * side)), level, layer);
+    const x = u * side - 0.5;
+    const y = v * side - 0.5;
+    const ix: i32 = @intFromFloat(@floor(x));
+    const iy: i32 = @intFromFloat(@floor(y));
+    const fx = x - @floor(x);
+    const fy = y - @floor(y);
+    var color: [4]f32 = @splat(0);
+    for (0..2) |dy| for (0..2) |dx| {
+        const texel = anisoProbeTexel(ix + @as(i32, @intCast(dx)), iy + @as(i32, @intCast(dy)), level, layer);
+        const weight = (if (dx == 0) 1 - fx else fx) * (if (dy == 0) 1 - fy else fy);
+        for (&color, texel) |*c, t| c.* += weight * t;
+    };
+    return color;
+}
+
+fn guestAnisotropicProbe(allocator: std.mem.Allocator) !void {
+    const memory = try allocator.create(GraphicsMemory);
+    defer allocator.destroy(memory);
+    memory.* = .{};
+    const vs = [_]u32{ 0xe0382000, 0x80000005, 0xe0382010, 0x80000805, 0xf80000cf, 0x03020100, 0xf8000a0f, 0x0b0a0908, 0xbf810000 };
+    @memcpy(memory.data[0x200..][0..@sizeOf(@TypeOf(vs))], std.mem.asBytes(&vs));
+    var state = try graphicsState(16, 16, 16);
+    try state.writeRegister(.shader, 0x04b, 4 << 1);
+    for ([_]u32{ 0x1000, 32 << 16, 3, 0xfac }, 0..) |word, i| try state.writeRegister(.shader, 0x04c + @as(u32, @intCast(i)), word);
+    try state.writeRegister(.context, 0x191, 0); // ATTR0 reads PARAM0.
+    try state.writeRegister(.shader, 0x00b, 12 << 1);
+    var renderer = try d3d12.Renderer.init(allocator, memory.access(), false);
+    defer renderer.deinit();
+    var executor = gpu.DcbExecutor{ .state = &state, .backend = renderer.dcbBackend(), .allocator = allocator };
+    var cases: usize = 0;
+    for ([_]bool{ false, true }) |array| {
+        const layer: u32 = if (array) 1 else 0;
+        const words = [_]u32{ 0x100, (56 << 20) | (3 << 30), 15 | (63 << 14), (@as(u32, if (array) 13 else 9) << 28) | 0xfac | (3 << 16), layer, 3 << 4, 0, 0 };
+        const layout = try gpu.TextureLayout.fromImage(try gpu.resources.decodeImageDescriptor(&words));
+        const backing = memory.data[0x10000..][0..@intCast(layout.required_source_bytes)];
+        @memset(backing, 0xab);
+        for (0..layer + 1) |slice| for (0..4) |level| {
+            const view = try layout.subresource(@intCast(level), @intCast(slice), 1);
+            const pixels = try allocator.alloc(u8, @intCast(try view.stagingBytes()));
+            defer allocator.free(pixels);
+            const side = @as(usize, 64) >> @as(u6, @intCast(level));
+            for (0..side) |y| for (0..side) |x| {
+                const color = anisoProbeTexel(@intCast(x), @intCast(y), @intCast(level), @intCast(slice));
+                for (color, 0..) |c, i| pixels[(y * side + x) * 4 + i] = @intFromFloat(c);
+            };
+            try view.tile(pixels, backing);
+        };
+        const before = try allocator.dupe(u8, backing);
+        defer allocator.free(before);
+        for (words, 0..) |word, i| try state.writeRegister(.shader, 0x00c + @as(u32, @intCast(i)), word);
+        const ps = [_]u32{ 0xc8000000, 0xc8010001, 0xc8040100, 0xc8050101, vop1(1, 2, 255), @bitCast(@as(f32, @floatFromInt(layer))), 0xf0800f00 | (@as(u32, if (array) 5 else 1) << 3), 0x00400400, 0xf800080f, 0x07060504, 0xbf810000 };
+        @memcpy(memory.data[0x400..][0..@sizeOf(@TypeOf(ps))], std.mem.asBytes(&ps));
+        for ([_]u32{ 1, 2, 3, 4 }) |ratio_code| for ([_]bool{ false, true }) |linear| for ([_]bool{ false, true }) |mip_linear| for ([_][2]f32{ .{ 4, 1 }, .{ 1, 8 }, .{ 0.25, 0.25 }, .{ 16, 2 } }) |scale| {
+            const vertices = [_][8]f32{
+                .{ -1, -1, 0, 1, 0.37 / 64.0, (16 * scale[1] + 0.37) / 64, 0, 1 },
+                .{ 3, -1, 0, 1, (32 * scale[0] + 0.37) / 64, (16 * scale[1] + 0.37) / 64, 0, 1 },
+                .{ -1, 3, 0, 1, 0.37 / 64.0, (-16 * scale[1] + 0.37) / 64, 0, 1 },
+            };
+            @memcpy(memory.data[0x1000..][0..@sizeOf(@TypeOf(vertices))], std.mem.asBytes(&vertices));
+            const filter: u32 = if (linear) 3 else 2;
+            try state.writeRegister(.shader, 0x014, 0x92 | (ratio_code << 9));
+            try state.writeRegister(.shader, 0x015, 3 << 20);
+            try state.writeRegister(.shader, 0x016, (filter << 20) | (filter << 22) | (@as(u32, if (mip_linear) 2 else 1) << 26) | @as(u32, if (mip_linear) 128 else 0));
+            @memset(memory.data[0x2000..0x2400], 0xa7);
+            _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 2 });
+            const max_taps: f32 = @floatFromInt(@as(u32, 1) << @as(u5, @intCast(ratio_code)));
+            const width = @max(1, @max(@min(scale[0], scale[1]), @max(scale[0], scale[1]) / max_taps));
+            const taps: u32 = @intFromFloat(std.math.clamp(@ceil(@max(scale[0], scale[1]) / width), 1, max_taps));
+            const lod = std.math.clamp(@log2(width) + @as(f32, if (mip_linear) 0.5 else 0), 0, 3);
+            const low: u32 = @intFromFloat(if (mip_linear) @floor(lod) else @floor(lod + 0.5));
+            const high = @min(3, low + 1);
+            const blend = if (mip_linear) lod - @floor(lod) else 0;
+            for (0..16) |y| for (0..16) |x| {
+                var expected: [4]f32 = @splat(0);
+                for (0..taps) |tap| {
+                    const offset = (@as(f32, @floatFromInt(tap)) + 0.5) / @as(f32, @floatFromInt(taps)) - 0.5;
+                    const u = ((@as(f32, @floatFromInt(x)) + 0.5 + (if (scale[0] > scale[1]) offset else 0)) * scale[0] + 0.37) / 64;
+                    const v = ((@as(f32, @floatFromInt(y)) + 0.5 + (if (scale[0] > scale[1]) 0 else offset)) * scale[1] + 0.37) / 64;
+                    const a = anisoProbeSample(u, v, low, layer, linear);
+                    const b = anisoProbeSample(u, v, high, layer, linear);
+                    for (&expected, a, b) |*e, ca, cb| e.* += (ca * (1 - blend) + cb * blend) / @as(f32, @floatFromInt(taps));
+                }
+                for (expected, 0..) |e, channel| {
+                    const actual = memory.data[0x2000 + (y * 16 + x) * 4 + channel];
+                    if (@abs(@as(f32, @floatFromInt(actual)) - e) > 2) {
+                        std.debug.print("Aniso mismatch array={} ratio={d} linear={} mip={} scale={any} pixel={d},{d} ch={d} got={d} expected={d}\n", .{ array, ratio_code, linear, mip_linear, scale, x, y, channel, actual, e });
+                        return error.AnisotropicSamplingMismatch;
+                    }
+                }
+            };
+            cases += 1;
+        };
+        if (!std.mem.eql(u8, before, backing)) return error.AnisotropicSourceModified;
+    }
+    // Mixed point/linear anisotropy is deliberately outside this implementation.
+    const before = memory.data[0x2000..0x2400].*;
+    try state.writeRegister(.shader, 0x016, (2 << 20) | (3 << 22) | (1 << 26));
+    const packet: gpu.pm4.Packet = .{ .kind = .command, .header = command(gpu.pm4.draw_index_auto, 2), .opcode = gpu.pm4.draw_index_auto, .body = &.{ 3, 2 } };
+    if (renderer.draw(&state, packet)) |_| return error.MixedAnisotropyAccepted else |err| if (err != error.GraphicsSamplerModeNotImplemented) return err;
+    if (!std.mem.eql(u8, &before, memory.data[0x2000..0x2400])) return error.RejectedAnisotropyModifiedTarget;
+    std.debug.print("PASS {d} anisotropic full-frame checks against CPU filtering: 2/4/8/16x, point/bilinear XY, point/linear mips, LOD bias, magnification, both axes, 2D/array layers and source preservation\n", .{cases});
 }
 
 fn guestFanProbe(allocator: std.mem.Allocator) !void {
@@ -2545,6 +2780,7 @@ fn guestResourcesProbe(allocator: std.mem.Allocator, staging_limit: usize, uploa
     try guestCompressedImageProbe(allocator, memory, &state, &executor);
     try guestPackedImageProbe(allocator, memory, &state, &executor, &renderer);
     try guestNarrowImageProbe(allocator, memory, &state, &executor, &renderer);
+    try guestArrayImageProbe(allocator, memory, &state, &executor, &renderer);
     try guestTexelCoordinatesProbe(allocator, memory, &state, &executor, &renderer, &vs);
     // A missing input must fail before touching the output attachment.
     const before = memory.data[0x2000..0x5000].*;
@@ -2733,6 +2969,103 @@ fn guestNarrowImageProbe(allocator: std.mem.Allocator, memory: *GraphicsMemory, 
     try state.writeRegister(.shader, 0x014, 2 | (2 << 3) | (2 << 6));
     if (!std.mem.eql(u8, &before, memory.data[0x2000..0x5000])) return error.RejectedViewModifiedTarget;
     std.debug.print("PASS R8/RG8 textures: linear/tiled, narrow upload rows, one-layer array views, components and unchanged source bytes (8 cases); multi-layer/sRGB rejection\n", .{});
+}
+
+fn guestArrayImageProbe(allocator: std.mem.Allocator, memory: *GraphicsMemory, state: *gpu.State, executor: *gpu.DcbExecutor, renderer: *d3d12.Renderer) !void {
+    const saved_memory = try allocator.create(GraphicsMemory);
+    defer allocator.destroy(saved_memory);
+    saved_memory.* = memory.*;
+    const saved_state = state.*;
+    defer {
+        memory.* = saved_memory.*;
+        state.* = saved_state;
+    }
+    try state.writeRegister(.shader, 0x00b, 28 << 1);
+    try state.writeRegister(.shader, 0x014, 2 | (2 << 3) | (2 << 6));
+    try state.writeRegister(.shader, 0x016, 0);
+    // The same pixel shader samples a 2D image and an array/cube. Their
+    // distinct HLSL register ranges must not overwrite or alias image types.
+    const second = [_]u32{ 0x700, 56 << 20, 0, 0x90000fac, 0, 0, 0, 0 };
+    for (second, 0..) |word, i| try state.writeRegister(.shader, 0x020 + @as(u32, @intCast(i)), word);
+    @memcpy(memory.data[0x70000..][0..4], &[_]u8{ 128, 255, 64, 255 });
+    var cases: usize = 0;
+    for ([_]u32{ 1, 2 }) |dimension| for ([_]u16{ 56, 169 }) |format| for ([_]gpu.resources.TileMode{ .linear, .standard_4kb }) |mode| {
+        const layers: u32 = if (dimension == 1) 12 else 3;
+        const first: u32 = if (dimension == 1) 6 else 2;
+        const image_type: u32 = if (dimension == 1) 11 else 13;
+        const words = [_]u32{ 0x100, (@as(u32, format) << 20) | (3 << 30), 1 | (7 << 14), (image_type << 28) | 0xfac | (@as(u32, @intFromEnum(mode)) << 20), (first + layers - 1) | (first << 16), 0, 0, 0 };
+        const layout = try gpu.SurfaceLayout.fromImage(try gpu.resources.decodeImageDescriptor(&words));
+        const pixels = try allocator.alloc(u8, @intCast(layout.staging_bytes));
+        defer allocator.free(pixels);
+        const plane = pixels.len / layers;
+        for (0..layers) |layer| {
+            if (format == 56) {
+                for (0..8) |y| for (0..8) |x| {
+                    @memcpy(pixels[layer * plane + (y * 8 + x) * 4 ..][0..4], &[_]u8{ @intCast(15 + layer * 17), @intCast(20 + x * 29), @intCast(30 + y * 27), 255 });
+                };
+            } else {
+                for (0..4) |block| {
+                    const color: u16 = @as(u16, @intCast(layer + 2)) << 11 | @as(u16, @intCast(9 + block * 9)) << 5 | @as(u16, @intCast(5 + layer));
+                    const at = pixels[layer * plane + block * 8 ..][0..8];
+                    std.mem.writeInt(u16, at[0..2], color, .little);
+                    std.mem.writeInt(u16, at[2..4], 0, .little);
+                    @memset(at[4..], 0);
+                }
+            }
+        }
+        const backing = memory.data[0x10000..][0..@intCast(layout.required_source_bytes)];
+        @memset(backing, 0xad);
+        try layout.tile(pixels, backing);
+        const before = try allocator.dupe(u8, backing);
+        defer allocator.free(before);
+        for (0..layers) |layer| {
+            var actual: [0x3000]u8 = undefined;
+            // Compare every byte against independently staged 2D sampling of
+            // the selected face, including gradients, padding and alpha.
+            for (0..2) |reference| {
+                var ps: std.ArrayList(u32) = .empty;
+                defer ps.deinit(allocator);
+                // Avoid exact point-sampling boundaries: the cube projection
+                // can legally choose either neighbor at an exact texel edge.
+                try ps.appendSlice(allocator, &.{ 0xc8000000, 0xc8010001, 0xc8040100, 0xc8050101, vop1(0x01, 3, 255), @bitCast(@as(f32, 0.015625)), vop2(0x03, 0, 0, 3), vop2(0x03, 1, 1, 3), 0xf0800f08, 0x00450800 }); // T=s20 S=s8 -> v8..11 (ordinary 2D)
+                if (reference == 0) {
+                    for (words, 0..) |word, i| try state.writeRegister(.shader, 0x00c + @as(u32, @intCast(i)), word);
+                    if (dimension == 1) try ps.appendSlice(allocator, &.{ vop1(0x01, 3, 242), vop2(0x03, 0, 0, 3), vop2(0x03, 1, 1, 3) });
+                    const index: f32 = @floatFromInt(if (dimension == 1) (layer / 6) * 8 + layer % 6 else layer);
+                    try ps.appendSlice(allocator, &.{ vop1(0x01, 2, 255), @bitCast(index), 0xf0800f00 | (if (dimension == 1) @as(u32, 3 << 3) else @as(u32, 5 << 3)), 0x00400400 });
+                } else {
+                    const reference_words = [_]u32{ 0x600, words[1], words[2], 0x90000fac, 0, 0, 0, 0 };
+                    const reference_layout = try gpu.SurfaceLayout.fromImage(try gpu.resources.decodeImageDescriptor(&reference_words));
+                    const reference_backing = memory.data[0x60000..][0..@intCast(reference_layout.required_source_bytes)];
+                    try reference_layout.tile(pixels[layer * plane ..][0..plane], reference_backing);
+                    for (reference_words, 0..) |word, i| try state.writeRegister(.shader, 0x00c + @as(u32, @intCast(i)), word);
+                    try ps.appendSlice(allocator, &.{ 0xf0800f08, 0x00400400 });
+                }
+                try ps.appendSlice(allocator, &.{ vop2(0x08, 0, 4, 8), vop2(0x08, 1, 5, 9), vop2(0x08, 2, 6, 10), vop2(0x08, 3, 7, 11), 0xf800080f, 0x03020100, 0xbf810000 });
+                @memcpy(memory.data[0x400..][0 .. ps.items.len * 4], std.mem.sliceAsBytes(ps.items));
+                @memset(memory.data[0x2000..0x5000], 0);
+                _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 2 });
+                if (reference == 0) actual = memory.data[0x2000..0x5000].* else {
+                    for (actual, memory.data[0x2000..0x5000], 0..) |a, e, i| if (@abs(@as(i16, a) - e) > 1) {
+                        std.debug.print("Array image mismatch dimension={d} format={d} tile={f} layer={d} byte={d}: {d} expected {d}\n", .{ dimension, format, mode, layer, i, a, e });
+                        return error.ArrayImageSamplingMismatch;
+                    };
+                }
+            }
+            cases += 1;
+        }
+        if (!std.mem.eql(u8, before, backing)) return error.ArrayImageSourceModified;
+    };
+    // Invalid cube shape must fail before publishing any output.
+    try state.writeRegister(.shader, 0x00f, 0xb0000fac);
+    try state.writeRegister(.shader, 0x010, 6); // Seven faces.
+    const invalid_ps = [_]u32{ vop1(0x01, 0, 242), vop1(0x01, 1, 242), vop1(0x01, 2, 128), 0xf0800f18, 0x00400400, 0xf800080f, 0x07060504, 0xbf810000 };
+    @memcpy(memory.data[0x400..][0..@sizeOf(@TypeOf(invalid_ps))], std.mem.asBytes(&invalid_ps));
+    const before_target = memory.data[0x2000..0x5000].*;
+    const packet: gpu.pm4.Packet = .{ .kind = .command, .header = command(gpu.pm4.draw_index_auto, 2), .opcode = gpu.pm4.draw_index_auto, .body = &.{ 3, 2 } };
+    if (renderer.draw(state, packet)) |_| return error.InvalidCubeAccepted else |err| if (err != error.GraphicsTextureFormatOrMipNotImplemented) return err;
+    if (!std.mem.eql(u8, &before_target, memory.data[0x2000..0x5000])) return error.RejectedCubeModifiedTarget;
+    std.debug.print("PASS {d} array/cube full-frame comparisons: all faces of two cubes, base slices, RGBA8/BC1, linear/tiled uploads, mixed 2D/cube banks and invalid shape isolation\n", .{cases});
 }
 
 fn guestTexelCoordinatesProbe(allocator: std.mem.Allocator, memory: *GraphicsMemory, state: *gpu.State, executor: *gpu.DcbExecutor, renderer: *d3d12.Renderer, vertex: []const u32) !void {

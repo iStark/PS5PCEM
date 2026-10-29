@@ -217,13 +217,24 @@ pub const DrawResources = struct {
     }
 
     fn captureImage(self: *DrawResources, stage: *Stage, resolver: *gpu.scalar_resources.Resolver, inst: gpu.ShaderInstruction) !void {
-        if (inst.opcode != .image_sample or inst.image_dimension != .dim_2d or inst.image_sample_flags.compare or inst.image_r128)
+        errdefer std.debug.print("[d3d12 image operation] program=0x{x} pc=0x{x} op={s} dimension={s} flags={any} r128={any} resource=s{d} sampler=s{d}\n", .{
+            resolver.bindings.program_address, inst.pc, @tagName(inst.opcode), @tagName(inst.image_dimension), inst.image_sample_flags, inst.image_r128, inst.src1.reg, inst.src2.reg,
+        });
+        if (inst.opcode != .image_sample or inst.image_sample_flags.compare or inst.image_r128)
             return error.GraphicsImageOperationNotImplemented;
         var words: [8]u32 = undefined;
         var sampler_words: [4]u32 = undefined;
         if (!try resolver.words(inst.src1.reg, inst.pc, &words) or !try resolver.words(inst.src2.reg, inst.pc, &sampler_words))
             return error.DynamicGraphicsImageNotImplemented;
         const descriptor = try gpu.resources.decodeImageDescriptor(&words);
+        errdefer std.debug.print("[d3d12 image] program=0x{x} pc=0x{x} descriptor={any}\n", .{ resolver.bindings.program_address, inst.pc, descriptor });
+        // GFX10 DIM=3 is Cube; its historical decoder name is dim_2d_array.
+        const dimension: u32 = switch (inst.image_dimension) {
+            .dim_2d => 0,
+            .dim_2d_array => 1,
+            .dim_2d_array_alt => 2,
+            else => return error.GraphicsImageOperationNotImplemented,
+        };
         const sampler = try gpu.resources.decodeSamplerDescriptor(&sampler_words);
         errdefer std.debug.print("[d3d12 sampler] program=0x{x} pc=0x{x} words={x},{x},{x},{x} descriptor={any}\n", .{
             resolver.bindings.program_address, inst.pc, sampler_words[0], sampler_words[1], sampler_words[2], sampler_words[3], sampler,
@@ -238,49 +249,81 @@ pub const DrawResources = struct {
             173, 174 => 77,
             else => 0,
         };
-        // A 2D instruction can view the sole layer of an array descriptor.
-        // Multi-layer descriptors and array-indexed instructions remain rejected.
-        const single_layer = descriptor.depth_or_layers == 1 and descriptor.base_array == 0;
-        const view_2d = descriptor.image_type == .color_2d or (descriptor.image_type == .color_2d_array and single_layer);
+        if (descriptor.base_array >= descriptor.depth_or_layers) return error.GraphicsTextureFormatOrMipNotImplemented;
+        const layers = descriptor.depth_or_layers - descriptor.base_array;
+        const view_supported = switch (dimension) {
+            0 => layers == 1 and (descriptor.image_type == .color_2d or descriptor.image_type == .color_2d_array),
+            1 => descriptor.image_type == .cube and descriptor.base_array % 6 == 0 and layers % 6 == 0 and descriptor.width == descriptor.height,
+            2 => descriptor.image_type == .color_2d_array or descriptor.image_type == .cube,
+            else => unreachable,
+        };
         const compressed = format == 71 or format == 74 or format == 77;
+        const mips = descriptor.viewMipLevels();
+        const mip_allocation = descriptor.resourceMipLevels() > 1;
         // A DCC-compressed RGBA8 view (for example a render target the guest
         // samples next) resolves its fast-clear keys before detiling. CMASK
         // and FMASK compression remain unsupported.
         const dcc: ?surfaces.Dcc = if (descriptor.dccMetadataAddress()) |address| .{ .address = address, .clear_word = null } else null;
-        if (!view_2d or !single_layer or format == 0 or descriptor.viewBaseLevel() != 0 or
-            descriptor.viewMipLevels() != 1 or descriptor.max_mip != 0 or descriptor.base_array != 0 or
+        if (!view_supported or format == 0 or descriptor.viewBaseLevel() != 0 or
             descriptor.min_lod != 0 or (compressed and descriptor.bc_swizzle != 0) or
-            descriptor.cmask_fast_clear or descriptor.fmask_compression or (dcc != null and format != 28) or
+            descriptor.cmask_fast_clear or descriptor.fmask_compression or (dcc != null and (format != 28 or layers != 1 or mip_allocation)) or
             (dcc == null and gpu.MetadataSurface.fromImage(descriptor).hasAny()))
         {
-            std.debug.print("[d3d12 image] program=0x{x} pc=0x{x} descriptor={any}\n", .{ resolver.bindings.program_address, inst.pc, descriptor });
             return error.GraphicsTextureFormatOrMipNotImplemented;
         }
-        const expected_bytes = try native.sampledImageSize(descriptor.width, descriptor.height, format);
+        const expected_bytes = native.sampledImageMipChainSize(descriptor.width, descriptor.height, format, layers, dimension, mips) catch return error.GraphicsTextureFormatOrMipNotImplemented;
+        if (dimension == 1 and sampler.disable_cube_wrap) return error.GraphicsSamplerModeNotImplemented;
         // Narrow and packed formats have no sRGB DXGI variants; adding one
         // to their enum does not select a gamma-decoding view.
         if (sampler.force_srgb and (format == 61 or format == 49 or format == 115)) return error.GraphicsSamplerModeNotImplemented;
-        if (sampler.trunc_coordinates or sampler.filter_mode != 0 or
-            sampler.maximum_anisotropy != 0 or sampler.minification_filter > 1 or sampler.magnification_filter > 1 or
+        if (sampler.trunc_coordinates or sampler.filter_mode != 0 or sampler.maximum_anisotropy > 4 or
             sampler.mip_filter > 2 or sampler.border_color_type == 3)
             return error.GraphicsSamplerModeNotImplemented;
+        const anisotropy = sampler.maximum_anisotropy != 0 and (sampler.minification_filter >= 2 or sampler.magnification_filter >= 2);
+        if (anisotropy and (sampler.minification_filter != sampler.magnification_filter or
+            dimension == 1 or resolver.bindings.stage != .pixel or sampler.unnormalized_coordinates or
+            @as(u16, @bitCast(inst.image_sample_flags)) != 0 or sampler.mip_filter == 0)) return error.GraphicsSamplerModeNotImplemented;
         const unnormalized = sampler.unnormalized_coordinates;
-        if (unnormalized and (resolver.bindings.stage != .pixel or @as(u16, @bitCast(inst.image_sample_flags)) != 0 or
+        if (unnormalized and (mips != 1 or dimension != 0 or resolver.bindings.stage != .pixel or @as(u16, @bitCast(inst.image_sample_flags)) != 0 or
             sampler.mip_filter != 0 or sampler.minimum_lod != 0 or sampler.lod_bias != 0 or
             sampler.minification_filter != sampler.magnification_filter)) return error.GraphicsSamplerModeNotImplemented;
-        const layout = try gpu.SurfaceLayout.fromImage(descriptor);
-        if (layout.staging_bytes != expected_bytes) return error.GraphicsImageFootprintMismatch;
-        if (layout.required_source_bytes > 256 * 1024 * 1024 or layout.staging_bytes > 256 * 1024 * 1024) return error.GraphicsSnapshotBudgetExceeded;
-        _ = try layout.sourceRange(descriptor.address);
+        const layout = if (!mip_allocation) try gpu.SurfaceLayout.fromImage(descriptor) else null;
+        if (layout) |single| {
+            if (single.staging_bytes != expected_bytes) return error.GraphicsImageFootprintMismatch;
+            if (single.required_source_bytes > 256 * 1024 * 1024 or single.staging_bytes > 256 * 1024 * 1024) return error.GraphicsSnapshotBudgetExceeded;
+            _ = try single.sourceRange(descriptor.address);
+        }
         var retained: ?texture_cache.Lease = null;
         var pixel_lease: staging.Lease = undefined;
         // DCC keys are not covered by the texture cache's page proof, so a
         // compressed view always takes the fresh read path.
-        const pixels: []const u8 = if (self.textures != null and dcc == null) blk: {
-            retained = try self.textures.?.acquire(self.allocator, self.reader, self.tracking, descriptor.address, layout);
+        const pixels: []const u8 = if (mip_allocation) blk: {
+            const texture = try gpu.TextureLayout.fromImage(descriptor);
+            var required: u64 = 0;
+            for (0..mips) |level| required = @max(required, (try texture.subresource(@intCast(level), 0, layers)).required_source_bytes);
+            if (required > 256 * 1024 * 1024) return error.GraphicsSnapshotBudgetExceeded;
+            _ = try std.math.add(u64, descriptor.address, required);
+            var backing = try staging.Lease.alloc(self.allocator, self.pool, @intCast(required));
+            defer backing.deinit();
+            try self.reader.read(descriptor.address, backing.bytes);
+            pixel_lease = try staging.Lease.alloc(self.allocator, self.pool, expected_bytes);
+            errdefer pixel_lease.deinit();
+            var offset: usize = 0;
+            // Native D3D subresource order: mip + layer * mip_count.
+            for (0..layers) |layer| for (0..mips) |level| {
+                const view = try texture.subresource(@intCast(level), @intCast(layer), 1);
+                const size: usize = @intCast(try view.stagingBytes());
+                if (size > pixel_lease.bytes.len - offset) return error.GraphicsImageFootprintMismatch;
+                try view.detile(backing.bytes, pixel_lease.bytes[offset..][0..size]);
+                offset += size;
+            };
+            if (offset != expected_bytes) return error.GraphicsImageFootprintMismatch;
+            break :blk pixel_lease.bytes;
+        } else if (self.textures != null and dcc == null) blk: {
+            retained = try self.textures.?.acquire(self.allocator, self.reader, self.tracking, descriptor.address, layout.?);
             break :blk retained.?.pixels();
         } else blk: {
-            var backing_lease = try staging.Lease.alloc(self.allocator, self.pool, @intCast(layout.required_source_bytes));
+            var backing_lease = try staging.Lease.alloc(self.allocator, self.pool, @intCast(layout.?.required_source_bytes));
             defer backing_lease.deinit();
             const backing = backing_lease.bytes;
             try self.reader.read(descriptor.address, backing);
@@ -289,9 +332,9 @@ pub const DrawResources = struct {
                 defer self.allocator.free(keys);
                 try metadata.expand(.{ .context = self.reader.context, .read = self.reader.read_fn }, backing, keys);
             }
-            pixel_lease = try staging.Lease.alloc(self.allocator, self.pool, @intCast(layout.staging_bytes));
+            pixel_lease = try staging.Lease.alloc(self.allocator, self.pool, @intCast(layout.?.staging_bytes));
             errdefer pixel_lease.deinit();
-            if (self.cache) |c| try c.detile(descriptor.address, layout, backing, pixel_lease.bytes) else try layout.detile(backing, pixel_lease.bytes);
+            if (self.cache) |c| try c.detile(descriptor.address, layout.?, backing, pixel_lease.bytes) else try layout.?.detile(backing, pixel_lease.bytes);
             break :blk pixel_lease.bytes;
         };
         var owns_pixels = true;
@@ -317,16 +360,21 @@ pub const DrawResources = struct {
             .content_id = if (retained) |lease| lease.contentId() else 0,
             .width = descriptor.width,
             .height = descriptor.height,
+            .layers = layers,
+            .dimension = dimension,
+            .mip_levels = mips,
             .format = format,
             .srgb = @intFromBool(sampler.force_srgb or (compressed and descriptor.unified_format % 2 == 0)),
             .components = components,
-            .filter = (@as(u32, sampler.minification_filter) << 4) | (@as(u32, sampler.magnification_filter) << 2) | @intFromBool(sampler.mip_filter == 2),
+            .filter = (@as(u32, sampler.minification_filter & 1) << 4) | (@as(u32, sampler.magnification_filter & 1) << 2) | @intFromBool(sampler.mip_filter == 2),
             .address_u = if (unnormalized) try unnormalizedAddressMode(sampler.clamp_x) else try addressMode(sampler.clamp_x),
             .address_v = if (unnormalized) try unnormalizedAddressMode(sampler.clamp_y) else try addressMode(sampler.clamp_y),
             .address_w = if (unnormalized) 3 else try addressMode(sampler.clamp_z),
             .min_lod = if (unnormalized) 0 else sampler.minimum_lod,
             .max_lod = if (unnormalized) 0 else sampler.maximum_lod,
-            .lod_bias = if (unnormalized) 0 else sampler.lod_bias,
+            // Shader anisotropy adds bias while selecting its explicit LOD.
+            // Keep the native sampler neutral to avoid applying it twice.
+            .lod_bias = if (unnormalized or anisotropy) 0 else sampler.lod_bias,
             .border = switch (sampler.border_color_type) {
                 0 => .{ 0, 0, 0, 0 },
                 1 => .{ 0, 0, 0, 1 },
@@ -361,9 +409,20 @@ pub const DrawResources = struct {
             .sampler_sgpr = inst.src2.reg,
             .descriptor_index = slot,
             .instruction_pc = inst.pc,
+            .dimension = switch (dimension) {
+                0 => .two_d,
+                1 => .cube,
+                2 => .two_d_array,
+                else => unreachable,
+            },
             .minimum_lod = sampler.minimum_lod,
             .maximum_lod = sampler.maximum_lod,
             .texel_coordinates_extent = if (unnormalized) .{ descriptor.width, descriptor.height } else null,
+            .anisotropy = if (anisotropy) .{
+                .extent = .{ descriptor.width, descriptor.height },
+                .max_taps = @as(u8, 1) << @as(u3, @intCast(sampler.maximum_anisotropy)),
+                .lod_bias = sampler.lod_bias,
+            } else null,
         });
     }
 };
@@ -400,6 +459,12 @@ test "sampled instructions share only matching views with freshly proven complet
     candidate = previous[0];
     candidate.width = 8;
     candidate.height = 2;
+    try std.testing.expect(matchingImage(&previous, candidate) == null);
+    candidate = previous[0];
+    candidate.dimension = 2;
+    try std.testing.expect(matchingImage(&previous, candidate) == null);
+    candidate = previous[0];
+    candidate.layers = 2;
     try std.testing.expect(matchingImage(&previous, candidate) == null);
 }
 

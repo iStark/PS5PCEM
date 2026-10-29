@@ -55,6 +55,46 @@ const usage =
     \\
 ;
 
+/// Opt-in diagnostic capture, independent of desktop/window capture. At most
+/// one completed scanout every five seconds replaces the explicitly named file.
+/// It changes no render state and is disabled in normal performance runs.
+const D3D12Capture = struct {
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    path: ?[]const u8 = null,
+    next_ns: u64 = 0,
+
+    fn frame(context: ?*anyopaque, flip: u64, width: u32, height: u32, pixels: []const u8) void {
+        const self: *@This() = @ptrCast(@alignCast(context.?));
+        const path = self.path orelse return;
+        if (path.len == 0) return;
+        const now = gpu.frame_timing.timestampNs();
+        if (now < self.next_ns) return;
+        self.next_ns = now +| 5 * std.time.ns_per_s;
+        self.save(path, width, height, pixels) catch |err| {
+            std.debug.print("[d3d12 capture] failed: {s}\n", .{@errorName(err)});
+            return;
+        };
+        std.debug.print("[d3d12 capture] flip={d} {d}x{d} path={s}\n", .{ flip, width, height, path });
+    }
+
+    fn save(self: *@This(), path: []const u8, width: u32, height: u32, pixels: []const u8) !void {
+        if (pixels.len != try d3d12.rgbaSize(width, height)) return error.InvalidFrameSize;
+        const file = try std.Io.Dir.cwd().createFile(self.io, path, .{ .truncate = true });
+        defer file.close(self.io);
+        var buffer: [16384]u8 = undefined;
+        var writer = file.writer(self.io, &buffer);
+        try writer.interface.print("P6\n{d} {d}\n255\n", .{ width, height });
+        const row = try self.allocator.alloc(u8, @as(usize, width) * 3);
+        defer self.allocator.free(row);
+        for (0..height) |y| {
+            for (0..width) |x| @memcpy(row[x * 3 ..][0..3], pixels[(y * width + x) * 4 ..][0..3]);
+            try writer.interface.writeAll(row);
+        }
+        try writer.interface.flush();
+    }
+};
+
 /// Whether a path names a ZArchive dump, by extension.
 fn isArchivePath(path: []const u8) bool {
     return std.ascii.eqlIgnoreCase(std.fs.path.extension(path), ".zar");
@@ -775,6 +815,8 @@ fn run(init: std.process.Init) !bool {
     var renderer: vulkan.Renderer = undefined;
     var renderer_initialized = false;
     var directx_renderer: ?d3d12.Renderer = null;
+    var directx_capture = D3D12Capture{ .io = io, .allocator = allocator };
+    defer if (directx_capture.path) |path| allocator.free(path);
     defer {
         // Stop every guest worker before taking away callbacks it may still be
         // executing, then release Vulkan before destroying the HWND surface.
@@ -1153,6 +1195,11 @@ fn run(init: std.process.Init) !bool {
             .gpu_generation = if (enable_gpu_page_tracker) runtime.firmware.libs.agc_submit.snapshotGeneration else null,
         }, init.minimal.environ.containsUnempty(allocator, "PS5_D3D12_VALIDATION") catch false);
         const directx = &directx_renderer.?;
+        if (init.minimal.environ.getAlloc(allocator, "PS5_D3D12_CAPTURE_PPM")) |path| {
+            directx_capture.path = path;
+            directx.on_scanout = D3D12Capture.frame;
+            directx.scanout_context = &directx_capture;
+        } else |_| {}
         if (init.minimal.environ.getAlloc(allocator, "PS5_D3D12_TEXTURE_CACHE")) |value| {
             defer allocator.free(value);
             if (std.mem.eql(u8, value, "0")) directx.textures.limit = 0;

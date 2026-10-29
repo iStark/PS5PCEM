@@ -218,6 +218,7 @@ test "depth bias converts matching precision and selects only surviving faces" {
 
 pub const Interface = struct {
     mask: u32 = 0,
+    flat_mask: u32 = 0,
     controls: [32]u32 = undefined,
     locations: [32]u8 = undefined,
 };
@@ -421,13 +422,25 @@ pub fn linkInterface(state: *const gpu.State, vertex: []const gpu.ShaderInstruct
         location.* = @intCast(i);
         control.* = state.readRegister(.context, 0x191 + @as(u32, @intCast(i))) orelse @as(u32, @intCast(i));
         if (inputs.attributes & (@as(u32, 1) << @intCast(i)) == 0) continue;
-        // Smooth PARAM interpolation is provided by the native rasterizer.
-        // Default constants, flat/custom and point-sprite inputs need their
-        // own lowering; do not silently replace them with screen-space UVs.
-        if (control.* & ~@as(u32, 0x1f) != 0) return error.FragmentInterpolationModeNotImplemented;
-        if (outputs.parameters & (@as(u32, 1) << @intCast(control.*)) == 0) return error.MissingVertexParameterExport;
+        // Smooth and flat PARAM inputs map to native rasterizer inputs.
+        // Default constants, custom and point-sprite modes still need lowering.
+        if (control.* & ~@as(u32, 0x41f) != 0) {
+            std.debug.print("[d3d12 interpolation] attr={d} control=0x{x} exports=0x{x}\n", .{ i, control.*, outputs.parameters });
+            return error.FragmentInterpolationModeNotImplemented;
+        }
+        if (control.* & 0x400 != 0) result.flat_mask |= @as(u32, 1) << @intCast(i);
+        if (outputs.parameters & (@as(u32, 1) << @intCast(control.* & 0x1f)) == 0) return error.MissingVertexParameterExport;
     }
-    for (fragment) |inst| if (inst.opcode == .v_interp_mov_f32) return error.FragmentPerVertexInterpolationNotImplemented;
+    for (fragment) |inst| if (inst.opcode == .v_interp_mov_f32) {
+        // MOV P0 on a flat attribute is exactly the provoking vertex value.
+        // P10/P20 and smooth/custom per-vertex reads require barycentrics.
+        if (inst.src1.value >= 32 or inst.src0.value != 2 or
+            result.flat_mask & (@as(u32, 1) << @intCast(inst.src1.value)) == 0)
+        {
+            std.debug.print("[d3d12 interpolation MOV] pc=0x{x} attr={d} source={d} flat=0x{x}\n", .{ inst.pc, inst.src1.value, inst.src0.value, result.flat_mask });
+            return error.FragmentPerVertexInterpolationNotImplemented;
+        }
+    };
     return result;
 }
 
@@ -510,5 +523,73 @@ test "fragment interface rejects absent exports and unsupported interpolation in
     try state.writeRegister(.context, 0x191, 3);
     try std.testing.expectEqual(@as(u32, 1), (try linkInterface(&state, &vertex, &fragment)).mask);
     try state.writeRegister(.context, 0x191, 0x403);
+    try std.testing.expectEqual(@as(u32, 1), (try linkInterface(&state, &vertex, &fragment)).flat_mask);
+    var mov = fragment;
+    mov[0].opcode = .v_interp_mov_f32;
+    mov[0].src0 = .{ .kind = .integer_inline_constant, .value = 2 };
+    try std.testing.expectEqual(@as(u32, 1), (try linkInterface(&state, &vertex, &mov)).flat_mask);
+    mov[0].src0.value = 0;
+    try std.testing.expectError(error.FragmentPerVertexInterpolationNotImplemented, linkInterface(&state, &vertex, &mov));
+    try state.writeRegister(.context, 0x191, 0x803);
     try std.testing.expectError(error.FragmentInterpolationModeNotImplemented, linkInterface(&state, &vertex, &fragment));
+}
+
+/// D3D12 selects the first vertex for flat triangle-list inputs. A cyclic
+/// rotation selects the guest's last vertex without changing winding, vertex
+/// IDs, culling, or the smooth attributes of a mixed interface.
+pub fn lastProvokingTriangleList(allocator: std.mem.Allocator, draw: *native.Draw, indices: []u8) ![]u8 {
+    const count = if (draw.index_count != 0) draw.index_count else draw.vertex_count;
+    if (draw.topology != 4) return error.FlatProvokingTopologyNotImplemented;
+    if (indices.len != 0) {
+        const width = draw.index_element_bytes;
+        if ((width != 2 and width != 4) or @as(usize, count) * width != indices.len) return error.InvalidTriangleIndices;
+        var i: usize = 0;
+        while (i + 2 < count) : (i += 3) {
+            const triangle = indices[i * width ..][0 .. 3 * width];
+            var last: [4]u8 = undefined;
+            @memcpy(last[0..width], triangle[2 * width ..][0..width]);
+            std.mem.copyBackwards(u8, triangle[width..], triangle[0 .. 2 * width]);
+            @memcpy(triangle[0..width], last[0..width]);
+        }
+        return indices;
+    }
+    if (@as(u64, count) * 4 > 64 * 1024 * 1024) return error.IndexBufferTooLarge;
+    const output = try allocator.alloc(u8, @as(usize, count) * 4);
+    errdefer allocator.free(output);
+    for (0..count) |i| {
+        const base = i - i % 3;
+        const offset = if (base + 2 < count) base + (i % 3 + 2) % 3 else i;
+        const index = try std.math.add(u32, draw.first_vertex, @intCast(offset));
+        std.mem.writeInt(u32, output[i * 4 ..][0..4], index, .little);
+    }
+    allocator.free(indices);
+    draw.index_count = count;
+    draw.index_element_bytes = 4;
+    draw.base_vertex = 0;
+    draw.first_vertex = 0;
+    return output;
+}
+
+test "last provoking rotation preserves index encoding base and incomplete tails" {
+    for ([_]u32{ 0, 2, 4 }) |width| {
+        var draw = try native.Draw.fullTarget(1, 1);
+        draw.vertex_count = 8;
+        draw.first_vertex = 9;
+        draw.base_vertex = -3;
+        draw.index_count = if (width != 0) 8 else 0;
+        draw.index_element_bytes = width;
+        const input = try std.testing.allocator.alloc(u8, 8 * width);
+        for (0..8) |i| if (width == 2) {
+            std.mem.writeInt(u16, input[i * 2 ..][0..2], @intCast(i + 9), .little);
+        } else if (width == 4) {
+            std.mem.writeInt(u32, input[i * 4 ..][0..4], @intCast(i + 9), .little);
+        };
+        const output = try lastProvokingTriangleList(std.testing.allocator, &draw, input);
+        defer std.testing.allocator.free(output);
+        for ([_]u32{ 11, 9, 10, 14, 12, 13, 15, 16 }, 0..) |expected, i| {
+            const actual = if (draw.index_element_bytes == 2) std.mem.readInt(u16, output[i * 2 ..][0..2], .little) else std.mem.readInt(u32, output[i * 4 ..][0..4], .little);
+            try std.testing.expectEqual(expected, actual);
+        }
+        try std.testing.expectEqual(@as(i32, if (width == 0) 0 else -3), draw.base_vertex);
+    }
 }

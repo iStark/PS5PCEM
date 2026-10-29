@@ -133,8 +133,18 @@ pub const SampledImageBinding = struct {
     /// for ordinary fragment IMAGE_SAMPLE on a single-level 2D view. The
     /// backend binds a matching clamp sampler and the shader samples LOD 0.
     texel_coordinates_extent: ?[2]u32 = null,
+    /// Shader taps for hosts whose native anisotropy cannot retain the guest
+    /// point/linear XY and mip filters. Only ordinary fragment 2D/array samples
+    /// use this opt-in path; the default translation is unchanged.
+    anisotropy: ?ShaderAnisotropy = null,
     /// Exact native texel format for the measured multi-texel load subset.
     multi_texel_format: ?StorageImageFormat = null,
+};
+
+pub const ShaderAnisotropy = struct {
+    extent: [2]u32,
+    max_taps: u8,
+    lod_bias: f32,
 };
 
 pub const SampledImageDimension = enum {
@@ -7366,6 +7376,14 @@ const Builder = struct {
             return Error.InvalidStorageBinding;
         };
         const image_dimension = binding.dimension;
+        if (binding.anisotropy) |aniso| {
+            if (self.stage != .fragment or (image_dimension != .two_d and image_dimension != .two_d_array) or
+                (inst.image_dimension != .dim_2d and inst.image_dimension != .dim_2d_array_alt) or
+                @as(u16, @bitCast(inst.image_sample_flags)) != 0 or binding.texel_coordinates_extent != null or
+                aniso.max_taps < 2 or aniso.max_taps > 16 or !std.math.isPowerOfTwo(aniso.max_taps) or
+                aniso.extent[0] == 0 or aniso.extent[1] == 0 or aniso.extent[0] > 16384 or aniso.extent[1] > 16384 or
+                !std.math.isFinite(aniso.lod_bias)) return Error.UnsupportedOpcode;
+        }
         if (binding.texel_coordinates_extent) |extent| {
             if (self.stage != .fragment or image_dimension != .two_d or inst.image_dimension != .dim_2d or
                 @as(u16, @bitCast(inst.image_sample_flags)) != 0 or
@@ -7498,7 +7516,9 @@ const Builder = struct {
             }
             return;
         }
-        if (level_zero or explicit_lod or binding.texel_coordinates_extent != null) {
+        if (binding.anisotropy) |aniso| {
+            try self.sampleAnisotropic(sampled, sampled_image, coordinates, image_dimension, aniso);
+        } else if (level_zero or explicit_lod or binding.texel_coordinates_extent != null) {
             // Compute shaders have no implicit derivatives. GFX10's
             // image_sample_lz names mip zero explicitly, which maps directly to
             // an explicit SPIR-V Lod operand and is valid in every shader stage.
@@ -7552,6 +7572,89 @@ const Builder = struct {
             );
             destination_index += 1;
         }
+    }
+
+    fn sampleAnisotropic(self: *Builder, result: u32, image: u32, coordinates: u32, dimension: SampledImageDimension, aniso: ShaderAnisotropy) Error!void {
+        // A bounded line of point/bilinear samples follows the footprint's
+        // longer screen derivative. Its perpendicular width and tap limit
+        // select the mip. Hardware anisotropy algorithms are implementation
+        // dependent; this preserves guest XY/mip filtering rather than
+        // silently substituting D3D's mandatory bilinear anisotropic filter.
+        const zero = try self.constant(.float32, 0);
+        const one = try self.constant(.float32, @bitCast(@as(f32, 1)));
+        const half = try self.constant(.float32, @bitCast(@as(f32, 0.5)));
+        const limit = try self.constant(.float32, @bitCast(@as(f32, @floatFromInt(aniso.max_taps))));
+        var uv: [2]u32 = undefined;
+        var gradients: [2][2]u32 = undefined;
+        var texel_gradients: [2][2]u32 = undefined;
+        for (0..2) |axis| {
+            uv[axis] = self.id();
+            try self.emit(&self.body, 81, &.{ self.float_type, uv[axis], coordinates, @intCast(axis) });
+            const size = try self.constant(.float32, @bitCast(@as(f32, @floatFromInt(aniso.extent[axis]))));
+            for (0..2) |derivative| {
+                gradients[derivative][axis] = self.id();
+                try self.emit(&self.body, @intCast(207 + derivative), &.{ self.float_type, gradients[derivative][axis], uv[axis] });
+                texel_gradients[derivative][axis] = try self.bvhBinary(133, self.float_type, gradients[derivative][axis], size);
+            }
+        }
+        var lengths: [2]u32 = undefined;
+        for (texel_gradients, 0..) |g, i| {
+            const squared = try self.bvhBinary(129, self.float_type, try self.bvhBinary(133, self.float_type, g[0], g[0]), try self.bvhBinary(133, self.float_type, g[1], g[1]));
+            lengths[i] = self.id();
+            try self.emit(&self.body, 12, &.{ self.float_type, lengths[i], self.ensureGlslStd450(), 31, squared }); // Sqrt
+        }
+        const x_major = try self.bvhBinary(186, self.bool_type, lengths[0], lengths[1]);
+        const major = try self.bvhSelect(self.float_type, x_major, lengths[0], lengths[1]);
+        const major_safe = self.id();
+        try self.emit(&self.body, 12, &.{ self.float_type, major_safe, self.ensureGlslStd450(), 40, major, one }); // FMax
+        const determinant = try self.bvhBinary(131, self.float_type, try self.bvhBinary(133, self.float_type, texel_gradients[0][0], texel_gradients[1][1]), try self.bvhBinary(133, self.float_type, texel_gradients[0][1], texel_gradients[1][0]));
+        const area = self.id();
+        try self.emit(&self.body, 12, &.{ self.float_type, area, self.ensureGlslStd450(), 4, determinant }); // FAbs
+        const perpendicular = try self.bvhBinary(136, self.float_type, area, major_safe);
+        const capped_width = try self.bvhBinary(136, self.float_type, major_safe, limit);
+        const width = self.id();
+        try self.emit(&self.body, 12, &.{ self.float_type, width, self.ensureGlslStd450(), 40, perpendicular, capped_width });
+        const minified_width = self.id();
+        try self.emit(&self.body, 12, &.{ self.float_type, minified_width, self.ensureGlslStd450(), 40, width, one });
+        const ratio = try self.bvhBinary(136, self.float_type, major_safe, minified_width);
+        // Interpolated derivatives can straddle an exact integer by a few
+        // ulps. Avoid alternating N and N+1 taps across an otherwise uniform
+        // footprint (particularly visible with nearest-neighbour texels).
+        const stable_ratio = try self.bvhBinary(131, self.float_type, ratio, try self.constant(.float32, @bitCast(@as(f32, 0.0001))));
+        const rounded = self.id();
+        try self.emit(&self.body, 12, &.{ self.float_type, rounded, self.ensureGlslStd450(), 9, stable_ratio }); // Ceil
+        const taps = self.id();
+        try self.emit(&self.body, 12, &.{ self.float_type, taps, self.ensureGlslStd450(), 43, rounded, one, limit }); // FClamp
+        const raw_lod = self.id();
+        try self.emit(&self.body, 12, &.{ self.float_type, raw_lod, self.ensureGlslStd450(), 30, minified_width }); // Log2
+        const lod = try self.bvhBinary(129, self.float_type, raw_lod, try self.constant(.float32, @bitCast(aniso.lod_bias)));
+        const direction = [2]u32{
+            try self.bvhSelect(self.float_type, x_major, gradients[0][0], gradients[1][0]),
+            try self.bvhSelect(self.float_type, x_major, gradients[0][1], gradients[1][1]),
+        };
+        const layer = self.id();
+        if (dimension == .two_d_array) try self.emit(&self.body, 81, &.{ self.float_type, layer, coordinates, 2 });
+        var sum = self.id();
+        try self.emit(&self.body, 80, &.{ self.vector4_type, sum, zero, zero, zero, zero });
+        for (0..aniso.max_taps) |i| {
+            const index = try self.constant(.float32, @bitCast(@as(f32, @floatFromInt(i))));
+            const active = try self.bvhBinary(184, self.bool_type, index, taps); // FOrdLessThan
+            const safe_index = try self.bvhSelect(self.float_type, active, index, zero);
+            const fraction = try self.bvhBinary(131, self.float_type, try self.bvhBinary(136, self.float_type, try self.bvhBinary(129, self.float_type, safe_index, half), taps), half);
+            const u = try self.bvhBinary(129, self.float_type, uv[0], try self.bvhBinary(133, self.float_type, direction[0], fraction));
+            const v = try self.bvhBinary(129, self.float_type, uv[1], try self.bvhBinary(133, self.float_type, direction[1], fraction));
+            const coord = self.id();
+            if (dimension == .two_d_array) {
+                try self.emit(&self.body, 80, &.{ self.vector3_type, coord, u, v, layer });
+            } else try self.emit(&self.body, 80, &.{ self.vector2_type, coord, u, v });
+            const tap = self.id();
+            try self.emit(&self.body, 88, &.{ self.vector4_type, tap, image, coord, 2, lod });
+            const weighted = self.id();
+            const weight = try self.bvhBinary(136, self.float_type, try self.bvhSelect(self.float_type, active, one, zero), taps);
+            try self.emit(&self.body, 142, &.{ self.vector4_type, weighted, tap, weight }); // VectorTimesScalar
+            sum = try self.bvhBinary(129, self.vector4_type, sum, weighted);
+        }
+        try self.emit(&self.body, 83, &.{ self.vector4_type, result, sum }); // CopyObject
     }
 
     fn sampleExplicitGradients(

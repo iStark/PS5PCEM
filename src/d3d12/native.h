@@ -44,7 +44,8 @@ typedef struct Ps5D3D12Buffer {
 typedef struct Ps5D3D12Image {
     const uint8_t *pixels;
     size_t size;
-    uint32_t width, height, format, srgb, components, filter, address_u, address_v, address_w;
+    /* dimension: 0=2D, 1=cube array, 2=2D array. Pixels are layer-major. */
+    uint32_t width, height, layers, dimension, mip_levels, format, srgb, components, filter, address_u, address_v, address_w;
     float min_lod, max_lod, lod_bias, border[4];
     /* Nonzero identifies an immutable pixel snapshot. Equal IDs always hold
      * equal pixels, so a completed GPU copy with that ID needs no upload. */

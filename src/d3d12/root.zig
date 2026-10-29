@@ -42,6 +42,10 @@ pub const SampledImage = extern struct {
     size: usize,
     width: u32,
     height: u32,
+    layers: u32 = 1,
+    /// 0: Texture2D, 1: TextureCubeArray (six faces per cube), 2: Texture2DArray.
+    dimension: u32 = 0,
+    mip_levels: u32 = 1,
     format: u32 = 28,
     srgb: u32 = 0,
     components: u32 = 5768,
@@ -368,7 +372,7 @@ pub const Device = struct {
         if (buffers.len > 64 or images.len > 32) return error.InvalidArgument;
         for (buffers) |buffer| if (buffer.size == 0 or buffer.size % 4 != 0 or buffer.size > 256 * 1024 * 1024) return error.InvalidArgument;
         for (images) |image| {
-            if (image.size != try sampledImageSize(image.width, image.height, image.format) or image.srgb > 1 or
+            if (image.size != try sampledImageMipChainSize(image.width, image.height, image.format, image.layers, image.dimension, image.mip_levels) or image.srgb > 1 or
                 ((image.format == 61 or image.format == 49 or image.format == 115) and image.srgb != 0) or
                 image.address_u < 1 or image.address_u > 4 or image.address_v < 1 or image.address_v > 4 or
                 image.address_w < 1 or image.address_w > 4 or image.filter & ~@as(u32, 0x15) != 0 or
@@ -428,6 +432,33 @@ pub fn rgbaSize(width: u32, height: u32) Error!usize {
 
 fn validColorFormat(format: u32) bool {
     return format == 28 or format == 31 or format == 34;
+}
+
+pub fn sampledImageMipChainSize(width: u32, height: u32, format: u32, layers: u32, dimension: u32, mip_levels: u32) Error!usize {
+    var total = try sampledImageArraySize(width, height, format, layers, dimension);
+    if (mip_levels == 0 or mip_levels > 15 or mip_levels > 1 + std.math.log2_int(u32, @max(width, height))) return error.InvalidArgument;
+    // Guest placement uses ceil dimensions while native mip extents floor.
+    // Check the selected chain, not whether the base is a power of two: a
+    // 96x32 view with four levels ends at 12x4 and matches exactly.
+    const compressed = format == 71 or format == 74 or format == 77;
+    for (1..mip_levels) |level| {
+        const divisor = @as(u32, 1) << @as(u5, @intCast(level));
+        if ((width + divisor - 1) / divisor != @max(1, width / divisor) or
+            (height + divisor - 1) / divisor != @max(1, height / divisor)) return error.InvalidArgument;
+        const w = @max(if (compressed) @as(u32, 4) else 1, width >> @as(u5, @intCast(level)));
+        const h = @max(if (compressed) @as(u32, 4) else 1, height >> @as(u5, @intCast(level)));
+        total += (try sampledImageSize(w, h, format)) * layers;
+    }
+    if (total > 256 * 1024 * 1024) return error.InvalidArgument;
+    return total;
+}
+
+pub fn sampledImageArraySize(width: u32, height: u32, format: u32, layers: u32, dimension: u32) Error!usize {
+    if (layers == 0 or layers > 2048 or dimension > 2 or (dimension == 0 and layers != 1) or
+        (dimension == 1 and (width != height or layers % 6 != 0))) return error.InvalidArgument;
+    const size = std.math.mul(usize, try sampledImageSize(width, height, format), layers) catch return error.InvalidArgument;
+    if (size > 256 * 1024 * 1024) return error.InvalidArgument;
+    return size;
 }
 
 pub fn sampledImageSize(width: u32, height: u32, format: u32) Error!usize {
@@ -506,4 +537,25 @@ test "sampled BC footprints count blocks and reject unsupported native extents" 
     try std.testing.expectError(error.InvalidArgument, sampledImageSize(127, 128, 77));
     try std.testing.expectError(error.InvalidArgument, sampledImageSize(4, 4, 98));
     try std.testing.expectError(error.InvalidArgument, sampledImageSize(16388, 4, 71));
+}
+
+test "sampled arrays validate shape layers and bounded storage" {
+    try std.testing.expectEqual(@as(usize, 8 * 8 * 4 * 12), try sampledImageArraySize(8, 8, 28, 12, 1));
+    try std.testing.expectEqual(@as(usize, 8 * 8 / 2 * 6), try sampledImageArraySize(8, 8, 71, 6, 1));
+    try std.testing.expectEqual(@as(usize, 13 * 9 * 3), try sampledImageArraySize(13, 9, 61, 3, 2));
+    for ([_][5]u32{
+        .{ 8, 8, 28, 0, 2 },         .{ 8, 8, 28, 2049, 2 }, .{ 8, 8, 28, 2, 0 },
+        .{ 8, 4, 28, 6, 1 },         .{ 8, 8, 28, 7, 1 },    .{ 8, 8, 28, 1, 3 },
+        .{ 16384, 16384, 28, 6, 1 },
+    }) |shape| try std.testing.expectError(error.InvalidArgument, sampledImageArraySize(shape[0], shape[1], shape[2], shape[3], shape[4]));
+}
+
+test "sampled mip chains include every layer and the smallest compressed blocks" {
+    try std.testing.expectEqual(@as(usize, 1702272), try sampledImageMipChainSize(64, 64, 28, 78, 2, 5));
+    try std.testing.expectEqual(@as(usize, 336), try sampledImageMipChainSize(8, 8, 71, 6, 1, 4));
+    try std.testing.expectEqual(@as(usize, 32640), try sampledImageMipChainSize(96, 32, 28, 2, 2, 4));
+    try std.testing.expectError(error.InvalidArgument, sampledImageMipChainSize(96, 32, 28, 2, 2, 7));
+    try std.testing.expectError(error.InvalidArgument, sampledImageMipChainSize(8, 8, 28, 1, 0, 5));
+    try std.testing.expectError(error.InvalidArgument, sampledImageMipChainSize(13, 8, 28, 1, 0, 3));
+    try std.testing.expectError(error.InvalidArgument, sampledImageMipChainSize(8, 8, 28, 1, 0, 0));
 }

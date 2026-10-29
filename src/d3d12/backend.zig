@@ -121,6 +121,9 @@ pub const Renderer = struct {
     presented_frames: u64 = 0,
     empty_draws: u64 = 0,
     metadata_expands: u64 = 0,
+    /// Optional diagnostic consumer of the exact RGBA bytes sent to DXGI.
+    on_scanout: ?*const fn (?*anyopaque, u64, u32, u32, []const u8) void = null,
+    scanout_context: ?*anyopaque = null,
     // One retains the immediate API contract for direct users. The runner can
     // opt into bounded grouping; no guest bytes are used as a validity stamp.
     draw_batch_limit: usize = 1,
@@ -581,7 +584,7 @@ pub const Renderer = struct {
             draw_state.topology = 5;
         }
         var queued = false;
-        const indices = try args.stage(self.allocator, .{ .context = self, .read = read, .write = write }, state, &draw_state, render.primitive_type);
+        var indices = try args.stage(self.allocator, .{ .context = self, .read = read, .write = write }, state, &draw_state, render.primitive_type);
         defer if (!queued) self.allocator.free(indices);
         if (render.primitive_type == 5 and indices.len == 0) return;
         draw_state.cull_mode = if (render.raster.cull_front) 2 else if (render.raster.cull_back) 3 else 1;
@@ -606,6 +609,13 @@ pub const Renderer = struct {
         const vs = vs_lease.view();
         const ps = ps_lease.view();
         const interface = try graphics.linkInterface(state, vs.program.instructions.items, ps.program.instructions.items);
+        if (interface.flat_mask != 0) {
+            if (render.primitive_type == 7) return error.FlatRectangleInterpolationNotImplemented;
+            const last = (state.readRegister(.context, 0x205) orelse 0) & (1 << 19) != 0;
+            // Fans already rotate the selected rim vertex during expansion.
+            if (last and render.primitive_type != 5)
+                indices = try graphics.lastProvokingTriangleList(self.allocator, &draw_state, indices);
+        }
         if (render.primitive_type == 7 and !ngg_rectangle) {
             if (args.count % 3 != 0) return error.IncompleteRectangleList;
             draw_state.rectangle_completion = 1;
@@ -831,6 +841,7 @@ pub const Renderer = struct {
         });
         const now = gpu.frame_timing.timestampNs();
         self.presented_frames +|= 1;
+        if (self.on_scanout) |callback| callback(self.scanout_context, self.presented_frames, display.width, display.height, pixels);
         if (self.cache_report_ns == 0 or now -| self.cache_report_ns >= 5 * std.time.ns_per_s) {
             std.debug.print("[d3d12 textures] flip={d} page={d} content={d} miss={d} evict={d} kib={d}\n", .{
                 self.presented_frames, self.textures.page_hits, self.textures.content_hits, self.textures.misses, self.textures.evictions, self.textures.bytes / 1024,

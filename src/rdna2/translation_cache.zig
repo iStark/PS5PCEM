@@ -552,6 +552,43 @@ test "dynamic buffer extents share translations while address and format rules r
 // canonical content; immutable lifetime IDs only reuse a checked prefix.
 const appendValue = rdna2.cache_key.appendValue;
 
+test "shader anisotropy cache separates tap limit, texture extent and LOD bias" {
+    const allocator = std.testing.allocator;
+    var program = try rdna2.decodeProgram(allocator, &.{ 0x7e0002f0, 0x7e0202f0, 0xf0800f08, 0x00400400, 0xf800080f, 0x07060504, 0xbf810000 });
+    defer program.deinit(allocator);
+    var bindings = [_]rdna2.spirv.SampledImageBinding{.{ .resource_sgpr = 0, .sampler_sgpr = 8, .descriptor_index = 0 }};
+    const options = rdna2.spirv.Options{ .stage = .fragment, .sampled_images = &bindings };
+    var cache = Cache{};
+    defer cache.deinit(allocator);
+    const plain = try cache.acquire(allocator, &program, options, .{});
+    defer plain.release();
+    const initial = rdna2.spirv.ShaderAnisotropy{ .extent = .{ 64, 64 }, .max_taps = 4, .lod_bias = 0 };
+    bindings[0].anisotropy = initial;
+    const first = try cache.acquire(allocator, &program, options, .{});
+    defer first.release();
+    try std.testing.expect(!plain.sameModule(first));
+    for (0..3) |change| {
+        bindings[0].anisotropy = initial;
+        switch (change) {
+            0 => bindings[0].anisotropy.?.extent[0] = 128,
+            1 => bindings[0].anisotropy.?.max_taps = 8,
+            else => bindings[0].anisotropy.?.lod_bias = 0.5,
+        }
+        const changed = try cache.acquire(allocator, &program, options, .{});
+        defer changed.release();
+        try std.testing.expect(!first.sameModule(changed));
+    }
+    bindings[0].anisotropy = initial;
+    const reused = try cache.acquire(allocator, &program, options, .{});
+    defer reused.release();
+    try std.testing.expect(first.sameModule(reused));
+    bindings[0].anisotropy.?.max_taps = 3;
+    try std.testing.expectError(error.UnsupportedOpcode, cache.acquire(allocator, &program, options, .{}));
+    bindings[0].anisotropy = initial;
+    bindings[0].dimension = .cube;
+    try std.testing.expectError(error.UnsupportedOpcode, cache.acquire(allocator, &program, options, .{}));
+}
+
 test "MIMG multi-texel translation cache separates native component formats" {
     const allocator = std.testing.allocator;
     var program = try rdna2.decodeProgram(allocator, &.{ 0xf0000308 | (0x42 << 18), 0, 0xbf810000 });

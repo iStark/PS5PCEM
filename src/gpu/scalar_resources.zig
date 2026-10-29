@@ -367,12 +367,12 @@ pub const Resolver = struct {
         while (index > first) {
             index -= 1;
             const inst = self.instructions[index];
-            // VALU writes vector results/VCC/EXEC, not scalar SCC. Scheduling
-            // it between a scalar compare and CSELECT does not make that
-            // comparison dynamic. Its SGPR inputs are still recovered at the
-            // compare's own PC, so later register reuse cannot change it.
+            // VALU and vector/LDS memory operations do not write scalar SCC.
+            // A vertex fetch scheduled between CMP and CSELECT therefore
+            // preserves the comparison. Recover its SGPR inputs at the CMP's
+            // own PC; later register reuse must not change the chosen branch.
             switch (inst.family) {
-                .vop1, .vop2, .vop3, .vop3p, .vopc, .vintrp => {
+                .vop1, .vop2, .vop3, .vop3p, .vopc, .vintrp, .mubuf, .mtbuf, .mimg, .flat, .ds => {
                     if (inst.opcode != .unknown and inst.dst.kind != .scc) continue;
                 },
                 else => {},
@@ -458,7 +458,7 @@ test "packed vertex format recovery proves CSELECT and refuses unknown or clobbe
     bindings.user_data_count = 4;
     bindings.user_data[2] = 0x022c0204;
     bindings.user_data[3] = 0x0fac03ac;
-    for (0..12) |variant| {
+    for (0..19) |variant| {
         var instructions = original;
         bindings.user_data[0] = if (variant == 0) 0 else if (variant == 2) 0xa0 else 0x80;
         if (variant == 3) instructions[7] = .{ .pc = 28, .opcode = .s_and_b32, .dst = M.reg(30), .src0 = M.imm(0), .src1 = M.imm(0) };
@@ -472,11 +472,20 @@ test "packed vertex format recovery proves CSELECT and refuses unknown or clobbe
         // input afterward. Recover the input at the comparison, not CSELECT.
         if (variant == 10) instructions[7] = .{ .pc = 28, .opcode = .s_mov_b32, .dst = M.reg(4), .src0 = M.imm(0) };
         if (variant == 11) instructions[7] = .{ .pc = 28, .opcode = .s_mov_b64, .dst = M.reg(20), .src0 = M.imm(0) };
+        // Quake II schedules a vertex fetch between CMP and the descriptor's
+        // CSELECT. Vector memory changes VGPRs/memory, not the scalar flag.
+        if (variant == 12) instructions[7] = .{ .pc = 28, .family = .mubuf, .opcode = .buffer_load_format_xyz, .dst = .{ .kind = .vgpr, .reg = 4 } };
+        if (variant == 13) instructions[7] = .{ .pc = 28, .family = .mtbuf, .opcode = .tbuffer_load_format_x, .dst = .{ .kind = .vgpr, .reg = 4 } };
+        if (variant == 14) instructions[7] = .{ .pc = 28, .family = .mimg, .opcode = .image_sample, .dst = .{ .kind = .vgpr, .reg = 4 } };
+        if (variant == 15) instructions[7] = .{ .pc = 28, .family = .flat, .opcode = .flat_load_dword, .dst = .{ .kind = .vgpr, .reg = 4 } };
+        if (variant == 16) instructions[7] = .{ .pc = 28, .family = .ds, .opcode = .ds_read_b32, .dst = .{ .kind = .vgpr, .reg = 4 } };
+        if (variant == 17) instructions[7] = .{ .pc = 28, .family = .mubuf, .opcode = .unknown };
+        if (variant == 18) instructions[7] = .{ .pc = 28, .family = .mubuf, .opcode = .buffer_load_format_xyz, .dst = .{ .kind = .scc } };
         var graph = try rdna2.control_flow.buildInstructions(std.testing.allocator, &instructions);
         defer graph.deinit(std.testing.allocator);
         var resolver = Resolver{ .bindings = &bindings, .reader = .{ .context = null, .read_fn = M.read }, .instructions = &instructions, .graph = &graph, .snapshot = &unknown_registers };
         var words: [1]u32 = undefined;
-        const recoverable = variant < 3 or variant == 6 or variant == 7 or variant >= 10;
+        const recoverable = variant < 3 or variant == 6 or variant == 7 or (variant >= 10 and variant <= 16);
         try std.testing.expectEqual(recoverable, try resolver.words(11, 36, &words));
         if (recoverable) try std.testing.expectEqual(([_]u32{ 0xfac, 0x1204, 0x122c })[if (variant >= 6) 1 else variant], words[0]);
     }
