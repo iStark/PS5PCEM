@@ -3144,10 +3144,15 @@ fn guestPackedImageProbe(allocator: std.mem.Allocator, memory: *GraphicsMemory, 
 }
 
 fn guestNarrowImageProbe(allocator: std.mem.Allocator, memory: *GraphicsMemory, state: *gpu.State, executor: *gpu.DcbExecutor, renderer: *d3d12.Renderer) !void {
-    for ([_]u16{ 1, 7, 14 }) |format| for ([_]gpu.resources.TileMode{ .linear, .standard_4kb }) |mode| for ([_]u32{ 9, 13 }) |image_type| {
+    const saved_batch_limit = renderer.draw_batch_limit;
+    renderer.draw_batch_limit = 64;
+    defer renderer.draw_batch_limit = saved_batch_limit;
+    // Leave the RG8 fixture for the following texel-coordinate probe.
+    for ([_]u16{ 1, 1, 7, 14 }, 0..) |format, view_index| for ([_]gpu.resources.TileMode{ .linear, .standard_4kb }) |mode| for ([_]u32{ 9, 13 }) |image_type| {
         const width: u32 = 13;
         const height: u32 = 9;
-        const components: u32 = if (format != 14) 4 | (0 << 3) | (0 << 6) | (1 << 9) else 4 | (5 << 3) | (0 << 6) | (1 << 9);
+        const alpha_only = view_index == 0;
+        const components: u32 = if (alpha_only) 4 << 9 else if (format != 14) 4 | (0 << 3) | (0 << 6) | (1 << 9) else 4 | (5 << 3) | (0 << 6) | (1 << 9);
         const words = [_]u32{ 0x100, (@as(u32, format) << 20) | (((width - 1) & 3) << 30), ((width - 1) >> 2) | ((height - 1) << 14), (image_type << 28) | components | (@as(u32, @intFromEnum(mode)) << 20), 0, 0, 0, 0 };
         for (words, 0..) |word, i| try state.writeRegister(.shader, 0x00c + @as(u32, @intCast(i)), word);
         const descriptor = try gpu.resources.decodeImageDescriptor(&words);
@@ -3161,18 +3166,30 @@ fn guestNarrowImageProbe(allocator: std.mem.Allocator, memory: *GraphicsMemory, 
             if (bytes == 2) pixels[(y * width + x) * bytes + 1] = @intCast(40 + y * 19);
         };
         const backing = memory.data[0x10000..][0..@intCast(layout.required_source_bytes)];
-        @memset(backing, 0xa7);
-        try layout.tile(pixels, backing);
+        const upload = memory.data[0x60000..][0..backing.len];
+        @memset(upload, 0xa7);
+        try layout.tile(pixels, upload);
+        // Exercise the real DMA callback, not a host memcpy to the atlas.
+        // A missing callback left Unity's R8 coverage at its allocation fill.
+        _ = try executor.execute(&.{
+            command(gpu.pm4.dma_data, 6), (2 << 29) | (3 << 20), 0xcdcdcdcd, 0, 0x10000, 0, @intCast(backing.len),
+            command(gpu.pm4.dma_data, 6), 3 << 29,               0x60000,    0, 0x10000, 0, @intCast(backing.len),
+        });
+        if (!std.mem.eql(u8, upload, backing)) return error.NarrowImageDmaUploadMismatch;
         const before = try allocator.dupe(u8, backing);
         defer allocator.free(before);
         @memset(memory.data[0x2000..0x5000], 0);
         _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 2 });
+        // The draw remains queued. DMA must complete it before copying its
+        // pixels, and the next upload must invalidate the earlier atlas view.
+        _ = try executor.execute(&.{ command(gpu.pm4.dma_data, 6), 3 << 20, 0x2000, 0, 0x70000, 0, 0x3000 });
+        if (!std.mem.eql(u8, memory.data[0x2000..0x5000], memory.data[0x70000..0x73000])) return error.NarrowImageDmaOrderingMismatch;
         if (!std.mem.eql(u8, before, backing)) return error.NarrowImageSourceModified;
         for ([_][2]usize{ .{ 30, 23 }, .{ 34, 23 }, .{ 30, 15 }, .{ 34, 15 } }) |point| {
             const tx: usize = @intFromFloat((@as(f32, @floatFromInt(point[0])) + 0.5) / 65 * @as(f32, @floatFromInt(width)));
             const ty: usize = @intFromFloat((1 - (@as(f32, @floatFromInt(point[1])) + 0.5) / 37) * @as(f32, @floatFromInt(height)));
             const red: u8 = if (format == 7) @intCast(((20 + tx * 11 + (40 + ty * 19) * 256) * 255 + 32767) / 65535) else @intCast(20 + tx * 11);
-            const expected = [4]u8{ red, if (format == 14) @intCast(40 + ty * 19) else 0, 0, 255 };
+            const expected: [4]u8 = if (alpha_only) .{ 0, 0, 0, red } else .{ red, if (format == 14) @intCast(40 + ty * 19) else 0, 0, 255 };
             const actual = memory.data[0x2000 + (point[1] * 72 + point[0]) * 4 ..][0..4];
             for (actual, expected) |a, e| if (@abs(@as(i16, a) - e) > 1) return error.NarrowImageSamplingMismatch;
         }
@@ -3186,7 +3203,7 @@ fn guestNarrowImageProbe(allocator: std.mem.Allocator, memory: *GraphicsMemory, 
     if (renderer.draw(state, packet)) |_| return error.NarrowSrgbAccepted else |err| if (err != error.GraphicsSamplerModeNotImplemented) return err;
     try state.writeRegister(.shader, 0x014, 2 | (2 << 3) | (2 << 6));
     if (!std.mem.eql(u8, &before, memory.data[0x2000..0x5000])) return error.RejectedViewModifiedTarget;
-    std.debug.print("PASS R8/R16/RG8 textures: linear/tiled, narrow upload rows, one-layer array views, components and unchanged source bytes (12 cases); multi-layer/sRGB rejection\n", .{});
+    std.debug.print("PASS R8/R16/RG8 textures: DMA fill/upload, linear/tiled, narrow rows, one-layer arrays, alpha-only font coverage and unchanged source bytes (16 cases); multi-layer/sRGB rejection\n", .{});
 }
 
 fn guestArrayImageProbe(allocator: std.mem.Allocator, memory: *GraphicsMemory, state: *gpu.State, executor: *gpu.DcbExecutor, renderer: *d3d12.Renderer) !void {

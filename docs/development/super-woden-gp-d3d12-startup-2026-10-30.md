@@ -82,3 +82,10 @@ remain unverified. Earlier Vulkan memory growth is not declared resolved.
 
 The separate [Vulkan orientation report](super-woden-gp-ui-orientation-2026-10-29.md)
 and its screenshots continue to describe Vulkan only.
+
+## Later font-upload fix
+
+The rectangle text described above was subsequently traced to unexecuted
+`DMA_DATA` texture uploads and fixed in D3D12. See the separate
+[font-upload report and updated capture](super-woden-gp-d3d12-fonts-2026-10-30.md).
+The startup measurements and screenshot above remain the earlier baseline.

@@ -221,6 +221,58 @@ pub const Renderer = struct {
         if (value.address != null) return drain(context);
         return from(context).failure == null;
     }
+    fn dmaCallback(context: ?*anyopaque, value: gpu.state.DmaData) bool {
+        const self = from(context);
+        if (self.failure != null) return false;
+        self.dma(value) catch |err| return self.rejected("DMA_DATA", err);
+        return true;
+    }
+
+    /// The AGC bridge installs its own DMA callback, so the executor's generic
+    /// memory-copy fallback is not reached. Complete transfers here before any
+    /// later shader snapshot or release can observe their destination.
+    pub fn dma(self: *Renderer, value: gpu.state.DmaData) !void {
+        try self.flushDraws();
+        const size: usize = value.byte_count;
+        if (size == 0) return; // A zero-length DMA still orders prior work.
+        if (size > 0x03ff_ffff or value.engine > 1) return error.InvalidDmaPacket;
+        if (value.source > 3 or (value.destination != 0 and value.destination != 1 and value.destination != 3))
+            return error.UnsupportedDmaSelector;
+        // Four-byte immediate writes to unmapped low sentinel addresses are
+        // emitted as ordering markers. Do not turn them into guest writes.
+        if (value.source == 2 and (value.destination == 0 or value.destination == 3) and
+            value.destination_address < 0x1_0000 and size == 4) return;
+        for ([_]struct { selector: u8, address: u64 }{
+            .{ .selector = value.source, .address = value.source_address },
+            .{ .selector = value.destination, .address = value.destination_address },
+        }) |endpoint| {
+            if (endpoint.selector == 1) {
+                if (endpoint.address > 64 * 1024 or size > 64 * 1024 - endpoint.address) return error.InvalidDmaGdsRange;
+            } else if (endpoint.selector != 2) {
+                _ = try std.math.add(u64, endpoint.address, size);
+            }
+        }
+        if ((value.source == 1 or value.destination == 1) and self.gds == null) {
+            self.gds = try self.allocator.alloc(u8, 64 * 1024);
+            @memset(self.gds.?, 0);
+        }
+        // Snapshot before writing, including overlapping memory/GDS ranges.
+        const bytes = try self.allocator.alloc(u8, size);
+        defer self.allocator.free(bytes);
+        switch (value.source) {
+            0, 3 => if (!self.memory.read(self.memory.context, value.source_address, bytes)) return error.GuestReadFailed,
+            1 => @memcpy(bytes, self.gds.?[@intCast(value.source_address)..][0..size]),
+            2 => {
+                var pattern: [4]u8 = undefined;
+                std.mem.writeInt(u32, &pattern, @truncate(value.source_address), .little);
+                for (bytes, 0..) |*byte, i| byte.* = pattern[i & 3];
+            },
+            else => unreachable,
+        }
+        if (value.destination == 1) {
+            @memcpy(self.gds.?[@intCast(value.destination_address)..][0..size], bytes);
+        } else if (!self.memory.write(self.memory.context, value.destination_address, bytes)) return error.GuestWriteFailed;
+    }
     fn release(context: ?*anyopaque, value: gpu.state.ReleaseMem) bool {
         if (!drain(context)) return false;
         // Preserve the executor's existing immediate-value release semantics,
@@ -352,6 +404,7 @@ pub const Renderer = struct {
         .acquire = acquire,
         .release = release,
         .event = event,
+        .dma_data = dmaCallback,
         .dispatch = dispatchCallback,
         .draw = drawCallback,
         .flip = flipCallback,
@@ -1297,4 +1350,82 @@ test "indirect D3D12 single draws validate argument reads and address arithmetic
     try t.expectError(error.Overflow, DrawArguments.indirect(t.allocator, memory.access(), &state, packet));
     packet.body = body[0..3];
     try t.expectError(error.InvalidDrawPacket, DrawArguments.indirect(t.allocator, memory.access(), &state, packet));
+}
+
+const DmaTestMemory = struct {
+    bytes: [256]u8 = @splat(0xcd),
+    writes: usize = 0,
+    fn read(raw: ?*anyopaque, address: u64, output: []u8) bool {
+        const self: *@This() = @ptrCast(@alignCast(raw.?));
+        if (address < 0x10000 or address - 0x10000 > self.bytes.len or output.len > self.bytes.len - (address - 0x10000)) return false;
+        @memcpy(output, self.bytes[@intCast(address - 0x10000)..][0..output.len]);
+        return true;
+    }
+    fn write(raw: ?*anyopaque, address: u64, input: []const u8) bool {
+        const self: *@This() = @ptrCast(@alignCast(raw.?));
+        if (address < 0x10000 or address - 0x10000 > self.bytes.len or input.len > self.bytes.len - (address - 0x10000)) return false;
+        @memcpy(self.bytes[@intCast(address - 0x10000)..][0..input.len], input);
+        self.writes += 1;
+        return true;
+    }
+    fn renderer(self: *@This()) Renderer {
+        // DMA without pending draws needs no host device.
+        return .{ .allocator = std.testing.allocator, .device = undefined, .staging_pool = .{ .allocator = std.testing.allocator }, .conversion_cache = .{ .allocator = std.testing.allocator }, .memory = .{ .context = self, .read = read, .write = write } };
+    }
+    fn packet(source: u8, from_address: u64, destination: u8, to_address: u64, size: u32) gpu.state.DmaData {
+        var value = std.mem.zeroes(gpu.state.DmaData);
+        value.source = source;
+        value.source_address = from_address;
+        value.destination = destination;
+        value.destination_address = to_address;
+        value.byte_count = size;
+        return value;
+    }
+};
+
+test "D3D12 DMA copies overlapping memory, fills partial words and shares persistent GDS" {
+    const t = std.testing;
+    var memory = DmaTestMemory{};
+    var renderer = memory.renderer();
+    defer if (renderer.gds) |bytes| t.allocator.free(bytes);
+    const backend = renderer.dcbBackend();
+    try t.expect(backend.vtable.dma_data != null); // AGC requires an explicit callback.
+    const dma = backend.vtable.dma_data.?;
+    @memcpy(memory.bytes[0..8], "abcdefgh");
+    try t.expect(dma(backend.context, DmaTestMemory.packet(0, 0x10000, 3, 0x10002, 7)));
+    try t.expectEqualStrings("ababcdefg", memory.bytes[0..9]);
+    try renderer.dma(DmaTestMemory.packet(2, 0x44332211, 0, 0x10011, 7));
+    try t.expectEqualSlices(u8, &.{ 0xcd, 0x11, 0x22, 0x33, 0x44, 0x11, 0x22, 0x33, 0xcd }, memory.bytes[16..25]);
+    try renderer.dma(DmaTestMemory.packet(3, 0x10002, 1, 8, 7));
+    try t.expectEqualStrings("abcdefg", renderer.gds.?[8..15]);
+    try t.expectEqual(@as(u8, 0), renderer.gds.?[7]);
+    try renderer.dma(DmaTestMemory.packet(1, 8, 1, 10, 7));
+    try renderer.dma(DmaTestMemory.packet(1, 8, 0, 0x10040, 9));
+    try t.expectEqualStrings("ababcdefg", memory.bytes[64..73]);
+    try renderer.dma(DmaTestMemory.packet(2, 0x08070605, 1, 65533, 3));
+    try t.expectEqualSlices(u8, &.{ 5, 6, 7 }, renderer.gds.?[65533..]);
+}
+
+test "D3D12 DMA rejects invalid transfers without publishing bytes or acknowledging failure" {
+    const t = std.testing;
+    var memory = DmaTestMemory{};
+    var renderer = memory.renderer();
+    const packet = DmaTestMemory.packet;
+    try t.expectError(error.UnsupportedDmaSelector, renderer.dma(packet(4, 0, 0, 0x10000, 4)));
+    try t.expectError(error.UnsupportedDmaSelector, renderer.dma(packet(2, 0, 2, 0x10000, 4)));
+    try t.expectError(error.InvalidDmaGdsRange, renderer.dma(packet(1, 65535, 0, 0x10000, 2)));
+    try t.expectError(error.InvalidDmaGdsRange, renderer.dma(packet(2, 0, 1, 65536, 1)));
+    try t.expectError(error.Overflow, renderer.dma(packet(0, std.math.maxInt(u64), 0, 0x10000, 4)));
+    try t.expectError(error.InvalidDmaPacket, renderer.dma(packet(2, 0, 0, 0x10000, 0x04000000)));
+    try t.expectError(error.GuestReadFailed, renderer.dma(packet(0, 0x20000, 0, 0x10000, 4)));
+    try t.expectError(error.GuestWriteFailed, renderer.dma(packet(2, 0, 0, 0x20000, 4)));
+    try renderer.dma(packet(2, 0, 3, 0, 4)); // Observed low-address ordering marker.
+    try renderer.dma(packet(0, 0, 0, 0, 0)); // Zero-length synchronization.
+    try t.expectEqual(@as(usize, 0), memory.writes);
+    try t.expect(std.mem.allEqual(u8, &memory.bytes, 0xcd));
+    const backend = renderer.dcbBackend();
+    try t.expect(!backend.vtable.dma_data.?(backend.context, packet(4, 0, 0, 0x10000, 4)));
+    try t.expectEqual(error.UnsupportedDmaSelector, renderer.failure.?);
+    try t.expect(!backend.vtable.dma_data.?(backend.context, packet(2, 0, 0, 0x10000, 4)));
+    try t.expectEqual(@as(usize, 0), memory.writes);
 }
