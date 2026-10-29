@@ -728,16 +728,11 @@ pub fn mountSaveDataSlot(slot: []const u8, may_create: bool) Error!SaveDataMount
         break :blk home.openDir(io, relative, .{ .iterate = true }) catch return Error.IoFailed;
     };
 
-    // Match slot enumeration: a named probe must not expose an interrupted
-    // transaction containing only metadata or empty staging files. Keep the
-    // files in place, but let a creating mount initialize the slot anew.
-    if (!created and !saveDataDirectoryHasPayload(directory, io, true, 0)) {
-        if (!may_create) {
-            directory.close(io);
-            return .missing;
-        }
-        created = true;
-    }
+    // A named mount tests whether the container exists, not whether the title
+    // has written a nonempty file yet. Games can create/unmount a container,
+    // then mount it read-only to probe their settings before the first write.
+    // Treating that valid empty container as missing aborts first-run startup
+    // (Jets 'n' Guns 2). Do not infer creation status from title-owned payload.
 
     table_lock.lock();
     defer table_lock.unlock();
@@ -2376,7 +2371,7 @@ test "save-data search hides interrupted slots without payload" {
     try testing.expectEqualStrings("complete", std.mem.sliceTo(&names[0], 0));
 }
 
-test "save-data mount does not load an interrupted slot or replace an active mount" {
+test "save-data named mounts preserve empty containers and missing probes preserve the active mount" {
     var fixture = try Fixture.init("title data");
     defer fixture.deinit();
     attachSaveDataHome(fixture.tmp.dir, "PPSA15065");
@@ -2392,12 +2387,13 @@ test "save-data mount does not load an interrupted slot or replace an active mou
     try fixture.tmp.dir.writeFile(testing.io, .{ .sub_path = "PPSA15065/complete/data/progress.bin", .data = "progress" });
 
     try testing.expectEqual(SaveDataMountOutcome.existed, try mountSaveDataSlot("complete", false));
-    try testing.expectEqual(SaveDataMountOutcome.missing, try mountSaveDataSlot("incomplete", false));
+    try testing.expectEqual(SaveDataMountOutcome.missing, try mountSaveDataSlot("absent", false));
     try testing.expectEqualStrings("complete", mountedSaveDataSlot());
     var bytes: [32]u8 = undefined;
     const metadata = try fixture.tmp.dir.readFile(testing.io, "PPSA15065/incomplete/sce_sys/param.txt", &bytes);
     try testing.expectEqualStrings("metadata", metadata);
-    try testing.expectEqual(SaveDataMountOutcome.created, try mountSaveDataSlot("incomplete", true));
+    try testing.expectEqual(SaveDataMountOutcome.existed, try mountSaveDataSlot("incomplete", false));
+    try testing.expectEqual(SaveDataMountOutcome.existed, try mountSaveDataSlot("incomplete", true));
     const fd = try open("/savedata0/save.bin", O.wronly);
     try testing.expectEqual(@as(usize, 8), try write(fd, "new save"));
     try close(fd);
@@ -2407,6 +2403,34 @@ test "save-data mount does not load an interrupted slot or replace an active mou
     defer close(restored) catch {};
     const count = try read(restored, &bytes);
     try testing.expectEqualStrings("new save", bytes[0..count]);
+}
+
+test "save-data first-run create unmount read-only remount needs no payload" {
+    var fixture = try Fixture.init("title data");
+    defer fixture.deinit();
+    attachSaveDataHome(fixture.tmp.dir, "PPSA17163");
+    defer {
+        unmountSaveData();
+        savedata_home = null;
+        title_identifier_length = 0;
+    }
+    try testing.expectEqual(SaveDataMountOutcome.missing, try mountSaveDataSlot("jng2", false));
+    try testing.expectEqual(SaveDataMountOutcome.created, try mountSaveDataSlot("jng2", true));
+    unmountSaveData();
+    try testing.expectEqual(SaveDataMountOutcome.existed, try mountSaveDataSlot("jng2", false));
+    try testing.expectError(Error.NotFound, open("/savedata0/game.ini", O.rdonly));
+    unmountSaveData();
+    try testing.expectEqual(SaveDataMountOutcome.existed, try mountSaveDataSlot("jng2", true));
+    const fd = try open("/savedata0/game.ini", O.wronly | O.creat);
+    try testing.expectEqual(@as(usize, 8), try write(fd, "settings"));
+    try close(fd);
+    unmountSaveData();
+    try testing.expectEqual(SaveDataMountOutcome.existed, try mountSaveDataSlot("jng2", false));
+    const restored = try open("/savedata0/game.ini", O.rdonly);
+    defer close(restored) catch {};
+    var bytes: [16]u8 = undefined;
+    const count = try read(restored, &bytes);
+    try testing.expectEqualStrings("settings", bytes[0..count]);
 }
 
 test "a title reads its own content through the mount" {
