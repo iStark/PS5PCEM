@@ -7139,12 +7139,32 @@ fn runGuestCullingProbe(allocator: std.mem.Allocator) !void {
 }
 
 fn runFullscreenOrientationProbe(allocator: std.mem.Allocator) !void {
-    var renderer = try vulkan.Renderer.init(allocator, .{});
+    for ([_]bool{ false, true }) |indexed| try runFullscreenOrientationCase(allocator, indexed);
+    std.debug.print("fullscreen orientation passed: procedural triangle and buffered indexed quad, both viewport signs, runtime UV scale/bias, guest-memory/resident sources and masked draws\n", .{});
+}
+
+noinline fn runFullscreenOrientationCase(allocator: std.mem.Allocator, indexed: bool) !void {
+    const renderer = try allocator.create(vulkan.Renderer);
+    defer allocator.destroy(renderer);
+    renderer.* = try vulkan.Renderer.init(allocator, .{});
     defer renderer.deinit();
     var guest = GuestMemory{};
     // Procedural triangle: POS.y = 2*y-1, PARAM0.y = (1-y)*scale+bias.
     // A negative viewport therefore does not imply flipped texture rows.
-    const vertex = [_]u32{ 0x34020a81, 0x36040a82, 0x7e0002f2, 0xf4280004, 0xfa000000, 0x36020282, 0x7e040d02, 0x7e060d01, 0xd5410001, 0x03ce04f4, 0x080804f2, 0xd5410002, 0x03ce06f4, 0xbf8cc07f, 0xd5410003, 0x00080103, 0xd5410004, 0x000c0304, 0xf80008cf, 0x00000102, 0xf8000203, 0x00000403, 0xbf810000 };
+    const procedural_vertex = [_]u32{ 0x34020a81, 0x36040a82, 0x7e0002f2, 0xf4280004, 0xfa000000, 0x36020282, 0x7e040d02, 0x7e060d01, 0xd5410001, 0x03ce04f4, 0x080804f2, 0xd5410002, 0x03ce06f4, 0xbf8cc07f, 0xd5410003, 0x00080103, 0xd5410004, 0x000c0304, 0xf80008cf, 0x00000102, 0xf8000203, 0x00000403, 0xbf810000 };
+    const fetch = mubuf(0x0e, 0, 0, 5, 12);
+    const buffered_vertex = [_]u32{
+        fetch[0], fetch[1], // V#s12: clip x/y and UV, indexed by the guest vertex ID
+        0xf4280004, 0xfa000000, // runtime UV scale/bias from V#s8
+        0xbf8c0070,
+        0xd5410002, 0x00080102, // u = u*s0+s2
+        0xd5410003, 0x000c0303, // v = v*s1+s3
+        vop1(1, 4, 128), vop1(1, 6, 242), // z=0, w=1
+        0xf80008cf,      0x06040100,
+        0xf8000203,      0x00000302,
+        0xbf810000,
+    };
+    const vertex: []const u32 = if (indexed) &buffered_vertex else &procedural_vertex;
     const fragment = [_]u32{ 0xbfa00001, 0xbefc0310, 0xc8100000, 0xc8140100, 0xc8110001, 0xc8150101, 0xf0900f08, 0x00400004, 0xbf8c3f70, 0x5e000300, 0x5e020702, 0xf8001c0f, 0x00000100, 0xbf810000 };
     for (vertex, 0..) |word, i| guest.word(0x700 + i * 4, word);
     for (fragment, 0..) |word, i| guest.word(0x900 + i * 4, word);
@@ -7159,12 +7179,25 @@ fn runFullscreenOrientationProbe(allocator: std.mem.Allocator) !void {
     const pixel_stage = gpu.resources.ShaderStage.pixel;
     try state.writeRegister(.shader, vertex_stage.programRegisterBase(), 7);
     try state.writeRegister(.shader, vertex_stage.programRegisterBase() + 1, 0);
-    try state.writeRegister(.shader, vertex_stage.programRegisterBase() + 3, 12 << 1);
+    try state.writeRegister(.shader, vertex_stage.programRegisterBase() + 3, (if (indexed) @as(u32, 16) else 12) << 1);
     try state.writeRegister(.shader, pixel_stage.programRegisterBase(), 9);
     try state.writeRegister(.shader, pixel_stage.programRegisterBase() + 1, 0);
     try state.writeRegister(.shader, pixel_stage.programRegisterBase() + 3, 12 << 1);
     for ([_]u32{ 0x12000, 0, 16, 0 }, 0..) |word, i|
         try state.writeRegister(.shader, vertex_stage.userDataBase() + 8 + @as(u32, @intCast(i)), word);
+    if (indexed) {
+        for ([_]u32{ 0x14000, 16 << 16, 4, 0 }, 0..) |word, i|
+            try state.writeRegister(.shader, vertex_stage.userDataBase() + 12 + @as(u32, @intCast(i)), word);
+        const vertices = [_][4]f32{
+            .{ -1, -1, 0, 1 }, .{ -1, 1, 0, 0 },
+            .{ 1, 1, 1, 0 },   .{ 1, -1, 1, 1 },
+        };
+        for (vertices, 0..) |values, i| for (values, 0..) |value, component|
+            guest.word(0x14000 + i * 16 + component * 4, @bitCast(value));
+        guest.word(0x15000, 0x00010000);
+        guest.word(0x15004, 0x00020002);
+        guest.word(0x15008, 0x00000003);
+    }
     for (image, 0..) |word, i| try state.writeRegister(.shader, pixel_stage.userDataBase() + @as(u32, @intCast(i)), word);
     for (0..4) |i| try state.writeRegister(.shader, pixel_stage.userDataBase() + 8 + @as(u32, @intCast(i)), 0);
     const context = [_][2]u32{
@@ -7175,7 +7208,9 @@ fn runFullscreenOrientationProbe(allocator: std.mem.Allocator) !void {
         .{ 0x205, 0 }, .{ 0x191, 0 },
     };
     for (context) |entry| try state.writeRegister(.context, entry[0], entry[1]);
-    const stream = [_]u32{ command(gpu.pm4.draw_index_auto, 2), 3, 0 };
+    const procedural_stream = [_]u32{ command(gpu.pm4.draw_index_auto, 2), 3, 0 };
+    const indexed_stream = [_]u32{ command(gpu.pm4.draw_index_2, 5), 4, 0x15000, 0, 6, 0 };
+    const stream: []const u32 = if (indexed) &indexed_stream else &procedural_stream;
     var executor = gpu.DcbExecutor{ .state = &state, .backend = renderer.dcbBackend(guest.interface()), .allocator = allocator };
     for (0..8) |case| {
         // Repeat through a resident render target, as in a multipass UI.
@@ -7189,14 +7224,14 @@ fn runFullscreenOrientationProbe(allocator: std.mem.Allocator) !void {
             try state.writeRegister(.context, 0x10f + @as(u32, @intCast(i)), @bitCast(value));
         for ([_]f32{ 1, if (reverse_uv) -1 else 1, 0, if (reverse_uv) 1 else 0 }, 0..) |value, i|
             guest.word(0x12000 + i * 4, @bitCast(value));
-        _ = try executor.execute(&stream);
+        _ = try executor.execute(stream);
         if (renderer.last_draw_error) |err| return err;
         try renderer.flushPendingGuestWrites();
         for (0..8) |y| for (0..8) |x| {
             const source_y = if (negative_viewport != reverse_uv) y else 7 - y;
             const expected: u32 = 0xff110000 | (@as(u32, @intCast(x * 30)) << 8) | @as(u32, @intCast(10 + source_y * 30));
             const actual = std.mem.readInt(u32, guest.bytes[destination + (y * 8 + x) * 4 ..][0..4], .little);
-            if (actual != expected) std.debug.print("fullscreen orientation case={d} pixel={d},{d}: expected={x} actual={x}\n", .{ case, x, y, expected, actual });
+            if (actual != expected) std.debug.print("fullscreen orientation indexed={any} case={d} pixel={d},{d}: expected={x} actual={x}\n", .{ indexed, case, x, y, expected, actual });
             try std.testing.expectEqual(expected, actual);
         };
         if (case == 6) {
@@ -7219,7 +7254,6 @@ fn runFullscreenOrientationProbe(allocator: std.mem.Allocator) !void {
             try state.writeRegister(.context, 0x200, 0);
         }
     }
-    std.debug.print("fullscreen orientation passed: procedural triangle, both viewport signs, runtime UV scale/bias and guest-memory/resident sources and a masked fullscreen quad\n", .{});
 }
 
 fn runConstantBufferFillProbe(allocator: std.mem.Allocator) !void {
@@ -14884,6 +14918,11 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--constant-buffer-fetch")) {
         try runConstantBufferFetchProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--resident-blit-orientation")) {
+        try runRendererProbe(allocator, vulkan.Renderer.probeResidentBlitOrientation);
+        std.debug.print("resident blit orientation passed: alternating Y flips, later overlays and chained copies preserve pixel orientation\n", .{});
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--packed-scanout")) {

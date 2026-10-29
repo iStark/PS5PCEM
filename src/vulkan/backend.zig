@@ -19506,10 +19506,10 @@ pub const Renderer = struct {
         const blit = vk.ImageBlit{
             .source_subresource = .{ .aspect_mask = vk.image_aspect_color_bit },
             .source_offsets = .{
-                .{ .x = 0, .y = 0, .z = 0 },
+                .{ .x = 0, .y = if (flip_vertical) @intCast(source.target.descriptor.height) else 0, .z = 0 },
                 .{
                     .x = @intCast(source.target.descriptor.width),
-                    .y = @intCast(source.target.descriptor.height),
+                    .y = if (flip_vertical) 0 else @intCast(source.target.descriptor.height),
                     .z = 1,
                 },
             },
@@ -19553,7 +19553,10 @@ pub const Renderer = struct {
         cached_destination.shader_read_layout = false;
         self.markRenderTargetWritten(cached_destination);
         cached_destination.last_used_sequence = self.render_target_sequence;
-        if (flip_vertical) cached_destination.scanout_flip_vertical = true;
+        // The copy's orientation belongs to its pixels, not to a later flip.
+        // Deferring it to presentation also flips UI drawn after this copy,
+        // and subsequent sampled-image consumers see the unflipped backing.
+        cached_destination.scanout_flip_vertical = false;
         self.render_targets.items[source_index].last_used_sequence = self.render_target_sequence;
         self.latest_render_target_index = destination_index;
         for (self.completed_frames.items) |*frame| {
@@ -22627,6 +22630,55 @@ pub const Renderer = struct {
         color.tile_mode = .linear;
         const index = try self.uploadLinearColorTarget(try guestColorTarget(color), pixels);
         try self.blitRenderTargetToSwapchain(index, null);
+    }
+
+    pub fn probeResidentBlitOrientation(self: *Renderer) anyerror!void {
+        const width = 32;
+        const height = 32;
+        var pixels: [width * height * 4]u8 = undefined;
+        for (0..height) |y| for (0..width) |x| {
+            pixels[(y * width + x) * 4 ..][0..4].* = .{ @intCast(x * 7), @intCast(y * 7), 37, 255 };
+        };
+        var color = std.mem.zeroes(gpu.resources.ColorTarget);
+        color.address = 0x1000;
+        color.width = width;
+        color.height = height;
+        color.pitch = width;
+        color.depth = 1;
+        color.format = 10;
+        color.write_mask = 15;
+        color.tile_mode = .linear;
+        const source = try self.uploadLinearColorTarget(try guestColorTarget(color), &pixels);
+        // Reuse the same destination across alternating flipped/normal copies.
+        // Later draws and copies must observe the same orientation as readback.
+        color.address = 0x3000;
+        const target = try guestColorTarget(color);
+        for ([_]bool{ true, false, true, false }) |flipped| {
+            const destination = (try self.blitResidentColorTarget(source, target, flipped)).?;
+            var expected = pixels;
+            if (flipped) flipRgba8Rows(&expected, width, height);
+            try self.materializeRenderTarget(destination);
+            try std.testing.expectEqualSlices(u8, &expected, self.completed_frames.items[self.latest_frame_index.?].pixels.items);
+
+            // An overlay confined to the top half must stay there. A deferred
+            // scanout flip used to move this later work into the bottom half.
+            var state = GraphicsPipelineState.default(width, height);
+            state.viewport_height_bits = @bitCast(@as(f32, height / 2));
+            state.scissor_height = height / 2;
+            try self.beginFrameDraw();
+            try self.drawGraphicsShaders(&graphics_probe_vertex_spirv, &graphics_probe_fragment_spirv, &.{}, &.{}, state, target, &.{}, null, false, false, false, .{ .vertex_count = 3 });
+            try self.materializeRenderTarget(destination);
+            const overlay = self.completed_frames.items[self.latest_frame_index.?].pixels.items;
+            const half = width * height * 2;
+            try std.testing.expect(!std.mem.eql(u8, expected[0..half], overlay[0..half]));
+            try std.testing.expectEqualSlices(u8, expected[half..], overlay[half..]);
+            @memcpy(&expected, overlay);
+
+            color.address = 0x5000;
+            const copied = (try self.blitResidentColorTarget(destination, try guestColorTarget(color), false)).?;
+            try self.materializeRenderTarget(copied);
+            try std.testing.expectEqualSlices(u8, &expected, self.completed_frames.items[self.latest_frame_index.?].pixels.items);
+        }
     }
 
     pub fn probePackedScanout(self: *Renderer) anyerror!void {
@@ -26265,10 +26317,13 @@ pub const Renderer = struct {
         {
             return;
         }
-        // Procedural triangles can transform UVs independently of positions,
-        // including a runtime Y scale/bias. Their viewport sign alone cannot
-        // determine copy orientation; preserve the translated vertex shader.
+        // Real vertex bindings carry projection/UV transforms independently
+        // of the viewport sign. Execute those shaders instead of guessing the
+        // copy orientation from a negative viewport (Unity uses both signs of
+        // the projection matrix with it). Retain the legacy missing-fetch
+        // fallback only when no vertex buffers could be recovered.
         if (copy_replaces_target and fragment_image_count == 1 and draw.index_count != null and
+            vertex_storage.mapping_count == 0 and
             hasFullscreenSampleBlitGeometry(draw) and
             matchesFullscreenSampleBlit(fragment_analysis.program.instructions.items))
         {
