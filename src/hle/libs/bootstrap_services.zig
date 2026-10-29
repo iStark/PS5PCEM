@@ -2093,6 +2093,7 @@ const SaveDataMemoryData = extern struct {
 /// not understood the API, and reserving it would be a denial of service
 /// against the host rather than a save.
 const maximum_save_data_memory = 32 * 1024 * 1024;
+const save_data_error_memory_not_ready: i32 = @bitCast(@as(u32, 0x809f0012));
 
 var save_data_memory: ?[]u8 = null;
 /// A spin lock rather than a general mutex: the critical sections are a memcpy
@@ -2151,16 +2152,27 @@ fn transferSaveDataMemory(request_address: u64, storing: bool) i32 {
     if (request_address == 0 or !kernel_memory.isGuestRangeAccessible(request_address, 0x10)) {
         return invalid_argument;
     }
+    lockSaveDataMemory();
+    defer save_data_memory_lock.unlock();
+    // GetMemory2 also probes readiness with no transfer descriptor. Unity
+    // checks this exact error before SetupMemory2; EINVAL aborts its save
+    // initialization and leaves KeyWe's slot cards empty.
+    const blob = save_data_memory orelse return save_data_error_memory_not_ready;
     const data_address: u64 = @as(*const u64, @ptrFromInt(request_address + 0x08)).*;
+    if (data_address == 0 and !storing) {
+        if (!kernel_memory.isGuestRangeAccessible(request_address, 0x20)) return invalid_argument;
+        const param_address = @as(*align(1) const u64, @ptrFromInt(request_address + 0x10)).*;
+        const icon_address = @as(*align(1) const u64, @ptrFromInt(request_address + 0x18)).*;
+        // A no-output probe is valid. Do not accidentally report that a
+        // metadata-only request succeeded without filling its destinations.
+        if (param_address == 0 and icon_address == 0) return errno.ok;
+    }
     const data = readMemoryData(data_address) orelse return invalid_argument;
     if (data.buffer == 0 or data.size == 0) return invalid_argument;
     if (!kernel_memory.isGuestRangeAccessible(data.buffer, @intCast(data.size))) {
         return errno.KernelError.efault.raw();
     }
 
-    lockSaveDataMemory();
-    defer save_data_memory_lock.unlock();
-    const blob = save_data_memory orelse return invalid_argument;
     // A transfer past the end of the reserve is refused rather than clamped: a
     // short read would hand the title a partly stale save and look like one it
     // had written.
@@ -2175,6 +2187,63 @@ fn transferSaveDataMemory(request_address: u64, storing: bool) i32 {
         @memcpy(guest[0..length], blob[start..][0..length]);
     }
     return errno.ok;
+}
+
+test "save memory readiness probe allows Unity to initialize its save slots" {
+    const testing = std.testing;
+    // No data descriptor is required for a readiness query.
+    var request: [8]u64 = @splat(0);
+    const previous = save_data_memory;
+    defer save_data_memory = previous;
+    save_data_memory = null;
+    try testing.expectEqual(save_data_error_memory_not_ready, saveDataGetMemory(@intFromPtr(&request)));
+    var bytes: [16]u8 = @splat(0);
+    save_data_memory = &bytes;
+    try testing.expectEqual(errno.ok, saveDataGetMemory(@intFromPtr(&request)));
+    var output: [16]u8 = @splat(0xff);
+    var data = SaveDataMemoryData{ .buffer = @intFromPtr(&output), .size = output.len, .offset = 0 };
+    request[1] = @intFromPtr(&data);
+    try testing.expectEqual(errno.ok, saveDataGetMemory(@intFromPtr(&request)));
+    try testing.expectEqualSlices(u8, &bytes, &output);
+}
+
+test "save memory setup transfer and sync survive a fresh title session" {
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    filesystem.attach(testing.io, tmp.dir);
+    defer filesystem.detach();
+    filesystem.attachSaveDataHome(tmp.dir, "PPSA00001");
+    const previous = save_data_memory;
+    save_data_memory = null;
+    defer {
+        if (save_data_memory) |blob| std.heap.page_allocator.free(blob);
+        save_data_memory = previous;
+    }
+    var request: [8]u64 = @splat(0);
+    try testing.expectEqual(save_data_error_memory_not_ready, saveDataGetMemory(@intFromPtr(&request)));
+    const setup = [_]u64{ 0, 64, 0, 0, 0, 0, 0, 0 };
+    try testing.expectEqual(errno.ok, saveDataSetupMemory(@intFromPtr(&setup), 0));
+    try testing.expectEqual(errno.ok, saveDataGetMemory(@intFromPtr(&request)));
+    var data = SaveDataMemoryData{ .buffer = @intFromPtr("slot payload"), .size = 12, .offset = 4 };
+    request[1] = @intFromPtr(&data);
+    try testing.expectEqual(errno.ok, saveDataSetMemory(@intFromPtr(&request)));
+    // Reject a partial/out-of-range write without damaging the valid data.
+    data.offset = 60;
+    try testing.expectEqual(invalid_argument, saveDataSetMemory(@intFromPtr(&request)));
+    try testing.expectEqual(errno.ok, saveDataSyncMemory(0));
+    std.heap.page_allocator.free(save_data_memory.?);
+    save_data_memory = null;
+    request[1] = 0;
+    try testing.expectEqual(save_data_error_memory_not_ready, saveDataGetMemory(@intFromPtr(&request)));
+    try testing.expectEqual(errno.ok, saveDataSetupMemory(@intFromPtr(&setup), 0));
+    var output: [64]u8 = @splat(0xff);
+    data = .{ .buffer = @intFromPtr(&output), .size = output.len, .offset = 0 };
+    request[1] = @intFromPtr(&data);
+    try testing.expectEqual(errno.ok, saveDataGetMemory(@intFromPtr(&request)));
+    try testing.expectEqualStrings("slot payload", output[4..16]);
+    try testing.expect(std.mem.allEqual(u8, output[0..4], 0));
+    try testing.expect(std.mem.allEqual(u8, output[16..], 0));
 }
 
 /// Puts the blob on disk. A title calls this when it wants the save to survive

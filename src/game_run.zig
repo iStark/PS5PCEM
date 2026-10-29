@@ -222,6 +222,7 @@ fn appendUnityDeferredModulesArchive(
         "Media/Plugins/SaveData.prx",
         "Media/Plugins/PSN.prx",
         "Media/Plugins/PSNCore.prx",
+        "Media/Plugins/Dialogs.prx",
         "Media/Plugins/libfmod.prx",
         "Media/Plugins/libfmodstudio.prx",
     };
@@ -305,6 +306,10 @@ fn appendUnityDeferredModules(
         "Media/Plugins/SaveData.prx",
         "Media/Plugins/PSN.prx",
         "Media/Plugins/PSNCore.prx",
+        // Unity resolves this through P/Invoke, without a DT_NEEDED edge.
+        // KeyWe's user/save initialization aborts if the shipped dialog
+        // plug-in is absent from the deferred module graph.
+        "Media/Plugins/Dialogs.prx",
         // FMOD is resolved through IL2CPP P/Invoke, so it has no DT_NEEDED
         // edge from the executable. A missing library aborts platform startup
         // in titles that initialize audio before creating their main menu.

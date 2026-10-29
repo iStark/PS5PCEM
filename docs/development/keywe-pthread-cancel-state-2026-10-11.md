@@ -2,6 +2,11 @@
 
 Title: PPSA02210, content version 01.000.000. Development build.
 
+**October 30 follow-up:** save-slot creation and reload now work, and the opening
+tutorial renders. The maintainer confirms **Playable · Completable**. See the
+[current report and captures](keywe-save-slots-2026-10-30.md); the observations
+below describe the earlier October 11 build.
+
 ## Missing import
 
 Unity's `Media/Modules/Il2CppUserAssemblies.prx` requested
