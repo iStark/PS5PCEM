@@ -56,6 +56,13 @@ pub const SampledImage = extern struct {
     /// Nonzero for an immutable cached snapshot; equal IDs hold equal pixels.
     content_id: u64 = 0,
 };
+pub const ColorAttachment = extern struct {
+    pixels: ?[*]u8 = null,
+    size: usize = 0,
+    format: u32 = 28,
+    write_mask: u32 = 15,
+    blend: blending.State = .{},
+};
 pub const Draw = extern struct {
     width: u32,
     height: u32,
@@ -95,6 +102,9 @@ pub const Draw = extern struct {
     check_dispatcher: u32 = 0,
     // Zero binds only a DSV, without allocating a dummy color surface.
     color_attachment: u32 = 1,
+    color_format: u32 = 28,
+    extra_color_count: u32 = 0,
+    extra_colors: [7]ColorAttachment = @splat(.{}),
     scalar_values: [129]u32 = @splat(0),
 
     pub fn fullTarget(width: u32, height: u32) Error!Draw {
@@ -323,7 +333,8 @@ pub const Device = struct {
         var native_jobs: [max_draw_batch]NativeDrawJob = undefined;
         for (jobs, native_jobs[0..jobs.len]) |*job, *out| {
             if (job.draw.width != jobs[0].draw.width or job.draw.height != jobs[0].draw.height or
-                job.draw.depth_format != jobs[0].draw.depth_format or job.draw.color_attachment != jobs[0].draw.color_attachment) return error.InvalidArgument;
+                job.draw.depth_format != jobs[0].draw.depth_format or job.draw.color_attachment != jobs[0].draw.color_attachment or
+                job.draw.extra_color_count != jobs[0].draw.extra_color_count or job.draw.color_format != jobs[0].draw.color_format) return error.InvalidArgument;
             try validateDraw(job.vertex, job.fragment, job.draw, job.indices, job.buffers, job.images, rgba, depth);
             out.* = .{ .vertex = job.vertex.ptr, .vertex_count = job.vertex.len, .fragment = job.fragment.ptr, .fragment_count = job.fragment.len, .draw = &job.draw, .indices = job.indices.ptr, .index_bytes = job.indices.len, .buffers = job.buffers.ptr, .buffer_count = @intCast(job.buffers.len), .images = job.images.ptr, .image_count = @intCast(job.images.len) };
         }
@@ -335,6 +346,22 @@ pub const Device = struct {
         if (draw.dynamic_scalars > 1 or draw.check_dispatcher > 1) return error.InvalidArgument;
         if (draw.color_attachment > 1 or (draw.color_attachment == 0 and
             (draw.depth_format == 0 or draw.write_mask != 0 or draw.blend.enabled != 0))) return error.InvalidArgument;
+        if (draw.extra_color_count > 7 or (draw.extra_color_count != 0 and draw.color_attachment == 0)) return error.InvalidArgument;
+        if (!validColorFormat(draw.color_format)) return error.InvalidArgument;
+        for (draw.extra_colors[0..draw.extra_color_count]) |color| {
+            if (color.pixels == null or color.size != try rgbaSize(draw.width, draw.height) or !validColorFormat(color.format) or
+                color.write_mask > 15 or !color.blend.valid() or !std.meta.eql(color.blend.constants, draw.blend.constants)) return error.InvalidArgument;
+        }
+        for (draw.extra_colors[0..draw.extra_color_count], 0..) |color, i| {
+            const start = @intFromPtr(color.pixels.?);
+            const end = std.math.add(usize, start, color.size) catch return error.InvalidArgument;
+            for ([_][]const u8{ rgba, depth, if (draw.stencil_pixels) |p| p[0..draw.stencil_bytes] else &.{} }) |plane| {
+                if (plane.len != 0 and start < @intFromPtr(plane.ptr) +| plane.len and @intFromPtr(plane.ptr) < end) return error.InvalidArgument;
+            }
+            for (draw.extra_colors[0..i]) |other| {
+                if (start < @intFromPtr(other.pixels.?) +| other.size and @intFromPtr(other.pixels.?) < end) return error.InvalidArgument;
+            }
+        }
         if (depth.len != try depthSize(draw.width, draw.height, draw.depth_format) or draw.depth_write > 1 or draw.depth_clip_enabled > 1 or
             draw.depth_compare < 1 or draw.depth_compare > 8 or (draw.depth_format == 0 and draw.depth_write != 0)) return error.InvalidArgument;
         if (!draw.blend.valid()) return error.InvalidArgument;
@@ -397,6 +424,10 @@ extern fn ps5_d3d12_draw_batch(*Handle, [*]const NativeDrawJob, u32, [*]u8, [*]u
 pub fn rgbaSize(width: u32, height: u32) Error!usize {
     if (width == 0 or height == 0 or width > 16384 or height > 16384) return error.InvalidArgument;
     return @as(usize, width) * height * 4;
+}
+
+fn validColorFormat(format: u32) bool {
+    return format == 28 or format == 31 or format == 34;
 }
 
 pub fn sampledImageSize(width: u32, height: u32, format: u32) Error!usize {

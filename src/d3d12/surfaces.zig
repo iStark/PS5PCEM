@@ -9,7 +9,8 @@ const staging = @import("staging.zig");
 const surface_cache = @import("surface_cache.zig");
 
 pub fn colorLayout(target: gpu.resources.ColorTarget) !gpu.SurfaceLayout {
-    if (target.format != 10 or target.number_type != 0 or target.component_swap > 1 or
+    _ = try colorFormat(target);
+    if (target.component_swap > 1 or
         target.samples_log2 != 0 or target.fragments_log2 != 0 or target.mip_level != 0 or
         target.maximum_mip != 0 or target.resource_type == 2 or target.depth > 1 or
         target.base_array_slice != 0 or target.last_array_slice != 0 or
@@ -18,6 +19,22 @@ pub fn colorLayout(target: gpu.resources.ColorTarget) !gpu.SurfaceLayout {
     const layout = try gpu.SurfaceLayout.fromColorTarget(target);
     try validate(layout, target.address);
     return layout;
+}
+
+/// Four-byte native render-target formats; staging preserves the encoded bits.
+/// DCC clear codes below currently describe only unsigned-normalized RGBA8.
+pub fn colorFormat(target: gpu.resources.ColorTarget) !u32 {
+    const format: u32 = switch (target.format) {
+        10 => switch (target.number_type) {
+            0 => 28, // R8G8B8A8_UNORM
+            1 => 31, // R8G8B8A8_SNORM
+            else => return error.UnsupportedRenderTargetLayout,
+        },
+        5 => if (target.number_type == 7 and target.component_swap == 0) 34 else return error.UnsupportedRenderTargetLayout, // R16G16_FLOAT
+        else => return error.UnsupportedRenderTargetLayout,
+    };
+    if (format != 28 and target.dcc_enabled) return error.UnsupportedRenderTargetLayout;
+    return format;
 }
 
 /// DCC keys accompany the colour layout; null for an uncompressed target.
@@ -365,6 +382,32 @@ test "color layout derives tiled and absent linear pitches without accepting com
     try std.testing.expectError(error.ArithmeticOverflow, colorLayout(target));
     try std.testing.expectError(error.UnsupportedScanoutLayout, scanoutLayout(65, 37, 72, 2));
     try std.testing.expectError(error.InvalidPitch, scanoutLayout(65, 37, 64, 1));
+}
+
+test "color formats preserve signed and half-float encodings and reject their unsupported metadata" {
+    var target = std.mem.zeroes(gpu.resources.ColorTarget);
+    target.address = 0x10000;
+    target.width = 65;
+    target.height = 37;
+    target.depth = 1;
+    target.tile_mode = .render_target;
+    target.format = 5;
+    target.number_type = 7;
+    try std.testing.expectEqual(@as(u32, 34), try colorFormat(target));
+    try std.testing.expectEqual(@as(u32, 4), (try colorLayout(target)).block.bytes_per_element);
+    target.component_swap = 1;
+    try std.testing.expectError(error.UnsupportedRenderTargetLayout, colorLayout(target));
+    target.component_swap = 0;
+    target.format = 10;
+    target.number_type = 1;
+    try std.testing.expectEqual(@as(u32, 31), try colorFormat(target));
+    _ = try colorLayout(target);
+    target.dcc_enabled = true;
+    target.dcc_address = 0x900000;
+    try std.testing.expectError(error.UnsupportedRenderTargetLayout, colorLayout(target));
+    target.dcc_enabled = false;
+    target.number_type = 4;
+    try std.testing.expectError(error.UnsupportedRenderTargetLayout, colorLayout(target));
 }
 
 test "depth layouts validate address and subresource contracts before staging" {

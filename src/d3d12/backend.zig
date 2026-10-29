@@ -37,7 +37,7 @@ pub const DisplayBuffer = struct {
     tiling_mode: u32,
     pixel_format: u64,
 };
-const TargetKey = struct { address: u64, layout: gpu.SurfaceLayout, swap_red_blue: bool = false };
+const TargetKey = struct { address: u64, layout: gpu.SurfaceLayout, swap_red_blue: bool = false, native_format: u32 = 0 };
 const PreparedDraw = struct {
     draw: native.Draw,
     indices: []u8,
@@ -53,6 +53,8 @@ const PreparedDraw = struct {
 };
 const PendingDraws = struct {
     color: ?surfaces.Staged,
+    extra_colors: [7]?surfaces.Staged = @splat(null),
+    extra_keys: [7]?TargetKey = @splat(null),
     depth: ?surfaces.Staged,
     stencil: ?surfaces.Staged = null,
     color_key: ?TargetKey,
@@ -69,6 +71,7 @@ const PendingDraws = struct {
     fn deinit(self: *PendingDraws, allocator: std.mem.Allocator) void {
         for (self.draws[0..self.count]) |*draw| draw.deinit(allocator);
         if (self.color) |*color| color.deinit();
+        for (&self.extra_colors) |*color| if (color.*) |*value| value.deinit();
         if (self.depth) |*depth| depth.deinit();
         if (self.stencil) |*stencil| stencil.deinit();
         if (self.htile) |*htile| htile.deinit();
@@ -85,6 +88,13 @@ const PendingDraws = struct {
             }
         }
         if (self.depth) |depth| if (address < depth.address + depth.backing.len and depth.address < end) return true;
+        for (self.extra_colors) |value| if (value) |color| {
+            if (address < color.address + color.backing.len and color.address < end) return true;
+            if (color.dcc) |dcc| {
+                const keys = std.math.divCeil(usize, color.backing.len, surfaces.Dcc.block_bytes) catch unreachable;
+                if (address < dcc.address + keys and dcc.address < end) return true;
+            }
+        };
         if (self.stencil) |stencil| if (address < stencil.address + stencil.backing.len and stencil.address < end) return true;
         if (self.htile) |htile| if (address < htile.address + htile.lease.bytes.len and htile.address < end) return true;
         return false;
@@ -245,8 +255,13 @@ pub const Renderer = struct {
             job.draw.stencil_pixels = stencil.pixels.ptr;
             job.draw.stencil_bytes = stencil.pixels.len;
         };
+        for (jobs[0..pending.count]) |*job| for (0..job.draw.extra_color_count) |i| {
+            job.draw.extra_colors[i].pixels = pending.extra_colors[i].?.pixels.ptr;
+            job.draw.extra_colors[i].size = pending.extra_colors[i].?.pixels.len;
+        };
         try self.device.drawBatchSpirv(jobs[0..pending.count], if (pending.color) |color| color.pixels else &.{}, if (pending.depth) |depth| depth.pixels else &.{});
         if (pending.color) |*color| try color.write(self.memory);
+        for (&pending.extra_colors) |*color| if (color.*) |*value| try value.write(self.memory);
         if (pending.depth_write or pending.htile != null) if (pending.depth) |*depth| try depth.write(self.memory);
         if (pending.stencil_write or pending.htile != null) if (pending.stencil) |*stencil| try stencil.write(self.memory);
         if (pending.htile) |*htile| try htile.publish(self.memory);
@@ -295,6 +310,7 @@ pub const Renderer = struct {
             target.width, target.height, target.pitch, target.format, target.number_type, target.tile_mode, target.samples_log2, target.fragments_log2,
         });
         if (render.color_targets[0]) |target| std.debug.print("[d3d12 target state] {any}\n", .{target});
+        for (render.color_targets[1..]) |value| if (value) |target| std.debug.print("[d3d12 MRT target] {any}\n", .{target});
         const active = graphics.routing(state) catch null;
         for ([_]gpu.resources.ShaderStage{ .vertex, .export_shader, .geometry, .hull, .pixel }) |stage| {
             if (active) |routing| if (stage != routing.stage and stage != .pixel) continue;
@@ -468,11 +484,20 @@ pub const Renderer = struct {
         const render = gpu.resources.decodeRenderState(state);
         if (render.color_count == 0 and try self.depthUtilityDraw(state, render, routing)) return;
         if ((state.readRegister(.context, 0) orelse 0) & ~@as(u32, 0x63) != 0) return error.DepthMetadataOperationNotImplemented;
-        if (render.color_count > 1 or (render.color_count == 1 and render.color_targets[0] == null)) return error.MultipleTargetsNotImplemented;
+        if (render.color_count != 0 and render.color_targets[0] == null) return error.SparseColorTargetsNotImplemented;
         const target = render.color_targets[0];
+        var extra_keys: [7]?TargetKey = @splat(null);
+        var extra_dcc: [7]?surfaces.Dcc = @splat(null);
+        for (render.color_targets, 0..) |color, slot| if ((color != null) != (slot < render.color_count)) return error.SparseColorTargetsNotImplemented;
+        for (1..@max(1, render.color_count)) |slot| {
+            const color = render.color_targets[slot] orelse return error.SparseColorTargetsNotImplemented;
+            if (color.width != target.?.width or color.height != target.?.height) return error.MismatchedRenderTargetExtents;
+            extra_keys[slot - 1] = .{ .address = color.address, .layout = try surfaces.colorLayout(color), .swap_red_blue = color.component_swap == 1, .native_format = try surfaces.colorFormat(color) };
+            extra_dcc[slot - 1] = surfaces.colorDcc(color);
+        }
         const extent: [2]u32 = if (target) |color| .{ color.width, color.height } else if (render.depth_target) |depth| .{ depth.width, depth.height } else return error.MissingAttachment;
         if ((state.readRegister(.context, 0x200) orelse 0) & (1 << 3) != 0) return error.DepthBoundsNotImplemented;
-        const color_key: ?TargetKey = if (target) |color| .{ .address = color.address, .layout = try surfaces.colorLayout(color), .swap_red_blue = color.component_swap == 1 } else null;
+        const color_key: ?TargetKey = if (target) |color| .{ .address = color.address, .layout = try surfaces.colorLayout(color), .swap_red_blue = color.component_swap == 1, .native_format = try surfaces.colorFormat(color) } else null;
         const color_dcc = if (target) |color| surfaces.colorDcc(color) else null;
         if (render.color_control.isMetadataOperation() or (target != null and
             ((state.readRegister(.context, 0x202) != null and !render.color_control.allowsAttachmentWrites(render.target_mask)) or render.color_control.logic_operation != 0xcc))) return error.ColorMetadataAndLogicOpsNotImplemented;
@@ -480,6 +505,13 @@ pub const Renderer = struct {
         const topology = try graphics.nativeTopology(render.primitive_type);
         var draw_state = try native.Draw.fullTarget(extent[0], extent[1]);
         draw_state.color_attachment = @intFromBool(target != null);
+        if (color_key) |key| draw_state.color_format = key.native_format;
+        draw_state.extra_color_count = render.color_count -| 1;
+        for (0..draw_state.extra_color_count) |i| {
+            draw_state.extra_colors[i].format = extra_keys[i].?.native_format;
+            draw_state.extra_colors[i].write_mask = render.color_targets[i + 1].?.write_mask & @as(u32, @truncate(render.shader_mask >> @as(u5, @intCast((i + 1) * 4)))) & 15;
+            draw_state.extra_colors[i].blend = try native.blending.decode(state, render.blends[i + 1]);
+        }
         var depth_key: ?TargetKey = null;
         var stencil_key: ?TargetKey = null;
         draw_state.stencil = try graphics.stencilState(render);
@@ -522,6 +554,13 @@ pub const Renderer = struct {
             depth_key = .{ .address = depth.read_address, .layout = layout };
         }
         if (target == null and depth_key == null) return error.MissingAttachment;
+        const attachments = [_]?TargetKey{color_key} ++ extra_keys ++ [_]?TargetKey{ depth_key, stencil_key };
+        for (attachments, 0..) |left, i| if (left) |a| {
+            for (attachments[i + 1 ..]) |right| if (right) |b| {
+                if (a.address < b.address + b.layout.required_source_bytes and b.address < a.address + a.layout.required_source_bytes)
+                    return error.AttachmentAliasNotImplemented;
+            };
+        };
         const bias = try graphics.depthBias(render.raster, draw_state.depth_format);
         draw_state.depth_bias = bias.constant;
         draw_state.depth_bias_slope = bias.slope;
@@ -660,7 +699,11 @@ pub const Renderer = struct {
         const owned_bytes = draw_resources.total + indices.len + 4 * (vertex.view().words.len + fragment.view().words.len);
         if (self.pending_draws) |*pending| {
             const additional = pending.image_budget.additional(owned_bytes, draw_resources.images.items);
-            if (!std.meta.eql(pending.color_key, color_key) or !std.meta.eql(if (pending.color) |color| color.dcc else null, color_dcc) or !std.meta.eql(pending.depth_key, depth_key) or !std.meta.eql(pending.stencil_key, stencil_key) or !std.meta.eql(pending.depth_descriptor, render.depth_target) or
+            var extra_match = std.meta.eql(pending.extra_keys, extra_keys);
+            for (pending.extra_colors, extra_dcc) |color, dcc| if (!std.meta.eql(if (color) |value| value.dcc else null, dcc)) {
+                extra_match = false;
+            };
+            if (!extra_match or !std.meta.eql(pending.color_key, color_key) or !std.meta.eql(if (pending.color) |color| color.dcc else null, color_dcc) or !std.meta.eql(pending.depth_key, depth_key) or !std.meta.eql(pending.stencil_key, stencil_key) or !std.meta.eql(pending.depth_descriptor, render.depth_target) or
                 pending.count >= @min(native.max_draw_batch, @max(1, self.draw_batch_limit)) or
                 pending.bytes + additional > draw_batch_bytes) try self.flushDraws();
         }
@@ -668,6 +711,11 @@ pub const Renderer = struct {
             var color: ?surfaces.Staged = null;
             if (color_key) |key| color = try surfaces.Staged.readColor(self.allocator, &self.staging_pool, &self.conversion_cache, self.memory, key.address, key.layout, color_dcc, key.swap_red_blue);
             errdefer if (color) |*value| value.deinit();
+            var extra_colors: [7]?surfaces.Staged = @splat(null);
+            errdefer for (&extra_colors) |*value| if (value.*) |*surface| surface.deinit();
+            for (extra_keys, extra_dcc, 0..) |key, dcc, i| if (key) |value| {
+                extra_colors[i] = try surfaces.Staged.readColor(self.allocator, &self.staging_pool, &self.conversion_cache, self.memory, value.address, value.layout, dcc, value.swap_red_blue);
+            };
             var depth: ?surfaces.Staged = null;
             if (depth_key) |key| depth = try surfaces.Staged.readCached(self.allocator, &self.staging_pool, &self.conversion_cache, self.memory, key.address, key.layout);
             errdefer if (depth) |*value| value.deinit();
@@ -680,7 +728,7 @@ pub const Renderer = struct {
                 htile = try surfaces.Htile.read(self.allocator, &self.staging_pool, self.memory, render.depth_target.?);
                 try htile.?.expand(&depth.?, if (stencil) |*value| value else null);
             }
-            self.pending_draws = .{ .color = color, .depth = depth, .stencil = stencil, .color_key = color_key, .depth_key = depth_key, .stencil_key = stencil_key, .depth_descriptor = render.depth_target, .htile = htile };
+            self.pending_draws = .{ .color = color, .extra_colors = extra_colors, .extra_keys = extra_keys, .depth = depth, .stencil = stencil, .color_key = color_key, .depth_key = depth_key, .stencil_key = stencil_key, .depth_descriptor = render.depth_target, .htile = htile };
         }
         const pending = &self.pending_draws.?;
         pending.bytes += pending.image_budget.additional(owned_bytes, draw_resources.images.items);
@@ -693,7 +741,7 @@ pub const Renderer = struct {
         if (pending.count >= @min(native.max_draw_batch, @max(1, self.draw_batch_limit)) or pending.bytes >= draw_batch_bytes) try self.flushDraws();
     }
 
-    /// Native utility rectangles may have no PS or color attachment. Compression
+    /// Native utility rectangles may have no PS or a null-export PS. Compression
     /// disable draws materialize HTILE into the base planes, even with all
     /// depth/stencil tests disabled. Only the remaining proven no-output case
     /// is an empty draw; it must never hide shader stores or system messages.
@@ -701,8 +749,13 @@ pub const Renderer = struct {
         const control = state.readRegister(.context, 0) orelse 0;
         if (render.depth_control.test_enabled or render.depth_control.write_enabled or render.depth_control.stencil_enabled or
             control & ~@as(u32, 0x60) != 0 or (state.readRegister(.context, 1) orelse 0) != 0 or
-            (state.readRegister(.context, 0x2e5) orelse 0) != 0 or gpu.resources.ShaderStage.pixel.programAddress(state) != null or
+            (state.readRegister(.context, 0x2e5) orelse 0) != 0 or
             render.color_control.isMetadataOperation()) return false;
+        if (gpu.resources.ShaderStage.pixel.programAddress(state)) |pixel_address| {
+            const pixel = try self.shader_analyses.acquire(self.allocator, self.reader(), pixel_address);
+            defer pixel.release();
+            if (!graphics.isNullFragment(&pixel.view().program)) return false;
+        }
         const address = routing.stage.programAddress(state) orelse return false;
         const lease = try self.shader_analyses.acquire(self.allocator, self.reader(), address);
         defer lease.release();

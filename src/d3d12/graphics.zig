@@ -8,6 +8,35 @@ const gpu = @import("gpu");
 const rdna2 = @import("rdna2");
 const native = @import("root.zig");
 
+/// A bound null-export PS has no stores, depth export or coverage changes.
+/// Only this exact terminal form can accompany a CPU metadata expansion;
+/// a discarded/conditional fragment must not turn into a full-surface update.
+pub fn isNullFragment(program: *const rdna2.Program) bool {
+    const code = program.instructions.items;
+    if (code.len != 2 or code[1].opcode != .s_endpgm) return false;
+    const output = code[0];
+    return output.opcode == .exp and output.export_target == 9 and output.export_enable == 0 and output.export_done;
+}
+
+test "metadata utility accepts only a terminal null-export fragment" {
+    var program = try rdna2.decodeProgram(std.testing.allocator, &.{ 0xf8001890, 0, 0xbf810000 });
+    defer program.deinit(std.testing.allocator);
+    try std.testing.expect(isNullFragment(&program));
+    for ([_]u6{ 0, 8, 12 }) |target| {
+        program.instructions.items[0].export_target = target;
+        try std.testing.expect(!isNullFragment(&program));
+    }
+    program.instructions.items[0].export_target = 9;
+    program.instructions.items[0].export_enable = 1;
+    try std.testing.expect(!isNullFragment(&program));
+    program.instructions.items[0].export_enable = 0;
+    program.instructions.items[1].opcode = .s_branch;
+    try std.testing.expect(!isNullFragment(&program));
+    var discard = try rdna2.decodeProgram(std.testing.allocator, &.{ 0xbefe0480, 0xf8001890, 0, 0xbf810000 });
+    defer discard.deinit(std.testing.allocator);
+    try std.testing.expect(!isNullFragment(&discard));
+}
+
 /// A dispatcher does not imply a guest loop: nested selections with terminal
 /// exits can require it too. With only forward edges and no indirect calls,
 /// each guest block can execute at most once. Reserve one visit per instruction

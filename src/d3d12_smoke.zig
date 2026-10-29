@@ -520,6 +520,7 @@ fn guestGraphicsProbe(allocator: std.mem.Allocator, device: *d3d12.Device) !void
     std.debug.print("PASS guest RDNA2 vertex/pixel shaders, raster output and preservation of masked target bytes\n", .{});
     std.debug.print("PASS nonzero first vertex and positive indexed base vertex\n", .{});
     try guestCommandProbe(allocator, &vertex_words, &pixel_words);
+    try guestMrtProbe(allocator, &vertex_words, &pixel_words);
     try guestSurfaceProbe(allocator, &vertex_words, &pixel_words);
     for ([_]usize{ 0, d3d12.surface_cache.Cache.default_limit }) |limit| try guestDepthProbe(allocator, &vertex_words, &pixel_words, limit);
     try guestDepthBiasProbe(allocator, &vertex_words, &pixel_words);
@@ -875,29 +876,43 @@ fn guestStencilCommandProbe(allocator: std.mem.Allocator, vertex: []const u32, f
         if (std.mem.readInt(u32, depth.pixels[i * 4 ..][0..4], .little) != 0x3f800000) return error.GuestHtileDepthLost;
     }
     if (try htile.word(keys, 0, 0, 0) != gpu.HtileLayout.expanded_depth_stencil) return error.GuestHtileNotPublished;
-    // Quake II uses a vertex-only compress-disable rectangle with all tests
-    // disabled. It still has to materialize the metadata into BOTH planes.
+    // Quake II uses compress-disable rectangles with no PS or a bound null PS.
+    // With tests disabled, both still materialize HTILE into BOTH planes.
     const utility_vs = [_]u32{ vop1(1, 0, 128), vop1(1, 1, 255), 0x3f800000, 0xf80008cf, 0x01000000, 0xbf810000 };
     @memcpy(memory.data[0x200..][0..@sizeOf(@TypeOf(utility_vs))], std.mem.asBytes(&utility_vs));
-    try state.writeRegister(.shader, 0x008, 0);
     try state.writeRegister(.context, 0x318, 0);
     try state.writeRegister(.context, 0x000, 0x60);
     try state.writeRegister(.context, 0x200, 0);
-    offset = 0;
-    while (offset < keys.len) : (offset += 4) std.mem.writeInt(u32, keys[offset..][0..4], 0xf0, .little);
     const previous_color = memory.data[0x2000..0x5000].*;
-    _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 2 });
-    if (renderer.metadata_expands != 1 or !std.mem.eql(u8, &previous_color, memory.data[0x2000..0x5000])) return error.DepthUtilityNotExecuted;
-    try depth.layout.detile(memory.data[0x20000..][0..depth.backing.len], depth.pixels);
-    try stencil.layout.detile(memory.data[0x30000..][0..stencil.backing.len], stencil.pixels);
-    for (depth.pixels) |byte| if (byte != 0) return error.DepthUtilityDidNotExpandDepth;
-    for (stencil.pixels) |byte| if (byte != 0) return error.DepthUtilityDidNotExpandStencil;
-    if (try htile.word(keys, 0, 0, 0) != gpu.HtileLayout.expanded_depth_stencil) return error.DepthUtilityDidNotExpandMetadata;
+    const null_ps = [_]u32{ 0xf8001890, 0, 0xbf810000 };
+    @memcpy(memory.data[0x400..][0..@sizeOf(@TypeOf(null_ps))], std.mem.asBytes(&null_ps));
+    for ([_]u32{ 0, 4 }, 0..) |pixel_address, pass| {
+        try state.writeRegister(.shader, 0x008, pixel_address);
+        offset = 0;
+        while (offset < keys.len) : (offset += 4) std.mem.writeInt(u32, keys[offset..][0..4], 0xf0, .little);
+        @memset(memory.data[0x20000..][0..depth.backing.len], 0xcd);
+        @memset(memory.data[0x30000..][0..stencil.backing.len], 0xcd);
+        _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 2 });
+        if (renderer.metadata_expands != pass + 1 or !std.mem.eql(u8, &previous_color, memory.data[0x2000..0x5000])) return error.DepthUtilityNotExecuted;
+        try depth.layout.detile(memory.data[0x20000..][0..depth.backing.len], depth.pixels);
+        try stencil.layout.detile(memory.data[0x30000..][0..stencil.backing.len], stencil.pixels);
+        for (depth.pixels) |byte| if (byte != 0) return error.DepthUtilityDidNotExpandDepth;
+        for (stencil.pixels) |byte| if (byte != 0) return error.DepthUtilityDidNotExpandStencil;
+        if (try htile.word(keys, 0, 0, 0) != gpu.HtileLayout.expanded_depth_stencil) return error.DepthUtilityDidNotExpandMetadata;
+    }
+    // A null export following discard must not trigger full-plane expansion.
+    const discard_ps = [_]u32{ 0xbefe0480, 0xf8001890, 0, 0xbf810000 };
+    @memcpy(memory.data[0x400..][0..@sizeOf(@TypeOf(discard_ps))], std.mem.asBytes(&discard_ps));
+    const before_rejection = try allocator.dupe(u8, &memory.data);
+    defer allocator.free(before_rejection);
+    const packet: gpu.pm4.Packet = .{ .kind = .command, .header = command(gpu.pm4.draw_index_auto, 2), .opcode = gpu.pm4.draw_index_auto, .body = &.{ 3, 2 } };
+    if (renderer.draw(&state, packet)) |_| return error.FragmentDiscardIgnored else |err| if (err != error.MissingAttachment) return err;
+    if (!std.mem.eql(u8, before_rejection, &memory.data)) return error.FragmentRejectionModifiedMetadata;
+    try state.writeRegister(.shader, 0x008, 0);
     // A system interrupt must never be classified as harmless vertex work.
     std.mem.writeInt(u32, memory.data[0x200..][0..4], 0xbf900001, .little);
-    const packet: gpu.pm4.Packet = .{ .kind = .command, .header = command(gpu.pm4.draw_index_auto, 2), .opcode = gpu.pm4.draw_index_auto, .body = &.{ 3, 2 } };
     if (renderer.draw(&state, packet)) |_| return error.VertexSystemMessageIgnored else |err| if (err != error.MissingAttachment) return err;
-    std.debug.print("PASS PM4 stencil clear/increment, HTILE persistence, PS-less compression-disable materialization of both planes, system-message rejection\n", .{});
+    std.debug.print("PASS PM4 stencil clear/increment, HTILE persistence, PS-less/null-PS compression-disable materialization of both planes, discard/system-message rejection\n", .{});
 }
 
 fn guestRectangleProbe(allocator: std.mem.Allocator) !void {
@@ -1596,6 +1611,160 @@ fn graphicsState(width: u32, height: u32, pitch: u32) !gpu.State {
     try state.writeRegister(.context, 0x3b0, ((width - 1) << 14) | (height - 1));
     try state.writeRegister(.context, 0x3b8, 0);
     return state;
+}
+
+fn guestMrtProbe(allocator: std.mem.Allocator, vertex: []const u32, fragment: []const u32) !void {
+    const memory = try allocator.create(GraphicsMemory);
+    defer allocator.destroy(memory);
+    memory.* = .{};
+    @memcpy(memory.data[0x200..][0 .. vertex.len * 4], std.mem.sliceAsBytes(vertex));
+    @memcpy(memory.data[0x400..][0 .. fragment.len * 4], std.mem.sliceAsBytes(fragment));
+    var renderer = try d3d12.Renderer.init(allocator, memory.access(), false);
+    defer renderer.deinit();
+    const initial_state = try graphicsState(65, 37, 72);
+    const packet: gpu.pm4.Packet = .{ .kind = .command, .header = command(gpu.pm4.draw_index_auto, 2), .opcode = gpu.pm4.draw_index_auto, .body = &.{ 3, 2 } };
+    try renderer.draw(&initial_state, packet);
+    const coverage = memory.data[0x2000..0x5000].*;
+    for ([_]u32{ 2, 5, 8 }) |count| for ([_]usize{ 1, 8 }) |batch_limit| {
+        var state = initial_state;
+        var program: std.ArrayList(u32) = .empty;
+        defer program.deinit(allocator);
+        var mask: u32 = 0;
+        for (0..count) |i| {
+            const slot: u32 = @intCast(i);
+            const address = 0x2000 + slot * 0x4000;
+            try state.writeRegister(.context, 0x318 + slot * 15, address >> 8);
+            try state.writeRegister(.context, 0x319 + slot * 15, 8);
+            try state.writeRegister(.context, 0x31c + slot * 15, 10 << 2);
+            try state.writeRegister(.context, 0x390 + slot, 0);
+            try state.writeRegister(.context, 0x3b0 + slot, (64 << 14) | 36);
+            try state.writeRegister(.context, 0x3b8 + slot, 0);
+            const channels: u32 = switch (slot % 3) {
+                0 => 7,
+                1 => 8,
+                else => 15,
+            };
+            mask |= channels << @as(u5, @intCast(slot * 4));
+            // Odd slots add source and destination; even slots replace.
+            try state.writeRegister(.context, 0x1e0 + slot, if (slot % 2 != 0) (1 << 30) | 1 | (1 << 8) else 0);
+            const red: f32 = @as(f32, @floatFromInt(slot + 1)) / 8;
+            try program.appendSlice(allocator, &.{ vop1(1, 0, 255), @bitCast(red), vop1(1, 1, 255), 0x3e800000, vop1(1, 2, 255), 0x3f400000, vop1(1, 3, 255), 0x3f800000, 0xf800000f | (slot << 4) | (if (slot + 1 == count) @as(u32, 0x800) else 0), 0x03020100 });
+            @memset(memory.data[address..][0..0x3000], @as(u8, @intCast(32 + slot)));
+        }
+        try program.append(allocator, 0xbf810000);
+        @memcpy(memory.data[0x400..][0 .. program.items.len * 4], std.mem.sliceAsBytes(program.items));
+        try state.writeRegister(.context, 0x08e, mask);
+        try state.writeRegister(.context, 0x204, 1 << 19);
+        try state.writeRegister(.context, 0x007, 64 | (36 << 16));
+        try state.writeRegister(.context, 0x010, 3);
+        try state.writeRegister(.context, 0x011, 1);
+        try state.writeRegister(.context, 0x012, 0x800);
+        try state.writeRegister(.context, 0x014, 0x800);
+        try state.writeRegister(.context, 0x013, 0x900);
+        try state.writeRegister(.context, 0x015, 0x900);
+        try state.writeRegister(.context, 0x200, 1 | 2 | 4 | (7 << 4) | (7 << 8));
+        try state.writeRegister(.context, 0x10b, 8 << 4); // Increment once per covered fragment.
+        try state.writeRegister(.context, 0x10c, 0x00ffff00);
+        @memset(memory.data[0x80000..0x90000], 0x3f);
+        @memset(memory.data[0x90000..0xa0000], 0x35);
+        renderer.draw_batch_limit = batch_limit;
+        try renderer.draw(&state, packet);
+        try renderer.draw(&state, packet);
+        try renderer.flushDraws();
+        const render = gpu.resources.decodeRenderState(&state);
+        for (0..count) |i| {
+            const target = render.color_targets[i].?;
+            const layout = try d3d12.surfaces.colorLayout(target);
+            const backing = memory.data[@intCast(target.address)..][0..@intCast(layout.required_source_bytes)];
+            const expected = try allocator.alloc(u8, backing.len);
+            defer allocator.free(expected);
+            @memset(expected, @as(u8, @intCast(32 + i)));
+            const src = [_]u8{ @intFromFloat(@round(@as(f32, @floatFromInt(i + 1)) / 8 * 255)), 64, 191, 255 };
+            for (0..37) |y| for (0..65) |x| {
+                if (coverage[(y * 72 + x) * 4] != 255) continue;
+                const pos: usize = @intCast(try layout.sourceByteOffset(@intCast(x), @intCast(y), 0));
+                for (0..4) |channel| if (target.write_mask & (@as(u4, 1) << @as(u2, @intCast(channel))) != 0) {
+                    expected[pos + channel] = if (i % 2 == 0) src[channel] else @intCast(@min(255, 32 + i + 2 * @as(usize, src[channel])));
+                };
+            };
+            if (!std.mem.eql(u8, backing, expected)) return error.MrtColorOrPaddingMismatch;
+        }
+        const target = render.depth_target.?;
+        const depth_layout = try d3d12.surfaces.depthLayout(target, 65, 37, true);
+        const stencil_layout = try d3d12.surfaces.stencilLayout(target, 65, 37, true);
+        for (0..37) |y| for (0..65) |x| {
+            const covered = coverage[(y * 72 + x) * 4] == 255;
+            const s: usize = @intCast(try stencil_layout.sourceByteOffset(@intCast(x), @intCast(y), 0));
+            const z: usize = @intCast(try depth_layout.sourceByteOffset(@intCast(x), @intCast(y), 0));
+            if (memory.data[0x90000 + s] != @as(u8, if (covered) 0x37 else 0x35)) return error.MrtRepeatedStencil;
+            if (std.mem.readInt(u32, memory.data[0x80000 + z ..][0..4], .little) != @as(u32, if (covered) 0 else 0x3f3f3f3f)) return error.MrtDepthMismatch;
+        };
+        // Reject attachment aliases before changing any guest plane.
+        try state.writeRegister(.context, 0x318 + 15, 0x20);
+        const previous = try allocator.dupe(u8, &memory.data);
+        defer allocator.free(previous);
+        if (renderer.draw(&state, packet)) |_| return error.MrtAliasAccepted else |err| if (err != error.AttachmentAliasNotImplemented) return err;
+        if (!std.mem.eql(u8, previous, &memory.data)) return error.MrtAliasChangedMemory;
+    };
+    // Rotate native formats through slot zero and the extra attachments at the
+    // same guest addresses. This also checks batching/PSO/resource cache keys.
+    for (0..3) |rotation| for ([_]usize{ 1, 8 }) |batch_limit| {
+        var state = initial_state;
+        var program: std.ArrayList(u32) = .empty;
+        defer program.deinit(allocator);
+        for (0..5) |slot| {
+            const reg: u32 = @intCast(slot);
+            const kind = (slot + rotation) % 3;
+            const address = 0x2000 + reg * 0x4000;
+            try state.writeRegister(.context, 0x318 + reg * 15, address >> 8);
+            try state.writeRegister(.context, 0x319 + reg * 15, 8);
+            try state.writeRegister(.context, 0x31c + reg * 15, switch (kind) {
+                0 => 10 << 2,
+                1 => (5 << 2) | (7 << 8),
+                else => (10 << 2) | (1 << 8),
+            });
+            try state.writeRegister(.context, 0x390 + reg, 0);
+            try state.writeRegister(.context, 0x3b0 + reg, (64 << 14) | 36);
+            try state.writeRegister(.context, 0x3b8 + reg, 0);
+            try state.writeRegister(.context, 0x1e0 + reg, if (kind == 1) (1 << 30) | 1 | (1 << 8) else 0);
+            const values: [4]f32 = switch (kind) {
+                0 => .{ 0, 1, 0, 1 },
+                1 => .{ -1, 2, 0, 0 },
+                else => .{ -1, 0, 1, 1 },
+            };
+            for (values, 0..) |value, channel| try program.appendSlice(allocator, &.{ vop1(1, @intCast(channel), 255), @bitCast(value) });
+            try program.appendSlice(allocator, &.{ 0xf800000f | (reg << 4) | (if (slot == 4) @as(u32, 0x800) else 0), 0x03020100 });
+            @memset(memory.data[address..][0..0x3000], 0);
+        }
+        try program.append(allocator, 0xbf810000);
+        @memcpy(memory.data[0x400..][0 .. program.items.len * 4], std.mem.sliceAsBytes(program.items));
+        try state.writeRegister(.context, 0x08e, 0xfffff);
+        renderer.draw_batch_limit = batch_limit;
+        try renderer.draw(&state, packet);
+        try renderer.draw(&state, packet);
+        try renderer.flushDraws();
+        const render = gpu.resources.decodeRenderState(&state);
+        for (0..5) |slot| {
+            const target = render.color_targets[slot].?;
+            const layout = try d3d12.surfaces.colorLayout(target);
+            const backing = memory.data[@intCast(target.address)..][0..@intCast(layout.required_source_bytes)];
+            const expected = try allocator.alloc(u8, backing.len);
+            defer allocator.free(expected);
+            @memset(expected, 0);
+            const value: [4]u8 = switch ((slot + rotation) % 3) {
+                0 => .{ 0, 255, 0, 255 },
+                1 => .{ 0, 0xc0, 0, 0x44 }, // half(-2), half(4), after two additive writes.
+                else => .{ 0x81, 0, 0x7f, 0x7f },
+            };
+            for (0..37) |y| for (0..65) |x| {
+                if (coverage[(y * 72 + x) * 4] != 255) continue;
+                const pos: usize = @intCast(try layout.sourceByteOffset(@intCast(x), @intCast(y), 0));
+                expected[pos..][0..4].* = value;
+            };
+            if (!std.mem.eql(u8, backing, expected)) return error.MrtMixedFormatMismatch;
+        }
+    };
+    std.debug.print("PASS 2/5/8 simultaneous targets, mixed RGBA8 UNORM/SNORM and RG16 float, independent masks/blends, exactly-once depth/stencil, immediate/grouped writes, padding and alias rejection\n", .{});
 }
 
 fn guestDepthBiasProbe(allocator: std.mem.Allocator, vertex: []const u32, fragment: []const u32) !void {

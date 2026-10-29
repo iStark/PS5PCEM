@@ -62,6 +62,12 @@ typedef struct Ps5D3D12Stencil {
     uint32_t front[4], back[4];
 } Ps5D3D12Stencil;
 
+typedef struct Ps5D3D12ColorAttachment {
+    uint8_t *pixels; size_t size;
+    uint32_t format, write_mask;
+    Ps5D3D12Blend blend;
+} Ps5D3D12ColorAttachment;
+
 typedef struct Ps5D3D12Draw {
     uint32_t width, height, vertex_count, instance_count, first_vertex, first_instance;
     uint32_t topology, cull_mode, front_ccw, write_mask;
@@ -79,6 +85,9 @@ typedef struct Ps5D3D12Draw {
     uint32_t dynamic_scalars;
     uint32_t check_dispatcher;
     uint32_t color_attachment;
+    uint32_t color_format;
+    uint32_t extra_color_count;
+    Ps5D3D12ColorAttachment extra_colors[7];
     uint32_t scalar_values[129]; /* VS 0..64, PS 65..128; binding 10. */
 } Ps5D3D12Draw;
 
