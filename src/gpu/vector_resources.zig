@@ -11,6 +11,67 @@ pub const Tuple = [8]usize;
 
 pub const BufferPointer = struct { instruction: usize, high_word16: bool };
 
+pub const FlatBufferPointer = struct { instruction: usize, component: u32 };
+
+/// Bound an absolute FLAT read whose address pair is fetched from one buffer
+/// record. This is staging provenance only: lanes still calculate their own
+/// addresses and the shader's checked memory reads remain authoritative.
+pub fn flatBufferPointer(
+    instructions: []const rdna2.Instruction,
+    graph: *const rdna2.control_flow.Graph,
+    before: usize,
+) ?FlatBufferPointer {
+    if (before >= instructions.len) return null;
+    const read = instructions[before];
+    switch (read.opcode) {
+        .flat_load_dword, .flat_load_dwordx2, .flat_load_dwordx3, .flat_load_dwordx4 => {},
+        else => return null,
+    }
+    if ((read.memory_segment != 0 and read.memory_segment != 2) or
+        read.src1.kind != .vgpr or read.src0.kind != .vgpr or !plain(read.src0)) return null;
+    const low = definitions.vectorLaneDefinition(instructions, graph, before, read.src0.reg) orelse return null;
+    const high = definitions.vectorLaneDefinition(instructions, graph, before, read.src0.reg + 1) orelse return null;
+    if (low.instruction != high.instruction or high.component != low.component + 1) return null;
+    const load = instructions[low.instruction];
+    switch (load.opcode) {
+        .buffer_load_dwordx2, .buffer_load_dwordx3, .buffer_load_dwordx4 => {},
+        else => return null,
+    }
+    if (high.component >= load.data_words or !plain(load.dst)) return null;
+    return .{ .instruction = low.instruction, .component = low.component };
+}
+
+test "flat pointer records preserve both address words and active lanes" {
+    var code = [_]rdna2.Instruction{
+        .{ .pc = 0, .opcode = .s_mov_b64, .dst = .{ .kind = .sgpr, .reg = 8 }, .src0 = .{ .kind = .exec_lo } },
+        .{ .pc = 4, .opcode = .buffer_load_dwordx4, .dst = .{ .kind = .vgpr, .reg = 20 }, .data_words = 4 },
+        .{ .pc = 12, .opcode = .s_nop },
+        .{ .pc = 16, .opcode = .flat_load_dwordx3, .src0 = .{ .kind = .vgpr, .reg = 20 }, .src1 = .{ .kind = .vgpr, .reg = 21 }, .memory_offset = 272, .data_words = 3 },
+        .{ .pc = 24, .opcode = .s_endpgm },
+    };
+    const original = code;
+    for (0..9) |variant| {
+        code = original;
+        switch (variant) {
+            1 => code[3].src0.reg = 22,
+            2 => code[3].src0.reg = 23, // High word was not part of the fetch.
+            3 => code[2] = .{ .pc = 12, .opcode = .v_mov_b32, .dst = .{ .kind = .vgpr, .reg = 21 }, .src0 = .{ .kind = .integer_inline_constant } },
+            4 => code[3].memory_segment = 1,
+            5 => code[3].src0.sdwa_sel = 4,
+            6 => code[3].memory_segment = 2,
+            7 => code[3].src1 = .{ .kind = .sgpr, .reg = 12 },
+            8 => code[2] = .{ .pc = 12, .opcode = .s_and_b64, .dst = .{ .kind = .exec_lo }, .src0 = .{ .kind = .sgpr, .reg = 40 }, .src1 = .{ .kind = .exec_lo } },
+            else => {},
+        }
+        var graph = try rdna2.control_flow.buildInstructions(std.testing.allocator, &code);
+        defer graph.deinit(std.testing.allocator);
+        const found = flatBufferPointer(&code, &graph, 3);
+        if ((variant >= 2 and variant <= 5) or variant == 7) {
+            try std.testing.expect(found == null);
+        } else try std.testing.expectEqual(FlatBufferPointer{ .instruction = 1, .component = if (variant == 1) 2 else 0 }, found.?);
+    }
+}
+
 /// Recover a correlated address pair selected from the same active lane.
 /// The upper word may discard a packed tag through WORD_0 sign extension.
 /// Keep the actual vector/scalar instructions; this only bounds host staging.

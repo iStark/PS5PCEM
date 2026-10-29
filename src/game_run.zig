@@ -699,6 +699,17 @@ fn run(init: std.process.Init) !bool {
         try out.print("  Unity startup render size {d}x{d} (virtual boot.config)\n", .{ output_mode.width(), output_mode.height() });
         try out.flush();
     }
+    // OXIDE's default ray-tracing material pass uses data-dependent shader
+    // calls which are not implemented yet. Ask Unreal for its real raster
+    // path; never skip those dispatches or modify the installed title files.
+    const unreal_ray_tracing = if (init.minimal.environ.getAlloc(allocator, "PS5_UNREAL_RAY_TRACING")) |text| enabled: {
+        defer allocator.free(text);
+        break :enabled !std.mem.eql(u8, std.mem.trim(u8, text, " \t\r\n"), "0");
+    } else |_| !std.ascii.eqlIgnoreCase(title_identifier, "PPSA07653");
+    if (try runtime.firmware.filesystem.configureUnrealRayTracing(unreal_ray_tracing)) {
+        try out.writeAll("  Unreal raster rendering (-noraytracing; virtual command line, PS5_UNREAL_RAY_TRACING=1 restores the title default)\n");
+        try out.flush();
+    }
     defer runtime.firmware.filesystem.detach();
 
     const rtc_day_offset: i32 = if (init.minimal.environ.getAlloc(

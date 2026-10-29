@@ -10977,6 +10977,8 @@ pub const Renderer = struct {
         } else false);
         if (checked_bvh and resources.flat_memory_count == 0)
             try self.prepareCheckedBvhMemory(resources, reader, analysis);
+        if (resources.flat_memory_count == 0)
+            try self.prepareVectorFlatMemory(resources, reader, analysis);
         // A dispatcher that reaches its guard must not silently leave a
         // partly written image for subsequent passes. Reuse the checked
         // memory fault record for programs that may need bounded control flow.
@@ -13233,24 +13235,28 @@ pub const Renderer = struct {
         var total: usize = 0;
         const scalars = result.scalar_registers[0..result.scalar_count];
         for (scalars) |low| {
-            if (low.register & 1 != 0 or low.value & 255 != 0) continue;
+            if (low.register & 1 != 0) continue;
             if (low.producer_pc) |pc| {
                 const index = analysis.instructionBefore(pc);
                 if (index == analysis.program.instructions.items.len or
                     analysis.program.instructions.items[index].pc != pc or
-                    !isPointerScalarLoad(analysis.program.instructions.items[index].opcode)) continue;
+                    analysis.program.instructions.items[index].family != .smem) continue;
             }
             const high = for (scalars) |candidate| {
                 if (candidate.producer_pc == low.producer_pc and candidate.register == low.register + 1) break candidate.value;
             } else continue;
             try self.appendBvhSnapshot(reader, &snapshots, @as(u64, low.value) | (@as(u64, high & 0xffff) << 32), false, &total);
+            // BVH resource descriptors encode their base in 256-byte units;
+            // they can arrive through S_BUFFER_LOAD just like literal roots.
+            // Metadata flags above the address's 40 bits are not pointer bits.
+            try self.appendBvhSnapshot(reader, &snapshots, (@as(u64, low.value) | (@as(u64, high & 0xff) << 32)) << 8, false, &total);
         }
         var cursor: usize = 0;
         while (cursor < snapshots.items.len) : (cursor += 1) {
             const snapshot = snapshots.items[cursor];
             for (0..snapshot.header.instance_count) |index| {
                 const offset = snapshot.header.instance_offset + index * 128;
-                const address = gpu.bvh_snapshot.instanceAddress(snapshot.bytes[offset..][0..128]);
+                const address = gpu.bvh_snapshot.instanceAddress(snapshot.header, snapshot.bytes[offset..][0..128]);
                 try self.appendBvhSnapshot(reader, &snapshots, address, true, &total);
             }
         }
@@ -13258,40 +13264,124 @@ pub const Renderer = struct {
             try self.stageFlatMaterialPage(result, 0, &.{});
             return;
         }
+        try self.stageFlatSnapshots(result, snapshots.items);
+        if (self.traceCurrentGraphicsFrame()) std.debug.print("[vulkan dcb] checked BVH snapshot regions={d} bytes={d}\n", .{ snapshots.items.len, total });
+    }
+
+    fn stageFlatSnapshots(self: *Renderer, result: *ComputeResources, snapshots: anytype) anyerror!void {
+        if (snapshots.len == 0) return;
+        const needs_fault_record = result.flat_memory_count == 0;
         var free: usize = 0;
         for (result.occupied) |used| if (!used) {
             free += 1;
         };
-        if (snapshots.items.len > free) return Error.InvalidStorageDescriptor;
+        if (snapshots.len > free or snapshots.len > result.flat_memories.len - result.flat_memory_count) return Error.InvalidStorageDescriptor;
         var upload_size: usize = 0;
-        for (snapshots.items, 0..) |snapshot, index|
-            upload_size += std.mem.alignForward(usize, 16 + snapshot.bytes.len + @as(usize, if (index == 0) 16 else 0), draw_upload_alignment);
+        for (snapshots, 0..) |snapshot, index|
+            upload_size += std.mem.alignForward(usize, 16 + std.mem.alignForward(usize, snapshot.bytes.len, 4) + @as(usize, if (needs_fault_record and index == 0) 16 else 0), draw_upload_alignment);
         // Reserve all regions before publishing any binding, so an upload
         // ring wrap cannot overwrite an earlier snapshot from this dispatch.
         const upload = try self.allocateDrawUpload(upload_size);
         const mapping = try self.mapDrawUpload(upload);
         defer mapping.release(self);
         var offset: usize = 0;
-        for (snapshots.items, 0..) |snapshot, index| {
-            const size = 16 + snapshot.bytes.len + @as(usize, if (index == 0) 16 else 0);
+        for (snapshots, 0..) |snapshot, index| {
+            const first = needs_fault_record and index == 0;
+            const payload_size = std.mem.alignForward(usize, snapshot.bytes.len, 4);
+            const size = 16 + payload_size + @as(usize, if (first) 16 else 0);
             const bytes = mapping.bytes[offset..][0..size];
             std.mem.writeInt(u64, bytes[0..8], snapshot.address, .little);
             std.mem.writeInt(u32, bytes[8..12], 0, .little);
             std.mem.writeInt(u32, bytes[12..16], @intCast(snapshot.bytes.len), .little);
             @memcpy(bytes[16..][0..snapshot.bytes.len], snapshot.bytes);
-            if (index == 0) @memset(bytes[16 + snapshot.bytes.len ..], 0);
+            @memset(bytes[16 + snapshot.bytes.len ..], 0);
             const slot = result.freeDescriptor() orelse return Error.InvalidStorageDescriptor;
             self.updateStorageDescriptorRange(slot, upload.buffer, upload.offset + offset, size);
             result.occupied[slot] = true;
-            result.flat_memories[result.flat_memory_count] = .{ .descriptor_index = slot, .fault_record_word = if (index == 0) @intCast((16 + snapshot.bytes.len) / 4) else null };
+            result.flat_memories[result.flat_memory_count] = .{ .descriptor_index = slot, .fault_record_word = if (first) @intCast((16 + payload_size) / 4) else null };
             result.flat_memory_count += 1;
-            if (index == 0) result.flat_memory_fault = .{ .buffer = upload.buffer, .offset = upload.offset + 8, .size = size - 8 };
+            if (first) result.flat_memory_fault = .{ .buffer = upload.buffer, .offset = upload.offset + 8, .size = size - 8 };
             offset += std.mem.alignForward(usize, size, draw_upload_alignment);
         }
         self.active_descriptor_set = self.descriptor_set;
         self.frame_profile.upload_bytes +%= upload_size;
         self.frame_profile.storage_upload_bytes +%= upload_size;
-        if (self.traceCurrentGraphicsFrame()) std.debug.print("[vulkan dcb] checked BVH snapshot regions={d} bytes={d}\n", .{ snapshots.items.len, total });
+    }
+
+    /// FLAT pointers loaded per lane from structured records (including BVH
+    /// build inputs) are not scalar pointer roots. Capture only the constant
+    /// byte ranges actually read through proven pairs, after GPU coherence.
+    fn prepareVectorFlatMemory(self: *Renderer, result: *ComputeResources, reader: gpu.ShaderMemoryReader, analysis: *const gpu.ShaderAnalysis) anyerror!void {
+        const instructions = analysis.program.instructions.items;
+        if (!gpu.resource_checkpoints.hasFlatMemoryReads(instructions, if (analysis.resource_checkpoints) |*plan| plan else null)) return;
+        const Plan = struct { origin: gpu.vector_resources.FlatBufferPointer, first: u32, end: u32 };
+        var plans: std.ArrayList(Plan) = .empty;
+        defer plans.deinit(self.allocator);
+        for (instructions, 0..) |inst, index| {
+            if (inst.memory_offset < 0 or inst.memory_offset > 4096) continue;
+            const origin = gpu.vector_resources.flatBufferPointer(instructions, &analysis.graph, index) orelse continue;
+            const first: u32 = @intCast(inst.memory_offset);
+            const end = first + @as(u32, inst.data_words) * 4;
+            var found = false;
+            for (plans.items) |*plan| {
+                if (!std.meta.eql(plan.origin, origin)) continue;
+                plan.first = @min(plan.first, first);
+                plan.end = @max(plan.end, end);
+                found = true;
+                break;
+            }
+            if (!found) try plans.append(self.allocator, .{ .origin = origin, .first = first, .end = end });
+        }
+        const Snapshot = struct { address: u64, bytes: []u8 };
+        var snapshots: std.ArrayList(Snapshot) = .empty;
+        defer {
+            for (snapshots.items) |snapshot| self.allocator.free(snapshot.bytes);
+            snapshots.deinit(self.allocator);
+        }
+        for (plans.items) |plan| {
+            const load = instructions[plan.origin.instruction];
+            if (!load.index_enable or load.offset_enable or load.memory_offset < 0 or
+                load.src1.kind != .sgpr or !inlineIntegerOperand(load.src2, 0)) continue;
+            for (result.mappings[0..result.mapping_count]) |binding| {
+                if (binding.resource_sgpr != load.src1.reg or
+                    (binding.instruction_pc != null and binding.instruction_pc != load.pc) or
+                    binding.swizzled or binding.add_thread_id or binding.stride < 8) continue;
+                const slot = binding.descriptor_index;
+                const extent = @min(binding.extent_bytes orelse continue, result.sizes[slot]);
+                const count = extent / binding.stride;
+                const pointer_offset = @as(u32, @intCast(load.memory_offset)) + plan.origin.component * 4;
+                if (count == 0 or count > 1024 or extent > 1024 * 1024 or pointer_offset + 8 > binding.stride) continue;
+                const base = result.addresses[slot];
+                try self.flushGuestStorageRange(base, extent);
+                for (0..count) |index| {
+                    const pointer = try reader.readU64(base + index * binding.stride + pointer_offset);
+                    if (pointer == 0 or pointer > @as(u64, 0x0000_ffff_ffff_ffff) - plan.end) continue;
+                    const address = pointer + plan.first;
+                    const size = plan.end - plan.first;
+                    var duplicate = false;
+                    for (snapshots.items) |snapshot| if (snapshot.address == address and snapshot.bytes.len == size) {
+                        duplicate = true;
+                        break;
+                    };
+                    if (duplicate) continue;
+                    // An unused record may be null or unreadable; it must not
+                    // fail host preparation. An executed read still faults in
+                    // the checked shader when no snapshot covers its address.
+                    const previous_failure = self.last_shader_read_failure;
+                    defer self.last_shader_read_failure = previous_failure;
+                    try self.flushGuestStorageRange(address, size);
+                    const bytes = try self.allocator.alloc(u8, size);
+                    reader.read(address, bytes) catch {
+                        self.allocator.free(bytes);
+                        continue;
+                    };
+                    errdefer self.allocator.free(bytes);
+                    if (snapshots.items.len == maximum_storage_descriptors) return Error.GuestBufferTooLarge;
+                    try snapshots.append(self.allocator, .{ .address = address, .bytes = bytes });
+                }
+            }
+        }
+        try self.stageFlatSnapshots(result, snapshots.items);
     }
 
     fn stageFlatMaterialPage(self: *Renderer, result: *ComputeResources, address: u64, bytes: []const u8) anyerror!void {

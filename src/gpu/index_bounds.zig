@@ -802,7 +802,21 @@ fn maskIsSubsetOfVectorWrite(instructions: []const Instruction, graph: *const Gr
                     if (!unchanged and !maskRestoresOrigin(instructions, graph, vector_write, 126, index, 0)) return false;
                     proof.has_origin = true;
                 }
-            } else if (inst.opcode == .s_mov_b64 or inst.opcode == .s_andn2_b64 or inst.opcode == .s_and_b64) {
+            } else if (inst.opcode == .s_and_b64) {
+                // Either side of AND can prove that EXEC is a subset of the
+                // fetch mask. Predicates commonly occupy src0 while src1 is
+                // the saved EXEC; failure on the predicate is not ambiguity.
+                var proved = false;
+                for ([_]rdna2.Operand{ inst.src0, inst.src1 }) |operand| {
+                    const source = @import("scalar_provenance.zig").scalarRegisterIndex(operand) orelse continue;
+                    var candidate = proof.*;
+                    if (!maskIsSubsetOfVectorWrite(instructions, graph, index, @intCast(source), vector_write, &candidate)) continue;
+                    proof.* = candidate;
+                    proved = true;
+                    break;
+                }
+                if (!proved) return false;
+            } else if (inst.opcode == .s_mov_b64 or inst.opcode == .s_andn2_b64) {
                 const source = @import("scalar_provenance.zig").scalarRegisterIndex(inst.src0) orelse return false;
                 if (!maskIsSubsetOfVectorWrite(instructions, graph, index, @intCast(source), vector_write, proof)) return false;
             } else return false;

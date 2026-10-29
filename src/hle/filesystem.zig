@@ -515,6 +515,47 @@ pub fn attachGuestAddressSpace(space: ?*guest_memory.AddressSpace) void {
 
 var boot_override: [boot_config.maximum_bytes]u8 = undefined;
 var boot_override_length: usize = 0;
+const unreal_command_path = "ue4commandline.txt";
+var unreal_command_override: [64 * 1024]u8 = undefined;
+var unreal_command_override_length: usize = 0;
+
+fn isLaunchOverridePath(relative: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(relative, boot_config.path) or std.ascii.eqlIgnoreCase(relative, unreal_command_path);
+}
+
+/// The caller holds table_lock; open FDs take their own immutable copy.
+fn launchOverride(relative: []const u8) ?[]const u8 {
+    if (std.ascii.eqlIgnoreCase(relative, boot_config.path) and boot_override_length != 0)
+        return boot_override[0..boot_override_length];
+    if (std.ascii.eqlIgnoreCase(relative, unreal_command_path) and unreal_command_override_length != 0)
+        return unreal_command_override[0..unreal_command_override_length];
+    return null;
+}
+
+/// Use Unreal's raster rendering path through its own command-line option.
+/// This is a launch preference, not shader elision. Installed files, archives
+/// and saves remain unchanged; reattaching /app0 removes the preference.
+pub fn configureUnrealRayTracing(enabled: bool) Error!bool {
+    const io = active_io orelse return Error.NotAttached;
+    table_lock.lock();
+    defer table_lock.unlock();
+    unreal_command_override_length = 0;
+    if (enabled) return false;
+    var original: [64 * 1024]u8 = undefined;
+    const source = if (title_archive) |archive| source: {
+        const node = archive.lookup(unreal_command_path) orelse return false;
+        if (!archive.isFile(node) or archive.fileSize(node) > original.len) return false;
+        const size = archive.readAt(node, 0, &original) catch return false;
+        break :source original[0..size];
+    } else (root orelse return Error.NotAttached).readFile(io, unreal_command_path, &original) catch return false;
+    // This adapter handles the UTF-8 launch file, not arbitrary binary data.
+    if (std.mem.indexOfScalar(u8, source, 0) != null) return false;
+    var tokens = std.mem.tokenizeAny(u8, source, " \t\r\n");
+    while (tokens.next()) |token| if (std.ascii.eqlIgnoreCase(token, "-noraytracing")) return false;
+    const replacement = std.fmt.bufPrint(&unreal_command_override, "{s} -noraytracing", .{std.mem.trimEnd(u8, source, " \t\r\n")}) catch return false;
+    unreal_command_override_length = replacement.len;
+    return true;
+}
 
 /// Called before guest threads start. All reads/stat calls see one immutable
 /// launch document, including positional reads and independently opened FDs.
@@ -555,6 +596,7 @@ pub fn attach(io: std.Io, directory: std.Io.Dir) void {
     clearArchiveDescriptorsLocked();
     title_archive = null;
     boot_override_length = 0;
+    unreal_command_override_length = 0;
     virtual_socket_signal.store(0, .release);
 }
 
@@ -568,6 +610,7 @@ pub fn attachArchive(io: std.Io, reader: *zarchive.Reader) void {
     clearArchiveDescriptorsLocked();
     title_archive = reader;
     boot_override_length = 0;
+    unreal_command_override_length = 0;
     virtual_socket_signal.store(0, .release);
 }
 
@@ -951,6 +994,7 @@ pub fn detach() void {
     root = null;
     title_archive = null;
     boot_override_length = 0;
+    unreal_command_override_length = 0;
     download_root = null;
     temporary_root = null;
     virtual_socket_signal.store(0, .release);
@@ -1064,11 +1108,11 @@ pub fn open(path: []const u8, flags: i32) Error!i32 {
 
     if (mount != .title) return openWritableFile(path, relative, flags, io, directory);
 
-    if (std.ascii.eqlIgnoreCase(relative, boot_config.path)) {
+    if (isLaunchOverridePath(relative)) {
         table_lock.lock();
         defer table_lock.unlock();
-        if (boot_override_length != 0) {
-            const bytes = std.heap.page_allocator.dupe(u8, boot_override[0..boot_override_length]) catch return Error.IoFailed;
+        if (launchOverride(relative)) |replacement| {
+            const bytes = std.heap.page_allocator.dupe(u8, replacement) catch return Error.IoFailed;
             errdefer std.heap.page_allocator.free(bytes);
             var entry = OpenFile{ .memory = bytes, .size = bytes.len };
             entry.path_length = @min(path.len, maximum_path);
@@ -1118,11 +1162,11 @@ fn openArchive(path: []const u8, flags: i32, archive: *zarchive.Reader) Error!i3
         return openArchiveDirectory(path, node);
     }
 
-    if (std.ascii.eqlIgnoreCase(relative, boot_config.path)) {
+    if (isLaunchOverridePath(relative)) {
         table_lock.lock();
         defer table_lock.unlock();
-        if (boot_override_length != 0) {
-            const bytes = std.heap.page_allocator.dupe(u8, boot_override[0..boot_override_length]) catch return Error.IoFailed;
+        if (launchOverride(relative)) |replacement| {
+            const bytes = std.heap.page_allocator.dupe(u8, replacement) catch return Error.IoFailed;
             errdefer std.heap.page_allocator.free(bytes);
             var entry = OpenFile{ .memory = bytes, .size = bytes.len };
             entry.path_length = @min(path.len, maximum_path);
@@ -1842,11 +1886,11 @@ pub fn stat(path: []const u8, out: *Stat) Error!void {
     var relative_storage: [maximum_path]u8 = undefined;
     const relative = hostRelative(path, &relative_storage, io, directory) orelse return Error.NotFound;
 
-    if (mountOf(path) == .title and std.ascii.eqlIgnoreCase(relative, boot_config.path)) {
+    if (mountOf(path) == .title and isLaunchOverridePath(relative)) {
         table_lock.lock();
         defer table_lock.unlock();
-        if (boot_override_length != 0) {
-            fillStat(out, boot_override_length, false);
+        if (launchOverride(relative)) |replacement| {
+            fillStat(out, replacement.len, false);
             return;
         }
     }
@@ -1876,11 +1920,11 @@ fn statArchive(path: []const u8, out: *Stat, archive: *zarchive.Reader) Error!vo
     var relative_storage: [maximum_path]u8 = undefined;
     const relative = normalizedMountRelative(path, &relative_storage) orelse return Error.NotFound;
 
-    if (std.ascii.eqlIgnoreCase(relative, boot_config.path)) {
+    if (isLaunchOverridePath(relative)) {
         table_lock.lock();
         defer table_lock.unlock();
-        if (boot_override_length != 0) {
-            fillStat(out, boot_override_length, false);
+        if (launchOverride(relative)) |replacement| {
+            fillStat(out, replacement.len, false);
             return;
         }
     }
@@ -2278,6 +2322,80 @@ test "display boot overlay has consistent reads and stat without modifying title
     defer close(raw) catch {};
     const length = try read(raw, &bytes);
     try testing.expectEqualStrings(original, bytes[0..length]);
+}
+
+test "Unreal raster launch preference preserves files and consistent reads across reconfiguration" {
+    var fixture = try Fixture.init("title data");
+    defer fixture.deinit();
+    const source = "../../../Game/Game.uproject -SessionName=\"Game Name\"\r\n";
+    const expected = "../../../Game/Game.uproject -SessionName=\"Game Name\" -noraytracing";
+    try fixture.tmp.dir.writeFile(testing.io, .{ .sub_path = unreal_command_path, .data = source });
+    try testing.expect(try configureUnrealRayTracing(false));
+    var info: Stat = undefined;
+    try stat("/app0/ue4commandline.txt", &info);
+    try testing.expectEqual(@as(i64, expected.len), info.size);
+    const fd = try open("/app0/ue4commandline.txt", O.rdonly);
+    defer close(fd) catch {};
+    var bytes: [256]u8 = undefined;
+    const head = try read(fd, bytes[0..7]);
+    const tail = try read(fd, bytes[head..]);
+    try testing.expectEqualStrings(expected, bytes[0 .. head + tail]);
+    try testing.expectEqual(@as(usize, 0), try read(fd, &bytes));
+    try fstat(fd, &info);
+    try testing.expectEqual(@as(i64, expected.len), info.size);
+    try testing.expect(!(try configureUnrealRayTracing(true)));
+    // Already-open files retain their own immutable launch document.
+    try testing.expectEqual(expected.len, try pread(fd, &bytes, 0));
+    try testing.expectEqualStrings(expected, bytes[0..expected.len]);
+    const raw = try open("/app0/ue4commandline.txt", O.rdonly);
+    defer close(raw) catch {};
+    const length = try read(raw, &bytes);
+    try testing.expectEqualStrings(source, bytes[0..length]);
+    try testing.expectEqualStrings(source, try fixture.tmp.dir.readFile(testing.io, unreal_command_path, &bytes));
+    try testing.expectError(Error.ReadOnly, open("/app0/ue4commandline.txt", O.wronly));
+    try testing.expect(try configureUnrealRayTracing(false));
+    detach();
+    attach(testing.io, fixture.tmp.dir);
+    try stat("/app0/ue4commandline.txt", &info);
+    try testing.expectEqual(@as(i64, source.len), info.size);
+    try fixture.tmp.dir.writeFile(testing.io, .{ .sub_path = unreal_command_path, .data = "Game.uproject -NoRayTracing\n" });
+    try testing.expect(!(try configureUnrealRayTracing(false)));
+}
+
+test "Unreal raster launch preference serves archived command lines without changing the archive" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const source = "../../../Game/Game.uproject -log\n";
+    const expected = "../../../Game/Game.uproject -log -noraytracing";
+    try zarchive.writeTestArchive(testing.io, tmp.dir, "game.zar", &.{
+        .{ .path = unreal_command_path, .data = source },
+        .{ .path = "data.bin", .data = "title content" },
+    });
+    var reader = try zarchive.Reader.open(testing.io, tmp.dir, "game.zar", testing.allocator);
+    defer reader.close();
+    attachArchive(testing.io, reader);
+    defer detach();
+    try testing.expect(try configureUnrealRayTracing(false));
+    var info: Stat = undefined;
+    try stat("/APP0/UE4COMMANDLINE.TXT", &info);
+    try testing.expectEqual(@as(i64, expected.len), info.size);
+    const fd = try open("/APP0/UE4COMMANDLINE.TXT", O.rdonly);
+    defer close(fd) catch {};
+    try fstat(fd, &info);
+    try testing.expectEqual(@as(i64, expected.len), info.size);
+    var bytes: [256]u8 = undefined;
+    try testing.expectEqual(expected.len - 7, try pread(fd, &bytes, 7));
+    try testing.expectEqualStrings(expected[7..], bytes[0 .. expected.len - 7]);
+    try testing.expectEqual(@as(usize, 0), try pread(fd, &bytes, expected.len));
+    try testing.expectError(Error.ReadOnly, open("/app0/ue4commandline.txt", O.wronly));
+    const node = reader.lookup(unreal_command_path).?;
+    try testing.expectEqual(source.len, try reader.readAt(node, 0, &bytes));
+    try testing.expectEqualStrings(source, bytes[0..source.len]);
+    try testing.expect(!(try configureUnrealRayTracing(true)));
+    try stat("/app0/ue4commandline.txt", &info);
+    try testing.expectEqual(@as(i64, source.len), info.size);
+    try testing.expectEqual(expected.len, try pread(fd, &bytes, 0));
+    try testing.expectEqualStrings(expected, bytes[0..expected.len]);
 }
 
 test "a missing title font is served from the bundled stand-ins and a shipped one is not" {
