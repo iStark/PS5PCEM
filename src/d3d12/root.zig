@@ -17,6 +17,7 @@ pub const shader_cache = @import("shader_cache.zig");
 pub const texture_cache = @import("texture_cache.zig");
 
 test {
+    _ = backend;
     _ = graphics;
     _ = surfaces;
     _ = staging;
@@ -76,6 +77,9 @@ pub const Draw = extern struct {
     depth_write: u32 = 0,
     depth_compare: u32 = 8,
     depth_clip_enabled: u32 = 1,
+    depth_bias: f32 = 0,
+    depth_bias_clamp: f32 = 0,
+    depth_bias_slope: f32 = 0,
     rectangle_completion: u32 = 0,
     rectangle_mask: u32 = 0,
     stencil: Stencil = .{},
@@ -354,6 +358,7 @@ pub const Device = struct {
             vertex[0] != 0x07230203 or fragment[0] != 0x07230203 or (draw.vertex_count == 0 and draw.index_count == 0) or draw.instance_count == 0 or
             (draw.topology != 4 and draw.topology != 5) or draw.cull_mode < 1 or draw.cull_mode > 3 or draw.write_mask > 15) return error.InvalidArgument;
         for (draw.viewport) |value| if (!std.math.isFinite(value)) return error.InvalidArgument;
+        if (!std.math.isFinite(draw.depth_bias) or !std.math.isFinite(draw.depth_bias_clamp) or !std.math.isFinite(draw.depth_bias_slope)) return error.InvalidArgument;
         if (draw.viewport[2] <= 0 or draw.viewport[3] <= 0 or draw.viewport[4] < 0 or draw.viewport[5] > 1 or draw.viewport[4] > draw.viewport[5] or
             draw.scissor[0] < 0 or draw.scissor[1] < 0 or draw.scissor[2] < draw.scissor[0] or draw.scissor[3] < draw.scissor[1]) return error.InvalidArgument;
     }

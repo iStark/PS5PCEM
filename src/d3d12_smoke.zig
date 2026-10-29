@@ -360,6 +360,61 @@ fn guestCommandProbe(allocator: std.mem.Allocator, vertex_words: []const u32, pi
         try state.writeRegister(.uconfig, 0x242, 4);
         try state.writeRegister(.uconfig, 0x24b, 0);
     }
+    for ([_]u32{ 3, 1, 0, 17, 0, 0, 0, 0 }, 0..) |value, i|
+        std.mem.writeInt(u32, memory.data[0x700 + i * 4 ..][0..4], value, .little);
+    _ = try executor.execute(&.{ command(gpu.pm4.set_base, 3), 1, 0x700, 0 });
+    for ([_]bool{ false, true }) |multi| {
+        @memcpy(memory.data[0x2000..], initial[0x2000..]);
+        if (multi) {
+            _ = try executor.execute(&.{ command(gpu.pm4.draw_indirect_multi, 9), 0, 0x280, 0x280, 0, 2, 0, 0, 16, 2 });
+        } else {
+            _ = try executor.execute(&.{ command(gpu.pm4.draw_indirect, 4), 0, 0x280, 0x280, 2 });
+        }
+        if (!std.mem.eql(u8, memory.data[0x2000..], before[0x2000..])) return error.Pm4IndirectAutoMismatch;
+    }
+    // Indirect single/multi indexed records use their own base/instance values,
+    // even with stale direct state. Compare every pixel and padding byte.
+    for ([_]u2{ 0, 1, 2 }) |index_type| {
+        for ([_]u32{ 99, 99, 7, 8, 9 }, 0..) |value, i| switch (index_type) {
+            0 => std.mem.writeInt(u16, memory.data[0x600 + i * 2 ..][0..2], @intCast(value), .little),
+            1 => std.mem.writeInt(u32, memory.data[0x600 + i * 4 ..][0..4], value, .little),
+            else => memory.data[0x600 + i] = @intCast(value),
+        };
+        for ([_]u32{ 3, 1, 2, @bitCast(@as(i32, -7)), 0, 0xdeadbeef, 0, 0, 0, 0, 0 }, 0..) |value, i|
+            std.mem.writeInt(u32, memory.data[0x708 + i * 4 ..][0..4], value, .little);
+        std.mem.writeInt(u32, memory.data[0x780..][0..4], 9, .little);
+        _ = try executor.execute(&.{ command(gpu.pm4.set_base, 3), 1, 0x700, 0, command(gpu.pm4.index_type, 1), index_type, command(gpu.pm4.index_base, 2), 0x600, 0, command(gpu.pm4.index_buffer_size, 1), 5 });
+        try state.writeRegister(.uconfig, 0x24a, 123);
+        state.instance_count = 0; // Indirect records supply their own count.
+        for ([_]usize{ 1, 8 }) |batch| {
+            renderer.draw_batch_limit = batch;
+            for ([_]u32{ 0, 2 }) |initiator| {
+                @memcpy(memory.data[0x2000..], initial[0x2000..]);
+                _ = try executor.execute(&.{ command(gpu.pm4.draw_index_indirect, 4), 8, 0x280, 0x280, initiator });
+                try renderer.flushDraws();
+                if (!std.mem.eql(u8, memory.data[0x2000..], before[0x2000..])) return error.Pm4IndirectSingleMismatch;
+                @memcpy(memory.data[0x2000..], initial[0x2000..]);
+                _ = try executor.execute(&.{ command(gpu.pm4.draw_index_indirect_multi, 9), 8, 0x280, 0x280, 1 << 30, 2, 0x780, 0, 24, initiator });
+                try renderer.flushDraws();
+                if (!std.mem.eql(u8, memory.data[0x2000..], before[0x2000..])) return error.Pm4IndirectMultiMismatch;
+            }
+        }
+    }
+    state.instance_count = 1;
+    try state.writeRegister(.uconfig, 0x24a, 0);
+    renderer.draw_batch_limit = 8;
+    @memcpy(memory.data[0x2000..], initial[0x2000..]);
+    @memset(memory.data[center..][0..4], 0);
+    _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 2 });
+    if (renderer.pending_draws == null) return error.Pm4IndirectHazardSetupFailed;
+    // The count aliases a pending GPU color write: its initial zero must be
+    // replaced by the completed pixel before the subsequent list is decoded.
+    const hazards = renderer.batch_hazards;
+    _ = try executor.execute(&.{ command(gpu.pm4.draw_index_indirect_multi, 9), 8, 0x280, 0x280, 1 << 30, 1, @intCast(center), 0, 24, 2 });
+    try renderer.flushDraws();
+    if (renderer.batch_hazards != hazards + 1 or !std.mem.eql(u8, memory.data[0x2000..], before[0x2000..])) return error.Pm4IndirectCountCoherenceMismatch;
+    renderer.draw_batch_limit = 1;
+    std.debug.print("PASS indirect single/multi indexed 8/16/32-bit records, signed bases, padded stride, count clamp, empty records, immediate/grouped execution and pending count coherence\n", .{});
     _ = try executor.execute(&.{ command(gpu.pm4.draw_index_2, 5), 0, 0, 0, 0, 0 });
     @memcpy(&memory.data, &before);
     try state.writeRegister(.context, 0x08f, 0); // Shader mask also suppresses writes.
@@ -467,6 +522,7 @@ fn guestGraphicsProbe(allocator: std.mem.Allocator, device: *d3d12.Device) !void
     try guestCommandProbe(allocator, &vertex_words, &pixel_words);
     try guestSurfaceProbe(allocator, &vertex_words, &pixel_words);
     for ([_]usize{ 0, d3d12.surface_cache.Cache.default_limit }) |limit| try guestDepthProbe(allocator, &vertex_words, &pixel_words, limit);
+    try guestDepthBiasProbe(allocator, &vertex_words, &pixel_words);
     try guestViewportDepthProbe(allocator, &vertex_words, &pixel_words);
     try guestVaryingProbe(allocator, &vertex_words);
     try guestFanProbe(allocator);
@@ -1540,6 +1596,85 @@ fn graphicsState(width: u32, height: u32, pitch: u32) !gpu.State {
     try state.writeRegister(.context, 0x3b0, ((width - 1) << 14) | (height - 1));
     try state.writeRegister(.context, 0x3b8, 0);
     return state;
+}
+
+fn guestDepthBiasProbe(allocator: std.mem.Allocator, vertex: []const u32, fragment: []const u32) !void {
+    const memory = try allocator.create(GraphicsMemory);
+    defer allocator.destroy(memory);
+    memory.* = .{};
+    @memcpy(memory.data[0x400..][0 .. fragment.len * 4], std.mem.sliceAsBytes(fragment));
+    var renderer = try d3d12.Renderer.init(allocator, memory.access(), false);
+    defer renderer.deinit();
+    var state = try graphicsState(65, 37, 72);
+    try state.writeRegister(.context, 0x204, 1 << 19);
+    try state.writeRegister(.context, 0x205, (1 << 11) | (1 << 12));
+    try state.writeRegister(.context, 0x007, 64 | (36 << 16));
+    try state.writeRegister(.context, 0x012, 0x200);
+    try state.writeRegister(.context, 0x014, 0x200);
+    try state.writeRegister(.context, 0x200, 2 | 4 | (7 << 4));
+    var executor = gpu.DcbExecutor{ .state = &state, .backend = renderer.dcbBackend(), .allocator = allocator };
+    const color_layout = try d3d12.surfaces.colorLayout(gpu.resources.decodeColorTarget(&state, 0, 15).?);
+    const color = memory.data[0x2000..][0..@intCast(color_layout.required_source_bytes)];
+    for ([_]bool{ false, true }) |sloped| {
+        var program: std.ArrayList(u32) = .empty;
+        defer program.deinit(allocator);
+        for (vertex) |word| {
+            if (word == vop1(0x01, 7, 128)) {
+                if (sloped) {
+                    // z = 0.5 + 0.25 * x: slope in framebuffer space is 0.5 / 65.
+                    try program.appendSlice(allocator, &.{ vop1(0x01, 7, 255), 0x3e800000, vop2(0x08, 7, 5, 7), vop1(0x01, 8, 255), 0x3f000000, vop2(0x03, 7, 7, 8) });
+                } else try program.appendSlice(allocator, &.{ vop1(0x01, 7, 255), 0x3f000000 });
+            } else try program.append(allocator, word);
+        }
+        @memcpy(memory.data[0x200..][0 .. program.items.len * 4], std.mem.sliceAsBytes(program.items));
+        for ([_]u8{ 1, 3 }) |format| {
+            try state.writeRegister(.context, 0x010, format);
+            try state.writeRegister(.context, 0x2de, if (format == 1) 0xf0 else 0x1e9);
+            const layout = try d3d12.surfaces.depthLayout(gpu.resources.decodeDepthTarget(&state).?, 65, 37, true);
+            const backing = memory.data[0x20000..][0..@intCast(layout.required_source_bytes)];
+            const bpp: usize = if (format == 1) 2 else 4;
+            const baseline = try allocator.alloc(u8, backing.len);
+            defer allocator.free(baseline);
+            // Repeat zero at the end: PSO keys must include every bias field.
+            const cases = [_][3]f32{ .{ 0, 0, 0 }, .{ 32, 0, 0 }, .{ -32, 0, 0 }, .{ 167.77214, 0, 0 }, .{ -167.77214, 0, 0 }, .{ 0, 16, 0 }, .{ 0, -16, 0 }, .{ 0, 16, 0.002 }, .{ 0, -16, -0.002 }, .{ 0, 0, 0 } };
+            for (cases, 0..) |bias, case| {
+                try state.writeRegister(.context, 0x2e0, @bitCast(bias[1]));
+                try state.writeRegister(.context, 0x2e2, @bitCast(bias[1]));
+                try state.writeRegister(.context, 0x2e1, @bitCast(bias[0]));
+                try state.writeRegister(.context, 0x2e3, @bitCast(bias[0]));
+                try state.writeRegister(.context, 0x2df, @bitCast(bias[2]));
+                @memset(backing, 0x5d);
+                @memset(color, 0xa7);
+                _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 2 });
+                if (case == 0) @memcpy(baseline, backing);
+                const expected = try allocator.dupe(u8, baseline);
+                defer allocator.free(expected);
+                const unit: f64 = if (format == 1) 1.0 / 65535.0 else 1.0 / 16777216.0;
+                var delta: f64 = bias[0] * unit + (if (sloped) @as(f64, bias[1]) / 16 * 0.5 / 65 else 0);
+                if (bias[2] > 0) delta = @min(delta, bias[2]);
+                if (bias[2] < 0) delta = @max(delta, bias[2]);
+                for (0..37) |y| for (0..65) |x| {
+                    const co: usize = @intCast(try color_layout.sourceByteOffset(@intCast(x), @intCast(y), 0));
+                    if (color[co] == 0xa7) continue;
+                    const offset: usize = @intCast(try layout.sourceByteOffset(@intCast(x), @intCast(y), 0));
+                    const actual: f64 = if (bpp == 2) @as(f64, @floatFromInt(std.mem.readInt(u16, backing[offset..][0..2], .little))) / 65535 else @as(f32, @bitCast(std.mem.readInt(u32, backing[offset..][0..4], .little)));
+                    const original: f64 = if (bpp == 2) @as(f64, @floatFromInt(std.mem.readInt(u16, baseline[offset..][0..2], .little))) / 65535 else @as(f32, @bitCast(std.mem.readInt(u32, baseline[offset..][0..4], .little)));
+                    // Raster depth setup may round by one DSV unit, even for
+                    // a constant-Z triangle; fractional bias stays FLOAT in
+                    // the native PSO and is never truncated by our boundary.
+                    const tolerance: f64 = if (format == 1) 1.1 / 65535.0 else if (sloped) 0.0000002 else 1.1 / 16777216.0;
+                    if (!std.math.isFinite(actual) or @abs(actual - original - delta) > tolerance) {
+                        std.debug.print("Depth bias format={d} sloped={} case={d} xy={d},{d} actual={d} baseline={d} delta={d}\n", .{ format, sloped, case, x, y, actual, original, delta });
+                        return error.DepthBiasMismatch;
+                    }
+                    @memcpy(expected[offset..][0..bpp], backing[offset..][0..bpp]);
+                };
+                if (!std.mem.eql(u8, backing, expected)) return error.DepthBiasPaddingMismatch;
+                if (case == cases.len - 1 and !std.mem.eql(u8, backing, baseline)) return error.DepthBiasCacheMismatch;
+            }
+        }
+    }
+    std.debug.print("PASS guest D16/D32 constant/slope depth bias, signed clamp, PSO changes and untouched padding\n", .{});
 }
 
 fn guestDepthProbe(allocator: std.mem.Allocator, vertex: []const u32, fragment: []const u32, conversion_limit: usize) !void {

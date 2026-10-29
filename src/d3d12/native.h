@@ -69,6 +69,7 @@ typedef struct Ps5D3D12Draw {
     int32_t base_vertex;
     Ps5D3D12Blend blend;
     uint32_t depth_format, depth_write, depth_compare, depth_clip_enabled;
+    float depth_bias, depth_bias_clamp, depth_bias_slope;
     uint32_t rectangle_completion, rectangle_mask;
     Ps5D3D12Stencil stencil;
     uint8_t *stencil_pixels; size_t stencil_bytes;

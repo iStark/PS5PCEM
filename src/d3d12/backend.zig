@@ -277,6 +277,7 @@ pub const Renderer = struct {
         std.debug.print("[d3d12 utility state] render_control=0x{x} count_control=0x{x} streamout=0x{x} color={any} target_mask=0x{x}\n", .{
             state.readRegister(.context, 0) orelse 0, state.readRegister(.context, 1) orelse 0, state.readRegister(.context, 0x2e5) orelse 0, render.color_control, render.target_mask,
         });
+        std.debug.print("[d3d12 raster] {any}\n", .{render.raster});
         std.debug.print("[d3d12 render] colors={d} depth_test={any} depth_write={any} stencil={any} blend={any}\n", .{
             render.color_count,                   render.depth_control.test_enabled, render.depth_control.write_enabled,
             render.depth_control.stencil_enabled, render.blends[0].enabled,
@@ -448,8 +449,21 @@ pub const Renderer = struct {
     }
 
     pub fn draw(self: *Renderer, state: *const gpu.State, packet: gpu.pm4.Packet) !void {
+        if (gpu.pm4.isIndirectDraw(packet.opcode)) return self.drawIndirect(state, packet);
         const args = try DrawArguments.decode(state, packet);
-        if (args.count == 0 or state.instance_count == 0) return;
+        return self.drawArguments(state, args);
+    }
+
+    fn drawIndirect(self: *Renderer, state: *const gpu.State, packet: gpu.pm4.Packet) !void {
+        // read() completes pending attachment writes before observing argument
+        // or count bytes. Compute writes are already published synchronously.
+        const records = try DrawArguments.indirect(self.allocator, .{ .context = self, .read = read, .write = write }, state, packet);
+        defer self.allocator.free(records);
+        for (records) |args| try self.drawArguments(state, args);
+    }
+
+    fn drawArguments(self: *Renderer, state: *const gpu.State, args: DrawArguments) !void {
+        if (args.count == 0 or args.instances == 0) return;
         const routing = try graphics.routing(state);
         const render = gpu.resources.decodeRenderState(state);
         if (render.color_count == 0 and try self.depthUtilityDraw(state, render, routing)) return;
@@ -462,7 +476,7 @@ pub const Renderer = struct {
         const color_dcc = if (target) |color| surfaces.colorDcc(color) else null;
         if (render.color_control.isMetadataOperation() or (target != null and
             ((state.readRegister(.context, 0x202) != null and !render.color_control.allowsAttachmentWrites(render.target_mask)) or render.color_control.logic_operation != 0xcc))) return error.ColorMetadataAndLogicOpsNotImplemented;
-        if (render.raster.rasterizer_discard or render.raster.polygon_mode != 0 or render.raster.depth_bias_front or render.raster.depth_bias_back or (render.raster.cull_front and render.raster.cull_back)) return error.UnsupportedRasterState;
+        if (render.raster.rasterizer_discard or render.raster.polygon_mode != 0 or (render.raster.cull_front and render.raster.cull_back)) return error.UnsupportedRasterState;
         const topology = try graphics.nativeTopology(render.primitive_type);
         var draw_state = try native.Draw.fullTarget(extent[0], extent[1]);
         draw_state.color_attachment = @intFromBool(target != null);
@@ -508,10 +522,15 @@ pub const Renderer = struct {
             depth_key = .{ .address = depth.read_address, .layout = layout };
         }
         if (target == null and depth_key == null) return error.MissingAttachment;
+        const bias = try graphics.depthBias(render.raster, draw_state.depth_format);
+        draw_state.depth_bias = bias.constant;
+        draw_state.depth_bias_slope = bias.slope;
+        draw_state.depth_bias_clamp = bias.clamp;
         if (target != null) draw_state.blend = try native.blending.decode(state, render.blends[0]);
         draw_state.vertex_count = if (args.index_bytes == 0) args.count else 0;
-        draw_state.instance_count = state.instance_count;
-        draw_state.first_vertex = state.readRegister(.uconfig, 0x24a) orelse 0;
+        draw_state.instance_count = args.instances;
+        draw_state.first_vertex = args.vertex_offset;
+        draw_state.first_instance = args.first_instance;
         draw_state.topology = topology;
         const ngg_rectangle = render.primitive_type == 7 and routing.stage == .export_shader;
         if (ngg_rectangle and args.index_bytes == 0) {
@@ -816,6 +835,9 @@ const DrawArguments = struct {
     count: u32,
     address: u64 = 0,
     index_bytes: u32 = 0,
+    instances: u32 = 1,
+    vertex_offset: u32 = 0,
+    first_instance: u32 = 0,
 
     fn decode(state: *const gpu.State, packet: gpu.pm4.Packet) !DrawArguments {
         const body = packet.body;
@@ -824,7 +846,7 @@ const DrawArguments = struct {
             // Only ordinary auto-index draws; opaque-count/streamout modes
             // require additional state and must not become a guessed count.
             if (body[1] != 2) return error.UnsupportedDrawInitiator;
-            return .{ .count = body[0] };
+            return .{ .count = body[0], .instances = state.instance_count, .vertex_offset = state.readRegister(.uconfig, 0x24a) orelse 0 };
         }
         var args: DrawArguments = undefined;
         var maximum: u32 = undefined;
@@ -845,7 +867,9 @@ const DrawArguments = struct {
             },
             else => return error.IndirectAndMultiDrawNotImplemented,
         }
-        if (args.count == 0 or state.instance_count == 0) return .{ .count = 0 };
+        args.instances = state.instance_count;
+        args.vertex_offset = state.readRegister(.uconfig, 0x24a) orelse 0;
+        if (args.count == 0 or args.instances == 0) return .{ .count = 0 };
         args.index_bytes = switch (state.index_type) {
             0 => 2,
             1 => 4,
@@ -859,6 +883,70 @@ const DrawArguments = struct {
         if (bytes > 64 * 1024 * 1024) return error.IndexBufferTooLarge;
         _ = try std.math.add(u64, args.address, bytes);
         return args;
+    }
+
+    fn indirect(allocator: std.mem.Allocator, memory: Memory, state: *const gpu.State, packet: gpu.pm4.Packet) ![]DrawArguments {
+        const multi = packet.opcode == gpu.pm4.draw_index_indirect_multi or packet.opcode == gpu.pm4.draw_indirect_multi;
+        const body = packet.body;
+        if (body.len != @as(usize, if (multi) 9 else 4)) return error.InvalidDrawPacket;
+        const spec = gpu.pm4.decodeIndirectDrawSpec(packet) orelse return error.InvalidDrawPacket;
+        // The PS5 SDK emits indexed packets with source select 2 as well as
+        // the ordinary indexed 0. The opcode determines the argument layout.
+        const initiator = body[if (multi) 8 else 3];
+        if (initiator != 2 and !(spec.indexed and initiator == 0)) return error.UnsupportedDrawInitiator;
+        // Do not silently ignore the CP's USER_DATA/start-index/draw-ID writes.
+        // 0x280 is SH_NOP; zero is the unused location in legacy packets.
+        for (body[1..3]) |location| if (location != 0 and location != 0x280) return error.IndirectShaderRegisterPatchNotImplemented;
+        if (multi and body[3] & ~@as(u32, (1 << 30) | 0xffff) != 0) return error.IndirectShaderRegisterPatchNotImplemented;
+        if (multi and body[3] & 0xffff != 0 and body[3] & 0xffff != 0x280) return error.IndirectShaderRegisterPatchNotImplemented;
+        const bytes = gpu.pm4.indirectDrawArgBytes(spec.indexed);
+        if (spec.data_offset % 4 != 0 or spec.stride % 4 != 0 or spec.stride < bytes) return error.InvalidIndirectStride;
+        var count = spec.count;
+        if (spec.count_from_memory) {
+            if (spec.count_address == 0 or spec.count_address % 4 != 0) return error.InvalidIndirectCountAddress;
+            _ = try std.math.add(u64, spec.count_address, 4);
+            var value: [4]u8 = undefined;
+            if (!memory.read(memory.context, spec.count_address, &value)) return error.GuestReadFailed;
+            count = @min(count, std.mem.readInt(u32, &value, .little));
+        } else if (spec.count_address != 0) return error.InvalidIndirectCountAddress;
+        // Reject excessive lists rather than silently dropping their tail.
+        if (count > gpu.pm4.maximum_indirect_draw_count) return error.IndirectDrawCountTooLarge;
+        if (count == 0) return allocator.alloc(DrawArguments, 0);
+        if (state.draw_indirect_args_base_address == 0 or state.draw_indirect_args_base_address % 4 != 0) return error.InvalidIndirectArgumentsAddress;
+        const base = try std.math.add(u64, state.draw_indirect_args_base_address, spec.data_offset);
+        const end = try std.math.add(u64, base, @as(u64, count - 1) * spec.stride);
+        _ = try std.math.add(u64, end, bytes);
+        const records = try allocator.alloc(DrawArguments, count);
+        errdefer allocator.free(records);
+        // Decode and validate the whole list before issuing any of its draws.
+        // Padding between records is not read or interpreted as arguments.
+        for (records, 0..) |*record, i| {
+            var data: [20]u8 = undefined;
+            if (!memory.read(memory.context, base + i * @as(u64, spec.stride), data[0..bytes])) return error.GuestReadFailed;
+            if (spec.indexed) {
+                const args = gpu.pm4.parseDrawIndexedIndirectArgs(&data);
+                record.* = .{ .count = args.index_count, .instances = args.instance_count, .vertex_offset = @bitCast(args.base_vertex), .first_instance = args.start_instance };
+                if (args.index_count == 0 or args.instance_count == 0) continue;
+                record.index_bytes = switch (state.index_type) {
+                    0 => 2,
+                    1 => 4,
+                    2 => 1,
+                    3 => return error.UnsupportedIndexType,
+                };
+                if (state.index_buffer_size != 0 and @as(u64, args.start_index) + args.index_count > state.index_buffer_size) return error.IndexCountOutOfBounds;
+                record.address = try std.math.add(u64, state.index_base_address, @as(u64, args.start_index) * record.index_bytes);
+                if (record.address == 0 or record.address % record.index_bytes != 0) return error.InvalidIndexAddress;
+                const index_size = @as(u64, record.count) * record.index_bytes;
+                if (index_size > 64 * 1024 * 1024) return error.IndexBufferTooLarge;
+                _ = try std.math.add(u64, record.address, index_size);
+            } else {
+                const args = gpu.pm4.parseDrawIndirectArgs(data[0..16]);
+                record.* = .{ .count = args.vertex_count, .instances = args.instance_count, .vertex_offset = args.start_vertex, .first_instance = args.start_instance };
+                if (args.vertex_count != 0 and args.instance_count != 0) _ = try std.math.add(u32, args.start_vertex, args.vertex_count - 1);
+            }
+            if (record.count != 0 and record.instances != 0) _ = try std.math.add(u32, record.first_instance, record.instances - 1);
+        }
+        return records;
     }
 
     fn stageFan(self: DrawArguments, allocator: std.mem.Allocator, memory: Memory, state: *const gpu.State, draw_state: *native.Draw) ![]u8 {
@@ -917,7 +1005,7 @@ const DrawArguments = struct {
         if (restart and reset_index & index_mask != index_mask) return error.CustomPrimitiveRestartNotImplemented;
         draw_state.index_count = self.count;
         draw_state.index_element_bytes = native_bytes;
-        draw_state.base_vertex = @bitCast(state.readRegister(.uconfig, 0x24a) orelse 0);
+        draw_state.base_vertex = @bitCast(self.vertex_offset);
         draw_state.first_vertex = 0;
         draw_state.primitive_restart = @intFromBool(restart);
         // Widen backwards in place so 8-bit source indices are not overwritten.
@@ -1062,4 +1150,86 @@ fn scalarOffset(resolver: *gpu.scalar_resources.Resolver, operand: gpu.ShaderOpe
         .integer_inline_constant, .literal_constant => operand.value,
         else => error.InvalidScalarOffset,
     };
+}
+
+const IndirectTestMemory = struct {
+    data: [256]u8 = @splat(0),
+    fn read(context: ?*anyopaque, address: u64, bytes: []u8) bool {
+        const self: *@This() = @ptrCast(@alignCast(context.?));
+        if (address > self.data.len or bytes.len > self.data.len - address) return false;
+        @memcpy(bytes, self.data[@intCast(address)..][0..bytes.len]);
+        return true;
+    }
+    fn write(_: ?*anyopaque, _: u64, _: []const u8) bool {
+        return false;
+    }
+    fn access(self: *@This()) Memory {
+        return .{ .context = self, .read = read, .write = write };
+    }
+    fn words(self: *@This(), address: usize, values: []const u32) void {
+        for (values, 0..) |value, i| std.mem.writeInt(u32, self.data[address + i * 4 ..][0..4], value, .little);
+    }
+};
+
+test "indirect D3D12 draws use counted padded records and ignore stale direct bases" {
+    const t = std.testing;
+    var memory = IndirectTestMemory{};
+    memory.words(0x10, &.{9});
+    memory.words(0x28, &.{ 5, 2, 2, @bitCast(@as(i32, -9)), 3, 0xdeadbeef });
+    memory.words(0x40, &.{ 0, 7, 0xffffffff, 0, 0 });
+    var state = gpu.State{ .draw_indirect_args_base_address = 0x20, .index_base_address = 0x1000, .index_buffer_size = 7, .instance_count = 99 };
+    try state.writeRegister(.uconfig, 0x24a, 123);
+    var body = [_]u32{ 8, 0x280, 0x280, 1 << 30, 2, 0x10, 0, 24, 2 };
+    const packet = gpu.pm4.Packet{ .kind = .command, .header = 0, .opcode = gpu.pm4.draw_index_indirect_multi, .body = &body };
+    const draws = try DrawArguments.indirect(t.allocator, memory.access(), &state, packet);
+    defer t.allocator.free(draws);
+    try t.expectEqual(@as(usize, 2), draws.len);
+    try t.expectEqual(@as(u64, 0x1004), draws[0].address);
+    try t.expectEqual(@as(u32, 5), draws[0].count);
+    try t.expectEqual(@as(u32, 2), draws[0].instances);
+    try t.expectEqual(@as(i32, -9), @as(i32, @bitCast(draws[0].vertex_offset)));
+    try t.expectEqual(@as(u32, 3), draws[0].first_instance);
+    try t.expectEqual(@as(u32, 0), draws[1].count);
+    body[4] = 0; // A maximum of zero must not become an unbounded list.
+    const empty = try DrawArguments.indirect(t.allocator, memory.access(), &state, packet);
+    defer t.allocator.free(empty);
+    try t.expectEqual(@as(usize, 0), empty.len);
+    body[4] = 2;
+    state.index_buffer_size = 6;
+    try t.expectError(error.IndexCountOutOfBounds, DrawArguments.indirect(t.allocator, memory.access(), &state, packet));
+    state.index_buffer_size = 7;
+    body[7] = 18;
+    try t.expectError(error.InvalidIndirectStride, DrawArguments.indirect(t.allocator, memory.access(), &state, packet));
+    body[7] = 24;
+    body[1] = 0x94;
+    try t.expectError(error.IndirectShaderRegisterPatchNotImplemented, DrawArguments.indirect(t.allocator, memory.access(), &state, packet));
+    body[1] = 0x280;
+    body[3] |= 1 << 31;
+    try t.expectError(error.IndirectShaderRegisterPatchNotImplemented, DrawArguments.indirect(t.allocator, memory.access(), &state, packet));
+    body[3] = 0;
+    body[5] = 0;
+    body[4] = gpu.pm4.maximum_indirect_draw_count + 1;
+    try t.expectError(error.IndirectDrawCountTooLarge, DrawArguments.indirect(t.allocator, memory.access(), &state, packet));
+}
+
+test "indirect D3D12 single draws validate argument reads and address arithmetic" {
+    const t = std.testing;
+    var memory = IndirectTestMemory{};
+    memory.words(0x20, &.{ 3, 4, 7, 11 });
+    var state = gpu.State{ .draw_indirect_args_base_address = 0x20 };
+    var body = [_]u32{ 0, 0x280, 0x280, 2 };
+    var packet = gpu.pm4.Packet{ .kind = .command, .header = 0, .opcode = gpu.pm4.draw_indirect, .body = &body };
+    const draws = try DrawArguments.indirect(t.allocator, memory.access(), &state, packet);
+    defer t.allocator.free(draws);
+    try t.expectEqual(@as(u32, 3), draws[0].count);
+    try t.expectEqual(@as(u32, 4), draws[0].instances);
+    try t.expectEqual(@as(u32, 7), draws[0].vertex_offset);
+    try t.expectEqual(@as(u32, 11), draws[0].first_instance);
+    state.draw_indirect_args_base_address = 0xf8;
+    try t.expectError(error.GuestReadFailed, DrawArguments.indirect(t.allocator, memory.access(), &state, packet));
+    state.draw_indirect_args_base_address = 0xfffffffffffffff8;
+    body[0] = 16;
+    try t.expectError(error.Overflow, DrawArguments.indirect(t.allocator, memory.access(), &state, packet));
+    packet.body = body[0..3];
+    try t.expectError(error.InvalidDrawPacket, DrawArguments.indirect(t.allocator, memory.access(), &state, packet));
 }

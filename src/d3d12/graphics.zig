@@ -145,6 +145,48 @@ pub const Routing = struct {
     fragment_wave32: bool,
 };
 
+pub const DepthBias = struct { constant: f32 = 0, slope: f32 = 0, clamp: f32 = 0 };
+
+/// PA_SU_POLY_OFFSET uses 1/16-pixel slope units. Its D16 fixed and D32
+/// floating formats agree with native bias units when their precision matches
+/// the DSV. Native creation checks float-bias support for non-integral values.
+pub fn depthBias(raster: gpu.resources.RasterState, format: u32) !DepthBias {
+    const front = if (raster.depth_bias_front) [2]f32{ raster.depth_bias_front_offset, raster.depth_bias_front_scale } else [2]f32{ 0, 0 };
+    const back = if (raster.depth_bias_back) [2]f32{ raster.depth_bias_back_offset, raster.depth_bias_back_scale } else [2]f32{ 0, 0 };
+    if (!raster.cull_front and !raster.cull_back and !std.meta.eql(front, back)) return error.IndependentDepthBiasNotImplemented;
+    const selected = if (raster.cull_front) back else front;
+    if (selected[0] == 0 and selected[1] == 0) return .{};
+    if (!std.math.isFinite(selected[0]) or !std.math.isFinite(selected[1]) or !std.math.isFinite(raster.depth_bias_clamp)) return error.InvalidDepthBias;
+    if (!((raster.depth_bias_format == 0x1e9 and format == 40) or
+        (raster.depth_bias_format == 0xf0 and format == 55))) return error.UnsupportedDepthBiasFormat;
+    return .{ .constant = selected[0], .slope = selected[1] / 16, .clamp = raster.depth_bias_clamp };
+}
+
+test "depth bias converts matching precision and selects only surviving faces" {
+    const t = std.testing;
+    var raster = gpu.resources.RasterState{ .depth_bias_front = true, .depth_bias_back = true, .depth_bias_format = 0x1e9, .depth_bias_front_offset = 4, .depth_bias_back_offset = 4, .depth_bias_front_scale = 32, .depth_bias_back_scale = 32, .depth_bias_clamp = 0.25 };
+    try t.expectEqual(DepthBias{ .constant = 4, .slope = 2, .clamp = 0.25 }, try depthBias(raster, 40));
+    try t.expectError(error.UnsupportedDepthBiasFormat, depthBias(raster, 55));
+    raster.depth_bias_back_offset = -3;
+    try t.expectError(error.IndependentDepthBiasNotImplemented, depthBias(raster, 40));
+    raster.cull_back = true;
+    try t.expectEqual(@as(f32, 4), (try depthBias(raster, 40)).constant);
+    raster.cull_back = false;
+    raster.cull_front = true;
+    try t.expectEqual(@as(f32, -3), (try depthBias(raster, 40)).constant);
+    raster.depth_bias_back_offset = 1.5;
+    try t.expectEqual(@as(f32, 1.5), (try depthBias(raster, 40)).constant);
+    raster.depth_bias_back_offset = std.math.inf(f32);
+    try t.expectError(error.InvalidDepthBias, depthBias(raster, 40));
+    raster.depth_bias_back_offset = 2147483648.0;
+    try t.expectEqual(@as(f32, 2147483648.0), (try depthBias(raster, 40)).constant);
+    raster.depth_bias_back_offset = -4;
+    raster.depth_bias_format = 0xf0;
+    try t.expectEqual(@as(f32, -4), (try depthBias(raster, 55)).constant);
+    raster.depth_bias_back = false;
+    try t.expectEqual(DepthBias{}, try depthBias(raster, 0));
+}
+
 pub const Interface = struct {
     mask: u32 = 0,
     controls: [32]u32 = undefined,

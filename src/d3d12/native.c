@@ -70,7 +70,7 @@ typedef struct ShaderEntry {
 /* Fixed-size words, not a native descriptor with pointers/padding. All other
  * PSO state is fixed by graphics_desc; dynamic constants/resources are rebound
  * on every draw and are deliberately absent from this key. */
-typedef struct PipelineKey { uint64_t words[36]; } PipelineKey;
+typedef struct PipelineKey { uint64_t words[39]; } PipelineKey;
 typedef struct PipelineEntry {
     PipelineKey key;
     uint64_t used;
@@ -84,7 +84,7 @@ struct Ps5D3D12 {
     CompileFn compile;
     CreateBlobFn create_blob;
     Ps5Dxc *dxc;
-    uint32_t shader_model, wave_ops;
+    uint32_t shader_model, wave_ops, float_depth_bias;
     IDXGIFactory4 *factory;
     ID3D12Device *device;
     ID3D12CommandQueue *queue;
@@ -646,6 +646,9 @@ int32_t ps5_d3d12_create(Ps5D3D12 **out, Ps5D3D12Info *info, int debug, char *er
     }
     info->shader_model = c->shader_model;
     info->wave_ops = c->wave_ops;
+    D3D12_FEATURE_DATA_D3D12_OPTIONS16 bias_options = {0};
+    if (SUCCEEDED(ID3D12Device_CheckFeatureSupport(c->device, D3D12_FEATURE_D3D12_OPTIONS16, &bias_options, sizeof(bias_options))))
+        c->float_depth_bias = bias_options.DynamicDepthBiasSupported;
     if (debug) TRY(ID3D12Device_QueryInterface(c->device, &IID_ID3D12InfoQueue, (void **)&c->messages));
     D3D12_COMMAND_QUEUE_DESC queue = {0};
     queue.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
@@ -1160,6 +1163,73 @@ static D3D12_GRAPHICS_PIPELINE_STATE_DESC graphics_desc(ID3D12RootSignature *roo
     desc.SampleDesc.Count = 1;
     return desc;
 }
+
+/* Zig's MinGW header has OPTIONS16 but not RASTERIZER_DESC1. Keep the public
+ * ABI locally named: FLOAT DepthBias, subobject 27, pointer-aligned stream.
+ * https://microsoft.github.io/DirectX-Specs/d3d/VulkanOn12.html */
+typedef struct Ps5RasterizerDesc1 {
+    D3D12_FILL_MODE FillMode;
+    D3D12_CULL_MODE CullMode;
+    BOOL FrontCounterClockwise;
+    FLOAT DepthBias, DepthBiasClamp, SlopeScaledDepthBias;
+    BOOL DepthClipEnable, MultisampleEnable, AntialiasedLineEnable;
+    UINT ForcedSampleCount;
+    D3D12_CONSERVATIVE_RASTERIZATION_MODE ConservativeRaster;
+} Ps5RasterizerDesc1;
+#define PS5_PSO_FIELD(T, name) union { struct { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE kind; T data; } value; void *alignment; } name
+static HRESULT graphics_pipeline_bias(Ps5D3D12 *c, D3D12_GRAPHICS_PIPELINE_STATE_DESC *desc, float bias, ID3D12PipelineState **pipeline) {
+    if ((double)bias >= INT_MIN && (double)bias <= INT_MAX && truncf(bias) == bias) {
+        desc->RasterizerState.DepthBias = (INT)bias;
+        return ID3D12Device_CreateGraphicsPipelineState(c->device, desc, &IID_ID3D12PipelineState, (void **)pipeline);
+    }
+    if (!c->float_depth_bias) return failure(c, DXGI_ERROR_UNSUPPORTED, "fractional depth bias requires D3D12 OPTIONS16 DynamicDepthBiasSupported");
+    ID3D12Device2 *device2 = NULL;
+    HRESULT hr = ID3D12Device_QueryInterface(c->device, &IID_ID3D12Device2, (void **)&device2);
+    if (FAILED(hr)) return hr;
+    struct {
+        PS5_PSO_FIELD(ID3D12RootSignature *, root);
+        PS5_PSO_FIELD(D3D12_SHADER_BYTECODE, vs);
+        PS5_PSO_FIELD(D3D12_SHADER_BYTECODE, ps);
+        PS5_PSO_FIELD(D3D12_SHADER_BYTECODE, gs);
+        PS5_PSO_FIELD(D3D12_BLEND_DESC, blend);
+        PS5_PSO_FIELD(UINT, mask);
+        PS5_PSO_FIELD(Ps5RasterizerDesc1, raster);
+        PS5_PSO_FIELD(D3D12_DEPTH_STENCIL_DESC, depth);
+        PS5_PSO_FIELD(D3D12_INPUT_LAYOUT_DESC, layout);
+        PS5_PSO_FIELD(D3D12_INDEX_BUFFER_STRIP_CUT_VALUE, strip);
+        PS5_PSO_FIELD(D3D12_PRIMITIVE_TOPOLOGY_TYPE, topology);
+        PS5_PSO_FIELD(struct D3D12_RT_FORMAT_ARRAY, targets);
+        PS5_PSO_FIELD(DXGI_FORMAT, dsv);
+        PS5_PSO_FIELD(DXGI_SAMPLE_DESC, samples);
+    } stream = {0};
+#define PS5_PSO_SET(name, tag, source) do { stream.name.value.kind = tag; stream.name.value.data = source; } while (0)
+    PS5_PSO_SET(root, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, desc->pRootSignature);
+    PS5_PSO_SET(vs, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, desc->VS);
+    PS5_PSO_SET(ps, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, desc->PS);
+    PS5_PSO_SET(gs, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS, desc->GS);
+    PS5_PSO_SET(blend, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, desc->BlendState);
+    PS5_PSO_SET(mask, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, desc->SampleMask);
+    stream.raster.value.kind = (D3D12_PIPELINE_STATE_SUBOBJECT_TYPE)27;
+    const D3D12_RASTERIZER_DESC *r = &desc->RasterizerState;
+    stream.raster.value.data = (Ps5RasterizerDesc1){r->FillMode, r->CullMode, r->FrontCounterClockwise, bias,
+        r->DepthBiasClamp, r->SlopeScaledDepthBias, r->DepthClipEnable, r->MultisampleEnable,
+        r->AntialiasedLineEnable, r->ForcedSampleCount, r->ConservativeRaster};
+    PS5_PSO_SET(depth, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, desc->DepthStencilState);
+    PS5_PSO_SET(layout, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT, desc->InputLayout);
+    PS5_PSO_SET(strip, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_IB_STRIP_CUT_VALUE, desc->IBStripCutValue);
+    PS5_PSO_SET(topology, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, desc->PrimitiveTopologyType);
+    stream.targets.value.kind = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS;
+    stream.targets.value.data.NumRenderTargets = desc->NumRenderTargets;
+    memcpy(stream.targets.value.data.RTFormats, desc->RTVFormats, sizeof(desc->RTVFormats));
+    PS5_PSO_SET(dsv, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, desc->DSVFormat);
+    PS5_PSO_SET(samples, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, desc->SampleDesc);
+#undef PS5_PSO_SET
+    D3D12_PIPELINE_STATE_STREAM_DESC input = { sizeof(stream), &stream };
+    hr = ID3D12Device2_CreatePipelineState(device2, &input, &IID_ID3D12PipelineState, (void **)pipeline);
+    release(device2);
+    return hr;
+}
+#undef PS5_PSO_FIELD
 
 static HRESULT graphics_pipeline(Ps5D3D12 *c, int depth) {
     HRESULT hr;
@@ -1686,7 +1756,8 @@ static HRESULT record_draw(Ps5D3D12 *c, DrawBatch *batch, const uint32_t *vertex
     for (UINT i = 0; i < 4; ++i) if (d->stencil.front[i] < 1 || d->stencil.front[i] > 8 ||
         d->stencil.back[i] < 1 || d->stencil.back[i] > 8) return E_INVALIDARG;
     if ((d->clear_flags & 1) && (!d->depth_format || !isfinite(d->clear_depth) || d->clear_depth < 0 || d->clear_depth > 1)) return E_INVALIDARG;
-    if (d->depth_write > 1 || d->depth_clip_enabled > 1 || d->depth_compare < 1 || d->depth_compare > 8 ||
+    if (!isfinite(d->depth_bias) || !isfinite(d->depth_bias_clamp) || !isfinite(d->depth_bias_slope) ||
+        d->depth_write > 1 || d->depth_clip_enabled > 1 || d->depth_compare < 1 || d->depth_compare > 8 ||
         (d->depth_format == 0 ? (depth_bytes != 0 || d->depth_write != 0) :
         ((d->depth_format != DXGI_FORMAT_D16_UNORM && d->depth_format != DXGI_FORMAT_D32_FLOAT) || !depth_pixels ||
         (uint64_t)d->width * d->height * depth_bpp != depth_bytes))) return E_INVALIDARG;
@@ -1721,6 +1792,10 @@ static HRESULT record_draw(Ps5D3D12 *c, DrawBatch *batch, const uint32_t *vertex
     TRY(compile_spirv(c, fragment, fragment_count, SpvExecutionModelFragment, buffer_count, image_count, d->dynamic_scalars, &ps, &ps_id));
     const D3D12_INDEX_BUFFER_STRIP_CUT_VALUE strip_cut = !d->primitive_restart ? D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED :
         d->index_element_bytes == 2 ? D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFF : D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFFFFFF;
+    uint32_t bias_bits, bias_clamp_bits, bias_slope_bits;
+    memcpy(&bias_bits, &d->depth_bias, sizeof(bias_bits));
+    memcpy(&bias_clamp_bits, &d->depth_bias_clamp, sizeof(bias_clamp_bits));
+    memcpy(&bias_slope_bits, &d->depth_bias_slope, sizeof(bias_slope_bits));
     const PipelineKey key = {{2, vs_id, ps_id, buffer_count, image_count, d->cull_mode, d->front_ccw != 0,
         d->write_mask, blend->enabled, blend->source_color, blend->destination_color, blend->color_operation,
         blend->source_alpha, blend->destination_alpha, blend->alpha_operation, strip_cut,
@@ -1728,7 +1803,8 @@ static HRESULT record_draw(Ps5D3D12 *c, DrawBatch *batch, const uint32_t *vertex
         d->rectangle_completion, d->rectangle_mask, has_stencil, d->stencil.enabled,
         d->stencil.read_mask, d->stencil.write_mask,
         d->stencil.front[0], d->stencil.front[1], d->stencil.front[2], d->stencil.front[3],
-        d->stencil.back[0], d->stencil.back[1], d->stencil.back[2], d->stencil.back[3], d->check_dispatcher, d->color_attachment}};
+        d->stencil.back[0], d->stencil.back[1], d->stencil.back[2], d->stencil.back[3], d->check_dispatcher, d->color_attachment,
+        bias_bits, bias_clamp_bits, bias_slope_bits}};
     if (!cached_pipeline(c, &key, &root, &pipeline)) {
         const ULONGLONG started = GetTickCount64();
         TRY(guest_graphics_root(c, buffer_count, image_count, d->dynamic_scalars, d->check_dispatcher, &root));
@@ -1752,6 +1828,8 @@ static HRESULT record_draw(Ps5D3D12 *c, DrawBatch *batch, const uint32_t *vertex
         pipeline_desc.RasterizerState.CullMode = d->cull_mode;
         pipeline_desc.RasterizerState.DepthClipEnable = d->depth_clip_enabled != 0;
         pipeline_desc.RasterizerState.FrontCounterClockwise = d->front_ccw != 0;
+        pipeline_desc.RasterizerState.DepthBiasClamp = d->depth_bias_clamp;
+        pipeline_desc.RasterizerState.SlopeScaledDepthBias = d->depth_bias_slope;
         pipeline_desc.BlendState.RenderTarget[0].RenderTargetWriteMask = (UINT8)d->write_mask;
         pipeline_desc.BlendState.RenderTarget[0].BlendEnable = blend->enabled != 0;
         pipeline_desc.BlendState.RenderTarget[0].SrcBlend = blend->source_color;
@@ -1761,7 +1839,7 @@ static HRESULT record_draw(Ps5D3D12 *c, DrawBatch *batch, const uint32_t *vertex
         pipeline_desc.BlendState.RenderTarget[0].DestBlendAlpha = blend->destination_alpha;
         pipeline_desc.BlendState.RenderTarget[0].BlendOpAlpha = blend->alpha_operation;
         pipeline_desc.IBStripCutValue = strip_cut;
-        TRY(ID3D12Device_CreateGraphicsPipelineState(c->device, &pipeline_desc, &IID_ID3D12PipelineState, (void **)&pipeline));
+        TRY(graphics_pipeline_bias(c, &pipeline_desc, d->depth_bias, &pipeline));
         c->cache_stats.pipeline_ms += GetTickCount64() - started;
         remember_pipeline(c, &key, root, pipeline);
     }
