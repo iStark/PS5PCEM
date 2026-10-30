@@ -1282,6 +1282,13 @@ pub fn scePthreadCreate(
         );
         return kernelStatus(err);
     };
+    // Thread-set audit for bring-up: PS5_TRACE=Pthread names every guest thread
+    // with its entry point, which is what a comparison against a working
+    // emulator's thread list needs.
+    if (trace.announces("scePthreadCreate")) {
+        const thread_name = cName(name);
+        std.debug.print("[pthread] created name={s} entry=0x{x}\n", .{ thread_name, entry_point });
+    }
     return errno.ok;
 }
 
