@@ -4,7 +4,7 @@
   <p><strong>Experimental PlayStation 5 emulation and interoperability research in Zig</strong></p>
   <p>Native guest execution · RDNA2 shader translation · Vulkan / DirectX 12 rendering · Windows / Linux launchers</p>
   <p>
-    <a href="https://github.com/iStark/PS5PCEM/releases/tag/v0.3.5"><img src="https://img.shields.io/github/v/release/iStark/PS5PCEM?include_prereleases&style=flat-square&color=3b95ff" alt="Latest release"></a>
+    <a href="https://github.com/iStark/PS5PCEM/releases/tag/v0.3.6"><img src="https://img.shields.io/github/v/release/iStark/PS5PCEM?include_prereleases&style=flat-square&color=3b95ff" alt="Latest release"></a>
     <img src="https://img.shields.io/badge/platform-Windows%20%2F%20Linux%20x64-3b95ff?style=flat-square" alt="Windows / Linux x64">
     <img src="https://img.shields.io/badge/Zig-0.16-f7a41d?style=flat-square" alt="Zig 0.16">
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-GPL--3.0--or--later-6f7782?style=flat-square" alt="GPL-3.0-or-later"></a>
@@ -12,7 +12,7 @@
     <img src="https://img.shields.io/badge/status-early%20prototype-e6a23c?style=flat-square" alt="Early prototype">
   </p>
   <p>
-    <a href="https://github.com/iStark/PS5PCEM/releases/tag/v0.3.5"><strong>Download prototype</strong></a>
+    <a href="https://github.com/iStark/PS5PCEM/releases/tag/v0.3.6"><strong>Download prototype</strong></a>
     · <a href="docs/README.md">Documentation</a>
     · <a href="docs/project-status.md">Compatibility status</a>
     · <a href="https://github.com/iStark/PS5PCEM/issues">Report an issue</a>
@@ -43,7 +43,7 @@ whether the host can run Vulkan before a title is started, naming the device it
 found, offers separate **Extract PKG** and **Extract ZAR** buttons, and asks
 GitHub Releases whether a newer version is available.
 
-Development builds also offer **Vulkan / DirectX 12** in the Windows library and Settings.
+Version 0.3.6 offers **Vulkan / DirectX 12** in the Windows library and Settings.
 DirectX 12 is an experimental native backend with limited PM4 and shader support;
 it is not ready for normal gameplay. Vulkan remains the default. See the
 [D3D12 implementation and validation notes](docs/architecture/d3d12.md).
@@ -132,13 +132,13 @@ subsystem internals are indexed in the
 
 ## Download
 
-The current Windows and Linux x64 prototype is **0.3.5**:
+The current Windows and Linux x64 prototype is **0.3.6**:
 
-- [Portable ZIP](https://github.com/iStark/PS5PCEM/releases/download/v0.3.5/PS5PCEM-0.3.5-windows-x64-portable.zip)
-- [Per-user installer](https://github.com/iStark/PS5PCEM/releases/download/v0.3.5/PS5PCEM-0.3.5-windows-x64-setup.exe)
-- Linux: [DEB](https://github.com/iStark/PS5PCEM/releases/download/v0.3.5/PS5PCEM-0.3.5-linux-x64.deb) · [RPM](https://github.com/iStark/PS5PCEM/releases/download/v0.3.5/PS5PCEM-0.3.5-linux-x64.rpm) · [Pacman](https://github.com/iStark/PS5PCEM/releases/download/v0.3.5/PS5PCEM-0.3.5-linux-x64.pacman) · [AppImage](https://github.com/iStark/PS5PCEM/releases/download/v0.3.5/PS5PCEM-0.3.5-linux-x64.AppImage)
-- [SHA-256 checksums](https://github.com/iStark/PS5PCEM/releases/download/v0.3.5/SHA256SUMS.txt)
-- [Release notes](docs/release-notes/v0.3.5.md)
+- [Portable ZIP](https://github.com/iStark/PS5PCEM/releases/download/v0.3.6/PS5PCEM-0.3.6-windows-x64-portable.zip)
+- [Per-user installer](https://github.com/iStark/PS5PCEM/releases/download/v0.3.6/PS5PCEM-0.3.6-windows-x64-setup.exe)
+- Linux: [DEB](https://github.com/iStark/PS5PCEM/releases/download/v0.3.6/PS5PCEM-0.3.6-linux-x64.deb) · [RPM](https://github.com/iStark/PS5PCEM/releases/download/v0.3.6/PS5PCEM-0.3.6-linux-x64.rpm) · [Pacman](https://github.com/iStark/PS5PCEM/releases/download/v0.3.6/PS5PCEM-0.3.6-linux-x64.pacman) · [AppImage](https://github.com/iStark/PS5PCEM/releases/download/v0.3.6/PS5PCEM-0.3.6-linux-x64.AppImage)
+- [SHA-256 checksums](https://github.com/iStark/PS5PCEM/releases/download/v0.3.6/SHA256SUMS.txt)
+- [Release notes](docs/release-notes/v0.3.6.md)
 
 The prototype requires Windows 10 2004 or newer, an x86-64-v3 CPU (AVX2, BMI2
 and FMA), and a current Vulkan 1.2-capable graphics driver. The applications and
@@ -176,7 +176,7 @@ Games, firmware, keys, system libraries, and console software are not included.
 | [Project status and compatibility](docs/project-status.md) | Screenshots, measured title milestones, and current limits |
 | [Implementation status](docs/implementation-status.md) | What the emulator can do, subsystem by subsystem |
 | [Architecture](docs/README.md#architecture) | RDNA2, GPU, Vulkan, memory, loader, HLE, CPU, diagnostics, and runtime internals |
-| [Release notes](docs/release-notes/v0.3.5.md) | Changes in the latest packaged prototype |
+| [Release notes](docs/release-notes/v0.3.6.md) | Changes in the latest packaged prototype |
 | [License and legal note](docs/legal.md) | GPL obligations, bundled dependencies, and project scope |
 
 Architecture reference:

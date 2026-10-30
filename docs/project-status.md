@@ -6,11 +6,12 @@ Development captures and the furthest repeatable point reached in each observed
 title. What the emulator can do subsystem by subsystem is listed separately in
 [Implementation status](implementation-status.md).
 
-**Release 0.3.5:** includes the Linux runtime and GTK launcher, Windows controller
-vibration and LightBar, audio corrections, renderer optimizations and 15 newly
-documented titles. See the [complete changes since 0.3.4](release-notes/v0.3.5.md)
-and [release checks](development/release-0.3.5-validation.md). Existing game grades
-and dated FPS results are unchanged by the release preparation.
+**Release 0.3.6:** adds the experimental Windows DirectX 12 backend, PKG/ZAR
+extraction in both launchers, twelve languages, FPS limits and motion input,
+plus Vulkan graphics/performance and save fixes. See the
+[complete changes since 0.3.5](release-notes/v0.3.6.md) and
+[release checks](development/release-0.3.6-validation.md). Dated FPS results
+retain their original scene, API and build scope; packaging is not a new benchmark.
 
 ## Compatibility and progress
 

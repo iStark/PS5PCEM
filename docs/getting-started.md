@@ -41,11 +41,12 @@ built for verification, but the publishing script rejects it:
 ```
 
 The portable archive and installer contain only `ps5pcem.exe`, `game-run.exe`,
-`pkgextractor.exe`, documentation, licensing, version, and branding files. Generated settings,
+`pkgextractor.exe`, the matching `dxcompiler.dll` / `dxil.dll` runtime,
+documentation, licensing, version, and branding files. Generated settings,
 caches, and savedata are intentionally not packaged.
 
 Linux builds and the DEB/RPM/Pacman/AppImage packaging workflow are documented
-in the [Linux guide](linux.md). Build both platforms before publishing 0.3.5:
+in the [Linux guide](linux.md). Build both platforms before publishing 0.3.6:
 the publishing script requires all six packages and matching SHA-256 entries.
 
 ## Usage

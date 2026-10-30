@@ -1,6 +1,8 @@
 # Linux packages
 
-PS5PCEM 0.3.5 includes a native x86-64 runner, GTK 3 launcher and PKG extractor.
+PS5PCEM 0.3.6 includes a native x86-64 runner, GTK 3 launcher and PKG/ZAR extractor.
+Both launchers offer twelve languages and 30/60/120 FPS limits. Linux uses
+Vulkan; the experimental DirectX 12 backend and Sony motion input are Windows-only.
 The Linux port is experimental; Windows game results are not Linux compatibility
 or performance claims.
 
@@ -21,14 +23,14 @@ through your distribution first. It can run without FUSE using
 
 ```sh
 # Debian / Ubuntu
-sudo apt install ./PS5PCEM-0.3.5-linux-x64.deb
+sudo apt install ./PS5PCEM-0.3.6-linux-x64.deb
 # Fedora
-sudo dnf install ./PS5PCEM-0.3.5-linux-x64.rpm
+sudo dnf install ./PS5PCEM-0.3.6-linux-x64.rpm
 # Arch Linux (the .pacman file is a standard zstd-compressed package)
-sudo pacman -U ./PS5PCEM-0.3.5-linux-x64.pacman
+sudo pacman -U ./PS5PCEM-0.3.6-linux-x64.pacman
 # AppImage
-chmod +x PS5PCEM-0.3.5-linux-x64.AppImage
-./PS5PCEM-0.3.5-linux-x64.AppImage
+chmod +x PS5PCEM-0.3.6-linux-x64.AppImage
+./PS5PCEM-0.3.6-linux-x64.AppImage
 ```
 
 Installed packages add PS5PCEM to the desktop applications menu. The `ps5pcem`,
