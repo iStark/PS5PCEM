@@ -10305,6 +10305,13 @@ const Builder = struct {
     fn flatLoadWords(self: *Builder, inst: instruction.Instruction, count: u8) Error!void {
         if (inst.memory_segment == 1) return self.scratchWords(inst, count, false);
         if (self.flat_memory_bindings.len != 0) return self.absoluteFlatLoadWords(inst, count);
+        if (inst.src1.kind != .sgpr) {
+            // An absolute pointer-form FLAT read can only be served by a
+            // captured snapshot. Without one, refuse to translate rather than
+            // silently answering zero, unless the caller opted into that for a
+            // shader whose unreachable branch contains the read.
+            if (!self.zero_unmapped_flat_loads) return Error.UnsupportedBufferAddressing;
+        }
         if (self.zero_unmapped_flat_loads and inst.src1.kind != .sgpr) {
             const zero = try self.constant(.bits32, 0);
             for (0..count) |index| {
@@ -17103,7 +17110,11 @@ test "cross-dword short load and store lower as two byte accesses" {
     const storage = [_]StorageBufferBinding{.{ .resource_sgpr = 4, .descriptor_index = 0 }};
     var module = try translate(std.testing.allocator, &program, .{ .stage = .compute, .storage_buffers = &storage });
     defer module.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 2), countOpcode(module.words, 62)); // two byte stores
+    // Each byte lands through a masked atomic insert so lanes writing
+    // neighbouring bytes of the same word do not lose each other.
+    try std.testing.expectEqual(@as(usize, 2), countOpcode(module.words, 240)); // OpAtomicAnd mask
+    try std.testing.expectEqual(@as(usize, 2), countOpcode(module.words, 241)); // OpAtomicOr insert
+    try std.testing.expect(!containsOpcode(module.words, 62)); // no plain word store
     try std.testing.expect(containsOpcode(module.words, 195)); // signed extension
 }
 
