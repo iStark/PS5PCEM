@@ -25,6 +25,9 @@ test "GLOBAL metadata page spans retain edge fields without overflowing" {
     try std.testing.expectEqual(PageRange{ .address = 0x2000, .size = 4096 }, pageRange(0x24f0, 172).?);
     try std.testing.expectEqual(PageRange{ .address = 0x2000, .size = 8192 }, pageRange(0x2ff0, 772).?);
     try std.testing.expectEqual(PageRange{ .address = 0x2000, .size = 4096 }, pageRange(0x2000, 4096).?);
+    const indexed_tail = pageRange(0x3f00, maximum_bytes).?;
+    try std.testing.expect(0x3f00 + 332 >= indexed_tail.address);
+    try std.testing.expect(0x3f00 + 332 + 16 <= indexed_tail.address + indexed_tail.size);
     try std.testing.expect(pageRange(0, 16) == null);
     try std.testing.expect(pageRange(0x2000, 0) == null);
     try std.testing.expect(pageRange(0x2000, maximum_bytes + 1) == null);
@@ -42,8 +45,8 @@ fn entryPair(code: []const rdna2.Instruction, graph: *const rdna2.control_flow.G
 }
 
 /// The SMEM accesses establish the extent of a parameter block, not the
-/// range of every possible GLOBAL address. The backend validates and captures
-/// its containing pages; reads outside them still fault. No guest bytes or
+/// range of every possible GLOBAL address. The backend validates a bounded
+/// window for the indexed tail; reads outside it still fault. No guest bytes or
 /// pointer values are cached here, and rewritten USER_DATA pairs are rejected.
 pub fn collect(code: []const rdna2.Instruction, graph: *const rdna2.control_flow.Graph, first: u32, count: u32, output: []Region) usize {
     return collectCached(code, graph, first, count, output, null);

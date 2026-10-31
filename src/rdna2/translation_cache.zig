@@ -44,6 +44,31 @@ fn appendMappedKey(key: *std.ArrayList(u8), allocator: std.mem.Allocator, values
     for (values) |value| try appendValue(key, allocator, mapper.map(value));
 }
 
+/// A runtime V# lookup emits the first binding's address/format rules and
+/// selects the descriptor from its SSBO table. The remaining candidates are
+/// validation inputs, not code variants. Validate the complete list before
+/// calling this; preserve its first-binding order and all non-table entries.
+fn appendStorageKey(key: *std.ArrayList(u8), allocator: std.mem.Allocator, bindings: []const rdna2.spirv.StorageBufferBinding) std.mem.Allocator.Error!void {
+    const has_lookup = for (bindings) |binding| {
+        if (binding.lookup != null) break true;
+    } else false;
+    if (!has_lookup) return appendMappedKey(key, allocator, bindings, StorageKey{});
+    const count_offset = key.items.len;
+    try appendValue(key, allocator, @as(usize, 0));
+    var count: usize = 0;
+    for (bindings, 0..) |binding, index| {
+        if (binding.lookup != null) {
+            const redundant = for (bindings[0..index]) |previous| {
+                if (previous.resource_sgpr == binding.resource_sgpr and previous.instruction_pc == binding.instruction_pc) break true;
+            } else false;
+            if (redundant) continue;
+        }
+        try appendValue(key, allocator, (StorageKey{}).map(binding));
+        count += 1;
+    }
+    @memcpy(key.items[count_offset..][0..@sizeOf(usize)], std.mem.asBytes(&count));
+}
+
 /// A dynamic scalar's array index is also its uniform-buffer word. Call this
 /// before both translation and upload, never only while constructing a key.
 /// Provenance can discover the same producer/register set in different orders
@@ -284,7 +309,7 @@ pub const Cache = struct {
         key_options.sampled_images = &.{};
         try appendValue(&self.key, allocator, key_options);
         try appendMappedKey(&self.key, allocator, options.sampled_images, SampledKey{});
-        try appendMappedKey(&self.key, allocator, options.storage_buffers, StorageKey{});
+        try appendStorageKey(&self.key, allocator, options.storage_buffers);
         try appendMappedKey(&self.key, allocator, options.scalar_registers, ScalarKey{ .dynamic = options.dynamic_scalar_binding != null });
         self.sequence +%= 1;
         const prefix_bytes = if (borrowed) |prefix| prefix.bytes else self.key.items[0..serialized_prefix_length];
@@ -511,6 +536,59 @@ test "runtime buffer lookup changes reuse words and still reject invalid candida
     try std.testing.expectError(error.InvalidStorageBinding, cache.acquire(a, &program, options, .{}));
     try std.testing.expectEqual(@as(u64, 1), cache.misses);
     try std.testing.expectEqual(@as(u64, 4), cache.hits);
+}
+
+test "runtime buffer candidate counts share translations but validate the full table" {
+    const a = std.testing.allocator;
+    var cache = Cache{};
+    defer cache.deinit(a);
+    var program = try rdna2.decodeProgram(a, &.{ 0xe030_2000, 0x8002_0100, 0xbf81_0000 });
+    defer program.deinit(a);
+    const table = rdna2.spirv.buffer_lookup.Binding{ .descriptor_index = 7, .word_offset = 11, .mask = 7, .probes = 8 };
+    var bindings: [4]rdna2.spirv.StorageBufferBinding = undefined;
+    for (&bindings, 0..) |*binding, index| binding.* = .{
+        .resource_sgpr = 8,
+        .descriptor_index = @intCast(index),
+        .stride = 4,
+        .candidate_words = .{ @as(u32, @intCast(index + 1)) * 4096, 0x40000, 4, 0x5204 },
+        .lookup = table,
+    };
+    var options = rdna2.spirv.Options{ .stage = .compute, .storage_buffers = bindings[0..1], .descriptor_array_length = 8 };
+    const first = try cache.acquire(a, &program, options, .{});
+    defer first.release();
+    for ([_]usize{ 4, 2, 3, 1 }) |count| {
+        options.storage_buffers = bindings[0..count];
+        const hit = try cache.acquire(a, &program, options, .{});
+        defer hit.release();
+        try std.testing.expect(first.sameModule(hit));
+        var fresh = try rdna2.translateProgramSpirv(a, &program, options);
+        defer fresh.deinit(a);
+        try std.testing.expectEqualSlices(u32, first.view().words, fresh.words);
+    }
+    options.storage_buffers = &bindings;
+    const saved = bindings[3];
+    bindings[3].stride = 8;
+    try std.testing.expectError(error.InvalidStorageBinding, cache.acquire(a, &program, options, .{}));
+    bindings[3] = saved;
+    bindings[3].candidate_words = bindings[0].candidate_words;
+    try std.testing.expectError(error.InvalidStorageBinding, cache.acquire(a, &program, options, .{}));
+    bindings[3] = saved;
+    bindings[3].descriptor_index = 8;
+    try std.testing.expectError(error.InvalidStorageBinding, cache.acquire(a, &program, options, .{}));
+    bindings[3] = saved;
+    bindings[3].lookup.?.word_offset += 1;
+    try std.testing.expectError(error.InvalidStorageBinding, cache.acquire(a, &program, options, .{}));
+    bindings[3] = saved;
+    try std.testing.expectEqual(@as(u64, 1), cache.misses);
+    // The first candidate remains significant: it supplies the safe fallback
+    // descriptor used when a lookup misses, even though the result is masked.
+    std.mem.swap(rdna2.spirv.StorageBufferBinding, &bindings[0], &bindings[1]);
+    const changed = try cache.acquire(a, &program, options, .{});
+    defer changed.release();
+    try std.testing.expect(!first.sameModule(changed));
+    var fresh = try rdna2.translateProgramSpirv(a, &program, options);
+    defer fresh.deinit(a);
+    try std.testing.expectEqualSlices(u32, changed.view().words, fresh.words);
 }
 
 test "dynamic buffer extents share translations while address and format rules remain keyed" {

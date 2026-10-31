@@ -1190,6 +1190,7 @@ const maximum_guest_buffers = maximum_storage_descriptors;
 const maximum_retained_buffer_entries = 8192;
 pub const maximum_storage_descriptors = 64;
 pub export var batched_storage_occupancy: bool = true;
+pub export var stable_metadata_slots: bool = true;
 
 fn storageOccupancyMask(occupied: *const [maximum_storage_descriptors]bool) u64 {
     // Reading byte lanes avoids the per-lane boolean normalization generated
@@ -1223,8 +1224,10 @@ test "descriptor occupancy preserves sparse slots lowest match and exact ranges"
         try std.testing.expectEqual(mask, storageOccupancyMask(&resources.occupied));
         batched_storage_occupancy = false;
         const expected_free = resources.freeDescriptor();
+        const expected_metadata = resources.freeMetadataDescriptor();
         batched_storage_occupancy = true;
         try std.testing.expectEqual(expected_free, resources.freeDescriptor());
+        try std.testing.expectEqual(expected_metadata, resources.freeMetadataDescriptor());
         for (0..15) |index| for ([_]usize{ 0, 4, 8, 12, 16 }) |size| {
             const address = 0x1000 + index * 64;
             batched_storage_occupancy = false;
@@ -1234,6 +1237,38 @@ test "descriptor occupancy preserves sparse slots lowest match and exact ranges"
         };
     }
 }
+test "metadata slots survive changing candidate counts and mixed bank exhaustion" {
+    const previous = stable_metadata_slots;
+    defer stable_metadata_slots = previous;
+    stable_metadata_slots = true;
+    const resources = try std.testing.allocator.create(ComputeResources);
+    defer std.testing.allocator.destroy(resources);
+    resources.* = .{};
+    for ([_]usize{ 0, 1, 7, 16, 35, 60 }) |candidates| {
+        @memset(&resources.occupied, false);
+        for (0..candidates) |_| {
+            const slot = resources.freeDescriptor().?;
+            resources.occupied[slot] = true;
+        }
+        for (0..3) |index| {
+            const slot = resources.freeMetadataDescriptor().?;
+            try std.testing.expectEqual(@as(u32, @intCast(63 - index)), slot);
+            try std.testing.expect(!resources.occupied[slot]);
+            resources.occupied[slot] = true;
+        }
+        for (candidates + 3..64) |index| {
+            const slot = if (index % 2 == 0) resources.freeDescriptor().? else resources.freeMetadataDescriptor().?;
+            try std.testing.expect(!resources.occupied[slot]);
+            resources.occupied[slot] = true;
+        }
+        try std.testing.expectEqual(@as(?u32, null), resources.freeDescriptor());
+        try std.testing.expectEqual(@as(?u32, null), resources.freeMetadataDescriptor());
+    }
+    resources.occupied[23] = false;
+    stable_metadata_slots = false;
+    try std.testing.expectEqual(resources.freeDescriptor(), resources.freeMetadataDescriptor());
+}
+
 const maximum_storage_images = rdna2.spirv.maximum_storage_images;
 const dynamic_scalar_descriptor_binding = 2 + maximum_storage_images;
 const sampled_image_3d_descriptor_binding = dynamic_scalar_descriptor_binding + 1;
@@ -5086,6 +5121,24 @@ const ComputeResources = struct {
         }
         for (self.occupied, 0..) |used, index| {
             if (!used) return @intCast(index);
+        }
+        return null;
+    }
+
+    /// Runtime candidate buffers grow from the start of the bank. Allocate
+    /// shader metadata from its other end so a different candidate count does
+    /// not renumber every pointer snapshot and lookup table in the SPIR-V.
+    /// Both allocators consult the same occupancy, including interleaved use.
+    fn freeMetadataDescriptor(self: *const ComputeResources) ?u32 {
+        if (!@atomicLoad(bool, &stable_metadata_slots, .monotonic)) return self.freeDescriptor();
+        if (@atomicLoad(bool, &batched_storage_occupancy, .monotonic)) {
+            const free = ~storageOccupancyMask(&self.occupied);
+            return if (free == 0) null else @intCast(63 - @clz(free));
+        }
+        var index: usize = self.occupied.len;
+        while (index != 0) {
+            index -= 1;
+            if (!self.occupied[index]) return @intCast(index);
         }
         return null;
     }
@@ -11007,7 +11060,7 @@ pub const Renderer = struct {
             const total_groups = std.math.mul(u64, groups, group_count[2]) catch return Error.GuestBufferTooLarge;
             const bytes = std.math.mul(u64, total_groups, lds_bytes) catch return Error.GuestBufferTooLarge;
             if (bytes == 0 or bytes > 16 * 1024 * 1024) return Error.GuestBufferTooLarge;
-            lds_slot = resources.freeDescriptor() orelse return Error.InvalidStorageDescriptor;
+            lds_slot = resources.freeMetadataDescriptor() orelse return Error.InvalidStorageDescriptor;
             spilled_lds = try self.createBuffer(bytes, vk.buffer_usage_storage_buffer_bit | vk.buffer_usage_transfer_src_bit, vk.memory_property_device_local_bit);
             self.updateStorageDescriptorRange(lds_slot.?, spilled_lds.?.handle, 0, bytes);
             resources.occupied[lds_slot.?] = true;
@@ -13158,7 +13211,7 @@ pub const Renderer = struct {
                 pages[order[end]] >> 32 == base >> 32) : (end += 1)
             {}
             const size = (end - first) * 4096;
-            const slot = result.freeDescriptor() orelse return Error.InvalidStorageDescriptor;
+            const slot = result.freeMetadataDescriptor() orelse return Error.InvalidStorageDescriptor;
             const upload = try self.allocateDrawUpload(size + 8);
             const mapping = try self.mapDrawUpload(upload);
             defer mapping.release(self);
@@ -13296,7 +13349,7 @@ pub const Renderer = struct {
             std.mem.writeInt(u32, bytes[12..16], @intCast(snapshot.bytes.len), .little);
             @memcpy(bytes[16..][0..snapshot.bytes.len], snapshot.bytes);
             @memset(bytes[16 + snapshot.bytes.len ..], 0);
-            const slot = result.freeDescriptor() orelse return Error.InvalidStorageDescriptor;
+            const slot = result.freeMetadataDescriptor() orelse return Error.InvalidStorageDescriptor;
             self.updateStorageDescriptorRange(slot, upload.buffer, upload.offset + offset, size);
             result.occupied[slot] = true;
             result.flat_memories[result.flat_memory_count] = .{ .descriptor_index = slot, .fault_record_word = if (first) @intCast((16 + payload_size) / 4) else null };
@@ -13391,17 +13444,18 @@ pub const Renderer = struct {
         var regions: [16]gpu.global_metadata.Region = undefined;
         const count = gpu.global_metadata.collectCached(instructions, &analysis.graph, bindings.scalar_user_data_base, bindings.user_data_count, &regions, analysis.scalar_definitions);
         if (count == 0) return;
-        var size: usize = 0;
-        for (regions[0..count]) |region| size = @max(size, std.mem.alignForward(usize, region.size + 4095, 4096));
-        var scratch: [4096]u8 = undefined;
-        const allocation = if (size > scratch.len) try self.allocator.alloc(u8, size) else null;
-        defer if (allocation) |bytes| self.allocator.free(bytes);
-        const bytes = allocation orelse scratch[0..size];
+        // A fixed SMEM field is only evidence of a parameter root, not the
+        // end of its dynamically indexed table. Use a bounded 64 KiB window
+        // from that root, checking every containing page. This is real guest
+        // memory, not a zero-filled allocation or an inferred array length.
+        const bytes = try self.allocator.alloc(u8, gpu.global_metadata.maximum_bytes + 4096);
+        defer self.allocator.free(bytes);
         for (regions[0..count]) |region| {
             const index = region.register - bindings.scalar_user_data_base;
             const address = @as(u64, bindings.user_data[index]) | (@as(u64, bindings.user_data[index + 1] & 0xffff) << 32);
             if (address == 0 or address > @as(u64, 0x0000_ffff_ffff_ffff) - region.size) continue;
-            const range = gpu.global_metadata.pageRange(address, region.size) orelse continue;
+            const span: u32 = @intCast(@min(gpu.global_metadata.maximum_bytes, @as(u64, 0x0000_ffff_ffff_ffff) - address));
+            const range = gpu.global_metadata.pageRange(address, span) orelse continue;
             // This dispatch must see preceding GPU writes. An unreadable
             // inactive root remains absent; an executed read still faults.
             const previous_failure = self.last_shader_read_failure;
@@ -13421,10 +13475,11 @@ pub const Renderer = struct {
             }
             if (run) |start| try self.stageFlatSnapshots(result, &[_]Snapshot{.{ .address = range.address + start, .bytes = bytes[start..range.size] }});
         }
+        if (result.flat_memory_count == 0) try self.stageFlatMaterialPage(result, 0, &.{});
     }
 
     fn stageFlatMaterialPage(self: *Renderer, result: *ComputeResources, address: u64, bytes: []const u8) anyerror!void {
-        const slot = result.freeDescriptor() orelse return Error.InvalidStorageDescriptor;
+        const slot = result.freeMetadataDescriptor() orelse return Error.InvalidStorageDescriptor;
         if (result.flat_memory_count == result.flat_memories.len) return Error.InvalidStorageDescriptor;
         const first = result.flat_memory_count == 0;
         const upload = try self.allocateDrawUpload(16 + bytes.len + @as(usize, if (first) 16 else 0));
@@ -13725,7 +13780,7 @@ pub const Renderer = struct {
             std.mem.writeInt(u32, destination[12..16], @intCast(region.size), .little);
             try reader.read(region.address, destination[16..][0..region.size]);
             if (index == 0) @memset(destination[region.size + 16 ..], 0);
-            const slot = result.freeDescriptor() orelse return Error.InvalidStorageDescriptor;
+            const slot = result.freeMetadataDescriptor() orelse return Error.InvalidStorageDescriptor;
             self.updateStorageDescriptorRange(slot, upload.buffer, cursor, destination.len);
             result.occupied[slot] = true;
             result.flat_memories[result.flat_memory_count] = .{
@@ -13767,7 +13822,7 @@ pub const Renderer = struct {
         for (plan.groups.values()) |group| total_words += lookup.capacity(group.count) * lookup.entry_words;
         if (total_words == 0) return;
         // Lack of a table slot leaves the existing complete comparison path.
-        const slot = resources.freeDescriptor() orelse return;
+        const slot = resources.freeMetadataDescriptor() orelse return;
         const upload = try self.allocateDrawUpload(total_words * 4);
         const mapping = try self.mapDrawUpload(upload);
         defer mapping.release(self);
@@ -13831,7 +13886,7 @@ pub const Renderer = struct {
         for (plan.groups.values()) |group| total_words += lookup.capacity(group.count) * lookup.entry_words;
         if (total_words == 0) return;
         // A saturated descriptor set retains complete literal comparisons.
-        const slot = resources.freeDescriptor() orelse return;
+        const slot = resources.freeMetadataDescriptor() orelse return;
         const upload = try self.allocateDrawUpload(total_words * 4);
         const mapping = try self.mapDrawUpload(upload);
         defer mapping.release(self);
@@ -13910,7 +13965,7 @@ pub const Renderer = struct {
 
     fn prepareUnboundImageFault(self: *Renderer, result: *ComputeResources) anyerror!u32 {
         if (result.sampled_image_fault_slot) |slot| return slot;
-        const slot = result.freeDescriptor() orelse return Error.InvalidStorageDescriptor;
+        const slot = result.freeMetadataDescriptor() orelse return Error.InvalidStorageDescriptor;
         const upload = try self.allocateDrawUpload(16);
         const mapping = try self.mapDrawUpload(upload);
         defer mapping.release(self);
@@ -14907,7 +14962,7 @@ pub const Renderer = struct {
                 dynamic = dynamic or binding.candidate_words != null or binding.lookup != null;
             }
             if (!mapped or dynamic) continue;
-            const counter_descriptor = resources.freeDescriptor() orelse continue;
+            const counter_descriptor = resources.freeMetadataDescriptor() orelse continue;
             const entry = found: {
                 var candidates = self.guest_buffer_address_index.candidates(self.guest_buffers.items, resources.addresses[index]);
                 while (candidates.next()) |slot| {
