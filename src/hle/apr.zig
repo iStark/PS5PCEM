@@ -983,7 +983,11 @@ fn findFileLocked(identifier: u32) ?*FileEntry {
 }
 
 fn expectSubmissionReady(identifier: u32) !void {
-    for (0..2000) |_| {
+    // A deferred batch may run hundreds of per-byte file operations. Count
+    // yields are not a time bound: 2000 of them elapse in well under a
+    // millisecond on an idle host. Use a wall-clock budget instead.
+    const deadline = std.Io.Timestamp.now(std.testing.io, .awake).nanoseconds + 10 * std.time.ns_per_s;
+    while (std.Io.Timestamp.now(std.testing.io, .awake).nanoseconds < deadline) {
         lock.lock();
         const ready = for (submissions) |submission| {
             if (submission.active and submission.identifier == identifier) break submission.complete;
