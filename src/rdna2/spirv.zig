@@ -15197,7 +15197,8 @@ test "GETPC SETPC continuation still exports position" {
         .vertex_index_vgpr = 0,
     });
     defer module.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 1), countOpcode(module.words, 62)); // OpStore Position
+    // The vertex prolog initializes Position and the export overwrites it.
+    try std.testing.expectEqual(@as(usize, 2), countOpcode(module.words, 62)); // OpStore Position
 }
 
 test "merged NGG vertex prolog reaches its position export" {
@@ -15251,7 +15252,8 @@ test "merged NGG vertex prolog reaches its position export" {
 
     // The wave-info read no longer rejects the program, the primitive export is
     // dropped rather than translated, and the position still reaches Vulkan.
-    try std.testing.expectEqual(@as(usize, 1), countOpcode(module.words, 62)); // OpStore Position
+    // Prolog zero-init, then the position export.
+    try std.testing.expectEqual(@as(usize, 2), countOpcode(module.words, 62)); // OpStore Position
     try std.testing.expect(containsOpcode(module.words, 111)); // OpConvertSToF from V5
     // Position, VertexIndex and InstanceIndex are decorated: a vertex prolog
     // selects between the latter two, so neither may be left undefined.
@@ -15303,7 +15305,9 @@ test "vertex PARAM export and fragment interpolation share a location" {
     // and extracts ATTR0 in the PS instead of manufacturing screen-space UVs.
     try std.testing.expectEqual(@as(usize, 2), countOpcode(vertex_module.words, 71)); // OpDecorate
     try std.testing.expectEqual(@as(usize, 3), countOpcode(vertex_module.words, 62)); // initialize Position/PARAM0, then export PARAM0
-    try std.testing.expectEqual(@as(usize, 3), countOpcode(fragment_module.words, 71)); // OpDecorate
+    // The fragment program exports no color, so only FragCoord and the ATTR0
+    // input are decorated; the color output is created on first EXP.
+    try std.testing.expectEqual(@as(usize, 2), countOpcode(fragment_module.words, 71)); // OpDecorate
     try std.testing.expectEqual(@as(usize, 2), countOpcode(fragment_module.words, 61)); // OpLoad
     try std.testing.expectEqual(@as(usize, 2), countOpcode(fragment_module.words, 81)); // OpCompositeExtract
 }
@@ -17073,7 +17077,12 @@ test "MUBUF glc controls atomic return-value writeback" {
         const atomic_result = firstInstructionOperand(module.words, 234, 1).?;
         const stored_value = firstInstructionOperand(module.words, 62, 1).?;
         if (glc) {
-            try std.testing.expectEqual(atomic_result, stored_value);
+            // The EXEC/OOB guard merges the atomic result through a phi, so the
+            // store reads that phi rather than the atomic's own result id.
+            const phi_result = firstInstructionOperand(module.words, 245, 1).?;
+            const phi_atomic = firstInstructionOperand(module.words, 245, 2).?;
+            try std.testing.expectEqual(atomic_result, phi_atomic);
+            try std.testing.expectEqual(phi_result, stored_value);
         } else {
             try std.testing.expect(atomic_result != stored_value);
         }
