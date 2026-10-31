@@ -28,3 +28,21 @@ Validation before the repeat run:
 
 The repeat game run is pending. Reaching character control and a sustained
 gameplay FPS improvement are **not yet verified** by this change.
+
+## Reviewed upstream contributions
+
+Five commits from `kleinergoo7/PS5PCEM` were cherry-picked with authorship
+preserved: `cf6daec`, `21f25a4`, `181d48c`, `13d7f01`, and `d717347`.
+They add opt-in thread-name tracing, restore rejection of unsnapshotted
+absolute FLAT reads, update shader assertions to the current lowering, and
+use a wall-clock deadline for deferred APR tests. The resulting tree passes
+all 316 RDNA2 tests in ReleaseSafe and all 25 APR tests in ReleaseFast.
+
+`bc712a0` (commit reserved GPU memory on demand) is not included. A reserved
+virtual range is not evidence that an arbitrary GPU read should create its
+backing. The read hook is also used for speculative resource discovery;
+automatically committing zero-filled pages there can conceal missing
+mappings or bad descriptors. A per-access 512 MiB limit does not bound
+cumulative commitment. This needs a demonstrated guest mapping/lazy-commit
+contract and coverage of aliases, holes, context ownership and memory budgets
+before it can become default behavior.
