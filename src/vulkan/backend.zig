@@ -10979,6 +10979,7 @@ pub const Renderer = struct {
             try self.prepareCheckedBvhMemory(resources, reader, analysis);
         if (resources.flat_memory_count == 0)
             try self.prepareVectorFlatMemory(resources, reader, analysis);
+        try self.prepareGlobalMetadata(resources, &bindings, reader, analysis);
         // A dispatcher that reaches its guard must not silently leave a
         // partly written image for subsequent passes. Reuse the checked
         // memory fault record for programs that may need bounded control flow.
@@ -13382,6 +13383,29 @@ pub const Renderer = struct {
             }
         }
         try self.stageFlatSnapshots(result, snapshots.items);
+    }
+
+    fn prepareGlobalMetadata(self: *Renderer, result: *ComputeResources, bindings: *const gpu.ShaderBindings, reader: gpu.ShaderMemoryReader, analysis: *const gpu.ShaderAnalysis) anyerror!void {
+        const instructions = analysis.program.instructions.items;
+        if (!gpu.resource_checkpoints.hasFlatMemoryReads(instructions, if (analysis.resource_checkpoints) |*plan| plan else null)) return;
+        var regions: [16]gpu.global_metadata.Region = undefined;
+        const count = gpu.global_metadata.collect(instructions, &analysis.graph, bindings.scalar_user_data_base, bindings.user_data_count, &regions);
+        if (count == 0) return;
+        const bytes = try self.allocator.alloc(u8, gpu.global_metadata.maximum_bytes);
+        defer self.allocator.free(bytes);
+        for (regions[0..count]) |region| {
+            const index = region.register - bindings.scalar_user_data_base;
+            const address = @as(u64, bindings.user_data[index]) | (@as(u64, bindings.user_data[index + 1] & 0xffff) << 32);
+            if (address == 0 or address > @as(u64, 0x0000_ffff_ffff_ffff) - region.size) continue;
+            // This dispatch must see preceding GPU writes. An unreadable
+            // inactive root remains absent; an executed read still faults.
+            const previous_failure = self.last_shader_read_failure;
+            defer self.last_shader_read_failure = previous_failure;
+            try self.flushGuestStorageRange(address, region.size);
+            reader.read(address, bytes[0..region.size]) catch continue;
+            const Snapshot = struct { address: u64, bytes: []const u8 };
+            try self.stageFlatSnapshots(result, &[_]Snapshot{.{ .address = address, .bytes = bytes[0..region.size] }});
+        }
     }
 
     fn stageFlatMaterialPage(self: *Renderer, result: *ComputeResources, address: u64, bytes: []const u8) anyerror!void {

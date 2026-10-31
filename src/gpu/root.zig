@@ -48,6 +48,7 @@ pub const ShaderAnalysis = shader_analysis.Analysis;
 pub const index_bounds = @import("index_bounds.zig");
 pub const scalar_resources = @import("scalar_resources.zig");
 pub const vector_resources = @import("vector_resources.zig");
+pub const global_metadata = @import("global_metadata.zig");
 pub const ShaderSpirvStage = shader_analysis.SpirvStage;
 pub const ShaderSpirvStorageBufferBinding = shader_analysis.SpirvStorageBufferBinding;
 pub const ShaderSpirvSampledImageBinding = shader_analysis.SpirvSampledImageBinding;
