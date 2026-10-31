@@ -11838,7 +11838,8 @@ fn runSceneBitsetPointerProbe(allocator: std.mem.Allocator) !void {
     std.debug.print("Scene bitset FLAT snapshots passed: runtime levels, stride extraction, last valid words, relocation, descriptor bounds and unmapped-read rejection\n", .{});
 }
 
-fn runBufferTableProbe(allocator: std.mem.Allocator) !void {
+// Keep the independent probes' large renderer frames off main's stack.
+noinline fn runBufferTableProbe(allocator: std.mem.Allocator) !void {
     try runBufferLookupProbe(allocator);
     try runBufferTableCase(allocator, false);
     try runBufferTableCase(allocator, true);
@@ -12038,7 +12039,7 @@ fn runScalarBufferFieldsProbe(allocator: std.mem.Allocator) !void {
     std.debug.print("scalar buffer fields passed: {d} dispatches, unused vector fields, unknown fourth SGPR, runtime offsets and partial-dword bounds\n", .{cases});
 }
 
-fn runScalarBufferTableProbe(allocator: std.mem.Allocator) !void {
+noinline fn runScalarBufferTableProbe(allocator: std.mem.Allocator) !void {
     for ([_]u32{ 2, 64 }) |records| {
         var renderer = try vulkan.Renderer.init(allocator, .{});
         defer renderer.deinit();
@@ -12093,7 +12094,7 @@ fn runScalarBufferTableProbe(allocator: std.mem.Allocator) !void {
     std.debug.print("scalar-buffer descriptor tables passed: lane-selected 592-byte records, duplicate/null entries, table and payload bounds, writes and relocation\n", .{});
 }
 
-fn runBufferLookupProbe(allocator: std.mem.Allocator) !void {
+noinline fn runBufferLookupProbe(allocator: std.mem.Allocator) !void {
     const lookup = gpu.shader_analysis.SpirvBufferLookup;
     const candidates = 128;
     const rows = candidates + 4;
@@ -12115,60 +12116,84 @@ fn runBufferLookupProbe(allocator: std.mem.Allocator) !void {
     for (code, 0..) |word, index| guest.word(0x100 + index * 4, word);
     var analysis = try gpu.shader_analysis.decode(allocator, .{ .context = &guest, .read_fn = GuestMemory.read }, 0x100, code.len);
     defer analysis.deinit(allocator);
-    var bindings: [candidates + 2]gpu.ShaderSpirvStorageBufferBinding = undefined;
-    bindings[0] = .{ .resource_sgpr = 8, .descriptor_index = 0 };
-    bindings[1] = .{ .resource_sgpr = 12, .descriptor_index = 3, .stride = 4 };
-    for (bindings[2..], 0..) |*binding, i| binding.* = .{
-        .resource_sgpr = 4,
-        .descriptor_index = @intCast(1 + i % 2),
-        .stride = 4,
-        .candidate_words = .{ @intCast(0x2000 + i * 256), 0x40000, @intCast(2 + i % 2), 0x5204 },
-        .lookup = .{ .descriptor_index = 4, .word_offset = 0, .mask = @intCast(capacity - 1), .probes = @intCast(capacity) },
-    };
-    var module = try analysis.translateSpirv(allocator, .{
-        .stage = .compute,
-        .wave32 = true,
-        .compute_inputs = .{ .workgroup_id_sgprs = .{ 20, null, null } },
-        .storage_buffers = &bindings,
-    });
-    defer module.deinit(allocator);
-    var table: [capacity * lookup.entry_words]u32 = undefined;
-    for (0..2) |pass| {
-        @memset(&table, 0);
-        for (bindings[2..], 0..) |binding, i| {
-            var words = binding.candidate_words.?;
-            for (&words, 0..) |*word, component| word.* ^= @as(u32, @intCast(pass)) << @intCast(20 + component);
-            lookup.insert(&table, words, binding.descriptor_index);
-            for (words, 0..) |word, component| guest.word(0x10000 + i * 16 + component * 4, word);
-        }
-        for (0..4) |mismatch| {
-            for (0..4) |component| {
-                var word = std.mem.readInt(u32, guest.bytes[0x10000 + component * 4 ..][0..4], .little);
-                if (component == mismatch) word ^= 0x80000000;
-                guest.word(0x10000 + (candidates + mismatch) * 16 + component * 4, word);
+    for ([_]bool{ false, true }) |dynamic_header| {
+        var bindings: [candidates + 2]gpu.ShaderSpirvStorageBufferBinding = undefined;
+        bindings[0] = .{ .resource_sgpr = 8, .descriptor_index = 0 };
+        bindings[1] = .{ .resource_sgpr = 12, .descriptor_index = 3, .stride = 4 };
+        for (bindings[2..], 0..) |*binding, i| binding.* = .{
+            .resource_sgpr = 4,
+            .descriptor_index = @intCast(1 + i % 2),
+            .stride = 4,
+            .candidate_words = .{ @intCast(0x2000 + i * 256), 0x40000, @intCast(2 + i % 2), 0x5204 },
+            .lookup = if (dynamic_header)
+                .{ .descriptor_index = 4, .word_offset = 7, .mask = 0, .probes = 0, .runtime_header = true }
+            else
+                .{ .descriptor_index = 4, .word_offset = 0, .mask = @intCast(capacity - 1), .probes = @intCast(capacity) },
+        };
+        var module = try analysis.translateSpirv(allocator, .{
+            .stage = .compute,
+            .wave32 = true,
+            .compute_inputs = .{ .workgroup_id_sgprs = .{ 20, null, null } },
+            .storage_buffers = &bindings,
+        });
+        defer module.deinit(allocator);
+        var table: [64 + capacity * lookup.entry_words]u32 = undefined;
+        for (0..@as(usize, if (dynamic_header) 10 else 2)) |pass| {
+            @memset(&table, 0);
+            const populated = if (dynamic_header and pass < 4) ([_]usize{ 128, 7, 1, 64 })[pass] else candidates;
+            const entries = lookup.capacity(populated);
+            const payload_word = if (dynamic_header) 16 + pass * 4 else 0;
+            const table_words = payload_word + entries * lookup.entry_words;
+            const payload = table[payload_word..table_words];
+            if (dynamic_header) {
+                table[7] = @intCast(payload_word);
+                table[8] = @intCast(entries - 1);
+                table[9] = @intCast(entries);
+                switch (pass) {
+                    4 => table[8] = 2, // capacity must be a power of two
+                    5 => table[9] += 1, // bounded probe count
+                    6 => table[7] = std.math.maxInt(u32), // wrapped payload offset
+                    7 => table[8] = 65535, // table does not fit the SSBO
+                    9 => table[8] = std.math.maxInt(u32), // wrapped capacity
+                    else => {},
+                }
+            }
+            for (bindings[2..], 0..) |binding, i| {
+                var words = binding.candidate_words.?;
+                for (&words, 0..) |*word, component| word.* ^= @as(u32, @intCast(pass)) << @intCast(20 + component);
+                if (i < populated) lookup.insert(payload, words, binding.descriptor_index);
+                for (words, 0..) |word, component| guest.word(0x10000 + i * 16 + component * 4, word);
+            }
+            for (0..4) |mismatch| {
+                for (0..4) |component| {
+                    var word = std.mem.readInt(u32, guest.bytes[0x10000 + component * 4 ..][0..4], .little);
+                    if (component == mismatch) word ^= 0x80000000;
+                    guest.word(0x10000 + (candidates + mismatch) * 16 + component * 4, word);
+                }
+            }
+            for (table[0..table_words], 0..) |word, i| guest.word(0x14000 + i * 4, word);
+            for (0..3) |i| {
+                guest.word(0x12000 + i * 4, @intCast(100 + i + pass * 1000));
+                guest.word(0x13000 + i * 4, @intCast(200 + i + pass * 1000));
+            }
+            for (0..rows) |i| guest.word(0x16000 + i * 4, 0xcccccccc);
+            const table_bytes = if (dynamic_header and pass == 8) 32 else table_words * 4; // truncated header
+            for ([_][3]u64{ .{ 0, 0x10000, rows * 16 }, .{ 1, 0x12000, 8 }, .{ 2, 0x13000, 12 }, .{ 3, 0x16000, rows * 4 }, .{ 4, 0x14000, table_bytes } }) |buffer|
+                _ = try renderer.stageGuestStorageBufferAt(@intCast(buffer[0]), buffer[1], @intCast(buffer[2]));
+            _ = try renderer.dispatchSpirv(module.words, .{ rows, 1, 1 });
+            var output: [rows * 4]u8 = undefined;
+            try renderer.readbackGuestStorageBuffer(0x16000, &output);
+            for (0..rows) |i| {
+                const valid = (!dynamic_header or pass < 4) and i < populated and i % 4 < 2 + i % 2;
+                const expected: u32 = if (valid) @intCast(100 + (i % 2) * 100 + i % 4 + pass * 1000) else 0;
+                try std.testing.expectEqual(expected, std.mem.readInt(u32, output[i * 4 ..][0..4], .little));
             }
         }
-        for (table, 0..) |word, i| guest.word(0x14000 + i * 4, word);
-        for (0..3) |i| {
-            guest.word(0x12000 + i * 4, @intCast(100 + i + pass * 1000));
-            guest.word(0x13000 + i * 4, @intCast(200 + i + pass * 1000));
-        }
-        for (0..rows) |i| guest.word(0x16000 + i * 4, 0xcccccccc);
-        for ([_][3]u64{ .{ 0, 0x10000, rows * 16 }, .{ 1, 0x12000, 8 }, .{ 2, 0x13000, 12 }, .{ 3, 0x16000, rows * 4 }, .{ 4, 0x14000, table.len * 4 } }) |buffer|
-            _ = try renderer.stageGuestStorageBufferAt(@intCast(buffer[0]), buffer[1], @intCast(buffer[2]));
-        _ = try renderer.dispatchSpirv(module.words, .{ rows, 1, 1 });
-        var output: [rows * 4]u8 = undefined;
-        try renderer.readbackGuestStorageBuffer(0x16000, &output);
-        for (0..rows) |i| {
-            const valid = i < candidates and i % 4 < 2 + i % 2;
-            const expected: u32 = if (valid) @intCast(100 + (i % 2) * 100 + i % 4 + pass * 1000) else 0;
-            try std.testing.expectEqual(expected, std.mem.readInt(u32, output[i * 4 ..][0..4], .little));
-        }
     }
-    std.debug.print("runtime buffer hash lookup passed: 128 colliding candidates, four-word misses, unequal bounds and table relocation\n", .{});
+    std.debug.print("runtime buffer hash lookup passed: collisions, exact misses, unequal bounds, changing capacities and offsets, malformed/truncated runtime headers\n", .{});
 }
 
-fn runBufferTableCase(allocator: std.mem.Allocator, large: bool) !void {
+noinline fn runBufferTableCase(allocator: std.mem.Allocator, large: bool) !void {
     var renderer = try vulkan.Renderer.init(allocator, .{});
     defer renderer.deinit();
     var guest = GuestMemory{};

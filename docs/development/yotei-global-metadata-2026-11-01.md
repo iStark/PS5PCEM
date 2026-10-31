@@ -43,8 +43,8 @@ Validation before the repeat run:
 
 The bounded-window repeat passes the earlier failures before the first flip
 and at flip 758, and continues past the baseline's flip 1023. The original
-faulting program is present in the repeat's translation cache. At flip 1179,
-587,354 compute dispatches and 160,105 draws had translated without a reported
+faulting program is present in the repeat's translation cache. At flip 1185,
+596,881 compute dispatches and 163,487 draws had translated without a reported
 draw, dispatch, flip or synchronization failure. Captures show the Digital
 Deluxe bonus notification and then a dark transition. Character control and
 a sustained gameplay FPS improvement are **not yet verified**.
@@ -73,7 +73,96 @@ and reject malformed secondary candidates.
   allocation and full-bank exhaustion.
 - All 317 RDNA2 tests pass in ReleaseSafe, including the candidate-count reuse
   and fresh-translation comparisons.
-- Runtime validation of these two additional reuse changes is pending.
+- The repeat with both changes passes the original GLOBAL failure and reaches
+  flip 1367. Draw preparation reports unreadable textures during streaming;
+  investigation of those failures is described below. Character control is
+  still unverified.
+
+### Runtime lookup headers
+
+Buffer lookup capacity, probe limits and payload offsets now live in a checked
+SSBO header. Changing a candidate population or moving a table payload can
+reuse the same shader. An unmatched lookup uses the table's known-bound slot
+as a safe address; the existing match predicate still returns zero for loads
+and suppresses stores. The header checks capacity, alignment implied by word
+offsets, table bounds and overflow before entering the probe loop. Static
+lookup lowering retains its prior SPIR-V instruction order.
+
+The translation cache validates every candidate before canonicalization,
+including candidates omitted from its key. Reordering candidates no longer
+specializes the masked fallback slot. On one captured Yōtei program, 21
+resource variants produce 19 distinct modules with the new headers and stable
+fallback. This is a limited reduction, **not a measured gameplay FPS gain**:
+other ordinary descriptor slots and resource shapes still vary.
+
+- All 318 RDNA2 tests pass in ReleaseSafe, including fresh-translation equality
+  across population changes and rejection of malformed secondary candidates.
+- All 268 Vulkan tests pass in ReleaseFast; the ReleaseFast runner builds.
+- The native Vulkan buffer-table probe passes with the validation layer and
+  no reported validation errors. It covers reads, stores, collisions, exact
+  misses, changing table populations and malformed/truncated headers.
+- Captured generated SPIR-V passes `spirv-val --target-env vulkan1.3`.
+- Only the diagnostic `vulkan-smoke` executable receives a larger stack
+  reserve (128 MiB), needed by its expanded independent probe fixtures.
+
+The game repeat using this change has started; sustained FPS and character
+control have not yet been measured in that executable.
+
+## Streaming texture failures and Windows address collisions
+
+In the stable-slot repeat, texture `0x92696e0000` repeatedly failed staging.
+This had an earlier kernel cause: fixed direct-memory mapping at that exact
+address returned `0x8002000c` (`fixed map not owned`). AddressSpace owned
+`0x1000000000..0x9269600000` and `0x926f800000..0xfc00000000`; the intervening
+host allocation contained the runner's own live AddressSpace object at
+`0x926a37fd18`. The texture address therefore collided with host-owned memory,
+rather than merely naming an uncommitted guest mip. The failed batch also
+leaves later streaming work incomplete.
+
+The renderer now reports the first failed source range, mip and layer, plus
+the shader program and T# LOD fields. Detailed source reports are bounded to
+32 per process. Failed reads remain failures; this does not manufacture
+backing or substitute blank texture data.
+
+The next process has uninterrupted host ownership across the observed
+`0x9000000000..0xa000000000` texture window. That avoids this particular
+collision for the repeat, but **does not fix arbitrary Windows ASLR collisions**.
+A permanent address-space solution remains open. Intermediate cached color
+attachments show the tree and fire; they are not proof of final presentation
+or character control. The previous bounded-window run did not log this mapping
+collision, so it should not be attributed to the lookup-header change.
+
+## Completed-buffer pool probe
+
+A live 32/128/32 MiB pool comparison suggests allocation churn can be reduced.
+The 128 MiB interval's three logged frames averaged 13.80 ms allocating and
+5.68 ms freeing buffers, versus 14.70 ms and 15.04 ms in the following 32 MiB
+interval's five logged frames. The first interval included cold compilation,
+and the scene changed throughout; frame counts are not a controlled FPS
+comparison. The original 32 MiB budget was restored and remains the default.
+
+At a warm frame (1353), 1,633 dispatched compute calls still required about
+328 MiB of uploads, 204 MiB of readbacks and 257 ms of fence waits. Removing
+cold pipeline stalls alone will not remove these steady rendering costs.
+
+## Rejected shared-lookup experiment
+
+The next loading frame (1180) took 629,086 ms, including 593,514 ms for 42 cold
+compute pipelines and 27,682 ms for 36 graphics pipeline misses. The run was
+stopped deliberately after reaching flip 1185, to measure compiler changes
+without another game or build competing for resources.
+
+A captured collision shader has seven checked memory regions. Lowering the
+shared snapshot-lookup threshold from 16 regions to four reduced its SPIR-V
+from 3,681,980 to 3,354,644 bytes. Both modules pass `spirv-val` for Vulkan 1.3;
+the regenerated original matches the captured module byte for byte.
+However, sequential uncached pipeline probes on the same RTX 3070 Ti and the
+same probe executable measured 65,878 ms for the modified module versus
+42,092 ms for the original. Peak process commitment was approximately
+3.40 GB versus 3.24 GB. This one controlled pair does not establish performance
+across other shaders, but provides no reason to adopt the lower threshold.
+The experiment remains outside the emulator source. These are compile-only
+measurements, not dispatched GPU time or game FPS.
 
 ## Reviewed upstream contributions
 

@@ -12,7 +12,21 @@ pub const Binding = struct {
     word_offset: u32,
     mask: u32,
     probes: u32,
+    /// word_offset names a host-built {payload_word, mask, probes} header.
+    /// The other two fields must be zero; changing table capacity is data.
+    runtime_header: bool = false,
 };
+pub const header_words = 3;
+pub const maximum_runtime_capacity = 65536;
+
+pub fn validBinding(binding: Binding, entry_size: u32) bool {
+    if (binding.runtime_header) return binding.mask == 0 and binding.probes == 0 and
+        (@as(u64, binding.word_offset) + header_words) * 4 <= std.math.maxInt(u32);
+    return binding.mask != std.math.maxInt(u32) and
+        std.math.isPowerOfTwo(binding.mask + 1) and binding.probes != 0 and
+        binding.probes <= binding.mask + 1 and
+        (@as(u64, binding.word_offset) + (@as(u64, binding.mask) + 1) * entry_size) * 4 <= std.math.maxInt(u32);
+}
 
 pub fn hash(words: [8]u32) u32 {
     var result: u32 = 2166136261;

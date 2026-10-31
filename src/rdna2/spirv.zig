@@ -933,9 +933,7 @@ pub fn validateStorageBufferBindings(bindings: []const StorageBufferBinding, des
         }
         if (binding.lookup) |lookup| {
             if (binding.candidate_words == null or binding.resource_sgpr > 124 or
-                lookup.descriptor_index >= descriptor_count or lookup.mask == std.math.maxInt(u32) or
-                !std.math.isPowerOfTwo(lookup.mask + 1) or lookup.probes == 0 or lookup.probes > lookup.mask + 1 or
-                (@as(u64, lookup.word_offset) + (@as(u64, lookup.mask) + 1) * buffer_lookup.entry_words) * 4 > std.math.maxInt(u32))
+                lookup.descriptor_index >= descriptor_count or !sampled_lookup.validBinding(lookup, buffer_lookup.entry_words))
                 return Error.InvalidStorageBinding;
         }
         for (bindings[0..index]) |previous| {
@@ -1685,9 +1683,7 @@ const Builder = struct {
         var has_sampled_lookup = false;
         for (options.sampled_images) |binding| if (binding.lookup) |lookup| {
             if (lookup.descriptor_index >= options.descriptor_array_length or
-                lookup.mask == std.math.maxInt(u32) or
-                lookup.probes == 0 or lookup.probes > lookup.mask + 1 or
-                !std.math.isPowerOfTwo(lookup.mask + 1) or binding.candidate_words == null)
+                !sampled_lookup.validBinding(lookup, sampled_lookup.entry_words) or binding.candidate_words == null)
                 return Error.InvalidStorageBinding;
             has_sampled_lookup = true;
         };
@@ -6510,6 +6506,29 @@ const Builder = struct {
     fn lookupDescriptor(self: *Builder, lookup: sampled_lookup.Binding, actual: []const u32) Error!u32 {
         const zero = try self.constant(.bits32, 0);
         const one = try self.constant(.bits32, 1);
+        var mask: u32 = undefined;
+        var probes: u32 = undefined;
+        var payload_byte: u32 = undefined;
+        if (lookup.runtime_header) {
+            const header_address = BufferAddress{ .binding = .{ .resource_sgpr = 0, .descriptor_index = lookup.descriptor_index }, .byte_offset = try self.constant(.bits32, lookup.word_offset * 4) };
+            const payload_word = try self.loadBufferWord(header_address, 0);
+            mask = try self.loadBufferWord(header_address, 1);
+            probes = try self.loadBufferWord(header_address, 2);
+            const capacity = try self.addBits(mask, one);
+            const words = try self.shiftRightBits(try self.bufferExtent(header_address), 2);
+            const remaining = try self.bvhBinary(130, self.bits_type, words, payload_word);
+            const entries = try self.bvhBinary(134, self.bits_type, remaining, try self.constant(.bits32, @intCast(actual.len + 1)));
+            // Reject malformed/truncated headers before entering the probe
+            // loop. Subtraction is only used when payload_word <= words;
+            // the bounded capacity also prevents multiplication overflow.
+            var valid = try self.bvhBinary(176, self.bool_type, mask, try self.constant(.bits32, sampled_lookup.maximum_runtime_capacity));
+            valid = try self.logicalAndValue(valid, try self.bvhBinary(170, self.bool_type, try self.bvhBinary(199, self.bits_type, capacity, mask), zero));
+            valid = try self.logicalAndValue(valid, try self.bvhBinary(178, self.bool_type, probes, capacity));
+            valid = try self.logicalAndValue(valid, try self.bvhBinary(178, self.bool_type, payload_word, words));
+            valid = try self.logicalAndValue(valid, try self.bvhBinary(178, self.bool_type, capacity, entries));
+            probes = try self.bvhSelect(self.bits_type, valid, probes, zero);
+            payload_byte = try self.multiplyBits(payload_word, try self.constant(.bits32, 4));
+        }
         var hash = try self.constant(.bits32, 2166136261);
         for (actual) |word| {
             const mixed = self.id();
@@ -6519,7 +6538,7 @@ const Builder = struct {
         }
         const folded = self.id();
         try self.emit(&self.body, 198, &.{ self.bits_type, folded, hash, try self.shiftRightBits(hash, 16) });
-        const first = try self.andBits(folded, lookup.mask);
+        const first = if (lookup.runtime_header) try self.bvhBinary(199, self.bits_type, folded, mask) else try self.andBits(folded, lookup.mask);
         const entry = self.id();
         const header = self.id();
         const body = self.id();
@@ -6542,7 +6561,7 @@ const Builder = struct {
         const within = self.id();
         const pending = self.id();
         try self.emit(&self.body, 170, &.{ self.bool_type, missing, result, zero });
-        try self.emit(&self.body, 176, &.{ self.bool_type, within, iteration, try self.constant(.bits32, lookup.probes) });
+        try self.emit(&self.body, 176, &.{ self.bool_type, within, iteration, if (lookup.runtime_header) probes else try self.constant(.bits32, lookup.probes) });
         try self.emit(&self.body, 167, &.{ self.bool_type, pending, missing, within });
         try self.emit(&self.body, 246, &.{ merge, next, 0 });
         try self.emit(&self.body, 250, &.{ pending, body, merge });
@@ -6550,7 +6569,7 @@ const Builder = struct {
         const record_byte = self.id();
         const byte = self.id();
         try self.emit(&self.body, 132, &.{ self.bits_type, record_byte, index, try self.constant(.bits32, @intCast((actual.len + 1) * 4)) });
-        try self.emit(&self.body, 128, &.{ self.bits_type, byte, record_byte, try self.constant(.bits32, lookup.word_offset * 4) });
+        try self.emit(&self.body, 128, &.{ self.bits_type, byte, record_byte, if (lookup.runtime_header) payload_byte else try self.constant(.bits32, lookup.word_offset * 4) });
         const address = BufferAddress{ .binding = .{ .resource_sgpr = 0, .descriptor_index = lookup.descriptor_index }, .byte_offset = byte };
         const encoded = self.id();
         try self.emit(&self.body, 61, &.{ self.bits_type, encoded, try self.bufferWordPointer(address, 0) });
@@ -6573,9 +6592,9 @@ const Builder = struct {
         const advanced = self.id();
         const attempts = self.id();
         try self.emit(&self.body, 128, &.{ self.bits_type, advanced, index, one });
-        try self.emit(&self.body, 199, &.{ self.bits_type, next_index, advanced, try self.constant(.bits32, lookup.mask) });
+        try self.emit(&self.body, 199, &.{ self.bits_type, next_index, advanced, if (lookup.runtime_header) mask else try self.constant(.bits32, lookup.mask) });
         try self.emit(&self.body, 128, &.{ self.bits_type, attempts, iteration, one });
-        try self.emit(&self.body, 169, &.{ self.bits_type, next_iteration, empty, try self.constant(.bits32, lookup.probes), attempts });
+        try self.emit(&self.body, 169, &.{ self.bits_type, next_iteration, empty, if (lookup.runtime_header) probes else try self.constant(.bits32, lookup.probes), attempts });
         try self.emit(&self.body, 249, &.{header});
         try self.emit(&self.body, 248, &.{merge});
         return result;
@@ -9729,7 +9748,11 @@ const Builder = struct {
             self.uses_nonuniform_storage_buffers = true;
             var actual: [4]u32 = undefined;
             for (&actual, 0..) |*word, i| word.* = try self.source(.{ .kind = .sgpr, .reg = binding.resource_sgpr + @as(u32, @intCast(i)) }, .bits32);
-            var slot = try self.constant(.bits32, binding.descriptor_index);
+            // On a runtime-table miss the access is masked by any_match.
+            // Use the bound table as the safe fallback, so reordering actual
+            // candidates does not create another shader specialization.
+            const fallback = if (binding.lookup) |lookup| (if (lookup.runtime_header) lookup.descriptor_index else binding.descriptor_index) else binding.descriptor_index;
+            var slot = try self.constant(.bits32, fallback);
             var any_match = try self.constantBool(false);
             if (binding.lookup) |lookup| {
                 const encoded = try self.lookupDescriptor(lookup, &actual);

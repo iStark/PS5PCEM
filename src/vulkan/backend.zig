@@ -1191,6 +1191,7 @@ const maximum_retained_buffer_entries = 8192;
 pub const maximum_storage_descriptors = 64;
 pub export var batched_storage_occupancy: bool = true;
 pub export var stable_metadata_slots: bool = true;
+pub export var dynamic_buffer_lookup_headers: bool = true;
 
 fn storageOccupancyMask(occupied: *const [maximum_storage_descriptors]bool) u64 {
     // Reading byte lanes avoids the per-lane boolean normalization generated
@@ -4495,8 +4496,17 @@ const SampledViewPlan = struct {
     }
 
     fn readSource(self: *const SampledViewPlan, memory: GuestMemory, address: u64, destination: []u8) bool {
+        return self.readSourceChecked(memory, address, destination, null);
+    }
+
+    const ReadFailure = struct { address: u64, size: usize, level: u8, layer: u32 };
+
+    fn readSourceChecked(self: *const SampledViewPlan, memory: GuestMemory, address: u64, destination: []u8, failure: ?*ReadFailure) bool {
         if (memory.read(memory.context, address, destination)) return true;
-        if (self.volume) return false;
+        if (self.volume) {
+            if (failure) |out| out.* = .{ .address = address, .size = destination.len, .level = self.base_level, .layer = 0 };
+            return false;
+        }
         // Array slices retain the full resource stride even when their high
         // mips are absent. Copy only the blocks addressed by this view. The
         // intervening bytes are never sampled or used by the detiler.
@@ -4508,7 +4518,11 @@ const SampledViewPlan = struct {
                     self.texture.source_layer_bytes + mip.offset);
                 const size: usize = @intCast(mip.storage_bytes);
                 if (start > destination.len or size > destination.len - start or
-                    !memory.read(memory.context, address + start, destination[start..][0..size])) return false;
+                    !memory.read(memory.context, address + start, destination[start..][0..size]))
+                {
+                    if (failure) |out| out.* = .{ .address = address + start, .size = size, .level = @intCast(self.base_level + index), .layer = @intCast(self.first_layer + layer) };
+                    return false;
+                }
             }
         }
         return true;
@@ -6747,6 +6761,7 @@ pub const Renderer = struct {
     excessive_draw_reports: u8 = 0,
     last_dispatch_error: ?anyerror = null,
     last_shader_read_failure: ?struct { address: u64, size: usize, caller: usize } = null,
+    sampled_source_failure_reports: u32 = 0,
     last_draw_error: ?anyerror = null,
     last_sync_error: ?anyerror = null,
     last_flip_error: ?anyerror = null,
@@ -13818,7 +13833,10 @@ pub const Renderer = struct {
                 .dimension = 0,
             }, index);
         }
-        var total_words: usize = 0;
+        const dynamic_headers = @atomicLoad(bool, &dynamic_buffer_lookup_headers, .monotonic);
+        const header_words = rdna2.spirv.sampled_lookup.header_words;
+        const header_size = if (dynamic_headers) plan.groups.count() * header_words else 0;
+        var total_words: usize = header_size;
         for (plan.groups.values()) |group| total_words += lookup.capacity(group.count) * lookup.entry_words;
         if (total_words == 0) return;
         // Lack of a table slot leaves the existing complete comparison path.
@@ -13833,9 +13851,13 @@ pub const Renderer = struct {
         plan.table.items.len = total_words;
         const table = plan.table.items;
         @memset(table, 0);
-        var cursor: usize = 0;
-        for (plan.groups.values()) |members| {
+        var cursor: usize = header_size;
+        for (plan.groups.values(), 0..) |members, group_index| {
             const entries = lookup.capacity(members.count);
+            if (dynamic_headers) {
+                std.debug.assert(entries <= rdna2.spirv.sampled_lookup.maximum_runtime_capacity);
+                @memcpy(table[group_index * header_words ..][0..header_words], &[_]u32{ @intCast(cursor), @intCast(entries - 1), @intCast(entries) });
+            }
             const group = table[cursor..][0 .. entries * lookup.entry_words];
             var index = members.first;
             while (index != sampled_lookup_plan.end) : (index = plan.next.items[index]) {
@@ -13844,9 +13866,13 @@ pub const Renderer = struct {
             }
             index = members.first;
             while (index != sampled_lookup_plan.end) : (index = plan.next.items[index]) {
-                // Capacity is stable across changing descriptor values. An
-                // empty record terminates a failed probe early in the shader.
-                mappings[index].lookup = .{ .descriptor_index = slot, .word_offset = @intCast(cursor), .mask = @intCast(entries - 1), .probes = @intCast(entries) };
+                // Group order follows instruction order. Headers keep both
+                // payload relocation and changing capacity out of SPIR-V.
+                // The static path remains available for a controlled replay.
+                mappings[index].lookup = if (dynamic_headers)
+                    .{ .descriptor_index = slot, .word_offset = @intCast(group_index * header_words), .mask = 0, .probes = 0, .runtime_header = true }
+                else
+                    .{ .descriptor_index = slot, .word_offset = @intCast(cursor), .mask = @intCast(entries - 1), .probes = @intCast(entries) };
             }
             cursor += group.len;
         }
@@ -28288,7 +28314,7 @@ pub const Renderer = struct {
                     sampledGraphicsWriteTarget(render_target_write, extra_colors, image_descriptor.address),
                 ) catch |err| {
                     std.debug.print(
-                        "[vulkan dcb] stageSampledImage failed: {s} pc=0x{x} dim={s} addr=0x{x} {d}x{d}x{d} pitch={d} fmt={d} type={s} tile={f} levels={d}..{d} base_array={d} dst={any} sampler(clamp={d}/{d}/{d} unorm={any} minmag={d}/{d} mip={d} lod={d:.3}..{d:.3})\n",
+                        "[vulkan dcb] stageSampledImage failed: {s} pc=0x{x} dim={s} addr=0x{x} {d}x{d}x{d} pitch={d} fmt={d} type={s} tile={f} levels={d}..{d} base_array={d} dst={any} sampler(clamp={d}/{d}/{d} unorm={any} minmag={d}/{d} mip={d} lod={d:.3}..{d:.3}) program=0x{x} stage={s} min_lod={d} max_mip={d} extended={any}\n",
                         .{
                             @errorName(err),
                             inst.pc,
@@ -28314,8 +28340,14 @@ pub const Renderer = struct {
                             sampler_descriptor.mip_filter,
                             sampler_descriptor.minimum_lod,
                             sampler_descriptor.maximum_lod,
+                            bindings.program_address,
+                            @tagName(bindings.stage),
+                            image_descriptor.min_lod,
+                            image_descriptor.max_mip,
+                            image_descriptor.extended,
                         },
                     );
+                    if (self.trace_resource_failures) self.reportResourceFailure(bindings, inst.*, sampled_scalar);
                     return err;
                 };
                 self.frame_profile.sampled_stage_ns +|= elapsedHostNanoseconds(sampled_started);
@@ -34819,7 +34851,12 @@ pub const Renderer = struct {
                     dumpDiagnosticBytes(self.allocator, prefix, ".layout", std.mem.asBytes(&plan.texture)) catch {};
                 }
             }
-            if (!plan.readSource(memory, descriptor.address, tiled)) {
+            var read_failure: SampledViewPlan.ReadFailure = undefined;
+            if (!plan.readSourceChecked(memory, descriptor.address, tiled, &read_failure)) {
+                if (self.sampled_source_failure_reports < 32) {
+                    self.sampled_source_failure_reports += 1;
+                    std.debug.print("[vulkan sampled source] texture=0x{x} unreadable=0x{x}+0x{x} mip={d} layer={d} first_resident={d} source_bytes=0x{x}\n", .{ descriptor.address, read_failure.address, read_failure.size, read_failure.level, read_failure.layer, plan.first_resident_level + plan.base_level, source_bytes });
+                }
                 if (descriptor.tile_mode != .depth) return Error.GuestMemoryReadFailed;
                 source_available = false;
                 fillUnbackedDepthSample(descriptor.unified_format, linear);
@@ -50406,7 +50443,12 @@ test "streamed sampled views read only resident mips across array gaps" {
         for (linear[linear.len / 2 ..]) |byte| try std.testing.expectEqual(@as(u8, 0x79), byte);
     }
     reader.resident -= 1;
-    try std.testing.expect(!plan.readSource(.{ .context = &reader, .read = Reader.read, .write = Reader.write }, 0, tiled));
+    var failure: SampledViewPlan.ReadFailure = undefined;
+    try std.testing.expect(!plan.readSourceChecked(.{ .context = &reader, .read = Reader.read, .write = Reader.write }, 0, tiled, &failure));
+    try std.testing.expectEqual(texture.levels[2].offset, failure.address);
+    try std.testing.expectEqual(texture.levels[2].storage_bytes, failure.size);
+    try std.testing.expectEqual(@as(u8, 2), failure.level);
+    try std.testing.expectEqual(@as(u32, 0), failure.layer);
 }
 
 test "unnormalized guest samplers satisfy Vulkan restrictions" {
