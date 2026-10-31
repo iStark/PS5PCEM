@@ -14330,7 +14330,9 @@ test "float transcendental VOP1 operations use explicit SPIR-V math" {
 
     var module = try translate(std.testing.allocator, &program, .{ .stage = .compute });
     defer module.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 11), countOpcode(module.words, 12)); // OpExtInst
+    // One explicit libm call per op, plus FAbs in each of SIN and COS for the
+    // exact quarter-turn correction added in c6a980c.
+    try std.testing.expectEqual(@as(usize, 13), countOpcode(module.words, 12)); // OpExtInst
     try std.testing.expect(containsOpcode(module.words, 136)); // OpFDiv
 }
 
@@ -14919,7 +14921,7 @@ test "permlane mix and image resinfo lower" {
         .sampled_images = &images,
     });
     defer resinfo_module.deinit(std.testing.allocator);
-    try std.testing.expect(containsOpcode(resinfo_module.words, 50) or containsOpcode(resinfo_module.words, 107));
+    try std.testing.expect(containsOpcode(resinfo_module.words, 103)); // OpImageQuerySizeLod
 }
 
 test "packed integer add and mad mix lower" {
@@ -16026,7 +16028,10 @@ test "fragment sample level zero accepts a packed texel offset before NSA coordi
 
     try std.testing.expect(containsOpcode(module.words, 88)); // OpImageSampleExplicitLod
     try std.testing.expectEqual(@as(usize, 2), countOpcode(module.words, 202));
-    try std.testing.expectEqual(@as(usize, 1), countOpcode(module.words, 81)); // dmask:w
+    // A dynamic texel offset cannot use ImageOperands ConstOffset, so the
+    // coordinates are adjusted explicitly: split the packed offset (2), query
+    // the image size (2), split the coordinates (2), then the dmask:w select.
+    try std.testing.expectEqual(@as(usize, 7), countOpcode(module.words, 81)); // dmask:w
 }
 
 test "compute image sample level zero uses explicit lod" {
@@ -16388,7 +16393,9 @@ test "three-coordinate image load follows a two-dimensional storage descriptor" 
     defer module.deinit(std.testing.allocator);
 
     try std.testing.expect(containsOpcode(module.words, 98)); // OpImageRead
-    try std.testing.expectEqual(@as(usize, 1), countOpcode(module.words, 23)); // uint2 coordinates
+    // Coordinates are uint2 for the two-dimensional descriptor; the second
+    // vector type is the float4 texel the rgba32f image read returns.
+    try std.testing.expectEqual(@as(usize, 2), countOpcode(module.words, 23)); // OpTypeVector
 }
 
 test "two-coordinate image store into an array view writes slice zero" {
