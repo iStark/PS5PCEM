@@ -12,17 +12,26 @@ The shader uses the same entry scalar pointer for fixed-offset SMEM reads and
 indexed GLOBAL reads of a small parameter block. SMEM values were prepared,
 but the GLOBAL snapshot contained only the empty fault-reporting region.
 
-The new preparation path derives a bounded block extent from SMEM accesses
+The new preparation path derives a bounded parameter span from SMEM accesses
 sharing an unchanged entry scalar pair with GLOBAL loads. It flushes previous
-GPU writes and captures real guest bytes on each dispatch. It does not create
-guest mappings, zero-fill failed reads, or skip the shader. Unknown roots and
-reads beyond the captured extent retain the checked fault path. The saved
-1,974-instruction shader yields one 772-byte parameter region.
+GPU writes and captures the containing readable pages on each dispatch. It
+does not create guest mappings, zero-fill failed reads, or skip the shader.
+Unmapped pages split the snapshot; unknown roots and reads outside the
+captured pages retain the checked fault path. The saved 1,974-instruction
+shader yields a 772-byte parameter span.
+
+An initial repeat exposed a boundary error before the first flip: program
+`0x80003c8100` has indexed GLOBAL fields immediately after its last fixed SMEM
+field. Capturing only the SMEM byte extent was insufficient. The page-based
+revision addresses this without guessing array contents or committing memory.
+It also reuses the existing immutable scalar-definition cache: the local
+100-query probe took 586,467 microseconds without that cache and 282
+microseconds after warming it. These are CPU analysis timings, not game FPS.
 
 Validation before the repeat run:
 
 - The captured-shader metadata probe passes.
-- All 163 focused metadata/provenance tests pass in ReleaseSafe, including
+- All 164 focused metadata/provenance tests pass in ReleaseSafe, including
   pointer clobbers, branch joins, dynamic offsets and excessive extents.
 - The GPU test build/run completes successfully.
 

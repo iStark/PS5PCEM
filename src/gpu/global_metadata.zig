@@ -8,21 +8,49 @@ const definitions = @import("index_bounds.zig");
 
 pub const maximum_bytes = 64 * 1024;
 pub const Region = struct { register: u32, size: u32 };
+pub const PageRange = struct { address: u64, size: usize };
 
-fn entryPair(code: []const rdna2.Instruction, graph: *const rdna2.control_flow.Graph, before: usize, register: u32, first: u32, count: u32) bool {
+/// Indexed GLOBAL fields can follow the last fixed SMEM field. Expose the
+/// containing pages, as for pointer-form SMEM, only after the memory reader
+/// validates each page. A reservation alone is never readable evidence.
+pub fn pageRange(address: u64, size: u32) ?PageRange {
+    if (address == 0 or size == 0 or size > maximum_bytes) return null;
+    const end = std.math.add(u64, address, size) catch return null;
+    const rounded = std.math.add(u64, end, 4095) catch return null;
+    const start = address & ~@as(u64, 4095);
+    return .{ .address = start, .size = @intCast((rounded & ~@as(u64, 4095)) - start) };
+}
+
+test "GLOBAL metadata page spans retain edge fields without overflowing" {
+    try std.testing.expectEqual(PageRange{ .address = 0x2000, .size = 4096 }, pageRange(0x24f0, 172).?);
+    try std.testing.expectEqual(PageRange{ .address = 0x2000, .size = 8192 }, pageRange(0x2ff0, 772).?);
+    try std.testing.expectEqual(PageRange{ .address = 0x2000, .size = 4096 }, pageRange(0x2000, 4096).?);
+    try std.testing.expect(pageRange(0, 16) == null);
+    try std.testing.expect(pageRange(0x2000, 0) == null);
+    try std.testing.expect(pageRange(0x2000, maximum_bytes + 1) == null);
+    try std.testing.expect(pageRange(std.math.maxInt(u64) - 8, 16) == null);
+}
+
+fn entryPair(code: []const rdna2.Instruction, graph: *const rdna2.control_flow.Graph, before: usize, register: u32, first: u32, count: u32, cache: ?*definitions.ScalarDefinitionCache) bool {
     if (register >= 127 or register < first or register + 1 >= @as(u64, first) + count) return false;
     for (0..2) |word| {
-        const origin = definitions.scalarDefinition(code, graph, before, register + @as(u32, @intCast(word))) orelse return false;
+        const source = register + @as(u32, @intCast(word));
+        const origin = (if (cache) |retained| retained.definition(before, source) else definitions.scalarDefinition(code, graph, before, source)) orelse return false;
         if (origin != .entry) return false;
     }
     return true;
 }
 
 /// The SMEM accesses establish the extent of a parameter block, not the
-/// range of every possible GLOBAL address. Only that extent is captured;
-/// executed GLOBAL reads outside it must still fault. No guest bytes or
+/// range of every possible GLOBAL address. The backend validates and captures
+/// its containing pages; reads outside them still fault. No guest bytes or
 /// pointer values are cached here, and rewritten USER_DATA pairs are rejected.
 pub fn collect(code: []const rdna2.Instruction, graph: *const rdna2.control_flow.Graph, first: u32, count: u32, output: []Region) usize {
+    return collectCached(code, graph, first, count, output, null);
+}
+
+pub fn collectCached(code: []const rdna2.Instruction, graph: *const rdna2.control_flow.Graph, first: u32, count: u32, output: []Region, retained: ?*definitions.ScalarDefinitionCache) usize {
+    const cache = if (retained) |value| if (value.matches(code, graph)) value else null else null;
     var roots: [128]bool = @splat(false);
     var any = false;
     for (code, 0..) |inst, index| {
@@ -31,7 +59,7 @@ pub fn collect(code: []const rdna2.Instruction, graph: *const rdna2.control_flow
             else => continue,
         }
         if (inst.memory_segment != 2 or inst.src1.kind != .sgpr or
-            !entryPair(code, graph, index, inst.src1.reg, first, count)) continue;
+            !entryPair(code, graph, index, inst.src1.reg, first, count, cache)) continue;
         roots[inst.src1.reg] = true;
         any = true;
     }
@@ -44,7 +72,7 @@ pub fn collect(code: []const rdna2.Instruction, graph: *const rdna2.control_flow
         }
         if (inst.src0.kind != .sgpr or inst.src0.reg >= roots.len or !roots[inst.src0.reg] or
             inst.memory_offset < 0 or inst.data_words == 0 or
-            !entryPair(code, graph, index, inst.src0.reg, first, count)) continue;
+            !entryPair(code, graph, index, inst.src0.reg, first, count, cache)) continue;
         const extra: u64 = switch (inst.src1.kind) {
             .null => 0,
             .integer_inline_constant, .literal_constant => inst.src1.value,
@@ -104,6 +132,14 @@ test "GLOBAL metadata shares only bounded unchanged entry parameter blocks" {
         defer graph.deinit(std.testing.allocator);
         var regions: [4]Region = undefined;
         const length = collect(&code, &graph, 2, 2, &regions);
+        var cache = definitions.ScalarDefinitionCache.init(std.testing.allocator, &code, &graph);
+        defer cache.deinit();
+        var cached_regions: [4]Region = undefined;
+        for (0..2) |_| {
+            const cached_count = collectCached(&code, &graph, 2, 2, &cached_regions, &cache);
+            try std.testing.expectEqual(length, cached_count);
+            try std.testing.expectEqualSlices(Region, regions[0..length], cached_regions[0..cached_count]);
+        }
         if (variant == 0 or variant == 8) {
             try std.testing.expectEqual(@as(usize, 1), length);
             try std.testing.expectEqual(Region{ .register = 2, .size = if (variant == 8) 836 else 772 }, regions[0]);

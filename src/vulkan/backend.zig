@@ -13389,22 +13389,37 @@ pub const Renderer = struct {
         const instructions = analysis.program.instructions.items;
         if (!gpu.resource_checkpoints.hasFlatMemoryReads(instructions, if (analysis.resource_checkpoints) |*plan| plan else null)) return;
         var regions: [16]gpu.global_metadata.Region = undefined;
-        const count = gpu.global_metadata.collect(instructions, &analysis.graph, bindings.scalar_user_data_base, bindings.user_data_count, &regions);
+        const count = gpu.global_metadata.collectCached(instructions, &analysis.graph, bindings.scalar_user_data_base, bindings.user_data_count, &regions, analysis.scalar_definitions);
         if (count == 0) return;
-        const bytes = try self.allocator.alloc(u8, gpu.global_metadata.maximum_bytes);
-        defer self.allocator.free(bytes);
+        var size: usize = 0;
+        for (regions[0..count]) |region| size = @max(size, std.mem.alignForward(usize, region.size + 4095, 4096));
+        var scratch: [4096]u8 = undefined;
+        const allocation = if (size > scratch.len) try self.allocator.alloc(u8, size) else null;
+        defer if (allocation) |bytes| self.allocator.free(bytes);
+        const bytes = allocation orelse scratch[0..size];
         for (regions[0..count]) |region| {
             const index = region.register - bindings.scalar_user_data_base;
             const address = @as(u64, bindings.user_data[index]) | (@as(u64, bindings.user_data[index + 1] & 0xffff) << 32);
             if (address == 0 or address > @as(u64, 0x0000_ffff_ffff_ffff) - region.size) continue;
+            const range = gpu.global_metadata.pageRange(address, region.size) orelse continue;
             // This dispatch must see preceding GPU writes. An unreadable
             // inactive root remains absent; an executed read still faults.
             const previous_failure = self.last_shader_read_failure;
             defer self.last_shader_read_failure = previous_failure;
-            try self.flushGuestStorageRange(address, region.size);
-            reader.read(address, bytes[0..region.size]) catch continue;
             const Snapshot = struct { address: u64, bytes: []const u8 };
-            try self.stageFlatSnapshots(result, &[_]Snapshot{.{ .address = address, .bytes = bytes[0..region.size] }});
+            var run: ?usize = null;
+            var offset: usize = 0;
+            while (offset < range.size) : (offset += 4096) {
+                const page = range.address + offset;
+                try self.flushGuestStorageRange(page, 4096);
+                reader.read(page, bytes[offset..][0..4096]) catch {
+                    if (run) |start| try self.stageFlatSnapshots(result, &[_]Snapshot{.{ .address = range.address + start, .bytes = bytes[start..offset] }});
+                    run = null;
+                    continue;
+                };
+                if (run == null) run = offset;
+            }
+            if (run) |start| try self.stageFlatSnapshots(result, &[_]Snapshot{.{ .address = range.address + start, .bytes = bytes[start..range.size] }});
         }
     }
 
