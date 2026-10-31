@@ -11841,8 +11841,9 @@ fn runSceneBitsetPointerProbe(allocator: std.mem.Allocator) !void {
 // Keep the independent probes' large renderer frames off main's stack.
 noinline fn runBufferTableProbe(allocator: std.mem.Allocator) !void {
     try runBufferLookupProbe(allocator);
-    try runBufferTableCase(allocator, false);
-    try runBufferTableCase(allocator, true);
+    try runBufferTableCase(allocator, false, false);
+    try runBufferTableCase(allocator, false, true);
+    try runBufferTableCase(allocator, true, true);
     try runScalarBufferTableProbe(allocator);
 }
 
@@ -12193,7 +12194,10 @@ noinline fn runBufferLookupProbe(allocator: std.mem.Allocator) !void {
     std.debug.print("runtime buffer hash lookup passed: collisions, exact misses, unequal bounds, changing capacities and offsets, malformed/truncated runtime headers\n", .{});
 }
 
-noinline fn runBufferTableCase(allocator: std.mem.Allocator, large: bool) !void {
+noinline fn runBufferTableCase(allocator: std.mem.Allocator, large: bool, stable_slots: bool) !void {
+    const previous = vulkan.backend.stable_direct_buffer_slots;
+    defer vulkan.backend.stable_direct_buffer_slots = previous;
+    vulkan.backend.stable_direct_buffer_slots = stable_slots;
     var renderer = try vulkan.Renderer.init(allocator, .{});
     defer renderer.deinit();
     var guest = GuestMemory{};
@@ -12225,29 +12229,30 @@ noinline fn runBufferTableCase(allocator: std.mem.Allocator, large: bool) !void 
     try state.writeRegister(.shader, 0x213, (16 << 1) | (1 << 7));
     try state.writeRegister(.shader, 0x240, 0x1000);
     try state.writeRegister(.shader, 0x241, 0);
-    for ([_]u32{ 0x8000, 4 << 16, 8, 0x5204 }, 0..) |word, i| try state.writeRegister(.shader, 0x24c + @as(u32, @intCast(i)), word);
-    for (0..2) |pass| {
+    for ([_]u32{ 0x18000, 4 << 16, 8, 0x5204 }, 0..) |word, i| try state.writeRegister(.shader, 0x24c + @as(u32, @intCast(i)), word);
+    for (0..3) |pass| {
+        const aliased = pass == 1;
         const first: u32 = 0x4000 + @as(u32, @intCast(pass)) * 0x1000;
-        const second: u32 = 0x6000 + @as(u32, @intCast(pass)) * 0x1000;
-        for ([_]u32{ first, 4 << 16, 4, 0x5204, second, 4 << 16, 6, 0x5204 }, 0..) |word, i| guest.word(0x1020 + i * 4, word);
+        const second: u32 = if (aliased) first else 0x6000 + @as(u32, @intCast(pass)) * 0x1000;
+        for ([_]u32{ first, 4 << 16, if (aliased) 6 else 4, 0x5204, second, 4 << 16, 6, 0x5204 }, 0..) |word, i| guest.word(0x1020 + i * 4, word);
         for (0..8) |i| {
             guest.word(first + i * 4, 0xdeadbeef);
             guest.word(second + i * 4, 0xdeadbeef);
-            guest.word(0x8000 + i * 4, 0xcccccccc);
+            guest.word(0x18000 + i * 4, 0xcccccccc);
         }
         _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 8, 1, 1 });
         try renderer.flushPendingGuestWrites();
         for (0..8) |i| {
-            const valid = if (i % 2 == 0) i < 4 else i < 6;
+            const valid = if (aliased or i % 2 != 0) i < 6 else i < 4;
             const expected: u32 = if (valid) @intCast(100 + i) else 0;
-            try std.testing.expectEqual(expected, std.mem.readInt(u32, guest.bytes[0x8000 + i * 4 ..][0..4], .little));
-            try std.testing.expectEqual(if (i % 2 == 0 and i < 4) @as(u32, @intCast(100 + i)) else 0xdeadbeef, std.mem.readInt(u32, guest.bytes[first + i * 4 ..][0..4], .little));
-            try std.testing.expectEqual(if (i % 2 == 1 and i < 6) @as(u32, @intCast(100 + i)) else 0xdeadbeef, std.mem.readInt(u32, guest.bytes[second + i * 4 ..][0..4], .little));
+            try std.testing.expectEqual(expected, std.mem.readInt(u32, guest.bytes[0x18000 + i * 4 ..][0..4], .little));
+            try std.testing.expectEqual(if (valid and (aliased or i % 2 == 0)) @as(u32, @intCast(100 + i)) else 0xdeadbeef, std.mem.readInt(u32, guest.bytes[first + i * 4 ..][0..4], .little));
+            try std.testing.expectEqual(if (valid and (aliased or i % 2 != 0)) @as(u32, @intCast(100 + i)) else 0xdeadbeef, std.mem.readInt(u32, guest.bytes[second + i * 4 ..][0..4], .little));
         }
     }
-    try std.testing.expectEqual(@as(u64, 1), renderer.pipeline_cache_misses);
-    try std.testing.expectEqual(@as(u64, 1), renderer.pipeline_cache_hits);
-    std.debug.print("buffer table selection passed (large={any}): active-lane index, VCC_HI offset, runtime V# reads/writes, unequal bounds, untouched neighbours and relocation\n", .{large});
+    try std.testing.expectEqual(@as(u64, if (stable_slots) 1 else 2), renderer.pipeline_cache_misses);
+    try std.testing.expectEqual(@as(u64, if (stable_slots) 2 else 1), renderer.pipeline_cache_hits);
+    std.debug.print("buffer table selection passed (large={any}, stable_slots={any}): active-lane index, VCC_HI offset, changing candidate populations, aliased reads/writes, unequal bounds, untouched neighbours and pipeline reuse\n", .{ large, stable_slots });
 }
 
 fn runVectorBufferAddressProbe(allocator: std.mem.Allocator) !void {

@@ -1191,6 +1191,7 @@ const maximum_retained_buffer_entries = 8192;
 pub const maximum_storage_descriptors = 64;
 pub export var batched_storage_occupancy: bool = true;
 pub export var stable_metadata_slots: bool = true;
+pub export var stable_direct_buffer_slots: bool = true;
 pub export var dynamic_buffer_lookup_headers: bool = true;
 
 fn storageOccupancyMask(occupied: *const [maximum_storage_descriptors]bool) u64 {
@@ -1268,6 +1269,76 @@ test "metadata slots survive changing candidate counts and mixed bank exhaustion
     resources.occupied[23] = false;
     stable_metadata_slots = false;
     try std.testing.expectEqual(resources.freeDescriptor(), resources.freeMetadataDescriptor());
+}
+
+test "direct buffer plans survive candidate populations aliases and failed staging" {
+    const previous = batched_storage_occupancy;
+    defer batched_storage_occupancy = previous;
+    const resources = try std.testing.allocator.create(ComputeResources);
+    defer std.testing.allocator.destroy(resources);
+    for ([_]bool{ false, true }) |batched| for ([_]usize{ 0, 1, 7, 20, 61 }) |population| {
+        batched_storage_occupancy = batched;
+        resources.* = .{};
+        resources.planDescriptorRange(0x10_0000, 128);
+        resources.planDescriptorRange(0x20_0000, 64);
+        resources.planDescriptorRange(0x10_0000, 128);
+        resources.planDescriptorRange(0x10_0000, 64);
+        try std.testing.expectEqual(@as(u64, 7), resources.planned_descriptors);
+        // Planned slots cannot be read as already staged resources.
+        try std.testing.expectEqual(@as(?u32, null), resources.descriptorForRange(0x10_0000, 128));
+        try std.testing.expectEqual(@as(?u32, 0), resources.slotForRange(0x10_0000, 128));
+        for (0..population) |i| {
+            const slot = resources.slotForRange(0x30_0000 + i * 256, 64).?;
+            try std.testing.expectEqual(@as(u32, @intCast(i + 3)), slot);
+            resources.occupied[slot] = true;
+            resources.addresses[slot] = 0x30_0000 + i * 256;
+            resources.sizes[slot] = 64;
+        }
+        try std.testing.expectEqual(@as(?u32, 1), resources.slotForRange(0x20_0000, 64));
+        resources.occupied[1] = true; // An indirect candidate aliases this direct range.
+        try std.testing.expectEqual(@as(?u32, 1), resources.descriptorForRange(0x20_0000, 64));
+        try std.testing.expectEqual(@as(?u32, 2), resources.slotForRange(0x10_0000, 64));
+        if (population == 61) {
+            try std.testing.expectEqual(@as(?u32, null), resources.freeDescriptor());
+            try std.testing.expectEqual(@as(?u32, null), resources.freeMetadataDescriptor());
+        }
+        // Simulate failed/superseded preparations for slots 0 and 2.
+        resources.releasePlannedDescriptors();
+        try std.testing.expectEqual(@as(u64, 0), resources.planned_descriptors);
+        try std.testing.expectEqual(@as(?u32, 0), resources.freeDescriptor());
+        try std.testing.expectEqual(@as(?u32, 1), resources.descriptorForRange(0x20_0000, 64));
+        try std.testing.expectEqual(@as(u64, 0), resources.addresses[0]);
+        try std.testing.expectEqual(@as(usize, 0), resources.sizes[2]);
+    };
+}
+
+test "direct buffer plans use instruction-local descriptors without reordering mappings" {
+    const resources = try std.testing.allocator.create(ComputeResources);
+    defer std.testing.allocator.destroy(resources);
+    resources.* = .{};
+    const instructions = [_]gpu.ShaderInstruction{
+        .{ .pc = 0, .family = .mubuf, .opcode = .buffer_load_dword, .src1 = .{ .kind = .sgpr, .reg = 8 } },
+        .{ .pc = 8, .family = .mubuf, .opcode = .buffer_store_dword, .src1 = .{ .kind = .sgpr, .reg = 8 } },
+        .{ .pc = 16, .family = .smem, .opcode = .s_buffer_load_dword, .src0 = .{ .kind = .sgpr, .reg = 8 } },
+        .{ .pc = 24, .family = .mubuf, .opcode = .buffer_load_dword, .src1 = .{ .kind = .sgpr, .reg = 8 } },
+    };
+    const snapshots = try std.testing.allocator.alloc(gpu.scalar_provenance.ScalarRegisters, instructions.len);
+    defer std.testing.allocator.free(snapshots);
+    @memset(snapshots, @splat(.{}));
+    for (snapshots[0..3], 0..) |*registers, i| {
+        const words = [_]u32{ 0x10_0000 + @as(u32, @intCast(i)) * 0x10_0000, 0, 64, 0 };
+        for (words, 8..) |word, reg| registers[reg] = .{ .known = true, .value = word };
+    }
+    // SMEM needs three words; a vector descriptor needs all four.
+    snapshots[2][11].known = false;
+    snapshots[3] = snapshots[0];
+    snapshots[3][10].known = false;
+    resources.planDirectBufferSlots(null, &instructions, &.{ 0, 8, 16, 24 }, snapshots);
+    try std.testing.expectEqual(@as(u64, 7), resources.planned_descriptors);
+    try std.testing.expectEqualSlices(u64, &.{ 0x10_0000, 0x20_0000, 0x30_0000 }, resources.addresses[0..3]);
+    try std.testing.expectEqual(@as(usize, 0), resources.mapping_count);
+    try std.testing.expectEqual(@as(u64, 0), storageOccupancyMask(&resources.occupied));
+    try std.testing.expectEqual(@as(u64, 0), storageOccupancyMask(&resources.writable));
 }
 
 const maximum_storage_images = rdna2.spirv.maximum_storage_images;
@@ -5026,6 +5097,8 @@ const ComputeResources = struct {
     addresses: [maximum_storage_descriptors]u64 = @splat(0),
     sizes: [maximum_storage_descriptors]usize = @splat(0),
     occupied: [maximum_storage_descriptors]bool = @splat(false),
+    /// Planned direct ranges own a slot number, but are not bound until staged.
+    planned_descriptors: u64 = 0,
     writable: [maximum_storage_descriptors]bool = @splat(false),
     write_ranges: [maximum_storage_descriptors]buffer_write_ranges.Ranges = @splat(.{}),
     write_origins: [maximum_storage_descriptors]BufferWriteOrigin = @splat(.{}),
@@ -5083,7 +5156,7 @@ const ComputeResources = struct {
         // An unused slot retains its initialized state. Reset the slots owned
         // by the previous operation, including store-only diagnostic slots,
         // instead of clearing every descriptor's write metadata on each draw.
-        var dirty = storageOccupancyMask(&result.occupied) | storageOccupancyMask(&result.writable);
+        var dirty = storageOccupancyMask(&result.occupied) | storageOccupancyMask(&result.writable) | result.planned_descriptors;
         while (dirty != 0) {
             const slot = @ctz(dirty);
             dirty &= dirty - 1;
@@ -5098,6 +5171,7 @@ const ComputeResources = struct {
             result.write_ranges[slot].whole = false;
             result.write_ranges[slot].count = 0;
         }
+        result.planned_descriptors = 0;
         result.specialized_scalar_prefix_end = 0;
         result.entry_scalar_snapshot_end = 0;
         result.scalar_memory_count = 0;
@@ -5130,11 +5204,11 @@ const ComputeResources = struct {
 
     fn freeDescriptor(self: *const ComputeResources) ?u32 {
         if (@atomicLoad(bool, &batched_storage_occupancy, .monotonic)) {
-            const free = ~storageOccupancyMask(&self.occupied);
+            const free = ~(storageOccupancyMask(&self.occupied) | self.planned_descriptors);
             return if (free == 0) null else @intCast(@ctz(free));
         }
         for (self.occupied, 0..) |used, index| {
-            if (!used) return @intCast(index);
+            if (!used and self.planned_descriptors & (@as(u64, 1) << @intCast(index)) == 0) return @intCast(index);
         }
         return null;
     }
@@ -5146,13 +5220,13 @@ const ComputeResources = struct {
     fn freeMetadataDescriptor(self: *const ComputeResources) ?u32 {
         if (!@atomicLoad(bool, &stable_metadata_slots, .monotonic)) return self.freeDescriptor();
         if (@atomicLoad(bool, &batched_storage_occupancy, .monotonic)) {
-            const free = ~storageOccupancyMask(&self.occupied);
+            const free = ~(storageOccupancyMask(&self.occupied) | self.planned_descriptors);
             return if (free == 0) null else @intCast(63 - @clz(free));
         }
         var index: usize = self.occupied.len;
         while (index != 0) {
             index -= 1;
-            if (!self.occupied[index]) return @intCast(index);
+            if (!self.occupied[index] and self.planned_descriptors & (@as(u64, 1) << @intCast(index)) == 0) return @intCast(index);
         }
         return null;
     }
@@ -5162,6 +5236,64 @@ const ComputeResources = struct {
             if (mapping.resource_sgpr == resource_sgpr) return mapping.descriptor_index;
         }
         return null;
+    }
+
+    fn slotForRange(self: *const ComputeResources, address: u64, size: usize) ?u32 {
+        var planned = self.planned_descriptors & ~storageOccupancyMask(&self.occupied);
+        while (planned != 0) {
+            const index = @ctz(planned);
+            planned &= planned - 1;
+            if (self.addresses[index] == address and self.sizes[index] == size) return @intCast(index);
+        }
+        return self.freeDescriptor();
+    }
+
+    fn planDescriptorRange(self: *ComputeResources, address: u64, size: usize) void {
+        if (self.descriptorForRange(address, size) != null) return;
+        const slot = self.slotForRange(address, size) orelse return;
+        self.planned_descriptors |= @as(u64, 1) << @intCast(slot);
+        self.addresses[slot] = address;
+        self.sizes[slot] = size;
+    }
+
+    fn releasePlannedDescriptors(self: *ComputeResources) void {
+        var unused = self.planned_descriptors & ~storageOccupancyMask(&self.occupied);
+        while (unused != 0) {
+            const slot = @ctz(unused);
+            unused &= unused - 1;
+            self.addresses[slot] = 0;
+            self.sizes[slot] = 0;
+        }
+        self.planned_descriptors = 0;
+    }
+
+    /// Assign known compute V# ranges before variable-length indirect tables.
+    /// This reads only existing instruction-local snapshots: no guest reads,
+    /// staging, stores or mapping insertion is moved out of shader order.
+    /// Unknown/recovered descriptors keep the ordinary preparation path.
+    fn planDirectBufferSlots(
+        self: *ComputeResources,
+        plan: ?*const gpu.resource_checkpoints.Plan,
+        instructions: []const gpu.ShaderInstruction,
+        pcs: []const u32,
+        snapshots: []const gpu.scalar_provenance.ScalarRegisters,
+    ) void {
+        var iterator = gpu.resource_checkpoints.Iterator.init(instructions, plan, .resource);
+        while (iterator.next()) |index| {
+            const inst = &instructions[index];
+            if (bufferResourceWrites(inst.opcode) == null) continue;
+            if (self.entry_scalar_snapshot_end != 0 and gpu.scalar_snapshots.complete(inst, self.scalar_registers[0..self.scalar_count])) continue;
+            const operand = if (inst.family == .smem) inst.src0 else inst.src1;
+            if (operand.kind != .sgpr) continue;
+            const registers = scalarRegistersAtCheckpoint(pcs, snapshots, inst.pc);
+            const decoded = (if (isBufferScalarLoad(inst.opcode))
+                scalarMemoryBufferDescriptor(registers, operand.reg)
+            else
+                scalarBufferDescriptor(registers, operand.reg)) catch continue;
+            const descriptor = takePlausibleBufferDescriptor(decoded) orelse continue;
+            const size = std.math.cast(usize, constantBufferFetchExtent(descriptor, inst.*, registers)) orelse continue;
+            self.planDescriptorRange(descriptor.address, size);
+        }
     }
 
     fn noteBufferStore(self: *ComputeResources, slot: u32, inst: gpu.ShaderInstruction) void {
@@ -5627,6 +5759,84 @@ fn vertexFetchScalarOffset(operand: gpu.ShaderOperand, registers: *const gpu.sca
     return switch (operand.kind) {
         .null => 0,
         .integer_inline_constant, .literal_constant => operand.value,
+        else => null,
+    };
+}
+
+fn bufferResourceWrites(opcode: gpu.ShaderOpcode) ?bool {
+    return switch (opcode) {
+        .buffer_load_ubyte,
+        .buffer_load_sbyte,
+        .buffer_load_ushort,
+        .buffer_load_sshort,
+        .buffer_load_ubyte_d16,
+        .buffer_load_ubyte_d16_hi,
+        .buffer_load_sbyte_d16,
+        .buffer_load_sbyte_d16_hi,
+        .buffer_load_short_d16,
+        .buffer_load_short_d16_hi,
+        .buffer_load_dword,
+        .buffer_load_dwordx2,
+        .buffer_load_dwordx3,
+        .buffer_load_dwordx4,
+        .buffer_load_format_x,
+        .buffer_load_format_xy,
+        .buffer_load_format_xyz,
+        .buffer_load_format_xyzw,
+        .buffer_load_format_d16_x,
+        .buffer_load_format_d16_xy,
+        .buffer_load_format_d16_xyz,
+        .buffer_load_format_d16_xyzw,
+        // The typed forms name the same V# through MTBUF and differ
+        // only in carrying their format in the instruction rather than
+        // the descriptor. Leaving them out here left every read
+        // through them without a mapping, and the translator lowers a
+        // read it cannot bind as a null buffer -- so the shader got
+        // zeroes and no diagnostic.
+        .tbuffer_load_format_x,
+        .tbuffer_load_format_xy,
+        .tbuffer_load_format_xyz,
+        .tbuffer_load_format_xyzw,
+        .s_buffer_load_dword,
+        .s_buffer_load_dwordx2,
+        .s_buffer_load_dwordx4,
+        .s_buffer_load_dwordx8,
+        .s_buffer_load_dwordx16,
+        => false,
+        .buffer_store_byte,
+        .buffer_store_short,
+        .buffer_store_byte_d16_hi,
+        .buffer_store_short_d16_hi,
+        .buffer_store_dword,
+        .buffer_store_dwordx2,
+        .buffer_store_dwordx3,
+        .buffer_store_dwordx4,
+        .buffer_store_format_x,
+        .buffer_store_format_xy,
+        .buffer_store_format_xyz,
+        .buffer_store_format_xyzw,
+        .buffer_store_format_d16_x,
+        .buffer_store_format_d16_hi_x,
+        .buffer_store_format_d16_xy,
+        .buffer_store_format_d16_xyz,
+        .buffer_store_format_d16_xyzw,
+        .tbuffer_store_format_x,
+        .tbuffer_store_format_xy,
+        .tbuffer_store_format_xyz,
+        .tbuffer_store_format_xyzw,
+        .buffer_atomic_swap,
+        .buffer_atomic_add,
+        .buffer_atomic_sub,
+        .buffer_atomic_smin,
+        .buffer_atomic_umin,
+        .buffer_atomic_smax,
+        .buffer_atomic_umax,
+        .buffer_atomic_and,
+        .buffer_atomic_or,
+        .buffer_atomic_xor,
+        .buffer_atomic_fmin,
+        .buffer_atomic_fmax,
+        => true,
         else => null,
     };
 }
@@ -13565,7 +13775,7 @@ pub const Renderer = struct {
         for (candidates.descriptors[0..candidates.count], candidates.words[0..candidates.count]) |descriptor, words| {
             const size: usize = @intCast(descriptor.size_bytes);
             const slot = result.descriptorForRange(descriptor.address, size) orelse blk: {
-                const free = result.freeDescriptor() orelse return Error.InvalidStorageDescriptor;
+                const free = result.slotForRange(descriptor.address, size) orelse return Error.InvalidStorageDescriptor;
                 if (!(read_only_snapshots and !writable and try self.tryStageTransientStorageBuffer(free, descriptor.address, size)))
                     _ = try self.stageGuestStorageBufferAt(free, descriptor.address, size);
                 result.occupied[free] = true;
@@ -14158,6 +14368,8 @@ pub const Renderer = struct {
         // Resolvers borrow the instruction-local snapshot until this lease is
         // released. No register array or unused load history needs copying.
         const buffer_scan_started = self.resourceTimestampNs();
+        if (bindings.stage == .compute and @atomicLoad(bool, &stable_direct_buffer_slots, .monotonic))
+            result.planDirectBufferSlots(if (analysis.resource_checkpoints) |*plan| plan else null, instructions, scalar_checkpoint_pcs, scalar_checkpoint_registers);
         var scalar_buffer_key: ?ScalarBufferDescriptorKey = null;
         var buffer_instructions = gpu.resource_checkpoints.Iterator.init(instructions, if (analysis.resource_checkpoints) |*plan| plan else null, .resource);
         while (buffer_instructions.next()) |instruction_index| {
@@ -14169,81 +14381,7 @@ pub const Renderer = struct {
                 _ = @atomicRmw(u64, &gpu.scalar_snapshots.entry_scalar_buffer_snapshots_used, .Add, 1, .monotonic);
                 continue;
             }
-            const is_store = switch (candidate.opcode) {
-                .buffer_load_ubyte,
-                .buffer_load_sbyte,
-                .buffer_load_ushort,
-                .buffer_load_sshort,
-                .buffer_load_ubyte_d16,
-                .buffer_load_ubyte_d16_hi,
-                .buffer_load_sbyte_d16,
-                .buffer_load_sbyte_d16_hi,
-                .buffer_load_short_d16,
-                .buffer_load_short_d16_hi,
-                .buffer_load_dword,
-                .buffer_load_dwordx2,
-                .buffer_load_dwordx3,
-                .buffer_load_dwordx4,
-                .buffer_load_format_x,
-                .buffer_load_format_xy,
-                .buffer_load_format_xyz,
-                .buffer_load_format_xyzw,
-                .buffer_load_format_d16_x,
-                .buffer_load_format_d16_xy,
-                .buffer_load_format_d16_xyz,
-                .buffer_load_format_d16_xyzw,
-                // The typed forms name the same V# through MTBUF and differ
-                // only in carrying their format in the instruction rather than
-                // the descriptor. Leaving them out here left every read
-                // through them without a mapping, and the translator lowers a
-                // read it cannot bind as a null buffer -- so the shader got
-                // zeroes and no diagnostic.
-                .tbuffer_load_format_x,
-                .tbuffer_load_format_xy,
-                .tbuffer_load_format_xyz,
-                .tbuffer_load_format_xyzw,
-                .s_buffer_load_dword,
-                .s_buffer_load_dwordx2,
-                .s_buffer_load_dwordx4,
-                .s_buffer_load_dwordx8,
-                .s_buffer_load_dwordx16,
-                => false,
-                .buffer_store_byte,
-                .buffer_store_short,
-                .buffer_store_byte_d16_hi,
-                .buffer_store_short_d16_hi,
-                .buffer_store_dword,
-                .buffer_store_dwordx2,
-                .buffer_store_dwordx3,
-                .buffer_store_dwordx4,
-                .buffer_store_format_x,
-                .buffer_store_format_xy,
-                .buffer_store_format_xyz,
-                .buffer_store_format_xyzw,
-                .buffer_store_format_d16_x,
-                .buffer_store_format_d16_hi_x,
-                .buffer_store_format_d16_xy,
-                .buffer_store_format_d16_xyz,
-                .buffer_store_format_d16_xyzw,
-                .tbuffer_store_format_x,
-                .tbuffer_store_format_xy,
-                .tbuffer_store_format_xyz,
-                .tbuffer_store_format_xyzw,
-                .buffer_atomic_swap,
-                .buffer_atomic_add,
-                .buffer_atomic_sub,
-                .buffer_atomic_smin,
-                .buffer_atomic_umin,
-                .buffer_atomic_smax,
-                .buffer_atomic_umax,
-                .buffer_atomic_and,
-                .buffer_atomic_or,
-                .buffer_atomic_xor,
-                .buffer_atomic_fmin,
-                .buffer_atomic_fmax,
-                => true,
-                else => continue,
-            };
+            const is_store = bufferResourceWrites(candidate.opcode) orelse continue;
             var store_prepared = false;
             // A skipped later access may still select an earlier unqualified
             // SGPR mapping in the translator. Do not certify partial coverage
@@ -14410,7 +14548,7 @@ pub const Renderer = struct {
                 continue;
             };
             const descriptor_index = result.descriptorForRange(descriptor.address, size) orelse blk: {
-                const free = result.freeDescriptor() orelse {
+                const free = result.slotForRange(descriptor.address, size) orelse {
                     self.traceSkippedStorage(bindings, inst.*, "descriptor capacity", descriptor);
                     if (log_verbose_gpu) std.debug.print("[vulkan dcb] no free storage slot for V# s{d}; soft-skip\n", .{resource_sgpr});
                     continue;
@@ -14499,6 +14637,10 @@ pub const Renderer = struct {
             if (is_store) result.noteBufferStore(descriptor_index, inst.*);
             store_prepared = true;
         }
+
+        // An invalid or superseded direct range must not hold capacity away
+        // from later metadata. Successful ranges remain occupied normally.
+        result.releasePlannedDescriptors();
 
         const pointer_memory_started = self.resourceTimestampNs();
         try self.prepareScalarPointerMemory(result, bindings, reader, analysis, scalar_checkpoint_pcs, scalar_checkpoint_registers, result.scalar_registers[recovered_pointer_begin..result.scalar_count]);

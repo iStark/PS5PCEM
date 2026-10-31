@@ -105,8 +105,65 @@ other ordinary descriptor slots and resource shapes still vary.
 - Only the diagnostic `vulkan-smoke` executable receives a larger stack
   reserve (128 MiB), needed by its expanded independent probe fixtures.
 
-The game repeat using this change has started; sustained FPS and character
-control have not yet been measured in that executable.
+The repeat using this executable passed the wolf brightness screen and
+reached the tree. Renderer checkpoints at flips 1088 and 1152 show both;
+the tree still has black patches and overly bright areas. These are renderer
+captures, not independent window captures. Character control remains unverified.
+
+![Yotei tree renderer checkpoint with remaining black patches and bright areas](../images/yotei-tree-vulkan-2026-11-01.png)
+
+*Flip 1152, Vulkan; resized from the renderer's 3840×2160 checkpoint to
+1280×720 for documentation. No brightness or color correction was applied.*
+
+Warm frames 1020 and 1080 took 656 and 671 ms (about 1.5 FPS), with no graphics
+or compute pipeline misses. Frame 1210 took 1098 ms, including 255.6 ms of fence
+waits, 320.2 MiB uploaded and 200.7 MiB read back. Symbolized waits identify
+release completion (61.2 ms), storage-image publication (40.0 ms), ordered
+buffer publication (39.1 ms), and mapping readback ranges (36.5 ms) among the
+remaining costs. These are individual scene observations, not a matched
+before/after FPS claim.
+
+No draw or dispatch failures were counted in these frames, but their unresolved
+storage preparations ranged from 1021 to 2228. Such a count does not prove an
+executed missing access: the instruction may be on an inactive path. It also
+does not establish full resource coverage. A trace of the next progressing
+scene is needed before attributing the visible artifacts to those gaps.
+
+The subsequent frame again compiles new compute variants for several minutes.
+The compiler completion count advances and submitted GPU work is complete;
+this interval is not a sustained gameplay FPS measurement. A concurrent build
+started after these warm-frame samples, so later timings during that build
+are excluded from performance comparisons.
+
+### Further resource-slot work
+
+A captured program's 21 variants produce only three distinct SPIR-V modules
+in an offline experiment that also places ordinary buffer bindings before
+variable-length indirect candidates. This is a translation experiment, not
+a measured loading-time or FPS improvement. The implementation under test
+plans known instruction-local V# slots without moving resource reads, staging,
+mapping insertion or stores out of instruction order. Pending slots cannot
+be mistaken for successfully staged resources, and unclaimed slots are released
+before metadata preparation. The ordinary graphics path is unchanged.
+
+All 270 Vulkan unit tests pass. The native buffer-table probe also passes
+with `VK_LAYER_KHRONOS_validation` and no reported validation errors. Its
+2→1→2 candidate-population sequence preserves actual reads, stores, aliasing,
+out-of-bounds results and untouched neighboring words. With slot planning,
+it creates one pipeline and reuses it twice; without planning, the same
+sequence creates two pipelines and reuses one. This establishes a reduction
+in redundant variants for that fixture, not a gameplay FPS gain.
+The ReleaseFast runner and probe build successfully (18/18 build steps).
+
+### Reference review
+
+AnyPS5's October 31 change
+[`684dfc1d56`](https://github.com/boykopovar/AnyPS5/commit/684dfc1d561d09a8c35c7c153c95bcfed7e49896)
+invalidates raw descriptor pages when entering forced synchronization and
+retries materialization/validation within that scope. Our shader reader already
+publishes overlapping deferred metadata and our resource-walk cache re-reads
+its dependencies. A corresponding stale-snapshot case has not yet been
+reproduced here; the reference change has not been copied as an unproven fix.
 
 ## Streaming texture failures and Windows address collisions
 
