@@ -282,3 +282,29 @@ Warm frames 1080 and 1140 took 713 and 666 ms (about 1.4–1.5 FPS); frame 1140
 still uploaded 326.9 MiB and read back 204.6 MiB. These are observations before
 the 3D mip change, not a measured FPS improvement. Character control remains
 unverified.
+
+### Volume runtime check and mip-cache eviction
+
+The volume-enabled repeat reached the tree again. Warm frame 1200 took
+672 ms (about 1.49 FPS), with no graphics or compute pipeline misses, and
+reported 14 volume-level copies. The new path is therefore used by the game,
+but this changing-scene sample does not demonstrate an overall FPS gain.
+The renderer checkpoint at flip 1216 still shows black patches on the tree.
+
+A read-only census at flip 1259 found all 16 assembled-mip cache slots full.
+Some loading-screen entries had last been used in batches 528–8259, while
+the current batch was 706156 and slot zero had been used in batch 704773.
+The full-cache path always replaced slot zero, so newly inserted volumes
+were evicted again while much older pyramids remained resident. The profile
+recorded four backing-image creations per frame in this part of the run.
+
+Eviction now selects the least recently used batch across the fixed-size
+table. The cache capacity and deferred image-destruction rules are unchanged.
+The native test fills the cache past capacity twice, verifies that the first
+overflow's fresh volume survives the next insertion, and checks all sixteen
+distinct queued samples after eviction. It passes with Vulkan validation;
+all 270 Vulkan unit tests also pass. The ReleaseFast runner builds successfully
+(15/15 requested steps). This establishes cache retention and
+correct results, not a measured gameplay FPS gain. Build/probe overlap is
+excluded from performance comparisons, and the ongoing game process keeps
+the preceding volume-enabled executable until a deliberate restart.

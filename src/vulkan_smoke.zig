@@ -5600,6 +5600,53 @@ fn runResidentMipChainProbe(allocator: std.mem.Allocator) !void {
         try renderer.readbackGuestStorageBuffer(0x10000, &output);
         for (0..4) |channel| try std.testing.expectApproxEqAbs(@as(f32, 128.0 / 255.0), @as(f32, @bitCast(std.mem.readInt(u32, output[channel * 4 ..][0..4], .little))), 0.0001);
         try std.testing.expect(renderer.storage_cpu_invalidations != 0);
+        if (volume and tracked and extent == 17) {
+            phase = "cache pressure and queued consumers";
+            // Two existing backings plus sixteen new volumes overflow the
+            // cache twice. The first overflow's fresh entry must survive the
+            // second; replacing slot zero repeatedly used to evict it while
+            // retaining loading-screen pyramids indefinitely.
+            const pyramid_stride = std.mem.alignForward(u64, texture.required_source_bytes, 0x1000);
+            try std.testing.expect(0x40000 + 16 * pyramid_stride <= guest.bytes.len);
+            for (0..16) |resource| {
+                var pyramid = chain;
+                pyramid[0] = @intCast((0x40000 + resource * pyramid_stride) >> 8);
+                const color = [_]f32{ @as(f32, @floatFromInt(resource + 1)) / 32.0, 0.25, 0.5, 1 };
+                for (0..3) |lod| {
+                    var image = pyramid;
+                    image[3] = (image[3] & ~@as(u32, 0xff000)) | (@as(u32, @intCast(lod)) << 12) | (@as(u32, @intCast(lod)) << 16);
+                    try state.writeRegister(.shader, compute.programRegisterBase(), 1);
+                    try state.writeRegister(.shader, 0x213, 13 << 1);
+                    for (image, 0..) |word, i| try state.writeRegister(.shader, compute.userDataBase() + @as(u32, @intCast(i)), word);
+                    for (color, 0..) |value, channel| try state.writeRegister(.shader, compute.userDataBase() + 8 + @as(u32, @intCast(channel)), @bitCast(value));
+                    try state.writeRegister(.shader, compute.userDataBase() + 12, @max(depth >> @as(u5, @intCast(lod)), 1) - 1);
+                    _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
+                }
+                const output_address: u32 = @intCast(0x14000 + resource * 256);
+                const values = pyramid ++ [_]u32{ 0, 0, 0, 0, output_address, 16 << 16, 1, 0 };
+                try state.writeRegister(.shader, compute.programRegisterBase(), 2);
+                try state.writeRegister(.shader, 0x213, 17 << 1);
+                for (values, 0..) |word, i| try state.writeRegister(.shader, compute.userDataBase() + @as(u32, @intCast(i)), word);
+                try state.writeRegister(.shader, compute.userDataBase() + 16, @bitCast(@as(f32, 1.0 - 0.5 / @as(f32, @floatFromInt(depth)))));
+                _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
+            }
+            try std.testing.expectEqual(@as(usize, 16), renderer.assembled_mip_chains.items.len);
+            phase = "recent chain retention";
+            const recent_address = 0x40000 + 14 * pyramid_stride;
+            const retained = for (renderer.assembled_mip_chains.items) |cached| {
+                if (cached.address == recent_address) break true;
+            } else false;
+            try std.testing.expect(retained);
+            // Eviction must not invalidate the consumers recorded earlier.
+            // Their color distinguishes every source; read them only now.
+            phase = "evicted chain queued consumers";
+            for (0..16) |resource| {
+                try renderer.readbackGuestStorageBuffer(0x14000 + resource * 256, &output);
+                const red: f32 = @as(f32, @floatFromInt(resource + 1)) / 32.0;
+                try std.testing.expectApproxEqAbs(red, @as(f32, @bitCast(std.mem.readInt(u32, output[0..4], .little))), 0.004);
+                try std.testing.expectApproxEqAbs(@as(f32, 0.25), @as(f32, @bitCast(std.mem.readInt(u32, output[4..8], .little))), 0.004);
+            }
+        }
     };
     std.debug.print("resident 2D/3D mip chains passed: GPU producers, same-frame updates, odd extents, LODs, sRGB/swizzles, cache reuse and CPU replacement\n", .{});
 }

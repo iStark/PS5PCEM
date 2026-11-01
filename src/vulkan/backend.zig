@@ -34177,7 +34177,14 @@ pub const Renderer = struct {
             return;
         }
         if (self.assembled_mip_chains.items.len >= maximum_assembled_mip_chains) {
-            const victim = &self.assembled_mip_chains.items[0];
+            // Inserts and swap-removal for backing reuse do not preserve age
+            // order. Always replacing slot zero churns new scene textures
+            // while old loading-screen pyramids occupy the remaining slots.
+            var oldest: usize = 0;
+            for (self.assembled_mip_chains.items[1..], 1..) |cached, index| {
+                if (cached.last_used_batch < self.assembled_mip_chains.items[oldest].last_used_batch) oldest = index;
+            }
+            const victim = &self.assembled_mip_chains.items[oldest];
             self.retireAssembledMipChainImage(victim.*);
             victim.* = chain;
             return;
