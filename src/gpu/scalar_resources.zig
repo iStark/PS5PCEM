@@ -119,7 +119,7 @@ pub const Resolver = struct {
     values: [64]struct { before: usize, register: u32, value: u32 } = undefined,
     valid_values: u64 = 0,
 
-    pub fn words(self: *Resolver, register: u32, before_pc: u32, output: []u32) !bool {
+    pub fn words(self: *Resolver, register: u32, before_pc: u32, output: []u32) shaders.Error!bool {
         self.valid_values = 0;
         self.batch_enabled = self.memoize_definitions and definition_cache_enabled.load(.monotonic);
         self.definition_batch = .{ .instructions = self.instructions, .graph = self.graph };
@@ -238,7 +238,7 @@ pub const Resolver = struct {
         return selected.words(register, before_pc, output);
     }
 
-    fn operand(self: *Resolver, op: rdna2.Operand, component: u32, before: usize, depth: u8) anyerror!?u32 {
+    fn operand(self: *Resolver, op: rdna2.Operand, component: u32, before: usize, depth: u8) shaders.Error!?u32 {
         if (op.absolute or op.negate or op.dpp) return null;
         if (scalar.scalarRegisterIndex(op)) |register| return self.word(@as(u32, @intCast(register)) + component, before, depth);
         return switch (op.kind) {
@@ -249,7 +249,7 @@ pub const Resolver = struct {
         };
     }
 
-    fn word(self: *Resolver, requested_register: u32, before: usize, depth: u8) anyerror!?u32 {
+    fn word(self: *Resolver, requested_register: u32, before: usize, depth: u8) shaders.Error!?u32 {
         if (requested_register >= scalar.maximum_scalar_registers or depth >= 24 or self.remaining == 0) return null;
         const slot: u6 = @truncate((before *% 37) ^ (@as(usize, requested_register) *% 17));
         const mask = @as(u64, 1) << slot;
@@ -266,7 +266,7 @@ pub const Resolver = struct {
         return result;
     }
 
-    fn recoverWord(self: *Resolver, requested_register: u32, before: usize, depth: u8) anyerror!?u32 {
+    fn recoverWord(self: *Resolver, requested_register: u32, before: usize, depth: u8) shaders.Error!?u32 {
         var register = requested_register;
         const direct_definition = if (self.batch_enabled)
             self.definition_batch.lookup(before, register)
@@ -416,7 +416,7 @@ pub const Resolver = struct {
 
     /// Vertex fetch shaders assemble format fields from a packed attribute
     /// table. Recover inputs at their producers, not from a later SGPR reuse.
-    fn descriptorExpression(self: *Resolver, inst: rdna2.Instruction, index: usize, component: u32, depth: u8) !?u32 {
+    fn descriptorExpression(self: *Resolver, inst: rdna2.Instruction, index: usize, component: u32, depth: u8) shaders.Error!?u32 {
         if (inst.opcode == .s_cselect_b32 or inst.opcode == .s_cselect_b64) {
             if (component >= @as(u32, if (inst.opcode == .s_cselect_b64) 2 else 1)) return null;
             const condition = (try self.comparisonBefore(index, depth)) orelse return null;
@@ -451,7 +451,7 @@ pub const Resolver = struct {
     /// Only a proven comparison in the same basic block can drive CSELECT.
     /// Stop at every instruction not known to preserve SCC; never borrow a
     /// comparison from across a branch or an intervening scalar ALU write.
-    fn comparisonBefore(self: *Resolver, before: usize, depth: u8) !?bool {
+    fn comparisonBefore(self: *Resolver, before: usize, depth: u8) shaders.Error!?bool {
         const first = for (self.graph.blocks.items) |block| {
             if (before >= block.first_instruction and before < block.first_instruction + block.instruction_count)
                 break block.first_instruction;
