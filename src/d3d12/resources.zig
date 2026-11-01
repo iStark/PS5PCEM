@@ -340,7 +340,7 @@ pub const DrawResources = struct {
             const backing = backing_lease.bytes;
             try self.reader.read(descriptor.address, backing);
             if (dcc) |metadata| {
-                const keys = try self.allocator.alloc(u8, std.math.divCeil(usize, backing.len, surfaces.Dcc.block_bytes) catch unreachable);
+                const keys = try self.allocator.alloc(u8, surfaces.Dcc.blockCount(backing.len));
                 defer self.allocator.free(keys);
                 try metadata.expand(.{ .context = self.reader.context, .read = self.reader.read_fn }, backing, keys);
             }
