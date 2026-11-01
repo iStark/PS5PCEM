@@ -524,6 +524,74 @@ noinline fn runLinearImageCompletionProbe(allocator: std.mem.Allocator) !void {
     try runLinearImageBatchProbe(allocator);
 }
 
+noinline fn runLinearReleaseReadbackProbe(allocator: std.mem.Allocator) !void {
+    const previous = vulkan.backend.coalesce_linear_release_readbacks;
+    defer vulkan.backend.coalesce_linear_release_readbacks = previous;
+    const Audit = struct {
+        guest: GuestMemory = .{},
+        labels: usize = 0,
+        reject_output: bool = false,
+        fn read(raw: ?*anyopaque, address: u64, bytes: []u8) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            return GuestMemory.read(&self.guest, address, bytes);
+        }
+        fn write(raw: ?*anyopaque, address: u64, bytes: []const u8) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (address == 0x8000 and self.reject_output) return false;
+            if (address == 0x7000) {
+                if (std.mem.readInt(u32, self.guest.bytes[0x8000..][0..4], .little) != 41 or
+                    !std.mem.allEqual(u8, self.guest.bytes[0x8004..][0..508], 0x5a)) return false;
+                self.labels += 1;
+            }
+            return GuestMemory.write(&self.guest, address, bytes);
+        }
+    };
+    var renderer = try vulkan.Renderer.init(allocator, .{ .enable_validation = true, .enable_timeline_scheduler = true, .defer_internal_releases = true });
+    defer renderer.deinit();
+    var baseline_submits: u64 = 0;
+    for ([_]bool{ false, true }) |coalesced| {
+        vulkan.backend.coalesce_linear_release_readbacks = coalesced;
+        var audit = Audit{};
+        @memset(audit.guest.bytes[0x8000..0x8200], 0x5a);
+        const backend = renderer.dcbBackend(.{ .context = &audit, .read = Audit.read, .write = Audit.write });
+        const code = [_]u32{ vop1(1, 0, 128), vop1(1, 1, 128), vop1(1, 2, 8), 0xf020_0108, 0x0000_0200, 0xbf81_0000 };
+        for (code, 0..) |word, i| audit.guest.word(0x100 + i * 4, word);
+        const compute = gpu.resources.ShaderStage.compute;
+        var state = gpu.State{};
+        try state.writeRegister(.shader, compute.programRegisterBase(), 1);
+        try state.writeRegister(.shader, compute.programRegisterBase() + 1, 0);
+        try state.writeRegister(.shader, 0x213, 9 << 1);
+        var descriptor = imageDescriptorWords(0x8000, 4, 2);
+        descriptor[1] = (descriptor[1] & ~(@as(u32, 0xff) << 20)) | (20 << 20);
+        descriptor[4] = 63;
+        for (descriptor, 0..) |word, i| try state.writeRegister(.shader, compute.userDataBase() + @as(u32, @intCast(i)), word);
+        try state.writeRegister(.shader, compute.userDataBase() + 8, 41);
+        _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
+        const before = renderer.frame_profile.submits;
+        var release = std.mem.zeroes(gpu.state.ReleaseMem);
+        release.destination = 1;
+        release.data_selection = 1;
+        release.address = 0x7000;
+        release.data = 42;
+        try std.testing.expect(backend.vtable.release.?(backend.context, release));
+        try std.testing.expectEqual(@as(usize, 1), audit.labels);
+        const submits = renderer.frame_profile.submits - before;
+        if (!coalesced) {
+            baseline_submits = submits;
+        } else {
+            try std.testing.expect(submits < baseline_submits);
+            std.debug.print("linear release readback: submits {d}->{d}, identical texels/padding before CPU label\n", .{ baseline_submits, submits });
+            _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
+            audit.reject_output = true;
+            try std.testing.expect(!backend.vtable.release.?(backend.context, release));
+            try std.testing.expectEqual(@as(usize, 1), audit.labels);
+            audit.reject_output = false;
+            try std.testing.expect(backend.vtable.release.?(backend.context, release));
+            try std.testing.expectEqual(@as(usize, 2), audit.labels);
+        }
+    }
+}
+
 noinline fn runLinearImageBatchProbe(allocator: std.mem.Allocator) !void {
     const previous = vulkan.backend.batch_linear_image_readbacks;
     defer vulkan.backend.batch_linear_image_readbacks = previous;
@@ -5639,8 +5707,17 @@ fn runResidentMipChainProbe(allocator: std.mem.Allocator) !void {
         }
         guest.changed();
         if (tracked) {
+            // Reproduce a tail mip whose previous GPU contents were discarded
+            // by publication after a CPU replacement. Its Vulkan allocation
+            // still exists, but generation zero must never be sampled as-is.
+            const tail = try texture.subresource(2, 0, 1);
+            const tail_offset: usize = @intCast(try tail.sourceByteOffset(0, 0, @max(depth >> 2, 1) - 1, 0));
+            @memset(allocation[tail_offset..][0..4], 51);
+            colors[2] = @splat(51.0 / 255.0);
+            guest.changed();
+            try renderer.probeCpuReplacedStorageMip(try gpu.resources.decodeImageDescriptor(&chain), 2);
             // Read the mixed CPU/GPU pyramid before publishing it. Only the
-            // edited mip may upload; neighbours must keep their GPU texels.
+            // edited/invalidated mips may upload; neighbours keep GPU texels.
             const readbacks = renderer.frame_profile.storage_image_readbacks;
             const uploads = renderer.sampled_image_uploads;
             for (0..3) |lod| {
@@ -15476,6 +15553,10 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--linear-image-completion")) {
         try runLinearImageCompletionProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--linear-release-readback")) {
+        try runLinearReleaseReadbackProbe(allocator);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--storage-srgb")) {

@@ -160,6 +160,8 @@ pub export var sampled_retirement_slack_bytes: u64 = 0;
 pub export var sampled_backing_reuse: bool = false;
 // Assemble only complete, coherent chains after validating every copy extent.
 pub export var assemble_resident_mip_chains: bool = true;
+pub export var recover_invalidated_mip_sources: bool = true;
+pub export var coalesce_linear_release_readbacks: bool = true;
 // Say what the levels looked like even when assembly stays off: the survey is
 // the whole point of the first run.
 pub export var survey_resident_mip_chains: bool = false;
@@ -23147,8 +23149,15 @@ pub const Renderer = struct {
     }
 
     pub fn probeStorageMipPublication(self: *Renderer, address: u64) anyerror!void {
+        var dirty_levels: usize = 0;
+        for (self.storage_image_cache.items) |cached| {
+            if (cached.valid and cached.gpu_dirty and cached.descriptor.address == address) dirty_levels += 1;
+        }
         for (self.storage_image_cache.items, 0..) |cached, index| {
             if (cached.valid and cached.gpu_dirty and cached.descriptor.address == address) {
+                // Restoring CPU-edited levels may leave just one GPU-owned
+                // mip. Publish that view without flushing unrelated buffers.
+                if (dirty_levels == 1) return self.flushCachedStorageImage(self.guest_memory.?, index);
                 // A digest-only overwrite baseline has no linear texel hash.
                 // The batched path must decline both a protected first mip and
                 // a protected sibling, leaving CPU-replacement checks to the
@@ -23166,6 +23175,30 @@ pub const Renderer = struct {
             }
         }
         return error.MissingDirtyMipChain;
+    }
+
+    pub fn probeCpuReplacedStorageMip(self: *Renderer, descriptor: gpu.ImageDescriptor, level: u8) anyerror!void {
+        for (self.storage_image_cache.items, 0..) |cached, index| {
+            if (!cached.valid or cached.descriptor.address != descriptor.address or cached.descriptor.viewBaseLevel() != level) continue;
+            try std.testing.expect(cached.gpu_dirty);
+            try self.flushCachedStorageImage(self.guest_memory.?, index);
+            try std.testing.expectEqual(@as(u64, 0), self.storage_image_cache.items[index].content_generation);
+            const sampler = std.mem.zeroes(gpu.resources.SamplerDescriptor);
+            const dimension: rdna2.spirv.SampledImageDimension = if (descriptor.image_type == .color_3d) .three_d else .two_d;
+            const format = sampledImageFormat(descriptor.unified_format, false).?;
+            const previous = recover_invalidated_mip_sources;
+            recover_invalidated_mip_sources = false;
+            defer recover_invalidated_mip_sources = previous;
+            try std.testing.expectEqual(@as(?PreparedSampledImage, null), try self.stageResidentStorageMipChain(descriptor, sampler, format, dimension));
+            recover_invalidated_mip_sources = true;
+            // An in-flight invalidated destination must not be rewritten by
+            // the sampler. Leave it to its producer's initialization path.
+            self.storage_image_cache.items[index].pin_count += 1;
+            defer self.releaseStorageImage(index);
+            try std.testing.expectEqual(@as(?PreparedSampledImage, null), try self.stageResidentStorageMipChain(descriptor, sampler, format, dimension));
+            return;
+        }
+        return error.MissingReplacedMip;
     }
 
     pub fn probeStorageVolumeInitialization(self: *Renderer, descriptor: gpu.ImageDescriptor, color: gpu.resources.ColorTarget, expected: []const u8) anyerror!void {
@@ -29775,6 +29808,10 @@ pub const Renderer = struct {
     }
 
     fn invalidateStorageGuestContents(self: *Renderer, cache_index: usize) void {
+        if (self.traceCurrentGraphicsFrame()) {
+            const source = self.storage_image_cache.items[cache_index];
+            std.debug.print("[gpu mip invalidate] flip={d} dispatch={d} @0x{x} mip={d} generation={d} dirty={any} pins={d} caller=0x{x}\n", .{ self.flip_callbacks + 1, self.frame_profile.dispatches, source.descriptor.address, source.descriptor.viewBaseLevel(), source.content_generation, source.gpu_dirty, source.pin_count, @returnAddress() });
+        }
         self.discardStorageContents(cache_index);
         const cached = &self.storage_image_cache.items[cache_index];
         self.storage_cpu_invalidations +%= 1;
@@ -30664,6 +30701,7 @@ pub const Renderer = struct {
     ) (Error || std.mem.Allocator.Error)!void {
         const snapshot = self.storage_image_cache.items[cache_index];
         if (!snapshot.valid or linear.len != snapshot.staging_bytes) return Error.UnsupportedStorageImage;
+        if (self.traceCurrentGraphicsFrame()) std.debug.print("[gpu mip upload] origin=storage-upload @0x{x} mip={d} index={d} generation={d} bytes={d} caller=0x{x}\n", .{ snapshot.descriptor.address, snapshot.descriptor.viewBaseLevel(), cache_index, snapshot.content_generation, linear.len, @returnAddress() });
         self.releaseStorageNativeBaseline(cache_index);
         // Reusing the shared transfer buffer needs a host wait, including
         // the first upload to an image: other images may still use it.
@@ -31057,6 +31095,7 @@ pub const Renderer = struct {
         discard_initial: bool,
     ) anyerror!PreparedStorageImage {
         const is_3d = descriptor.image_type == .color_3d;
+        if (self.traceCurrentGraphicsFrame()) std.debug.print("[gpu mip stage] flip={d} dispatch={d} @0x{x} mip={d} resource_levels={d} writable={any} discard_initial={any}\n", .{ self.flip_callbacks + 1, self.frame_profile.dispatches, descriptor.address, descriptor.viewBaseLevel(), descriptor.resourceMipLevels(), writable, discard_initial });
         const texture = gpu.TextureLayout.fromImage(descriptor) catch return Error.UnsupportedStorageImage;
         // The descriptor's depth_or_layers is the resource upper layer count,
         // while base_array narrows the view. A 3-layer resource viewed from
@@ -31419,8 +31458,10 @@ pub const Renderer = struct {
             // Padding and other mip levels share this allocation. Their CPU
             // changes do not change this view's texels or require uploading it.
             // Invalidated/replaced contents have no texel hash and still upload.
-            if (cached.guest_texel_hash == null or cached.guest_texel_hash.? != guest_texel_hash)
+            if (cached.guest_texel_hash == null or cached.guest_texel_hash.? != guest_texel_hash) {
+                if (self.traceCurrentGraphicsFrame()) std.debug.print("[gpu mip upload] origin=storage-stage @0x{x} mip={d} index={d} previous_hash={any} current_hash=0x{x}\n", .{ descriptor.address, descriptor.viewBaseLevel(), index, cached.guest_texel_hash, guest_texel_hash });
                 try self.uploadCachedStorageImage(index, linear);
+            }
             // A CPU fallback can replace a clean image previously uploaded by
             // the GPU path. Its older native snapshot must not validate the new
             // upload or classify that upload as a later CPU replacement.
@@ -34175,6 +34216,28 @@ pub const Renderer = struct {
         );
     }
 
+    fn rejectStorageMipChain(self: *Renderer, descriptor: gpu.ImageDescriptor, reason: []const u8, level: ?usize) ?PreparedSampledImage {
+        if (self.traceCurrentGraphicsFrame()) {
+            std.debug.print("[gpu mip decision] flip={d} dispatch={d} @0x{x} levels={d}..{d} count={d} result=reject reason={s} mip={any}\n", .{
+                self.flip_callbacks + 1,    self.frame_profile.dispatches, descriptor.address,
+                descriptor.viewBaseLevel(), descriptor.last_level,         descriptor.viewMipLevels(),
+                reason,                     level,
+            });
+            if (level) |wanted| {
+                var candidates = self.storage_image_address_index.candidatesBy(self.storage_image_cache.items, descriptor.address, CachedStorageImage.address);
+                while (candidates.next()) |index| {
+                    const cached = self.storage_image_cache.items[index];
+                    if (cached.descriptor.address != descriptor.address or cached.descriptor.viewBaseLevel() != wanted) continue;
+                    std.debug.print("    mip source index={d} valid={any} generation={d} dirty={any} pins={d} pending_init={any} fmt={d} extent={d}x{d} type={s}\n", .{
+                        index,                         cached.valid,                     cached.content_generation, cached.gpu_dirty,          cached.pin_count,
+                        cached.initialization_pending, cached.descriptor.unified_format, cached.subresource.width,  cached.subresource.height, @tagName(cached.descriptor.image_type),
+                    });
+                }
+            }
+        }
+        return null;
+    }
+
     /// Samples a compute output directly from its resident Vulkan image.  A
     /// CPU readback followed by a detile and re-upload is both redundant and
     /// especially expensive for Unity's 4K intermediate surfaces.
@@ -34191,18 +34254,21 @@ pub const Renderer = struct {
     ) anyerror!?PreparedSampledImage {
         const assemble = @atomicLoad(bool, &assemble_resident_mip_chains, .monotonic);
         const survey = @atomicLoad(bool, &survey_resident_mip_chains, .monotonic);
-        if (!assemble and !survey) return null;
+        if (!assemble and !survey) return self.rejectStorageMipChain(descriptor, "disabled", null);
         const levels = descriptor.viewMipLevels();
         const volume = dimension == .three_d and descriptor.image_type == .color_3d;
         const surface = dimension == .two_d and descriptor.image_type == .color_2d and descriptor.depth_or_layers == 1;
         if (levels < 2 or (!volume and !surface) or descriptor.base_array != 0 or descriptor.viewBaseLevel() != 0) {
-            return null;
+            return self.rejectStorageMipChain(descriptor, "view-eligibility", null);
         }
-        if (levels > maximum_assembled_mip_levels) return null;
+        if (levels > maximum_assembled_mip_levels) return self.rejectStorageMipChain(descriptor, "level-capacity", null);
 
         // Every level has to be present and current. A partial chain would
         // sample undefined texels in the levels it could not fill, which is a
-        // worse answer than the readback it replaces.
+        // worse answer than the readback it replaces. An invalidated, idle
+        // level may instead be restored from a stable guest snapshot below;
+        // never use the pixels left in its otherwise valid Vulkan object.
+        const recover_invalidated = @atomicLoad(bool, &recover_invalidated_mip_sources, .monotonic);
         var sources: [maximum_assembled_mip_levels]usize = undefined;
         for (0..levels) |level| {
             const found = found: {
@@ -34215,8 +34281,9 @@ pub const Renderer = struct {
                     if (!storageImageFormatsCompatible(cached.descriptor.unified_format, descriptor.unified_format)) continue;
                     if (cached.descriptor.image_type != descriptor.image_type or
                         cached.descriptor.depth_or_layers != descriptor.depth_or_layers or cached.descriptor.base_array != 0 or
-                        cached.descriptor.width != descriptor.width or cached.descriptor.height != descriptor.height or
-                        cached.content_generation == 0) continue;
+                        cached.descriptor.width != descriptor.width or cached.descriptor.height != descriptor.height) continue;
+                    if (cached.content_generation == 0 and (!recover_invalidated or cached.pin_count != 0 or
+                        cached.gpu_dirty or cached.initialization_pending or !sameStorageMipResource(cached.descriptor, descriptor))) continue;
                     // A volume uses a different swizzle across Z slices and
                     // mip tails. Equal base addresses and XY extents alone do
                     // not identify the same guest subresources.
@@ -34227,12 +34294,12 @@ pub const Renderer = struct {
                         newest = index;
                 }
                 break :found newest;
-            } orelse return null;
+            } orelse return self.rejectStorageMipChain(descriptor, "missing-current-source", level);
             sources[level] = found;
         }
 
-        const storage_format = storageImageFormat(descriptor.unified_format) orelse return null;
-        if (!sampledViewFormatCompatible(storage_format.vulkan, image_format)) return null;
+        const storage_format = storageImageFormat(descriptor.unified_format) orelse return self.rejectStorageMipChain(descriptor, "storage-format", null);
+        if (!sampledViewFormatCompatible(storage_format.vulkan, image_format)) return self.rejectStorageMipChain(descriptor, "sampled-format", null);
 
         // A level's producer wrote whatever extent the guest asked for, which
         // need not be the halving the destination level expects: a pyramid
@@ -34279,10 +34346,10 @@ pub const Renderer = struct {
                 );
             }
         }
-        if (!assemble) return null;
-        if (!extents_usable) return null;
+        if (!assemble) return self.rejectStorageMipChain(descriptor, "survey-only", null);
+        if (!extents_usable) return self.rejectStorageMipChain(descriptor, "source-too-small", null);
 
-        const memory = self.guest_memory orelse return null;
+        const memory = self.guest_memory orelse return self.rejectStorageMipChain(descriptor, "guest-memory-unavailable", null);
         // Resolve incompatible producers before allocating or modifying any
         // image. A CPU edit of one mip can be reloaded independently without
         // publishing the newer GPU output of all its neighbours.
@@ -34290,19 +34357,50 @@ pub const Renderer = struct {
         for (sources[0..levels], 0..) |index, level| {
             const cached = self.storage_image_cache.items[index];
             if (self.pendingBufferWrite(descriptor.address, cached.allocation_bytes)) |buffer| {
-                if (trace_survey) std.debug.print("[gpu mip reject] buffer @0x{x} bytes={d} overlaps @0x{x} bytes={d}\n", .{ buffer.guest_address, buffer.size, descriptor.address, cached.allocation_bytes });
-                return null;
+                if (trace_survey or self.traceCurrentGraphicsFrame()) std.debug.print("[gpu mip reject] buffer @0x{x} bytes={d} overlaps @0x{x} bytes={d}\n", .{ buffer.guest_address, buffer.size, descriptor.address, cached.allocation_bytes });
+                return self.rejectStorageMipChain(descriptor, "pending-buffer-write", level);
             }
             for (self.render_targets.items, 0..) |target, target_index| {
                 if (target.initialized and target.gpu_generation != target.host_generation and
                     byteRangesOverlap(descriptor.address, cached.allocation_bytes, target.target.descriptor.address, target.target.layout.required_source_bytes) and
                     !self.discardReplacedRenderTarget(target_index))
                 {
-                    if (trace_survey) std.debug.print("[gpu mip reject] color @0x{x} bytes={d} {d}x{d} overlaps @0x{x} bytes={d}\n", .{ target.target.descriptor.address, target.target.layout.required_source_bytes, target.target.descriptor.width, target.target.descriptor.height, descriptor.address, cached.allocation_bytes });
-                    return null;
+                    if (trace_survey or self.traceCurrentGraphicsFrame()) std.debug.print("[gpu mip reject] color @0x{x} bytes={d} {d}x{d} overlaps @0x{x} bytes={d}\n", .{ target.target.descriptor.address, target.target.layout.required_source_bytes, target.target.descriptor.width, target.target.descriptor.height, descriptor.address, cached.allocation_bytes });
+                    return self.rejectStorageMipChain(descriptor, "pending-color-write", level);
                 }
             }
-            if (cached.pin_count == 0 and try self.storageGuestContentsChanged(memory, index)) {
+            if (cached.content_generation == 0) {
+                // Guest bytes are authoritative only after incompatible GPU
+                // producers have been resolved. Sibling mips of this exact
+                // allocation are disjoint, including their packed mip tail.
+                for (self.storage_image_cache.items, 0..) |other, other_index| {
+                    if (other_index == index or !other.valid or !other.gpu_dirty or
+                        !byteRangesOverlap(cached.descriptor.address, cached.allocation_bytes, other.descriptor.address, other.allocation_bytes)) continue;
+                    if (disjointStorageImageMips(cached.descriptor, other.descriptor)) continue;
+                    // Scratch allocations alternate between unrelated HDR
+                    // surfaces and mip pyramids. As in layout conversion,
+                    // retire a CPU-replaced old interpretation before calling
+                    // it a pending writer. Pins still protect live producers.
+                    if (other.pin_count == 0 and try self.storageGuestContentsChanged(memory, other_index)) {
+                        self.invalidateStorageGuestContents(other_index);
+                        continue;
+                    }
+                    if (self.traceCurrentGraphicsFrame()) std.debug.print("[gpu mip writer] index={d} @0x{x} bytes={d} generation={d} pins={d} conflicts with @0x{x} mip={d}\n", .{ other_index, other.descriptor.address, other.allocation_bytes, other.content_generation, other.pin_count, descriptor.address, level });
+                    return self.rejectStorageMipChain(descriptor, "invalidated-source-storage-writer", level);
+                }
+                for (self.depth_targets.items) |other| {
+                    if (!other.initialized or other.gpu_generation == other.host_generation) continue;
+                    if (byteRangesOverlap(cached.descriptor.address, cached.allocation_bytes, other.target.address, other.target.allocation_bytes) or
+                        (other.target.has_stencil and byteRangesOverlap(cached.descriptor.address, cached.allocation_bytes, other.target.stencil_address, other.target.stencil_allocation_bytes)))
+                        return self.rejectStorageMipChain(descriptor, "invalidated-source-depth-writer", level);
+                }
+                for (self.completed_frames.items) |frame| {
+                    if (!frame.needs_writeback) continue;
+                    if (frame.target) |target| if (byteRangesOverlap(cached.descriptor.address, cached.allocation_bytes, target.descriptor.address, target.layout.required_source_bytes))
+                        return self.rejectStorageMipChain(descriptor, "invalidated-source-deferred-color", level);
+                }
+                cpu_changed[level] = true;
+            } else if (cached.pin_count == 0 and try self.storageGuestContentsChanged(memory, index)) {
                 cpu_changed[level] = true;
             }
         }
@@ -34311,11 +34409,11 @@ pub const Renderer = struct {
         // Preserve every selected source, including the untouched GPU mips.
         for (sources[0..levels]) |index| self.storage_image_cache.items[index].pin_count += 1;
         defer for (sources[0..levels]) |index| self.releaseStorageImage(index);
-        for (sources[0..levels], cpu_changed[0..levels]) |index, changed| {
+        for (sources[0..levels], cpu_changed[0..levels], 0..) |index, changed, level| {
             if (changed and !try self.reloadChangedStorageMip(memory, index)) {
                 if (trace_survey) std.debug.print("[gpu mip reject] CPU replacement has no stable snapshot @0x{x}\n", .{descriptor.address});
                 self.invalidateStorageGuestContents(index);
-                return null;
+                return self.rejectStorageMipChain(descriptor, "cpu-reload-unavailable-or-unstable", level);
             }
         }
         var signature_hash = std.hash.Wyhash.init(0);
@@ -34333,12 +34431,14 @@ pub const Renderer = struct {
                 chain.levels != levels or chain.image_format != image_format) continue;
             if (chain.signature != signature) break;
             chain.last_used_batch = self.sampled_image_batch;
+            if (self.traceCurrentGraphicsFrame()) std.debug.print("[gpu mip decision] flip={d} dispatch={d} @0x{x} result=resident-hit levels={d} signature=0x{x}\n", .{ self.flip_callbacks + 1, self.frame_profile.dispatches, descriptor.address, levels, signature });
             return .{
                 .image = chain.image,
                 .view = try self.residentImageViewLevelsMinLod(chain.image.handle, if (volume) vk.image_view_type_3d else vk.image_view_type_2d, image_format, try sampledImageComponents(descriptor.dst_select, descriptor.unified_format), vk.image_aspect_color_bit, 1, levels, sampledImageMinimumLod(descriptor, levels)),
                 .sampler = try self.residentSampler(sampler_descriptor),
             };
         }
+        if (self.traceCurrentGraphicsFrame()) std.debug.print("[gpu mip decision] flip={d} dispatch={d} @0x{x} result=assemble levels={d} signature=0x{x}\n", .{ self.flip_callbacks + 1, self.frame_profile.dispatches, descriptor.address, levels, signature });
         return self.buildAssembledMipChain(descriptor, sampler_descriptor, image_format, sources[0..levels], signature);
     }
 
@@ -34360,6 +34460,7 @@ pub const Renderer = struct {
         const texel_hash = gpu.parallel_copy.fingerprint(linear.bytes);
         if (query(memory.context, source.descriptor.address, source.allocation_bytes) != generation) return false;
         self.invalidateStorageGuestContents(index);
+        if (self.traceCurrentGraphicsFrame()) std.debug.print("[gpu mip upload] origin=cpu-reload @0x{x} mip={d} index={d} bytes={d}\n", .{ source.descriptor.address, source.descriptor.viewBaseLevel(), index, linear.bytes.len });
         try self.uploadCachedStorageImage(index, linear.bytes);
         const cached = &self.storage_image_cache.items[index];
         cached.guest_content_hash = backing_hash;
@@ -34438,6 +34539,7 @@ pub const Renderer = struct {
             self.destroyImage(destination);
         }
         if (reused != null) self.frame_profile.mip_chain_reuses +|= 1 else self.frame_profile.mip_chain_creates +|= 1;
+        var copied_levels: u32 = 0;
 
         const command_buffer = try self.beginOneShot();
         defer self.releaseOneShot(command_buffer);
@@ -34458,6 +34560,7 @@ pub const Renderer = struct {
 
         for (sources, 0..) |source, level| {
             if (reused) |chain| if (source.sameContents(chain.sources[level])) continue;
+            copied_levels += 1;
             self.frame_profile.mip_chain_level_copies +|= 1;
             if (volume) self.frame_profile.mip_chain_volume_level_copies +|= 1;
             try self.transitionTrackedImage(command_buffer, source.image, .{
@@ -34515,6 +34618,7 @@ pub const Renderer = struct {
         // fault whose real cause was a copy sized past the destination level;
         // with that fixed the wait bought nothing and cost a full pipeline
         // drain per pyramid per frame.
+        if (self.traceCurrentGraphicsFrame()) std.debug.print("[gpu mip backing trace] flip={d} dispatch={d} @0x{x} reused={any} copied={d}/{d} batch={d}\n", .{ self.flip_callbacks + 1, self.frame_profile.dispatches, descriptor.address, reused != null, copied_levels, levels, self.sampled_image_batch });
 
         const components = try sampledImageComponents(descriptor.dst_select, descriptor.unified_format);
         const view = try self.residentImageViewLevelsMinLod(
@@ -35797,6 +35901,7 @@ pub const Renderer = struct {
         if (native_clear == null) {
             self.frame_profile.upload_bytes +%= byte_count;
             self.frame_profile.texture_upload_bytes +%= byte_count;
+            if (self.traceCurrentGraphicsFrame()) std.debug.print("[gpu mip upload] origin=sampled @0x{x} base={d} last={d} levels={d} bytes={d} state=0x{x} generation={d}\n", .{ descriptor.address, descriptor.base_level, descriptor.last_level, mip_levels, byte_count, upload_state_hash, source_generation });
         }
 
         const minimum_lod = vk.ImageViewMinLodCreateInfoEXT{ .min_lod = sampledImageMinimumLod(descriptor, mip_levels) };
@@ -38527,6 +38632,12 @@ pub const Renderer = struct {
             self.release_was_queued = true;
             return true;
         }
+        // With no earlier labels, the image transfer itself can retire the
+        // queued producer. Preserve FIFO publication when older labels exist;
+        // drainInternalReleases handles that case before this release proceeds.
+        const readbacks_first = @atomicLoad(bool, &coalesce_linear_release_readbacks, .monotonic) and
+            self.deferred_internal_release_count == 0 and self.hasPendingLinearStorageImages();
+        if (readbacks_first and !self.publishDeferredStorageWrites(release.interrupt != 0)) return false;
         // RELEASE_MEM is the guest-visible completion boundary. Submit every
         // graphics command accumulated since the preceding boundary and wait
         // once before publishing its label/interrupt payload.
@@ -38544,7 +38655,7 @@ pub const Renderer = struct {
         // recycle any buffer allocation. Publish large outputs too: retaining
         // their dirty snapshots past this boundary can overwrite a later heap
         // allocation (including command buffers) on eviction.
-        if (!self.publishDeferredStorageWrites(release.interrupt != 0)) return false;
+        if (!readbacks_first and !self.publishDeferredStorageWrites(release.interrupt != 0)) return false;
         if ((release.destination != 0 and release.destination != 1) or release.address == 0) return true;
         var bytes: [8]u8 = undefined;
         const accepted = switch (release.data_selection) {
@@ -38770,17 +38881,27 @@ pub const Renderer = struct {
     fn drainInternalReleases(self: *Renderer, count: usize) Error!void {
         if (count == 0 or self.publishing_internal_release) return;
         std.debug.assert(count <= self.deferred_internal_release_count);
+        self.publishing_internal_release = true;
+        defer self.publishing_internal_release = false;
+        // Linear images must reach guest RAM before a CPU-visible label. Their
+        // publishers already order a transfer behind the producer and wait for
+        // that transfer. Record it before waiting for the label's older tick:
+        // otherwise the producer and its readback require separate submissions
+        // and host waits even when both could share the queued command buffer.
+        // Keep the buffer-only path's early wait: its retired write-extent
+        // counter can narrow the subsequent transfer. Image publication retires
+        // that work too before publishDeferredStorageWrites reaches buffers.
+        const readbacks_first = @atomicLoad(bool, &coalesce_linear_release_readbacks, .monotonic) and self.hasPendingLinearStorageImages();
+        if (readbacks_first and !self.publishDeferredStorageWrites(self.releasesPublishLargeBuffers(count))) return Error.GuestMemoryWriteFailed;
         if (self.deferred_internal_releases[count - 1].tick == command_buffer_pending_tick)
             try self.flushQueuedCommands();
         // One wait covers this FIFO prefix. Later commands may remain in
         // flight; a label read need only observe its own preceding work.
         const caller = if (self.release_drain_caller != 0) self.release_drain_caller else @returnAddress();
         try self.waitForTickFrom(self.deferred_internal_releases[count - 1].tick, caller);
-        self.publishing_internal_release = true;
-        defer self.publishing_internal_release = false;
         // CPU completion must not leave dirty snapshots of allocations the
         // guest can now reuse. Internal GPU-only labels keep large residency.
-        if (!self.publishDeferredStorageWrites(self.releasesPublishLargeBuffers(count))) return Error.GuestMemoryWriteFailed;
+        if (!readbacks_first and !self.publishDeferredStorageWrites(self.releasesPublishLargeBuffers(count))) return Error.GuestMemoryWriteFailed;
         var published: usize = 0;
         defer {
             const remaining = self.deferred_internal_release_count - published;
@@ -44420,7 +44541,7 @@ test "linear mip completion preserves interior alias publication order" {
     try std.testing.expect(linearMipCompletionIsIndependent(&entries, 0));
 }
 
-fn disjointStorageImageMips(a: gpu.ImageDescriptor, b: gpu.ImageDescriptor) bool {
+fn sameStorageMipResource(a: gpu.ImageDescriptor, b: gpu.ImageDescriptor) bool {
     if (a.address != b.address or a.width != b.width or a.height != b.height or
         a.depth_or_layers != b.depth_or_layers or a.pitch != b.pitch or
         a.unified_format != b.unified_format or a.tile_mode != b.tile_mode or
@@ -44429,6 +44550,11 @@ fn disjointStorageImageMips(a: gpu.ImageDescriptor, b: gpu.ImageDescriptor) bool
         a.samplesLog2() != 0 or b.samplesLog2() != 0 or
         a.dcc_enabled or b.dcc_enabled or a.cmask_fast_clear or b.cmask_fast_clear or
         a.fmask_compression or b.fmask_compression) return false;
+    return true;
+}
+
+fn disjointStorageImageMips(a: gpu.ImageDescriptor, b: gpu.ImageDescriptor) bool {
+    if (!sameStorageMipResource(a, b)) return false;
     const a_first: u16 = a.viewBaseLevel();
     const b_first: u16 = b.viewBaseLevel();
     return a_first + a.viewMipLevels() <= b_first or b_first + b.viewMipLevels() <= a_first;
