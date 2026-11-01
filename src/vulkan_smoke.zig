@@ -14867,7 +14867,7 @@ pub fn main(init: std.process.Init) !void {
             memory.fingerprint = GuestMemory.fingerprint;
             _ = renderer.dcbBackend(memory);
             try renderer.probeSampledArrayRefresh();
-            std.debug.print("sampled array refresh passed: timeline={any}, preserved layers, queued and materialized revisions, unknown-version/CPU-write/prepared-binding rejection, no extra texture upload/readback\n", .{timeline});
+            std.debug.print("sampled array refresh passed: timeline={any}, preserved layers, queued/materialized/evicted revisions, unknown-version/CPU-write/prepared-binding rejection, no extra texture upload/readback\n", .{timeline});
         }
         return;
     }

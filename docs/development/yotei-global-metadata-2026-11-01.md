@@ -338,3 +338,71 @@ later scene work continued through flip 1265. It was deliberately stopped
 to build the material fix after concurrent compilation approached the host
 commit limit; this was not a spontaneous game crash. Character control and
 a sustained post-tree FPS result remain unverified.
+
+### Warm repeat: simple presentation still has expensive resource work
+
+The repeat with the SDWA fix completed 978 compute warmups without a warmup
+failure. Its renderer checkpoint at flip 1088 shows a pre-order bonus message
+on a black background. Nearby warm frame 1080 still issued 285 draws and
+1,287 compute dispatches, uploaded 468,309 KiB and read back 220,222 KiB.
+It took 628 ms, including 172,577 microseconds of fence waits, with no graphics
+or compute pipeline misses. Frame 1140 took 665 ms. These changing-scene samples
+explain why a simple visible overlay does not imply a cheap emulated frame;
+they are not a controlled before/after FPS comparison.
+
+The later checkpoint at flip 1280 again shows the tree with black patches.
+The run reached flip 1295, with 171,290 recorded graphics draws translated and
+no recorded draw/dispatch failures through that point. The post-tree transition
+still encounters cold variants: frame 1293 spent 77,621 ms creating nine
+compute pipelines. Warm caches help revisited work, but neither a tenfold
+first-run compilation speedup nor controllable gameplay is established.
+The process was deliberately stopped to complete isolated regression builds
+without exhausting host commit. A concurrent probe build had already been
+cancelled for that reason; overlapping intervals are not FPS benchmarks.
+
+### Retaining sampled array layers after producer eviction
+
+A read-only census found five repeatedly uploaded 2048-by-2048 texture arrays,
+with nine or ten layers each (72 or 80 MiB). The existing refresh path already
+copies some changed layers on the GPU. Other refreshes reject a pending
+readback whose original attachment has left the render-target cache.
+
+The array can already contain that exact readback revision. Refresh now accepts
+an evicted source only when its nonzero, globally unique content generation
+matches the layer previously copied into this same sampled array. A conflicting
+resident version, unknown revision, CPU page change or incompatible producer
+still follows the guarded fallback. Guest-memory publication remains pending.
+The frame profile exposes successful uses as `retained_refreshes`.
+
+The native array probe now evicts and destroys the original attachment after
+copying its blue revision, then checks all three array layers again. It also
+rejects absent and mismatched generation proofs and covers reuse with no other
+GPU-dirty producer. Runtime use and FPS impact of this change remain to be
+measured separately.
+
+The native probe passes with both the fence and timeline schedulers on the
+RTX 3070 Ti, with `VK_LAYER_KHRONOS_validation` requested and no validation
+errors or warnings reported (4/4 build/run steps). All 270 Vulkan unit tests
+also pass in ReleaseFast. No title-specific address or skipped draw is used
+by this optimization.
+
+The isolated ReleaseFast runner build passes all 15 steps, and the standard
+`zig-out/bin/game-run.exe` has been updated with this change.
+
+### Private dispatcher-compilation experiment
+
+One captured compute module contains 184,875 SPIR-V instructions in one
+function, including a dispatcher switch with 876 cases. A private binary
+experiment groups those cases into 28 nested switches of at most 32 cases,
+retaining the original block bodies, default-path state updates and loop
+budget. The resulting module passes `spirv-val` for Vulkan 1.3.
+
+Sequential compile-only probes on the same RTX 3070 Ti and probe executable,
+with no application pipeline cache and no game/build running, measured
+40,328 ms for the original versus 28,177 ms for the grouped version.
+Peak process commitment fell from 2,982,158,336 to 2,272,632,832 bytes.
+This single pair suggests further investigation (about 30% less compile
+time), not a tenfold loading improvement or a rendering result. The modified
+module was never dispatched and this transformation is not enabled in the
+emulator. Native correctness coverage and multiple workloads are required
+before adopting it. Private game shader captures are not committed.

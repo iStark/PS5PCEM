@@ -3761,6 +3761,7 @@ const FrameProfile = struct {
     sampled_exact_hits: u64 = 0,
     sampled_view_hits: u64 = 0,
     sampled_array_refreshes: u64 = 0,
+    sampled_array_retained_refreshes: u64 = 0,
     sampled_array_layers: u64 = 0,
     sampled_array_rejections: [10]u64 = @splat(0),
     sampled_slow_paths: u64 = 0,
@@ -23222,7 +23223,8 @@ pub const Renderer = struct {
         const target = try guestColorTarget(color);
         const index = try self.acquireRenderTarget(target);
         self.render_targets.items[index].pin_count += 1;
-        defer self.releaseRenderTarget(index);
+        var original_pinned = true;
+        defer if (original_pinned) self.releaseRenderTarget(index);
         color.base_array_slice = 2;
         color.last_array_slice = 2;
         const stable_index = try self.acquireRenderTarget(try guestColorTarget(color));
@@ -23340,11 +23342,63 @@ pub const Renderer = struct {
         try std.testing.expect(try self.refreshSampledColorArray(sampled_index, descriptor, page_generation, epoch));
         try std.testing.expectEqual(@as(u64, 3), self.frame_profile.sampled_array_layers);
         try std.testing.expectEqual(@as(u64, 2), self.frame_profile.sampled_array_refreshes);
+        // The sampled array owns the blue pixels even after the attachment
+        // cache destroys their producer. Its pending readback must not force
+        // all three layers through guest memory again.
+        var original_backing = self.render_targets.items[index].backing_snapshot;
+        const frame_index = self.latest_frame_index.?;
+        const generation = self.completed_frames.items[frame_index].source_content_generation;
+        const cache_limit = self.render_target_cache_limit;
+        self.render_target_cache_limit = self.render_targets.items.len;
+        defer self.render_target_cache_limit = cache_limit;
+        self.releaseRenderTarget(index);
+        original_pinned = false;
+        var unrelated = color;
+        unrelated.address = 0x4000;
+        unrelated.base_array_slice = 0;
+        unrelated.last_array_slice = 0;
+        const replacement = try self.acquireRenderTarget(try guestColorTarget(unrelated));
+        try std.testing.expectEqual(index, replacement);
+        try std.testing.expect(self.completed_frames.items[frame_index].needs_writeback);
+        try std.testing.expectEqual(generation, self.completed_frames.items[frame_index].source_content_generation);
+        const retained_generation = self.sampled_image_cache.items[sampled_index].array_layer_generations[1];
+        try std.testing.expectEqual(generation, retained_generation);
+        self.sampled_image_cache.items[sampled_index].array_layer_generations[1] = 0;
+        try std.testing.expect(!try self.refreshSampledColorArray(sampled_index, descriptor, page_generation, epoch));
+        self.sampled_image_cache.items[sampled_index].array_layer_generations[1] = generation + 1;
+        try std.testing.expect(!try self.refreshSampledColorArray(sampled_index, descriptor, page_generation, epoch));
+        self.sampled_image_cache.items[sampled_index].array_layer_generations[1] = retained_generation;
+        try std.testing.expect(try self.refreshSampledColorArray(sampled_index, descriptor, page_generation, epoch));
+        // No remaining GPU-dirty layer is needed for the retained-frame proof.
+        const stable_initialized = self.render_targets.items[stable_index].initialized;
+        self.render_targets.items[stable_index].initialized = false;
+        const retained_only = self.refreshSampledColorArray(sampled_index, descriptor, page_generation, epoch);
+        self.render_targets.items[stable_index].initialized = stable_initialized;
+        try std.testing.expect(try retained_only);
+        try std.testing.expectEqual(before_upload, self.frame_profile.texture_upload_bytes);
+        try std.testing.expectEqual(before_readback + 8 * 8 * 4, self.frame_profile.readback_bytes);
+        const retained_commands = try self.beginOneShot();
+        defer self.releaseOneShot(retained_commands);
+        const retained_range = vk.ImageSubresourceRange{ .aspect_mask = vk.image_aspect_color_bit, .layer_count = 3 };
+        try self.transitionTrackedImage(retained_commands, original.image.handle, retained_range, image_state.transfer_source_usage);
+        const retained_copy = vk.BufferImageCopy{
+            .image_subresource = .{ .aspect_mask = vk.image_aspect_color_bit, .layer_count = 3 },
+            .image_extent = .{ .width = 8, .height = 8, .depth = 1 },
+        };
+        self.device_functions.cmd_copy_image_to_buffer(retained_commands, original.image.handle, vk.image_layout_transfer_src_optimal, readback.handle, 1, @ptrCast(&retained_copy));
+        try self.transitionTrackedImage(retained_commands, original.image.handle, retained_range, image_state.shader_read_usage);
+        const retained_host = vk.BufferMemoryBarrier{ .source_access_mask = vk.access_transfer_write_bit, .destination_access_mask = vk.access_host_read_bit, .buffer = readback.handle, .offset = 0, .size = output_bytes };
+        self.device_functions.cmd_pipeline_barrier(retained_commands, vk.pipeline_stage_transfer_bit, vk.pipeline_stage_host_bit, 0, 0, null, 1, @ptrCast(&retained_host), 0, null);
+        try self.submitOneShot(retained_commands);
+        try self.waitForSubmittedWork();
+        var retained_pixels: [output_bytes]u8 = undefined;
+        try self.readMapped(readback, &retained_pixels);
+        try std.testing.expectEqualSlices(u8, observed[output_bytes..], &retained_pixels);
         // A CPU write to another slice must not discard this GPU producer.
         if (!memory.write(memory.context, descriptor.address, &.{ 0x11, 0x22, 0x33, 0x44 })) return Error.GuestMemoryWriteFailed;
-        try std.testing.expect(!self.render_targets.items[index].backing_snapshot.changed(memory, target));
+        try std.testing.expect(!original_backing.changed(memory, target));
         if (!memory.write(memory.context, descriptor.address + target.layout.source_slice_bytes, &.{ 0x11, 0x22, 0x33, 0x44 })) return Error.GuestMemoryWriteFailed;
-        try std.testing.expect(self.render_targets.items[index].backing_snapshot.changed(memory, target));
+        try std.testing.expect(original_backing.changed(memory, target));
     }
 
     pub fn probeFeedbackSnapshots(self: *Renderer) anyerror!void {
@@ -34410,20 +34464,33 @@ pub const Renderer = struct {
                     byteRangesOverlap(address, span, depth.target.stencil_address, depth.target.stencil_allocation_bytes))) return self.rejectSampledArray(5);
         }
         var materialized_layers: [max_layers]bool = @splat(false);
+        var retained_evicted_layer = false;
         for (self.completed_frames.items) |frame| {
             if (frame.needs_writeback) if (frame.target) |target| {
                 if (!byteRangesOverlap(address, span, frame.guest_address, target.layout.required_source_bytes)) continue;
                 // Readback does not make guest RAM current. The resident image
                 // is still a valid source if it is the exact captured version;
-                // CPU-only frames and superseded/evicted sources must fall back.
+                // CPU-only and superseded frames still need publication.
                 const layer = target.descriptor.base_array_slice;
                 if (frame.source_content_generation == 0 or layer >= descriptor.depth_or_layers)
                     return self.rejectSampledArray(6);
+                var resident_target = false;
                 const resident = for (self.render_targets.items) |candidate| {
-                    if (candidate.initialized and candidate.content_generation == frame.source_content_generation and
-                        sameRenderTarget(candidate.target, target)) break true;
+                    if (!candidate.initialized or !sameRenderTarget(candidate.target, target)) continue;
+                    resident_target = true;
+                    if (candidate.content_generation == frame.source_content_generation) break true;
                 } else false;
-                if (!resident) return self.rejectSampledArray(6);
+                if (!resident) {
+                    // Evicting the producer does not erase the exact revision
+                    // already copied into this array. Its global content epoch
+                    // proves the pending readback is represented here. Keep
+                    // rejecting an unknown revision or a conflicting resident
+                    // target; CPU changes were rejected above as well.
+                    if (resident_target or snapshot.array_layer_generations[layer] != frame.source_content_generation)
+                        return self.rejectSampledArray(6);
+                    retained_evicted_layer = true;
+                    continue;
+                }
                 materialized_layers[layer] = true;
             };
         }
@@ -34471,10 +34538,11 @@ pub const Renderer = struct {
             sources[layer] = target_index;
             count += 1;
         }
-        if (dirty_count == 0) return false;
+        if (dirty_count == 0 and !retained_evicted_layer) return false;
         if (count == 0) {
             self.sampled_image_cache.items[index].source_generation = source_generation;
             _ = self.image_aliases.markSynchronized(snapshot.alias_token);
+            if (retained_evicted_layer) self.frame_profile.sampled_array_retained_refreshes +|= 1;
             return true;
         }
         for (sources) |source| if (source) |target_index| {
@@ -34509,6 +34577,7 @@ pub const Renderer = struct {
         self.sampled_image_cache.items[index].source_generation = source_generation;
         _ = self.image_aliases.markSynchronized(snapshot.alias_token);
         self.frame_profile.sampled_array_refreshes +|= 1;
+        if (retained_evicted_layer) self.frame_profile.sampled_array_retained_refreshes +|= 1;
         self.frame_profile.sampled_array_layers +|= count;
         return true;
     }
@@ -39710,9 +39779,9 @@ pub const Renderer = struct {
                 "[gpu sampled inner] flip={d} gen={d}ms/{d} prefix={d}ms resident={d}ms probe={d}ms/{d} page={d}ms/{d} paths(exact/view/slow)={d}/{d}/{d} flush(alias/simg/buf/tgt/htile)={d}/{d}/{d}/{d}/{d}ms materialize={d}/{d} readbacks={d}/{d}KiB\n",
                 .{ self.flip_callbacks, profile.sampled_generation_scan_ns / std.time.ns_per_ms, profile.sampled_generation_calls, profile.sampled_prefix_ns / std.time.ns_per_ms, profile.sampled_resident_ns / std.time.ns_per_ms, profile.sampled_probe2_ns / std.time.ns_per_ms, profile.sampled_probe2_calls, profile.sampled_page_ns / std.time.ns_per_ms, profile.sampled_page_calls, profile.sampled_exact_hits, profile.sampled_view_hits, profile.sampled_slow_paths, profile.flush_alias_ns / std.time.ns_per_ms, profile.flush_storage_image_ns / std.time.ns_per_ms, profile.flush_storage_ns / std.time.ns_per_ms, profile.flush_target_ns / std.time.ns_per_ms, profile.flush_htile_ns / std.time.ns_per_ms, profile.materialize_target_hits, profile.materialize_target_calls, profile.target_readbacks, profile.target_readback_bytes / 1024 },
             );
-            if (profile.sampled_array_refreshes != 0) std.debug.print(
-                "[gpu sampled arrays] flip={d} refreshes={d} layers={d}\n",
-                .{ self.flip_callbacks, profile.sampled_array_refreshes, profile.sampled_array_layers },
+            if (profile.sampled_array_refreshes != 0 or profile.sampled_array_retained_refreshes != 0) std.debug.print(
+                "[gpu sampled arrays] flip={d} refreshes={d} layers={d} retained_refreshes={d}\n",
+                .{ self.flip_callbacks, profile.sampled_array_refreshes, profile.sampled_array_layers, profile.sampled_array_retained_refreshes },
             );
             if (!std.mem.allEqual(u64, &profile.sampled_array_rejections, 0)) std.debug.print(
                 "[gpu sampled array rejects] flip={d} shape/pages/batch/buffer/storage/depth/frame/target/layout/state={any}\n",
