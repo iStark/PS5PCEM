@@ -18,6 +18,9 @@ pub const Options = struct {
     /// Shared PRX images are packed into the guest system-software window.
     module_load_start: u64 = memory.system_reserved.start,
     maximum_file_size: usize = 512 * 1024 * 1024,
+    /// Applied to the root's private bytes before mapping, for both folder and
+    /// archive sources. Dependencies are never patched through this option.
+    executable_patch: ?loader.game_patches.Profile = null,
     /// Additional title PRX files to map before guest execution. This models
     /// modules a title later names through `sceKernelLoadStartModule` while the
     /// current runtime still performs graph construction as one safe phase.
@@ -102,6 +105,7 @@ pub const ModuleGraph = struct {
     allocator: std.mem.Allocator,
     nodes: std.ArrayList(Module) = .empty,
     root_index: usize = 0,
+    executable_patch_result: loader.game_patches.Result = .not_requested,
     initialization_order: std.ArrayList(usize) = .empty,
     module_images: std.ArrayList(*loader.MappedImage) = .empty,
 
@@ -456,6 +460,9 @@ fn loadFromSource(
         options.maximum_file_size,
     );
     try appendNode(&graph, executable_name, root_bytes);
+    if (options.executable_patch) |profile| {
+        graph.executable_patch_result = try loader.game_patches.apply(profile, root_bytes);
+    }
 
     // Explicitly requested modules are roots of their own dynamic subgraphs.
     // Making them dependencies of the executable maps, relocates and

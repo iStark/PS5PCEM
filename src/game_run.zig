@@ -52,6 +52,8 @@ const usage =
     \\archive-relative executable as the last argument. Direct execution requires Windows or Linux x86-64.
     \\PS5_GRAPHICS_API=vulkan|d3d12 selects the renderer. D3D12 is experimental and Windows-only.
     \\PS5_FPS_LIMIT=30|60|120|0 caps completed flips; 0 or unset leaves them uncapped.
+    \\PS5_GAME_PATCHES=auto|off|astro-bot-1080p selects verified in-memory game patches.
+    \\Auto enables ASTRO BOT 1080p only for the known PPSA21564 1.018 executable at 1080p output.
     \\PS5_HLE_BUNDLED_MODULES=libSceAmpr.sprx selects firmware for named fakelib modules (semicolon-separated).
     \\
 ;
@@ -652,8 +654,23 @@ fn run(init: std.process.Init) !bool {
         }
     }
 
+    const patch_mode = if (init.minimal.environ.getAlloc(allocator, "PS5_GAME_PATCHES")) |text| mode: {
+        defer allocator.free(text);
+        break :mode loader.game_patches.Mode.parse(text) catch {
+            try stderr.writeAll("Invalid PS5_GAME_PATCHES: use auto, off, or astro-bot-1080p\n");
+            try stderr.flush();
+            return false;
+        };
+    } else |_| loader.game_patches.Mode.auto;
+    const executable_patch = loader.game_patches.select(patch_mode, title_identifier, output_mode.height()) catch {
+        try stderr.writeAll("ASTRO BOT 1080p requires title PPSA21564 and a verified executable\n");
+        try stderr.flush();
+        return false;
+    };
+
     var graph = if (archive_reader) |reader|
         emu.loadModuleGraphArchive(io, reader, archive_executable, .{
+            .executable_patch = executable_patch,
             .preload_modules = preload_modules.items,
             .deferred_modules = deferred_modules.items,
             .ignore_bundled_drivers = ignore_bundled_drivers,
@@ -666,6 +683,7 @@ fn run(init: std.process.Init) !bool {
         }
     else
         emu.loadModuleGraph(io, executable_path, .{
+            .executable_patch = executable_patch,
             .preload_modules = preload_modules.items,
             .deferred_modules = deferred_modules.items,
             .ignore_bundled_drivers = ignore_bundled_drivers,
@@ -677,6 +695,17 @@ fn run(init: std.process.Init) !bool {
             return false;
         };
     defer graph.deinit();
+
+    switch (graph.executable_patch_result) {
+        .applied => try out.writeAll("  Game patch  ASTRO BOT 1920x1080 internal rendering (PPSA21564 01.018.000; SHA-256 and 13 byte guards verified; memory only)\n"),
+        .unsupported_executable => {
+            try out.writeAll("  Game patch  ASTRO BOT 1080p not applied: executable SHA-256 is not in the verified profile\n");
+            try out.flush();
+            if (patch_mode == .astro_bot_1080p) return false;
+        },
+        .not_requested => {},
+    }
+    try out.flush();
 
     // Must precede any guest execution: a throwing title asks the kernel which
     // module owns each return address, and without an answer its runtime finds

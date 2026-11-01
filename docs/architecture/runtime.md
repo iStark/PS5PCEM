@@ -58,6 +58,25 @@ lower internal rendering or guarantee higher FPS. Yōtei has been observed to
 allocate 3840×2160 resources even with VideoOut class 1. Startup logs distinguish
 the requested output profile from the actual host window dimensions.
 
+`PS5_GAME_PATCHES=auto|off|astro-bot-1080p` controls verified executable
+patches. The default `auto` selects ASTRO BOT's existing 1920x1080 internal
+render mode when the output preference is 1080p, the title is **PPSA21564**, and
+the entire **01.018.000** SELF matches SHA-256
+`aaef7a00968bebdeae17c0ee874cc0a9dbadf412c833cb1a9e1428c0ddc24aaa`.
+Thirteen byte guards cover the selector and its three setter/table copies.
+Only the six-byte selector instruction changes. An unknown executable remains
+unmodified in `auto`; an explicit `astro-bot-1080p` request stops if the title
+or executable identity is unsupported. `off` restores the game's original
+selection for comparisons. Other output preferences do not auto-enable it.
+
+The patch changes only the loader's private in-memory copy, before mapping and
+execution, for both directory and ZArchive launches. It does not edit installed
+game files or enable GI, physics, frame-timing, DLSS or FSR changes. Resolution
+locations were adapted from the [DLSSKytyPS5 ASTRO BOT profiles](https://github.com/iska0702/DLSSKytyPS5/blob/main/_Patches/PPSA21567.json)
+and independently checked against the executable above. Other regions and
+versions require their own verification; matching version numbers alone are
+insufficient.
+
 ```zig
 const runtime = @import("runtime");
 

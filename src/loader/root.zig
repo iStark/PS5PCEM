@@ -19,6 +19,7 @@ pub const linker = @import("linker.zig");
 pub const image_loader = @import("image_loader.zig");
 pub const tls = @import("tls.zig");
 pub const exports = @import("exports.zig");
+pub const game_patches = @import("game_patches.zig");
 
 pub const Image = elf.Image;
 pub const ObjectType = elf.ObjectType;
@@ -64,4 +65,5 @@ test {
     _ = image_loader;
     _ = tls;
     _ = exports;
+    _ = game_patches;
 }
