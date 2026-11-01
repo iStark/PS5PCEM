@@ -46973,7 +46973,7 @@ fn resolveProducedSamplerDescriptor(
         .definition_cache = analysis.scalar_definitions,
     };
     var words: [4]u32 = undefined;
-    if (!try resolver.words(sampler_sgpr, before_pc, &words)) {
+    if (!try resolver.wordsWithUniformBranches(sampler_sgpr, before_pc, &words)) {
         // A sampler can be shared by dynamically chosen material records only
         // when every possible load is in bounds and all four words agree.
         // Otherwise even an OOB zero sampler could select different filtering.

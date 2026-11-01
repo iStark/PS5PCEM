@@ -19,6 +19,7 @@ pub var persistent_definition_cache_enabled = std.atomic.Value(bool).init(true);
 pub var persistent_definition_cache_hits = std.atomic.Value(u64).init(0);
 pub var persistent_definition_cache_misses = std.atomic.Value(u64).init(0);
 pub export var bounded_pointer_recovery_scratch: bool = true;
+pub export var uniform_resource_branch_recovery: bool = true;
 
 // Reaching-definition recovery only reads this snapshot. Sharing the immutable
 // unknown state avoids copying 128 register records for every preparation.
@@ -143,6 +144,98 @@ pub const Resolver = struct {
         if (before == self.instructions.len) return false;
         for (output, 0..) |*value, component| value.* = (try self.word(register + @as(u32, @intCast(component)), before, 0)) orelse return false;
         return true;
+    }
+
+    /// Retry an ambiguous resource after proving scalar-uniform branch choices.
+    /// The ordinary static query stays fast and cacheable. This fallback owns
+    /// a draw-local graph: neither live conditions nor the pruned definitions
+    /// may enter the persistent shader cache. Unknown conditions retain both
+    /// edges, and structurally unreachable resources remain unresolved.
+    pub fn wordsWithUniformBranches(self: *Resolver, register: u32, before_pc: u32, output: []u32) !bool {
+        if (try self.words(register, before_pc, output)) return true;
+        if (!@atomicLoad(bool, &uniform_resource_branch_recovery, .monotonic)) return false;
+        // A shader-side write could change the predicate after this host
+        // snapshot. Without an alias proof, retain the existing unresolved
+        // result for programs that can modify guest memory themselves.
+        for (self.instructions) |inst| {
+            const name = @tagName(inst.opcode);
+            if (inst.gds or std.mem.indexOf(u8, name, "store") != null or
+                std.mem.indexOf(u8, name, "atomic") != null) return false;
+        }
+        const maximum_blocks = 1024;
+        if (self.graph.blocks.items.len > maximum_blocks or self.graph.edges.items.len > maximum_blocks * 2) return false;
+        const query_block = for (self.graph.blocks.items, 0..) |block, index| {
+            if (before_pc >= block.start_pc and before_pc < block.end_pc) break index;
+        } else return false;
+        // Only resolve choices that reconverge at this resource. Do not prune
+        // its outer guard: resources in currently inactive paths still need a
+        // valid binding, and proving a path inactive is a separate operation.
+        var reaches_query: [maximum_blocks]bool = @splat(false);
+        var pending: [maximum_blocks]usize = undefined;
+        pending[0] = query_block;
+        reaches_query[query_block] = true;
+        var pending_count: usize = 1;
+        var cursor: usize = 0;
+        while (cursor < pending_count) : (cursor += 1) {
+            for (self.graph.edges.items) |edge| {
+                if (edge.from >= self.graph.blocks.items.len or edge.to >= self.graph.blocks.items.len) return false;
+                if (edge.to != pending[cursor] or reaches_query[edge.from]) continue;
+                reaches_query[edge.from] = true;
+                pending[pending_count] = edge.from;
+                pending_count += 1;
+            }
+        }
+        var converging_edges: [maximum_blocks]u2 = @splat(0);
+        for (self.graph.edges.items) |edge| {
+            if (reaches_query[edge.to]) converging_edges[edge.from] |= if (edge.kind == .branch) @as(u2, 1) else 2;
+        }
+        var edges: [maximum_blocks * 2]rdna2.control_flow.Edge = undefined;
+        var conditions: [maximum_blocks]enum { unqueried, unknown, is_false, is_true } = @splat(.unqueried);
+        // A representative snapshot may hold an intermediate loop value.
+        // Branch proof must reconstruct every input from its actual producer.
+        var proof = Resolver{
+            .bindings = self.bindings,
+            .reader = self.reader,
+            .instructions = self.instructions,
+            .graph = self.graph,
+            .snapshot = &unknown_registers,
+            .remaining = 2048,
+        };
+        var edge_count: usize = 0;
+        for (self.graph.edges.items) |edge| {
+            if (edge.from >= self.graph.blocks.items.len or edge.to >= self.graph.blocks.items.len) return false;
+            const block = self.graph.blocks.items[edge.from];
+            if (block.instruction_count == 0) return false;
+            const last = block.first_instruction + block.instruction_count - 1;
+            if (last >= self.instructions.len) return false;
+            const opcode = self.instructions[last].opcode;
+            if (converging_edges[edge.from] == 3 and (opcode == .s_cbranch_scc0 or opcode == .s_cbranch_scc1)) {
+                if (conditions[edge.from] == .unqueried) {
+                    conditions[edge.from] = .unknown;
+                    if (proof.comparisonBefore(last, 0) catch null) |condition|
+                        conditions[edge.from] = if (condition) .is_true else .is_false;
+                }
+                const condition = conditions[edge.from];
+                // Graph fallthrough edges intentionally have no predicate;
+                // for a conditional terminator they are its complement.
+                const expected = (opcode == .s_cbranch_scc1) == (edge.kind == .branch);
+                if ((condition == .is_true and !expected) or
+                    (condition == .is_false and expected)) continue;
+            }
+            edges[edge_count] = edge;
+            edge_count += 1;
+        }
+        if (edge_count == self.graph.edges.items.len) return false;
+        var graph = self.graph.*;
+        graph.edges = .{ .items = edges[0..edge_count], .capacity = edges.len };
+        var selected = Resolver{
+            .bindings = self.bindings,
+            .reader = self.reader,
+            .instructions = self.instructions,
+            .graph = &graph,
+            .snapshot = &unknown_registers,
+        };
+        return selected.words(register, before_pc, output);
     }
 
     fn operand(self: *Resolver, op: rdna2.Operand, component: u32, before: usize, depth: u8) anyerror!?u32 {
@@ -429,6 +522,127 @@ pub const Resolver = struct {
         return null;
     }
 };
+
+test "uniform sampler branches read current predicates without poisoning static origins" {
+    const M = struct {
+        words: [12]u32 = .{ 0, 0, 0, 0, 0x11, 0x22, 0x33, 0x44, 0xaa, 0xbb, 0xcc, 0xdd },
+        readable: bool = true,
+        fn read(context: ?*anyopaque, address: u64, output: []u8) bool {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            if (!self.readable or address < 0x1000 or address + output.len > 0x1030) return false;
+            const bytes = std.mem.asBytes(&self.words);
+            @memcpy(output, bytes[@intCast(address - 0x1000)..][0..output.len]);
+            return true;
+        }
+    };
+    const original = [_]rdna2.Instruction{
+        .{ .pc = 0, .opcode = .s_load_dwordx4, .dst = .{ .kind = .sgpr, .reg = 8 }, .src0 = .{ .kind = .sgpr }, .src1 = .{ .kind = .null }, .memory_offset = 16, .data_words = 4 },
+        .{ .pc = 4, .opcode = .s_load_dword, .dst = .{ .kind = .sgpr, .reg = 4 }, .src0 = .{ .kind = .sgpr }, .src1 = .{ .kind = .null }, .data_words = 1 },
+        .{ .pc = 8, .opcode = .s_cmp_lg_u32, .dst = .{ .kind = .scc }, .src0 = .{ .kind = .sgpr, .reg = 4 }, .src1 = .{ .kind = .integer_inline_constant } },
+        .{ .pc = 12, .opcode = .s_nop },
+        .{ .pc = 16, .opcode = .s_cbranch_scc0, .branch_target = 24 },
+        .{ .pc = 20, .opcode = .s_load_dwordx4, .dst = .{ .kind = .sgpr, .reg = 8 }, .src0 = .{ .kind = .sgpr }, .src1 = .{ .kind = .null }, .memory_offset = 32, .data_words = 4 },
+        .{ .pc = 24, .opcode = .s_endpgm },
+    };
+    for (0..9) |variant| {
+        var instructions = original;
+        if (variant == 1) instructions[4].opcode = .s_cbranch_scc1;
+        if (variant == 2) instructions[3] = .{ .pc = 12, .opcode = .s_and_b32, .dst = .{ .kind = .sgpr, .reg = 20 } }; // clobbers SCC
+        if (variant == 3) instructions[2].src0 = .{ .kind = .sgpr, .reg = 40 }; // unknown predicate
+        if (variant == 4) instructions[4].opcode = .s_cbranch_execz; // wave-dependent predicate
+        if (variant == 5) {
+            instructions[1].opcode = .s_buffer_load_dword;
+            instructions[1].src0.reg = 2;
+        }
+        if (variant == 6) instructions[3] = .{ .pc = 12, .opcode = .buffer_store_dword, .family = .mubuf };
+        if (variant == 7) instructions[3] = .{ .pc = 12, .opcode = .image_atomic_add, .family = .mimg };
+        if (variant == 8) instructions[3] = .{ .pc = 12, .opcode = .ds_write_b32, .family = .ds, .gds = true };
+        var graph = try rdna2.control_flow.buildInstructions(std.testing.allocator, &instructions);
+        defer graph.deinit(std.testing.allocator);
+        var cache = definitions.ScalarDefinitionCache.init(std.testing.allocator, &instructions, &graph);
+        defer cache.deinit();
+        var memory = M{};
+        var bindings = std.mem.zeroes(shaders.StageBindings);
+        bindings.user_data_count = if (variant == 5) 6 else 2;
+        bindings.user_data[0] = 0x1000;
+        if (variant == 5) @memcpy(bindings.user_data[2..6], &[_]u32{ 0x1000, 4 << 16, 1, 0x4dfac });
+        var snapshot = scalar.Evaluation{};
+        // An enticing value from a different representative path is not proof.
+        snapshot.registers[4] = .{ .known = true, .value = 99, .producer_pc = 4 };
+        for ([_]u32{ 0, 1, 0, 0xffff_ffff }) |predicate| {
+            memory.words[0] = predicate;
+            var resolver = Resolver{ .bindings = &bindings, .reader = .{ .context = &memory, .read_fn = M.read }, .instructions = &instructions, .graph = &graph, .snapshot = &snapshot.registers, .definition_cache = &cache };
+            var output: [4]u32 = undefined;
+            try std.testing.expect(!try resolver.words(8, 24, &output));
+            resolver.remaining = 512;
+            const recoverable = variant < 2 or variant == 5;
+            try std.testing.expectEqual(recoverable, try resolver.wordsWithUniformBranches(8, 24, &output));
+            if (recoverable) {
+                const alternate = (predicate != 0) != (variant == 1);
+                try std.testing.expectEqualSlices(u32, memory.words[if (alternate) 8 else 4..][0..4], &output);
+            }
+            // Live pruning must not make the persistent static query unique.
+            resolver.remaining = 512;
+            try std.testing.expect(!try resolver.words(8, 24, &output));
+            memory.words[4] +%= 1;
+            memory.words[8] +%= 1;
+        }
+        memory.readable = false;
+        var resolver = Resolver{ .bindings = &bindings, .reader = .{ .context = &memory, .read_fn = M.read }, .instructions = &instructions, .graph = &graph, .snapshot = &snapshot.registers };
+        var output: [4]u32 = undefined;
+        try std.testing.expect(!try resolver.wordsWithUniformBranches(8, 24, &output));
+    }
+}
+
+test "uniform resource selection preserves outer guards and refuses loop-carried predicates" {
+    const M = struct {
+        fn read(_: ?*anyopaque, _: u64, _: []u8) bool {
+            return false;
+        }
+        fn reg(index: u32) rdna2.Operand {
+            return .{ .kind = .sgpr, .reg = index };
+        }
+        fn imm(value: u32) rdna2.Operand {
+            return .{ .kind = .integer_inline_constant, .value = value };
+        }
+    };
+    const guarded = [_]rdna2.Instruction{
+        .{ .pc = 0, .opcode = .s_cmp_eq_u32, .dst = .{ .kind = .scc }, .src0 = M.imm(0), .src1 = M.imm(0) },
+        .{ .pc = 4, .opcode = .s_cbranch_scc1, .branch_target = 32 },
+        .{ .pc = 8, .opcode = .s_mov_b32, .dst = M.reg(8), .src0 = M.imm(17) },
+        .{ .pc = 12, .opcode = .s_cmp_eq_u32, .dst = .{ .kind = .scc }, .src0 = M.reg(0), .src1 = M.imm(0) },
+        .{ .pc = 16, .opcode = .s_cbranch_scc1, .branch_target = 24 },
+        .{ .pc = 20, .opcode = .s_mov_b32, .dst = M.reg(8), .src0 = M.imm(34) },
+        .{ .pc = 24, .opcode = .s_nop },
+        .{ .pc = 28, .opcode = .s_branch, .branch_target = 32 },
+        .{ .pc = 32, .opcode = .s_endpgm },
+    };
+    const loop = [_]rdna2.Instruction{
+        .{ .pc = 0, .opcode = .s_mov_b32, .dst = M.reg(8), .src0 = M.imm(17) },
+        .{ .pc = 4, .opcode = .s_mov_b32, .dst = M.reg(4), .src0 = M.imm(0) },
+        .{ .pc = 8, .opcode = .s_cmp_eq_u32, .dst = .{ .kind = .scc }, .src0 = M.reg(4), .src1 = M.imm(0) },
+        .{ .pc = 12, .opcode = .s_cbranch_scc1, .branch_target = 20 },
+        .{ .pc = 16, .opcode = .s_mov_b32, .dst = M.reg(8), .src0 = M.imm(34) },
+        .{ .pc = 20, .opcode = .s_add_u32, .dst = M.reg(4), .src0 = M.reg(4), .src1 = M.imm(1) },
+        .{ .pc = 24, .opcode = .s_cbranch_execz, .branch_target = 8 },
+        .{ .pc = 28, .opcode = .s_endpgm },
+    };
+    var bindings = std.mem.zeroes(shaders.StageBindings);
+    bindings.user_data_count = 1;
+    var snapshot = scalar.Evaluation{};
+    snapshot.registers[4] = .{ .known = true, .value = 1, .producer_pc = 20 };
+    for ([_][]const rdna2.Instruction{ &guarded, &loop }, 0..) |instructions, variant| {
+        var graph = try rdna2.control_flow.buildInstructions(std.testing.allocator, instructions);
+        defer graph.deinit(std.testing.allocator);
+        for (0..2) |predicate| {
+            bindings.user_data[0] = @intCast(predicate);
+            var resolver = Resolver{ .bindings = &bindings, .reader = .{ .context = null, .read_fn = M.read }, .instructions = instructions, .graph = &graph, .snapshot = &snapshot.registers };
+            var output: [1]u32 = undefined;
+            try std.testing.expectEqual(variant == 0, try resolver.wordsWithUniformBranches(8, if (variant == 0) 24 else 28, &output));
+            if (variant == 0) try std.testing.expectEqual(@as(u32, if (predicate == 0) 17 else 34), output[0]);
+        }
+    }
+}
 
 test "packed vertex format recovery proves CSELECT and refuses unknown or clobbered SCC" {
     const M = struct {

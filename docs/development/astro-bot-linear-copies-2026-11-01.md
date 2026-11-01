@@ -92,8 +92,39 @@ All eight intervals have clear last-error fields. Their periodic profiles report
 zero draw failures, dispatch failures and unsupported compute, with the existing
 12 unresolved storage bindings. This clean draw count applies to the title;
 the gameplay baseline below still has a failed sampled-image draw. The switch
-is restored to its enabled default. Candidate gameplay comparison is pending
-the next entry into the controllable scene.
+is restored to its enabled default. The later crash-site comparison is below.
+
+## Candidate crash-site comparison
+
+After the opening and DualSense wake-up, the user left the game without input.
+The stationary crash-site view still includes the left-stick tutorial inset.
+The compiler was stopped before timing; frame captures were disabled throughout
+all four intervals. Each interval follows ten seconds of settling:
+
+| CPU copy path | Flips | Frames / seconds | FPS | Median fence wait |
+|---|---|---|---:|---:|
+| Row copies | 41495–41743 | 248 / 45.001209 | 5.511 | 40.438 ms |
+| Pooled packed ranges | 41800–42050 | 250 / 45.002538 | 5.555 | 41.513 ms |
+| Pooled, repeat | 42104–42354 | 250 / 45.000794 | 5.555 | 43.117 ms |
+| Row copies, return | 42409–42654 | 245 / 45.013494 | 5.443 | 41.522 ms |
+
+The paired mean difference is approximately **+1.4% in this sequence**, only
+two to five frames per interval. This is a small result, not evidence of a
+stable large gain. It is not directly comparable with the different camera
+position in the preceding runner's baseline.
+
+Packed copies process about 62.7 MiB per frame here, but median readback volume
+is unchanged at **240,228 KiB/frame** (234.6 MiB). Uploads remain approximately
+103.7 MiB/frame, with about 221–225 submissions in the periodic profiles.
+All 16 profiled frames still have **one failed draw and 12 unresolved storage
+bindings**; dispatch failures and unsupported compute are zero. Clear last-error
+fields do not cancel those per-frame failures.
+
+The next [sampler investigation](astro-bot-uniform-samplers-2026-11-01.md)
+addresses that rejected draw separately. No sampler fix is active during these
+copy measurements.
+
+![Crash-site view after the four copy intervals; movement tutorial and blur remain](../images/astro-bot-crash-site-copy-comparison-2026-11-01.png)
 
 ## Confirmed gameplay baseline
 
