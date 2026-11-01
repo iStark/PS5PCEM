@@ -308,3 +308,33 @@ all 270 Vulkan unit tests also pass. The ReleaseFast runner builds successfully
 correct results, not a measured gameplay FPS gain. Build/probe overlap is
 excluded from performance comparisons, and the ongoing game process keeps
 the preceding volume-enabled executable until a deliberate restart.
+
+### Restoring material-pointer discovery after SDWA decoding changes
+
+The post-tree transition recorded one rejected pixel draw at program
+`0x800026ed00`, instruction `0x8b4`, with an unresolved `s28` sampled image.
+A local replay of the shader and captured tables reproduces the failure:
+the common-lane proof finds both pointer words, but rejects the upper-word
+`V_MOV_B32` because its decoded DWORD destination carries
+`explicit_sdwa_dst=true`. This marker was introduced to distinguish full
+DWORD writes from partial f16 writes; it does not change the full-width
+integer move used to remove the pointer's packed tag.
+
+Pointer discovery now accepts that marker specifically on the proven
+`V_MOV_B32` DWORD destination. Partial destinations, other modifiers,
+unrelated source words and changes to the selected lane remain rejected.
+The public synthetic regression covers both the explicit full-width form
+and a rejected partial form. The private replay changes from no recovered
+pointer/candidates to the correct material base and 60 distinct image
+descriptors, retaining the runtime tuple and sampler checks. Tables were
+read after the diagnostic rather than at a suspended draw, so this replay
+establishes the analysis regression, not a complete rendering result.
+
+All 329 GPU analysis tests and 270 Vulkan tests pass. The isolated ReleaseFast
+runner build passes all 15 steps. The volume-enabled
+process predates this fix. Its cold
+transition includes a frame with 537,327 ms in compute pipeline creation;
+later scene work continued through flip 1265. It was deliberately stopped
+to build the material fix after concurrent compilation approached the host
+commit limit; this was not a spontaneous game crash. Character control and
+a sustained post-tree FPS result remain unverified.

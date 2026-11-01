@@ -98,8 +98,14 @@ pub fn bufferPointer(
     var high = definitions.scalarLaneDefinition(instructions, graph, before, register + 1, 0) orelse return null;
     var high_word16 = false;
     const move = instructions[high.instruction];
+    // V_MOV_B32 writes the complete DWORD for either encoding. The explicit
+    // SDWA destination flag distinguishes partial f16 writes elsewhere; it
+    // does not modify this full-width pointer-word copy. Keep every selector
+    // and other modifier checked below.
+    var move_destination = move.dst;
+    move_destination.explicit_sdwa_dst = false;
     if (high.component == 0 and move.opcode == .v_mov_b32 and move.src0.kind == .vgpr and
-        move.src0.sdwa_sel == 4 and move.src0.sdwa_sext and plain(move.dst))
+        move.src0.sdwa_sel == 4 and move.src0.sdwa_sext and plain(move_destination))
     {
         var source = move.src0;
         source.sdwa_sel = 6;
@@ -125,7 +131,7 @@ test "buffer pointer tuples retain the fetch and common active lane" {
         .{ .pc = 32, .opcode = .s_endpgm },
     };
     const original = code;
-    for (0..6) |variant| {
+    for (0..8) |variant| {
         code = original;
         switch (variant) {
             1 => code[5].src0.reg = 21, // Untagged pair from the same fetch.
@@ -133,16 +139,21 @@ test "buffer pointer tuples retain the fetch and common active lane" {
             3 => code[4] = .{ .pc = 24, .opcode = .s_mov_b64, .dst = .{ .kind = .exec_lo }, .src0 = .{ .kind = .sgpr, .reg = 8 } },
             4 => code[2].src0.negate = true,
             5 => code[1].dst.sdwa_sel = 4,
+            6 => code[2].dst.explicit_sdwa_dst = true, // Decoded DWORD SDWA destination.
+            7 => {
+                code[2].dst.explicit_sdwa_dst = true;
+                code[2].dst.sdwa_sel = 4; // Partial destination is not a pointer word.
+            },
             else => {},
         }
         var graph = try rdna2.control_flow.buildInstructions(std.testing.allocator, &code);
         defer graph.deinit(std.testing.allocator);
         const pointer = bufferPointer(&code, &graph, 6, 90);
-        if (variant >= 2) {
+        if ((variant >= 2 and variant <= 5) or variant == 7) {
             try std.testing.expect(pointer == null);
         } else {
             try std.testing.expectEqual(@as(usize, 1), pointer.?.instruction);
-            try std.testing.expectEqual(variant == 0, pointer.?.high_word16);
+            try std.testing.expectEqual(variant != 1, pointer.?.high_word16);
         }
     }
 }
