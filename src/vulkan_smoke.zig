@@ -521,6 +521,93 @@ noinline fn runLinearImageCompletionProbe(allocator: std.mem.Allocator) !void {
         try std.testing.expectEqual(@as(usize, 3), audit.labels);
     }
     std.debug.print("linear image completion passed: FP32 GPU copies visible to direct CPU reads before labels, repeated allocation reuse, preserved row padding, synchronous/queued releases\n", .{});
+    try runLinearImageBatchProbe(allocator);
+}
+
+noinline fn runLinearImageBatchProbe(allocator: std.mem.Allocator) !void {
+    const previous = vulkan.backend.batch_linear_image_readbacks;
+    defer vulkan.backend.batch_linear_image_readbacks = previous;
+    const Audit = struct {
+        guest: GuestMemory = .{},
+        replaced: bool = false,
+        overlapping: bool = false,
+        replace_after_first: bool = false,
+        labels: usize = 0,
+        fn read(raw: ?*anyopaque, address: u64, bytes: []u8) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            return GuestMemory.read(&self.guest, address, bytes);
+        }
+        fn write(raw: ?*anyopaque, address: u64, bytes: []const u8) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (address == 0x8000 and self.replace_after_first) {
+                // A CPU writer replaces a later output after the shared GPU
+                // readback, while earlier outputs are being published.
+                self.guest.word(0x9000, 0xdead_beef);
+                self.replaced = true;
+                self.replace_after_first = false;
+            }
+            if (address == 0x7000) {
+                if (!self.overlapping) for (0..3) |i| {
+                    const base = 0x8000 + i * 0x1000;
+                    const expected: u32 = if (self.replaced and i == 1) 0xdead_beef else @intCast(41 + i);
+                    if (std.mem.readInt(u32, self.guest.bytes[base..][0..4], .little) != expected) return false;
+                    // Only the first texel was stored; retain the other row,
+                    // untouched texels and padding before publishing the label.
+                    if (!std.mem.allEqual(u8, self.guest.bytes[base + 4 ..][0..508], 0x5a)) return false;
+                };
+                self.labels += 1;
+            }
+            return GuestMemory.write(&self.guest, address, bytes);
+        }
+    };
+    for ([_]bool{ false, true }) |timeline| {
+        for (0..4) |scenario| {
+            var baseline: [0x3000]u8 = undefined;
+            var baseline_submits: u64 = 0;
+            for ([_]bool{ false, true }) |batched| {
+                vulkan.backend.batch_linear_image_readbacks = batched;
+                var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = timeline, .defer_internal_releases = timeline, .defer_small_storage_writes = true });
+                defer renderer.deinit();
+                var audit = Audit{ .replaced = scenario == 1, .overlapping = scenario == 2, .replace_after_first = scenario == 3 };
+                @memset(audit.guest.bytes[0x8000..0xb000], 0x5a);
+                const backend = renderer.dcbBackend(.{ .context = &audit, .read = Audit.read, .write = Audit.write });
+                const code = [_]u32{ vop1(1, 0, 128), vop1(1, 1, 128), vop1(1, 2, 8), 0xf020_0108, 0x0000_0200, 0xbf81_0000 };
+                for (code, 0..) |word, i| audit.guest.word(0x100 + i * 4, word);
+                var state = gpu.State{};
+                const compute = gpu.resources.ShaderStage.compute;
+                try state.writeRegister(.shader, compute.programRegisterBase(), 1);
+                try state.writeRegister(.shader, compute.programRegisterBase() + 1, 0);
+                try state.writeRegister(.shader, 0x213, 9 << 1);
+                for (0..3) |i| {
+                    const base: u32 = @intCast(0x8000 + i * @as(usize, if (audit.overlapping) 0x100 else 0x1000));
+                    var descriptor = imageDescriptorWords(base, 4, 2);
+                    descriptor[1] = (descriptor[1] & ~(@as(u32, 0xff) << 20)) | (20 << 20); // R32_UINT
+                    descriptor[4] = 63; // 256-byte rows, with 240 bytes of padding
+                    for (descriptor, 0..) |word, j| try state.writeRegister(.shader, compute.userDataBase() + @as(u32, @intCast(j)), word);
+                    try state.writeRegister(.shader, compute.userDataBase() + 8, @intCast(41 + i));
+                    _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
+                }
+                if (audit.replaced) audit.guest.word(0x9000, 0xdead_beef);
+                const before = renderer.frame_profile.submits;
+                var release = std.mem.zeroes(gpu.state.ReleaseMem);
+                release.destination = 1;
+                release.data_selection = 1;
+                release.address = 0x7000;
+                release.data = 42;
+                try std.testing.expect(backend.vtable.release.?(backend.context, release));
+                try std.testing.expectEqual(@as(usize, 1), audit.labels);
+                const submits = renderer.frame_profile.submits - before;
+                if (!batched) {
+                    @memcpy(&baseline, audit.guest.bytes[0x8000..0xb000]);
+                    baseline_submits = submits;
+                } else {
+                    try std.testing.expectEqualSlices(u8, &baseline, audit.guest.bytes[0x8000..0xb000]);
+                    if (scenario == 0) try std.testing.expect(submits < baseline_submits);
+                    std.debug.print("linear image batch timeline={any} case={d}: submits {d}->{d}, identical CPU bytes before label\n", .{ timeline, scenario, baseline_submits, submits });
+                }
+            }
+        }
+    }
 }
 
 fn runStorageImageCopyCase(

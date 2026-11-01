@@ -116,6 +116,8 @@ pub export var native_release_timestamps: bool = false;
 pub export var batch_release_interrupts: bool = false;
 /// Completion boundaries inspect tracked GPU writers instead of clean cache entries.
 pub export var indexed_completion_buffers: bool = true;
+/// Copy independent linear image outputs together before CPU completion.
+pub export var batch_linear_image_readbacks: bool = true;
 pub export var indexed_release_projection: bool = true;
 pub export var cache_ngg_export_analysis: bool = true;
 pub export var avoid_unusable_draw_capture: bool = true;
@@ -29757,6 +29759,17 @@ pub const Renderer = struct {
         memory: GuestMemory,
         cache_index: usize,
     ) (Error || std.mem.Allocator.Error)!void {
+        return self.flushCachedStorageImagePrepared(memory, cache_index, null);
+    }
+
+    const PreparedStorageReadback = struct { buffer: OwnedBuffer, offset: usize };
+
+    fn flushCachedStorageImagePrepared(
+        self: *Renderer,
+        memory: GuestMemory,
+        cache_index: usize,
+        prepared: ?PreparedStorageReadback,
+    ) (Error || std.mem.Allocator.Error)!void {
         if (cache_index >= self.storage_image_cache.items.len) return;
         const snapshot = self.storage_image_cache.items[cache_index];
         if (!snapshot.valid or !snapshot.gpu_dirty) return;
@@ -29808,70 +29821,16 @@ pub const Renderer = struct {
         self.frame_profile.storage_image_readbacks +|= 1;
         if (@atomicLoad(bool, &trace_materialized_targets, .monotonic) and self.flip_callbacks % 120 == 0)
             std.debug.print("[gpu storage materialize] flip={d} @0x{x} {d}x{d} bytes={d} fmt={d} caller=0x{x} flush=0x{x}\n", .{ self.flip_callbacks, snapshot.descriptor.address, snapshot.subresource.width, snapshot.subresource.height, snapshot.staging_bytes, snapshot.descriptor.unified_format, @returnAddress(), self.last_flush_caller });
-        const is_3d = snapshot.descriptor.image_type == .color_3d;
-        const is_2d_array = snapshot.descriptor.image_type == .color_2d_array;
-        const array_layers = if (is_2d_array) snapshot.subresource.depth_or_layers else 1;
-
-        const transfer = try self.storageImageTransfer(snapshot.staging_bytes);
-        const command_buffer = try self.beginOneShot();
-        defer self.releaseOneShot(command_buffer);
-        self.orderStorageTransferWrite(command_buffer, transfer);
-        try self.transitionTrackedImage(
-            command_buffer,
-            snapshot.image.handle,
-            .{ .aspect_mask = vk.image_aspect_color_bit, .layer_count = array_layers },
-            image_state.transfer_source_usage,
-        );
-        const copy = vk.BufferImageCopy{
-            .image_subresource = .{
-                .aspect_mask = vk.image_aspect_color_bit,
-                .layer_count = array_layers,
-            },
-            .image_extent = .{
-                .width = snapshot.subresource.width,
-                .height = snapshot.subresource.height,
-                .depth = if (is_3d) snapshot.subresource.depth_or_layers else 1,
-            },
-        };
-        self.device_functions.cmd_copy_image_to_buffer(
-            command_buffer,
-            snapshot.image.handle,
-            vk.image_layout_transfer_src_optimal,
-            transfer.handle,
-            1,
-            @ptrCast(&copy),
-        );
-        const host_barrier = vk.BufferMemoryBarrier{
-            .source_access_mask = vk.access_transfer_write_bit,
-            .destination_access_mask = vk.access_host_read_bit,
-            .buffer = transfer.handle,
-            .offset = 0,
-            .size = transfer.size,
-        };
-        self.device_functions.cmd_pipeline_barrier(
-            command_buffer,
-            vk.pipeline_stage_transfer_bit,
-            vk.pipeline_stage_host_bit,
-            0,
-            0,
-            null,
-            1,
-            @ptrCast(&host_barrier),
-            0,
-            null,
-        );
-        try self.transitionTrackedImage(
-            command_buffer,
-            snapshot.image.handle,
-            .{ .aspect_mask = vk.image_aspect_color_bit, .layer_count = array_layers },
-            image_state.storage_usage,
-        );
-        try self.submitOneShot(command_buffer);
-
-        // Finish the GPU copy before refreshing guest padding or mapping its result.
-        // Keep the mapping inside the CPU-only transform, and release it before
-        // invoking the guest write callback or changing cached image ownership.
-        try self.waitForSubmittedWork();
+        const transfer = if (prepared) |copy| copy.buffer else try self.storageImageTransfer(snapshot.staging_bytes);
+        const transfer_offset = if (prepared) |copy| copy.offset else 0;
+        if (prepared == null) {
+            const command_buffer = try self.beginOneShot();
+            defer self.releaseOneShot(command_buffer);
+            self.orderStorageTransferWrite(command_buffer, transfer);
+            try self.recordStorageImageReadback(command_buffer, snapshot, transfer, 0);
+            try self.submitOneShot(command_buffer);
+            try self.waitForSubmittedWork();
+        }
         const copy_still_current = observed_generation != 0 and
             memory.gpu_generation.?(memory.context, snapshot.descriptor.address, snapshot.allocation_bytes) == observed_generation;
         if (!copy_still_current) {
@@ -29888,7 +29847,7 @@ pub const Renderer = struct {
         }
         var published_texel_hash: u64 = undefined;
         {
-            const mapping = try self.mapBufferRange(transfer, 0, snapshot.staging_bytes);
+            const mapping = try self.mapBufferRange(transfer, transfer_offset, snapshot.staging_bytes);
             defer mapping.release(self);
             const linear = mapping.bytes;
             if (self.traceCurrentGraphicsFrame()) {
@@ -29923,6 +29882,66 @@ pub const Renderer = struct {
         ));
         self.frame_profile.readback_bytes +%= snapshot.staging_bytes;
         self.frame_profile.storage_readback_bytes +%= snapshot.staging_bytes;
+    }
+
+    fn recordStorageImageReadback(self: *Renderer, command: vk.CommandBuffer, snapshot: CachedStorageImage, transfer: OwnedBuffer, offset: usize) Error!void {
+        const is_3d = snapshot.descriptor.image_type == .color_3d;
+        const layers = if (snapshot.descriptor.image_type == .color_2d_array) snapshot.subresource.depth_or_layers else 1;
+        const range = vk.ImageSubresourceRange{ .aspect_mask = vk.image_aspect_color_bit, .layer_count = layers };
+        try self.transitionTrackedImage(command, snapshot.image.handle, range, image_state.transfer_source_usage);
+        const copy = vk.BufferImageCopy{
+            .buffer_offset = offset,
+            .image_subresource = .{ .aspect_mask = vk.image_aspect_color_bit, .layer_count = layers },
+            .image_extent = .{ .width = snapshot.subresource.width, .height = snapshot.subresource.height, .depth = if (is_3d) snapshot.subresource.depth_or_layers else 1 },
+        };
+        self.device_functions.cmd_copy_image_to_buffer(command, snapshot.image.handle, vk.image_layout_transfer_src_optimal, transfer.handle, 1, @ptrCast(&copy));
+        const host = vk.BufferMemoryBarrier{ .source_access_mask = vk.access_transfer_write_bit, .destination_access_mask = vk.access_host_read_bit, .buffer = transfer.handle, .offset = offset, .size = snapshot.staging_bytes };
+        self.device_functions.cmd_pipeline_barrier(command, vk.pipeline_stage_transfer_bit, vk.pipeline_stage_host_bit, 0, 0, null, 1, @ptrCast(&host), 0, null);
+        try self.transitionTrackedImage(command, snapshot.image.handle, range, image_state.storage_usage);
+    }
+
+    /// Adjacent completion outputs can share a transfer while preserving their
+    /// publication order. Stop at an overlapping or special backing: publishing
+    /// past it early could change another view's CPU-replacement observation.
+    fn flushLinearStorageImageBatch(self: *Renderer, memory: GuestMemory, first_index: usize) (Error || std.mem.Allocator.Error)!bool {
+        if (!@atomicLoad(bool, &batch_linear_image_readbacks, .monotonic)) return false;
+        var indices: [16]usize = undefined;
+        var offsets: [16]usize = undefined;
+        var count: usize = 0;
+        var total: usize = 0;
+        for (self.storage_image_cache.items[first_index..], first_index..) |cached, index| {
+            if (!cached.valid or !cached.gpu_dirty or cached.descriptor.tile_mode != .linear) continue;
+            if (cached.retile_backing != null or cached.guest_native_baseline != null or
+                cached.guest_native_baseline_digest != null or cached.depth_snapshot != null or
+                cached.staging_bytes == 0 or count == indices.len) break;
+            const offset = std.mem.alignForward(usize, total, 256);
+            if (cached.staging_bytes > maximum_frame_bytes - offset) break;
+            const overlap = for (indices[0..count]) |previous| {
+                const other = self.storage_image_cache.items[previous];
+                if (byteRangesOverlap(cached.descriptor.address, cached.allocation_bytes, other.descriptor.address, other.allocation_bytes)) break true;
+            } else false;
+            if (overlap) break;
+            indices[count] = index;
+            offsets[count] = offset;
+            count += 1;
+            total = offset + cached.staging_bytes;
+        }
+        if (count < 2) return false;
+        for (indices[0..count]) |index| self.storage_image_cache.items[index].pin_count += 1;
+        defer for (indices[0..count]) |index| self.releaseStorageImage(index);
+        const transfer = try self.storageImageTransfer(total);
+        const command = try self.beginOneShot();
+        defer self.releaseOneShot(command);
+        self.orderStorageTransferWrite(command, transfer);
+        for (indices[0..count], offsets[0..count]) |index, offset|
+            try self.recordStorageImageReadback(command, self.storage_image_cache.items[index], transfer, offset);
+        try self.submitOneShot(command);
+        try self.waitForSubmittedWork();
+        // Each normal publisher still validates CPU replacement and preserves
+        // row padding after retirement. Only its GPU copy/wait was shared.
+        for (indices[0..count], offsets[0..count]) |index, offset|
+            try self.flushCachedStorageImagePrepared(memory, index, .{ .buffer = transfer, .offset = offset });
+        return true;
     }
 
     /// Publish disjoint mips of one allocation with one GPU retirement and
@@ -38600,6 +38619,17 @@ pub const Renderer = struct {
             };
             for (self.storage_image_cache.items, 0..) |cached, index| {
                 if (!cached.valid or !cached.gpu_dirty or cached.descriptor.tile_mode != .linear) continue;
+                const batched = if (@atomicLoad(bool, &batch_linear_image_readbacks, .monotonic))
+                    (linearMipCompletionIsIndependent(self.storage_image_cache.items, index) and (self.flushCachedStorageMipChain(memory, index, null) catch |err| {
+                        self.last_sync_error = err;
+                        return false;
+                    })) or (self.flushLinearStorageImageBatch(memory, index) catch |err| {
+                        self.last_sync_error = err;
+                        return false;
+                    })
+                else
+                    false;
+                if (batched) continue;
                 self.flushCachedStorageImage(memory, index) catch |err| {
                     self.last_sync_error = err;
                     std.debug.print("[vulkan dcb] linear image completion writeback failed: {s}\n", .{@errorName(err)});
@@ -44017,6 +44047,47 @@ fn sameStorageImageBinding(a: gpu.ImageDescriptor, b: gpu.ImageDescriptor) bool 
         a.viewBaseLevel() == b.viewBaseLevel() and
         a.viewMipLevels() == b.viewMipLevels() and
         a.base_array == b.base_array;
+}
+
+fn linearMipCompletionIsIndependent(entries: []const CachedStorageImage, first_index: usize) bool {
+    const first = entries[first_index];
+    // Mips share a base, but an interior-address alias can be interleaved
+    // between them in completion order. Do not publish later mips past it.
+    for (entries) |other| {
+        if (!other.valid or !other.gpu_dirty or other.descriptor.tile_mode != .linear or
+            other.descriptor.address == first.descriptor.address) continue;
+        if (byteRangesOverlap(first.descriptor.address, first.allocation_bytes, other.descriptor.address, other.allocation_bytes)) return false;
+    }
+    return true;
+}
+
+test "linear mip completion preserves interior alias publication order" {
+    var entries: [2]CachedStorageImage = undefined;
+    for (&entries) |*entry| {
+        entry.* = .{
+            .alias_token = undefined,
+            .descriptor = std.mem.zeroInit(gpu.ImageDescriptor, .{ .image_type = .color_2d }),
+            .subresource = undefined,
+            .image = undefined,
+            .view = 0,
+            .allocation_bytes = 0x1000,
+            .staging_bytes = 0,
+            .last_used_sequence = 0,
+            .gpu_dirty = true,
+        };
+        entry.descriptor.tile_mode = .linear;
+        entry.descriptor.address = 0x1000;
+    }
+    try std.testing.expect(linearMipCompletionIsIndependent(&entries, 0));
+    entries[1].descriptor.address = 0x1800;
+    try std.testing.expect(!linearMipCompletionIsIndependent(&entries, 0));
+    entries[1].descriptor.address = 0x800;
+    try std.testing.expect(!linearMipCompletionIsIndependent(&entries, 0));
+    entries[1].gpu_dirty = false;
+    try std.testing.expect(linearMipCompletionIsIndependent(&entries, 0));
+    entries[1].gpu_dirty = true;
+    entries[1].descriptor.address = 0x2000;
+    try std.testing.expect(linearMipCompletionIsIndependent(&entries, 0));
 }
 
 fn disjointStorageImageMips(a: gpu.ImageDescriptor, b: gpu.ImageDescriptor) bool {
