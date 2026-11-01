@@ -66,8 +66,12 @@ enabled. The existing RGB alpha-preservation probe also passes all 65,536
 half-float alpha bit patterns, and the dynamic viewport/scissor probe passes
 with both depth paths. Their logs contain no Vulkan validation error.
 
-A fresh in-game comparison is pending. No visual fix or FPS improvement is
-claimed from the native probe alone.
+The subsequent live crash-site check confirms that the draw receives the
+correct constants, but the blur remains. A second fault applies a stale DCC
+clear before the blend and erases the computed destination. The
+[compute-to-raster follow-up](astro-bot-compute-dcc-2026-11-01.md) records the
+evidence and additional correction. Blend constants alone do not establish a
+corrected gameplay image or an FPS gain.
 
 The complete ReleaseFast build passes **24/24 steps**, including both test
 suites and the runner. The ordinary `zig-out/bin/game-run.exe` and its PDB

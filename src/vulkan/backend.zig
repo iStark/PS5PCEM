@@ -33,6 +33,7 @@ pub export var graphics_uniform_specialization: bool = false;
 pub export var vertex_uniform_specialization: bool = false;
 /// Diagnostic A/B switch; ordinary draws always honor CB_BLEND_RGBA.
 pub export var guest_blend_constants: bool = true;
+pub export var preserve_computed_dcc_contents: bool = true;
 pub export var indexed_compute_sampled_scan: bool = true;
 pub export var capture_storage_program: u64 = 0;
 pub export var capture_storage_flip: u64 = 0;
@@ -4124,6 +4125,29 @@ test "storage color initialization requires identical full 2D addressing" {
     try std.testing.expect(!storageColorInitializationLayoutsMatch(target, descriptor, partial_view));
 }
 
+test "HDR storage and color views agree at a padded dynamic resolution" {
+    var color = std.mem.zeroes(gpu.resources.ColorTarget);
+    color.address = 0x10000;
+    color.resource_type = 1;
+    color.width = 2432;
+    color.height = 1368;
+    color.format = 12;
+    color.number_type = 7;
+    color.tile_mode = .render_target;
+    var descriptor = std.mem.zeroInit(gpu.ImageDescriptor, .{ .image_type = .color_2d });
+    descriptor.address = color.address;
+    descriptor.width = color.width;
+    descriptor.height = color.height;
+    descriptor.pitch = color.width;
+    descriptor.depth_or_layers = 1;
+    descriptor.tile_mode = color.tile_mode;
+    descriptor.unified_format = 71;
+    descriptor.extended = true;
+    const target = try guestColorTarget(color);
+    const texture = try gpu.TextureLayout.fromImage(descriptor);
+    try std.testing.expect(storageColorInitializationLayoutsMatch(target, descriptor, try texture.subresource(0, 0, 1)));
+}
+
 const ColorPublicationBaseline = struct {
     snapshot: *ColorBackingSnapshot,
     range: ColorBackingRange,
@@ -4680,6 +4704,9 @@ const CachedStorageImage = struct {
     guest_content_hash: u64 = 0,
     // Changes only when texels change, independently of read-only bindings.
     content_generation: u64 = 0,
+    /// A real compute write supersedes the metadata it consumed. A subsequent
+    /// metadata write, including an identical clear, revokes this observation.
+    dcc_write: ?StorageDccWrite = null,
     guest_content_hash_valid: bool = false,
     guest_page_generation: u64 = 0,
     depth_snapshot: ?struct { image: vk.Image, generation: u64 } = null,
@@ -4710,6 +4737,18 @@ const CachedStorageImage = struct {
 
     fn address(self: CachedStorageImage) u64 {
         return self.descriptor.address;
+    }
+};
+
+const StorageDccWrite = struct {
+    address: u64,
+    size: usize,
+    generation: u64,
+
+    fn current(self: @This(), memory: GuestMemory, address: u64, size: usize) bool {
+        if (self.address != address or self.size != size or self.generation == 0) return false;
+        const query = memory.gpu_generation orelse return false;
+        return query(memory.context, address, size) == self.generation;
     }
 };
 
@@ -17108,6 +17147,7 @@ pub const Renderer = struct {
     fn colorTargetFastClearTexel(self: *Renderer, target: GuestColorTarget) anyerror!?DccClearTexel {
         const descriptor = target.descriptor;
         if (!descriptor.dcc_enabled or descriptor.dcc_address == 0) return null;
+        if (try self.computedDccContentsCurrent(target)) return null;
         const code = (try self.uniformDccCode(
             descriptor.dcc_address,
             target.layout.required_source_bytes,
@@ -17391,7 +17431,9 @@ pub const Renderer = struct {
         const memory = self.guest_memory orelse return null;
         if (self.storage_image_cache.items[index].pin_count == 0 and try self.storageGuestContentsChanged(memory, index)) return null;
         var clear_zero = false;
-        if (target.descriptor.dcc_enabled and target.descriptor.dcc_address != 0) {
+        if (target.descriptor.dcc_enabled and target.descriptor.dcc_address != 0 and
+            !try self.computedDccContentsCurrent(target))
+        {
             const key_size: usize = @intCast((target.layout.required_source_bytes + 255) / 256);
             if (self.pendingBufferWrite(target.descriptor.dcc_address, key_size) != null) return null;
             const code = try self.uniformDccCode(target.descriptor.dcc_address, size);
@@ -23167,6 +23209,86 @@ pub const Renderer = struct {
             }
         }
         return error.VolumeInitializationNotPublished;
+    }
+
+    pub fn probeComputedDccInitialization(self: *Renderer, scenario: u8) anyerror!void {
+        const memory = self.guest_memory.?;
+        var color = std.mem.zeroes(gpu.resources.ColorTarget);
+        color.address = 0x10000;
+        color.resource_type = 1;
+        color.width = 37;
+        color.height = 23;
+        color.format = 12;
+        color.number_type = 7;
+        color.tile_mode = .render_target;
+        color.write_mask = 15;
+        color.dcc_enabled = true;
+        color.dcc_address = 0x80000;
+        const target = try guestColorTarget(color);
+        var descriptor = std.mem.zeroInit(gpu.ImageDescriptor, .{ .image_type = .color_2d });
+        descriptor.address = color.address;
+        descriptor.width = color.width;
+        descriptor.height = color.height;
+        descriptor.pitch = color.width;
+        descriptor.depth_or_layers = 1;
+        descriptor.unified_format = 71;
+        descriptor.tile_mode = color.tile_mode;
+        descriptor.extended = true;
+        descriptor.descriptor_flags = 1 << 21;
+        descriptor.metadata_address = color.dcc_address;
+        descriptor.dst_select = .{ 4, 5, 6, 7 };
+        const key_size: usize = @intCast((target.layout.required_source_bytes + 255) / 256);
+        const metadata = try self.allocator.alloc(u8, key_size);
+        defer self.allocator.free(metadata);
+        @memset(metadata, 0);
+        try std.testing.expect(memory.write(memory.context, color.dcc_address, metadata));
+        const resources = try ComputeResources.acquire(self);
+        defer resources.deinit(self);
+        resources.storage_images[0] = try self.stageStorageImageRaw(descriptor, 0, true);
+        resources.storage_image_count = 1;
+        const source_index = resources.storage_images[0].cache_index.?;
+        const pixels = try self.allocator.alloc(u8, 37 * 23 * 8);
+        defer self.allocator.free(pixels);
+        const seed = [4]f16{ 0.5, 0.125, 0.75, 1 };
+        for (0..37 * 23) |pixel| for (seed, 0..) |value, channel| {
+            std.mem.writeInt(u16, pixels[pixel * 8 + channel * 2 ..][0..2], @bitCast(value), .little);
+        };
+        // Upload a real native GPU result, then exercise the same ownership
+        // commit that follows a compute dispatch. No guest pixels are replaced.
+        try self.uploadCachedStorageImage(source_index, pixels);
+        if (scenario == 7) {
+            resources.writable[0] = true;
+            resources.addresses[0] = color.dcc_address;
+            resources.sizes[0] = key_size;
+        }
+        if (scenario == 8) resources.store_preparation_incomplete = true;
+        try self.commitStorageImages(memory, resources);
+        if (scenario == 1) try self.flushCachedStorageImage(memory, source_index);
+        if (scenario == 2 or scenario == 3) {
+            @memset(metadata, if (scenario == 3) 0xc0 else 0);
+            try std.testing.expect(memory.write(memory.context, color.dcc_address, metadata));
+        }
+        if (scenario == 4) try std.testing.expect(memory.write(memory.context, color.address, &.{ 1, 2, 3, 4 }));
+        if (scenario == 6) try std.testing.expect(memory.write(memory.context, 0x70000, &.{ 1, 2, 3, 4 }));
+        const should_preserve = scenario == 0 or scenario == 1 or scenario == 6;
+        try std.testing.expectEqual(should_preserve, try self.computedDccContentsCurrent(target));
+        var state = GraphicsPipelineState.default(color.width, color.height);
+        state.color_attachment_formats[0] = vk.format_r16g16b16a16_sfloat;
+        try self.beginFrameDraw();
+        try self.drawGraphicsShaders(&graphics_probe_vertex_spirv, &graphics_probe_fragment_spirv, &.{}, &.{}, state, target, &.{}, null, false, false, false, .{ .vertex_count = 0 });
+        const target_index = try self.acquireRenderTarget(target);
+        try self.readbackRenderTarget(target_index, true);
+        const actual = for (self.completed_frames.items) |frame| {
+            if (frame.target) |view| if (sameRenderTarget(view, target)) break frame.pixels.items;
+        } else return error.MissingPresentedFrame;
+        if (should_preserve) {
+            try std.testing.expectEqualSlices(u8, pixels, actual);
+        } else {
+            for (0..37 * 23 * 4) |component| {
+                const value: f16 = @bitCast(std.mem.readInt(u16, actual[component * 2 ..][0..2], .little));
+                try std.testing.expectEqual(@as(f16, if (scenario == 3) 1 else 0), value);
+            }
+        }
     }
 
     pub fn probeCachedStorageVolumeCommit(self: *Renderer, descriptor: gpu.ImageDescriptor, color: gpu.resources.ColorTarget, expected: []const u8) anyerror!void {
@@ -29669,6 +29791,7 @@ pub const Renderer = struct {
         cached.strict_guest_backing = false;
         cached.initialization_pending = false;
         cached.content_generation = 0;
+        cached.dcc_write = null;
         cached.gpu_dirty = false;
         cached.guest_content_hash_valid = false;
         cached.guest_page_generation = 0;
@@ -30322,6 +30445,53 @@ pub const Renderer = struct {
         self.storage_content_sequence +%= 1;
         if (self.storage_content_sequence == 0) self.storage_content_sequence = 1;
         self.storage_image_cache.items[cache_index].content_generation = self.storage_content_sequence;
+        self.storage_image_cache.items[cache_index].dcc_write = null;
+    }
+
+    fn rememberStorageDccWrite(self: *Renderer, index: usize, descriptor: gpu.ImageDescriptor, resources: *const ComputeResources) void {
+        const memory = self.guest_memory orelse return;
+        const track = memory.track_gpu_read orelse return;
+        if (memory.gpu_generation == null) return;
+        const address = descriptor.dccMetadataAddress() orelse return;
+        const size = std.math.divCeil(usize, self.storage_image_cache.items[index].allocation_bytes, dcc_block_bytes) catch return;
+        if (size == 0 or size > maximum_dcc_key_bytes or self.pendingBufferWrite(address, size) != null) return;
+        // A dispatch explicitly writing metadata has no implicit ordering
+        // between that write and its image stores. Do not certify it, even
+        // when the metadata buffer was eagerly published before this commit.
+        if (resources.store_preparation_incomplete) return;
+        for (resources.writable, 0..) |writable, slot| {
+            if (writable and byteRangesOverlap(address, size, resources.addresses[slot], resources.sizes[slot])) return;
+        }
+        for (resources.storage_images[0..resources.storage_image_count]) |other| {
+            if (other.writable and byteRangesOverlap(address, size, other.descriptor.address, other.allocation_bytes)) return;
+        }
+        const generation = track(memory.context, address, size);
+        if (generation != 0) self.storage_image_cache.items[index].dcc_write = .{ .address = address, .size = size, .generation = generation };
+    }
+
+    /// A fresh expanded compute image can outlive publication into its native
+    /// backing. Re-reading its unchanged compressed clear code must not erase
+    /// those texels when the allocation next becomes a raster attachment.
+    fn computedDccContentsCurrent(self: *Renderer, target: GuestColorTarget) anyerror!bool {
+        if (!@atomicLoad(bool, &preserve_computed_dcc_contents, .monotonic)) return false;
+        const memory = self.guest_memory orelse return false;
+        const address = target.descriptor.dcc_address;
+        const size = std.math.cast(usize, target.layout.required_source_bytes) orelse return false;
+        const key_size = std.math.divCeil(usize, size, dcc_block_bytes) catch return false;
+        if (address == 0 or self.pendingBufferWrite(address, key_size) != null or
+            self.pendingBufferWrite(target.descriptor.address, size) != null) return false;
+        var candidates = self.storage_image_address_index.candidatesBy(self.storage_image_cache.items, target.descriptor.address, CachedStorageImage.address);
+        while (candidates.next()) |index| {
+            const source = self.storage_image_cache.items[index];
+            const observation = source.dcc_write orelse continue;
+            if (!source.valid or source.content_generation == 0 or source.allocation_bytes != size or
+                !storageColorInitializationLayoutsMatch(target, source.descriptor, source.subresource) or
+                !observation.current(memory, address, key_size)) continue;
+            if (try self.storageGuestContentsChanged(memory, index)) continue;
+            // Coherence checks can publish work or observe a concurrent write.
+            if (observation.current(memory, address, key_size)) return true;
+        }
+        return false;
     }
 
     /// Retile the GPU result before downloading it, then publish only the
@@ -33252,6 +33422,7 @@ pub const Renderer = struct {
         const source = &self.storage_image_cache.items[index];
         source.gpu_dirty = false;
         source.content_generation = 0;
+        source.dcc_write = null;
         source.guest_content_hash_valid = false;
         source.guest_page_generation = 0;
         source.guest_texel_hash = null;
@@ -33358,6 +33529,7 @@ pub const Renderer = struct {
             cached.initialization_pending = false;
             cached.gpu_dirty = true;
             self.markStorageContentWritten(cache_index);
+            self.rememberStorageDccWrite(cache_index, prepared.descriptor, resources);
             _ = self.image_aliases.markWrite(cached.alias_token);
             if (try self.commitCachedStorageVolume(prepared, cache_index)) continue;
             self.invalidateStorageRasterAliases(prepared.descriptor);

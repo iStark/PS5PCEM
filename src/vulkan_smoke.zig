@@ -6267,6 +6267,49 @@ fn runStorageColorInitializationProbe(allocator: std.mem.Allocator) !void {
     std.debug.print("storage-to-color initialization passed: exact linear, 4 KiB and R_X views, odd extents and native pixel readback\n", .{});
 }
 
+noinline fn runComputedDccInitializationProbe(allocator: std.mem.Allocator) !void {
+    const Fixture = struct {
+        guest: SizedGuestMemory(1024 * 1024) = .{ .watch_generation = 1 },
+        metadata_generation: u64 = 1,
+
+        fn read(context: ?*anyopaque, address: u64, bytes: []u8) bool {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            return @TypeOf(self.guest).read(&self.guest, address, bytes);
+        }
+        fn write(context: ?*anyopaque, address: u64, bytes: []const u8) bool {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            if (address < 0x90000 and address + bytes.len > 0x80000) self.metadata_generation += 1;
+            return @TypeOf(self.guest).write(&self.guest, address, bytes);
+        }
+        fn generation(context: ?*anyopaque, address: u64, size: usize) u64 {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            if (address >= 0x80000 and address + size <= 0x90000) return self.metadata_generation;
+            return self.guest.watch_generation;
+        }
+    };
+    const saved = vulkan.backend.native_storage_color_initialization;
+    defer vulkan.backend.native_storage_color_initialization = saved;
+    for ([_]bool{ false, true }) |native| for (0..9) |scenario| {
+        vulkan.backend.native_storage_color_initialization = native;
+        const renderer = try allocator.create(vulkan.Renderer);
+        defer allocator.destroy(renderer);
+        renderer.* = try vulkan.Renderer.init(allocator, .{ .enable_validation = true, .enable_timeline_scheduler = true });
+        defer renderer.deinit();
+        const fixture = try allocator.create(Fixture);
+        defer allocator.destroy(fixture);
+        fixture.* = .{};
+        _ = renderer.dcbBackend(.{
+            .context = fixture,
+            .read = Fixture.read,
+            .write = Fixture.write,
+            .track_gpu_read = if (scenario == 5) null else Fixture.generation,
+            .gpu_generation = if (scenario == 5) null else Fixture.generation,
+        });
+        try renderer.probeComputedDccInitialization(@intCast(scenario));
+        std.debug.print("computed DCC initialization passed: native={} scenario={d}\n", .{ native, scenario });
+    };
+}
+
 noinline fn runStorageImageCpuReuseProbe(allocator: std.mem.Allocator) !void {
     for ([_]bool{ false, true }) |fingerprint| try runStorageImageCpuReuseCase(allocator, fingerprint, false);
     try runStorageImageCpuReuseCase(allocator, true, true);
@@ -15020,6 +15063,10 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--storage-color-initialization")) {
         try runStorageColorInitializationProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--computed-dcc-initialization")) {
+        try runComputedDccInitializationProbe(allocator);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--storage-raster-replacement")) {
