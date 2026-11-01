@@ -94,6 +94,15 @@ var sdk11_acb_page_probe: AcbLabelPageProbe = .{};
 var submission_header_write_reports: u32 = 0;
 var unmapped_wait_reports: u32 = 0;
 var unsafe_island_reports: u32 = 0;
+var unreadable_source_reports: u32 = 0;
+
+/// A GPU read with no backing is a dropped dispatch, not a cache miss. Say so
+/// at the point of failure (bounded: this runs on the read path).
+fn noteUnreadableSource(address: u64, size: usize) void {
+    if (unreadable_source_reports >= 8) return;
+    unreadable_source_reports += 1;
+    std.debug.print("[agc submit] unreadable guest source addr=0x{x} size={d}\n", .{ address, size });
+}
 
 const maximum_submission_aliases = 256;
 const submission_allocation_header_bytes: u64 = 0x10;
@@ -1076,14 +1085,20 @@ fn borrowGuestRead(space: *guest_address_space.AddressSpace, address: u64, size:
 pub fn readGuestMemory(context: ?*anyopaque, address: u64, bytes: []u8) bool {
     if (video_out.readLabelMemory(address, bytes)) return true;
     if (addressSpaceFromContext(context) orelse memory.attachedAddressSpace()) |space| {
-        var lease = borrowGuestRead(space, address, bytes.len) orelse return false;
+        var lease = borrowGuestRead(space, address, bytes.len) orelse {
+            noteUnreadableSource(address, bytes.len);
+            return false;
+        };
         defer lease.release();
         gpu.parallel_copy.guest_copy_pool.copy(bytes, lease.bytes);
         return true;
     }
     // Prefer a known AGC arena alias. Compact GPU VAs live in the broad guest
     // reservation too, but do not necessarily have committed CPU pages there.
-    const resolved = resolveGuestMemoryAddress(address, bytes.len) orelse return false;
+    const resolved = resolveGuestMemoryAddress(address, bytes.len) orelse {
+        noteUnreadableSource(address, bytes.len);
+        return false;
+    };
     const source: [*]const u8 = @ptrFromInt(resolved);
     gpu.parallel_copy.guest_copy_pool.copy(bytes, source[0..bytes.len]);
     return true;
