@@ -5397,7 +5397,10 @@ fn runResidentMipChainProbe(allocator: std.mem.Allocator) !void {
     const previous = vulkan.backend.assemble_resident_mip_chains;
     vulkan.backend.assemble_resident_mip_chains = true;
     defer vulkan.backend.assemble_resident_mip_chains = previous;
-    for ([_]bool{ false, true }) |tracked| for ([_]u32{ 16, 17 }) |extent| {
+    for ([_]bool{ false, true }) |volume| for ([_]bool{ false, true }) |tracked| for ([_]u32{ 16, 17 }) |extent| {
+        var phase: []const u8 = "GPU revisions";
+        errdefer std.debug.print("resident mip probe failed: volume={any} tracked={any} extent={d} phase={s}\n", .{ volume, tracked, extent, phase });
+        const depth: u32 = if (volume) extent - 8 else 1;
         const Memory = SizedGuestMemory(2 * 1024 * 1024);
         const guest = try allocator.create(Memory);
         defer allocator.destroy(guest);
@@ -5412,25 +5415,44 @@ fn runResidentMipChainProbe(allocator: std.mem.Allocator) !void {
             memory.gpu_generation = Memory.generation;
         }
         const backend = renderer.dcbBackend(memory);
-        const store = [_]u32{
+        const store_2d = [_]u32{
             vop1(1, 0, 128), vop1(1, 1, 128),
             vop1(1, 2, 8),   vop1(1, 3, 9),
             vop1(1, 4, 10),  vop1(1, 5, 11),
             0xf020_0f08,     0x0000_0200,
             0xbf81_0000,
         };
-        const sample = [_]u32{
+        const sample_2d = [_]u32{
             vop1(1, 0, 128), vop1(1, 1, 128),
             0xf09c_0f0a,     0x0040_0200,
             1,               0xe078_0000,
             0x8003_0200,     0xbf81_0000,
         };
+        // Write and sample the final Vulkan-visible Z slice of each mip.
+        // A copy that accidentally keeps depth=1 must fail this probe.
+        const store_3d = [_]u32{
+            vop1(1, 0, 128), vop1(1, 1, 128), vop1(1, 2, 12),
+            vop1(1, 4, 8),   vop1(1, 5, 9),   vop1(1, 6, 10),
+            vop1(1, 7, 11),  0xf020_0f10,     0x0000_0400,
+            0xbf81_0000,
+        };
+        const sample_3d = [_]u32{
+            vop1(1, 0, 128), vop1(1, 1, 128), vop1(1, 2, 16),
+            0xf09c_0f12,     0x0040_0400,     0x0201,
+            0xe078_0000,     0x8003_0400,     0xbf81_0000,
+        };
+        const store: []const u32 = if (volume) &store_3d else &store_2d;
+        const sample: []const u32 = if (volume) &sample_3d else &sample_2d;
         for (store, 0..) |word, i| guest.word(0x100 + i * 4, word);
         for (sample, 0..) |word, i| guest.word(0x200 + i * 4, word);
         var state = gpu.State{};
         const compute = gpu.resources.ShaderStage.compute;
         try state.writeRegister(.shader, compute.programRegisterBase() + 1, 0);
         var chain = sampledImageDescriptorWords(0x20000, extent, extent);
+        if (volume) {
+            chain[3] = (chain[3] & 0x0fff_ffff) | 0xa000_0000;
+            chain[4] = depth - 1;
+        }
         chain[3] |= (2 << 16) | (@as(u32, @intFromEnum(gpu.resources.TileMode.standard_4kb)) << 20);
         chain[5] = 2 << 4;
         const texture = try gpu.TextureLayout.fromImage(try gpu.resources.decodeImageDescriptor(&chain));
@@ -5447,9 +5469,10 @@ fn runResidentMipChainProbe(allocator: std.mem.Allocator) !void {
                 var image = chain;
                 image[3] = (image[3] & ~@as(u32, 0xff000)) | (@as(u32, @intCast(lod)) << 12) | (@as(u32, @intCast(lod)) << 16);
                 try state.writeRegister(.shader, compute.programRegisterBase(), 1);
-                try state.writeRegister(.shader, 0x213, 12 << 1);
+                try state.writeRegister(.shader, 0x213, (if (volume) @as(u32, 13) else 12) << 1);
                 for (image, 0..) |word, i| try state.writeRegister(.shader, compute.userDataBase() + @as(u32, @intCast(i)), word);
                 for (colors[lod], 0..) |value, channel| try state.writeRegister(.shader, compute.userDataBase() + 8 + @as(u32, @intCast(channel)), @bitCast(value));
+                if (volume) try state.writeRegister(.shader, compute.userDataBase() + 12, @max(depth >> @as(u5, @intCast(lod)), 1) - 1);
                 _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
             }
             // Producing the next mip must not publish earlier disjoint mips,
@@ -5468,8 +5491,12 @@ fn runResidentMipChainProbe(allocator: std.mem.Allocator) !void {
                 const output_address: u32 = @intCast(0x10000 + sample_index * 256);
                 const userdata = image ++ sampler ++ [_]u32{ output_address, 16 << 16, 1, 0 };
                 try state.writeRegister(.shader, compute.programRegisterBase(), 2);
-                try state.writeRegister(.shader, 0x213, 16 << 1);
+                try state.writeRegister(.shader, 0x213, (if (volume) @as(u32, 17) else 16) << 1);
                 for (userdata, 0..) |word, i| try state.writeRegister(.shader, compute.userDataBase() + @as(u32, @intCast(i)), word);
+                if (volume) {
+                    const mip_depth: f32 = @floatFromInt(@max(depth >> @as(u5, @intCast(lod)), 1));
+                    try state.writeRegister(.shader, compute.userDataBase() + 16, @bitCast(1.0 - 0.5 / mip_depth));
+                }
                 _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
                 for (0..4) |channel| {
                     var expected = colors[lod][if (swap and channel != 3) 2 - channel else channel];
@@ -5489,6 +5516,7 @@ fn runResidentMipChainProbe(allocator: std.mem.Allocator) !void {
         }
         // Read only after both revisions have queued all their consumers.
         // Reusing the backing must preserve the first revision's samples.
+        phase = "queued sample readback";
         for (expected_samples, 0..) |expected, index| {
             var output: [16]u8 = undefined;
             try std.testing.expect(backend.vtable.read(backend.context, 0x10000 + index * 256, &output));
@@ -5501,18 +5529,24 @@ fn runResidentMipChainProbe(allocator: std.mem.Allocator) !void {
         // CPU replacement of one packed-tail mip must not discard the newer
         // GPU output of its neighbours. Padding belongs to the guest too.
         const allocation = guest.bytes[0x20000..][0..@intCast(texture.required_source_bytes)];
-        const padding = allocation.len - 1;
+        phase = "CPU mip edit";
+        const texel_bytes = try allocator.alloc(u8, allocation.len);
+        defer allocator.free(texel_bytes);
+        @memset(texel_bytes, 0);
         for (0..3) |lod| {
             const view = try texture.subresource(@intCast(lod), 0, 1);
-            for (0..view.height) |y| for (0..view.width) |x| {
-                const offset = try view.sourceByteOffset(@intCast(x), @intCast(y), 0, 0);
-                try std.testing.expect(padding < offset or padding >= offset + 4);
+            for (0..view.depth_or_layers) |z| for (0..view.height) |y| for (0..view.width) |x| {
+                const offset: usize = @intCast(try view.sourceByteOffset(@intCast(x), @intCast(y), @intCast(z), 0));
+                @memset(texel_bytes[offset..][0..4], 1);
             };
         }
+        // A volume's final allocation byte can be a live texel. Find padding
+        // outside every mip and Z slice instead of assuming it is at the end.
+        const padding = std.mem.indexOfScalar(u8, texel_bytes, 0) orelse return error.ExpectedGuestPadding;
         allocation[padding] = 0x5b;
         if (extent == 17) {
             const view = try texture.subresource(1, 0, 1);
-            const offset: usize = @intCast(try view.sourceByteOffset(0, 0, 0, 0));
+            const offset: usize = @intCast(try view.sourceByteOffset(0, 0, @max(depth >> 1, 1) - 1, 0));
             @memset(allocation[offset..][0..4], 64);
             colors[1] = @splat(64.0 / 255.0);
         }
@@ -5526,6 +5560,10 @@ fn runResidentMipChainProbe(allocator: std.mem.Allocator) !void {
                 const lod_fixed: u32 = @intCast(lod * 256);
                 const userdata = chain ++ [_]u32{ 0, lod_fixed | (lod_fixed << 12), 0, 0, 0x10000, 16 << 16, 1, 0 };
                 for (userdata, 0..) |word, i| try state.writeRegister(.shader, compute.userDataBase() + @as(u32, @intCast(i)), word);
+                if (volume) {
+                    const mip_depth: f32 = @floatFromInt(@max(depth >> @as(u5, @intCast(lod)), 1));
+                    try state.writeRegister(.shader, compute.userDataBase() + 16, @bitCast(1.0 - 0.5 / mip_depth));
+                }
                 _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
                 var output: [16]u8 = undefined;
                 try renderer.readbackGuestStorageBuffer(0x10000, &output);
@@ -5536,6 +5574,7 @@ fn runResidentMipChainProbe(allocator: std.mem.Allocator) !void {
             try std.testing.expectEqual(@as(u8, 0x5b), allocation[padding]);
         }
         const before_writes = guest.write_calls;
+        phase = "mip publication";
         try renderer.probeStorageMipPublication(0x20000);
         try std.testing.expectEqual(before_writes + 1, guest.write_calls);
         try std.testing.expectEqual(@as(u8, 0x5b), allocation[padding]);
@@ -5543,13 +5582,15 @@ fn runResidentMipChainProbe(allocator: std.mem.Allocator) !void {
         try renderer.flushPendingGuestWrites();
         for (0..3) |lod| {
             const view = try texture.subresource(@intCast(lod), 0, 1);
-            const offset: usize = 0x20000 + @as(usize, @intCast(try view.sourceByteOffset(0, 0, 0, 0)));
+            const z = @max(depth >> @as(u5, @intCast(lod)), 1) - 1;
+            const offset: usize = 0x20000 + @as(usize, @intCast(try view.sourceByteOffset(0, 0, z, 0)));
             for (0..4) |channel| try std.testing.expectApproxEqAbs(colors[lod][channel], @as(f32, @floatFromInt(guest.bytes[offset + channel])) / 255.0, 0.004);
-            const untouched: usize = 0x20000 + @as(usize, @intCast(try view.sourceByteOffset(1, 0, 0, 0)));
+            const untouched: usize = 0x20000 + @as(usize, @intCast(try view.sourceByteOffset(1, 0, z, 0)));
             try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0 }, guest.bytes[untouched..][0..4]);
         }
         // CPU allocation reuse without an explicit renderer write callback.
         // Reject the old resident chain and sample the newly authored bytes.
+        phase = "CPU allocation reuse";
         @memset(guest.bytes[0x20000..][0..@intCast(texture.required_source_bytes)], 128);
         guest.changed();
         const userdata = chain ++ [_]u32{ 0, 0, 0, 0, 0x10000, 16 << 16, 1, 0 };
@@ -5560,7 +5601,7 @@ fn runResidentMipChainProbe(allocator: std.mem.Allocator) !void {
         for (0..4) |channel| try std.testing.expectApproxEqAbs(@as(f32, 128.0 / 255.0), @as(f32, @bitCast(std.mem.readInt(u32, output[channel * 4 ..][0..4], .little))), 0.0001);
         try std.testing.expect(renderer.storage_cpu_invalidations != 0);
     };
-    std.debug.print("resident mip chain passed: GPU producers, same-frame updates, odd extents, LODs, sRGB/swizzles, cache reuse and CPU replacement\n", .{});
+    std.debug.print("resident 2D/3D mip chains passed: GPU producers, same-frame updates, odd extents, LODs, sRGB/swizzles, cache reuse and CPU replacement\n", .{});
 }
 
 fn runSampledScratchProbe(allocator: std.mem.Allocator) !void {

@@ -238,3 +238,47 @@ mappings or bad descriptors. A per-access 512 MiB limit does not bound
 cumulative commitment. This needs a demonstrated guest mapping/lazy-commit
 contract and coverage of aliases, holes, context ownership and memory budgets
 before it can become default behavior.
+
+## Resident 3D mip chains
+
+A bounded trace of the direct-slot runner found a 128×128×128 R8 volume at
+`0x500c8b7000`, sampled across levels 0–6. All seven GPU-written mip images
+were resident, but the assembly path accepted only 2D textures. Sampling the
+volume therefore fell back to publication, CPU detiling and another upload.
+
+Resident mip assembly now supports 3D images, including the depth of each
+level. Its cache distinguishes image dimensionality and depth; matching a
+volume producer also checks its guest tiling, pitch and full mip geometry.
+Every requested level must be available and current. Same-frame writes
+invalidate only the changed levels, and CPU replacement retains the existing
+coherence checks. The frame profile reports `volume_levels` separately.
+
+When the CPU actually needs the volume, compatible disjoint mip images can
+now share one readback submission and one guest-memory publication. The
+copies include all Z slices. Incompatible layouts and overwrite baselines
+still use the guarded per-image fallback; guest padding and CPU-edited mips
+are preserved.
+
+Validation:
+
+- All 270 Vulkan unit tests pass; ReleaseFast runner and probe builds pass
+  all 21 requested build steps.
+- The native resident-mip probe passes eight 2D/3D cases on the RTX 3070 Ti
+  with `VK_LAYER_KHRONOS_validation` enabled and no reported validation
+  errors or warnings.
+- The probe reads the final Z slice of each 3D level, verifies queued
+  consumers across same-frame updates, odd dimensions, LODs, swizzles and
+  sRGB, then checks individual CPU mip edits, padding, batched publication
+  and full CPU allocation reuse. Backing images are reused without stale
+  pixels or unnecessary sampled-image uploads.
+
+The preceding direct-slot run reached flip 1253 without recorded draw,
+dispatch, flip or synchronization errors, and was deliberately stopped to
+avoid host memory pressure during the build. A census of the 5,916-byte
+program with prefix hash `09939c9b7c759fa9` found three cached variants in
+that run versus 19 in the earlier run. These censuses cover different scene
+positions, so they do not establish a final total or loading-time ratio.
+Warm frames 1080 and 1140 took 713 and 666 ms (about 1.4–1.5 FPS); frame 1140
+still uploaded 326.9 MiB and read back 204.6 MiB. These are observations before
+the 3D mip change, not a measured FPS improvement. Character control remains
+unverified.

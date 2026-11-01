@@ -3655,6 +3655,7 @@ const FrameProfile = struct {
     mip_chain_creates: u64 = 0,
     mip_chain_reuses: u64 = 0,
     mip_chain_level_copies: u64 = 0,
+    mip_chain_volume_level_copies: u64 = 0,
     storage_discarded_readbacks: u64 = 0,
     storage_discarded_readback_bytes: u64 = 0,
     storage_guest_checks: u64 = 0,
@@ -4749,12 +4750,13 @@ const MipChainSource = struct {
     image: vk.Image,
     width: u32,
     height: u32,
+    depth: u32 = 1,
     restore: image_state.Usage,
     generation: u64,
 
     fn sameContents(a: MipChainSource, b: MipChainSource) bool {
         return a.generation != 0 and a.generation == b.generation and a.image == b.image and
-            a.width == b.width and a.height == b.height;
+            a.width == b.width and a.height == b.height and a.depth == b.depth;
     }
 };
 
@@ -4764,6 +4766,8 @@ const AssembledMipChain = struct {
     image_format: u32,
     width: u32,
     height: u32,
+    depth: u32 = 1,
+    image_type: gpu.resources.ImageType = .color_2d,
     levels: u32,
     /// The source sequences this was built from. A level written again makes
     /// the chain stale, and rebuilding is the only way to pick the write up.
@@ -18043,6 +18047,7 @@ pub const Renderer = struct {
         for (self.assembled_mip_chains.items) |*chain| {
             if (chain.address != descriptor.address or chain.unified_format != descriptor.unified_format or
                 chain.width != descriptor.width or chain.height != descriptor.height or
+                chain.image_type != .color_2d or chain.depth != 1 or
                 chain.levels != levels or chain.image_format != image_format) continue;
             if (chain.signature != signature) break;
             chain.last_used_batch = self.sampled_image_batch;
@@ -29871,7 +29876,9 @@ pub const Renderer = struct {
     /// CPU replacements are checked for every view before any texel is tiled.
     fn flushCachedStorageMipChain(self: *Renderer, memory: GuestMemory, first_index: usize, image_view: ?gpu.ImageDescriptor) (Error || std.mem.Allocator.Error)!bool {
         const first = self.storage_image_cache.items[first_index];
-        if (first.descriptor.image_type != .color_2d or first.descriptor.depth_or_layers != 1 or
+        const volume = first.descriptor.image_type == .color_3d;
+        const surface = first.descriptor.image_type == .color_2d and first.descriptor.depth_or_layers == 1;
+        if ((!volume and !surface) or first.descriptor.base_array != 0 or
             first.descriptor.viewMipLevels() != 1 or first.depth_snapshot != null or
             first.guest_native_baseline != null or first.guest_native_baseline_digest != null or first.retile_backing != null) return false;
         var indices: [16]usize = undefined;
@@ -29912,7 +29919,7 @@ pub const Renderer = struct {
             const copy = vk.BufferImageCopy{
                 .buffer_offset = offset,
                 .image_subresource = .{ .aspect_mask = vk.image_aspect_color_bit },
-                .image_extent = .{ .width = snapshot.subresource.width, .height = snapshot.subresource.height, .depth = 1 },
+                .image_extent = .{ .width = snapshot.subresource.width, .height = snapshot.subresource.height, .depth = snapshot.subresource.depth_or_layers },
             };
             self.device_functions.cmd_copy_image_to_buffer(commands, snapshot.image.handle, vk.image_layout_transfer_src_optimal, transfer.handle, 1, @ptrCast(&copy));
             try self.transitionTrackedImage(commands, snapshot.image.handle, range, image_state.storage_usage);
@@ -33783,9 +33790,9 @@ pub const Renderer = struct {
         const survey = @atomicLoad(bool, &survey_resident_mip_chains, .monotonic);
         if (!assemble and !survey) return null;
         const levels = descriptor.viewMipLevels();
-        if (levels < 2 or dimension != .two_d or descriptor.image_type != .color_2d or
-            descriptor.depth_or_layers != 1 or descriptor.viewBaseLevel() != 0)
-        {
+        const volume = dimension == .three_d and descriptor.image_type == .color_3d;
+        const surface = dimension == .two_d and descriptor.image_type == .color_2d and descriptor.depth_or_layers == 1;
+        if (levels < 2 or (!volume and !surface) or descriptor.base_array != 0 or descriptor.viewBaseLevel() != 0) {
             return null;
         }
         if (levels > maximum_assembled_mip_levels) return null;
@@ -33803,9 +33810,16 @@ pub const Renderer = struct {
                     if (!cached.valid or cached.descriptor.address != descriptor.address) continue;
                     if (cached.descriptor.viewBaseLevel() != level or cached.descriptor.viewMipLevels() != 1) continue;
                     if (!storageImageFormatsCompatible(cached.descriptor.unified_format, descriptor.unified_format)) continue;
-                    if (cached.descriptor.depth_or_layers != 1 or cached.descriptor.base_array != 0 or
+                    if (cached.descriptor.image_type != descriptor.image_type or
+                        cached.descriptor.depth_or_layers != descriptor.depth_or_layers or cached.descriptor.base_array != 0 or
                         cached.descriptor.width != descriptor.width or cached.descriptor.height != descriptor.height or
                         cached.content_generation == 0) continue;
+                    // A volume uses a different swizzle across Z slices and
+                    // mip tails. Equal base addresses and XY extents alone do
+                    // not identify the same guest subresources.
+                    if (volume and (cached.descriptor.tile_mode != descriptor.tile_mode or
+                        cached.descriptor.pitch != descriptor.pitch or cached.descriptor.array_pitch != descriptor.array_pitch or
+                        cached.descriptor.resourceMipLevels() != descriptor.resourceMipLevels())) continue;
                     if (newest == null or cached.content_generation > self.storage_image_cache.items[newest.?].content_generation)
                         newest = index;
                 }
@@ -33830,14 +33844,15 @@ pub const Renderer = struct {
             const shift: u5 = @intCast(level);
             const level_width = @max(descriptor.width >> shift, 1);
             const level_height = @max(descriptor.height >> shift, 1);
-            if (cached.subresource.width != level_width or cached.subresource.height != level_height)
+            const level_depth = if (volume) @max(descriptor.depth_or_layers >> shift, 1) else 1;
+            if (cached.subresource.width != level_width or cached.subresource.height != level_height or cached.subresource.depth_or_layers != level_depth)
                 extents_match = false;
             // Short is fatal, over is not: the guest rounds a level extent up
             // where Vulkan rounds down, so a producer can carry a row and a
             // column the sampler never addresses at that level. Those are
             // droppable. A source narrower than its level is not: the copy
             // would leave real texels undefined.
-            if (cached.subresource.width < level_width or cached.subresource.height < level_height)
+            if (cached.subresource.width < level_width or cached.subresource.height < level_height or cached.subresource.depth_or_layers < level_depth)
                 extents_usable = false;
         }
         const trace_survey = survey and self.reported_mip_surveys < 4;
@@ -33911,12 +33926,13 @@ pub const Renderer = struct {
         for (self.assembled_mip_chains.items) |*chain| {
             if (chain.address != descriptor.address or chain.unified_format != descriptor.unified_format or
                 chain.width != descriptor.width or chain.height != descriptor.height or
+                chain.image_type != descriptor.image_type or chain.depth != descriptor.depth_or_layers or
                 chain.levels != levels or chain.image_format != image_format) continue;
             if (chain.signature != signature) break;
             chain.last_used_batch = self.sampled_image_batch;
             return .{
                 .image = chain.image,
-                .view = try self.residentImageViewLevelsMinLod(chain.image.handle, vk.image_view_type_2d, image_format, try sampledImageComponents(descriptor.dst_select, descriptor.unified_format), vk.image_aspect_color_bit, 1, levels, sampledImageMinimumLod(descriptor, levels)),
+                .view = try self.residentImageViewLevelsMinLod(chain.image.handle, if (volume) vk.image_view_type_3d else vk.image_view_type_2d, image_format, try sampledImageComponents(descriptor.dst_select, descriptor.unified_format), vk.image_aspect_color_bit, 1, levels, sampledImageMinimumLod(descriptor, levels)),
                 .sampler = try self.residentSampler(sampler_descriptor),
             };
         }
@@ -33969,7 +33985,7 @@ pub const Renderer = struct {
         var images: [maximum_assembled_mip_levels]MipChainSource = undefined;
         for (sources, 0..) |index, level| {
             const cached = self.storage_image_cache.items[index];
-            images[level] = .{ .image = cached.image.handle, .width = cached.subresource.width, .height = cached.subresource.height, .restore = image_state.storage_usage, .generation = cached.content_generation };
+            images[level] = .{ .image = cached.image.handle, .width = cached.subresource.width, .height = cached.subresource.height, .depth = cached.subresource.depth_or_layers, .restore = image_state.storage_usage, .generation = cached.content_generation };
         }
         return self.buildMipChainImages(descriptor, sampler_descriptor, image_format, images[0..sources.len], signature);
     }
@@ -33983,6 +33999,8 @@ pub const Renderer = struct {
         signature: u64,
     ) anyerror!?PreparedSampledImage {
         const levels: u32 = @intCast(sources.len);
+        const volume = descriptor.image_type == .color_3d;
+        const depth = if (volume) descriptor.depth_or_layers else 1;
         // A changed level invalidates the contents, not the allocation. Older
         // draws have already been recorded and the transfer barrier orders
         // them before this overwrite. A current-batch view is still being
@@ -33992,6 +34010,7 @@ pub const Renderer = struct {
             for (self.assembled_mip_chains.items, 0..) |chain, index| {
                 if (chain.address != descriptor.address or chain.unified_format != descriptor.unified_format or
                     chain.width != descriptor.width or chain.height != descriptor.height or
+                    chain.image_type != descriptor.image_type or chain.depth != depth or
                     chain.levels != levels or chain.image_format != image_format or
                     chain.last_used_batch == self.sampled_image_batch) continue;
                 _ = self.assembled_mip_chains.swapRemove(index);
@@ -34002,9 +34021,9 @@ pub const Renderer = struct {
         const destination = if (reused) |chain| chain.image else try self.createImageWithExtent(
             descriptor.width,
             descriptor.height,
+            depth,
             1,
-            1,
-            vk.image_type_2d,
+            if (volume) vk.image_type_3d else vk.image_type_2d,
             0,
             image_format,
             vk.image_usage_transfer_dst_bit | vk.image_usage_sampled_bit,
@@ -34037,6 +34056,7 @@ pub const Renderer = struct {
         for (sources, 0..) |source, level| {
             if (reused) |chain| if (source.sameContents(chain.sources[level])) continue;
             self.frame_profile.mip_chain_level_copies +|= 1;
+            if (volume) self.frame_profile.mip_chain_volume_level_copies +|= 1;
             try self.transitionTrackedImage(command_buffer, source.image, .{
                 .aspect_mask = vk.image_aspect_color_bit,
                 .layer_count = 1,
@@ -34055,7 +34075,7 @@ pub const Renderer = struct {
                 .extent = .{
                     .width = level_width,
                     .height = level_height,
-                    .depth = 1,
+                    .depth = @min(source.depth, @max(depth >> shift, 1)),
                 },
             };
             self.device_functions.cmd_copy_image(
@@ -34096,7 +34116,7 @@ pub const Renderer = struct {
         const components = try sampledImageComponents(descriptor.dst_select, descriptor.unified_format);
         const view = try self.residentImageViewLevelsMinLod(
             destination.handle,
-            vk.image_view_type_2d,
+            if (volume) vk.image_view_type_3d else vk.image_view_type_2d,
             image_format,
             components,
             vk.image_aspect_color_bit,
@@ -34107,8 +34127,8 @@ pub const Renderer = struct {
         if (self.reported_mip_assemblies < 8) {
             self.reported_mip_assemblies += 1;
             std.debug.print(
-                "[vulkan dcb] assembled mip chain @0x{x} {d}x{d} levels={d} from resident images\n",
-                .{ descriptor.address, descriptor.width, descriptor.height, levels },
+                "[vulkan dcb] assembled mip chain @0x{x} {d}x{d}x{d} levels={d} from resident images\n",
+                .{ descriptor.address, descriptor.width, descriptor.height, depth, levels },
             );
         }
         var retained_sources: [maximum_assembled_mip_levels]MipChainSource = undefined;
@@ -34119,6 +34139,8 @@ pub const Renderer = struct {
             .image_format = image_format,
             .width = descriptor.width,
             .height = descriptor.height,
+            .depth = depth,
+            .image_type = descriptor.image_type,
             .levels = levels,
             .signature = signature,
             .image = destination,
@@ -34148,6 +34170,7 @@ pub const Renderer = struct {
         for (self.assembled_mip_chains.items) |*existing| {
             if (existing.address != chain.address or existing.unified_format != chain.unified_format or
                 existing.width != chain.width or existing.height != chain.height or
+                existing.image_type != chain.image_type or existing.depth != chain.depth or
                 existing.levels != chain.levels or existing.image_format != chain.image_format) continue;
             self.retireAssembledMipChainImage(existing.*);
             existing.* = chain;
@@ -39749,7 +39772,7 @@ pub const Renderer = struct {
                 .{ self.flip_callbacks, profile.depth_storage_copies, profile.depth_storage_copy_bytes / 1024, profile.depth_storage_reuses },
             );
             std.debug.print("[gpu mip reload] flip={d} levels={d} upload_kib={d}\n", .{ self.flip_callbacks, profile.mip_cpu_reloads, profile.mip_cpu_reload_bytes / 1024 });
-            std.debug.print("[gpu mip backing] flip={d} creates={d} reuses={d} copied_levels={d}\n", .{ self.flip_callbacks, profile.mip_chain_creates, profile.mip_chain_reuses, profile.mip_chain_level_copies });
+            std.debug.print("[gpu mip backing] flip={d} creates={d} reuses={d} copied_levels={d} volume_levels={d}\n", .{ self.flip_callbacks, profile.mip_chain_creates, profile.mip_chain_reuses, profile.mip_chain_level_copies, profile.mip_chain_volume_level_copies });
             std.debug.print(
                 "[gpu sampled cache] flip={d} creates={d}/{d}us allocs={d}/{d}us retries={d} trim_us={d} retire_waits={d} blocked={d} retire_fence_us={d} pending_kib={d} slack_kib={d} reuses={d}\n",
                 .{
@@ -43970,6 +43993,20 @@ test "storage mip publication only excludes disjoint views of one physical resou
     try std.testing.expect(!disjointStorageImageMips(a, b));
     b.unified_format = a.unified_format;
     b.dcc_enabled = true;
+    try std.testing.expect(!disjointStorageImageMips(a, b));
+
+    // Volume mips share a swizzle allocation, but their texels remain
+    // disjoint only when the full resource geometry agrees, including Z.
+    a.image_type = .color_3d;
+    a.depth_or_layers = 8;
+    a.base_level = 0;
+    a.last_level = 0;
+    b = a;
+    b.base_level = 1;
+    b.last_level = 1;
+    try std.testing.expect(disjointStorageImageMips(a, b));
+    try std.testing.expect(disjointStorageImageMips(b, a));
+    b.depth_or_layers = 4;
     try std.testing.expect(!disjointStorageImageMips(a, b));
 }
 
