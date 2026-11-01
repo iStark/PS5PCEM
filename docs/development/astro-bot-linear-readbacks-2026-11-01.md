@@ -110,3 +110,40 @@ visibility checks. The wake-up baseline's 256 MiB/frame is a different scene
 from this title benchmark. Removing those bytes requires proving when the CPU
 needs them or retaining compatible image consumers on the GPU; dropping the
 completion publication would break direct guest CPU reads.
+
+## Follow-up: wake-up and controlled crash-site scene
+
+The user advanced the wake-up prompt by shaking the DualSense, then moved ASTRO
+with the left stick until the movement prompt disappeared. The later comparison
+therefore reaches confirmed character control, rather than only the cinematic.
+
+At the earlier wake-up prompt, three stationary intervals measured 4.644 FPS
+with batching off and 4.667 / 4.644 FPS with it on. The fourth interval is excluded:
+the user shook the controller and advanced the scene during that interval.
+
+After movement, the user left the character and camera idle. Compilation,
+captures and CPU stack sampling were stopped during the four 45-second intervals;
+the same ten-second settling periods and off/on/on/off sequence were used.
+
+| Completion path | Flips | Frames / seconds | FPS | Median readback | Median fence wait |
+|---|---|---|---:|---:|---:|
+| Individual | 19001–19233 | 232 / 45.001824 | 5.155 | 240,228 KiB | 48.168 ms |
+| Batched | 19282–19492 | 210 / 45.001219 | 4.667 | 240,228 KiB | 55.440 ms |
+| Batched, repeat | 19541–19769 | 228 / 45.001400 | 5.067 | 240,228 KiB | 50.402 ms |
+| Individual, return | 19820–20047 | 227 / 45.001055 | 5.044 | 240,228 KiB | 50.615 ms |
+
+These results **do not establish a gameplay gain**. One enabled interval is
+slower, while its repeat is close to the return baseline. The title-screen
+gain above must not be generalized to this scene. Median uploads are about
+102.5 MiB per frame; readbacks are about 234.6 MiB per frame in every interval.
+
+The last-error fields were clear at each interval boundary, but the per-frame
+profiles still report **one failed draw and 12 unresolved storage bindings**.
+The log identifies the failed draw as `UnsupportedSampledImage`: the pixel
+shader at `0x500a38f00`, instruction `0x854`, cannot resolve its sampler in s0.
+This predates the measurement. It must not be described as a clean rendering
+run just because a later successful draw cleared the last-error field.
+
+Frame 20352, saved after timing, retains pronounced world-image blur. No visual
+fix or 20 FPS result is claimed. The next investigation targets the CPU copies
+behind these transfers, while preserving completion visibility.

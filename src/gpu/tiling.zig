@@ -16,6 +16,8 @@ const parallel_copy = @import("parallel_copy.zig");
 pub export var contiguous_linear_staging: bool = true;
 pub export var contiguous_linear_staging_bytes: u64 = 0;
 pub export var contiguous_linear_staging_fallbacks: u64 = 0;
+pub export var contiguous_linear_copies: bool = true;
+pub export var contiguous_linear_copy_bytes: u64 = 0;
 
 pub const Error = error{
     InvalidExtent,
@@ -941,6 +943,32 @@ pub const Layout = struct {
         const row_bytes = @as(usize, self.width) * element_bytes;
         if (self.block.tile_mode.isLinear()) {
             const tiled_row_bytes = @as(usize, self.row_pitch_elements) * element_bytes;
+            // A packed row has exactly the staging byte order. Coalesce only
+            // visible texels; physical slice padding and the first-slice/mip
+            // offsets must survive both directions of this copy.
+            if (@atomicLoad(bool, &contiguous_linear_copies, .monotonic) and
+                tiled_row_bytes == row_bytes and self.staging_bytes >= parallel_copy.Pool.minimum_bytes and
+                pool.participants.load(.acquire) > 1)
+            {
+                const slice_bytes = row_bytes * @as(usize, self.height);
+                const packed_slices = self.source_slice_bytes == slice_bytes and self.staging_slice_bytes == slice_bytes;
+                const count = if (packed_slices) 1 else self.layers;
+                const length = if (packed_slices) slice_bytes * @as(usize, self.layers) else slice_bytes;
+                // Keep the existing row-copy engine when each range is too
+                // short for helpers; a serial REP copy can lose on L3-sized
+                // images even when the complete staging allocation is large.
+                if (length >= parallel_copy.Pool.minimum_bytes) {
+                    for (0..count) |layer| {
+                        const tiled: usize = @intCast(self.source_slice_bytes * (@as(u64, self.first_slice) + layer) + self.source_base_offset);
+                        const linear: usize = @intCast(self.staging_slice_bytes * layer);
+                        const src = if (to_tiled) linear else tiled;
+                        const dst = if (to_tiled) tiled else linear;
+                        pool.copy(destination[dst..][0..length], source[src..][0..length]);
+                    }
+                    _ = @atomicRmw(u64, &contiguous_linear_copy_bytes, .Add, self.staging_bytes, .monotonic);
+                    return;
+                }
+            }
             for (0..self.layers) |layer_index| {
                 const physical_slice = @as(usize, self.first_slice) + layer_index;
                 const tiled_slice: usize = @intCast(self.source_slice_bytes * physical_slice + self.source_base_offset);
@@ -2847,6 +2875,59 @@ test "optimized tile and detile preserve partial pitched blocks and slice offset
     try testing.expect(std.mem.allEqual(u8, tiled[0..@intCast(layout.source_slice_bytes)], 0xa5));
     try layout.detile(tiled, actual);
     try testing.expectEqualSlices(u8, linear, actual);
+}
+
+test "packed linear copies preserve slice gaps first slices and mip offsets" {
+    const saved = contiguous_linear_copies;
+    defer contiguous_linear_copies = saved;
+    var pool = parallel_copy.Pool{ .participants = .init(4) };
+    defer pool.deinit();
+    for ([_]u8{ 1, 4 }) |workers| for ([_]u32{ 1031, 4097 }) |height| inline for (.{ 8, 16 }) |bytes| {
+        pool.participants.store(workers, .release);
+        for (0..3) |mode| {
+            var layout = try Layout.init(.{
+                .tile_mode = .linear,
+                .width = 160,
+                .height = height,
+                .layers = 4,
+                .first_slice = 1,
+                .row_pitch_elements = if (mode == 2) 192 else 160,
+            }, bytes);
+            layout.source_base_offset = 128;
+            layout.required_source_bytes += 128;
+            if (mode == 1) {
+                layout.source_slice_bytes += 256;
+                layout.required_source_bytes += 256 * (layout.first_slice + layout.layers);
+            }
+            const linear = try testing.allocator.alloc(u8, @intCast(layout.staging_bytes));
+            defer testing.allocator.free(linear);
+            const expected = try testing.allocator.alloc(u8, @intCast(layout.required_source_bytes));
+            defer testing.allocator.free(expected);
+            const actual = try testing.allocator.alloc(u8, expected.len);
+            defer testing.allocator.free(actual);
+            const roundtrip = try testing.allocator.alloc(u8, linear.len);
+            defer testing.allocator.free(roundtrip);
+            for (linear, 0..) |*byte, i| byte.* = @truncate(i *% 17 +% (i >> 7));
+            @memset(expected, 0xc3);
+            @memset(actual, 0xc3);
+            contiguous_linear_copies = false;
+            try layout.copyElementsUsingPool(true, bytes, linear, expected, &pool);
+            contiguous_linear_copies = true;
+            const before = contiguous_linear_copy_bytes;
+            try layout.copyElementsUsingPool(true, bytes, linear, actual, &pool);
+            try testing.expectEqualSlices(u8, expected, actual);
+            try layout.copyElementsUsingPool(false, bytes, actual, roundtrip, &pool);
+            try testing.expectEqualSlices(u8, linear, roundtrip);
+            const eligible = workers > 1 and mode != 2 and (mode == 0 or layout.staging_slice_bytes >= parallel_copy.Pool.minimum_bytes);
+            try testing.expectEqual(if (eligible) 2 * layout.staging_bytes else 0, contiguous_linear_copy_bytes - before);
+            for ([_]u32{ 0, 1, height - 1 }) |y| for ([_]u32{ 0, 159 }) |x| for (0..4) |slice| {
+                const tiled: usize = @intCast(try layout.sourceByteOffset(x, y, @intCast(slice)));
+                const offset: usize = @intCast(try layout.stagingByteOffset(x, y, @intCast(slice)));
+                try testing.expectEqualSlices(u8, linear[offset..][0..bytes], actual[tiled..][0..bytes]);
+            };
+        }
+    };
+    try testing.expectEqual(@as(usize, 3), pool.worker_count);
 }
 
 test "checked memory staging shares the CPU detile address map" {
