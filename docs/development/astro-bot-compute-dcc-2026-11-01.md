@@ -52,8 +52,53 @@ The full ReleaseFast runner and smoke build pass **606 tests** (333 GPU and
 DCC metadata-clear and DCC single-texel-clear regressions also pass.
 The runner SHA-256 is
 `2d3b34f1ce20c1c0529a1f245a3285369cc2b7ffa758cd144bc0180cfda2c276`.
-The live comparison is pending, so no corrected gameplay image or FPS gain
-is claimed yet.
+## Live visual comparison
+
+The rebuilt runner reaches the crash-site DualSense wake-up prompt. In one
+process, toggling only `preserve_computed_dcc_contents` **on → off → on**
+restores, loses and restores the sharp world image. The camera remains in
+the same position; the controller, prompt and particles retain their idle
+animations. All game effects and the corrected blend constants remain
+enabled in every interval. This confirms the reported scene-wide blur fix
+at this location, not complete graphics correctness in every level.
+
+Each interval follows ten seconds of settling and measures flip and present
+counters for thirty seconds. Captures are taken **outside** those intervals.
+Host: Ryzen 7 7700, RTX 3070 Ti; Vulkan, Speed, performance game preference,
+hybrid input, retained caches, default-enabled exact-build 1080p profile.
+The game still uses a 2432×1368 HDR intermediate and a 4K final target.
+
+| DCC preservation | Flips/presents | Seconds | FPS | World image |
+| --- | ---: | ---: | ---: | --- |
+| On | 143 | 30.001283 | 4.77 | Sharp |
+| Off | 144 | 30.001325 | 4.80 | Dark and heavily blurred |
+| On again | 140 | 30.000885 | 4.67 | Sharp again |
+
+This is a correctness result, **not a speedup**. These intervals precede
+free character movement. All sampled profile rows have zero rejected draws,
+rejected dispatches and unsupported compute operations, but **12 unresolved
+storage bindings remain**. Their median readback volume is about **255.9 MiB
+per frame**, with **253–260 submissions** and **51–52 ms** of fence waits.
+The corrected path uploads about 25.4 MiB more per frame because it retains
+the computed destination instead of replacing it with a clear. Keeping that
+image resident across the hand-off is a remaining optimization target.
+
+| Old behavior, fix temporarily disabled | Default behavior, fix restored |
+| --- | --- |
+| [![Blurred world with sharp overlay](../images/astro-bot-dcc-before-2026-11-01.png)](../images/astro-bot-dcc-before-2026-11-01.png) | [![Sharp crash-site world after DCC preservation](../images/astro-bot-dcc-after-2026-11-01.png)](../images/astro-bot-dcc-after-2026-11-01.png) |
+
+These are unmodified renderer checkpoints, losslessly converted from PPM to
+PNG, at flips **20800** and **21056**. They are not desktop-window captures,
+enhanced previews or separate replay renders. The first restored-state
+capture at flip 20544 shows the same sharp result.
+
+A separate native HDR capture after bloom at flip **19624** preserves alpha
+**1** in all **3,326,976** pixels. The earlier blend-only capture at flip
+44189 had alpha **0** throughout. These captures are from different moments;
+their HDR maxima are not treated as a brightness benchmark. The shader and
+texture diagnostic blobs remain private.
+
+## Earlier run and remaining verification
 
 The preceding blend-only run measured **259 flips/presents in 30.000321 s,
 8.63 FPS**, in the moving space introduction. This is not a gameplay benchmark.
