@@ -63,3 +63,17 @@ The ordinary `zig-out/bin/game-run.exe` and its PDB are updated to that build.
 One separate 30-second opening-cinematic interval in the preceding runner
 measured 247 flips/presents in 30.000479 seconds, **8.23 FPS**. This moving
 sequence is not comparable with the stationary crash-site gameplay results.
+
+## Later crash-site observation
+
+The rebuilt runner subsequently reached the stationary DualSense wake-up
+prompt. Three 30-second same-process intervals with sampler recovery
+on/off/on measured **4.77 / 5.03 / 5.03 FPS**. Every periodic profile in these
+intervals reported zero failed draws, failed dispatches and unsupported
+compute programs, with 12 unresolved storage bindings still present.
+The formerly rejected draw did not recur with recovery disabled either,
+so this sequence does not establish its visual benefit or an FPS gain.
+
+World-image blur remained. Individual pass captures then identified a
+separate missing blend-constant state in the bloom composite; see the
+[blend-constant investigation](astro-bot-blend-constants-2026-11-01.md).

@@ -31,6 +31,8 @@ const renderdoc = @import("renderdoc");
 pub export var native_tessellation: bool = false;
 pub export var graphics_uniform_specialization: bool = false;
 pub export var vertex_uniform_specialization: bool = false;
+/// Diagnostic A/B switch; ordinary draws always honor CB_BLEND_RGBA.
+pub export var guest_blend_constants: bool = true;
 pub export var indexed_compute_sampled_scan: bool = true;
 pub export var capture_storage_program: u64 = 0;
 pub export var capture_storage_flip: u64 = 0;
@@ -907,6 +909,7 @@ const DeviceFunctions = struct {
     cmd_set_scissor: vk.PfnCmdSetScissor,
     cmd_set_depth_bias: vk.PfnCmdSetDepthBias,
     cmd_set_stencil_reference: vk.PfnCmdSetStencilReference,
+    cmd_set_blend_constants: vk.PfnCmdSetBlendConstants,
     cmd_bind_descriptor_sets: vk.PfnCmdBindDescriptorSets,
     cmd_dispatch: vk.PfnCmdDispatch,
     cmd_begin_render_pass: vk.PfnCmdBeginRenderPass,
@@ -994,6 +997,7 @@ const DeviceFunctions = struct {
             .cmd_set_scissor = try deviceProc(get_proc, device, vk.PfnCmdSetScissor, "vkCmdSetScissor"),
             .cmd_set_depth_bias = try deviceProc(get_proc, device, vk.PfnCmdSetDepthBias, "vkCmdSetDepthBias"),
             .cmd_set_stencil_reference = try deviceProc(get_proc, device, vk.PfnCmdSetStencilReference, "vkCmdSetStencilReference"),
+            .cmd_set_blend_constants = try deviceProc(get_proc, device, vk.PfnCmdSetBlendConstants, "vkCmdSetBlendConstants"),
             .cmd_bind_descriptor_sets = try deviceProc(get_proc, device, vk.PfnCmdBindDescriptorSets, "vkCmdBindDescriptorSets"),
             .cmd_dispatch = try deviceProc(get_proc, device, vk.PfnCmdDispatch, "vkCmdDispatch"),
             .cmd_begin_render_pass = try deviceProc(get_proc, device, vk.PfnCmdBeginRenderPass, "vkCmdBeginRenderPass"),
@@ -1675,12 +1679,41 @@ test "graphics pipeline key excludes dynamic draw values and preserves static st
     changed.depth_bias_slope_bits = @bitCast(@as(f32, 3));
     changed.stencil_front_reference = 0x35;
     changed.stencil_back_reference = 0xc2;
+    changed.blend_constant_bits = .{ 0x3f666666, 0x3e800000, 0xbf000000, 0x3f800000 };
     try std.testing.expectEqualDeep(original.pipelineKey(), changed.pipelineKey());
+    var reused = original;
+    reused.copyDynamicFrom(changed);
+    try std.testing.expectEqual(changed.blend_constant_bits, reused.blend_constant_bits);
     inline for (.{ "depth_write_enable", "depth_bias_enable", "stencil_test_enable", "stencil_front_compare_mask", "stencil_back_write_mask", "rasterization_samples", "rectangle_completion", "topology", "programmable_blend" }) |field| {
         var static_change = original;
         @field(static_change, field) += 1;
         try std.testing.expect(!std.meta.eql(original.pipelineKey(), static_change.pipelineKey()));
     }
+}
+
+test "blend constants map attachment channels and reject conflicting MRT values" {
+    var state = GraphicsPipelineState.default(16, 16);
+    state.color_write_masks[0] = 15;
+    state.source_color_blend_factors[0] = 10;
+    state.source_alpha_blend_factors[0] = 12;
+    const logical = [4]u32{ 0x3e000000, 0x3e800000, 0x3f400000, 0x3f000000 };
+    var required: [4]?u32 = @splat(null);
+    try Renderer.mergeBlendConstants(&state, 0, 0xc6, 4, logical, &required);
+    try std.testing.expectEqual([4]u32{ logical[2], logical[1], logical[0], logical[3] }, state.blend_constant_bits);
+    try Renderer.mergeBlendConstants(&state, 0, 0xc6, 4, logical, &required);
+    try std.testing.expectError(Error.UnsupportedGraphicsState, Renderer.mergeBlendConstants(&state, 0, 0xe4, 4, logical, &required));
+    // MIN/MAX and masked channels do not constrain the shared constant.
+    state.color_blend_operations[0] = 3;
+    try Renderer.mergeBlendConstants(&state, 0, 0xe4, 4, logical, &required);
+    state.color_blend_operations[0] = 0;
+    state.color_write_masks[0] = 2;
+    try Renderer.mergeBlendConstants(&state, 0, 0xe4, 4, logical, &required);
+    // A two-component R/A surface routes the logical alpha constant to G.
+    required = @splat(null);
+    state.color_write_masks[0] = 3;
+    try Renderer.mergeBlendConstants(&state, 0, 0x6c, 2, logical, &required);
+    try std.testing.expectEqual(logical[0], state.blend_constant_bits[0]);
+    try std.testing.expectEqual(logical[3], state.blend_constant_bits[1]);
 }
 
 test "graphics pipeline buckets verify colliding state and shaders after replacement" {
@@ -2375,6 +2408,7 @@ const GraphicsPipelineState = extern struct {
     /// Bits name CB slots whose packed 11/11/10 UNORM blend is performed in
     /// the fragment shader. The equation itself is part of the shader key.
     programmable_blend: u32 = 0,
+    blend_constant_bits: [4]u32 = @splat(0),
 
     /// Render-area extent and dynamic draw values do not affect pipeline
     /// compatibility. Keep the original state for recording each draw, and
@@ -2398,12 +2432,14 @@ const GraphicsPipelineState = extern struct {
         key.depth_bias_slope_bits = 0;
         key.stencil_front_reference = 0;
         key.stencil_back_reference = 0;
+        key.blend_constant_bits = @splat(0);
         return key;
     }
 
     /// Resource reuse retains analyzed static state, but every draw supplies
     /// fresh dynamic values, including separate front/back stencil references.
     fn copyDynamicFrom(self: *GraphicsPipelineState, current: GraphicsPipelineState) void {
+        self.blend_constant_bits = current.blend_constant_bits;
         inline for (.{ "width", "height", "viewport_x_bits", "viewport_y_bits", "viewport_width_bits", "viewport_height_bits", "viewport_min_depth_bits", "viewport_max_depth_bits", "scissor_x", "scissor_y", "scissor_width", "scissor_height", "depth_bias_constant_bits", "depth_bias_slope_bits", "stencil_front_reference", "stencil_back_reference" }) |field| {
             @field(self, field) = @field(current, field);
         }
@@ -16154,6 +16190,9 @@ pub const Renderer = struct {
         result.destination_alpha_blend_factors = @splat(0);
         result.alpha_blend_operations = @splat(0);
         result.programmable_blend = 0;
+        result.blend_constant_bits = if (@atomicLoad(bool, &guest_blend_constants, .monotonic)) render.blend_constant_bits else @splat(0);
+        const logical_constants = result.blend_constant_bits;
+        var constant_requirements: [4]?u32 = @splat(null);
         @memset(packed_unorm_blend, 0);
 
         var highest: u32 = 0;
@@ -16215,8 +16254,37 @@ pub const Renderer = struct {
                 try vulkanBlendOperation(blend.alpha_operation)
             else
                 result.color_blend_operations[slot];
+            if (!integer_color) try mergeBlendConstants(result, slot, colorTargetExportMapping(color.descriptor), colorTargetComponentCount(color.descriptor.format) orelse 4, logical_constants, &constant_requirements);
         }
         result.color_attachment_count = highest + 1;
+    }
+
+    /// Constants follow the same logical-to-physical channel permutation as
+    /// exports. Vulkan has one RGBA constant for all MRTs, so conflicting
+    /// requirements must not silently use whichever attachment came last.
+    fn mergeBlendConstants(result: *GraphicsPipelineState, slot: usize, mapping: u8, components: usize, logical: [4]u32, required: *[4]?u32) Error!void {
+        for (0..@min(components, 4)) |physical| {
+            if (result.color_write_masks[slot] & (@as(u32, 1) << @intCast(physical)) == 0) continue;
+            const alpha = physical == 3;
+            const operation = if (alpha) result.alpha_blend_operations[slot] else result.color_blend_operations[slot];
+            if (operation == 3 or operation == 4) continue; // MIN/MAX ignore factors.
+            const factors = if (alpha)
+                [2]u32{ result.source_alpha_blend_factors[slot], result.destination_alpha_blend_factors[slot] }
+            else
+                [2]u32{ result.source_color_blend_factors[slot], result.destination_color_blend_factors[slot] };
+            for (factors) |factor| {
+                const index: usize = switch (factor) {
+                    10, 11 => physical,
+                    12, 13 => 3,
+                    else => continue,
+                };
+                const source: u2 = if (factor == 12 or factor == 13) 3 else @truncate(mapping >> @as(u3, @intCast(physical * 2)));
+                const value = logical[source];
+                if (required[index]) |prior| if (prior != value) return Error.UnsupportedGraphicsState;
+                required[index] = value;
+                result.blend_constant_bits[index] = value;
+            }
+        }
     }
 
     fn guestGraphicsState(render: *const gpu.RenderState, target: gpu.resources.ColorTarget) Error!GraphicsPipelineState {
@@ -16376,6 +16444,11 @@ pub const Renderer = struct {
                 self.frame_profile.dynamic_state_commands += 2;
             }
         } else self.frame_profile.dynamic_state_avoided += 1;
+        if (previous == null or !std.meta.eql(previous.?.blend_constant_bits, state.blend_constant_bits)) {
+            const constants: [4]f32 = @bitCast(state.blend_constant_bits);
+            self.device_functions.cmd_set_blend_constants(command_buffer, &constants);
+            self.frame_profile.dynamic_state_commands += 1;
+        } else self.frame_profile.dynamic_state_avoided += 1;
         self.recording_graphics_state = state;
     }
 
@@ -16475,7 +16548,7 @@ pub const Renderer = struct {
             .scissor_count = 1,
             .scissors = @ptrCast(&scissor),
         };
-        const dynamic_states = [_]u32{ vk.dynamic_state_viewport, vk.dynamic_state_scissor, vk.dynamic_state_depth_bias, vk.dynamic_state_stencil_reference };
+        const dynamic_states = [_]u32{ vk.dynamic_state_viewport, vk.dynamic_state_scissor, vk.dynamic_state_depth_bias, vk.dynamic_state_stencil_reference, vk.dynamic_state_blend_constants };
         const dynamic_state = vk.PipelineDynamicStateCreateInfo{
             .dynamic_state_count = dynamic_states.len,
             .dynamic_states = &dynamic_states,
@@ -23599,6 +23672,91 @@ pub const Renderer = struct {
                 try std.testing.expectEqual(@as(u8, 0), pixels[center]);
             }
         }
+    }
+
+    /// Exercise actual blend equations across cached pipelines and recordings.
+    pub fn probeBlendConstants(self: *Renderer) anyerror!void {
+        const width = 16;
+        const height = 16;
+        var color = std.mem.zeroes(gpu.resources.ColorTarget);
+        color.address = 0x100000;
+        color.width = width;
+        color.height = height;
+        color.pitch = width;
+        color.depth = 1;
+        color.format = 12;
+        color.number_type = 7;
+        color.tile_mode = .linear;
+        color.write_mask = 15;
+        const target = try guestColorTarget(color);
+        const index = try self.acquireRenderTarget(target);
+        const image = self.render_targets.items[index].image.handle;
+        const readback = try self.createBuffer(width * height * 8, vk.buffer_usage_transfer_dst_bit, vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit);
+        defer self.destroyBuffer(readback);
+        var vertex = try buildFullscreenProbeVertexSpirv(self.allocator, false, 1, 1);
+        defer vertex.deinit(self.allocator);
+        const range = vk.ImageSubresourceRange{ .aspect_mask = vk.image_aspect_color_bit };
+        const seed = [4]f32{ 0.5, 0.125, 0.75, 0.5 };
+        const source = [4]f32{ 1, 0.25, 0.1, 1 };
+        const variants = [_][4]f32{ .{ 0, 0, 0, 0 }, .{ 0.9, 0.9, 0.9, 1 }, .{ 0.125, 0.25, 0.75, 0.5 }, .{ 1, 1, 1, 1 }, .{ 0, 0, 0, 0 } };
+        for (0..5) |mode| {
+            var state = GraphicsPipelineState.default(width, height);
+            state.topology = vk.primitive_topology_triangle_strip;
+            state.color_attachment_formats[0] = vk.format_r16g16b16a16_sfloat;
+            state.blend_enables[0] = 1;
+            state.source_color_blend_factors[0] = if (mode == 4) 1 else @intCast(10 + mode);
+            state.destination_color_blend_factors[0] = if (mode == 4) 10 else 0;
+            state.source_alpha_blend_factors[0] = if (mode == 4) 0 else state.source_color_blend_factors[0];
+            state.destination_alpha_blend_factors[0] = if (mode == 4) 1 else 0;
+            state.color_write_masks[0] = if (mode == 4) 7 else 15;
+            const misses = self.graphics_pipeline_cache_misses;
+            for (variants) |constants| {
+                var current = state;
+                current.blend_constant_bits = @bitCast(constants);
+                state.copyDynamicFrom(current);
+                try self.beginFrameDraw();
+                {
+                    const command = try self.beginOneShot();
+                    defer self.releaseOneShot(command);
+                    try self.transitionTrackedImage(command, image, range, image_state.transfer_destination_usage);
+                    const clear = vk.ClearColorValue{ .float32 = seed };
+                    self.device_functions.cmd_clear_color_image(command, image, vk.image_layout_transfer_dst_optimal, &clear, 1, @ptrCast(&range));
+                    try self.transitionTrackedImage(command, image, range, image_state.color_attachment_usage);
+                    try self.submitOneShot(command);
+                }
+                self.render_targets.items[index].initialized = true;
+                var expected = seed;
+                // Two draws share a recording; subsequent variants recycle it.
+                for (0..2) |_| {
+                    try self.drawGraphicsShaders(vertex.words, &graphics_probe_fragment_spirv, &.{}, &.{}, state, target, &.{}, null, false, false, false, .{ .vertex_count = 4 });
+                    for (&expected, 0..) |*value, channel| {
+                        const constant = constants[if (mode == 2 or mode == 3) 3 else channel];
+                        const factor = if (mode == 1 or mode == 3) 1 - constant else constant;
+                        const result = if (mode == 4) (if (channel == 3) value.* else source[channel] + value.* * constant) else source[channel] * factor;
+                        value.* = @as(f16, @floatCast(result));
+                    }
+                }
+                {
+                    const command = try self.beginOneShot();
+                    defer self.releaseOneShot(command);
+                    try self.transitionTrackedImage(command, image, range, image_state.transfer_source_usage);
+                    const copy = vk.BufferImageCopy{ .image_subresource = .{ .aspect_mask = range.aspect_mask }, .image_extent = .{ .width = width, .height = height, .depth = 1 } };
+                    self.device_functions.cmd_copy_image_to_buffer(command, image, vk.image_layout_transfer_src_optimal, readback.handle, 1, @ptrCast(&copy));
+                    const host = vk.BufferMemoryBarrier{ .source_access_mask = vk.access_transfer_write_bit, .destination_access_mask = vk.access_host_read_bit, .buffer = readback.handle, .offset = 0, .size = readback.size };
+                    self.device_functions.cmd_pipeline_barrier(command, vk.pipeline_stage_transfer_bit, vk.pipeline_stage_host_bit, 0, 0, null, 1, @ptrCast(&host), 0, null);
+                    try self.submitOneShot(command);
+                }
+                var pixels: [width * height * 8]u8 = undefined;
+                try self.readMapped(readback, &pixels);
+                for (0..width * height) |pixel| for (expected, 0..) |value, channel| {
+                    const actual: f16 = @bitCast(std.mem.readInt(u16, pixels[pixel * 8 + channel * 2 ..][0..2], .little));
+                    try std.testing.expectApproxEqAbs(value, @as(f32, actual), 0.002);
+                };
+                try std.testing.expectEqual(misses + 1, self.graphics_pipeline_cache_misses);
+            }
+        }
+        try self.finishDrawBatch();
+        std.debug.print("blend constants passed: constant/inverse color and alpha, destination scene retention, RGB mask, repeated pipeline and command-buffer reuse\n", .{});
     }
 
     /// Compare every half-float alpha bit pattern, including signed zero,

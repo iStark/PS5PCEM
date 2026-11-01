@@ -479,6 +479,8 @@ pub const RenderState = struct {
     scissor: ?Scissor,
     raster: RasterState,
     blends: [color_target_count]BlendControl,
+    /// CB_BLEND_RED/GREEN/BLUE/ALPHA, retained as exact float bit patterns.
+    blend_constant_bits: [4]u32 = @splat(0),
     color_control: ColorControl,
     /// VGT_PRIMITIVE_TYPE from the uconfig register bank. AGC uses value 7
     /// for the NGG rectangle-list auto draws that back fullscreen passes.
@@ -678,6 +680,12 @@ pub fn decodeRenderState(state: *const gpu_state.State) RenderState {
         .scissor = decodeScissor(state, 0),
         .raster = decodeRasterState(state),
         .blends = decodeBlendControls(state),
+        .blend_constant_bits = .{
+            state.readRegister(.context, 0x105) orelse 0,
+            state.readRegister(.context, 0x106) orelse 0,
+            state.readRegister(.context, 0x107) orelse 0,
+            state.readRegister(.context, 0x108) orelse 0,
+        },
         .color_control = decodeColorControl(state),
         .primitive_type = state.readRegister(.uconfig, 0x242) orelse 4,
     };
@@ -688,6 +696,16 @@ pub fn decodeRenderState(state: *const gpu_state.State) RenderState {
         if (target.isActive()) result.active_color_count += 1;
     }
     return result;
+}
+
+test "blend constants preserve independent context updates and float bits" {
+    var state = gpu_state.State{};
+    try testing.expectEqual([4]u32{ 0, 0, 0, 0 }, decodeRenderState(&state).blend_constant_bits);
+    const bits = [4]u32{ 0x3f666666, 0x3e800000, 0xbf000000, 0x3f800000 };
+    for (bits, 0..) |word, channel| try state.writeRegister(.context, @intCast(0x105 + channel), word);
+    try testing.expectEqual(bits, decodeRenderState(&state).blend_constant_bits);
+    try state.writeRegister(.context, 0x107, 0x80000000);
+    try testing.expectEqual([4]u32{ bits[0], bits[1], 0x80000000, bits[3] }, decodeRenderState(&state).blend_constant_bits);
 }
 
 /// EXP MRT numbers and SPI_SHADER_COL_FORMAT are compact, while CB_SHADER_MASK
