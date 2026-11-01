@@ -52,6 +52,7 @@ The full ReleaseFast runner and smoke build pass **606 tests** (333 GPU and
 DCC metadata-clear and DCC single-texel-clear regressions also pass.
 The runner SHA-256 is
 `2d3b34f1ce20c1c0529a1f245a3285369cc2b7ffa758cd144bc0180cfda2c276`.
+
 ## Live visual comparison
 
 The rebuilt runner reaches the crash-site DualSense wake-up prompt. In one
@@ -97,6 +98,37 @@ A separate native HDR capture after bloom at flip **19624** preserves alpha
 44189 had alpha **0** throughout. These captures are from different moments;
 their HDR maxima are not treated as a brightness benchmark. The shader and
 texture diagnostic blobs remain private.
+
+The maintainer subsequently reported that the blur also appears resolved in
+the actual game window. The same process accepts the DualSense shake,
+continues through the wake-up animation and reaches the third-person view
+behind ASTRO with the objective marker. Sharp details remain visible during
+that transition; this is consistent with the renderer-checkpoint comparison.
+
+## Movement tutorial follow-up
+
+The same runner then reaches the first movement tutorial, with ASTRO in the
+third-person world view and the objective marker visible. The camera remains
+fixed in the before/after captures; ASTRO, the tutorial inset, clouds and
+other scene elements continue their idle animations. A separate interval
+records **160 flips and 160 presents in 30.000633 seconds: 5.33 FPS**.
+The DCC correction stays enabled and captures occur outside the measurement.
+This is the starting gameplay/tutorial view, not the preceding controller
+wake-up prompt. No new movement-input test or later-level claim is made for
+this interval; character control was verified in the earlier November 1 run.
+
+The three profile samples in this interval have median **234.6 MiB/frame
+readbacks**, **129.1 MiB/frame uploads**, **227 submissions** and **43.4 ms of
+fence waits**. They contain **zero draw/dispatch failures and unsupported
+compute**, with **12 unresolved storage bindings** still present. This is
+not a paired FPS improvement over another version or scene. Full graphics
+correctness, later levels and completion remain unverified.
+
+[![ASTRO BOT movement tutorial after the blur correction](../images/astro-bot-dcc-movement-2026-11-01.png)](../images/astro-bot-dcc-movement-2026-11-01.png)
+
+Unmodified renderer checkpoint at flip **30208**, captured after the timed
+interval (flips 29908–30068). The earlier checkpoint at flip 29696 confirms
+the same camera position. Neither image is a desktop-window capture.
 
 ## Earlier run and remaining verification
 
