@@ -266,15 +266,27 @@ pub fn encode(handle: u64, param: ?*align(1) const EncodeParam, output_info: ?*a
     notifyWrite(input.png_mem_addr, size);
     const target: [*]u8 = @ptrFromInt(input.png_mem_addr);
     var writer: std.Io.Writer = .fixed(target[0..size]);
-    writer.writeAll("\x89PNG\r\n\x1a\n") catch unreachable;
+    writer.writeAll("\x89PNG\r\n\x1a\n") catch {
+        publishInfo(output_info, .{});
+        return data_overflow;
+    };
     var header: [13]u8 = @splat(0);
     std.mem.writeInt(u32, header[0..4], input.image_width, .big);
     std.mem.writeInt(u32, header[4..8], input.image_height, .big);
     header[8] = 8;
     header[9] = if (input.color_space == 19) 6 else 2;
-    writeChunk(&writer, "IHDR", &header) catch unreachable;
-    writeChunk(&writer, "IDAT", compressed.storage[0..compressed.size]) catch unreachable;
-    writeChunk(&writer, "IEND", &.{}) catch unreachable;
+    writeChunk(&writer, "IHDR", &header) catch {
+        publishInfo(output_info, .{});
+        return data_overflow;
+    };
+    writeChunk(&writer, "IDAT", compressed.storage[0..compressed.size]) catch {
+        publishInfo(output_info, .{});
+        return data_overflow;
+    };
+    writeChunk(&writer, "IEND", &.{}) catch {
+        publishInfo(output_info, .{});
+        return data_overflow;
+    };
     publishInfo(output_info, .{ .data_size = @intCast(size), .processed_height = input.image_height });
     return @intCast(size);
 }
