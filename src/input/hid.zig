@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Artur Strazewicz
 
-//! Finding and reading a Sony controller over the host's HID stack.
+//! Sony HID input/output on Windows and normalized evdev gamepad input on Linux.
 //!
 //! Shared read/write access drives gameplay feedback; read-only fallback still
 //! accepts input when another application owns output access.
@@ -104,7 +104,7 @@ const LightBarSetup = struct {
 
 const Device = struct {
     handle: ?*anyopaque = null,
-    /// Linux hidraw file descriptor. The Windows handle above stays null there.
+    /// Linux evdev file descriptor. The Windows handle above stays null there.
     fd: c_int = -1,
     /// evdev devices report no Sony family; null keeps a generic pad honest
     /// in presence() instead of borrowing a Sony identity for the display.
@@ -462,7 +462,7 @@ fn closeDevice() void {
     if (comptime builtin.os.tag == .linux) {
         if (device.fd >= 0) _ = Linux.closeFd(device.fd);
         device = .{};
-        Linux.axis_ranges = [_]Linux.AxisRange{.{}} ** 6;
+        Linux.resetInput();
         latest = null;
         latest_motion = null;
         return;
@@ -684,6 +684,9 @@ const Linux = if (builtin.os.tag == .linux) struct {
 
     // evdev protocol numbers, verified against
     // /usr/include/linux/{input-event-codes,input}.h on the host.
+    const ev_syn: u32 = 0x00;
+    const syn_report: u16 = 0;
+    const syn_dropped: u16 = 3;
     const ev_key: u32 = 0x01;
     const ev_abs: u32 = 0x03;
     const btn_gamepad: u16 = 0x130;
@@ -726,6 +729,7 @@ const Linux = if (builtin.os.tag == .linux) struct {
 
     /// _IOR('E',0x02,input_id).
     const eviocgid: u32 = 0x80000000 | (8 << 16) | (0x45 << 8) | 0x02;
+    const eviocgkey: u32 = 0x80000000 | (128 << 16) | (0x45 << 8) | 0x18;
 
     const InputId = extern struct {
         bustype: u16,
@@ -752,8 +756,19 @@ const Linux = if (builtin.os.tag == .linux) struct {
     /// Ranges for X, Y, Z, RX, RY, RZ in that order. Reset on open and close;
     /// a missing axis keeps its rest value forever.
     var axis_ranges: [6]AxisRange = [_]AxisRange{.{}} ** 6;
+    var digital_triggers: [2]bool = .{ false, false };
+    var pending_pad: dualshock.Pad = .{};
+    var dropped: bool = false;
+
+    fn resetInput() void {
+        axis_ranges = @splat(.{});
+        digital_triggers = @splat(false);
+        pending_pad = .{};
+        dropped = false;
+    }
 
     fn hasBit(bits: []const u8, code: u16) bool {
+        if (code / 8 >= bits.len) return false;
         const byte = bits[code / 8];
         const shift: u3 = @intCast(code % 8);
         return byte >> shift & 1 != 0;
@@ -790,8 +805,14 @@ const Linux = if (builtin.os.tag == .linux) struct {
             btn_west => pad.square = pressed,
             btn_tl => pad.l1 = pressed,
             btn_tr => pad.r1 = pressed,
-            btn_tl2 => pad.l2 = pressed,
-            btn_tr2 => pad.r2 = pressed,
+            btn_tl2 => {
+                digital_triggers[0] = pressed;
+                pad.l2 = pressed or pad.analog_l2 > 24;
+            },
+            btn_tr2 => {
+                digital_triggers[1] = pressed;
+                pad.r2 = pressed or pad.analog_r2 > 24;
+            },
             btn_select => pad.create = pressed,
             btn_start => pad.options = pressed,
             btn_mode => pad.home = pressed,
@@ -815,7 +836,7 @@ const Linux = if (builtin.os.tag == .linux) struct {
             },
             abs_z => if (axis_ranges[2].present) {
                 pad.analog_l2 = normalizeAxis(value, axis_ranges[2].minimum, axis_ranges[2].maximum);
-                if (!pad.l2) pad.l2 = pad.analog_l2 > 24;
+                pad.l2 = digital_triggers[0] or pad.analog_l2 > 24;
             },
             abs_rx => if (axis_ranges[3].present) {
                 pad.right_x = normalizeAxis(value, axis_ranges[3].minimum, axis_ranges[3].maximum);
@@ -825,7 +846,7 @@ const Linux = if (builtin.os.tag == .linux) struct {
             },
             abs_rz => if (axis_ranges[5].present) {
                 pad.analog_r2 = normalizeAxis(value, axis_ranges[5].minimum, axis_ranges[5].maximum);
-                if (!pad.r2) pad.r2 = pad.analog_r2 > 24;
+                pad.r2 = digital_triggers[1] or pad.analog_r2 > 24;
             },
             abs_hat0x => {
                 pad.left = value < 0;
@@ -864,23 +885,13 @@ const Linux = if (builtin.os.tag == .linux) struct {
         var key_bits: [128]u8 = @splat(0);
         if (linux.errno(linux.ioctl(fd, eviocgbit(ev_key, key_bits.len), @intFromPtr(&key_bits))) != .SUCCESS) return false;
         if (!isGamepad(key_bits[0..])) return false;
-        var abs_bits: [16]u8 = @splat(0);
-        if (linux.errno(linux.ioctl(fd, eviocgbit(ev_abs, abs_bits.len), @intFromPtr(&abs_bits))) != .SUCCESS) return false;
-        if (!hasBit(abs_bits[0..], abs_x)) return false;
-
         var id: InputId = .{ .bustype = 0, .vendor = 0, .product = 0, .version = 0 };
         if (linux.errno(linux.ioctl(fd, eviocgid, @intFromPtr(&id))) != .SUCCESS) return false;
         const identified = dualshock.identify(id.vendor, id.product);
 
-        axis_ranges = [_]AxisRange{.{}} ** 6;
-        queryAxis(fd, abs_bits[0..], abs_x, 0);
-        queryAxis(fd, abs_bits[0..], abs_y, 1);
-        queryAxis(fd, abs_bits[0..], abs_z, 2);
-        queryAxis(fd, abs_bits[0..], abs_rx, 3);
-        queryAxis(fd, abs_bits[0..], abs_ry, 4);
-        queryAxis(fd, abs_bits[0..], abs_rz, 5);
-
-        latest = .{};
+        resetInput();
+        pending_pad = (StateReader{ .fd = fd }).read() orelse return false;
+        latest = pending_pad;
         device = .{
             .fd = fd,
             .family = identified orelse .dual_shock_4,
@@ -895,34 +906,68 @@ const Linux = if (builtin.os.tag == .linux) struct {
     }
 
     fn isGamepad(key_bits: []const u8) bool {
-        // Anything in the gamepad/joystick ranges, or a directional pad with
-        // a face button, counts. Keyboards and mice never set these.
-        var code: u16 = 0x120;
-        while (code < 0x140) : (code += 1) {
-            if (hasBit(key_bits, code)) return true;
-        }
-        if (hasBit(key_bits, btn_dpad_up)) return true;
-        return hasBit(key_bits, btn_south);
+        // BTN_GAMEPAD identifies the mapping handled here. A flight stick
+        // using BTN_JOYSTICK needs its own mapping; do not steal the pad slot.
+        // D-pad-only gamepads are valid too and do not need ABS_X.
+        return hasBit(key_bits, btn_gamepad);
     }
 
-    fn queryAxis(fd: c_int, abs_bits: []const u8, code: u16, slot: usize) void {
-        if (!hasBit(abs_bits, code)) return;
-        var info: AbsInfo = .{ .value = 0, .minimum = 0, .maximum = 0, .fuzz = 0, .flat = 0, .resolution = 0 };
-        if (linux.errno(linux.ioctl(fd, eviocgabs(code), @intFromPtr(&info))) != .SUCCESS) return;
-        if (info.maximum <= info.minimum) return;
-        axis_ranges[slot] = .{ .present = true, .minimum = info.minimum, .maximum = info.maximum };
-        if (latest) |*pad| {
-            // Seed rest positions from the live axis so the first poll does
-            // not report a corner deflection.
-            const rest = normalizeAxis(info.value, info.minimum, info.maximum);
-            switch (code) {
-                abs_x => pad.left_x = rest,
-                abs_y => pad.left_y = rest,
-                abs_rx => pad.right_x = rest,
-                abs_ry => pad.right_y = rest,
-                else => {},
-            }
+    const StateReader = struct {
+        fd: c_int,
+        fn keys(self: @This(), bits: *[128]u8) bool {
+            return linux.errno(linux.ioctl(self.fd, eviocgkey, @intFromPtr(bits))) == .SUCCESS;
         }
+        fn axes(self: @This(), bits: *[16]u8) bool {
+            return linux.errno(linux.ioctl(self.fd, eviocgbit(ev_abs, bits.len), @intFromPtr(bits))) == .SUCCESS;
+        }
+        fn axis(self: @This(), code: u16) ?AbsInfo {
+            var info: AbsInfo = undefined;
+            if (linux.errno(linux.ioctl(self.fd, eviocgabs(code), @intFromPtr(&info))) != .SUCCESS) return null;
+            return info;
+        }
+        fn read(self: @This()) ?dualshock.Pad {
+            return snapshot(self);
+        }
+    };
+
+    // evdev only emits changes. Read held buttons, triggers and hats as well
+    // as sticks on attach, and repeat this after SYN_DROPPED. Publish only a
+    // complete snapshot, never a partly initialized controller.
+    fn snapshot(reader: anytype) ?dualshock.Pad {
+        var keys: [128]u8 = @splat(0);
+        var axes: [16]u8 = @splat(0);
+        if (!reader.keys(&keys) or !reader.axes(&axes)) return null;
+        var pad = dualshock.Pad{};
+        axis_ranges = @splat(.{});
+        digital_triggers = @splat(false);
+        for (btn_south..btn_thumbr + 1) |code| applyKey(&pad, @intCast(code), hasBit(&keys, @intCast(code)));
+        for (btn_dpad_up..btn_dpad_right + 1) |code| applyKey(&pad, @intCast(code), hasBit(&keys, @intCast(code)));
+        for ([_]u16{ abs_x, abs_y, abs_z, abs_rx, abs_ry, abs_rz, abs_hat0x, abs_hat0y }) |code| {
+            if (!hasBit(&axes, code)) continue;
+            const info = reader.axis(code) orelse return null;
+            if (axisIndex(code)) |slot| {
+                if (info.maximum <= info.minimum) continue;
+                axis_ranges[slot] = .{ .present = true, .minimum = info.minimum, .maximum = info.maximum };
+            }
+            applyAbs(&pad, code, info.value);
+        }
+        return pad;
+    }
+
+    fn consumeEvent(event: EvdevEvent, reader: anytype) bool {
+        if (event.event_type == ev_syn) {
+            if (event.code == syn_dropped) {
+                dropped = true;
+            } else if (event.code == syn_report) {
+                if (dropped) pending_pad = reader.read() orelse return false;
+                dropped = false;
+                latest = pending_pad;
+            }
+        } else if (!dropped) {
+            if (event.event_type == ev_key) applyKey(&pending_pad, event.code, event.value != 0);
+            if (event.event_type == ev_abs) applyAbs(&pending_pad, event.code, event.value);
+        }
+        return true;
     }
 } else struct {};
 
@@ -956,6 +1001,7 @@ fn drainLinux() void {
         var raw: [@sizeOf(EvdevEvent)]u8 = undefined;
         const result = linux.read(device.fd, raw[0..].ptr, raw.len);
         if (linux.errno(result) != .SUCCESS) {
+            if (linux.errno(result) == .INTR) continue;
             if (linux.errno(result) != .AGAIN) closeDevice();
             return;
         }
@@ -965,10 +1011,9 @@ fn drainLinux() void {
         }
         if (result != raw.len) continue;
         const event = std.mem.bytesAsValue(EvdevEvent, &raw).*;
-        if (event.event_type == Linux.ev_key) {
-            Linux.applyKey(&latest.?, event.code, event.value != 0);
-        } else if (event.event_type == Linux.ev_abs) {
-            Linux.applyAbs(&latest.?, event.code, event.value);
+        if (!Linux.consumeEvent(event, Linux.StateReader{ .fd = device.fd })) {
+            closeDevice();
+            return;
         }
     }
 }
@@ -1155,6 +1200,7 @@ test "linux evdev requests match the kernel header values" {
     try std.testing.expectEqual(@as(u32, 0x80184540), Linux.eviocgabs(0x00));
     try std.testing.expectEqual(@as(u32, 0x80184551), Linux.eviocgabs(0x11));
     try std.testing.expectEqual(@as(u32, 0x80084502), Linux.eviocgid);
+    try std.testing.expectEqual(@as(u32, 0x80804518), Linux.eviocgkey);
     try std.testing.expectEqual(@as(usize, 24), @sizeOf(Linux.AbsInfo));
     try std.testing.expectEqual(@as(usize, 8), @sizeOf(Linux.InputId));
     try std.testing.expectEqual(@as(usize, 24), @sizeOf(EvdevEvent));
@@ -1162,6 +1208,8 @@ test "linux evdev requests match the kernel header values" {
 
 test "linux evdev buttons and axes map to the guest pad" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    Linux.resetInput();
+    defer Linux.resetInput();
     var pad = dualshock.Pad{};
     Linux.applyKey(&pad, 0x130, true);
     Linux.applyKey(&pad, 0x133, true);
@@ -1188,4 +1236,125 @@ test "linux evdev buttons and axes map to the guest pad" {
     try std.testing.expectEqual(@as(u8, 128), Linux.normalizeAxis(0, 10, 5));
     try std.testing.expectEqual(@as(u8, 0), Linux.normalizeAxis(-99, 0, 255));
     try std.testing.expectEqual(@as(u8, 255), Linux.normalizeAxis(999, 0, 255));
+}
+
+test "linux evdev analog and digital triggers release independently" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    Linux.resetInput();
+    defer Linux.resetInput();
+    var pad = dualshock.Pad{};
+    Linux.axis_ranges[2] = .{ .present = true, .maximum = 1023 };
+    Linux.axis_ranges[5] = Linux.axis_ranges[2];
+    for ([_]u16{ Linux.abs_z, Linux.abs_rz }) |code| Linux.applyAbs(&pad, code, 1023);
+    try std.testing.expect(pad.l2 and pad.r2);
+    for ([_]u16{ Linux.abs_z, Linux.abs_rz }) |code| Linux.applyAbs(&pad, code, 0);
+    try std.testing.expect(!pad.l2 and !pad.r2);
+    try std.testing.expectEqual(@as(u8, 0), pad.analog_l2);
+    try std.testing.expectEqual(@as(u8, 0), pad.analog_r2);
+    Linux.applyKey(&pad, Linux.btn_tl2, true);
+    Linux.applyAbs(&pad, Linux.abs_z, 0);
+    try std.testing.expect(pad.l2);
+    Linux.applyKey(&pad, Linux.btn_tl2, false);
+    try std.testing.expect(!pad.l2);
+    Linux.applyAbs(&pad, Linux.abs_rz, 1023);
+    Linux.applyKey(&pad, Linux.btn_tr2, false);
+    try std.testing.expect(pad.r2);
+    Linux.applyAbs(&pad, Linux.abs_rz, 0);
+    try std.testing.expect(!pad.r2);
+}
+
+test "linux evdev initial snapshot preserves held controls and rejects incomplete queries" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    Linux.resetInput();
+    defer Linux.resetInput();
+    const Reader = struct {
+        fail_axis: bool = false,
+        fn keys(_: @This(), bits: *[128]u8) bool {
+            for ([_]u16{ Linux.btn_south, Linux.btn_tl2, Linux.btn_start }) |code|
+                bits[code / 8] |= @as(u8, 1) << @as(u3, @intCast(code % 8));
+            return true;
+        }
+        fn axes(_: @This(), bits: *[16]u8) bool {
+            for ([_]u16{ Linux.abs_x, Linux.abs_y, Linux.abs_z, Linux.abs_rz, Linux.abs_hat0x }) |code|
+                bits[code / 8] |= @as(u8, 1) << @as(u3, @intCast(code % 8));
+            return true;
+        }
+        fn axis(self: @This(), code: u16) ?Linux.AbsInfo {
+            if (self.fail_axis) return null;
+            return .{
+                .value = switch (code) {
+                    Linux.abs_x => 190,
+                    Linux.abs_y => 45,
+                    Linux.abs_rz => 255,
+                    Linux.abs_hat0x => -1,
+                    else => 0,
+                },
+                .minimum = 0,
+                .maximum = 255,
+                .fuzz = 0,
+                .flat = 0,
+                .resolution = 0,
+            };
+        }
+    };
+    const pad = Linux.snapshot(Reader{}).?;
+    try std.testing.expect(pad.cross and pad.options and pad.l2 and pad.r2 and pad.left);
+    try std.testing.expectEqual(@as(u8, 190), pad.left_x);
+    try std.testing.expectEqual(@as(u8, 45), pad.left_y);
+    try std.testing.expectEqual(@as(u8, 128), pad.right_x);
+    try std.testing.expectEqual(@as(u8, 0), pad.analog_l2);
+    try std.testing.expectEqual(@as(u8, 255), pad.analog_r2);
+    try std.testing.expect(Linux.snapshot(Reader{ .fail_axis = true }) == null);
+    var bits: [128]u8 = @splat(0);
+    bits[0x120 / 8] = 1; // A joystick button alone has no mapped gamepad controls.
+    try std.testing.expect(!Linux.isGamepad(&bits));
+    bits[Linux.btn_gamepad / 8] = 1;
+    try std.testing.expect(Linux.isGamepad(&bits));
+    try std.testing.expect(!Linux.hasBit(&bits, 0xffff));
+}
+
+test "linux evdev publishes whole packets and resynchronizes dropped events" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const saved = latest;
+    Linux.resetInput();
+    defer {
+        Linux.resetInput();
+        latest = saved;
+    }
+    const Reader = struct {
+        calls: u32 = 0,
+        fail: bool = false,
+        fn read(self: *@This()) ?dualshock.Pad {
+            self.calls += 1;
+            return if (self.fail) null else .{ .cross = true, .left_x = 203 };
+        }
+    };
+    var reader = Reader{};
+    latest = .{};
+    var event = EvdevEvent{ .seconds = 0, .microseconds = 0, .event_type = Linux.ev_key, .code = Linux.btn_south, .value = 1 };
+    try std.testing.expect(Linux.consumeEvent(event, &reader));
+    try std.testing.expect(!latest.?.cross); // No half-packet state escapes.
+    event.event_type = Linux.ev_syn;
+    event.code = Linux.syn_report;
+    try std.testing.expect(Linux.consumeEvent(event, &reader));
+    try std.testing.expect(latest.?.cross);
+    event.code = Linux.syn_dropped;
+    try std.testing.expect(Linux.consumeEvent(event, &reader));
+    event.event_type = Linux.ev_key;
+    event.code = Linux.btn_south;
+    event.value = 0;
+    try std.testing.expect(Linux.consumeEvent(event, &reader));
+    try std.testing.expect(Linux.pending_pad.cross);
+    event.event_type = Linux.ev_syn;
+    event.code = Linux.syn_report;
+    try std.testing.expect(Linux.consumeEvent(event, &reader));
+    try std.testing.expectEqual(@as(u32, 1), reader.calls);
+    try std.testing.expectEqual(@as(u8, 203), latest.?.left_x);
+    try std.testing.expect(latest.?.cross);
+    reader.fail = true;
+    event.code = Linux.syn_dropped;
+    try std.testing.expect(Linux.consumeEvent(event, &reader));
+    event.code = Linux.syn_report;
+    try std.testing.expect(!Linux.consumeEvent(event, &reader));
+    try std.testing.expectEqual(@as(u8, 203), latest.?.left_x);
 }
