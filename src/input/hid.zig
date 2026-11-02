@@ -18,7 +18,7 @@ const motion_sensors = @import("motion.zig");
 const Mutex = @import("memory").HostMutex;
 var mutex: Mutex = .{};
 
-pub const supported = builtin.os.tag == .windows;
+pub const supported = builtin.os.tag == .windows or builtin.os.tag == .linux;
 
 pub const Presence = struct {
     connected: bool = false,
@@ -104,6 +104,11 @@ const LightBarSetup = struct {
 
 const Device = struct {
     handle: ?*anyopaque = null,
+    /// Linux hidraw file descriptor. The Windows handle above stays null there.
+    fd: c_int = -1,
+    /// evdev devices report no Sony family; null keeps a generic pad honest
+    /// in presence() instead of borrowing a Sony identity for the display.
+    identified_family: ?dualshock.Family = null,
     event: ?*anyopaque = null,
     family: dualshock.Family = .dual_sense,
     /// Read from the declared report lengths when the pad is opened, because an
@@ -131,6 +136,7 @@ const Device = struct {
     sensor_clock: ?u32 = null,
 
     fn isOpen(self: Device) bool {
+        if (comptime builtin.os.tag == .linux) return self.fd >= 0;
         return self.handle != null;
     }
 };
@@ -197,6 +203,9 @@ pub fn presence() Presence {
     defer mutex.unlock();
     _ = pollLocked();
     if (!device.isOpen()) return .{};
+    if (comptime builtin.os.tag == .linux) {
+        return .{ .connected = true, .family = device.identified_family, .transport = device.transport, .writable = device.writable };
+    }
     return .{ .connected = true, .family = device.family, .transport = device.transport, .writable = device.writable };
 }
 
@@ -325,6 +334,7 @@ fn send(output: dualshock.Output) bool {
 }
 
 fn pumpOutputLocked() bool {
+    if (comptime builtin.os.tag == .linux) return pumpOutputLinux();
     const handle = device.handle orelse return false;
     if (device.write_pending) {
         var written: u32 = 0;
@@ -346,7 +356,7 @@ fn pumpOutputLocked() bool {
     var output = device.output.next() orelse return false;
     const transport = device.transport orelse return false;
     if (device.family == .dual_sense and transport == .bluetooth) {
-        output = device.light_bar_setup.prepare(output, Win32.GetTickCount64());
+        output = device.light_bar_setup.prepare(output, tickMs());
         // Waiting for the LED animation must not resend unchanged motor data.
         if (device.output.applied) |applied| if (std.meta.eql(output, applied)) return true;
     }
@@ -394,8 +404,26 @@ fn refuseOutput() void {
 }
 
 fn finishOutputLocked() void {
-    const until = Win32.GetTickCount64() + 250;
-    while (pumpOutputLocked() and Win32.GetTickCount64() < until) Win32.Sleep(1);
+    const until = tickMs() + 250;
+    while (pumpOutputLocked() and tickMs() < until) tickSleep();
+}
+
+/// Monotonic milliseconds for LED timing; host-native on each platform.
+fn tickMs() u64 {
+    if (comptime builtin.os.tag == .windows) return Win32.GetTickCount64();
+    var now: std.os.linux.timespec = undefined;
+    if (std.os.linux.clock_gettime(.MONOTONIC, &now) != 0 or now.sec < 0) return 0;
+    return @as(u64, @intCast(now.sec)) * std.time.ms_per_s + @as(u64, @intCast(now.nsec)) / std.time.ns_per_ms;
+}
+
+/// A millisecond pause while draining output; host-native on each platform.
+fn tickSleep() void {
+    if (comptime builtin.os.tag == .windows) {
+        Win32.Sleep(1);
+    } else {
+        var request = std.os.linux.timespec{ .sec = 0, .nsec = std.time.ns_per_ms };
+        _ = std.os.linux.nanosleep(&request, null);
+    }
 }
 
 /// Forces the next poll to search again. The launcher calls this when Windows
@@ -431,6 +459,14 @@ fn ensureOpen() void {
 
 fn closeDevice() void {
     test_running = false;
+    if (comptime builtin.os.tag == .linux) {
+        if (device.fd >= 0) _ = Linux.closeFd(device.fd);
+        device = .{};
+        Linux.axis_ranges = [_]Linux.AxisRange{.{}} ** 6;
+        latest = null;
+        latest_motion = null;
+        return;
+    }
     if (device.handle) |handle| {
         // Reads and writes may originate on different host threads. CancelIo
         // cancels only the calling thread's I/O; retain storage until completion.
@@ -459,6 +495,7 @@ fn closeDevice() void {
 
 /// Consumes every report the driver has ready, keeping the last one.
 fn drain() void {
+    if (comptime builtin.os.tag == .linux) return drainLinux();
     var drained: u32 = 0;
     while (drained < maximum_drained_reports) : (drained += 1) {
         if (!device.read_pending and !beginRead()) return;
@@ -497,6 +534,7 @@ fn integrate(raw: dualshock.RawMotion) void {
 
 /// Starts one overlapped read. Returns false when the device is gone.
 fn beginRead() bool {
+    if (comptime builtin.os.tag == .linux) return false; // Linux reads inline in drainLinux.
     const handle = device.handle orelse return false;
     device.overlapped = .{ .event = device.event };
     var transferred: u32 = 0;
@@ -514,6 +552,7 @@ fn beginRead() bool {
 }
 
 fn openFirstController() void {
+    if (comptime builtin.os.tag == .linux) return Linux.openFirstController();
     var interface_guid = Win32.hid_interface_guid;
     const set = Win32.SetupDiGetClassDevsW(
         &interface_guid,
@@ -639,6 +678,300 @@ const Overlapped = extern struct {
     offset_high: u32 = 0,
     event: ?*anyopaque = null,
 };
+
+const Linux = if (builtin.os.tag == .linux) struct {
+    const linux = std.os.linux;
+
+    // evdev protocol numbers, verified against
+    // /usr/include/linux/{input-event-codes,input}.h on the host.
+    const ev_key: u32 = 0x01;
+    const ev_abs: u32 = 0x03;
+    const btn_gamepad: u16 = 0x130;
+    const btn_south: u16 = 0x130;
+    const btn_east: u16 = 0x131;
+    const btn_north: u16 = 0x133;
+    const btn_west: u16 = 0x134;
+    const btn_tl: u16 = 0x136;
+    const btn_tr: u16 = 0x137;
+    const btn_tl2: u16 = 0x138;
+    const btn_tr2: u16 = 0x139;
+    const btn_select: u16 = 0x13a;
+    const btn_start: u16 = 0x13b;
+    const btn_mode: u16 = 0x13c;
+    const btn_thumbl: u16 = 0x13d;
+    const btn_thumbr: u16 = 0x13e;
+    const btn_dpad_up: u16 = 0x220;
+    const btn_dpad_down: u16 = 0x221;
+    const btn_dpad_left: u16 = 0x222;
+    const btn_dpad_right: u16 = 0x223;
+    const abs_x: u16 = 0x00;
+    const abs_y: u16 = 0x01;
+    const abs_z: u16 = 0x02;
+    const abs_rx: u16 = 0x03;
+    const abs_ry: u16 = 0x04;
+    const abs_rz: u16 = 0x05;
+    const abs_hat0x: u16 = 0x10;
+    const abs_hat0y: u16 = 0x11;
+
+    /// _IOC(_IOC_READ,'E',0x20+ev,len), lengths capped to 13 bits.
+    fn eviocgbit(ev: u32, len: usize) u32 {
+        const capped: u32 = @intCast(@min(len, 0x1fff));
+        return 0x80000000 | (capped << 16) | (0x45 << 8) | (0x20 + ev);
+    }
+
+    /// _IOR('E',0x40+abs,input_absinfo).
+    fn eviocgabs(axis: u32) u32 {
+        return 0x80000000 | (24 << 16) | (0x45 << 8) | (0x40 + axis);
+    }
+
+    /// _IOR('E',0x02,input_id).
+    const eviocgid: u32 = 0x80000000 | (8 << 16) | (0x45 << 8) | 0x02;
+
+    const InputId = extern struct {
+        bustype: u16,
+        vendor: u16,
+        product: u16,
+        version: u16,
+    };
+
+    const AbsInfo = extern struct {
+        value: i32,
+        minimum: i32,
+        maximum: i32,
+        fuzz: i32,
+        flat: i32,
+        resolution: i32,
+    };
+
+    const AxisRange = struct {
+        present: bool = false,
+        minimum: i32 = 0,
+        maximum: i32 = 0,
+    };
+
+    /// Ranges for X, Y, Z, RX, RY, RZ in that order. Reset on open and close;
+    /// a missing axis keeps its rest value forever.
+    var axis_ranges: [6]AxisRange = [_]AxisRange{.{}} ** 6;
+
+    fn hasBit(bits: []const u8, code: u16) bool {
+        const byte = bits[code / 8];
+        const shift: u3 = @intCast(code % 8);
+        return byte >> shift & 1 != 0;
+    }
+
+    fn axisIndex(code: u16) ?usize {
+        return switch (code) {
+            abs_x => 0,
+            abs_y => 1,
+            abs_z => 2,
+            abs_rx => 3,
+            abs_ry => 4,
+            abs_rz => 5,
+            else => null,
+        };
+    }
+
+    /// Maps a raw axis sample into the unsigned 0..255 range the guest
+    /// expects, clamping driver overshoot. Sticks rest at 128 upstream;
+    /// callers seed rest values at open.
+    fn normalizeAxis(value: i32, minimum: i32, maximum: i32) u8 {
+        if (maximum <= minimum) return 128;
+        const span: i64 = @as(i64, maximum) - minimum;
+        const scaled: i64 = (@as(i64, value) - minimum) * 255;
+        const clamped = @max(0, @min(@divTrunc(scaled, span), 255));
+        return @intCast(clamped);
+    }
+
+    fn applyKey(pad: *dualshock.Pad, code: u16, pressed: bool) void {
+        switch (code) {
+            btn_south => pad.cross = pressed,
+            btn_east => pad.circle = pressed,
+            btn_north => pad.triangle = pressed,
+            btn_west => pad.square = pressed,
+            btn_tl => pad.l1 = pressed,
+            btn_tr => pad.r1 = pressed,
+            btn_tl2 => pad.l2 = pressed,
+            btn_tr2 => pad.r2 = pressed,
+            btn_select => pad.create = pressed,
+            btn_start => pad.options = pressed,
+            btn_mode => pad.home = pressed,
+            btn_thumbl => pad.l3 = pressed,
+            btn_thumbr => pad.r3 = pressed,
+            btn_dpad_up => pad.up = pressed,
+            btn_dpad_down => pad.down = pressed,
+            btn_dpad_left => pad.left = pressed,
+            btn_dpad_right => pad.right = pressed,
+            else => {},
+        }
+    }
+
+    fn applyAbs(pad: *dualshock.Pad, code: u16, value: i32) void {
+        switch (code) {
+            abs_x => if (axis_ranges[0].present) {
+                pad.left_x = normalizeAxis(value, axis_ranges[0].minimum, axis_ranges[0].maximum);
+            },
+            abs_y => if (axis_ranges[1].present) {
+                pad.left_y = normalizeAxis(value, axis_ranges[1].minimum, axis_ranges[1].maximum);
+            },
+            abs_z => if (axis_ranges[2].present) {
+                pad.analog_l2 = normalizeAxis(value, axis_ranges[2].minimum, axis_ranges[2].maximum);
+                if (!pad.l2) pad.l2 = pad.analog_l2 > 24;
+            },
+            abs_rx => if (axis_ranges[3].present) {
+                pad.right_x = normalizeAxis(value, axis_ranges[3].minimum, axis_ranges[3].maximum);
+            },
+            abs_ry => if (axis_ranges[4].present) {
+                pad.right_y = normalizeAxis(value, axis_ranges[4].minimum, axis_ranges[4].maximum);
+            },
+            abs_rz => if (axis_ranges[5].present) {
+                pad.analog_r2 = normalizeAxis(value, axis_ranges[5].minimum, axis_ranges[5].maximum);
+                if (!pad.r2) pad.r2 = pad.analog_r2 > 24;
+            },
+            abs_hat0x => {
+                pad.left = value < 0;
+                pad.right = value > 0;
+            },
+            abs_hat0y => {
+                pad.up = value < 0;
+                pad.down = value > 0;
+            },
+            else => {},
+        }
+    }
+
+    fn closeFd(fd: c_int) void {
+        _ = linux.close(fd);
+    }
+
+    fn openFirstController() void {
+        var index: u32 = 0;
+        while (index < 64) : (index += 1) {
+            var path: [24]u8 = undefined;
+            const name = std.fmt.bufPrintZ(&path, "/dev/input/event{d}", .{index}) catch continue;
+            if (openDevice(name)) return;
+        }
+    }
+
+    fn openDevice(path: [*:0]const u8) bool {
+        // Input only: force feedback and light-bar output stay unimplemented
+        // on Linux (see shortcut below), so read-only is the honest mode.
+        const opened = linux.open(path, .{ .ACCMODE = .RDONLY, .NONBLOCK = true, .CLOEXEC = true }, 0);
+        if (linux.errno(opened) != .SUCCESS) return false;
+        const fd: c_int = @intCast(opened);
+        var keep = false;
+        defer if (!keep) closeFd(fd);
+
+        var key_bits: [128]u8 = @splat(0);
+        if (linux.errno(linux.ioctl(fd, eviocgbit(ev_key, key_bits.len), @intFromPtr(&key_bits))) != .SUCCESS) return false;
+        if (!isGamepad(key_bits[0..])) return false;
+        var abs_bits: [16]u8 = @splat(0);
+        if (linux.errno(linux.ioctl(fd, eviocgbit(ev_abs, abs_bits.len), @intFromPtr(&abs_bits))) != .SUCCESS) return false;
+        if (!hasBit(abs_bits[0..], abs_x)) return false;
+
+        var id: InputId = .{ .bustype = 0, .vendor = 0, .product = 0, .version = 0 };
+        if (linux.errno(linux.ioctl(fd, eviocgid, @intFromPtr(&id))) != .SUCCESS) return false;
+        const identified = dualshock.identify(id.vendor, id.product);
+
+        axis_ranges = [_]AxisRange{.{}} ** 6;
+        queryAxis(fd, abs_bits[0..], abs_x, 0);
+        queryAxis(fd, abs_bits[0..], abs_y, 1);
+        queryAxis(fd, abs_bits[0..], abs_z, 2);
+        queryAxis(fd, abs_bits[0..], abs_rx, 3);
+        queryAxis(fd, abs_bits[0..], abs_ry, 4);
+        queryAxis(fd, abs_bits[0..], abs_rz, 5);
+
+        latest = .{};
+        device = .{
+            .fd = fd,
+            .family = identified orelse .dual_shock_4,
+            .identified_family = identified,
+            .transport = if (id.bustype == 5) .bluetooth else .usb,
+            .input_length = maximum_report_bytes,
+            .output_length = 0,
+            .writable = false,
+        };
+        keep = true;
+        return true;
+    }
+
+    fn isGamepad(key_bits: []const u8) bool {
+        // Anything in the gamepad/joystick ranges, or a directional pad with
+        // a face button, counts. Keyboards and mice never set these.
+        var code: u16 = 0x120;
+        while (code < 0x140) : (code += 1) {
+            if (hasBit(key_bits, code)) return true;
+        }
+        if (hasBit(key_bits, btn_dpad_up)) return true;
+        return hasBit(key_bits, btn_south);
+    }
+
+    fn queryAxis(fd: c_int, abs_bits: []const u8, code: u16, slot: usize) void {
+        if (!hasBit(abs_bits, code)) return;
+        var info: AbsInfo = .{ .value = 0, .minimum = 0, .maximum = 0, .fuzz = 0, .flat = 0, .resolution = 0 };
+        if (linux.errno(linux.ioctl(fd, eviocgabs(code), @intFromPtr(&info))) != .SUCCESS) return;
+        if (info.maximum <= info.minimum) return;
+        axis_ranges[slot] = .{ .present = true, .minimum = info.minimum, .maximum = info.maximum };
+        if (latest) |*pad| {
+            // Seed rest positions from the live axis so the first poll does
+            // not report a corner deflection.
+            const rest = normalizeAxis(info.value, info.minimum, info.maximum);
+            switch (code) {
+                abs_x => pad.left_x = rest,
+                abs_y => pad.left_y = rest,
+                abs_rx => pad.right_x = rest,
+                abs_ry => pad.right_y = rest,
+                else => {},
+            }
+        }
+    }
+} else struct {};
+
+/// Linux has no output path yet: force feedback and the light bar stay
+/// unimplemented (shortcut: implement EV_FF effect upload/playback and the
+/// Sony LED protocol, once input is proven). The queue is left untouched.
+fn pumpOutputLinux() bool {
+    if (device.fd < 0) return false;
+    return false;
+}
+
+/// Input event from /dev/input/event*, in kernel layout: two native words
+/// of timestamp, then type, code and a signed value.
+const EvdevEvent = extern struct {
+    seconds: i64,
+    microseconds: i64,
+    event_type: u16,
+    code: u16,
+    value: i32,
+};
+
+/// Consumes every queued input event, keeping the newest state. The
+/// descriptor is non-blocking: EAGAIN ends the drain, anything else gone
+/// means the pad went away mid-read.
+fn drainLinux() void {
+    if (device.fd < 0) return;
+    const linux = std.os.linux;
+    if (latest == null) latest = .{};
+    var drained: u32 = 0;
+    while (drained < maximum_drained_reports) : (drained += 1) {
+        var raw: [@sizeOf(EvdevEvent)]u8 = undefined;
+        const result = linux.read(device.fd, raw[0..].ptr, raw.len);
+        if (linux.errno(result) != .SUCCESS) {
+            if (linux.errno(result) != .AGAIN) closeDevice();
+            return;
+        }
+        if (result == 0) {
+            closeDevice();
+            return;
+        }
+        if (result != raw.len) continue;
+        const event = std.mem.bytesAsValue(EvdevEvent, &raw).*;
+        if (event.event_type == Linux.ev_key) {
+            Linux.applyKey(&latest.?, event.code, event.value != 0);
+        } else if (event.event_type == Linux.ev_abs) {
+            Linux.applyAbs(&latest.?, event.code, event.value);
+        }
+    }
+}
 
 const Win32 = if (builtin.os.tag == .windows) struct {
     const Guid = extern struct {
@@ -812,3 +1145,47 @@ test "an unsupported host reports no controller" {
     try std.testing.expect(!presence().connected);
 }
 
+test "linux evdev requests match the kernel header values" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    // _IOC(_IOC_READ,'E',0x20+ev,len), _IOR('E',0x40+abs,absinfo) and
+    // _IOR('E',0x02,input_id), verified against
+    // /usr/include/linux/{input-event-codes,input}.h on the host.
+    try std.testing.expectEqual(@as(u32, 0x80604520), Linux.eviocgbit(0x00, 96));
+    try std.testing.expectEqual(@as(u32, 0x80804521), Linux.eviocgbit(0x01, 128));
+    try std.testing.expectEqual(@as(u32, 0x80184540), Linux.eviocgabs(0x00));
+    try std.testing.expectEqual(@as(u32, 0x80184551), Linux.eviocgabs(0x11));
+    try std.testing.expectEqual(@as(u32, 0x80084502), Linux.eviocgid);
+    try std.testing.expectEqual(@as(usize, 24), @sizeOf(Linux.AbsInfo));
+    try std.testing.expectEqual(@as(usize, 8), @sizeOf(Linux.InputId));
+    try std.testing.expectEqual(@as(usize, 24), @sizeOf(EvdevEvent));
+}
+
+test "linux evdev buttons and axes map to the guest pad" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var pad = dualshock.Pad{};
+    Linux.applyKey(&pad, 0x130, true);
+    Linux.applyKey(&pad, 0x133, true);
+    Linux.applyKey(&pad, 0x13b, true);
+    Linux.applyKey(&pad, 0xffff, true);
+    try std.testing.expect(pad.cross and pad.triangle and pad.options);
+    try std.testing.expect(!pad.circle and !pad.home);
+    Linux.applyKey(&pad, 0x130, false);
+    try std.testing.expect(!pad.cross);
+    Linux.axis_ranges[0] = .{ .present = true, .minimum = 0, .maximum = 255 };
+    Linux.axis_ranges[1] = .{ .present = true, .minimum = -32768, .maximum = 32767 };
+    Linux.axis_ranges[2] = .{ .present = true, .minimum = 0, .maximum = 1023 };
+    Linux.applyAbs(&pad, 0x00, 255);
+    Linux.applyAbs(&pad, 0x01, 32767);
+    Linux.applyAbs(&pad, 0x02, 1023);
+    Linux.applyAbs(&pad, 0x77, 5);
+    try std.testing.expectEqual(@as(u8, 255), pad.left_x);
+    try std.testing.expectEqual(@as(u8, 255), pad.left_y);
+    try std.testing.expectEqual(@as(u8, 255), pad.analog_l2);
+    try std.testing.expect(pad.l2);
+    Linux.applyAbs(&pad, 0x10, -1);
+    Linux.applyAbs(&pad, 0x11, 1);
+    try std.testing.expect(pad.left and pad.down and !pad.right and !pad.up);
+    try std.testing.expectEqual(@as(u8, 128), Linux.normalizeAxis(0, 10, 5));
+    try std.testing.expectEqual(@as(u8, 0), Linux.normalizeAxis(-99, 0, 255));
+    try std.testing.expectEqual(@as(u8, 255), Linux.normalizeAxis(999, 0, 255));
+}

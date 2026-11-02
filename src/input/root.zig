@@ -348,10 +348,18 @@ fn mergeKeyboard(state: *State, keys: Mapping) void {
 }
 
 fn mergeController(state: *State) void {
-    if (comptime builtin.os.tag != .windows) return;
     // Sony's own pads are not XInput devices, so they are read straight from
     // HID and take precedence. XInput remains the path for Xbox-compatible
-    // controllers and for anything presenting itself as one.
+    // controllers and for anything presenting itself as one. Linux has no
+    // XInput; every evdev gamepad arrives through hid already normalized.
+    if (comptime builtin.os.tag == .linux) {
+        if (hid.poll()) |pad| {
+            mergeSonyPad(state, pad);
+            state.motion = hid.motion();
+        }
+        return;
+    }
+    if (comptime builtin.os.tag != .windows) return;
     if (hid.poll()) |pad| {
         mergeSonyPad(state, pad);
         state.motion = hid.motion();
