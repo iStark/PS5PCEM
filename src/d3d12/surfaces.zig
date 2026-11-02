@@ -125,6 +125,13 @@ pub const Dcc = struct {
 
     pub const block_bytes = 256;
 
+    /// How many key bytes cover `len` backing bytes. Division first so a
+    /// guest-sized length cannot overflow the addition a naive
+    /// `(len + block - 1) / block` ceiling needs.
+    pub fn blockCount(len: usize) usize {
+        return len / block_bytes + @intFromBool(len % block_bytes != 0);
+    }
+
     fn texel(self: Dcc, code: u8) ?[4]u8 {
         return switch (code) {
             0x00 => .{ 0, 0, 0, 0 },
@@ -140,7 +147,7 @@ pub const Dcc = struct {
     /// Rewrites every fast-cleared block of `backing` with its clear value.
     /// Comp-to-single (0x10) blocks keep their representative first texel.
     pub fn expand(self: Dcc, memory: anytype, backing: []u8, keys: []u8) !void {
-        if (keys.len != std.math.divCeil(usize, backing.len, block_bytes) catch unreachable) return error.InvalidDccKeyRange;
+        if (keys.len != blockCount(backing.len)) return error.InvalidDccKeyRange;
         if (!memory.read(memory.context, self.address, keys)) return error.GuestReadFailed;
         for (keys, 0..) |code, block| {
             if (code == 0xff) continue;
@@ -161,6 +168,16 @@ pub const Dcc = struct {
         if (!memory.write(memory.context, self.address, keys)) return error.GuestWriteFailed;
     }
 };
+
+test "DCC block counts cover partial blocks without overflowing guest lengths" {
+    try std.testing.expectEqual(@as(usize, 0), Dcc.blockCount(0));
+    try std.testing.expectEqual(@as(usize, 1), Dcc.blockCount(1));
+    try std.testing.expectEqual(@as(usize, 1), Dcc.blockCount(256));
+    try std.testing.expectEqual(@as(usize, 2), Dcc.blockCount(257));
+    const maximum = std.math.maxInt(usize);
+    try std.testing.expectEqual(maximum / 256 + 1, Dcc.blockCount(maximum));
+    try std.testing.expectEqual(maximum / 256, Dcc.blockCount(maximum - 255));
+}
 
 test "DCC fast-clear keys expand into the tiled backing and unknown codes are rejected" {
     const Memory = struct {
@@ -318,13 +335,13 @@ pub const Staged = struct {
     }
 
     fn expandDcc(allocator: std.mem.Allocator, dcc: Dcc, memory: anytype, backing: []u8) !void {
-        const keys = try allocator.alloc(u8, std.math.divCeil(usize, backing.len, Dcc.block_bytes) catch unreachable);
+        const keys = try allocator.alloc(u8, Dcc.blockCount(backing.len));
         defer allocator.free(keys);
         try dcc.expand(memory, backing, keys);
     }
 
     fn publishDcc(allocator: std.mem.Allocator, dcc: Dcc, memory: anytype, bytes: usize) !void {
-        const keys = try allocator.alloc(u8, std.math.divCeil(usize, bytes, Dcc.block_bytes) catch unreachable);
+        const keys = try allocator.alloc(u8, Dcc.blockCount(bytes));
         defer allocator.free(keys);
         try dcc.markUncompressed(memory, keys);
     }

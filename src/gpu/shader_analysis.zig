@@ -30,6 +30,16 @@ pub const Error = shaders.Error || rdna2.Error || rdna2.control_flow.Error || st
     AddressOverflow,
 };
 
+var cache_enable_reports: std.atomic.Value(u32) = .init(0);
+
+fn noteCacheEnable(name: []const u8) void {
+    var reports = cache_enable_reports.load(.monotonic);
+    while (reports < 8) {
+        reports = cache_enable_reports.cmpxchgWeak(reports, reports + 1, .monotonic, .monotonic) orelse break;
+    } else return;
+    std.debug.print("[shader analysis] optional {s} cache disabled by allocation failure\n", .{name});
+}
+
 pub const Analysis = struct {
     code: std.ArrayList(u32),
     program: rdna2.Program,
@@ -218,9 +228,12 @@ pub const Analysis = struct {
         value.* = try self.buildUniformSpecialization(allocator, retained);
         retained_owned = false;
         if (active_cache != null) {
-            value.enableScalarDefinitionCache(allocator) catch {};
-            value.enableResourceCheckpoints(allocator) catch {};
-            value.enableTranslationKey(allocator) catch {};
+            // Optional caches degrade to recompute on allocation failure; the
+            // fallback is specified and tested, but the failure still surfaces
+            // here instead of vanishing.
+            value.enableScalarDefinitionCache(allocator) catch noteCacheEnable("scalar definitions");
+            value.enableResourceCheckpoints(allocator) catch noteCacheEnable("resource checkpoints");
+            value.enableTranslationKey(allocator) catch noteCacheEnable("translation key");
         }
         if (active_cache) |cache| {
             var victim: ?*UniformSpecializations.Entry = null;

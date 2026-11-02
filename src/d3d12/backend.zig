@@ -83,7 +83,7 @@ const PendingDraws = struct {
             if (address < color.address + color.backing.len and color.address < end) return true;
             // The pending flush also rewrites the colour target's DCC keys.
             if (color.dcc) |dcc| {
-                const keys = std.math.divCeil(usize, color.backing.len, surfaces.Dcc.block_bytes) catch unreachable;
+                const keys = surfaces.Dcc.blockCount(color.backing.len);
                 if (address < dcc.address + keys and dcc.address < end) return true;
             }
         }
@@ -91,7 +91,7 @@ const PendingDraws = struct {
         for (self.extra_colors) |value| if (value) |color| {
             if (address < color.address + color.backing.len and color.address < end) return true;
             if (color.dcc) |dcc| {
-                const keys = std.math.divCeil(usize, color.backing.len, surfaces.Dcc.block_bytes) catch unreachable;
+                const keys = surfaces.Dcc.blockCount(color.backing.len);
                 if (address < dcc.address + keys and dcc.address < end) return true;
             }
         };
@@ -99,6 +99,173 @@ const PendingDraws = struct {
         if (self.htile) |htile| if (address < htile.address + htile.lease.bytes.len and htile.address < end) return true;
         return false;
     }
+};
+
+/// Every failure the experimental DirectX 12 backend can report.
+/// Stored on the renderer and delivered to the optional failure callback,
+/// so both name the full set instead of erasing it.
+pub const Error = std.mem.Allocator.Error || error{
+    AttachmentAliasNotImplemented,
+    ColorMetadataAndLogicOpsNotImplemented,
+    ComputeScalarMemoryOperationNotImplemented,
+    CustomPrimitiveRestartNotImplemented,
+    DepthBoundsNotImplemented,
+    DepthColorAliasNotImplemented,
+    DepthMetadataOperationNotImplemented,
+    DisplayBufferUnavailable,
+    DisplayResolverUnavailable,
+    DynamicBufferDescriptorNotImplemented,
+    DynamicScalarOffsetNotImplemented,
+    DynamicScalarPointerNotImplemented,
+    FlatMemoryNotImplemented,
+    FlatRectangleInterpolationNotImplemented,
+    GuestReadFailed,
+    GuestWriteFailed,
+    IncompleteRectangleList,
+    IndexBufferTooLarge,
+    IndexCountOutOfBounds,
+    IndirectAndMultiDrawNotImplemented,
+    IndirectDrawCountTooLarge,
+    IndirectShaderRegisterPatchNotImplemented,
+    InvalidBaseVertex,
+    InvalidBufferDescriptor,
+    InvalidDmaGdsRange,
+    InvalidDmaPacket,
+    InvalidDrawPacket,
+    InvalidIndexAddress,
+    InvalidIndirectArgumentsAddress,
+    InvalidIndirectCountAddress,
+    InvalidIndirectStride,
+    InvalidScalarPointer,
+    MismatchedRenderTargetExtents,
+    MissingAttachment,
+    MissingDepthTarget,
+    OverlappingBufferViewsNotImplemented,
+    PositiveYOrMirroredViewportNotImplemented,
+    ReadOnlyDepthDecompressionNotImplemented,
+    SampledAndStorageImagesNotImplemented,
+    SelectiveDepthDecompressionNotImplemented,
+    SparseColorTargetsNotImplemented,
+    StencilAttachmentAliasNotImplemented,
+    StorageBudgetExceeded,
+    UnboundedControlFlowNotImplemented,
+    UnsupportedBufferDescriptor,
+    UnsupportedDispatchPacket,
+    UnsupportedDispatchSize,
+    UnsupportedDmaSelector,
+    UnsupportedDrawInitiator,
+    UnsupportedIndexType,
+    UnsupportedNggRectangleCount,
+    UnsupportedPrimitiveRestartControl,
+    UnsupportedRasterState,
+    UnsupportedScalarPointerRange,
+    UnsupportedWorkgroupSize,
+    WorkgroupMemoryNotImplemented,
+    AddressOverflow,
+    ArithmeticOverflow,
+    CompressedColorTargetNotImplemented,
+    D16StencilDepthNotImplemented,
+    CompressedDepthTargetNotImplemented,
+    CoordinateOutOfRange,
+    DestinationTooSmall,
+    DualSourceBlendingNotImplemented,
+    DynamicGraphicsBufferNotImplemented,
+    DynamicGraphicsImageNotImplemented,
+    EmptyProgram,
+    FlatProvokingTopologyNotImplemented,
+    FragmentInterpolationModeNotImplemented,
+    FragmentPerVertexInterpolationNotImplemented,
+    GeometryAmplificationNotImplemented,
+    GraphicsFlatMemoryNotImplemented,
+    GraphicsImageFootprintMismatch,
+    GraphicsImageOperationNotImplemented,
+    GraphicsLdsNotImplemented,
+    GraphicsSamplerAddressModeNotImplemented,
+    GraphicsSamplerModeNotImplemented,
+    GraphicsScalarMemoryOperationNotImplemented,
+    GraphicsSnapshotBudgetExceeded,
+    GraphicsStorageWritesNotImplemented,
+    GraphicsTextureFormatOrMipNotImplemented,
+    IncompleteDescriptor,
+    IncompleteVertexTables,
+    IndependentDepthBiasNotImplemented,
+    IndependentStencilMasksNotImplemented,
+    InstructionLimitExceeded,
+    InvalidArgument,
+    InvalidBlendFactor,
+    InvalidBlendOperation,
+    InvalidBranchTarget,
+    InvalidDccKeyRange,
+    InvalidDepthBias,
+    InvalidDescriptor,
+    InvalidExtent,
+    InvalidFanIndices,
+    InvalidFormat,
+    InvalidGraphicsStageRouting,
+    InvalidIrStage,
+    InvalidMetadata,
+    InvalidPitch,
+    InvalidScalarCall,
+    InvalidScalarOffset,
+    InvalidStageInterface,
+    InvalidStorageBinding,
+    InvalidTextureComponent,
+    InvalidTriangleIndices,
+    InvalidVertexSemanticCount,
+    InvalidViewportDepth,
+    MemoryReadFailed,
+    MetadataCountOutOfRange,
+    MissingEndProgram,
+    MissingLiteralConstant,
+    MissingProgram,
+    MissingStencilTarget,
+    MissingVertexParameterExport,
+    MissingVertexProgram,
+    NativeFailure,
+    NggCullingNotImplemented,
+    NonFiniteBlendConstant,
+    Overflow,
+    ResourceOutsideExtendedUserData,
+    ResourceOutsideUserData,
+    SeparateDepthAddressesNotImplemented,
+    SeparateStencilAddressesNotImplemented,
+    ShaderLoopBudgetExceeded,
+    SourceTooSmall,
+    StencilOperationNotImplemented,
+    StencilReplacementNotImplemented,
+    SurfaceBudgetExceeded,
+    TessellationStagesNotImplemented,
+    TruncatedInstruction,
+    UndefinedRegister,
+    UnknownInstructionFamily,
+    UnrestrictedViewportDepthNotImplemented,
+    UnsupportedBufferAddressing,
+    UnsupportedControlFlow,
+    UnsupportedDepthBiasFormat,
+    UnsupportedDepthLayout,
+    UnsupportedDestination,
+    UnsupportedElementSize,
+    UnsupportedFormat,
+    UnsupportedGraphicsBufferDescriptor,
+    UnsupportedLegacyStageRouting,
+    UnsupportedMetadataLayout,
+    UnsupportedMipChain,
+    UnsupportedMultisample,
+    UnsupportedNggStageRouting,
+    UnsupportedOpcode,
+    UnsupportedPlatform,
+    UnsupportedPrimitive,
+    UnsupportedRenderTargetLayout,
+    UnsupportedScalarDestination,
+    UnsupportedScalarSource,
+    UnsupportedScanoutFormat,
+    UnsupportedScanoutLayout,
+    UnsupportedStencilLayout,
+    UnsupportedTileMode,
+    UnsupportedVolume,
+    UserDataOutOfRange,
+    VectorGprOutOfRange,
+    VertexTableIndexOutOfRange,
 };
 
 pub const Renderer = struct {
@@ -110,8 +277,8 @@ pub const Renderer = struct {
     textures: texture_cache.Cache = .{},
     translations: translation_cache.Cache = .{ .maximum_bytes = 32 * 1024 * 1024, .maximum_entries = 256 },
     memory: Memory,
-    failure: ?anyerror = null,
-    on_failure: ?*const fn (anyerror) void = null,
+    failure: ?Error = null,
+    on_failure: ?*const fn (Error) void = null,
     display_resolver: ?*const fn (gpu.state.Flip) ?DisplayBuffer = null,
     fps_context: ?*anyopaque = null,
     fps_update: ?*const fn (?*anyopaque, u32) void = null,
@@ -159,7 +326,7 @@ pub const Renderer = struct {
     fn from(context: ?*anyopaque) *Renderer {
         return @ptrCast(@alignCast(context.?));
     }
-    fn rejected(self: *Renderer, operation: []const u8, err: anyerror) bool {
+    fn rejected(self: *Renderer, operation: []const u8, err: Error) bool {
         if (self.failure == null) {
             self.failure = err;
             std.debug.print("[d3d12] {s} rejected: {s}; experimental backend stopped, no Vulkan fallback\n", .{ operation, @errorName(err) });
@@ -290,7 +457,7 @@ pub const Renderer = struct {
         }
         return true;
     }
-    pub fn flushDraws(self: *Renderer) anyerror!void {
+    pub fn flushDraws(self: *Renderer) Error!void {
         if (self.failure) |err| return err;
         const pending = if (self.pending_draws) |*value| value else return;
         defer {

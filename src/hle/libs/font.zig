@@ -20,17 +20,17 @@ const FontMemory = extern struct {
     type: u16,
     attr: u16,
     size: u32,
-    address: usize,
-    mspace: usize,
-    interface: usize,
-    destroy_callback: usize,
-    destroy_object: usize,
-    user_object: usize,
-    parent_object: usize,
+    address: u64,
+    mspace: u64,
+    interface: u64,
+    destroy_callback: u64,
+    destroy_object: u64,
+    user_object: u64,
+    parent_object: u64,
 };
 const GlyphMetrics = raster.Metrics;
 const RenderSurface = extern struct {
-    buffer: usize,
+    buffer: u64,
     width_bytes: i32,
     pixel_size_bytes: i8,
     padding0: u8 = 0,
@@ -45,13 +45,13 @@ const RenderSurface = extern struct {
     reserved: [22]u32 = @splat(0),
 };
 const TransImage = extern struct {
-    address: usize = 0,
+    address: u64 = 0,
     width_bytes: u32 = 0,
     width: u32 = 0,
     height: u32 = 0,
 };
 const SurfaceImage = extern struct {
-    address: usize = 0,
+    address: u64 = 0,
     width_bytes: u32 = 0,
     pixel_size_bytes: u8 = 0,
     pixel_format: u8 = 0,
@@ -66,7 +66,7 @@ const ImageMetrics = extern struct {
     height: u32 = 0,
 };
 const RenderOutput = extern struct {
-    trans_image: usize = 0,
+    trans_image: u64 = 0,
     surface_image: SurfaceImage = .{},
     update_rect: Rect = .{},
     image_metrics: ImageMetrics = .{},
@@ -76,23 +76,23 @@ const HorizontalLayout = extern struct { baseline: f32, height: f32, effect_heig
 const LibrarySelection = extern struct {
     magic: u32 = 0x464f_4e54,
     reserved: u32 = 0,
-    reserved_pointer: usize = 0,
-    get_pixel_resolution: usize = 0,
-    init: usize = 0,
-    term: usize = 0,
-    support: usize = 0,
+    reserved_pointer: u64 = 0,
+    get_pixel_resolution: u64 = 0,
+    init: u64 = 0,
+    term: u64 = 0,
+    support: u64 = 0,
 };
 const RendererSelection = extern struct {
     magic: u32 = 0x4654_524e,
     size: u32 = @sizeOf(RendererSelection),
-    create: usize = 0,
-    destroy: usize = 0,
-    query: usize = 0,
+    create: u64 = 0,
+    destroy: u64 = 0,
+    query: u64 = 0,
 };
 const Font = struct {
-    handle: usize = 0,
-    library: usize = 0,
-    renderer: usize = 0,
+    handle: u64 = 0,
+    library: u64 = 0,
+    renderer: u64 = 0,
     face: ?*raster.Face = null,
     style: raster.Style = .{},
     render_style: ?raster.Style = null,
@@ -107,7 +107,7 @@ const Font = struct {
     }
 };
 var lock: memory.HostMutex = .{};
-var libraries: [32]usize = @splat(0);
+var libraries: [32]u64 = @splat(0);
 const DeviceCache = struct {
     bytes: []u8 = &.{},
     owned: bool = false,
@@ -119,12 +119,12 @@ const DeviceCache = struct {
     }
 };
 var device_caches: [32]DeviceCache = @splat(.{});
-var renderers: [64]usize = @splat(0);
+var renderers: [64]u64 = @splat(0);
 var fonts: [128]Font = @splat(.{});
-var next_handle: usize = 0x464f0000;
+var next_handle: u64 = 0x464f0000;
 var library_selection = LibrarySelection{};
 var renderer_selection = RendererSelection{};
-const OwnedGlyph = struct { handle: usize, glyph: raster.Glyph, attribute: u32 = 0, value: u64 = 0 };
+const OwnedGlyph = struct { handle: u64, glyph: raster.Glyph, attribute: u32 = 0, value: u64 = 0 };
 var generated_glyphs: std.ArrayList(OwnedGlyph) = .empty;
 
 pub fn reset() void {
@@ -140,12 +140,12 @@ pub fn reset() void {
     @memset(&renderers, 0);
     // Do not recycle stale handles when another title starts in this process.
 }
-pub fn readable(address: usize, size: usize) bool {
+pub fn readable(address: u64, size: u64) bool {
     return address != 0 and kernel_memory.isGuestRangeAccessible(address, size);
 }
-pub fn writable(address: usize, size: usize) bool {
+pub fn writable(address: u64, size: u64) bool {
     if (address == 0) return false;
-    _ = std.math.add(usize, address, size) catch return false;
+    _ = std.math.add(u64, address, size) catch return false;
     if (kernel_memory.attachedAddressSpace()) |space| {
         // GPU tracking temporarily removes host write permission. Check the
         // logical guest permission before notifyGuestWrite restores it.
@@ -154,7 +154,7 @@ pub fn writable(address: usize, size: usize) bool {
     }
     return true; // Host-only tests, as in kernel_memory's read boundary.
 }
-pub fn notifyWrite(address: usize, size: usize) void {
+pub fn notifyWrite(address: u64, size: u64) void {
     if (kernel_memory.attachedAddressSpace()) |space| space.notifyGuestWrite(address, size);
 }
 fn validOutput(comptime T: type, output: ?*T) bool {
@@ -164,14 +164,14 @@ fn writeOutput(comptime T: type, output: *T, value: T) void {
     notifyWrite(@intFromPtr(output), @sizeOf(T));
     output.* = value;
 }
-fn newHandle() usize {
+fn newHandle() u64 {
     next_handle += 1;
     return next_handle;
 }
-fn hasHandle(handles: []const usize, handle: usize) bool {
-    return handle != 0 and std.mem.indexOfScalar(usize, handles, handle) != null;
+fn hasHandle(handles: []const u64, handle: u64) bool {
+    return handle != 0 and std.mem.indexOfScalar(u64, handles, handle) != null;
 }
-fn findFont(handle: usize) ?*Font {
+fn findFont(handle: u64) ?*Font {
     if (handle != 0) for (&fonts) |*font| {
         if (font.handle == handle) return font;
     };
@@ -184,7 +184,7 @@ fn fontError(err: raster.Error) i32 {
         else => invalid_parameter,
     };
 }
-fn memoryInit(output: ?*FontMemory, address: usize, size: u32, interface: usize, mspace: usize, callback: usize, object: usize) callconv(abi.guest) i32 {
+fn memoryInit(output: ?*FontMemory, address: u64, size: u32, interface: u64, mspace: u64, callback: u64, object: u64) callconv(abi.guest) i32 {
     if (!validOutput(FontMemory, output)) return errno.KernelError.efault.raw();
     writeOutput(FontMemory, output.?, .{
         .type = 1,
@@ -206,32 +206,32 @@ fn memoryTerm(output: ?*FontMemory) callconv(abi.guest) i32 {
     output.?.type = 0;
     return errno.ok;
 }
-fn createHandle(handles: []usize, output: ?*usize) i32 {
-    if (!validOutput(usize, output)) return errno.KernelError.efault.raw();
+fn createHandle(handles: []u64, output: ?*u64) i32 {
+    if (!validOutput(u64, output)) return errno.KernelError.efault.raw();
     for (handles) |*slot| if (slot.* == 0) {
         slot.* = newHandle();
-        writeOutput(usize, output.?, slot.*);
+        writeOutput(u64, output.?, slot.*);
         return errno.ok;
     };
     return errno.KernelError.enomem.raw();
 }
-fn createLibrary(_: ?*const FontMemory, _: usize, _: u64, output: ?*usize) callconv(abi.guest) i32 {
+fn createLibrary(_: ?*const FontMemory, _: u64, _: u64, output: ?*u64) callconv(abi.guest) i32 {
     lock.lock();
     defer lock.unlock();
     return createHandle(&libraries, output);
 }
-fn createLibraryDefault(mem: ?*const FontMemory, selection: usize, output: ?*usize) callconv(abi.guest) i32 {
+fn createLibraryDefault(mem: ?*const FontMemory, selection: u64, output: ?*u64) callconv(abi.guest) i32 {
     return createLibrary(mem, selection, 0, output);
 }
-fn createRenderer(_: ?*const FontMemory, _: usize, _: u64, output: ?*usize) callconv(abi.guest) i32 {
+fn createRenderer(_: ?*const FontMemory, _: u64, _: u64, output: ?*u64) callconv(abi.guest) i32 {
     lock.lock();
     defer lock.unlock();
     return createHandle(&renderers, output);
 }
-fn destroyLibrary(output: ?*usize) callconv(abi.guest) i32 {
+fn destroyLibrary(output: ?*u64) callconv(abi.guest) i32 {
     lock.lock();
     defer lock.unlock();
-    if (!validOutput(usize, output)) return errno.KernelError.efault.raw();
+    if (!validOutput(u64, output)) return errno.KernelError.efault.raw();
     const handle = output.?.*;
     if (!hasHandle(&libraries, handle)) return invalid_parameter;
     for (&fonts) |*font| if (font.library == handle) {
@@ -241,13 +241,13 @@ fn destroyLibrary(output: ?*usize) callconv(abi.guest) i32 {
         device_caches[index].clear();
         slot.* = 0;
     };
-    writeOutput(usize, output.?, 0);
+    writeOutput(u64, output.?, 0);
     return errno.ok;
 }
-fn destroyRenderer(output: ?*usize) callconv(abi.guest) i32 {
+fn destroyRenderer(output: ?*u64) callconv(abi.guest) i32 {
     lock.lock();
     defer lock.unlock();
-    if (!validOutput(usize, output)) return errno.KernelError.efault.raw();
+    if (!validOutput(u64, output)) return errno.KernelError.efault.raw();
     const handle = output.?.*;
     if (!hasHandle(&renderers, handle)) return invalid_parameter;
     for (&fonts) |*font| if (font.renderer == handle) {
@@ -256,11 +256,11 @@ fn destroyRenderer(output: ?*usize) callconv(abi.guest) i32 {
     for (&renderers) |*slot| if (slot.* == handle) {
         slot.* = 0;
     };
-    writeOutput(usize, output.?, 0);
+    writeOutput(u64, output.?, 0);
     return errno.ok;
 }
-fn openFont(library: usize, data: []const u8, output: ?*usize) i32 {
-    if (!validOutput(usize, output)) return errno.KernelError.efault.raw();
+fn openFont(library: u64, data: []const u8, output: ?*u64) i32 {
+    if (!validOutput(u64, output)) return errno.KernelError.efault.raw();
     if (!hasHandle(&libraries, library)) return invalid_parameter;
     for (&fonts) |*font| if (font.handle == 0) {
         const face = allocator.create(raster.Face) catch return errno.KernelError.enomem.raw();
@@ -269,24 +269,24 @@ fn openFont(library: usize, data: []const u8, output: ?*usize) i32 {
             return fontError(err);
         };
         font.* = .{ .handle = newHandle(), .library = library, .face = face };
-        writeOutput(usize, output.?, font.handle);
+        writeOutput(u64, output.?, font.handle);
         return errno.ok;
     };
     return errno.KernelError.enomem.raw();
 }
-fn openFontMemory(library: usize, address: usize, size: u32, _: usize, output: ?*usize) callconv(abi.guest) i32 {
+fn openFontMemory(library: u64, address: u64, size: u32, _: u64, output: ?*u64) callconv(abi.guest) i32 {
     if (size == 0 or size > 64 * 1024 * 1024) return invalid_parameter;
     if (!readable(address, size)) return errno.KernelError.efault.raw();
     lock.lock();
     defer lock.unlock();
     return openFont(library, @as([*]const u8, @ptrFromInt(address))[0..size], output);
 }
-fn openFontSet(library: usize, _: u32, _: u32, _: usize, output: ?*usize) callconv(abi.guest) i32 {
+fn openFontSet(library: u64, _: u32, _: u32, _: u64, output: ?*u64) callconv(abi.guest) i32 {
     lock.lock();
     defer lock.unlock();
     return openFont(library, raster.fallback_font, output);
 }
-fn openFontInstance(handle: usize, _: usize, output: ?*usize) callconv(abi.guest) i32 {
+fn openFontInstance(handle: u64, _: u64, output: ?*u64) callconv(abi.guest) i32 {
     lock.lock();
     defer lock.unlock();
     const source = findFont(handle) orelse return invalid_font;
@@ -304,24 +304,24 @@ fn closeFont(handle: usize) callconv(abi.guest) i32 {
     font.close();
     return errno.ok;
 }
-fn supportSystemFonts(library: usize) callconv(abi.guest) i32 {
+fn supportSystemFonts(library: u64) callconv(abi.guest) i32 {
     lock.lock();
     defer lock.unlock();
     return if (hasHandle(&libraries, library)) errno.ok else invalid_parameter;
 }
-fn supportExternalFonts(library: usize, _: u32, _: u32) callconv(abi.guest) i32 {
+fn supportExternalFonts(library: u64, _: u32, _: u32) callconv(abi.guest) i32 {
     return supportSystemFonts(library);
 }
 
 /// Null storage asks the library to own the cache allocation. Caller storage
 /// remains borrowed. Glyph transfer images use this buffer, with wraparound;
 /// the outline cache stays in FreeType's host-side representation.
-fn attachDeviceCacheBuffer(library: usize, address: usize, size: u32) callconv(abi.guest) i32 {
+fn attachDeviceCacheBuffer(library: u64, address: u64, size: u32) callconv(abi.guest) i32 {
     if (size > 64 * 1024 * 1024 or (address != 0 and size == 0)) return invalid_parameter;
     lock.lock();
     defer lock.unlock();
     if (library == 0) return invalid_parameter;
-    const index = std.mem.indexOfScalar(usize, &libraries, library) orelse return invalid_parameter;
+    const index = std.mem.indexOfScalar(u64, &libraries, library) orelse return invalid_parameter;
     var replacement = DeviceCache{};
     if (size != 0) {
         if (address == 0) {
@@ -340,8 +340,8 @@ fn attachDeviceCacheBuffer(library: usize, address: usize, size: u32) callconv(a
     return errno.ok;
 }
 
-fn cacheTransferImage(library: usize, pixels: []const u8) []const u8 {
-    const index = std.mem.indexOfScalar(usize, &libraries, library) orelse return pixels;
+fn cacheTransferImage(library: u64, pixels: []const u8) []const u8 {
+    const index = std.mem.indexOfScalar(u64, &libraries, library) orelse return pixels;
     const cache = &device_caches[index];
     if (pixels.len == 0 or pixels.len > cache.bytes.len) return pixels;
     if (pixels.len > cache.bytes.len - cache.cursor) cache.cursor = 0;
@@ -351,7 +351,7 @@ fn cacheTransferImage(library: usize, pixels: []const u8) []const u8 {
     cache.cursor += pixels.len;
     return destination;
 }
-fn bindRenderer(handle: usize, renderer: usize) callconv(abi.guest) i32 {
+fn bindRenderer(handle: u64, renderer: u64) callconv(abi.guest) i32 {
     lock.lock();
     defer lock.unlock();
     const font = findFont(handle) orelse return invalid_font;
@@ -375,7 +375,7 @@ fn rebindRenderer(handle: usize) callconv(abi.guest) i32 {
     font.render_style = null;
     return errno.ok;
 }
-fn setScale(handle: usize, width: f32, height: f32, render: bool) i32 {
+fn setScale(handle: u64, width: f32, height: f32, render: bool) i32 {
     lock.lock();
     defer lock.unlock();
     const font = findFont(handle) orelse return invalid_font;
@@ -386,13 +386,13 @@ fn setScale(handle: usize, width: f32, height: f32, render: bool) i32 {
     if (render) font.render_style = style else font.style = style;
     return errno.ok;
 }
-fn setScalePixel(handle: usize, width: f32, height: f32) callconv(abi.guest) i32 {
+fn setScalePixel(handle: u64, width: f32, height: f32) callconv(abi.guest) i32 {
     return setScale(handle, width, height, false);
 }
-fn setupRenderScalePixel(handle: usize, width: f32, height: f32) callconv(abi.guest) i32 {
+fn setupRenderScalePixel(handle: u64, width: f32, height: f32) callconv(abi.guest) i32 {
     return setScale(handle, width, height, true);
 }
-fn setSlant(handle: usize, slant: f32, render: bool) i32 {
+fn setSlant(handle: u64, slant: f32, render: bool) i32 {
     lock.lock();
     defer lock.unlock();
     const font = findFont(handle) orelse return invalid_font;
@@ -402,13 +402,13 @@ fn setSlant(handle: usize, slant: f32, render: bool) i32 {
     if (render) font.render_style = style else font.style = style;
     return errno.ok;
 }
-fn setEffectSlant(handle: usize, slant: f32) callconv(abi.guest) i32 {
+fn setEffectSlant(handle: u64, slant: f32) callconv(abi.guest) i32 {
     return setSlant(handle, slant, false);
 }
-fn setupRenderEffectSlant(handle: usize, slant: f32) callconv(abi.guest) i32 {
+fn setupRenderEffectSlant(handle: u64, slant: f32) callconv(abi.guest) i32 {
     return setSlant(handle, slant, true);
 }
-fn setWeight(handle: usize, x: f32, y: f32, mode: u32, render: bool) i32 {
+fn setWeight(handle: u64, x: f32, y: f32, mode: u32, render: bool) i32 {
     if (mode != 0 or !std.math.isFinite(x) or !std.math.isFinite(y)) return invalid_parameter;
     lock.lock();
     defer lock.unlock();
@@ -419,13 +419,13 @@ fn setWeight(handle: usize, x: f32, y: f32, mode: u32, render: bool) i32 {
     if (render) f.render_style = style else f.style = style;
     return 0;
 }
-fn setEffectWeight(handle: usize, x: f32, y: f32, mode: u32) callconv(abi.guest) i32 {
+fn setEffectWeight(handle: u64, x: f32, y: f32, mode: u32) callconv(abi.guest) i32 {
     return setWeight(handle, x, y, mode, false);
 }
-fn setupRenderEffectWeight(handle: usize, x: f32, y: f32, mode: u32) callconv(abi.guest) i32 {
+fn setupRenderEffectWeight(handle: u64, x: f32, y: f32, mode: u32) callconv(abi.guest) i32 {
     return setWeight(handle, x, y, mode, true);
 }
-fn getVerticalLayout(handle: usize, output: ?*HorizontalLayout) callconv(abi.guest) i32 {
+fn getVerticalLayout(handle: u64, output: ?*HorizontalLayout) callconv(abi.guest) i32 {
     if (!validOutput(HorizontalLayout, output)) return invalid_parameter;
     lock.lock();
     defer lock.unlock();
@@ -433,8 +433,8 @@ fn getVerticalLayout(handle: usize, output: ?*HorizontalLayout) callconv(abi.gue
     writeOutput(HorizontalLayout, output.?, .{ .baseline = f.style.width / 2, .height = f.style.width, .effect_height = f.style.width * (1 + f.style.weight_x) });
     return 0;
 }
-fn generateGlyph(handle: usize, code: u32, _: usize, output: ?*usize) callconv(abi.guest) i32 {
-    if (!validOutput(usize, output)) return invalid_parameter;
+fn generateGlyph(handle: u64, code: u32, _: u64, output: ?*u64) callconv(abi.guest) i32 {
+    if (!validOutput(u64, output)) return invalid_parameter;
     lock.lock();
     defer lock.unlock();
     const f = findFont(handle) orelse return invalid_font;
@@ -446,22 +446,22 @@ fn generateGlyph(handle: usize, code: u32, _: usize, output: ?*usize) callconv(a
         allocator.free(glyph.pixels);
         return errno.KernelError.enomem.raw();
     };
-    writeOutput(usize, output.?, id);
+    writeOutput(u64, output.?, id);
     return 0;
 }
-fn deleteGlyph(_: usize, output: ?*usize) callconv(abi.guest) i32 {
-    if (!validOutput(usize, output)) return invalid_parameter;
+fn deleteGlyph(_: u64, output: ?*u64) callconv(abi.guest) i32 {
+    if (!validOutput(u64, output)) return invalid_parameter;
     lock.lock();
     defer lock.unlock();
     for (generated_glyphs.items, 0..) |glyph, i| if (glyph.handle == output.?.*) {
         allocator.free(glyph.glyph.pixels);
         _ = generated_glyphs.swapRemove(i);
-        writeOutput(usize, output.?, 0);
+        writeOutput(u64, output.?, 0);
         return 0;
     };
     return invalid_parameter;
 }
-fn glyphAttribute(handle: usize, attribute: u32, value: u64) callconv(abi.guest) i32 {
+fn glyphAttribute(handle: u64, attribute: u32, value: u64) callconv(abi.guest) i32 {
     lock.lock();
     defer lock.unlock();
     for (generated_glyphs.items) |*glyph| if (glyph.handle == handle) {
@@ -473,7 +473,7 @@ fn glyphAttribute(handle: usize, attribute: u32, value: u64) callconv(abi.guest)
     };
     return invalid_parameter;
 }
-pub fn metricsImpl(handle: usize, codepoint: u32, output: ?*GlyphMetrics, render: bool) i32 {
+pub fn metricsImpl(handle: u64, codepoint: u32, output: ?*GlyphMetrics, render: bool) i32 {
     if (!validOutput(GlyphMetrics, output)) return errno.KernelError.efault.raw();
     lock.lock();
     defer lock.unlock();
@@ -482,13 +482,13 @@ pub fn metricsImpl(handle: usize, codepoint: u32, output: ?*GlyphMetrics, render
     writeOutput(GlyphMetrics, output.?, glyph.metrics);
     return errno.ok;
 }
-fn glyphMetrics(handle: usize, codepoint: u32, output: ?*GlyphMetrics) callconv(abi.guest) i32 {
+fn glyphMetrics(handle: u64, codepoint: u32, output: ?*GlyphMetrics) callconv(abi.guest) i32 {
     return metricsImpl(handle, codepoint, output, false);
 }
-fn renderGlyphMetrics(handle: usize, codepoint: u32, output: ?*GlyphMetrics) callconv(abi.guest) i32 {
+fn renderGlyphMetrics(handle: u64, codepoint: u32, output: ?*GlyphMetrics) callconv(abi.guest) i32 {
     return metricsImpl(handle, codepoint, output, true);
 }
-fn getKerning(handle: usize, previous: u32, code: u32, output: ?*Kerning) callconv(abi.guest) i32 {
+fn getKerning(handle: u64, previous: u32, code: u32, output: ?*Kerning) callconv(abi.guest) i32 {
     if (!validOutput(Kerning, output)) return errno.KernelError.efault.raw();
     lock.lock();
     defer lock.unlock();
@@ -497,7 +497,7 @@ fn getKerning(handle: usize, previous: u32, code: u32, output: ?*Kerning) callco
     writeOutput(Kerning, output.?, .{ .offset_x = offset });
     return errno.ok;
 }
-fn getHorizontalLayout(handle: usize, output: ?*HorizontalLayout) callconv(abi.guest) i32 {
+fn getHorizontalLayout(handle: u64, output: ?*HorizontalLayout) callconv(abi.guest) i32 {
     if (!validOutput(HorizontalLayout, output)) return errno.KernelError.efault.raw();
     lock.lock();
     defer lock.unlock();
@@ -506,7 +506,7 @@ fn getHorizontalLayout(handle: usize, output: ?*HorizontalLayout) callconv(abi.g
     writeOutput(HorizontalLayout, output.?, .{ .baseline = layout[0], .height = layout[1], .effect_height = layout[2] });
     return errno.ok;
 }
-fn renderSurfaceInit(output: ?*RenderSurface, buffer: usize, width_bytes: i32, pixel_size_bytes: i32, width: i32, height: i32) callconv(abi.guest) void {
+fn renderSurfaceInit(output: ?*RenderSurface, buffer: u64, width_bytes: i32, pixel_size_bytes: i32, width: i32, height: i32) callconv(abi.guest) void {
     if (!validOutput(RenderSurface, output)) return;
     writeOutput(RenderSurface, output.?, .{
         .buffer = buffer,
@@ -562,7 +562,7 @@ fn paint(glyph: *const raster.Glyph, surface: *const RenderSurface, x: f32, y: f
     rect.* = .{ .x = @intCast(left), .y = @intCast(top), .width = @intCast(right - left), .height = @intCast(bottom - top) };
     return errno.ok;
 }
-fn renderGlyph(handle: usize, codepoint: u32, surface: ?*RenderSurface, x: f32, y: f32, metrics: ?*GlyphMetrics, output: ?*RenderOutput) callconv(abi.guest) i32 {
+fn renderGlyph(handle: u64, codepoint: u32, surface: ?*RenderSurface, x: f32, y: f32, metrics: ?*GlyphMetrics, output: ?*RenderOutput) callconv(abi.guest) i32 {
     if (!std.math.isFinite(x) or !std.math.isFinite(y) or @abs(x) > 10000000 or @abs(y) > 10000000) return invalid_parameter;
     if (metrics != null and !validOutput(GlyphMetrics, metrics)) return errno.KernelError.efault.raw();
     if (output != null and !validOutput(RenderOutput, output)) return errno.KernelError.efault.raw();
@@ -644,9 +644,9 @@ pub const ft_exports = [_]symbols.Export{
 test "font generated glyphs own their pixels and weight changes outlines" {
     reset();
     defer reset();
-    var library: usize = 0;
-    var handle: usize = 0;
-    var glyph: usize = 0;
+    var library: u64 = 0;
+    var handle: u64 = 0;
+    var glyph: u64 = 0;
     try std.testing.expectEqual(errno.ok, createLibraryDefault(null, 0, &library));
     try std.testing.expectEqual(errno.ok, openFontSet(library, 0, 0, 0, &handle));
     try std.testing.expectEqual(errno.ok, setScalePixel(handle, 64, 64));
@@ -676,8 +676,8 @@ test "font writes invalidate GPU watches and reject read-only guest surfaces" {
     defer kernel_memory.attachAddressSpace(null);
     reset();
     defer reset();
-    var library: usize = 0;
-    var font: usize = 0;
+    var library: u64 = 0;
+    var font: u64 = 0;
     try std.testing.expectEqual(errno.ok, createLibrary(null, 0, 0, &library));
     try std.testing.expectEqual(errno.ok, openFontSet(library, 0, 0, 0, &font));
     var surface: RenderSurface = undefined;
@@ -699,8 +699,8 @@ test "font writes invalidate GPU watches and reject read-only guest surfaces" {
 test "font device cache owns or borrows storage and backs rendered transfer images" {
     reset();
     defer reset();
-    var library: usize = 0;
-    var font: usize = 0;
+    var library: u64 = 0;
+    var font: u64 = 0;
     try std.testing.expectEqual(errno.ok, createLibrary(null, 0, 0, &library));
     try std.testing.expectEqual(errno.ok, openFontSet(library, 0, 0, 0, &font));
     var buffer: [4096]u8 = @splat(0xaa);
@@ -715,7 +715,7 @@ test "font device cache owns or borrows storage and backs rendered transfer imag
     try std.testing.expect(std.mem.indexOfNone(u8, buffer[0..bytes], &.{0}) != null);
     try std.testing.expectEqual(@as(u8, 0xaa), buffer[bytes]);
     try std.testing.expectEqual(errno.ok, attachDeviceCacheBuffer(library, 0, 1024 * 1024));
-    const index = std.mem.indexOfScalar(usize, &libraries, library).?;
+    const index = std.mem.indexOfScalar(u64, &libraries, library).?;
     try std.testing.expect(device_caches[index].owned);
     try std.testing.expectEqual(errno.ok, renderGlyph(font, 'A', null, 0, 0, null, &result));
     try std.testing.expectEqual(@intFromPtr(device_caches[index].bytes.ptr), transfer.address);
@@ -738,10 +738,10 @@ test "font ABI structures retain firmware sizes and offsets" {
 test "font handles own independent faces, scale and lifetime" {
     reset();
     defer reset();
-    var library: usize = 0;
-    var renderer: usize = 0;
-    var first: usize = 0;
-    var second: usize = 0;
+    var library: u64 = 0;
+    var renderer: u64 = 0;
+    var first: u64 = 0;
+    var second: u64 = 0;
     try std.testing.expectEqual(errno.ok, createLibrary(null, 0, 0, &library));
     try std.testing.expectEqual(errno.ok, createRenderer(null, 0, 0, &renderer));
     try std.testing.expectEqual(errno.ok, openFontSet(library, 0, 0, 0, &first));
@@ -789,8 +789,8 @@ test "font clipped rasterization preserves bearings, padding and output bounds" 
 test "font renders from copied guest bytes with optional outputs and render scale" {
     reset();
     defer reset();
-    var library: usize = 0;
-    var handle: usize = 0;
+    var library: u64 = 0;
+    var handle: u64 = 0;
     try std.testing.expectEqual(errno.ok, createLibrary(null, 0, 0, &library));
     const data = try std.testing.allocator.dupe(u8, raster.fallback_font);
     defer std.testing.allocator.free(data);
@@ -825,8 +825,8 @@ test "font renders from copied guest bytes with optional outputs and render scal
 test "font atlas metrics and rendering accept the complete Latin-1 range including DEL" {
     reset();
     defer reset();
-    var library: usize = 0;
-    var handle: usize = 0;
+    var library: u64 = 0;
+    var handle: u64 = 0;
     try std.testing.expectEqual(errno.ok, createLibrary(null, 0, 0, &library));
     try std.testing.expectEqual(errno.ok, openFontSet(library, 0, 0, 0, &handle));
     var pixels = [_]u8{0} ** (32 * 32);

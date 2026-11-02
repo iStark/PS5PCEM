@@ -278,7 +278,7 @@ fn resolveD3D12VideoOutBuffer(flip: gpu.state.Flip) ?d3d12.backend.DisplayBuffer
     return .{ .address = buffer.address, .width = buffer.width, .height = buffer.height, .pitch_in_pixels = buffer.pitch_in_pixels, .tiling_mode = buffer.tiling_mode, .pixel_format = buffer.pixel_format };
 }
 
-fn stopUnsupportedD3D12(_: anyerror) void {
+fn stopUnsupportedD3D12(_: d3d12.backend.Error) void {
     // Do not let the title wait forever for labels belonging to rejected GPU
     // work. Match the contained guest-fault shutdown, including pad feedback.
     std.debug.print("The experimental DirectX 12 backend cannot execute this submission yet. Select Vulkan to run this title.\n", .{});

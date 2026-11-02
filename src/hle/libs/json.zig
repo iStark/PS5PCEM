@@ -766,21 +766,21 @@ fn serializeQuoted(text: []const u8, output: *std.ArrayList(u8)) !void {
     try output.append(allocator, '"');
 }
 
-fn serializeNode(index: u32, output: *std.ArrayList(u8)) error{OutOfMemory}!void {
+fn serializeNode(index: u32, output: *std.ArrayList(u8)) error{ OutOfMemory, NoSpaceLeft }!void {
     const allocator = std.heap.page_allocator;
     const node: Node = if (index == no_child) .{} else getNode(index).*;
     var number: [512]u8 = undefined;
     switch (node.kind) {
         .null_value => try output.appendSlice(allocator, "null"),
         .boolean => try output.appendSlice(allocator, if (node.boolean) "true" else "false"),
-        .integer => try output.appendSlice(allocator, std.fmt.bufPrint(&number, "{d}", .{node.integer}) catch unreachable),
-        .unsigned_integer => try output.appendSlice(allocator, std.fmt.bufPrint(&number, "{d}", .{@as(u64, @bitCast(node.integer))}) catch unreachable),
+        .integer => try output.appendSlice(allocator, try std.fmt.bufPrint(&number, "{d}", .{node.integer})),
+        .unsigned_integer => try output.appendSlice(allocator, try std.fmt.bufPrint(&number, "{d}", .{@as(u64, @bitCast(node.integer))})),
         .real => {
             // JSON has no representation for NaN or infinity.
             if (!std.math.isFinite(node.real)) {
                 try output.appendSlice(allocator, "null");
             } else {
-                const text = std.fmt.bufPrint(&number, "{d}", .{node.real}) catch unreachable;
+                const text = try std.fmt.bufPrint(&number, "{d}", .{node.real});
                 try output.appendSlice(allocator, text);
                 if (std.mem.indexOfAny(u8, text, ".eE") == null) try output.appendSlice(allocator, ".0");
             }

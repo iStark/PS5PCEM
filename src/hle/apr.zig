@@ -1144,10 +1144,17 @@ test "AMPR concurrent additions and paired snapshots are atomic" {
     reset();
     defer reset();
     const Worker = struct {
-        fn run(address: u64) void {
+        failed: std.atomic.Value(bool) = .init(false),
+        fn run(self: *@This(), address: u64) void {
             for (0..1000) |_| {
-                const id = submitCommandBuffer(address) catch @panic("AMPR submit failed");
-                waitCommandBuffer(id) catch @panic("AMPR wait failed");
+                const id = submitCommandBuffer(address) catch {
+                    self.failed.store(true, .monotonic);
+                    return;
+                };
+                waitCommandBuffer(id) catch {
+                    self.failed.store(true, .monotonic);
+                    return;
+                };
             }
         }
     };
@@ -1155,11 +1162,12 @@ test "AMPR concurrent additions and paired snapshots are atomic" {
         try constructCommandBuffer(0x1000 + i);
         try appendCounter(0x1000 + i, .{ .write = .{ .counter = 2, .access = .pair, .value = 0x100000001, .operation = .add } }, 32);
     }
+    var worker = Worker{};
     var threads: [4]std.Thread = undefined;
     var started: usize = 0;
     defer for (threads[0..started]) |thread| thread.join();
     for (&threads, 0..) |*thread, i| {
-        thread.* = try std.Thread.spawn(.{}, Worker.run, .{0x1000 + i});
+        thread.* = try std.Thread.spawn(.{}, Worker.run, .{ &worker, 0x1000 + i });
         started += 1;
     }
     for (0..10000) |_| {
@@ -1168,6 +1176,7 @@ test "AMPR concurrent additions and paired snapshots are atomic" {
     }
     for (threads) |thread| thread.join();
     started = 0;
+    try std.testing.expect(!worker.failed.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 0xfa000000fa0), counter_bank.read(2, .pair));
 }
 

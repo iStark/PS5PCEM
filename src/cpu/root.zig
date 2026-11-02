@@ -993,6 +993,9 @@ const LinuxX64Machine = struct {
     /// kilobytes per host worker and are kept for its lifetime.
     fn ensureThreadBlock() *ThreadBlock {
         if (thread_block) |block| return block;
+        // Host out-of-memory, not a guest fault: one block per host thread,
+        // and a title exhausts stacks long before these. No faithful guest
+        // value exists for this path, so allocation failure ends the host.
         const block = std.heap.page_allocator.create(ThreadBlock) catch
             @panic("cannot allocate the guest thread block");
         block.* = .{ .host_fs = readFsBase(), .guest_fs = 0 };
@@ -5300,7 +5303,7 @@ test "initial dispatch carries FS, stack, arguments, and nested callbacks" {
     context.bridge.invoke_callback = true;
 
     const prepared = try context.manager.prepareInitialThread("eboot-main");
-    defer context.manager.releaseInitialThread(prepared.handle) catch {};
+    // Released explicitly below to assert unmapping; no deferred release.
     const stack_mapping_address = prepared.stack_address - prepared.guard_size;
     const stack_mapping_size = prepared.guard_size +
         (try alignForwardForTest(prepared.stack_size, memory.page_size));
@@ -5819,7 +5822,7 @@ test "native bridge unwinds scePthreadExit to the dispatcher" {
     defer threading.attachManager(null);
 
     const prepared = try manager.prepareInitialThread("native-exit");
-    defer manager.releaseInitialThread(prepared.handle) catch {};
+    defer manager.releaseInitialThread(prepared.handle) catch |err| std.debug.print("test cleanup failed: {s}\n", .{@errorName(err)});
     try testing.expectEqual(
         @as(u64, 0x55),
         try dispatcher.dispatchInitial(prepared, code_address, &.{}),
