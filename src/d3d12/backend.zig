@@ -524,6 +524,11 @@ pub const Renderer = struct {
             state.readRegister(.context, 0xb4),  state.readRegister(.context, 0xb5),
             state.readRegister(.context, 0x204), state.readRegister(.context, 0x206),
         });
+        std.debug.print("[d3d12 depth planes] z_info={any} stencil_info={any} size={any} read={any}/{any} write={any}/{any}\n", .{
+            state.readRegister(.context, 0x010), state.readRegister(.context, 0x011), state.readRegister(.context, 0x007),
+            state.readRegister(.context, 0x012), state.readRegister(.context, 0x013), state.readRegister(.context, 0x014),
+            state.readRegister(.context, 0x015),
+        });
         if (render.blends[0].enabled) std.debug.print("[d3d12 blend] control=0x{x} constants={any}\n", .{
             state.readRegister(.context, 0x1e0) orelse 0,
             native.blending.decode(state, render.blends[0]) catch null,
@@ -704,7 +709,8 @@ pub const Renderer = struct {
     fn drawArguments(self: *Renderer, state: *const gpu.State, args: DrawArguments) !void {
         if (args.count == 0 or args.instances == 0) return;
         const routing = try graphics.routing(state);
-        const render = gpu.resources.decodeRenderState(state);
+        var render = gpu.resources.decodeRenderState(state);
+        render.depth_control = graphics.effectiveDepthControl(state);
         if (render.color_count == 0 and try self.depthUtilityDraw(state, render, routing)) return;
         if ((state.readRegister(.context, 0) orelse 0) & ~@as(u32, 0x63) != 0) return error.DepthMetadataOperationNotImplemented;
         if (render.color_count != 0 and render.color_targets[0] == null) return error.SparseColorTargetsNotImplemented;
@@ -719,7 +725,7 @@ pub const Renderer = struct {
             extra_dcc[slot - 1] = surfaces.colorDcc(color);
         }
         const extent: [2]u32 = if (target) |color| .{ color.width, color.height } else if (render.depth_target) |depth| .{ depth.width, depth.height } else return error.MissingAttachment;
-        if ((state.readRegister(.context, 0x200) orelse 0) & (1 << 3) != 0) return error.DepthBoundsNotImplemented;
+        if (graphics.hasDepthPlane(state) and (state.readRegister(.context, 0x200) orelse 0) & (1 << 3) != 0) return error.DepthBoundsNotImplemented;
         const color_key: ?TargetKey = if (target) |color| .{ .address = color.address, .layout = try surfaces.colorLayout(color), .swap_red_blue = color.component_swap == 1, .native_format = try surfaces.colorFormat(color) } else null;
         const color_dcc = if (target) |color| surfaces.colorDcc(color) else null;
         if (render.color_control.isMetadataOperation() or (target != null and

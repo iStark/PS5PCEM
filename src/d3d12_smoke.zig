@@ -225,6 +225,27 @@ fn guestCommandProbe(allocator: std.mem.Allocator, vertex_words: []const u32, pi
         }
     }
     const before = memory.data;
+    // Color draws may leave depth/stencil tests, clears and bounds enabled
+    // while both plane formats are INVALID. The draw must still execute and
+    // must not touch stale depth addresses. Compare the entire guest backing.
+    for ([_]bool{ false, true }) |explicit_invalid| {
+        memory.data = initial;
+        var invalid_planes = state;
+        try invalid_planes.writeRegister(.context, 0, 3);
+        try invalid_planes.writeRegister(.context, 0x200, 0x007007ff);
+        if (explicit_invalid) {
+            try invalid_planes.writeRegister(.context, 0x010, 0);
+            try invalid_planes.writeRegister(.context, 0x011, 0);
+            try invalid_planes.writeRegister(.context, 0x012, 0x10);
+            try invalid_planes.writeRegister(.context, 0x014, 0x10);
+            try invalid_planes.writeRegister(.context, 0x013, 0x11);
+            try invalid_planes.writeRegister(.context, 0x015, 0x11);
+        }
+        var plane_executor = gpu.DcbExecutor{ .state = &invalid_planes, .backend = renderer.dcbBackend(), .allocator = allocator };
+        _ = try plane_executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 2 });
+        if (!std.mem.eql(u8, &before, &memory.data)) return error.InvalidDepthPlaneChangedColorDraw;
+    }
+    std.debug.print("PASS color draw with invalid/unwritten depth and stencil formats, stale tests/clears/bounds and preserved backing\n", .{});
     renderer.draw_batch_limit = 8;
     const batch_backend = renderer.dcbBackend();
     for (0..7) |boundary| {
@@ -2066,7 +2087,11 @@ fn guestDepthProbe(allocator: std.mem.Allocator, vertex: []const u32, fragment: 
     try state.writeRegister(.context, 0x012, 0x200);
     try state.writeRegister(.context, 0x014, 0x200);
     try state.writeRegister(.context, 0x200, 3 | 4);
-    if (renderer.draw(&state, packet)) |_| return error.MissingStencilAccepted else |err| if (err != error.UnsupportedStencilLayout) return err;
+    // INVALID stencil is disabled. A valid stencil format with no backing
+    // remains an error, even when the depth plane itself is usable.
+    try state.writeRegister(.context, 0x011, 1);
+    if (renderer.draw(&state, packet)) |_| return error.MissingStencilAccepted else |err| if (err != error.SeparateStencilAddressesNotImplemented) return err;
+    try state.writeRegister(.context, 0x011, 0);
     try state.writeRegister(.context, 0x200, 2 | 4 | (1 << 3));
     if (renderer.draw(&state, packet)) |_| return error.DepthBoundsAccepted else |err| if (err != error.DepthBoundsNotImplemented) return err;
     try state.writeRegister(.context, 0x200, 2 | 4);

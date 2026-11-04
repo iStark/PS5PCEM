@@ -8,6 +8,49 @@ const gpu = @import("gpu");
 const rdna2 = @import("rdna2");
 const native = @import("root.zig");
 
+pub fn hasDepthPlane(state: *const gpu.State) bool {
+    return (state.readRegister(.context, 0x010) orelse 0) & 3 != 0;
+}
+
+/// Z_INVALID and STENCIL_INVALID disable their planes independently of the
+/// test/clear bits left in DB_DEPTH_CONTROL and DB_RENDER_CONTROL. Do not use
+/// a missing decoded target as this check: a valid format with an incomplete
+/// descriptor must still be rejected by attachment validation.
+pub fn effectiveDepthControl(state: *const gpu.State) gpu.resources.DepthControl {
+    var control = gpu.resources.decodeDepthControl(state);
+    if (!hasDepthPlane(state)) {
+        control.test_enabled = false;
+        control.write_enabled = false;
+        control.clear_enabled = false;
+    }
+    if ((state.readRegister(.context, 0x011) orelse 0) & 1 == 0) {
+        control.stencil_enabled = false;
+        control.stencil_clear_enabled = false;
+        control.backface_enabled = false;
+    }
+    return control;
+}
+
+test "invalid depth and stencil formats independently disable stale tests and clears" {
+    var state = gpu.State{};
+    try state.writeRegister(.context, 0x200, 0x007007ff);
+    try state.writeRegister(.context, 0, 3);
+    for ([_]u32{ 0, 1, 2, 3 }) |depth| {
+        for ([_]u32{ 0, 1 }) |stencil| {
+            try state.writeRegister(.context, 0x010, depth);
+            try state.writeRegister(.context, 0x011, stencil);
+            const control = effectiveDepthControl(&state);
+            try std.testing.expectEqual(depth != 0, hasDepthPlane(&state));
+            try std.testing.expectEqual(depth != 0, control.test_enabled);
+            try std.testing.expectEqual(depth != 0, control.write_enabled);
+            try std.testing.expectEqual(depth != 0, control.clear_enabled);
+            try std.testing.expectEqual(stencil != 0, control.stencil_enabled);
+            try std.testing.expectEqual(stencil != 0, control.stencil_clear_enabled);
+            try std.testing.expectEqual(stencil != 0, control.backface_enabled);
+        }
+    }
+}
+
 /// A bound null-export PS has no stores, depth export or coverage changes.
 /// Only this exact terminal form can accompany a CPU metadata expansion;
 /// a discarded/conditional fragment must not turn into a full-surface update.
