@@ -87,6 +87,8 @@ pub fn main(init: std.process.Init) !void {
     if (!std.mem.eql(u32, &source_words, &preserved)) return error.InvalidLayoutModifiedBuffer;
     std.debug.print("PASS guest RDNA2 -> shared IR -> HLSL -> D3D12 compute, descriptor arrays and exact readback\n", .{});
     try guestWaveProbe(allocator, &device);
+    try guestComputeImagesProbe(allocator, &device);
+    try guestComputeImageLayoutProbe(allocator);
 
     for ([_][2]u32{ .{ 1, 1 }, .{ 71, 37 }, .{ 256, 129 } }) |extent| {
         const width, const height = extent;
@@ -108,6 +110,126 @@ pub fn main(init: std.process.Init) !void {
     try guestGraphicsProbe(allocator, &device);
     if (device.validationErrors() != 0) return error.ValidationFailed;
     std.debug.print("D3D12 hardware probes passed\n", .{});
+}
+
+fn guestComputeImagesProbe(allocator: std.mem.Allocator, device: *d3d12.Device) !void {
+    const formats = [_]struct { guest: rdna2.spirv.StorageImageFormat, native: u32, bytes: u32 }{
+        .{ .guest = .r32_uint, .native = 42, .bytes = 4 },
+        .{ .guest = .rgba8_unorm, .native = 28, .bytes = 4 },
+        .{ .guest = .rgba16_float, .native = 10, .bytes = 8 },
+    };
+    for (formats) |format| for (0..3) |dimension| {
+        const layers: u32 = if (dimension == 0) 1 else 3;
+        const width = 7;
+        const height = 5;
+        const dim: u32 = switch (dimension) {
+            0 => 1,
+            1 => 5,
+            else => 2,
+        };
+        const kernel = [_]u32{ 0xf0000f00 | (dim << 3), 0x00000400, 0xf0200f00 | (dim << 3), 0x00020400, 0xbf810000 };
+        var program = try rdna2.decodeProgram(allocator, &kernel);
+        defer program.deinit(allocator);
+        const shader_dimension: rdna2.spirv.StorageImageDimension = switch (dimension) {
+            0 => .two_d,
+            1 => .two_d_array,
+            else => .three_d,
+        };
+        var shader = try rdna2.translateProgramSpirv(allocator, &program, .{
+            .stage = .compute,
+            .local_size = .{ width, height, layers },
+            .compute_inputs = .{ .local_invocation_id_components = 3 },
+            .storage_images = &.{
+                .{ .resource_sgpr = 0, .descriptor_index = 0, .format = format.guest, .dimension = shader_dimension },
+                .{ .resource_sgpr = 8, .descriptor_index = 1, .format = format.guest, .dimension = shader_dimension },
+            },
+            .allow_control_flow_fallback = false,
+        });
+        defer shader.deinit(allocator);
+        const source = try allocator.alloc(u8, width * height * layers * format.bytes);
+        defer allocator.free(source);
+        const destination = try allocator.alloc(u8, source.len);
+        defer allocator.free(destination);
+        const before = device.cacheStats();
+        for (0..2) |pass| {
+            if (format.guest == .rgba16_float) {
+                for (0..source.len / 2) |i| std.mem.writeInt(u16, source[i * 2 ..][0..2], @bitCast(@as(f16, @floatFromInt((i + pass * 13) % 255))), .little);
+            } else {
+                for (source, 0..) |*byte, i| byte.* = @truncate(i * 31 + pass * 17);
+            }
+            @memset(destination, 0xcc);
+            try device.dispatchImagesSpirv(shader.words, &.{}, &.{
+                .{ .pixels = source.ptr, .size = source.len, .width = width, .height = height, .layers = layers, .dimension = @intCast(dimension), .format = format.native },
+                .{ .pixels = destination.ptr, .size = destination.len, .width = width, .height = height, .layers = layers, .dimension = @intCast(dimension), .format = format.native, .writable = 1 },
+            }, .{ 1, 1, 1 }, false);
+            if (!std.mem.eql(u8, source, destination)) {
+                std.debug.print("Compute image mismatch: {s}, dimension={d}, pass={d}\n", .{ @tagName(format.guest), dimension, pass });
+                return error.ComputeImageMismatch;
+            }
+        }
+        if (before.enabled != 0 and device.cacheStats().shader_hits <= before.shader_hits) return error.ComputeImageCacheMiss;
+    };
+    std.debug.print("PASS compute storage images: exact uint/UNORM/HDR loads and stores, 2D/array/volume, row pitches and changed-input cache hits (18 dispatches)\n", .{});
+}
+
+fn guestComputeImageLayoutProbe(allocator: std.mem.Allocator) !void {
+    const Memory = struct {
+        data: []u8,
+        fn read(context: ?*anyopaque, address: u64, bytes: []u8) bool {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            if (address > self.data.len or bytes.len > self.data.len - address) return false;
+            @memcpy(bytes, self.data[@intCast(address)..][0..bytes.len]);
+            return true;
+        }
+        fn write(context: ?*anyopaque, address: u64, bytes: []const u8) bool {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            if (address > self.data.len or bytes.len > self.data.len - address) return false;
+            @memcpy(self.data[@intCast(address)..][0..bytes.len], bytes);
+            return true;
+        }
+    };
+    var memory = Memory{ .data = try allocator.alloc(u8, 2 * 1024 * 1024) };
+    defer allocator.free(memory.data);
+    var renderer = try d3d12.Renderer.init(allocator, .{ .context = &memory, .read = Memory.read, .write = Memory.write }, false);
+    defer renderer.deinit();
+    for ([_]u32{ 1, 2, 5 }) |dim| for ([_]u32{ 0, 24, 27 }) |tile| for ([_]u32{ 0, 1 }) |level| {
+        if (tile == 0 and level != 0) continue; // Linear layouts have one level.
+        errdefer std.debug.print("Compute image layout case dim={d} tile={d} level={d}\n", .{ dim, tile, level });
+        @memset(memory.data, 0x5a);
+        const code = [_]u32{
+            0x7e0802ff,              0x12345678, // v_mov_b32 v4, literal
+            0xf0200100 | (dim << 3), 0x00000400,
+            0xbf810000,
+        };
+        const program_address: u32 = 0x100 + dim * 256;
+        @memcpy(memory.data[program_address..][0 .. code.len * 4], std.mem.sliceAsBytes(&code));
+        const descriptor = [_]u32{
+            0x100, // 0x10000
+            (20 << 20) | (3 << 30), // R32_UINT, width=8
+            1 | (7 << 14), // height=8
+            0xfac | (level << 12) | (level << 16) | (tile << 20) | ((if (dim == 2) @as(u32, 10) else if (dim == 5) @as(u32, 13) else 9) << 28),
+            if (dim == 1) 0 else 3,
+            if (tile == 0) 0 else 2 << 4,
+            0,
+            0,
+        };
+        const texture = try gpu.TextureLayout.fromImage(try gpu.resources.decodeImageDescriptor(&descriptor));
+        const view = try texture.subresource(@intCast(level), 0, if (dim == 5) 4 else 1);
+        const expected = try allocator.dupe(u8, memory.data);
+        defer allocator.free(expected);
+        const offset: usize = @intCast(0x10000 + try view.sourceByteOffset(0, 0, 0, 0));
+        std.mem.writeInt(u32, expected[offset..][0..4], 0x12345678, .little);
+        var state = gpu.State{};
+        try state.writeRegister(.shader, 0x20c, program_address >> 8);
+        try state.writeRegister(.shader, 0x20d, 0);
+        try state.writeRegister(.shader, 0x213, (8 << 1) | (2 << 11));
+        for (descriptor, 0..) |word, i| try state.writeRegister(.shader, 0x240 + @as(u32, @intCast(i)), word);
+        var executor = gpu.DcbExecutor{ .state = &state, .backend = renderer.dcbBackend(), .allocator = allocator };
+        _ = try executor.execute(&.{ command(gpu.pm4.dispatch_direct, 4), 1, 1, 1, 1 });
+        if (renderer.failure) |err| return err;
+        if (!std.mem.eql(u8, expected, memory.data)) return error.ComputeImageGuestLayoutMismatch;
+    };
+    std.debug.print("PASS PM4 compute image stores: 15 linear/depth/color tiled 2D/array/volume views; mip and padding preservation\n", .{});
 }
 
 fn guestWaveProbe(allocator: std.mem.Allocator, device: *d3d12.Device) !void {
@@ -543,6 +665,7 @@ fn guestGraphicsProbe(allocator: std.mem.Allocator, device: *d3d12.Device) !void
     try guestCommandProbe(allocator, &vertex_words, &pixel_words);
     try guestMrtProbe(allocator, &vertex_words, &pixel_words);
     try guestFloatTargetProbe(allocator, &vertex_words);
+    try guestPackedTargetProbe(allocator, &vertex_words);
     try guestSurfaceProbe(allocator, &vertex_words, &pixel_words);
     for ([_]usize{ 0, d3d12.surface_cache.Cache.default_limit }) |limit| try guestDepthProbe(allocator, &vertex_words, &pixel_words, limit);
     try guestDepthBiasProbe(allocator, &vertex_words, &pixel_words);
@@ -1850,6 +1973,69 @@ fn guestFloatTargetProbe(allocator: std.mem.Allocator, vertex: []const u32) !voi
         if (!std.mem.eql(u8, backing, original)) return error.FloatSampleSourceModified;
     }
     std.debug.print("PASS RGBA16F render/readback/sample across six guest layouts, negative/HDR values and source preservation\n", .{});
+}
+
+fn guestPackedTargetProbe(allocator: std.mem.Allocator, vertex: []const u32) !void {
+    const memory = try allocator.create(GraphicsMemory);
+    defer allocator.destroy(memory);
+    memory.* = .{};
+    @memcpy(memory.data[0x200..][0 .. vertex.len * 4], std.mem.sliceAsBytes(vertex));
+    const fragment = [_]u32{
+        vop1(1, 0, 255), @bitCast(@as(f32, 1)),    vop1(1, 1, 255), @bitCast(@as(f32, 0.75)),
+        vop1(1, 2, 255), @bitCast(@as(f32, 0.25)), vop1(1, 3, 255), @bitCast(@as(f32, 1)),
+        0xf800080f,      0x03020100,               0xbf810000,
+    };
+    @memcpy(memory.data[0x400..][0..@sizeOf(@TypeOf(fragment))], std.mem.asBytes(&fragment));
+    var renderer = try d3d12.Renderer.init(allocator, memory.access(), false);
+    defer renderer.deinit();
+    const packet: gpu.pm4.Packet = .{ .kind = .command, .header = command(gpu.pm4.draw_index_auto, 2), .opcode = gpu.pm4.draw_index_auto, .body = &.{ 3, 2 } };
+    for ([_]gpu.resources.TileMode{ .linear, .standard_256b, .standard_4kb, .standard_64kb, .partially_resident, .render_target }) |mode| {
+        var state = try graphicsState(65, 37, 72);
+        try state.writeRegister(.context, 0x318, 0x100);
+        try state.writeRegister(.context, 0x3b8, @as(u32, @intFromEnum(mode)) << 14);
+        const layout = try d3d12.surfaces.colorLayout(gpu.resources.decodeColorTarget(&state, 0, 15).?);
+        const backing = memory.data[0x10000..][0..@intCast(layout.required_source_bytes)];
+        @memset(backing, 0xa7);
+        try renderer.draw(&state, packet);
+        // Independent RGBA8 render determines raster coverage; packed targets
+        // must change those same texels and preserve every padding byte.
+        const coverage = try allocator.dupe(u8, backing);
+        defer allocator.free(coverage);
+        for ([_]u32{ 9 << 2, (6 << 2) | (7 << 8) }, [_]u32{
+            1023 | (767 << 10) | (256 << 20) | (3 << 30),
+            0x3c0 | (0x3a0 << 11) | (0x1a0 << 22),
+        }) |info, encoded| {
+            try state.writeRegister(.context, 0x31c, info);
+            @memset(backing, 0xa7);
+            try renderer.draw(&state, packet);
+            const expected = try allocator.alloc(u8, backing.len);
+            defer allocator.free(expected);
+            @memset(expected, 0xa7);
+            for (0..37) |y| for (0..65) |x| {
+                const offset: usize = @intCast(try layout.sourceByteOffset(@intCast(x), @intCast(y), 0));
+                if (coverage[offset] != 255) continue;
+                std.mem.writeInt(u32, expected[offset..][0..4], encoded, .little);
+            };
+            if (!std.mem.eql(u8, backing, expected)) {
+                for (0..backing.len / 4) |i| {
+                    const actual = std.mem.readInt(u32, backing[i * 4 ..][0..4], .little);
+                    const wanted = std.mem.readInt(u32, expected[i * 4 ..][0..4], .little);
+                    if (actual != wanted) {
+                        std.debug.print("Packed target mode={s} info=0x{x} offset=0x{x}: actual=0x{x}, expected=0x{x}\n", .{ @tagName(mode), info, i * 4, actual, wanted });
+                        break;
+                    }
+                }
+                return error.PackedTargetMismatch;
+            }
+            if (info == 9 << 2) {
+                var staged = try d3d12.surfaces.Staged.read(allocator, memory.access(), 0x10000, layout);
+                defer staged.deinit();
+                try d3d12.surfaces.convertScanout(staged.pixels, 0x8100_0000_2200_0000);
+                if (!std.mem.eql(u8, staged.pixels[(18 * 65 + 32) * 4 ..][0..4], &.{ 255, 191, 64, 255 })) return error.PackedScanoutMismatch;
+            }
+        }
+    }
+    std.debug.print("PASS RGB10A2/R11G11B10 render and readback across six guest layouts, SDR scanout and preserved padding\n", .{});
 }
 
 fn guestDepthBiasProbe(allocator: std.mem.Allocator, vertex: []const u32, fragment: []const u32) !void {

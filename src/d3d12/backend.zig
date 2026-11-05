@@ -11,6 +11,7 @@ const native = @import("root.zig");
 const graphics = @import("graphics.zig");
 const surfaces = @import("surfaces.zig");
 const resources = @import("resources.zig");
+const compute_images = @import("compute_images.zig");
 const staging = @import("staging.zig");
 const surface_cache = @import("surface_cache.zig");
 const shader_cache = @import("shader_cache.zig");
@@ -143,7 +144,11 @@ pub const Error = std.mem.Allocator.Error || error{
     OverlappingBufferViewsNotImplemented,
     PositiveYOrMirroredViewportNotImplemented,
     ReadOnlyDepthDecompressionNotImplemented,
-    SampledAndStorageImagesNotImplemented,
+    ComputeImageOperationNotImplemented,
+    ComputeImageLayoutNotImplemented,
+    ComputeImageFormatNotImplemented,
+    ComputeImageAliasNotImplemented,
+    DynamicComputeImageNotImplemented,
     SelectiveDepthDecompressionNotImplemented,
     SparseColorTargetsNotImplemented,
     StencilAttachmentAliasNotImplemented,
@@ -259,6 +264,7 @@ pub const Error = std.mem.Allocator.Error || error{
     UnsupportedScalarDestination,
     UnsupportedScalarSource,
     UnsupportedScanoutFormat,
+    InvalidPixelSize,
     UnsupportedScanoutLayout,
     UnsupportedStencilLayout,
     UnsupportedTileMode,
@@ -606,6 +612,8 @@ pub const Renderer = struct {
         const analysis = analysis_lease.view();
         var storage = Storage{ .allocator = self.allocator };
         defer storage.deinit();
+        var images = compute_images.Images{ .allocator = self.allocator };
+        defer images.deinit();
         const unknown: gpu.scalar_provenance.ScalarRegisters = @splat(.{});
         // COMPUTE_PGM_RSRC2.LDS_SIZE counts 128-dword (512-byte) granules.
         const lds_bytes = ((state.readRegister(.shader, 0x213) orelse 0) >> 15 & 0x1ff) * 512;
@@ -613,7 +621,10 @@ pub const Renderer = struct {
         for (analysis.program.instructions.items) |inst| {
             var resolver = gpu.scalar_resources.Resolver{ .bindings = &bindings, .reader = self.reader(), .instructions = analysis.program.instructions.items, .graph = &analysis.graph, .snapshot = &unknown };
             switch (inst.family) {
-                .mimg => return error.SampledAndStorageImagesNotImplemented,
+                .mimg => {
+                    try images.capture(&resolver, inst);
+                    continue;
+                },
                 .flat => return error.FlatMemoryNotImplemented,
                 .smem => {
                     try storage.stageScalar(self.memory, &resolver, inst);
@@ -663,6 +674,7 @@ pub const Renderer = struct {
             .compute_inputs = .{ .workgroup_id_sgprs = system.workgroup_id_sgprs, .threadgroup_size_sgpr = system.threadgroup_size_sgpr, .local_invocation_id_components = system.local_invocation_id_components },
             .scalar_registers = scalar[0..scalar_count],
             .storage_buffers = storage.mappings.items,
+            .storage_images = images.bindings.items,
             .scalar_memories = storage.pointers.items,
             .descriptor_array_length = @intCast(@max(1, storage.count)),
             .workgroup_memory_size_bytes = lds_bytes,
@@ -686,10 +698,19 @@ pub const Renderer = struct {
             native_buffers[buffer_count] = native.Buffer.fromSlice(self.gds.?);
             buffer_count += 1;
         }
-        try self.device.dispatchSpirv(module.words, native_buffers[0..buffer_count], groups, uses_gds);
+        // Independent native snapshots cannot represent writable buffer/image
+        // aliases. Reject them before executing or publishing any writes.
+        for (images.entries[0..images.count], images.native_images[0..images.count]) |entry, image| {
+            for (0..storage.count) |i| if ((image.writable != 0 or storage.writable[i]) and
+                entry.descriptor.address < storage.addresses[i] + storage.sizes[i] and
+                storage.addresses[i] < entry.descriptor.address + entry.layout.required_source_bytes)
+                return error.ComputeImageAliasNotImplemented;
+        }
+        try self.device.dispatchImagesSpirv(module.words, native_buffers[0..buffer_count], images.native_images[0..images.count], groups, uses_gds);
         for (0..storage.count) |i| {
             if (storage.writable[i] and !self.memory.write(self.memory.context, storage.addresses[i], storage.data[i][0..storage.sizes[i]])) return error.GuestWriteFailed;
         }
+        try images.commit(self.memory);
     }
 
     pub fn draw(self: *Renderer, state: *const gpu.State, packet: gpu.pm4.Packet) !void {
@@ -1053,15 +1074,12 @@ pub const Renderer = struct {
         const resolve = self.display_resolver orelse return error.DisplayResolverUnavailable;
         const display = resolve(flip) orelse return error.DisplayBufferUnavailable;
         errdefer std.debug.print("[d3d12 scanout] rejected buffer={any}\n", .{display});
-        const swap_red_blue = try surfaces.scanoutSwapsRedBlue(display.pixel_format);
+        _ = try surfaces.scanoutSwapsRedBlue(display.pixel_format);
         const layout = try surfaces.scanoutLayout(display.width, display.height, display.pitch_in_pixels, display.tiling_mode);
         var surface = try surfaces.Staged.readCached(self.allocator, &self.staging_pool, &self.conversion_cache, self.memory, display.address, layout);
         defer surface.deinit();
         const pixels = surface.pixels;
-        if (swap_red_blue) {
-            var offset: usize = 0;
-            while (offset < pixels.len) : (offset += 4) std.mem.swap(u8, &pixels[offset], &pixels[offset + 2]);
-        }
+        try surfaces.convertScanout(pixels, display.pixel_format);
         try self.device.presentRgba(pixels, display.width, display.height);
         if (self.frame_started_ns == 0) std.debug.print("[d3d12] first frame presented: {d}x{d} format=0x{x} tile={d}\n", .{
             display.width, display.height, display.pixel_format, display.tiling_mode,

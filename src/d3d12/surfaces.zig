@@ -32,6 +32,8 @@ pub fn colorFormat(target: gpu.resources.ColorTarget) !u32 {
         },
         5 => if (target.number_type == 7 and target.component_swap == 0) 34 else return error.UnsupportedRenderTargetLayout, // R16G16_FLOAT
         12 => if (target.number_type == 7 and target.component_swap == 0) 10 else return error.UnsupportedRenderTargetLayout, // R16G16B16A16_FLOAT
+        9 => if (target.number_type == 0 and target.component_swap == 0) 24 else return error.UnsupportedRenderTargetLayout, // R10G10B10A2_UNORM
+        6 => if (target.number_type == 7 and target.component_swap == 0) 26 else return error.UnsupportedRenderTargetLayout, // R11G11B10_FLOAT
         else => return error.UnsupportedRenderTargetLayout,
     };
     if (format != 28 and target.dcc_enabled) return error.UnsupportedRenderTargetLayout;
@@ -93,15 +95,52 @@ pub fn scanoutSwapsRedBlue(pixel_format: u64) !bool {
     return switch (pixel_format) {
         0, 0x8000_0000_2200_0000 => false, // RGBA8 (zero retains the legacy internal default).
         0x8000_0000_0000_0000 => true, // BGRA8.
+        0x8100_0000_2200_0000 => false, // RGB10A2 SDR.
+        0x8100_0000_0000_0000 => true, // BGR10A2 SDR.
         else => error.UnsupportedScanoutFormat,
     };
 }
 
-test "VideoOut RGBA8 and BGRA8 select the correct byte order without accepting HDR" {
+pub fn convertScanout(pixels: []u8, pixel_format: u64) !void {
+    const swap = try scanoutSwapsRedBlue(pixel_format);
+    if (pixels.len % 4 != 0) return error.InvalidPixelSize;
+    const packed_sdr = pixel_format >> 56 == 0x81;
+    var offset: usize = 0;
+    while (offset < pixels.len) : (offset += 4) {
+        if (packed_sdr) {
+            const word = std.mem.readInt(u32, pixels[offset..][0..4], .little);
+            pixels[offset] = @intCast(((word & 1023) * 255 + 511) / 1023);
+            pixels[offset + 1] = @intCast((((word >> 10) & 1023) * 255 + 511) / 1023);
+            pixels[offset + 2] = @intCast((((word >> 20) & 1023) * 255 + 511) / 1023);
+            pixels[offset + 3] = @intCast((word >> 30) * 85);
+        }
+        if (swap) std.mem.swap(u8, &pixels[offset], &pixels[offset + 2]);
+    }
+}
+
+test "VideoOut RGBA8, BGRA8 and packed SDR select channels without accepting PQ HDR" {
     try std.testing.expect(!try scanoutSwapsRedBlue(0x8000_0000_2200_0000));
     try std.testing.expect(try scanoutSwapsRedBlue(0x8000_0000_0000_0000));
     try std.testing.expect(!try scanoutSwapsRedBlue(0));
-    try std.testing.expectError(error.UnsupportedScanoutFormat, scanoutSwapsRedBlue(0x8100_0000_2200_0000));
+    try std.testing.expectError(error.UnsupportedScanoutFormat, scanoutSwapsRedBlue(0x8100_0704_2200_0000));
+    for (0..1024) |code| {
+        const r: u32 = @intCast(code);
+        const g = (r * 7) % 1024;
+        const b = 1023 - r;
+        const a = r % 4;
+        const packed_word = r | (g << 10) | (b << 20) | (a << 30);
+        for ([_]bool{ false, true }) |swap| {
+            var bytes = std.mem.toBytes(std.mem.nativeToLittle(u32, packed_word));
+            try convertScanout(&bytes, if (swap) 0x8100_0000_0000_0000 else 0x8100_0000_2200_0000);
+            const expected = [_]u8{
+                @intFromFloat(@round(@as(f64, @floatFromInt(if (swap) b else r)) * 255.0 / 1023.0)),
+                @intFromFloat(@round(@as(f64, @floatFromInt(g)) * 255.0 / 1023.0)),
+                @intFromFloat(@round(@as(f64, @floatFromInt(if (swap) r else b)) * 255.0 / 1023.0)),
+                @intCast(a * 85),
+            };
+            try std.testing.expectEqualSlices(u8, &expected, &bytes);
+        }
+    }
 }
 
 fn validate(layout: gpu.SurfaceLayout, address: u64) !void {

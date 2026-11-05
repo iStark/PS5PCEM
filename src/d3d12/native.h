@@ -41,6 +41,12 @@ typedef struct Ps5D3D12Buffer {
     size_t size;
 } Ps5D3D12Buffer;
 
+typedef struct Ps5D3D12StorageImage {
+    uint8_t *pixels;
+    size_t size;
+    uint32_t width, height, layers, dimension, format, writable;
+} Ps5D3D12StorageImage;
+
 typedef struct Ps5D3D12Image {
     const uint8_t *pixels;
     size_t size;
@@ -132,7 +138,8 @@ int32_t ps5_d3d12_resource_pool_limit(Ps5D3D12 *context, uint64_t bytes);
  * Used by the hardware probe to exercise eviction and uncached equivalence. */
 int32_t ps5_d3d12_cache_limits(Ps5D3D12 *context, uint32_t shaders, uint32_t pipelines);
 int32_t ps5_d3d12_dispatch_spirv(Ps5D3D12 *context, const uint32_t *words, size_t word_count,
-    const Ps5D3D12Buffer *buffers, uint32_t buffer_count, const uint32_t groups[3], uint32_t gds);
+    const Ps5D3D12Buffer *buffers, uint32_t buffer_count, const uint32_t groups[3], uint32_t gds,
+    const Ps5D3D12StorageImage *images, uint32_t image_count);
 int32_t ps5_d3d12_draw_spirv(Ps5D3D12 *context, const uint32_t *vs, size_t vs_count,
     const uint32_t *ps, size_t ps_count, const Ps5D3D12Draw *draw, const uint8_t *indices, size_t index_bytes,
     const Ps5D3D12Buffer *buffers, uint32_t buffer_count, const Ps5D3D12Image *images, uint32_t image_count, uint8_t *rgba,

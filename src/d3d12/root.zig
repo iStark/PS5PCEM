@@ -37,6 +37,18 @@ pub const Buffer = extern struct {
         return .{ .bytes = bytes.ptr, .size = bytes.len };
     }
 };
+/// A tightly packed, single-mip UAV. dimension: 0=2D, 1=2D array, 2=3D.
+pub const StorageImage = extern struct {
+    pixels: [*]u8,
+    size: usize,
+    width: u32,
+    height: u32,
+    layers: u32 = 1,
+    dimension: u32 = 0,
+    format: u32,
+    writable: u32 = 0,
+};
+
 pub const SampledImage = extern struct {
     pixels: [*]const u8,
     size: usize,
@@ -308,11 +320,16 @@ pub const Device = struct {
     /// With `gds`, the last buffer is the persistent global data share bound
     /// after the guest storage array; it is read back like the others.
     pub fn dispatchSpirv(self: *Device, words: []const u32, buffers: []const Buffer, groups: [3]u32, gds: bool) Error!void {
+        return self.dispatchImagesSpirv(words, buffers, &.{}, groups, gds);
+    }
+
+    pub fn dispatchImagesSpirv(self: *Device, words: []const u32, buffers: []const Buffer, images: []const StorageImage, groups: [3]u32, gds: bool) Error!void {
         if (words.len < 5 or words[0] != 0x07230203 or buffers.len > 64 + @as(usize, @intFromBool(gds)) or (gds and buffers.len == 0)) return error.InvalidArgument;
         for (groups) |size| if (size == 0 or size > 65535) return error.InvalidArgument;
         for (buffers) |buffer| if (buffer.size == 0 or buffer.size % 4 != 0 or buffer.size > 256 * 1024 * 1024) return error.InvalidArgument;
         if (builtin.os.tag != .windows) return error.UnsupportedPlatform;
-        try self.check(ps5_d3d12_dispatch_spirv(self.handle, words.ptr, words.len, buffers.ptr, @intCast(buffers.len), &groups, @intFromBool(gds)));
+        if (images.len > 32) return error.InvalidArgument;
+        try self.check(ps5_d3d12_dispatch_spirv(self.handle, words.ptr, words.len, buffers.ptr, @intCast(buffers.len), &groups, @intFromBool(gds), images.ptr, @intCast(images.len)));
     }
 
     pub fn drawSpirv(self: *Device, vertex: []const u32, fragment: []const u32, draw: Draw, rgba: []u8) Error!void {
@@ -435,7 +452,7 @@ pub fn colorSize(width: u32, height: u32, format: u32) Error!usize {
     const rgba = try rgbaSize(width, height);
     const size = switch (format) {
         10 => rgba * 2, // R16G16B16A16_FLOAT
-        28, 31, 34 => rgba,
+        24, 26, 28, 31, 34 => rgba,
         else => return error.InvalidArgument,
     };
     if (size > 256 * 1024 * 1024) return error.InvalidArgument;
@@ -517,7 +534,7 @@ extern fn ps5_d3d12_attachment_stats(*Handle, *AttachmentStats) void;
 extern fn ps5_d3d12_attachment_cache(*Handle, c_int) i32;
 extern fn ps5_d3d12_upload_cache_limit(*Handle, u64) i32;
 extern fn ps5_d3d12_resource_pool_limit(*Handle, u64) i32;
-extern fn ps5_d3d12_dispatch_spirv(*Handle, [*]const u32, usize, [*]const Buffer, u32, *const [3]u32, u32) i32;
+extern fn ps5_d3d12_dispatch_spirv(*Handle, [*]const u32, usize, [*]const Buffer, u32, *const [3]u32, u32, [*]const StorageImage, u32) i32;
 extern fn ps5_d3d12_draw_spirv(*Handle, [*]const u32, usize, [*]const u32, usize, *const Draw, [*]const u8, usize, [*]const Buffer, u32, [*]const SampledImage, u32, [*]u8, [*]u8, usize) i32;
 extern fn ps5_d3d12_present_rgba(*Handle, [*]const u8, u32, u32) i32;
 

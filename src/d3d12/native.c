@@ -64,7 +64,7 @@ typedef struct ShaderEntry {
     size_t word_count, bytes;
     uint64_t hash, id, used;
     SpvExecutionModel stage;
-    uint32_t buffers, images, scalars;
+    uint32_t buffers, images, scalars, storage_images;
     ID3DBlob *code;
 } ShaderEntry;
 /* Fixed-size words, not a native descriptor with pointers/padding. All other
@@ -803,7 +803,7 @@ static HRESULT root_signature(Ps5D3D12 *c, int compute, ID3D12RootSignature **ou
  * emits HLSL, which the Windows compiler turns into native D3D bytecode.
  * Reflection rejects resources not yet bound by this backend. */
 static HRESULT compile_spirv_uncached(Ps5D3D12 *c, const uint32_t *words, size_t word_count,
-    SpvExecutionModel stage, uint32_t buffer_count, uint32_t image_count, uint32_t scalars, ID3DBlob **code) {
+    SpvExecutionModel stage, uint32_t buffer_count, uint32_t image_count, uint32_t scalars, uint32_t storage_count, ID3DBlob **code) {
     spvc_context context = NULL;
     spvc_parsed_ir ir = NULL;
     spvc_compiler compiler = NULL;
@@ -847,10 +847,11 @@ static HRESULT compile_spirv_uncached(Ps5D3D12 *c, const uint32_t *words, size_t
         if (!count) continue;
         const int storage = kind == SPVC_RESOURCE_TYPE_STORAGE_BUFFER;
         const int sampled = kind == SPVC_RESOURCE_TYPE_SAMPLED_IMAGE;
+        const int typed = kind == SPVC_RESOURCE_TYPE_STORAGE_IMAGE && stage == SpvExecutionModelGLCompute;
         const uint32_t expected_count = storage ? buffer_count : sampled ? image_count : 0;
         // For compute, `scalars` instead selects the persistent GDS block,
         // bound as one UAV immediately after the guest storage array.
-        if ((!storage && !sampled) || count > (storage ? 1u + (scalars != 0) + (stage == SpvExecutionModelFragment) : 4u)) {
+        if ((!storage && !sampled && !typed) || count > (typed ? storage_count : storage ? 1u + (scalars != 0) + (stage == SpvExecutionModelFragment) : 4u)) {
             snprintf(c->error, sizeof(c->error), "D3D12 shader resource kind %u/count %zu is not supported by this pipeline", kind, count);
             goto done;
         }
@@ -858,6 +859,19 @@ static HRESULT compile_spirv_uncached(Ps5D3D12 *c, const uint32_t *words, size_t
             const unsigned set = spvc_compiler_get_decoration(compiler, list[resource].id, SpvDecorationDescriptorSet);
             const unsigned binding = spvc_compiler_get_decoration(compiler, list[resource].id, SpvDecorationBinding);
             spvc_type type = spvc_compiler_get_type_handle(compiler, list[resource].type_id);
+            if (typed) {
+                if (set != 0 || binding < 2 || binding - 2 >= storage_count || spvc_type_get_num_array_dimensions(type) ||
+                    spvc_type_get_image_multisampled(type) || spvc_type_get_image_is_depth(type) ||
+                    (spvc_type_get_image_dimension(type) != SpvDim2D && spvc_type_get_image_dimension(type) != SpvDim3D)) {
+                    hr = failure(c, E_INVALIDARG, "compute storage image descriptor mismatch"); goto done;
+                }
+                spvc_hlsl_resource_binding remap;
+                spvc_hlsl_resource_binding_init(&remap);
+                remap.stage = stage; remap.desc_set = set; remap.binding = binding;
+                remap.uav.register_space = 1; remap.uav.register_binding = binding - 2;
+                CROSS(spvc_compiler_hlsl_add_resource_binding(compiler, &remap));
+                continue;
+            }
             const int scalar = storage && scalars && binding == 10 && stage != SpvExecutionModelGLCompute;
             const int global = storage && scalars && binding == PS5_GDS_BINDING && stage == SpvExecutionModelGLCompute;
             const int status = storage && stage == SpvExecutionModelFragment && set == 1 && binding == 0;
@@ -909,7 +923,7 @@ done:
 }
 
 static HRESULT compile_spirv(Ps5D3D12 *c, const uint32_t *words, size_t word_count,
-    SpvExecutionModel stage, uint32_t buffer_count, uint32_t image_count, uint32_t scalars, ID3DBlob **code, uint64_t *id) {
+    SpvExecutionModel stage, uint32_t buffer_count, uint32_t image_count, uint32_t scalars, uint32_t storage_count, ID3DBlob **code, uint64_t *id) {
     if (word_count > SIZE_MAX / sizeof(*words)) return E_INVALIDARG;
     const size_t word_bytes = word_count * sizeof(*words);
     uint64_t hash = UINT64_C(14695981039346656037);
@@ -917,7 +931,7 @@ static HRESULT compile_spirv(Ps5D3D12 *c, const uint32_t *words, size_t word_cou
     for (UINT i = 0; i < c->shader_limit; ++i) {
         ShaderEntry *entry = &c->shader_cache[i];
         if (!entry->code || entry->hash != hash || entry->word_count != word_count || entry->stage != stage ||
-            entry->buffers != buffer_count || entry->images != image_count || entry->scalars != scalars || memcmp(entry->words, words, word_bytes)) continue;
+            entry->buffers != buffer_count || entry->images != image_count || entry->scalars != scalars || entry->storage_images != storage_count || memcmp(entry->words, words, word_bytes)) continue;
         ++c->cache_stats.shader_hits;
         entry->used = ++c->cache_clock;
         *code = entry->code; *id = entry->id;
@@ -926,7 +940,7 @@ static HRESULT compile_spirv(Ps5D3D12 *c, const uint32_t *words, size_t word_cou
     }
     ++c->cache_stats.shader_misses;
     const ULONGLONG started = GetTickCount64();
-    HRESULT hr = compile_spirv_uncached(c, words, word_count, stage, buffer_count, image_count, scalars, code);
+    HRESULT hr = compile_spirv_uncached(c, words, word_count, stage, buffer_count, image_count, scalars, storage_count, code);
     c->cache_stats.compile_ms += GetTickCount64() - started;
     if (FAILED(hr)) return hr; // Failed validation/compilation is never cached.
     *id = ++c->next_shader_id; // Never reuse an ID when an LRU slot is replaced.
@@ -950,23 +964,32 @@ static HRESULT compile_spirv(Ps5D3D12 *c, const uint32_t *words, size_t word_cou
         evict_shader(c, victim);
     } while (c->cache_stats.shader_bytes + bytes > SHADER_CACHE_BYTES);
     *victim = (ShaderEntry){.words = copy, .word_count = word_count, .bytes = bytes, .hash = hash, .id = *id,
-        .used = ++c->cache_clock, .stage = stage, .buffers = buffer_count, .images = image_count, .scalars = scalars, .code = *code};
+        .used = ++c->cache_clock, .stage = stage, .buffers = buffer_count, .images = image_count, .scalars = scalars, .storage_images = storage_count, .code = *code};
     IUnknown_AddRef((IUnknown *)*code);
     ++c->cache_stats.shader_entries;
     c->cache_stats.shader_bytes += bytes;
     return S_OK;
 }
 
-static HRESULT storage_root(Ps5D3D12 *c, uint32_t count, ID3D12RootSignature **root) {
-    D3D12_DESCRIPTOR_RANGE range = {0};
-    range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
-    range.NumDescriptors = count;
+static HRESULT storage_root(Ps5D3D12 *c, uint32_t count, uint32_t images, ID3D12RootSignature **root) {
+    D3D12_DESCRIPTOR_RANGE ranges[2] = {0};
+    UINT range_count = 0;
+    if (count) {
+        ranges[range_count].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+        ranges[range_count++].NumDescriptors = count;
+    }
+    if (images) {
+        ranges[range_count].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+        ranges[range_count].NumDescriptors = images;
+        ranges[range_count].RegisterSpace = 1;
+        ranges[range_count++].OffsetInDescriptorsFromTableStart = count;
+    }
     D3D12_ROOT_PARAMETER parameter = {0};
     parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-    parameter.DescriptorTable.NumDescriptorRanges = 1;
-    parameter.DescriptorTable.pDescriptorRanges = &range;
+    parameter.DescriptorTable.NumDescriptorRanges = range_count;
+    parameter.DescriptorTable.pDescriptorRanges = ranges;
     D3D12_ROOT_SIGNATURE_DESC desc = {0};
-    desc.NumParameters = count ? 1 : 0;
+    desc.NumParameters = range_count ? 1 : 0;
     desc.pParameters = &parameter;
     ID3DBlob *blob = NULL, *errors = NULL;
     HRESULT hr = c->serialize(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &errors);
@@ -1022,11 +1045,80 @@ static HRESULT guest_graphics_root(Ps5D3D12 *c, uint32_t buffers, uint32_t image
     return hr;
 }
 
+typedef struct ComputeImage {
+    ID3D12Resource *texture, *upload, *readback;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprints[64];
+    UINT rows[64], subresources;
+    UINT64 row_bytes[64], bytes;
+} ComputeImage;
+
+static HRESULT compute_image(Ps5D3D12 *c, const Ps5D3D12StorageImage *image, ComputeImage *out,
+    D3D12_CPU_DESCRIPTOR_HANDLE handle) {
+    HRESULT hr;
+    if (!image->pixels || !image->width || !image->height || !image->layers || image->width > 16384 ||
+        image->height > 16384 || image->dimension > 2 || (image->dimension == 0 && image->layers != 1) ||
+        (image->dimension == 1 && image->layers > 64) || (image->dimension == 2 &&
+        (image->width > 2048 || image->height > 2048 || image->layers > 2048)) ||
+        !image->size || image->size > 256 * 1024 * 1024 || image->writable > 1)
+        return failure(c, E_INVALIDARG, "compute image bounds");
+    D3D12_FEATURE_DATA_FORMAT_SUPPORT support = {0};
+    support.Format = image->format;
+    TRY(ID3D12Device_CheckFeatureSupport(c->device, D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support)));
+    const UINT flags = D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD | (image->writable ? D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE : 0);
+    if ((support.Support2 & flags) != flags) { hr = failure(c, DXGI_ERROR_UNSUPPORTED, "typed compute image load/store format"); goto done; }
+    D3D12_RESOURCE_DESC desc = {0};
+    desc.Dimension = image->dimension == 2 ? D3D12_RESOURCE_DIMENSION_TEXTURE3D : D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = image->width; desc.Height = image->height; desc.DepthOrArraySize = (UINT16)image->layers;
+    desc.MipLevels = 1; desc.Format = image->format; desc.SampleDesc.Count = 1;
+    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    out->subresources = image->dimension == 1 ? image->layers : 1;
+    ID3D12Device_GetCopyableFootprints(c->device, &desc, 0, out->subresources, 0, out->footprints, out->rows, out->row_bytes, &out->bytes);
+    UINT64 tight = 0;
+    for (UINT i = 0; i < out->subresources; ++i) tight += out->row_bytes[i] * out->rows[i] * out->footprints[i].Footprint.Depth;
+    if (out->bytes > 512 * UINT64_C(1024) * 1024 || tight != image->size) { hr = failure(c, E_INVALIDARG, "compute image footprint"); goto done; }
+    D3D12_HEAP_PROPERTIES heap = {0}; heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    TRY(ID3D12Device_CreateCommittedResource(c->device, &heap, 0, &desc, D3D12_RESOURCE_STATE_COPY_DEST, NULL, &IID_ID3D12Resource, (void **)&out->texture));
+    TRY(buffer(c, out->bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, 0, &out->upload));
+    if (image->writable) TRY(buffer(c, out->bytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST, 0, &out->readback));
+    void *mapped;
+    D3D12_RANGE empty = {0, 0}, entire = {0, (SIZE_T)out->bytes};
+    TRY(ID3D12Resource_Map(out->upload, 0, &empty, &mapped));
+    size_t cursor = 0;
+    for (UINT i = 0; i < out->subresources; ++i) {
+        const D3D12_PLACED_SUBRESOURCE_FOOTPRINT *fp = &out->footprints[i];
+        for (UINT z = 0; z < fp->Footprint.Depth; ++z) for (UINT y = 0; y < out->rows[i]; ++y) {
+            memcpy((uint8_t *)mapped + fp->Offset + ((size_t)z * out->rows[i] + y) * fp->Footprint.RowPitch,
+                image->pixels + cursor, (size_t)out->row_bytes[i]);
+            cursor += (size_t)out->row_bytes[i];
+        }
+    }
+    ID3D12Resource_Unmap(out->upload, 0, &entire);
+    D3D12_UNORDERED_ACCESS_VIEW_DESC view = {0}; view.Format = desc.Format;
+    if (image->dimension == 2) { view.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE3D; view.Texture3D.WSize = image->layers; }
+    else if (image->dimension == 1) { view.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY; view.Texture2DArray.ArraySize = image->layers; }
+    else view.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    ID3D12Device_CreateUnorderedAccessView(c->device, out->texture, NULL, &view, handle);
+done:
+    return hr;
+}
+
+static void copy_compute_image(Ps5D3D12 *c, const ComputeImage *image, int readback) {
+    for (UINT i = 0; i < image->subresources; ++i) {
+        D3D12_TEXTURE_COPY_LOCATION texture = {0}, linear = {0};
+        texture.pResource = image->texture; texture.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; texture.SubresourceIndex = i;
+        linear.pResource = readback ? image->readback : image->upload; linear.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        linear.PlacedFootprint = image->footprints[i];
+        ID3D12GraphicsCommandList_CopyTextureRegion(c->commands, readback ? &linear : &texture, 0, 0, 0, readback ? &texture : &linear, NULL);
+    }
+}
+
 int32_t ps5_d3d12_dispatch_spirv(Ps5D3D12 *c, const uint32_t *words, size_t word_count,
-    const Ps5D3D12Buffer *buffers, uint32_t count, const uint32_t groups[3], uint32_t gds) {
+    const Ps5D3D12Buffer *buffers, uint32_t count, const uint32_t groups[3], uint32_t gds,
+    const Ps5D3D12StorageImage *images, uint32_t image_count) {
     // With `gds`, the final buffer is the GDS block at u(array_count); the
     // guest storage array keeps u0..u(array_count - 1).
     if (!c || !words || word_count < 5 || gds > 1 || count > 64 + gds || (gds && !count) || (count && !buffers) || !groups) return E_INVALIDARG;
+    if (image_count > 32 || (image_count && !images)) return E_INVALIDARG;
     for (UINT axis = 0; axis < 3; ++axis) if (!groups[axis] || groups[axis] > 65535) return E_INVALIDARG;
     for (UINT i = 0; i < count; ++i) if (!buffers[i].bytes || !buffers[i].size || buffers[i].size % 4 || buffers[i].size > 256 * 1024 * 1024) return E_INVALIDARG;
     HRESULT hr;
@@ -1035,12 +1127,13 @@ int32_t ps5_d3d12_dispatch_spirv(Ps5D3D12 *c, const uint32_t *words, size_t word
     ID3D12PipelineState *pipeline = NULL;
     ID3D12DescriptorHeap *heap = NULL;
     ID3D12Resource *gpu[65] = {0}, *upload[65] = {0}, *readback[65] = {0};
+    ComputeImage typed[32] = {0};
     uint64_t shader_id;
-    TRY(compile_spirv(c, words, word_count, SpvExecutionModelGLCompute, count - gds, 0, gds, &code, &shader_id));
-    const PipelineKey key = {{1, shader_id, 0, count}};
+    TRY(compile_spirv(c, words, word_count, SpvExecutionModelGLCompute, count - gds, 0, gds, image_count, &code, &shader_id));
+    const PipelineKey key = {{1, shader_id, image_count, count}};
     if (!cached_pipeline(c, &key, &root, &pipeline)) {
         const ULONGLONG started = GetTickCount64();
-        TRY(storage_root(c, count, &root));
+        TRY(storage_root(c, count, image_count, &root));
         D3D12_COMPUTE_PIPELINE_STATE_DESC desc = {0};
         desc.pRootSignature = root;
         desc.CS.pShaderBytecode = ID3D10Blob_GetBufferPointer(code);
@@ -1049,10 +1142,10 @@ int32_t ps5_d3d12_dispatch_spirv(Ps5D3D12 *c, const uint32_t *words, size_t word
         c->cache_stats.pipeline_ms += GetTickCount64() - started;
         remember_pipeline(c, &key, root, pipeline);
     }
-    if (count) {
+    if (count || image_count) {
         D3D12_DESCRIPTOR_HEAP_DESC descriptors = {0};
         descriptors.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-        descriptors.NumDescriptors = count;
+        descriptors.NumDescriptors = count + image_count;
         descriptors.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         TRY(ID3D12Device_CreateDescriptorHeap(c->device, &descriptors, &IID_ID3D12DescriptorHeap, (void **)&heap));
         D3D12_CPU_DESCRIPTOR_HANDLE handle = ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(heap);
@@ -1074,24 +1167,51 @@ int32_t ps5_d3d12_dispatch_spirv(Ps5D3D12 *c, const uint32_t *words, size_t word
             ID3D12Device_CreateUnorderedAccessView(c->device, gpu[i], NULL, &view, handle);
             handle.ptr += stride;
         }
+        for (UINT i = 0; i < image_count; ++i) {
+            TRY(compute_image(c, &images[i], &typed[i], handle));
+            handle.ptr += stride;
+        }
     }
     TRY(begin(c));
     for (UINT i = 0; i < count; ++i) {
         ID3D12GraphicsCommandList_CopyBufferRegion(c->commands, gpu[i], 0, upload[i], 0, buffers[i].size);
         transition(c, gpu[i], D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     }
+    for (UINT i = 0; i < image_count; ++i) {
+        copy_compute_image(c, &typed[i], 0);
+        transition(c, typed[i].texture, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    }
     ID3D12GraphicsCommandList_SetPipelineState(c->commands, pipeline);
     ID3D12GraphicsCommandList_SetComputeRootSignature(c->commands, root);
-    if (count) {
+    if (count || image_count) {
         ID3D12GraphicsCommandList_SetDescriptorHeaps(c->commands, 1, &heap);
         ID3D12GraphicsCommandList_SetComputeRootDescriptorTable(c->commands, 0, ID3D12DescriptorHeap_GetGPUDescriptorHandleForHeapStart(heap));
     }
     ID3D12GraphicsCommandList_Dispatch(c->commands, groups[0], groups[1], groups[2]);
+    for (UINT i = 0; i < image_count; ++i) if (images[i].writable) {
+        transition(c, typed[i].texture, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        copy_compute_image(c, &typed[i], 1);
+    }
     for (UINT i = 0; i < count; ++i) {
         transition(c, gpu[i], D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
         ID3D12GraphicsCommandList_CopyBufferRegion(c->commands, readback[i], 0, gpu[i], 0, buffers[i].size);
     }
     TRY(submit(c));
+    for (UINT i = 0; i < image_count; ++i) if (images[i].writable) {
+        ComputeImage *image = &typed[i];
+        void *mapped;
+        D3D12_RANGE entire = {0, (SIZE_T)image->bytes}, empty = {0, 0};
+        TRY(ID3D12Resource_Map(image->readback, 0, &entire, &mapped));
+        size_t cursor = 0;
+        for (UINT sub = 0; sub < image->subresources; ++sub) {
+            const D3D12_PLACED_SUBRESOURCE_FOOTPRINT *fp = &image->footprints[sub];
+            for (UINT z = 0; z < fp->Footprint.Depth; ++z) for (UINT y = 0; y < image->rows[sub]; ++y) {
+                memcpy(images[i].pixels + cursor, (uint8_t *)mapped + fp->Offset + ((size_t)z * image->rows[sub] + y) * fp->Footprint.RowPitch, (size_t)image->row_bytes[sub]);
+                cursor += (size_t)image->row_bytes[sub];
+            }
+        }
+        ID3D12Resource_Unmap(image->readback, 0, &empty);
+    }
     for (UINT i = 0; i < count; ++i) {
         void *mapped;
         D3D12_RANGE entire = {0, buffers[i].size}, empty = {0, 0};
@@ -1100,6 +1220,7 @@ int32_t ps5_d3d12_dispatch_spirv(Ps5D3D12 *c, const uint32_t *words, size_t word
         ID3D12Resource_Unmap(readback[i], 0, &empty);
     }
 done:
+    for (UINT i = 0; i < image_count; ++i) { retire(c, typed[i].texture); retire(c, typed[i].upload); retire(c, typed[i].readback); }
     for (UINT i = 0; i < count; ++i) { retire(c, readback[i]); retire(c, upload[i]); retire(c, gpu[i]); }
     retire(c, heap); retire(c, pipeline); retire(c, root); release(code);
     return hr;
@@ -1545,7 +1666,8 @@ static int valid_blend_factor(uint32_t factor, int alpha) {
 static UINT color_bytes_per_pixel(uint32_t format) {
     switch (format) {
     case DXGI_FORMAT_R16G16B16A16_FLOAT: return 8;
-    case DXGI_FORMAT_R8G8B8A8_UNORM: case DXGI_FORMAT_R8G8B8A8_SNORM: case DXGI_FORMAT_R16G16_FLOAT: return 4;
+    case DXGI_FORMAT_R8G8B8A8_UNORM: case DXGI_FORMAT_R8G8B8A8_SNORM: case DXGI_FORMAT_R16G16_FLOAT:
+    case DXGI_FORMAT_R10G10B10A2_UNORM: case DXGI_FORMAT_R11G11B10_FLOAT: return 4;
     default: return 0;
     }
 }
@@ -1929,8 +2051,8 @@ static HRESULT record_draw(Ps5D3D12 *c, DrawBatch *batch, const uint32_t *vertex
     ID3D12Resource *depth = NULL, *depth_upload = NULL, *depth_readback = NULL;
     ID3D12Resource *scalar_upload = NULL;
     uint64_t vs_id, ps_id;
-    TRY(compile_spirv(c, vertex, vertex_count, SpvExecutionModelVertex, buffer_count, image_count, d->dynamic_scalars, &vs, &vs_id));
-    TRY(compile_spirv(c, fragment, fragment_count, SpvExecutionModelFragment, buffer_count, image_count, d->dynamic_scalars, &ps, &ps_id));
+    TRY(compile_spirv(c, vertex, vertex_count, SpvExecutionModelVertex, buffer_count, image_count, d->dynamic_scalars, 0, &vs, &vs_id));
+    TRY(compile_spirv(c, fragment, fragment_count, SpvExecutionModelFragment, buffer_count, image_count, d->dynamic_scalars, 0, &ps, &ps_id));
     const D3D12_INDEX_BUFFER_STRIP_CUT_VALUE strip_cut = !d->primitive_restart ? D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED :
         d->index_element_bytes == 2 ? D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFF : D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFFFFFF;
     uint32_t bias_bits, bias_clamp_bits, bias_slope_bits;
