@@ -39,7 +39,7 @@ const site_url = "https://ps5pcem.com";
 const releases_url = "https://github.com/iStark/PS5PCEM/releases/latest";
 const latest_release_url = "https://api.github.com/repos/iStark/PS5PCEM/releases/latest";
 const github_url = "https://github.com/iStark/PS5PCEM";
-const boosty_url = "https://boosty.to/ps5pcem";
+const znosin_url = "https://znosin.com/c/ps5pcem";
 const window_width = 1180;
 const window_height = 760;
 const sidebar_width = 222;
@@ -918,7 +918,7 @@ fn handleClick(x: i32, y: i32) void {
             2 => current_page = .saves,
             3 => current_page = .settings,
             4 => openUri(site_url),
-            5 => openUri(boosty_url),
+            5 => openUri(znosin_url),
             else => openUri(github_url),
         }
         if (current_page != .library) {
@@ -1156,7 +1156,7 @@ fn drawNavigation(cr: *anyopaque) void {
     drawVulkanStatus(cr);
     localizedText(cr, .project, .{ .left = 28, .top = 560, .right = 190, .bottom = 580 }, 0x007c716a, .small, .{});
     roundFill(cr, .{ .left = 20, .top = 626, .right = 202, .bottom = 670 }, 10, 0x003d3029);
-    localizedText(cr, .support_boosty, .{ .left = 32, .top = 639, .right = 192, .bottom = 660 }, 0x00ffac64, .small, .{});
+    text(cr, "Znosin  ↗", .{ .left = 32, .top = 636, .right = 192, .bottom = 662 }, 0x00ffac64, .regular, .{});
     text(cr, "GitHub · iStark  ↗", .{ .left = 28, .top = 690, .right = 198, .bottom = 716 }, 0x00b9afa8, .regular, .{});
     text(cr, "ps5pcem.com  ↗", .{ .left = 28, .top = 588, .right = 198, .bottom = 612 }, 0x00ffac64, .regular, .{});
 }

@@ -29,7 +29,7 @@ const releases_url = "https://github.com/iStark/PS5PCEM/releases/latest";
 const latest_release_host = "api.github.com";
 const latest_release_path = "/repos/iStark/PS5PCEM/releases/latest";
 const github_url = "https://github.com/iStark/PS5PCEM";
-const boosty_url = "https://boosty.to/ps5pcem";
+const znosin_url = "https://znosin.com/c/ps5pcem";
 const window_width = 1180;
 const window_height = 760;
 const sidebar_width = 222;
@@ -502,7 +502,7 @@ const nav_rects = [_]Rect{
     .{ .left = 20, .top = 184, .right = 202, .bottom = 232 },
     .{ .left = 20, .top = 242, .right = 202, .bottom = 290 },
     .{ .left = 20, .top = 300, .right = 202, .bottom = 348 },
-    // The project site, under the PROJECT heading and above the Boosty pill.
+    // Project links share these hitboxes with hover handling.
     .{ .left = 20, .top = 584, .right = 202, .bottom = 616 },
     .{ .left = 20, .top = 626, .right = 202, .bottom = 670 },
     .{ .left = 20, .top = 680, .right = 202, .bottom = 724 },
@@ -910,7 +910,7 @@ fn handleClick(window: Win32.Window, x: i32, y: i32) void {
             2 => current_page = .saves,
             3 => current_page = .settings,
             4 => openSite(window),
-            5 => openBoosty(window),
+            5 => openZnosin(window),
             else => openGithub(window),
         }
         if (current_page != .library) {
@@ -1158,7 +1158,7 @@ fn drawNavigation(dc: Win32.DeviceContext) void {
     drawVulkanStatus(dc);
     localizedText(dc, .project, .{ .left = 28, .top = 560, .right = 190, .bottom = 580 }, 0x007c716a, small_font, Win32.dt_left | Win32.dt_end_ellipsis);
     roundFill(dc, .{ .left = 20, .top = 626, .right = 202, .bottom = 670 }, 10, 0x003d3029);
-    localizedText(dc, .support_boosty, .{ .left = 32, .top = 639, .right = 192, .bottom = 660 }, 0x00ffac64, small_font, Win32.dt_left | Win32.dt_end_ellipsis);
+    text(dc, w("Znosin  ↗"), -1, .{ .left = 32, .top = 636, .right = 192, .bottom = 662 }, 0x00ffac64, regular_font, Win32.dt_left);
     text(dc, w("GitHub · iStark  ↗"), -1, .{ .left = 28, .top = 690, .right = 198, .bottom = 716 }, 0x00b9afa8, regular_font, Win32.dt_left);
     text(dc, w("ps5pcem.com  ↗"), -1, .{ .left = 28, .top = 588, .right = 198, .bottom = 612 }, 0x00ffac64, regular_font, Win32.dt_left);
 }
@@ -2967,8 +2967,8 @@ fn openSite(owner: Win32.Window) void {
     _ = Win32.ShellExecuteW(owner, w("open"), w(site_url), null, null, Win32.show_normal);
 }
 
-fn openBoosty(owner: Win32.Window) void {
-    _ = Win32.ShellExecuteW(owner, w("open"), w(boosty_url), null, null, Win32.show_normal);
+fn openZnosin(owner: Win32.Window) void {
+    _ = Win32.ShellExecuteW(owner, w("open"), w(znosin_url), null, null, Win32.show_normal);
 }
 
 fn inputModeTitle() Phrase {
