@@ -13,6 +13,7 @@ const abi = @import("../abi.zig");
 const trace = @import("../trace.zig");
 const errno = @import("../errno.zig");
 const symbols = @import("../symbols.zig");
+const services = @import("services.zig");
 
 const net_error_bad_file_descriptor: i32 = @bitCast(@as(u32, 0x8041_0109));
 const net_error_invalid_argument: i32 = @bitCast(@as(u32, 0x8041_0116));
@@ -410,6 +411,7 @@ const ssl_exports = [_]symbols.Export{
     .{ .name = "sceSslGetSerialNumber", .function = trace.wrap("sceSslGetSerialNumber", &sslUnavailable), .expect_id = "DOwXL+FQMEY" },
     .{ .name = "sceSslGetPem", .function = trace.wrap("sceSslGetPem", &sslUnavailable), .expect_id = "kLB5aGoUJXg" },
     .{ .name = "sceSslClose", .function = trace.wrap("sceSslClose", &sslUnavailable), .expect_id = "viRXSHZYd0c" },
+    .{ .name = "sceSslSetMinSslVersion", .function = trace.wrap("sceSslSetMinSslVersion", &sslUnavailable), .expect_id = "QWSxBzf6lAg" },
 };
 
 // libSceHttp URI parsing and lifecycle -------------------------------------
@@ -822,6 +824,10 @@ const http2_exports = [_]symbols.Export{
     .{ .name = "sceHttp2WaitAsync", .function = trace.wrap("sceHttp2WaitAsync", &http2WaitAsync), .expect_id = "MOp-AUhdfi8" },
     .{ .name = "sceHttp2ReadDataAsync", .function = trace.wrap("sceHttp2ReadDataAsync", &http2ReadDataAsync), .expect_id = "bGN-6zbo7ms" },
     .{ .name = "sceHttp2SetResolveTimeOut", .function = trace.wrap("sceHttp2SetResolveTimeOut", &http2RequestOption), .expect_id = "ACjtE27aErY" },
+    .{ .name = "sceHttp2SetAutoRedirect", .function = trace.wrap("sceHttp2SetAutoRedirect", &http2RequestOption), .expect_id = "b9AvoIaOuHI" },
+    .{ .name = "sceHttp2SetInflateGZIPEnabled", .function = trace.wrap("sceHttp2SetInflateGZIPEnabled", &http2RequestOption), .expect_id = "uRosf8GQbHQ" },
+    .{ .name = "sceHttp2RemoveRequestHeader", .function = trace.wrap("sceHttp2RemoveRequestHeader", &http2RequestOnlyOption), .expect_id = "jHdP0CS4ZlA" },
+    .{ .name = "sceHttp2GetMemoryPoolStats", .function = trace.wrap("sceHttp2GetMemoryPoolStats", &services.absent), .expect_id = "otUQuZa-mv0" },
 };
 
 // libSceNpWebApi2 -----------------------------------------------------------
@@ -1017,9 +1023,25 @@ test "network families register the title import surface" {
         "59tL1AQBb8U",
         "htyBOoWeS58",
         "zXqcE0fizz0",
+        "b9AvoIaOuHI",
+        "uRosf8GQbHQ",
+        "jHdP0CS4ZlA",
+        "otUQuZa-mv0",
+        "QWSxBzf6lAg",
     }) |id| {
         try std.testing.expect(db.findById(id, .function) != null);
     }
+}
+
+test "HTTP2 pool stats report absence without touching memory" {
+    var db = symbols.Database{};
+    defer db.deinit(std.testing.allocator);
+    try register(&db, std.testing.allocator);
+    const entry = db.findById("otUQuZa-mv0", .function) orelse return error.MissingHttp2MemoryPoolStats;
+    const invoke: *const @TypeOf(services.absent) = @ptrFromInt(entry.address);
+    var buffer: [16]u8 = @splat(0xa5);
+    try std.testing.expectEqual(errno.KernelError.enosys.raw(), invoke(1, @intFromPtr(&buffer), buffer.len, 0, 0, 0));
+    try std.testing.expectEqualSlices(u8, &([_]u8{0xa5} ** 16), &buffer);
 }
 
 test "closing an SSL session reports it missing without touching memory" {
