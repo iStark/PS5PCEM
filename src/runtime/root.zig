@@ -90,6 +90,7 @@ pub const Runtime = struct {
             self.database = .{};
         }
         try hle.registerAll(&self.database, allocator);
+        hle.libs.kernel_runtime.attachSymbolDatabase(&self.database);
         hle.libs.audio.reset();
         hle.libs.font.reset();
         hle.libs.share.reset();
