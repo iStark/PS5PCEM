@@ -16,8 +16,8 @@ pub const feedback = @import("feedback.zig");
 pub const motion = @import("motion.zig");
 
 pub const Mode = enum {
-    /// Preserve the old unattended bring-up behaviour when game-run is invoked
-    /// directly instead of through the launcher.
+    /// Explicit opt-in legacy unattended bring-up behaviour. Direct runs use
+    /// `hybrid` by default so no synthetic buttons are pressed.
     automatic,
     controller,
     keyboard,
@@ -263,18 +263,20 @@ pub fn stopFeedback() void {
 
 pub fn mode() Mode {
     if (cached_mode) |value| return value;
-    var value: Mode = .automatic;
+    var value: Mode = .hybrid;
     if (comptime builtin.os.tag == .windows) {
         var buffer: [32]u8 = undefined;
         const length = Win32.GetEnvironmentVariableA("PS5_INPUT_MODE", &buffer, buffer.len);
         if (length > 0 and length < buffer.len) {
             const text = buffer[0..length];
+            if (eqlIgnoreCase(text, "automatic")) value = .automatic;
             if (eqlIgnoreCase(text, "controller")) value = .controller;
             if (eqlIgnoreCase(text, "keyboard")) value = .keyboard;
             if (eqlIgnoreCase(text, "hybrid")) value = .hybrid;
             if (eqlIgnoreCase(text, "scripted")) value = .scripted;
         }
     } else if (posixEnvironment("PS5_INPUT_MODE")) |text| {
+        if (eqlIgnoreCase(text, "automatic")) value = .automatic;
         if (eqlIgnoreCase(text, "controller")) value = .controller;
         if (eqlIgnoreCase(text, "keyboard")) value = .keyboard;
         if (eqlIgnoreCase(text, "hybrid")) value = .hybrid;
@@ -288,10 +290,8 @@ pub fn read() State {
     const selected = mode();
     var state = State{ .connected = true };
     if (selected == .scripted) return state;
-    // Direct game-run sessions keep the unattended Cross pulse in libScePad,
-    // but must still accept an explicit key or a physical controller. Some
-    // title prompts stop their render loop while waiting, so a short pulse
-    // that happened just before the prompt cannot be recovered otherwise.
+    // Explicit automatic/scripted profiles still merge physical input where
+    // applicable; only the legacy automatic profile adds synthetic Cross.
     if (selected == .automatic or selected == .controller or selected == .hybrid) mergeController(&state);
     if (selected == .automatic or selected == .keyboard or selected == .hybrid) mergeKeyboard(&state, mapping());
     return state;
