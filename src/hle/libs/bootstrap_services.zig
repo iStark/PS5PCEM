@@ -1833,7 +1833,6 @@ fn outputZero64(_: i32, output: ?*u64) callconv(abi.guest) i32 {
 /// Presents a stable local NP profile. Unity's PlayStation integration treats
 /// a successful query with an empty account as a transient state and may keep
 /// retrying its startup flow indefinitely.
-const np_state_signed_in: u32 = 2;
 const np_reachability_unavailable: u32 = 0;
 
 fn npGetAccountId(user_id: i32, output: ?*u64) callconv(abi.guest) i32 {
@@ -1855,7 +1854,7 @@ fn npGetState(_: i32, output: ?*u32) callconv(abi.guest) i32 {
     // The local account remains signed in even when PSN itself is unreachable.
     // Reporting SIGNED_OUT makes Unity's PSN integration wait for a login event
     // which an offline emulator can never deliver.
-    state.* = np_state_signed_in;
+    state.* = @intCast(services.np_state_signed_in);
     return errno.ok;
 }
 
@@ -6397,7 +6396,7 @@ test "NP manager exposes a consistent local offline profile" {
     try std.testing.expectEqual(errno.ok, npGetAccountCountry(1, &country));
     try std.testing.expectEqualSlices(u8, &.{ 'U', 'S', 0, 0 }, &country);
     try std.testing.expectEqual(errno.ok, npGetState(1, &state));
-    try std.testing.expectEqual(np_state_signed_in, state);
+    try std.testing.expectEqual(@as(u32, @intCast(services.np_state_signed_in)), state);
     try std.testing.expectEqual(errno.ok, npGetReachabilityState(1, &reachability));
     try std.testing.expectEqual(np_reachability_unavailable, reachability);
 
