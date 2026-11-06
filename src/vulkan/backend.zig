@@ -1445,6 +1445,10 @@ const maximum_staged_buffer_bytes = 128 * 1024 * 1024;
 // the dominant transfer despite already having exact-address readback paths.
 const deferred_storage_write_min_bytes = 256 * 1024;
 const maximum_frame_bytes = 128 * 1024 * 1024;
+/// Layered compute storage images can legitimately exceed the frame staging
+/// cap: 4096x4096 RGBA32 across four array layers is 256 MiB. Keep a separate
+/// bound so ordinary frame transfers stay small without rejecting the image.
+const maximum_storage_image_bytes = 512 * 1024 * 1024;
 // Sampled atlases can exceed a framebuffer's size: a 16K BC7 atlas with
 // its mip chain needs about 341 MiB. Keep a separate bounded upload budget.
 const maximum_sampled_image_bytes = 512 * 1024 * 1024;
@@ -3977,6 +3981,10 @@ test "completed frame replacement bounds slack and preserves pending peers" {
 const ColorBackingSnapshot = struct {
     hash: ?u64 = null,
     generation: u64 = 0,
+    /// Without page tracking, a large attachment would otherwise be hashed on
+    /// every draw that reacquires it. One full check per presented frame still
+    /// catches guest CPU writes without making the hash dominate the frame.
+    last_checked_flip: u64 = 0,
     // The layout belongs to this snapshot's target. Packed-tail span discovery
     // can walk thousands of texels; repeat it only when capturing a new target,
     // not at every resident-image lookup or sibling publication.
@@ -3987,7 +3995,14 @@ const ColorBackingSnapshot = struct {
         const address = target.descriptor.address + range.offset;
         const size = range.size;
         // Arm before hashing so a concurrent native write invalidates the proof.
-        const generation = if (memory.track_gpu_read) |track| track(memory.context, address, size) else 0;
+        // A context without read watches still exposes page generations; using
+        // them lets large attachments skip repeated whole-range fingerprints.
+        const generation = if (memory.track_gpu_read) |track|
+            track(memory.context, address, size)
+        else if (memory.gpu_generation) |query|
+            query(memory.context, address, size)
+        else
+            0;
         const hash = if (memory.fingerprint) |fingerprint| fingerprint(memory.context, address, size) else null;
         return .{ .hash = hash, .generation = generation, .range = range };
     }
@@ -6310,18 +6325,22 @@ fn sampledImageDimensionForInstruction(
     switch (image_type) {
         .color_3d => return .three_d,
         .color_2d_array => return .two_d_array,
+        .color_1d_array => return .two_d_array,
+        .color_2d_msaa => return .two_d,
+        .color_2d_msaa_array => return .two_d_array,
         .color_1d, .color_2d => return .two_d,
         else => {},
     }
     return switch (dimension) {
         .dim_1d => .two_d,
-        .dim_2d => .two_d,
+        .dim_1d_array => .two_d_array,
+        .dim_2d, .dim_2d_msaa => .two_d,
+        .dim_2d_msaa_array => .two_d_array,
         .dim_3d => .three_d,
         // GFX10 MIMG DIM=3 denotes a cubemap. The decoder's historical enum
         // label is kept to avoid changing the instruction representation.
         .dim_2d_array => .cube,
         .dim_2d_array_alt => .two_d_array,
-        else => null,
     };
 }
 
@@ -18144,7 +18163,7 @@ pub const Renderer = struct {
             const cached = &self.render_targets.items[index];
             if (cached.gpu_generation == 0) return null;
             if (self.guest_memory) |memory| {
-                if (cached.backing_snapshot.changed(memory, cached.target)) return null;
+                if (self.colorBackingChanged(&cached.backing_snapshot, memory, cached.target)) return null;
             }
             indices[level] = index;
             images[level] = .{
@@ -18208,7 +18227,7 @@ pub const Renderer = struct {
         const index = newest orelse return null;
         const source = self.render_targets.items[index];
         if (self.guest_memory) |memory| {
-            if (self.render_targets.items[index].backing_snapshot.changed(memory, source.target)) return null;
+            if (self.colorBackingChanged(&self.render_targets.items[index].backing_snapshot, memory, source.target)) return null;
         }
         // A newer producer in another representation needs normal coherence.
         for (self.render_targets.items, 0..) |cached, other| {
@@ -19379,13 +19398,14 @@ pub const Renderer = struct {
             }
             const cached = &self.render_targets.items[index];
             if (self.guest_memory) |memory| {
-                if (cached.backing_snapshot.changed(memory, target)) {
+                if (self.colorBackingChanged(&cached.backing_snapshot, memory, target)) {
                     if (traceColorPublication(target)) std.debug.print("[color publication reacquire changed] addr=0x{x} mip={d} face={d} hash={any}\n", .{ target.descriptor.address, target.descriptor.mip_level, target.descriptor.base_array_slice, cached.backing_snapshot.hash });
                     if (@atomicLoad(bool, &trace_materialized_targets, .monotonic) and self.flip_callbacks % 120 == 0)
                         std.debug.print("[gpu target backing changed] flip={d} @0x{x} {d}x{d} generation={d}/{d}\n", .{ self.flip_callbacks, target.descriptor.address, target.descriptor.width, target.descriptor.height, cached.gpu_generation, cached.host_generation });
                     invalidateResidentTarget(cached);
                     self.invalidateCompletedFrames(target.descriptor.address, target.layout.required_source_bytes);
                     cached.backing_snapshot = ColorBackingSnapshot.capture(memory, target);
+                    cached.backing_snapshot.last_checked_flip = self.flip_callbacks;
                     cached.backing_was_accessible = self.colorTargetBackingAccessible(target);
                 }
             }
@@ -19444,7 +19464,7 @@ pub const Renderer = struct {
         const cached = &self.render_targets.items[index];
         if (!cached.initialized) return false;
         const memory = self.guest_memory orelse return false;
-        if (!cached.backing_snapshot.changed(memory, cached.target)) return false;
+        if (!self.colorBackingChanged(&cached.backing_snapshot, memory, cached.target)) return false;
         if (traceColorPublication(cached.target)) std.debug.print("[color publication readback changed] addr=0x{x} mip={d} face={d} hash={any}\n", .{ cached.target.descriptor.address, cached.target.descriptor.mip_level, cached.target.descriptor.base_array_slice, cached.backing_snapshot.hash });
         invalidateResidentTarget(cached);
         for (self.completed_frames.items) |*frame| {
@@ -21049,7 +21069,7 @@ pub const Renderer = struct {
         const target = cached.target orelse return;
         if (self.guest_memory) |memory| {
             if (discardUnmappedCompletedFrame(cached, memory)) return;
-            if (cached.backing_snapshot.changed(memory, target)) {
+            if (self.colorBackingChanged(&cached.backing_snapshot, memory, target)) {
                 if (traceColorPublication(target)) std.debug.print("[color publication completed changed] addr=0x{x} mip={d} face={d} hash={any}\n", .{ target.descriptor.address, target.descriptor.mip_level, target.descriptor.base_array_slice, cached.backing_snapshot.hash });
                 if (@atomicLoad(bool, &capture_cube_uploads, .monotonic) and target.descriptor.maximum_mip > 0 and target.descriptor.width <= 128) {
                     const range = cached.backing_snapshot.range;
@@ -29970,6 +29990,42 @@ pub const Renderer = struct {
         return hash.final();
     }
 
+    /// Renderer-aware backing check. `ColorBackingSnapshot.changed` is kept for
+    /// standalone tests, but the live path must use the cached guest fingerprint
+    /// so a large attachment is not rehashed on every draw.
+    fn colorBackingChanged(
+        self: *Renderer,
+        snapshot: *ColorBackingSnapshot,
+        memory: GuestMemory,
+        target: GuestColorTarget,
+    ) bool {
+        const previous_hash = snapshot.hash orelse return false;
+        const range = snapshot.range;
+        const address = target.descriptor.address + range.offset;
+        const size = range.size;
+        if (snapshot.generation != 0) if (memory.gpu_generation) |generation| {
+            if (generation(memory.context, address, size) == snapshot.generation) return false;
+        };
+        if (memory.fingerprint == null) return false;
+        const has_page_tracking = memory.track_gpu_read != null or memory.gpu_generation != null;
+        if (!has_page_tracking and size > 32 * 1024 * 1024 and
+            snapshot.last_checked_flip == self.flip_callbacks)
+        {
+            return false;
+        }
+        const observed = if (memory.track_gpu_read) |track|
+            track(memory.context, address, size)
+        else if (memory.gpu_generation) |query|
+            query(memory.context, address, size)
+        else
+            0;
+        const current_hash = self.fingerprintGuestRange(memory, address, size) orelse return false;
+        if (current_hash != previous_hash) return true;
+        snapshot.generation = observed;
+        snapshot.last_checked_flip = self.flip_callbacks;
+        return false;
+    }
+
     fn fingerprintGuestRange(self: *Renderer, memory: GuestMemory, address: u64, size: usize) ?u64 {
         const fingerprint = memory.fingerprint orelse return null;
         if (@atomicLoad(bool, &cached_guest_fingerprints, .monotonic))
@@ -31151,8 +31207,8 @@ pub const Renderer = struct {
             if (is_2d_array) texture.layers else 1,
         ) catch return Error.UnsupportedStorageImage;
         const staging_bytes_u64 = subresource.stagingBytes() catch return Error.UnsupportedStorageImage;
-        if (staging_bytes_u64 == 0 or staging_bytes_u64 > maximum_frame_bytes or
-            texture.required_source_bytes == 0 or texture.required_source_bytes > maximum_frame_bytes or
+        if (staging_bytes_u64 == 0 or staging_bytes_u64 > maximum_storage_image_bytes or
+            texture.required_source_bytes == 0 or texture.required_source_bytes > maximum_storage_image_bytes or
             subresource.block.bytes_per_element != storageImageBytesPerTexel(descriptor.unified_format))
         {
             return Error.UnsupportedStorageImage;
@@ -32260,7 +32316,7 @@ pub const Renderer = struct {
         // replace this backing meanwhile. Recheck before consuming GPU pixels.
         for (selected) |source_index| {
             const source = &self.render_targets.items[source_index];
-            if (source.backing_snapshot.changed(memory, source.target)) {
+            if (self.colorBackingChanged(&source.backing_snapshot, memory, source.target)) {
                 if (self.traceCurrentGraphicsFrame()) std.debug.print("[gpu layout reject] changed color @0x{x} image @0x{x}\n", .{ source.target.descriptor.address, descriptor.address });
                 if (matching_index == null) self.destroyCachedStorageImage(index) else self.releaseStorageImage(index);
                 return null;
@@ -35071,10 +35127,11 @@ pub const Renderer = struct {
         const is_2d_array = dimension == .two_d_array;
         const compatible_type = switch (dimension) {
             .two_d => descriptor.image_type == .color_2d or descriptor.image_type == .cube or
-                descriptor.image_type == .color_1d,
+                descriptor.image_type == .color_1d or descriptor.image_type == .color_2d_msaa,
             .three_d => descriptor.image_type == .color_3d,
             .cube => descriptor.image_type == .cube,
-            .two_d_array => descriptor.image_type == .color_2d_array or descriptor.image_type == .cube,
+            .two_d_array => descriptor.image_type == .color_2d_array or descriptor.image_type == .cube or
+                descriptor.image_type == .color_1d_array or descriptor.image_type == .color_2d_msaa_array,
         };
         if (!compatible_type) {
             std.debug.print(
