@@ -926,3 +926,14 @@ test "installed content is answered as being on the drive" {
     );
     try testing.expectEqual(disc_map_error_invalid_argument, discMapIsRequestOnHDD(null, 0, 0, &on_drive));
 }
+
+test "JSON2 initializer diagnostic hooks accept registration" {
+    var db = symbols.Database{};
+    defer db.deinit(testing.allocator);
+    try register(&db, testing.allocator);
+    inline for (&.{ "+drDFyAS6u4", "00oCq0RwSAY", "i1393UBWu1U", "tck9g-yOqPg", "GvGvswb0v34", "W72B9ylU2JA" }) |id| {
+        const symbol = db.findById(id, .function) orelse return error.MissingJson2Hook;
+        const hook: *const @TypeOf(accept) = @ptrFromInt(symbol.address);
+        try testing.expectEqual(errno.ok, hook(0, 0, 0, 0, 0, 0));
+    }
+}
