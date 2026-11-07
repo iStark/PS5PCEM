@@ -1139,7 +1139,9 @@ fn run(init: std.process.Init) !bool {
         // ASTRO BOT republishes compute output every frame; unchanged ranges
         // are recognised by fingerprint instead of uploaded again.
         use_astro_bot_gpu_profile;
-    const default_copy_workers: u8 = if (use_big_helmet_gpu_profile or use_gta_iii_buffer_profile or use_astro_bot_gpu_profile or
+    // The current D3D12 path publishes attachment snapshots to guest memory.
+    // Reuse the bounded copy/tiling pool for these large transfers as well.
+    const default_copy_workers: u8 = if (selected_api == .d3d12 or use_big_helmet_gpu_profile or use_gta_iii_buffer_profile or use_astro_bot_gpu_profile or
         std.ascii.eqlIgnoreCase(title_identifier, yotei_title_id) or
         std.ascii.eqlIgnoreCase(title_identifier, little_nightmares_enhanced_title_id)) 4 else 1;
     const gpu_copy_workers: u8 = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_COPY_WORKERS")) |text| parse: {
@@ -1273,6 +1275,7 @@ fn run(init: std.process.Init) !bool {
             .gpu_generation = if (enable_gpu_page_tracker) runtime.firmware.libs.agc_submit.snapshotGeneration else null,
         }, init.minimal.environ.containsUnempty(allocator, "PS5_D3D12_VALIDATION") catch false);
         const directx = &directx_renderer.?;
+        directx.profile.enabled = init.minimal.environ.containsUnempty(allocator, "PS5_D3D12_PROFILE") catch false;
         if (init.minimal.environ.getAlloc(allocator, "PS5_D3D12_CAPTURE_PPM")) |path| {
             directx_capture.path = path;
             directx.on_scanout = D3D12Capture.frame;
@@ -1303,6 +1306,11 @@ fn run(init: std.process.Init) !bool {
         if (init.minimal.environ.getAlloc(allocator, "PS5_D3D12_DRAW_BATCH")) |value| {
             defer allocator.free(value);
             directx.draw_batch_limit = std.math.clamp(std.fmt.parseInt(usize, value, 10) catch 1, 1, d3d12.max_draw_batch);
+        } else |_| {}
+        if (init.minimal.environ.getAlloc(allocator, "PS5_D3D12_SURFACE_CACHE_MIB")) |value| {
+            defer allocator.free(value);
+            const mib = std.fmt.parseInt(usize, value, 10) catch 512;
+            directx.conversion_cache.limit = @min(mib, 1024) * 1024 * 1024;
         } else |_| {}
         if (init.minimal.environ.getAlloc(allocator, "PS5_D3D12_SURFACE_CACHE")) |value| {
             defer allocator.free(value);

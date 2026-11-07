@@ -8,7 +8,10 @@ const std = @import("std");
 const gpu = @import("gpu");
 
 pub const Cache = struct {
-    pub const default_limit = 256 * 1024 * 1024;
+    // A 4K attachment keeps both its tiled backing and linear pixels. Several
+    // alternating color/depth surfaces exceed 256 MiB and otherwise evict
+    // their own conversions every frame. Allocation remains lazy and bounded.
+    pub const default_limit = 512 * 1024 * 1024;
     const Entry = struct {
         address: u64 = 0,
         layout: gpu.SurfaceLayout = undefined,

@@ -275,6 +275,24 @@ pub const Error = std.mem.Allocator.Error || error{
     VertexTableIndexOutOfRange,
 };
 
+/// Opt-in CPU wall-clock buckets. Resource/target preparation are subsets of
+/// draw preparation; native drawing includes queue submission and fence waits.
+const Profile = struct {
+    enabled: bool = false,
+    draw_ns: u64 = 0,
+    resources_ns: u64 = 0,
+    targets_ns: u64 = 0,
+    flush_ns: u64 = 0,
+    native_ns: u64 = 0,
+    write_ns: u64 = 0,
+    scanout_ns: u64 = 0,
+    present_ns: u64 = 0,
+
+    fn now(self: *const Profile) u64 {
+        return if (self.enabled) gpu.frame_timing.timestampNs() else 0;
+    }
+};
+
 pub const Renderer = struct {
     allocator: std.mem.Allocator,
     device: native.Device,
@@ -293,6 +311,7 @@ pub const Renderer = struct {
     frame_started_ns: u64 = 0,
     cache_report_ns: u64 = 0,
     presented_frames: u64 = 0,
+    profile: Profile = .{},
     empty_draws: u64 = 0,
     metadata_expands: u64 = 0,
     /// Optional diagnostic consumer of the exact RGBA bytes sent to DXGI.
@@ -303,6 +322,8 @@ pub const Renderer = struct {
     draw_batch_limit: usize = 1,
     pending_draws: ?PendingDraws = null,
     batch_groups: u64 = 0,
+    acquire_calls: u64 = 0,
+    acquire_queued: u64 = 0,
     batch_draws: u64 = 0,
     batch_hazards: u64 = 0,
     /// Persistent 64 KiB global data share, allocated by the first GDS dispatch.
@@ -386,7 +407,15 @@ pub const Renderer = struct {
         return true;
     }
     fn acquire(context: ?*anyopaque, _: gpu.state.AcquireMem) bool {
-        return drain(context);
+        // ACQUIRE_MEM orders GPU accesses; it does not publish a CPU completion
+        // label. Keep same-attachment draws in their original native order.
+        // A later shader/index/indirect read that aliases an attachment flushes
+        // through read()/textureGeneration(), including DCC and HTILE ranges.
+        // Dispatches, DMA, CPU-visible reads/writes and releases still drain.
+        const self = from(context);
+        self.acquire_calls += 1;
+        if (self.pending_draws != null) self.acquire_queued += 1;
+        return self.failure == null;
     }
     fn event(context: ?*anyopaque, value: gpu.state.EventWrite) bool {
         // Non-addressed GPU cache/order events do not publish CPU-visible
@@ -467,6 +496,10 @@ pub const Renderer = struct {
     pub fn flushDraws(self: *Renderer) Error!void {
         if (self.failure) |err| return err;
         const pending = if (self.pending_draws) |*value| value else return;
+        const flush_start = self.profile.now();
+        defer if (self.profile.enabled) {
+            self.profile.flush_ns +|= self.profile.now() -| flush_start;
+        };
         defer {
             pending.deinit(self.allocator);
             self.pending_draws = null;
@@ -488,12 +521,16 @@ pub const Renderer = struct {
             job.draw.extra_colors[i].pixels = pending.extra_colors[i].?.pixels.ptr;
             job.draw.extra_colors[i].size = pending.extra_colors[i].?.pixels.len;
         };
+        const native_start = self.profile.now();
         try self.device.drawBatchSpirv(jobs[0..pending.count], if (pending.color) |color| color.pixels else &.{}, if (pending.depth) |depth| depth.pixels else &.{});
+        const write_start = self.profile.now();
+        if (self.profile.enabled) self.profile.native_ns +|= write_start -| native_start;
         if (pending.color) |*color| try color.write(self.memory);
         for (&pending.extra_colors) |*color| if (color.*) |*value| try value.write(self.memory);
         if (pending.depth_write or pending.htile != null) if (pending.depth) |*depth| try depth.write(self.memory);
         if (pending.stencil_write or pending.htile != null) if (pending.stencil) |*stencil| try stencil.write(self.memory);
         if (pending.htile) |*htile| try htile.publish(self.memory);
+        if (self.profile.enabled) self.profile.write_ns +|= self.profile.now() -| write_start;
         self.batch_groups += 1;
         self.batch_draws += pending.count;
     }
@@ -783,6 +820,11 @@ pub const Renderer = struct {
 
     fn drawArguments(self: *Renderer, state: *const gpu.State, args: DrawArguments) !void {
         if (args.count == 0 or args.instances == 0) return;
+        const prepare_start = self.profile.now();
+        const flush_before = self.profile.flush_ns;
+        defer if (self.profile.enabled) {
+            self.profile.draw_ns +|= (self.profile.now() -| prepare_start) -| (self.profile.flush_ns -| flush_before);
+        };
         const routing = try graphics.routing(state);
         var render = gpu.resources.decodeRenderState(state);
         render.depth_control = graphics.effectiveDepthControl(state);
@@ -953,10 +995,13 @@ pub const Renderer = struct {
             .tracking = .{ .context = self, .generation = textureGeneration, .arm = trackTexture },
         };
         defer if (!queued) draw_resources.deinit();
+        const resources_start = self.profile.now();
+        const resource_flush_before = self.profile.flush_ns;
         var vs_resources = try draw_resources.capture(&vs_bindings, vs);
         defer vs_resources.deinit(self.allocator);
         var ps_resources = try draw_resources.capture(&ps_bindings, ps);
         defer ps_resources.deinit(self.allocator);
+        if (self.profile.enabled) self.profile.resources_ns +|= (self.profile.now() -| resources_start) -| (self.profile.flush_ns -| resource_flush_before);
         var vs_scalar: [65]rdna2.spirv.ScalarRegister = undefined;
         var ps_scalar: [64]rdna2.spirv.ScalarRegister = undefined;
         var vs_scalar_count = entryScalars(vs_bindings, &vs_scalar);
@@ -1042,6 +1087,10 @@ pub const Renderer = struct {
                 pending.bytes + additional > draw_batch_bytes) try self.flushDraws();
         }
         if (self.pending_draws == null) {
+            const targets_start = self.profile.now();
+            defer if (self.profile.enabled) {
+                self.profile.targets_ns +|= self.profile.now() -| targets_start;
+            };
             var color: ?surfaces.Staged = null;
             if (color_key) |key| color = try surfaces.Staged.readColor(self.allocator, &self.staging_pool, &self.conversion_cache, self.memory, key.address, key.layout, color_dcc, key.swap_red_blue);
             errdefer if (color) |*value| value.deinit();
@@ -1150,6 +1199,7 @@ pub const Renderer = struct {
 
     pub fn present(self: *Renderer, flip: gpu.state.Flip) !void {
         try self.flushDraws();
+        const scanout_start = self.profile.now();
         const resolve = self.display_resolver orelse return error.DisplayResolverUnavailable;
         const display = resolve(flip) orelse return error.DisplayBufferUnavailable;
         errdefer std.debug.print("[d3d12 scanout] rejected buffer={any}\n", .{display});
@@ -1159,7 +1209,10 @@ pub const Renderer = struct {
         defer surface.deinit();
         const pixels = surface.pixels;
         try surfaces.convertScanout(pixels, display.pixel_format);
+        const present_start = self.profile.now();
+        if (self.profile.enabled) self.profile.scanout_ns +|= present_start -| scanout_start;
         try self.device.presentRgba(pixels, display.width, display.height);
+        if (self.profile.enabled) self.profile.present_ns +|= self.profile.now() -| present_start;
         if (self.frame_started_ns == 0) std.debug.print("[d3d12] first frame presented: {d}x{d} format=0x{x} tile={d}\n", .{
             display.width, display.height, display.pixel_format, display.tiling_mode,
         });
@@ -1167,11 +1220,17 @@ pub const Renderer = struct {
         self.presented_frames +|= 1;
         if (self.on_scanout) |callback| callback(self.scanout_context, self.presented_frames, display.width, display.height, pixels);
         if (self.cache_report_ns == 0 or now -| self.cache_report_ns >= 5 * std.time.ns_per_s) {
+            if (self.profile.enabled) std.debug.print("[d3d12 profile] flip={d} clock_ms={d} cumulative_ms prepare={d} resources={d} targets={d} flush={d} native={d} publish={d} scanout={d} present={d}\n", .{
+                self.presented_frames,                          now / std.time.ns_per_ms,                     self.profile.draw_ns / std.time.ns_per_ms,
+                self.profile.resources_ns / std.time.ns_per_ms, self.profile.targets_ns / std.time.ns_per_ms, self.profile.flush_ns / std.time.ns_per_ms,
+                self.profile.native_ns / std.time.ns_per_ms,    self.profile.write_ns / std.time.ns_per_ms,   self.profile.scanout_ns / std.time.ns_per_ms,
+                self.profile.present_ns / std.time.ns_per_ms,
+            });
             std.debug.print("[d3d12 textures] flip={d} page={d} content={d} miss={d} evict={d} kib={d}\n", .{
                 self.presented_frames, self.textures.page_hits, self.textures.content_hits, self.textures.misses, self.textures.evictions, self.textures.bytes / 1024,
             });
-            std.debug.print("[d3d12 batches] flip={d} limit={d} draws={d} groups={d} hazards={d}\n", .{
-                self.presented_frames, self.draw_batch_limit, self.batch_draws, self.batch_groups, self.batch_hazards,
+            std.debug.print("[d3d12 batches] flip={d} limit={d} draws={d} groups={d} hazards={d} acquires={d} queued={d}\n", .{
+                self.presented_frames, self.draw_batch_limit, self.batch_draws, self.batch_groups, self.batch_hazards, self.acquire_calls, self.acquire_queued,
             });
             std.debug.print("[d3d12 guest shaders] flip={d} analysis={d}/{d} invalidations={d} translation={d}/{d} kib={d}\n", .{
                 self.presented_frames,  self.shader_analyses.hits, self.shader_analyses.misses,    self.shader_analyses.invalidations,

@@ -698,6 +698,11 @@ fn guestCommandProbe(allocator: std.mem.Allocator, vertex_words: []const u32, pi
         if (!batch_backend.vtable.read(batch_backend.context, 0x600, &observed) or renderer.pending_draws == null) return error.UnrelatedReadFlushedBatch;
         _ = try executor.execute(&.{ command(gpu.pm4.event_write, 1), 0x2f });
         if (renderer.pending_draws == null or !std.mem.eql(u8, &memory.data, &initial)) return error.CacheEventPublishedBeforeBoundary;
+        // Both packet encodings order the same pending target. An acquire
+        // must not publish it early; each CPU-visible boundary below must.
+        _ = try executor.execute(&.{ command(gpu.pm4.acquire_mem, 6), 0x7ffff, 0xffffffff, 0xff, 0, 0, 10 });
+        _ = try executor.execute(&.{ command(gpu.pm4.nop, 7) | (@as(u32, gpu.pm4.custom.acquire_mem) << 2), 0x80000000, 1, 0, 0x20, 0, 10, 0x7ffff });
+        if (renderer.pending_draws == null or !std.mem.eql(u8, &memory.data, &initial)) return error.AcquirePublishedBeforeBoundary;
         switch (boundary) {
             0 => if (!batch_backend.vtable.read(batch_backend.context, center, &observed)) return error.BatchFeedbackReadFailed,
             1 => if (!batch_backend.vtable.read_wait.?(batch_backend.context, 0x600, &observed)) return error.BatchWaitFailed,
@@ -712,8 +717,35 @@ fn guestCommandProbe(allocator: std.mem.Allocator, vertex_words: []const u32, pi
         if (boundary == 4 and std.mem.readInt(u32, memory.data[0x600..][0..4], .little) != 0x1234) return error.BatchReleaseLabelMissing;
     }
     renderer.draw_batch_limit = 1;
+    // Each draw has a different constant applied to both source and
+    // destination. Dropping or reordering draws changes the final result.
+    // Compare the complete pitched backing with immediate execution.
+    var blended_state = state;
+    try blended_state.writeRegister(.context, 0x1e0, (1 << 30) | 13 | (13 << 8));
+    var blend_executor = gpu.DcbExecutor{ .state = &blended_state, .backend = renderer.dcbBackend(), .allocator = allocator };
+    var immediate_blended: @TypeOf(memory.data) = undefined;
+    for ([_]usize{ 1, 8 }) |limit| {
+        renderer.draw_batch_limit = limit;
+        memory.data = initial;
+        const groups_before = renderer.batch_groups;
+        for (0..3) |i| {
+            const factor: f32 = @as(f32, @floatFromInt(i + 1)) / 8;
+            for (0..4) |channel| try blended_state.writeRegister(.context, 0x105 + @as(u32, @intCast(channel)), @bitCast(factor));
+            _ = try blend_executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 2 });
+            _ = try blend_executor.execute(&.{ command(gpu.pm4.acquire_mem, 6), 0x7ffff, 0xffffffff, 0xff, 0, 0, 10 });
+            _ = try blend_executor.execute(&.{ command(gpu.pm4.nop, 7) | (@as(u32, gpu.pm4.custom.acquire_mem) << 2), 0, 1, 0, 0x20, 0, 10, 0x7ffff });
+        }
+        if (limit > 1 and !std.mem.eql(u8, &memory.data, &initial)) return error.BlendedAcquirePublishedEarly;
+        try renderer.flushDraws();
+        if (renderer.batch_groups - groups_before != (if (limit == 1) @as(u64, 3) else 1)) return error.AcquireSplitOrderedDraws;
+        if (limit == 1) {
+            immediate_blended = memory.data;
+            if (memory.data[center] < 100 or memory.data[center] > 150) return error.BlendedAcquireReferenceMismatch;
+        } else if (!std.mem.eql(u8, &memory.data, &immediate_blended)) return error.BlendedAcquireImageMismatch;
+    }
+    renderer.draw_batch_limit = 1;
     memory.data = before;
-    std.debug.print("PASS queued PM4 draws: target feedback, wait/live reads, guest writes, release labels and submission drain publish completed pixels; unrelated reads preserve the group\n", .{});
+    std.debug.print("PASS queued PM4 draws: standard/custom acquires preserve ordered blending; target feedback, wait/live reads, guest writes, release labels and submission drain publish completed pixels\n", .{});
     // Use the actual Raiden routing (ES program / GS USER_DATA / NGG
     // passthrough), with a deliberately stale legacy VS bank. The shader
     // consumes USER_DATA[0] at s8 and merged wave info at s3; either wrong bank
