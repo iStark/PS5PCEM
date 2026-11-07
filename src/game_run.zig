@@ -146,6 +146,7 @@ const gta_iii_title_id = "PPSA03527";
 const quake_ii_title_id = "PPSA09477";
 const subnautica_below_zero_title_id = "PPSA02457";
 const astro_bot_title_id = "PPSA21564";
+const trackmania_title_id = "PPSA02195";
 const terminator_audio_latency_ms: u16 = 128;
 
 /// Compatibility stays the global default, while profiles enable only paths
@@ -587,7 +588,12 @@ fn run(init: std.process.Init) !bool {
     // Demon's Souls ships link-time driver shadows its bundled initializer
     // cannot satisfy; route it to the live firmware path instead. See
     // ModuleGraphOptions.ignore_bundled_drivers: big, per-title, deliberate.
-    const ignore_bundled_drivers = std.ascii.eqlIgnoreCase(title_identifier, demons_souls_title_id);
+    // Trackmania's bundled AGC/AMPR compatibility drivers expect to hook the
+    // live kernel and leave the native APR command stream unwritten, which
+    // corrupts resource loads. Route them to HLE, where APR buffers are tracked
+    // by construction.
+    const ignore_bundled_drivers = std.ascii.eqlIgnoreCase(title_identifier, demons_souls_title_id) or
+        std.ascii.eqlIgnoreCase(title_identifier, trackmania_title_id);
     if (ignore_bundled_drivers) {
         try out.print("  Drivers  bundled shadows ignored, firmware path\n", .{});
         try out.flush();
