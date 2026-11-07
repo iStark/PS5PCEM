@@ -2135,7 +2135,11 @@ const WindowsX64Machine = struct {
     /// 64-bit pointer MOVs). Covers MOV/MOVZX/MOVSX plus ALU forms that only
     /// read memory (`add/sub/cmp/and/or/xor/test reg, [null+disp]`).
     fn tryEmulateNullMemoryLoad(context: *std.os.windows.CONTEXT, memory_address: u64) bool {
-        if (memory_address == 0 or memory_address >= lost_base_window) return false;
+        // Unreal's optional object fields can live at offset zero. Once the
+        // instruction is recognized as a load, supplying zero/the synthetic
+        // stub is safer than terminating a worker on a deliberately optional
+        // null object. Unrecognized null reads still remain contained faults.
+        if (memory_address >= lost_base_window) return false;
         // Same wild-Rip hazard as the null-object compare above.
         if (!memory.isHostRangeReadable(context.Rip, 15)) return false;
         const code: [*]const u8 = @ptrFromInt(context.Rip);
@@ -3063,6 +3067,10 @@ const WindowsX64Machine = struct {
     /// Discards scalar and vector stores into the first page and steps past the instruction.
     fn tryEmulateNullMemoryStore(context: *std.os.windows.CONTEXT, memory_address: u64) bool {
         if (memory_address >= lost_base_window) return false;
+        // The guest may fault while its instruction pointer is already
+        // unmapped. Reading the would-be ignored store would then turn a
+        // recoverable guest fault into a host crash inside this handler.
+        if (!memory.isHostRangeReadable(context.Rip, 15)) return false;
         const code: [*]const u8 = @ptrFromInt(context.Rip);
         // C5 xx 11 /r and C5 xx 7F /r are the two-byte-VEX store forms of
         // VMOVUPS/VMOVUPD/VMOVSS/VMOVSD and VMOVDQA/VMOVDQU. Unreal uses them
