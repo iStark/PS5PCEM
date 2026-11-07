@@ -89,6 +89,11 @@ pub fn main(init: std.process.Init) !void {
     try guestWaveProbe(allocator, &device);
     try guestComputeImagesProbe(allocator, &device);
     try guestComputeImageLayoutProbe(allocator);
+    try guestComputeDccVolumeProbe(allocator);
+    try guestPackedDccSampledProbe(allocator);
+    try guestComputeForwardBranchesProbe(allocator);
+    try guestComputeStatusIsolationProbe(allocator, &device);
+    try guestComputeSampledProbe(allocator, &device);
 
     for ([_][2]u32{ .{ 1, 1 }, .{ 71, 37 }, .{ 256, 129 } }) |extent| {
         const width, const height = extent;
@@ -230,6 +235,321 @@ fn guestComputeImageLayoutProbe(allocator: std.mem.Allocator) !void {
         if (!std.mem.eql(u8, expected, memory.data)) return error.ComputeImageGuestLayoutMismatch;
     };
     std.debug.print("PASS PM4 compute image stores: 15 linear/depth/color tiled 2D/array/volume views; mip and padding preservation\n", .{});
+}
+
+fn guestComputeDccVolumeProbe(allocator: std.mem.Allocator) !void {
+    const memory = try allocator.create(GraphicsMemory);
+    defer allocator.destroy(memory);
+    memory.* = .{};
+    var renderer = try d3d12.Renderer.init(allocator, memory.access(), false);
+    defer renderer.deinit();
+    const store = [_]u32{ vop1(1, 4, 255), 0x40000000, vop1(1, 5, 255), 0x40400000, vop1(1, 6, 255), 0x40800000, vop1(1, 7, 255), 0x40a00000, 0xf0200f10, 0x00000400, 0xbf810000 };
+    const sample = [_]u32{ vop1(1, 0, 255), 0x3f000000, vop1(1, 1, 256), vop1(1, 2, 256), vop1(1, 3, 128), 0xf0900f10, 0x00400400, 0xe0780000, 0x80030400, 0xbf810000 };
+    @memcpy(memory.data[0x100..][0..@sizeOf(@TypeOf(store))], std.mem.asBytes(&store));
+    @memcpy(memory.data[0x200..][0..@sizeOf(@TypeOf(sample))], std.mem.asBytes(&sample));
+    var descriptor = [_]u32{ 0x100, (71 << 20) | (3 << 30), 1 | (7 << 14), (10 << 28) | (27 << 20) | 0xfac, 7, 0, (1 << 21), 10 }; // DCC at 0xa0000.
+    const texture = try gpu.TextureLayout.fromImage(try gpu.resources.decodeImageDescriptor(&descriptor));
+    const view = try texture.subresource(0, 0, 1);
+    const backing = memory.data[0x10000..][0..@intCast(texture.required_source_bytes)];
+    const keys = memory.data[0xa0000..][0..d3d12.surfaces.Dcc.blockCount(backing.len)];
+    var state = gpu.State{};
+    try state.writeRegister(.shader, 0x20c, 1);
+    try state.writeRegister(.shader, 0x20d, 0);
+    try state.writeRegister(.shader, 0x213, (16 << 1) | (2 << 11));
+    for ([_]u32{ 0x92, 0xfff000, 1 << 24, 0, 0x1000, 0, 16, 0 }, 0..) |word, i| try state.writeRegister(.shader, 0x248 + @as(u32, @intCast(i)), word);
+    const packet = gpu.pm4.Packet{ .kind = .command, .header = command(gpu.pm4.dispatch_direct, 4), .opcode = gpu.pm4.dispatch_direct, .body = &.{ 1, 1, 1, 1 } };
+    for ([_]bool{ false, true }) |alpha_msb| for ([_]u8{ 0, 0x40, 0x80, 0xc0, 0xff, 0x10 }) |key| {
+        errdefer std.debug.print("DCC volume case key=0x{x} alpha_msb={} backing={d} keys={d}\n", .{ key, alpha_msb, backing.len, keys.len });
+        descriptor[6] = (1 << 21) | (if (alpha_msb) @as(u32, 1 << 22) else 0);
+        for (descriptor, 0..) |word, i| try state.writeRegister(.shader, 0x240 + @as(u32, @intCast(i)), word);
+        @memset(keys, key);
+        var original: [4]f16 = .{ 0.25, 0.5, 0.75, 1 };
+        for (0..backing.len / 8) |i| @memcpy(backing[i * 8 ..][0..8], std.mem.asBytes(&original));
+        if (key != 0xff and key != 0x10) for (&original, 0..) |*channel, i| {
+            channel.* = if (key & (if (i == (if (alpha_msb) @as(usize, 3) else 0)) @as(u8, 0x40) else 0x80) != 0) 1 else 0;
+        };
+        // Sample before the store, so uniform compressed keys are exercised.
+        try state.writeRegister(.shader, 0x20c, 2);
+        const expected = try allocator.dupe(u8, &memory.data);
+        defer allocator.free(expected);
+        const sampled: [4]f32 = .{ original[0], original[1], original[2], original[3] };
+        @memcpy(expected[0x1000..][0..16], std.mem.asBytes(&sampled));
+        try renderer.dispatch(&state, packet);
+        if (!std.mem.eql(u8, expected, &memory.data)) return error.ComputeDccVolumeSampleMismatch;
+        // A single texel store must retain the logical clear in every other
+        // texel and publish uncompressed keys only after successful completion.
+        for (0..backing.len / 8) |i| @memcpy(expected[0x10000 + i * 8 ..][0..8], std.mem.asBytes(&original));
+        const stored: [4]f16 = .{ 2, 3, 4, 5 };
+        const offset: usize = @intCast(try view.sourceByteOffset(0, 0, 0, 0));
+        @memcpy(expected[0x10000 + offset ..][0..8], std.mem.asBytes(&stored));
+        @memset(expected[0xa0000..][0..keys.len], 0xff);
+        try state.writeRegister(.shader, 0x20c, 1);
+        try renderer.dispatch(&state, packet);
+        if (!std.mem.eql(u8, expected, &memory.data)) return error.ComputeDccVolumeStoreMismatch;
+    };
+    for ([_]bool{ false, true }) |mixed| {
+        @memset(keys, if (mixed) 0xff else 0x55);
+        if (mixed) keys[keys.len - 1] = 0;
+        const before = try allocator.dupe(u8, &memory.data);
+        defer allocator.free(before);
+        try std.testing.expectError(error.CompressedColorTargetNotImplemented, renderer.dispatch(&state, packet));
+        if (!std.mem.eql(u8, before, &memory.data)) return error.ComputeDccRejectionModifiedMemory;
+    }
+    std.debug.print("PASS DCC RGBA16_FLOAT volume: 12 sampled clears and partial stores, both alpha positions, complete texel/key preservation, unsupported/mixed-key rejection\n", .{});
+}
+
+fn guestPackedDccSampledProbe(allocator: std.mem.Allocator) !void {
+    const memory = try allocator.create(GraphicsMemory);
+    defer allocator.destroy(memory);
+    memory.* = .{};
+    var renderer = try d3d12.Renderer.init(allocator, memory.access(), false);
+    defer renderer.deinit();
+    const code = [_]u32{ vop1(1, 0, 255), 0x3f000000, vop1(1, 1, 256), vop1(1, 2, 128), 0xf0900f08, 0x00400400, 0xe0780000, 0x80030400, 0xbf810000 };
+    @memcpy(memory.data[0x100..][0..@sizeOf(@TypeOf(code))], std.mem.asBytes(&code));
+    var descriptor = [_]u32{ 0x100, (50 << 20) | (3 << 30), 3 << 14, (9 << 28) | (27 << 20) | 0xfac, 0, 0, 1 << 21, 10 };
+    const layout = try gpu.TextureLayout.fromImage(try gpu.resources.decodeImageDescriptor(&descriptor));
+    const backing = memory.data[0x10000..][0..@intCast(layout.required_source_bytes)];
+    const keys = memory.data[0xa0000..][0..d3d12.surfaces.Dcc.blockCount(backing.len)];
+    var state = gpu.State{};
+    try state.writeRegister(.shader, 0x20c, 1);
+    try state.writeRegister(.shader, 0x20d, 0);
+    try state.writeRegister(.shader, 0x213, 16 << 1);
+    for ([_]u32{ 0x92, 0xfff000, 1 << 24, 0, 0x1000, 0, 16, 0 }, 0..) |word, i| try state.writeRegister(.shader, 0x248 + @as(u32, @intCast(i)), word);
+    const packet = gpu.pm4.Packet{ .kind = .command, .header = command(gpu.pm4.dispatch_direct, 4), .opcode = gpu.pm4.dispatch_direct, .body = &.{ 1, 1, 1, 1 } };
+    for ([_]bool{ false, true }) |alpha_msb| for ([_]u8{ 0, 0x40, 0x80, 0xc0, 0xff, 0x10 }) |key| {
+        descriptor[6] = (1 << 21) | (if (alpha_msb) @as(u32, 1 << 22) else 0);
+        for (descriptor, 0..) |word, i| try state.writeRegister(.shader, 0x240 + @as(u32, @intCast(i)), word);
+        const bits: u32 = 17 | (511 << 10) | (999 << 20) | (2 << 30);
+        for (0..backing.len / 4) |i| std.mem.writeInt(u32, backing[i * 4 ..][0..4], bits, .little);
+        @memset(keys, key);
+        const before = try allocator.dupe(u8, &memory.data);
+        defer allocator.free(before);
+        try renderer.dispatch(&state, packet);
+        for (0..4) |channel| {
+            const expected: f32 = if (key == 0xff or key == 0x10)
+                @as(f32, @floatFromInt((bits >> @as(u5, @intCast(channel * 10))) & (if (channel == 3) @as(u32, 3) else 1023))) / (if (channel == 3) @as(f32, 3) else 1023)
+            else if (key & (if (channel == (if (alpha_msb) @as(usize, 3) else 0)) @as(u8, 0x40) else 0x80) != 0) 1 else 0;
+            const actual: f32 = @bitCast(std.mem.readInt(u32, memory.data[0x1000 + channel * 4 ..][0..4], .little));
+            if (@abs(actual - expected) > 0.000001) return error.PackedDccSampleMismatch;
+        }
+        @memcpy(before[0x1000..][0..16], memory.data[0x1000..][0..16]);
+        if (!std.mem.eql(u8, before, &memory.data)) return error.PackedDccSampleChangedSource;
+    };
+    std.debug.print("PASS RGB10A2 DCC sampling: 12 packed/uniform/comp-to-single cases, both alpha positions, exact source and metadata preservation\n", .{});
+}
+
+fn guestComputeForwardBranchesProbe(allocator: std.mem.Allocator) !void {
+    const memory = try allocator.create(GraphicsMemory);
+    defer allocator.destroy(memory);
+    memory.* = .{};
+    var renderer = try d3d12.Renderer.init(allocator, memory.access(), false);
+    defer renderer.deinit();
+    // Two forward selections share an exit, while the third path terminates
+    // separately. This needs a dispatcher but cannot revisit a guest block.
+    var code = [_]u32{
+        vop1(1, 1, 129), 0xbf068008, 0xbf850007,
+        vop1(1, 1, 130), 0xbf068009, 0xbf850004,
+        vop1(1, 1, 131), 0xe0702000, 0x80000100,
+        0xbf810000,      0xe0702000, 0x80000100,
+        0xbf810000,
+    };
+    @memcpy(memory.data[0x100..][0..@sizeOf(@TypeOf(code))], std.mem.asBytes(&code));
+    var program = try rdna2.decodeProgram(allocator, &code);
+    defer program.deinit(allocator);
+    var translated = try rdna2.translateProgramSpirv(allocator, &program, .{
+        .stage = .compute,
+        .local_size = .{ 64, 1, 1 },
+        .scalar_registers = &.{ .{ .register = 8, .value = 0 }, .{ .register = 9, .value = 0 } },
+        .storage_buffers = &.{.{ .resource_sgpr = 0, .descriptor_index = 0, .stride = 4, .extent_bytes = 256 }},
+        .allow_control_flow_fallback = false,
+    });
+    defer translated.deinit(allocator);
+    if (!translated.used_dispatcher) return error.ComputeForwardDispatcherNotExercised;
+    var state = gpu.State{};
+    try state.writeRegister(.shader, 0x20c, 1);
+    try state.writeRegister(.shader, 0x20d, 0);
+    try state.writeRegister(.shader, 0x207, 64);
+    try state.writeRegister(.shader, 0x213, 10 << 1);
+    for ([_]u32{ 0x1000, 4 << 16, 64, 0 }, 0..) |word, i| try state.writeRegister(.shader, 0x240 + @as(u32, @intCast(i)), word);
+    const packet = gpu.pm4.Packet{ .kind = .command, .header = command(gpu.pm4.dispatch_direct, 4), .opcode = gpu.pm4.dispatch_direct, .body = &.{ 1, 1, 1, 1 } };
+    for ([_][3]u32{ .{ 0, 0, 1 }, .{ 0, 1, 1 }, .{ 1, 0, 2 }, .{ 1, 1, 3 } }) |variant| {
+        try state.writeRegister(.shader, 0x248, variant[0]);
+        try state.writeRegister(.shader, 0x249, variant[1]);
+        @memset(memory.data[0x1000..0x1100], 0xa7);
+        const expected = try allocator.dupe(u8, &memory.data);
+        defer allocator.free(expected);
+        for (0..64) |i| std.mem.writeInt(u32, expected[0x1000 + i * 4 ..][0..4], variant[2], .little);
+        try renderer.dispatch(&state, packet);
+        if (!std.mem.eql(u8, expected, &memory.data)) return error.ComputeForwardDispatcherMismatch;
+    }
+    // An unfinished cycle must withhold its intermediate UAV stores.
+    code[9] = 0xbf82fff6; // s_branch -> word 0
+    @memcpy(memory.data[0x200..][0..@sizeOf(@TypeOf(code))], std.mem.asBytes(&code));
+    try state.writeRegister(.shader, 0x20c, 2);
+    const before = try allocator.dupe(u8, &memory.data);
+    defer allocator.free(before);
+    try std.testing.expectError(error.ShaderLoopBudgetExceeded, renderer.dispatch(&state, packet));
+    if (!std.mem.eql(u8, before, &memory.data)) return error.RejectedComputeDispatcherWroteMemory;
+    const loops = [_]u32{
+        0xbe890380,    vop1(1, 1, 128), 0xbf068008,         0xbf850008,
+        0xbf090809,    0xbf850006,      sop2(0, 9, 9, 129), 0xbf068209,
+        0xbf850002,    vop1(1, 1, 9),   0xbf800000,         0xbf82fff8,
+        vop1(1, 1, 9), 0xe0702000,      0x80000100,         0xbf810000,
+    };
+    @memcpy(memory.data[0x300..][0..@sizeOf(@TypeOf(loops))], std.mem.asBytes(&loops));
+    try state.writeRegister(.shader, 0x20c, 3);
+    for ([_]u32{ 0, 1, 64, 129, 511, 900 }) |count| {
+        try state.writeRegister(.shader, 0x248, count);
+        @memset(memory.data[0x1000..0x1100], 0xa7);
+        const expected = try allocator.dupe(u8, &memory.data);
+        defer allocator.free(expected);
+        for (0..64) |i| std.mem.writeInt(u32, expected[0x1000 + i * 4 ..][0..4], count, .little);
+        try renderer.dispatch(&state, packet);
+        if (!std.mem.eql(u8, expected, &memory.data)) return error.ComputeCheckedLoopMismatch;
+    }
+    std.debug.print("PASS compute dispatchers: four forward branch paths, six finite loops, exact 64-lane stores and withheld writes on exhaustion\n", .{});
+}
+
+fn guestComputeStatusIsolationProbe(allocator: std.mem.Allocator, device: *d3d12.Device) !void {
+    const code = [_]u32{ vop1(1, 0, 128), vop1(1, 1, 128), vop1(1, 4, 255), 0x12345678, 0xe0702000, 0x80000400, 0xf0200108, 0x00020400, 0xbf810000 };
+    var program = try rdna2.decodeProgram(allocator, &code);
+    defer program.deinit(allocator);
+    try program.instructions.insertSlice(allocator, program.instructions.items.len - 1, &.{
+        .{ .opcode = .s_mov_b32, .dst = .{ .kind = .m0 }, .src0 = .{ .kind = .literal_constant, .value = 0xffff }, .src_count = 1 },
+        .{ .family = .ds, .opcode = .ds_write_b32, .src0 = .{ .kind = .vgpr, .reg = 0 }, .src1 = .{ .kind = .vgpr, .reg = 4 }, .src_count = 2, .gds = true },
+        .{ .opcode = .s_nop },
+        .{ .opcode = .s_branch, .branch_target = 7 * 8 },
+    });
+    for (program.instructions.items, 0..) |*inst, i| {
+        inst.pc = @intCast(i * 8);
+        inst.word_count = 2;
+    }
+    var data: [64]u8 = undefined;
+    var pixels: [64]u8 = undefined;
+    var gds: [64 * 1024]u8 = undefined;
+    // Revisit both cache variants after a failed dispatch: status must be reset,
+    // and it must never alias guest u0, image u0/space1 or the persistent GDS.
+    for ([_]bool{ false, true, false, true }) |exhausted| {
+        program.instructions.items[8].opcode = if (exhausted) .s_branch else .s_nop;
+        var shader = try rdna2.translateProgramSpirv(allocator, &program, .{
+            .stage = .compute,
+            .maximum_dispatcher_iterations = 8,
+            .compute_dispatcher_status = true,
+            .scalarize_ballot_first = true,
+            .gds_storage = true,
+            .descriptor_array_length = 1,
+            .storage_buffers = &.{.{ .resource_sgpr = 0, .descriptor_index = 0, .stride = 4, .extent_bytes = data.len }},
+            .storage_images = &.{.{ .resource_sgpr = 8, .descriptor_index = 0, .format = .r32_uint }},
+            .allow_control_flow_fallback = false,
+        });
+        defer shader.deinit(allocator);
+        if (exhausted and !shader.used_dispatcher) return error.ComputeIsolationDispatcherNotExercised;
+        @memset(&data, 0xa7);
+        @memset(&pixels, 0xa7);
+        @memset(&gds, 0xa7);
+        const result = device.dispatchImagesSpirvChecked(shader.words, &.{ d3d12.Buffer.fromSlice(&data), d3d12.Buffer.fromSlice(&gds) }, &.{.{ .pixels = &pixels, .size = pixels.len, .width = 4, .height = 4, .format = 42, .writable = 1 }}, .{ 1, 1, 1 }, true, true);
+        if (exhausted) {
+            try std.testing.expectError(error.ShaderLoopBudgetExceeded, result);
+        } else try result;
+        const expected: u32 = if (exhausted) 0xa7a7a7a7 else 0x12345678;
+        for ([_][]const u8{ &data, &pixels, &gds }, 0..) |bytes, i| {
+            if (std.mem.readInt(u32, bytes[0..4], .little) != expected or !std.mem.allEqual(u8, bytes[4..], 0xa7)) {
+                std.debug.print("Compute status isolation: exhausted={} resource={d} first=0x{x} expected=0x{x} tail_preserved={}\n", .{ exhausted, i, std.mem.readInt(u32, bytes[0..4], .little), expected, std.mem.allEqual(u8, bytes[4..], 0xa7) });
+                return error.ComputeStatusIsolationMismatch;
+            }
+        }
+    }
+    std.debug.print("PASS compute status isolation: buffer/image/GDS writes commit only on completion, failure preserves all bytes and cached retries reset status\n", .{});
+}
+
+fn guestComputeSampledProbe(allocator: std.mem.Allocator, device: *d3d12.Device) !void {
+    const code = [_]u32{ vop1(1, 8, 255), 0x3f000000, vop1(1, 9, 255), 0x3f000000, 0xf11c0108, 0x00610008, 0xe0780000, 0x80000000, vop1(1, 10, 128), vop1(1, 11, 128), 0xf0200f08, 0x0004000a, 0xbf810000 };
+    var program = try rdna2.decodeProgram(allocator, &code);
+    defer program.deinit(allocator);
+    var shader = try rdna2.translateProgramSpirv(allocator, &program, .{
+        .stage = .compute,
+        .sampled_images = &.{.{ .resource_sgpr = 4, .sampler_sgpr = 12, .descriptor_index = 0 }},
+        .sampled_image_array_length = 1,
+        .storage_images = &.{.{ .resource_sgpr = 16, .descriptor_index = 0, .format = .rgba32_float }},
+        .storage_buffers = &.{.{ .resource_sgpr = 0, .descriptor_index = 0, .extent_bytes = 16 }},
+        .descriptor_array_length = 1,
+        .allow_control_flow_fallback = false,
+    });
+    defer shader.deinit(allocator);
+    const memory = try allocator.create(GraphicsMemory);
+    defer allocator.destroy(memory);
+    memory.* = .{};
+    var renderer = try d3d12.Renderer.init(allocator, memory.access(), false);
+    defer renderer.deinit();
+    @memcpy(memory.data[0x100..][0..@sizeOf(@TypeOf(code))], std.mem.asBytes(&code));
+    const descriptor = [_]u32{ 0x100, (22 << 20) | (1 << 30), 1 << 14, 0x90000fac, 0, 0, 0, 0 };
+    const layout = try gpu.SurfaceLayout.fromImage(try gpu.resources.decodeImageDescriptor(&descriptor));
+    const destination = [_]u32{ 0x200, @as(u32, @intFromEnum(rdna2.spirv.StorageImageFormat.rgba32_float)) << 20, 0, 0x90000fac, 0, 0, 0, 0 };
+    const destination_texture = try gpu.TextureLayout.fromImage(try gpu.resources.decodeImageDescriptor(&destination));
+    const destination_view = try destination_texture.subresource(0, 0, 1);
+    var state = gpu.State{};
+    try state.writeRegister(.shader, 0x20c, 1);
+    try state.writeRegister(.shader, 0x20d, 0);
+    try state.writeRegister(.shader, 0x213, 24 << 1);
+    for ([_]u32{ 0x1000, 0, 16, 0 }, 0..) |word, i| try state.writeRegister(.shader, 0x240 + @as(u32, @intCast(i)), word);
+    for (descriptor, 0..) |word, i| try state.writeRegister(.shader, 0x244 + @as(u32, @intCast(i)), word);
+    for (destination, 0..) |word, i| try state.writeRegister(.shader, 0x250 + @as(u32, @intCast(i)), word);
+    for (0..4) |i| try state.writeRegister(.shader, 0x24c + @as(u32, @intCast(i)), if (i == 0) 2 | (2 << 3) | (2 << 6) else 0);
+    const packet = gpu.pm4.Packet{ .kind = .command, .header = command(gpu.pm4.dispatch_direct, 4), .opcode = gpu.pm4.dispatch_direct, .body = &.{ 1, 1, 1, 1 } };
+    for (0..2) |pass| {
+        const base: f32 = @floatFromInt(pass * 100);
+        const texels = [_]f32{ base + 10, base + 20, base + 30, base + 40 };
+        const expected = [_]f32{ texels[2], texels[3], texels[1], texels[0] };
+        var output: [4]f32 = @splat(-1);
+        var image_output: [4]f32 = @splat(-2);
+        try device.dispatchResourcesSpirv(shader.words, &.{d3d12.Buffer.fromSlice(std.mem.asBytes(&output))}, &.{.{ .pixels = std.mem.asBytes(&image_output), .size = 16, .width = 1, .height = 1, .format = 2, .writable = 1 }}, &.{.{ .pixels = std.mem.sliceAsBytes(&texels).ptr, .size = 16, .width = 2, .height = 2, .format = 41 }}, .{ 1, 1, 1 }, false, false);
+        if (!std.mem.eql(f32, &expected, &output) or !std.mem.eql(f32, &expected, &image_output)) return error.ComputeGatherOrderMismatch;
+        try layout.tile(std.mem.sliceAsBytes(&texels), memory.data[0x10000..][0..@intCast(layout.required_source_bytes)]);
+        const expected_memory = try allocator.dupe(u8, &memory.data);
+        defer allocator.free(expected_memory);
+        @memcpy(expected_memory[0x1000..][0..16], std.mem.sliceAsBytes(&expected));
+        try destination_view.tile(std.mem.sliceAsBytes(&expected), expected_memory[0x20000..][0..@intCast(destination_view.required_source_bytes)]);
+        try renderer.dispatch(&state, packet);
+        if (!std.mem.eql(u8, expected_memory, &memory.data)) return error.ComputeGatherGuestMismatch;
+    }
+    // Sampling an image while writing its overlapping guest buffer cannot be
+    // represented by two immutable snapshots. Reject without publishing data.
+    try state.writeRegister(.shader, 0x240, 0x10000);
+    const before = try allocator.dupe(u8, &memory.data);
+    defer allocator.free(before);
+    try std.testing.expectError(error.ComputeImageAliasNotImplemented, renderer.dispatch(&state, packet));
+    if (!std.mem.eql(u8, before, &memory.data)) return error.ComputeSampledAliasModifiedMemory;
+    // The startup downsampler gathers from a nonzero R16_FLOAT mip and writes
+    // another mip in the same tiled allocation. Preserve every other texel.
+    try state.writeRegister(.shader, 0x240, 0x1000);
+    const mip_descriptor = [_]u32{ 0x400, (13 << 20) | (3 << 30), 15 | (63 << 14), 0x90000fac | (3 << 12) | (3 << 16) | (27 << 20), 0, 6 << 4, 0, 0 };
+    var target_descriptor = mip_descriptor;
+    target_descriptor[3] = (target_descriptor[3] & ~@as(u32, 0xff000)) | (4 << 12) | (4 << 16);
+    const mip_texture = try gpu.TextureLayout.fromImage(try gpu.resources.decodeImageDescriptor(&mip_descriptor));
+    const source_mip = try mip_texture.subresource(3, 0, 1);
+    const target_mip = try mip_texture.subresource(4, 0, 1);
+    const backing = memory.data[0x40000..][0..@intCast(mip_texture.required_source_bytes)];
+    @memset(backing, 0xa7);
+    var mip_pixels: [64]f16 = undefined;
+    for (&mip_pixels, 0..) |*value, i| value.* = @floatFromInt(100 + i);
+    try source_mip.tile(std.mem.asBytes(&mip_pixels), backing);
+    for (mip_descriptor, 0..) |word, i| try state.writeRegister(.shader, 0x244 + @as(u32, @intCast(i)), word);
+    for (target_descriptor, 0..) |word, i| try state.writeRegister(.shader, 0x250 + @as(u32, @intCast(i)), word);
+    const mip_expected = [_]f32{ 135, 136, 128, 127 };
+    const mip_memory = try allocator.dupe(u8, &memory.data);
+    defer allocator.free(mip_memory);
+    @memcpy(mip_memory[0x1000..][0..16], std.mem.asBytes(&mip_expected));
+    var target_pixels: [16]f16 = undefined;
+    try target_mip.detile(backing, std.mem.asBytes(&target_pixels));
+    target_pixels[0] = 135;
+    try target_mip.tile(std.mem.asBytes(&target_pixels), mip_memory[0x40000..][0..backing.len]);
+    try renderer.dispatch(&state, packet);
+    if (!std.mem.eql(u8, mip_memory, &memory.data)) return error.ComputeMipGatherMismatch;
+    for (mip_descriptor, 0..) |word, i| try state.writeRegister(.shader, 0x250 + @as(u32, @intCast(i)), word);
+    try std.testing.expectError(error.ComputeImageAliasNotImplemented, renderer.dispatch(&state, packet));
+    if (!std.mem.eql(u8, mip_memory, &memory.data)) return error.ComputeOverlappingMipModifiedMemory;
+    std.debug.print("PASS compute sampled R32_FLOAT gather: native/PM4 texel order, changed-input cache reuse, complete memory reference and writable-alias rejection\n", .{});
+    std.debug.print("PASS nonzero R16_FLOAT mip gather: mip 3 -> mip 4 in one tiled allocation, full backing preservation and overlapping-view rejection\n", .{});
 }
 
 fn guestWaveProbe(allocator: std.mem.Allocator, device: *d3d12.Device) !void {
@@ -664,6 +984,7 @@ fn guestGraphicsProbe(allocator: std.mem.Allocator, device: *d3d12.Device) !void
     std.debug.print("PASS nonzero first vertex and positive indexed base vertex\n", .{});
     try guestCommandProbe(allocator, &vertex_words, &pixel_words);
     try guestMrtProbe(allocator, &vertex_words, &pixel_words);
+    try guestR8TargetProbe(allocator, &vertex_words, &pixel_words);
     try guestFloatTargetProbe(allocator, &vertex_words);
     try guestPackedTargetProbe(allocator, &vertex_words);
     try guestSurfaceProbe(allocator, &vertex_words, &pixel_words);
@@ -1027,26 +1348,38 @@ fn guestStencilCommandProbe(allocator: std.mem.Allocator, vertex: []const u32, f
     // Quake II uses compress-disable rectangles with no PS or a bound null PS.
     // With tests disabled, both still materialize HTILE into BOTH planes.
     const utility_vs = [_]u32{ vop1(1, 0, 128), vop1(1, 1, 255), 0x3f800000, 0xf80008cf, 0x01000000, 0xbf810000 };
-    @memcpy(memory.data[0x200..][0..@sizeOf(@TypeOf(utility_vs))], std.mem.asBytes(&utility_vs));
+    // Oxide Room 104's NGG utility also uses logical shift, unsigned integer
+    // conversion and floating multiply-add to form rectangle coordinates.
+    const oxide_utility_vs = [_]u32{
+        vop1(1, 0, 128),                           vop1(1, 1, 255), 0x3f800000,
+        (0x16 << 25) | (3 << 17) | (5 << 9) | 129, vop1(6, 3, 259), 0xd1410003,
+        242 | (259 << 9) | (243 << 18),            0xf80008cf,      0x01000000,
+        0xbf810000,
+    };
     try state.writeRegister(.context, 0x318, 0);
     try state.writeRegister(.context, 0x000, 0x60);
     try state.writeRegister(.context, 0x200, 0);
     const previous_color = memory.data[0x2000..0x5000].*;
     const null_ps = [_]u32{ 0xf8001890, 0, 0xbf810000 };
     @memcpy(memory.data[0x400..][0..@sizeOf(@TypeOf(null_ps))], std.mem.asBytes(&null_ps));
-    for ([_]u32{ 0, 4 }, 0..) |pixel_address, pass| {
-        try state.writeRegister(.shader, 0x008, pixel_address);
-        offset = 0;
-        while (offset < keys.len) : (offset += 4) std.mem.writeInt(u32, keys[offset..][0..4], 0xf0, .little);
-        @memset(memory.data[0x20000..][0..depth.backing.len], 0xcd);
-        @memset(memory.data[0x30000..][0..stencil.backing.len], 0xcd);
-        _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 2 });
-        if (renderer.metadata_expands != pass + 1 or !std.mem.eql(u8, &previous_color, memory.data[0x2000..0x5000])) return error.DepthUtilityNotExecuted;
-        try depth.layout.detile(memory.data[0x20000..][0..depth.backing.len], depth.pixels);
-        try stencil.layout.detile(memory.data[0x30000..][0..stencil.backing.len], stencil.pixels);
-        for (depth.pixels) |byte| if (byte != 0) return error.DepthUtilityDidNotExpandDepth;
-        for (stencil.pixels) |byte| if (byte != 0) return error.DepthUtilityDidNotExpandStencil;
-        if (try htile.word(keys, 0, 0, 0) != gpu.HtileLayout.expanded_depth_stencil) return error.DepthUtilityDidNotExpandMetadata;
+    var expansion_count: u64 = 0;
+    for ([_][]const u32{ &utility_vs, &oxide_utility_vs }) |utility| {
+        @memcpy(memory.data[0x200..][0 .. utility.len * 4], std.mem.sliceAsBytes(utility));
+        for ([_]u32{ 0, 4 }) |pixel_address| {
+            try state.writeRegister(.shader, 0x008, pixel_address);
+            offset = 0;
+            while (offset < keys.len) : (offset += 4) std.mem.writeInt(u32, keys[offset..][0..4], 0xf0, .little);
+            @memset(memory.data[0x20000..][0..depth.backing.len], 0xcd);
+            @memset(memory.data[0x30000..][0..stencil.backing.len], 0xcd);
+            _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 2 });
+            expansion_count += 1;
+            if (renderer.metadata_expands != expansion_count or !std.mem.eql(u8, &previous_color, memory.data[0x2000..0x5000])) return error.DepthUtilityNotExecuted;
+            try depth.layout.detile(memory.data[0x20000..][0..depth.backing.len], depth.pixels);
+            try stencil.layout.detile(memory.data[0x30000..][0..stencil.backing.len], stencil.pixels);
+            for (depth.pixels) |byte| if (byte != 0) return error.DepthUtilityDidNotExpandDepth;
+            for (stencil.pixels) |byte| if (byte != 0) return error.DepthUtilityDidNotExpandStencil;
+            if (try htile.word(keys, 0, 0, 0) != gpu.HtileLayout.expanded_depth_stencil) return error.DepthUtilityDidNotExpandMetadata;
+        }
     }
     // A null export following discard must not trigger full-plane expansion.
     const discard_ps = [_]u32{ 0xbefe0480, 0xf8001890, 0, 0xbf810000 };
@@ -1060,7 +1393,13 @@ fn guestStencilCommandProbe(allocator: std.mem.Allocator, vertex: []const u32, f
     // A system interrupt must never be classified as harmless vertex work.
     std.mem.writeInt(u32, memory.data[0x200..][0..4], 0xbf900001, .little);
     if (renderer.draw(&state, packet)) |_| return error.VertexSystemMessageIgnored else |err| if (err != error.MissingAttachment) return err;
-    std.debug.print("PASS PM4 stencil clear/increment, HTILE persistence, PS-less/null-PS compression-disable materialization of both planes, discard/system-message rejection\n", .{});
+    // Vertex stores must not turn into metadata-only completion either.
+    const storing_vs = [_]u32{ 0xe0702000, 0x80000100, 0xbf810000 };
+    @memcpy(memory.data[0x200..][0..@sizeOf(@TypeOf(storing_vs))], std.mem.asBytes(&storing_vs));
+    @memcpy(before_rejection, &memory.data);
+    if (renderer.draw(&state, packet)) |_| return error.VertexStoreIgnored else |err| if (err != error.MissingAttachment) return err;
+    if (!std.mem.eql(u8, before_rejection, &memory.data)) return error.VertexStoreRejectionModifiedMemory;
+    std.debug.print("PASS PM4 stencil clear/increment, HTILE persistence, PS-less/null-PS compression-disable materialization of both planes, discard/system-message/store rejection\n", .{});
 }
 
 fn guestRectangleProbe(allocator: std.mem.Allocator) !void {
@@ -1773,6 +2112,31 @@ fn guestMrtProbe(allocator: std.mem.Allocator, vertex: []const u32, fragment: []
     const packet: gpu.pm4.Packet = .{ .kind = .command, .header = command(gpu.pm4.draw_index_auto, 2), .opcode = gpu.pm4.draw_index_auto, .body = &.{ 3, 2 } };
     try renderer.draw(&initial_state, packet);
     const coverage = memory.data[0x2000..0x5000].*;
+    // Stale higher slots may have unrelated extents, formats and metadata.
+    // With zero effective channel masks they cannot constrain this draw.
+    for ([_]bool{ false, true }) |shader_masked| {
+        var state = initial_state;
+        for (1..8) |slot| {
+            const reg: u32 = @intCast(slot);
+            try state.writeRegister(.context, 0x318 + reg * 15, 0x600);
+            try state.writeRegister(.context, 0x319 + reg * 15, 127);
+            try state.writeRegister(.context, 0x31c + reg * 15, (9 << 2) | (1 << 28));
+            try state.writeRegister(.context, 0x390 + reg, 27);
+            try state.writeRegister(.context, 0x3b0 + reg, (1023 << 14) | 1023);
+            try state.writeRegister(.context, 0x3b8 + reg, 0);
+        }
+        try state.writeRegister(.context, 0x08e, if (shader_masked) 0xffffffff else 15);
+        try state.writeRegister(.context, 0x08f, if (shader_masked) 15 else 0xffffffff);
+        const before = try allocator.dupe(u8, &memory.data);
+        defer allocator.free(before);
+        try renderer.draw(&state, packet);
+        try renderer.flushDraws();
+        if (!std.mem.eql(u8, before, &memory.data)) return error.InactiveMrtModifiedMemory;
+        try state.writeRegister(.context, 0x08e, 255);
+        try state.writeRegister(.context, 0x08f, 255);
+        try std.testing.expectError(error.MismatchedRenderTargetExtents, renderer.draw(&state, packet));
+        if (!std.mem.eql(u8, before, &memory.data)) return error.InvalidActiveMrtModifiedMemory;
+    }
     for ([_]u32{ 2, 5, 8 }) |count| for ([_]usize{ 1, 8 }) |batch_limit| {
         var state = initial_state;
         var program: std.ArrayList(u32) = .empty;
@@ -1917,6 +2281,58 @@ fn guestMrtProbe(allocator: std.mem.Allocator, vertex: []const u32, fragment: []
         }
     };
     std.debug.print("PASS 2/5/8 simultaneous targets, mixed RGBA8 UNORM/SNORM and RG16/RGBA16 float, independent masks/blends, exactly-once depth/stencil, immediate/grouped writes, padding and alias rejection\n", .{});
+}
+
+fn guestR8TargetProbe(allocator: std.mem.Allocator, vertex: []const u32, fragment: []const u32) !void {
+    const memory = try allocator.create(GraphicsMemory);
+    defer allocator.destroy(memory);
+    memory.* = .{};
+    @memcpy(memory.data[0x200..][0 .. vertex.len * 4], std.mem.sliceAsBytes(vertex));
+    @memcpy(memory.data[0x400..][0 .. fragment.len * 4], std.mem.sliceAsBytes(fragment));
+    var renderer = try d3d12.Renderer.init(allocator, memory.access(), false);
+    defer renderer.deinit();
+    var state = try graphicsState(65, 37, 72);
+    const packet = gpu.pm4.Packet{ .kind = .command, .header = command(gpu.pm4.draw_index_auto, 2), .opcode = gpu.pm4.draw_index_auto, .body = &.{ 3, 2 } };
+    try renderer.draw(&state, packet);
+    try renderer.flushDraws();
+    const coverage = memory.data[0x2000..0x5000].*;
+    const quarter = [_]u32{ vop1(1, 0, 255), 0x3e800000, vop1(1, 1, 128), vop1(1, 2, 128), vop1(1, 3, 242), 0xf800080f, 0x03020100, 0xbf810000 };
+    @memcpy(memory.data[0x400..][0..@sizeOf(@TypeOf(quarter))], std.mem.asBytes(&quarter));
+    try state.writeRegister(.context, 0x318, 0x100);
+    try state.writeRegister(.context, 0x319, 0);
+    try state.writeRegister(.context, 0x31c, (1 << 2) | (1 << 28));
+    try state.writeRegister(.context, 0x3b8, 27 << 14);
+    try state.writeRegister(.context, 0x325, 0xa00);
+    try state.writeRegister(.context, 0x3a8, 0);
+    try state.writeRegister(.context, 0x323, 123);
+    const target = gpu.resources.decodeColorTarget(&state, 0, 15).?;
+    const layout = try d3d12.surfaces.colorLayout(target);
+    const backing = memory.data[0x10000..][0..@intCast(layout.required_source_bytes)];
+    const keys = memory.data[0xa0000..][0..d3d12.surfaces.Dcc.blockCount(backing.len)];
+    for ([_]u8{ 0, 0x40, 0x80, 0xc0, 0x20, 0x10, 0xff }) |key| for ([_]u32{ 15, 14 }) |mask| {
+        @memset(backing, 61);
+        @memset(keys, key);
+        const expected = try allocator.dupe(u8, &memory.data);
+        defer allocator.free(expected);
+        const initial: u8 = switch (key) {
+            0, 0x80 => 0,
+            0x40, 0xc0 => 255,
+            0x20 => 123,
+            else => 61,
+        };
+        @memset(expected[0x10000..][0..backing.len], initial);
+        @memset(expected[0xa0000..][0..keys.len], 0xff);
+        if (mask & 1 != 0) for (0..37) |y| for (0..65) |x| {
+            if (coverage[(y * 72 + x) * 4] != 255) continue;
+            const offset: usize = @intCast(try layout.sourceByteOffset(@intCast(x), @intCast(y), 0));
+            expected[0x10000 + offset] = 64;
+        };
+        try state.writeRegister(.context, 0x08e, mask);
+        try renderer.draw(&state, packet);
+        try renderer.flushDraws();
+        if (!std.mem.eql(u8, expected, &memory.data)) return error.R8TargetMemoryMismatch;
+    };
+    std.debug.print("PASS R8 render target: 14 DCC plain/fixed/register/single-clear cases, red masks, full backing/padding/key reference\n", .{});
 }
 
 fn guestFloatTargetProbe(allocator: std.mem.Allocator, vertex: []const u32) !void {

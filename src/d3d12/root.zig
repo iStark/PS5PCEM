@@ -324,12 +324,20 @@ pub const Device = struct {
     }
 
     pub fn dispatchImagesSpirv(self: *Device, words: []const u32, buffers: []const Buffer, images: []const StorageImage, groups: [3]u32, gds: bool) Error!void {
+        return self.dispatchImagesSpirvChecked(words, buffers, images, groups, gds, false);
+    }
+
+    pub fn dispatchImagesSpirvChecked(self: *Device, words: []const u32, buffers: []const Buffer, images: []const StorageImage, groups: [3]u32, gds: bool, check_dispatcher: bool) Error!void {
+        return self.dispatchResourcesSpirv(words, buffers, images, &.{}, groups, gds, check_dispatcher);
+    }
+
+    pub fn dispatchResourcesSpirv(self: *Device, words: []const u32, buffers: []const Buffer, images: []const StorageImage, sampled: []const SampledImage, groups: [3]u32, gds: bool, check_dispatcher: bool) Error!void {
         if (words.len < 5 or words[0] != 0x07230203 or buffers.len > 64 + @as(usize, @intFromBool(gds)) or (gds and buffers.len == 0)) return error.InvalidArgument;
         for (groups) |size| if (size == 0 or size > 65535) return error.InvalidArgument;
         for (buffers) |buffer| if (buffer.size == 0 or buffer.size % 4 != 0 or buffer.size > 256 * 1024 * 1024) return error.InvalidArgument;
         if (builtin.os.tag != .windows) return error.UnsupportedPlatform;
-        if (images.len > 32) return error.InvalidArgument;
-        try self.check(ps5_d3d12_dispatch_spirv(self.handle, words.ptr, words.len, buffers.ptr, @intCast(buffers.len), &groups, @intFromBool(gds), images.ptr, @intCast(images.len)));
+        if (images.len > 32 or sampled.len > 32) return error.InvalidArgument;
+        try self.check(ps5_d3d12_dispatch_spirv(self.handle, words.ptr, words.len, buffers.ptr, @intCast(buffers.len), &groups, @intFromBool(gds), images.ptr, @intCast(images.len), @intFromBool(check_dispatcher), sampled.ptr, @intCast(sampled.len)));
     }
 
     pub fn drawSpirv(self: *Device, vertex: []const u32, fragment: []const u32, draw: Draw, rgba: []u8) Error!void {
@@ -391,7 +399,7 @@ pub const Device = struct {
         for (buffers) |buffer| if (buffer.size == 0 or buffer.size % 4 != 0 or buffer.size > 256 * 1024 * 1024) return error.InvalidArgument;
         for (images) |image| {
             if (image.size != try sampledImageMipChainSize(image.width, image.height, image.format, image.layers, image.dimension, image.mip_levels) or image.srgb > 1 or
-                ((image.format == 10 or image.format == 56 or image.format == 61 or image.format == 49 or image.format == 115) and image.srgb != 0) or
+                ((image.format == 10 or image.format == 24 or image.format == 54 or image.format == 41 or image.format == 34 or image.format == 56 or image.format == 61 or image.format == 49 or image.format == 115) and image.srgb != 0) or
                 image.address_u < 1 or image.address_u > 4 or image.address_v < 1 or image.address_v > 4 or
                 image.address_w < 1 or image.address_w > 4 or image.filter & ~@as(u32, 0x15) != 0 or
                 !std.math.isFinite(image.min_lod) or !std.math.isFinite(image.max_lod) or !std.math.isFinite(image.lod_bias) or
@@ -452,6 +460,7 @@ pub fn colorSize(width: u32, height: u32, format: u32) Error!usize {
     const rgba = try rgbaSize(width, height);
     const size = switch (format) {
         10 => rgba * 2, // R16G16B16A16_FLOAT
+        61 => rgba / 4, // R8_UNORM
         24, 26, 28, 31, 34 => rgba,
         else => return error.InvalidArgument,
     };
@@ -492,10 +501,10 @@ pub fn sampledImageArraySize(width: u32, height: u32, format: u32, layers: u32, 
 
 pub fn sampledImageSize(width: u32, height: u32, format: u32) Error!usize {
     const rgba = try rgbaSize(width, height);
-    if (format == 28) return rgba;
+    if (format == 28 or format == 24 or format == 41 or format == 34) return rgba;
     if (format == 10) return colorSize(width, height, format);
     if (format == 61) return rgba / 4;
-    if (format == 56 or format == 49 or format == 115) return rgba / 2;
+    if (format == 56 or format == 54 or format == 49 or format == 115) return rgba / 2;
     // Native BC base dimensions must be whole 4x4 blocks. Smaller mip levels
     // will need a separate subresource path; never pad and change guest UVs.
     if (width % 4 != 0 or height % 4 != 0) return error.InvalidArgument;
@@ -534,7 +543,7 @@ extern fn ps5_d3d12_attachment_stats(*Handle, *AttachmentStats) void;
 extern fn ps5_d3d12_attachment_cache(*Handle, c_int) i32;
 extern fn ps5_d3d12_upload_cache_limit(*Handle, u64) i32;
 extern fn ps5_d3d12_resource_pool_limit(*Handle, u64) i32;
-extern fn ps5_d3d12_dispatch_spirv(*Handle, [*]const u32, usize, [*]const Buffer, u32, *const [3]u32, u32, [*]const StorageImage, u32) i32;
+extern fn ps5_d3d12_dispatch_spirv(*Handle, [*]const u32, usize, [*]const Buffer, u32, *const [3]u32, u32, [*]const StorageImage, u32, u32, [*]const SampledImage, u32) i32;
 extern fn ps5_d3d12_draw_spirv(*Handle, [*]const u32, usize, [*]const u32, usize, *const Draw, [*]const u8, usize, [*]const Buffer, u32, [*]const SampledImage, u32, [*]u8, [*]u8, usize) i32;
 extern fn ps5_d3d12_present_rgba(*Handle, [*]const u8, u32, u32) i32;
 

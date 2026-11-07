@@ -60,6 +60,16 @@ supplied locally and is not included in this repository.
 
 ## Dated development reports
 
+**November 7, 2026 — OXIDE Room 104 DirectX 12 startup progress:** utility
+HTILE expansion, checked compute loops, sampled compute textures, nonzero mip
+views, uniform DCC storage/sampling, RGB10A2 sampling and R8 render targets now
+pass their reproduced stops. Trailing masked attachments no longer cause false
+extent failures. **The game still stops on DCC for an RGBA16_FLOAT raster
+attachment; menu, gameplay and FPS remain unverified on DirectX.** All 51
+D3D12 unit tests and the complete native GPU suite pass; the standard runner
+is rebuilt. The existing Vulkan result is unchanged.
+[Changes, validation and remaining blocker](development/oxide-room-104-d3d12-startup-2026-11-07.md).
+
 **November 5, 2026 — Big Helmet Heroes DirectX 12 startup progress:** native
 compute-image execution and packed 10-bit SDR scanout remove the first two
 stops. The first presented frame is still blank; the next color draw rejects

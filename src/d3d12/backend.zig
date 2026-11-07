@@ -614,6 +614,12 @@ pub const Renderer = struct {
         defer storage.deinit();
         var images = compute_images.Images{ .allocator = self.allocator };
         defer images.deinit();
+        var sampled = resources.DrawResources{ .allocator = self.allocator, .reader = self.reader(), .pool = &self.staging_pool, .cache = &self.conversion_cache };
+        defer sampled.deinit();
+        var sampled_stage = resources.Stage{};
+        defer sampled_stage.deinit(self.allocator);
+        var sampled_ranges: std.ArrayList(struct { start: u64, end: u64, descriptor: gpu.resources.ImageDescriptor, metadata: bool = false }) = .empty;
+        defer sampled_ranges.deinit(self.allocator);
         const unknown: gpu.scalar_provenance.ScalarRegisters = @splat(.{});
         // COMPUTE_PGM_RSRC2.LDS_SIZE counts 128-dword (512-byte) granules.
         const lds_bytes = ((state.readRegister(.shader, 0x213) orelse 0) >> 15 & 0x1ff) * 512;
@@ -622,7 +628,18 @@ pub const Renderer = struct {
             var resolver = gpu.scalar_resources.Resolver{ .bindings = &bindings, .reader = self.reader(), .instructions = analysis.program.instructions.items, .graph = &analysis.graph, .snapshot = &unknown };
             switch (inst.family) {
                 .mimg => {
-                    try images.capture(&resolver, inst);
+                    if (inst.opcode == .image_sample or inst.opcode == .image_gather4) {
+                        var words: [8]u32 = undefined;
+                        if (!try resolver.words(inst.src1.reg, inst.pc, &words)) return error.DynamicComputeImageNotImplemented;
+                        const descriptor = try gpu.resources.decodeImageDescriptor(&words);
+                        const size = if (descriptor.resourceMipLevels() > 1 or descriptor.image_type == .color_3d)
+                            (try gpu.TextureLayout.fromImage(descriptor)).required_source_bytes
+                        else
+                            (try gpu.SurfaceLayout.fromImage(descriptor)).required_source_bytes;
+                        try sampled_ranges.append(self.allocator, .{ .start = descriptor.address, .end = try std.math.add(u64, descriptor.address, size), .descriptor = descriptor });
+                        if (descriptor.dccMetadataAddress()) |address| try sampled_ranges.append(self.allocator, .{ .start = address, .end = try std.math.add(u64, address, surfaces.Dcc.blockCount(@intCast(size))), .descriptor = descriptor, .metadata = true });
+                        try sampled.captureImage(&sampled_stage, &resolver, inst);
+                    } else try images.capture(&resolver, inst);
                     continue;
                 },
                 .flat => return error.FlatMemoryNotImplemented,
@@ -665,9 +682,12 @@ pub const Renderer = struct {
         }
         var scalar: [64]rdna2.spirv.ScalarRegister = undefined;
         const scalar_count = entryScalars(bindings, &scalar);
+        const dispatch_budget = if (analysis.pipeline_options.enable_typed_ir) null else graphics.forwardDispatcherBudget(&analysis.program, &analysis.graph);
         const module_lease = try self.translations.acquirePrepared(self.allocator, &analysis.program, .{
             .stage = .compute,
             .program_address = bindings.program_address,
+            .maximum_dispatcher_iterations = dispatch_budget orelse 65536,
+            .compute_dispatcher_status = dispatch_budget == null,
             .local_size = local,
             .wave32 = initiator & (1 << 15) != 0,
             .scalarize_ballot_first = true,
@@ -675,6 +695,8 @@ pub const Renderer = struct {
             .scalar_registers = scalar[0..scalar_count],
             .storage_buffers = storage.mappings.items,
             .storage_images = images.bindings.items,
+            .sampled_images = sampled_stage.images.items,
+            .sampled_image_array_length = @intCast(@max(1, sampled.images.items.len)),
             .scalar_memories = storage.pointers.items,
             .descriptor_array_length = @intCast(@max(1, storage.count)),
             .workgroup_memory_size_bytes = lds_bytes,
@@ -683,7 +705,11 @@ pub const Renderer = struct {
         }, analysis.pipeline_options, analysis.translation_key);
         defer module_lease.release();
         const module = module_lease.view();
-        if (module.used_dispatcher or module.used_control_flow_fallback) return error.UnboundedControlFlowNotImplemented;
+        if (module.used_control_flow_fallback) {
+            std.debug.print("[d3d12 compute control flow] program=0x{x} dispatcher={} blocks={d} back_edges={d}\n", .{ bindings.program_address, module.used_dispatcher, analysis.graph.blocks.items.len, analysis.graph.back_edge_count });
+            reportControlFlow("compute", analysis);
+            return error.UnboundedControlFlowNotImplemented;
+        }
         var native_buffers: [65]native.Buffer = undefined;
         for (storage.data[0..storage.count], native_buffers[0..storage.count]) |bytes, *buffer| buffer.* = native.Buffer.fromSlice(bytes);
         var buffer_count = storage.count;
@@ -705,8 +731,35 @@ pub const Renderer = struct {
                 entry.descriptor.address < storage.addresses[i] + storage.sizes[i] and
                 storage.addresses[i] < entry.descriptor.address + entry.layout.required_source_bytes)
                 return error.ComputeImageAliasNotImplemented;
+            if (entry.dcc) |metadata| {
+                const end = metadata.address + surfaces.Dcc.blockCount(metadata.bytes);
+                for (0..storage.count) |i| if ((image.writable != 0 or storage.writable[i]) and
+                    metadata.address < storage.addresses[i] + storage.sizes[i] and storage.addresses[i] < end)
+                    return error.ComputeImageAliasNotImplemented;
+                for (images.entries[0..images.count], images.native_images[0..images.count]) |other, other_image| if ((image.writable != 0 or other_image.writable != 0) and
+                    metadata.address < other.descriptor.address + other.layout.required_source_bytes and other.descriptor.address < end)
+                    return error.ComputeImageAliasNotImplemented;
+                for (images.entries[0..images.count], images.native_images[0..images.count]) |other, other_image| if (other.dcc) |other_metadata| {
+                    if (entry.descriptor.address != other.descriptor.address and (image.writable != 0 or other_image.writable != 0) and
+                        metadata.address < other_metadata.address + surfaces.Dcc.blockCount(other_metadata.bytes) and other_metadata.address < end)
+                        return error.ComputeImageAliasNotImplemented;
+                };
+                for (sampled_ranges.items) |range| if (image.writable != 0 and metadata.address < range.end and range.start < end)
+                    return error.ComputeImageAliasNotImplemented;
+            }
         }
-        try self.device.dispatchImagesSpirv(module.words, native_buffers[0..buffer_count], images.native_images[0..images.count], groups, uses_gds);
+        for (sampled_ranges.items) |range| {
+            for (0..storage.count) |i| if (storage.writable[i] and range.start < storage.addresses[i] + storage.sizes[i] and storage.addresses[i] < range.end)
+                return error.ComputeImageAliasNotImplemented;
+            for (images.entries[0..images.count], images.native_images[0..images.count]) |entry, image| if (image.writable != 0 and
+                range.start < entry.descriptor.address + entry.layout.required_source_bytes and entry.descriptor.address < range.end and
+                (range.metadata or !compute_images.disjointMipViews(range.descriptor, entry.descriptor)))
+                return error.ComputeImageAliasNotImplemented;
+        }
+        self.device.dispatchResourcesSpirv(module.words, native_buffers[0..buffer_count], images.native_images[0..images.count], sampled.images.items, groups, uses_gds, module.used_dispatcher and dispatch_budget == null) catch |err| {
+            std.debug.print("[d3d12 compute] program=0x{x} groups={any} local={any} error={s}\n", .{ bindings.program_address, groups, local, @errorName(err) });
+            return err;
+        };
         for (0..storage.count) |i| {
             if (storage.writable[i] and !self.memory.write(self.memory.context, storage.addresses[i], storage.data[i][0..storage.sizes[i]])) return error.GuestWriteFailed;
         }
@@ -732,6 +785,21 @@ pub const Renderer = struct {
         const routing = try graphics.routing(state);
         var render = gpu.resources.decodeRenderState(state);
         render.depth_control = graphics.effectiveDepthControl(state);
+        // Engines leave previous G-buffer attachments bound after switching
+        // to a smaller postprocess target. Trailing slots with no exported,
+        // writable channels are not native attachments for this draw. Keep
+        // slot zero for the existing fully masked/depth-only extent handling.
+        if (!render.color_control.isMetadataOperation()) {
+            var slot: usize = render.color_targets.len;
+            while (slot > 1) {
+                slot -= 1;
+                const color = render.color_targets[slot] orelse continue;
+                const exported: u8 = @truncate(render.shader_mask >> @as(u5, @intCast(slot * 4)));
+                if (color.write_mask & exported & 15 != 0) break;
+                render.color_targets[slot] = null;
+                render.color_count -= 1;
+            }
+        }
         if (render.color_count == 0 and try self.depthUtilityDraw(state, render, routing)) return;
         if ((state.readRegister(.context, 0) orelse 0) & ~@as(u32, 0x63) != 0) return error.DepthMetadataOperationNotImplemented;
         if (render.color_count != 0 and render.color_targets[0] == null) return error.SparseColorTargetsNotImplemented;
@@ -1033,10 +1101,13 @@ pub const Renderer = struct {
                 .s_sub_i32,
                 .s_lshr_b64,
                 .v_lshlrev_b32,
+                .v_lshrrev_b32,
                 .v_and_b32,
                 .v_mov_b32,
                 .v_add_nc_u32,
                 .v_cvt_f32_i32,
+                .v_cvt_f32_u32,
+                .v_mad_f32,
                 => {},
                 .exp => if (inst.export_target < 12 or inst.export_target > 20) return false,
                 .s_sendmsg => if (inst.src0.value != 9) return false, // GS_ALLOC_REQ, never interrupts/system messages.

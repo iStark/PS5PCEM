@@ -434,6 +434,10 @@ pub const Options = struct {
     /// if the dispatcher stops before END. The host must check it after the
     /// fence and reject all attachment writes on exhaustion.
     graphics_dispatcher_status: bool = false,
+    /// Compute equivalent of graphics_dispatcher_status. The private UAV is
+    /// separate from guest buffers, GDS and images; the host must withhold all
+    /// their writes if any invocation exhausts its dispatcher budget.
+    compute_dispatcher_status: bool = false,
     /// Guest wave32 mode limits VALU scalar masks and EXEC lane indexing to
     /// the low word, independently of the host workgroup size.
     wave32: bool = false,
@@ -1373,8 +1377,9 @@ const Builder = struct {
             try self.emit(&self.declarations, 32, &.{ self.scalar_word_pointer_type, 12, self.bits_type });
             try self.emit(&self.declarations, 59, &.{ storage_pointer, self.scalar_buffer, 12 }); // OpVariable
         }
-        if (options.graphics_dispatcher_status) {
-            if (options.stage != .fragment) return Error.InvalidStageInterface;
+        if (options.graphics_dispatcher_status or options.compute_dispatcher_status) {
+            if ((options.graphics_dispatcher_status and options.stage != .fragment) or
+                (options.compute_dispatcher_status and options.stage != .compute)) return Error.InvalidStageInterface;
             const words = self.id();
             const block = self.id();
             const pointer = self.id();
@@ -18219,6 +18224,21 @@ test "fragment dispatcher status reports exhaustion without changing default tra
     }
     for ([_]Stage{ .vertex, .compute }) |stage|
         try std.testing.expectError(Error.InvalidStageInterface, translate(std.testing.allocator, &program, .{ .stage = stage, .graphics_dispatcher_status = true }));
+}
+
+test "compute dispatcher status is opt-in and uses an isolated atomic status UAV" {
+    var program = try @import("decoder.zig").decodeProgram(std.testing.allocator, &.{ 0xbf80_0000, 0xbf82_fffe, 0xbf81_0000 });
+    defer program.deinit(std.testing.allocator);
+    for ([_]bool{ false, true }) |checked| {
+        var module = try translate(std.testing.allocator, &program, .{ .stage = .compute, .compute_dispatcher_status = checked });
+        defer module.deinit(std.testing.allocator);
+        try std.testing.expect(module.used_dispatcher);
+        try std.testing.expectEqual(checked, containsOpcode(module.words, 241));
+        try std.testing.expectEqual(checked, containsDecoration(module.words, 34, 1));
+        try expectPhiParentsArePredecessors(module.words);
+    }
+    for ([_]Stage{ .vertex, .fragment }) |stage|
+        try std.testing.expectError(Error.InvalidStageInterface, translate(std.testing.allocator, &program, .{ .stage = stage, .compute_dispatcher_status = true }));
 }
 
 test "unstructured back edges lower through a dispatcher" {

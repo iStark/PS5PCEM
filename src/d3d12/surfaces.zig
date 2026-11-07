@@ -22,9 +22,10 @@ pub fn colorLayout(target: gpu.resources.ColorTarget) !gpu.SurfaceLayout {
 }
 
 /// Native render-target formats; staging preserves the encoded bits.
-/// DCC clear codes below currently describe only unsigned-normalized RGBA8.
+/// DCC render-target clears currently cover unsigned-normalized R8/RGBA8.
 pub fn colorFormat(target: gpu.resources.ColorTarget) !u32 {
     const format: u32 = switch (target.format) {
+        1 => if (target.number_type == 0 and target.component_swap == 0) 61 else return error.UnsupportedRenderTargetLayout, // R8_UNORM
         10 => switch (target.number_type) {
             0 => 28, // R8G8B8A8_UNORM
             1 => 31, // R8G8B8A8_SNORM
@@ -36,14 +37,14 @@ pub fn colorFormat(target: gpu.resources.ColorTarget) !u32 {
         6 => if (target.number_type == 7 and target.component_swap == 0) 26 else return error.UnsupportedRenderTargetLayout, // R11G11B10_FLOAT
         else => return error.UnsupportedRenderTargetLayout,
     };
-    if (format != 28 and target.dcc_enabled) return error.UnsupportedRenderTargetLayout;
+    if (format != 28 and format != 61 and target.dcc_enabled) return error.UnsupportedRenderTargetLayout;
     return format;
 }
 
 /// DCC keys accompany the colour layout; null for an uncompressed target.
 pub fn colorDcc(target: gpu.resources.ColorTarget) ?Dcc {
     if (!target.dcc_enabled) return null;
-    return .{ .address = target.dcc_address, .clear_word = target.clear_words[0] };
+    return .{ .address = target.dcc_address, .clear_word = target.clear_words[0], .r8 = target.format == 1 };
 }
 
 pub fn depthLayout(target: gpu.resources.DepthTarget, width: u32, height: u32, writable: bool) !gpu.SurfaceLayout {
@@ -161,6 +162,7 @@ pub const Dcc = struct {
     /// Render targets carry CB_COLOR*_CLEAR_WORD0; sampled views do not, so
     /// code 0x20 cannot be resolved for them.
     clear_word: ?u32,
+    r8: bool = false,
 
     pub const block_bytes = 256;
 
@@ -172,6 +174,8 @@ pub const Dcc = struct {
     }
 
     fn texel(self: Dcc, code: u8) ?[4]u8 {
+        if (self.r8 and (code == 0 or code == 0x40 or code == 0x80 or code == 0xc0))
+            return @splat(if (code & 0x40 != 0) 255 else 0);
         return switch (code) {
             0x00 => .{ 0, 0, 0, 0 },
             0x40 => .{ 0, 0, 0, 255 },
@@ -188,16 +192,18 @@ pub const Dcc = struct {
     pub fn expand(self: Dcc, memory: anytype, backing: []u8, keys: []u8) !void {
         if (keys.len != blockCount(backing.len)) return error.InvalidDccKeyRange;
         if (!memory.read(memory.context, self.address, keys)) return error.GuestReadFailed;
+        if (self.r8 and keys.len != 0 and !std.mem.allEqual(u8, keys, keys[0])) return error.CompressedColorTargetNotImplemented;
+        const texel_bytes: usize = if (self.r8) 1 else 4;
         for (keys, 0..) |code, block| {
             if (code == 0xff) continue;
             const bytes = backing[block * block_bytes .. @min(backing.len, (block + 1) * block_bytes)];
             var value: [4]u8 = undefined;
             if (code == 0x10) {
-                if (bytes.len < 4) return error.CompressedColorTargetNotImplemented;
-                value = bytes[0..4].*;
+                if (bytes.len < texel_bytes) return error.CompressedColorTargetNotImplemented;
+                @memcpy(value[0..texel_bytes], bytes[0..texel_bytes]);
             } else value = self.texel(code) orelse return error.CompressedColorTargetNotImplemented;
             var offset: usize = 0;
-            while (offset + 4 <= bytes.len) : (offset += 4) bytes[offset..][0..4].* = value;
+            while (offset + texel_bytes <= bytes.len) : (offset += texel_bytes) @memcpy(bytes[offset..][0..texel_bytes], value[0..texel_bytes]);
         }
     }
 
@@ -205,6 +211,82 @@ pub const Dcc = struct {
     pub fn markUncompressed(self: Dcc, memory: anytype, keys: []u8) !void {
         @memset(keys, 0xff);
         if (!memory.write(memory.context, self.address, keys)) return error.GuestWriteFailed;
+    }
+};
+
+/// Full, single-mip sampled/storage allocations with uniform DCC keys. A
+/// uniform key is independent of the metadata address permutation. Mixed
+/// keys need the DCC layout equation and are deliberately not interpreted.
+pub const TextureDcc = struct {
+    address: u64,
+    bytes: usize,
+    format: u16,
+    alpha_msb: bool,
+
+    pub fn fromImage(image: gpu.resources.ImageDescriptor, bytes: usize) !?TextureDcc {
+        const address = image.dccMetadataAddress() orelse {
+            if (gpu.MetadataSurface.fromImage(image).hasAny()) return error.CompressedColorTargetNotImplemented;
+            return null;
+        };
+        if (image.resourceMipLevels() != 1 or image.viewBaseLevel() != 0 or image.base_array != 0 or
+            image.samplesLog2() != 0 or image.cmask_fast_clear or image.fmask_compression or
+            (image.unified_format != 1 and image.unified_format != 50 and image.unified_format != 56 and image.unified_format != 71) or
+            bytes != (try gpu.TextureLayout.fromImage(image)).required_source_bytes) return error.CompressedColorTargetNotImplemented;
+        _ = try std.math.add(u64, address, Dcc.blockCount(bytes));
+        return .{ .address = address, .bytes = bytes, .format = image.unified_format, .alpha_msb = image.descriptor_flags & (1 << 22) != 0 };
+    }
+
+    pub fn expand(self: TextureDcc, memory: anytype, backing: []u8) !void {
+        if (backing.len != self.bytes or self.bytes == 0) return error.InvalidDccKeyRange;
+        var scratch: [256]u8 = undefined;
+        var first: ?u8 = null;
+        var offset: usize = 0;
+        const count = Dcc.blockCount(self.bytes);
+        while (offset < count) {
+            const keys = scratch[0..@min(scratch.len, count - offset)];
+            if (!memory.read(memory.context, self.address + offset, keys)) return error.GuestReadFailed;
+            if (first == null) first = keys[0];
+            if (!std.mem.allEqual(u8, keys, first.?)) return error.CompressedColorTargetNotImplemented;
+            offset += keys.len;
+        }
+        const code = first.?;
+        if (code == 0xff) return;
+        const texel_bytes: usize = if (self.format == 1) 1 else if (self.format == 71) 8 else 4;
+        var texel: [8]u8 = @splat(0);
+        if (code != 0x10) {
+            if (code != 0 and code != 0x40 and code != 0x80 and code != 0xc0) {
+                std.debug.print("[d3d12 DCC] unsupported uniform key=0x{x} address=0x{x}\n", .{ code, self.address });
+                return error.CompressedColorTargetNotImplemented;
+            }
+            for (0..(if (self.format == 1) @as(usize, 1) else 4)) |channel| {
+                const one = code & (if (channel == (if (self.alpha_msb and self.format != 1) @as(usize, 3) else 0)) @as(u8, 0x40) else 0x80) != 0;
+                if (self.format == 50) {
+                    var bits = std.mem.readInt(u32, texel[0..4], .little);
+                    if (one) bits |= @as(u32, if (channel == 3) 3 else 1023) << @as(u5, @intCast(channel * 10));
+                    std.mem.writeInt(u32, texel[0..4], bits, .little);
+                } else if (self.format == 71) std.mem.writeInt(u16, texel[channel * 2 ..][0..2], if (one) 0x3c00 else 0, .little) else texel[channel] = if (one) 255 else 0;
+            }
+        }
+        offset = 0;
+        while (offset < backing.len) {
+            const block = backing[offset..@min(backing.len, offset + Dcc.block_bytes)];
+            if (block.len % texel_bytes != 0) return error.InvalidDccKeyRange;
+            if (code == 0x10) @memcpy(texel[0..texel_bytes], block[0..texel_bytes]);
+            var pixel: usize = 0;
+            while (pixel < block.len) : (pixel += texel_bytes) @memcpy(block[pixel..][0..texel_bytes], texel[0..texel_bytes]);
+            offset += block.len;
+        }
+    }
+
+    pub fn publish(self: TextureDcc, memory: anytype) !void {
+        const keys: [256]u8 = @splat(0xff);
+        const count = Dcc.blockCount(self.bytes);
+        var offset: usize = 0;
+        while (offset < count) {
+            const part = keys[0..@min(keys.len, count - offset)];
+            if (!memory.write(memory.context, self.address + offset, part)) return error.GuestWriteFailed;
+            offset += part.len;
+        }
     }
 };
 

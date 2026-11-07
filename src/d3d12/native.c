@@ -851,7 +851,7 @@ static HRESULT compile_spirv_uncached(Ps5D3D12 *c, const uint32_t *words, size_t
         const uint32_t expected_count = storage ? buffer_count : sampled ? image_count : 0;
         // For compute, `scalars` instead selects the persistent GDS block,
         // bound as one UAV immediately after the guest storage array.
-        if ((!storage && !sampled && !typed) || count > (typed ? storage_count : storage ? 1u + (scalars != 0) + (stage == SpvExecutionModelFragment) : 4u)) {
+        if ((!storage && !sampled && !typed) || count > (typed ? storage_count : storage ? 1u + (scalars != 0) + (stage != SpvExecutionModelVertex) : 4u)) {
             snprintf(c->error, sizeof(c->error), "D3D12 shader resource kind %u/count %zu is not supported by this pipeline", kind, count);
             goto done;
         }
@@ -874,7 +874,7 @@ static HRESULT compile_spirv_uncached(Ps5D3D12 *c, const uint32_t *words, size_t
             }
             const int scalar = storage && scalars && binding == 10 && stage != SpvExecutionModelGLCompute;
             const int global = storage && scalars && binding == PS5_GDS_BINDING && stage == SpvExecutionModelGLCompute;
-            const int status = storage && stage == SpvExecutionModelFragment && set == 1 && binding == 0;
+            const int status = storage && (stage == SpvExecutionModelFragment || stage == SpvExecutionModelGLCompute) && set == 1 && binding == 0;
             // Shared SPIR-V banks: 2D=1, CubeArray=36, 2DArray=37, 3D=35.
             // Give each a distinct HLSL register range. The root signature
             // aliases those SRV ranges onto the same proven snapshot slots.
@@ -971,7 +971,7 @@ static HRESULT compile_spirv(Ps5D3D12 *c, const uint32_t *words, size_t word_cou
     return S_OK;
 }
 
-static HRESULT storage_root(Ps5D3D12 *c, uint32_t count, uint32_t images, ID3D12RootSignature **root) {
+static HRESULT storage_root(Ps5D3D12 *c, uint32_t count, uint32_t images, uint32_t sampled, uint32_t storage_buffers, uint32_t status, ID3D12RootSignature **root) {
     D3D12_DESCRIPTOR_RANGE ranges[2] = {0};
     UINT range_count = 0;
     if (count) {
@@ -984,13 +984,32 @@ static HRESULT storage_root(Ps5D3D12 *c, uint32_t count, uint32_t images, ID3D12
         ranges[range_count].RegisterSpace = 1;
         ranges[range_count++].OffsetInDescriptorsFromTableStart = count;
     }
-    D3D12_ROOT_PARAMETER parameter = {0};
-    parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-    parameter.DescriptorTable.NumDescriptorRanges = range_count;
-    parameter.DescriptorTable.pDescriptorRanges = ranges;
+    D3D12_ROOT_PARAMETER parameters[4] = {0};
+    D3D12_DESCRIPTOR_RANGE sampled_ranges[2][4] = {0};
+    UINT parameter_count = 0;
+    if (range_count) {
+        parameters[parameter_count].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        parameters[parameter_count].DescriptorTable.NumDescriptorRanges = range_count;
+        parameters[parameter_count++].DescriptorTable.pDescriptorRanges = ranges;
+    }
+    if (sampled) for (UINT table = 0; table < 2; ++table) {
+        for (UINT bank = 0; bank < 4; ++bank) {
+            sampled_ranges[table][bank].RangeType = table ? D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER : D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+            sampled_ranges[table][bank].NumDescriptors = sampled;
+            sampled_ranges[table][bank].BaseShaderRegister = (table ? 0 : storage_buffers) + bank * sampled;
+            sampled_ranges[table][bank].OffsetInDescriptorsFromTableStart = 0;
+        }
+        parameters[parameter_count].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        parameters[parameter_count].DescriptorTable.NumDescriptorRanges = 4;
+        parameters[parameter_count++].DescriptorTable.pDescriptorRanges = sampled_ranges[table];
+    }
+    if (status) {
+        parameters[parameter_count].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+        parameters[parameter_count++].Descriptor.RegisterSpace = 2;
+    }
     D3D12_ROOT_SIGNATURE_DESC desc = {0};
-    desc.NumParameters = range_count ? 1 : 0;
-    desc.pParameters = &parameter;
+    desc.NumParameters = parameter_count;
+    desc.pParameters = parameters;
     ID3DBlob *blob = NULL, *errors = NULL;
     HRESULT hr = c->serialize(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &errors);
     if (SUCCEEDED(hr)) hr = ID3D12Device_CreateRootSignature(c->device, 0, ID3D10Blob_GetBufferPointer(blob), ID3D10Blob_GetBufferSize(blob), &IID_ID3D12RootSignature, (void **)root);
@@ -1112,13 +1131,34 @@ static void copy_compute_image(Ps5D3D12 *c, const ComputeImage *image, int readb
     }
 }
 
+typedef struct GraphicsResources {
+    ID3D12DescriptorHeap *views, *samplers;
+    UINT view_offset, sampler_offset;
+    ID3D12Resource *buffers[64], *buffer_uploads[64], *images[32], *image_uploads[32];
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprints[32];
+    UINT image_layers[32], image_mips[32];
+    UINT64 image_layer_stride[32];
+    uint8_t buffer_shared[64];
+} GraphicsResources;
+typedef struct DrawBatch DrawBatch;
+static ID3D12Resource *batch_buffer(DrawBatch *batch, const Ps5D3D12Buffer *buffer);
+static ID3D12Resource *batch_image(DrawBatch *batch, const Ps5D3D12Image *image);
+static HRESULT batch_heaps(Ps5D3D12 *c, DrawBatch *batch, GraphicsResources *r, UINT views, UINT samplers);
+
+static HRESULT prepare_graphics_resources(Ps5D3D12 *, DrawBatch *, GraphicsResources *, const Ps5D3D12Buffer *, UINT, const Ps5D3D12Image *, UINT);
+static void upload_graphics_resources(Ps5D3D12 *, GraphicsResources *, const Ps5D3D12Buffer *, UINT, UINT);
+static int valid_sampled_image(const Ps5D3D12Image *);
+
 int32_t ps5_d3d12_dispatch_spirv(Ps5D3D12 *c, const uint32_t *words, size_t word_count,
     const Ps5D3D12Buffer *buffers, uint32_t count, const uint32_t groups[3], uint32_t gds,
-    const Ps5D3D12StorageImage *images, uint32_t image_count) {
+    const Ps5D3D12StorageImage *images, uint32_t image_count, uint32_t check_dispatcher,
+    const Ps5D3D12Image *sampled, uint32_t sampled_count) {
     // With `gds`, the final buffer is the GDS block at u(array_count); the
     // guest storage array keeps u0..u(array_count - 1).
     if (!c || !words || word_count < 5 || gds > 1 || count > 64 + gds || (gds && !count) || (count && !buffers) || !groups) return E_INVALIDARG;
-    if (image_count > 32 || (image_count && !images)) return E_INVALIDARG;
+    if (image_count > 32 || (image_count && !images) || check_dispatcher > 1) return E_INVALIDARG;
+    if (sampled_count > 32 || (sampled_count && !sampled)) return E_INVALIDARG;
+    for (UINT i = 0; i < sampled_count; ++i) if (!valid_sampled_image(&sampled[i])) return E_INVALIDARG;
     for (UINT axis = 0; axis < 3; ++axis) if (!groups[axis] || groups[axis] > 65535) return E_INVALIDARG;
     for (UINT i = 0; i < count; ++i) if (!buffers[i].bytes || !buffers[i].size || buffers[i].size % 4 || buffers[i].size > 256 * 1024 * 1024) return E_INVALIDARG;
     HRESULT hr;
@@ -1127,13 +1167,15 @@ int32_t ps5_d3d12_dispatch_spirv(Ps5D3D12 *c, const uint32_t *words, size_t word
     ID3D12PipelineState *pipeline = NULL;
     ID3D12DescriptorHeap *heap = NULL;
     ID3D12Resource *gpu[65] = {0}, *upload[65] = {0}, *readback[65] = {0};
+    ID3D12Resource *status = NULL, *status_upload = NULL, *status_readback = NULL;
     ComputeImage typed[32] = {0};
+    GraphicsResources textures = {0};
     uint64_t shader_id;
-    TRY(compile_spirv(c, words, word_count, SpvExecutionModelGLCompute, count - gds, 0, gds, image_count, &code, &shader_id));
-    const PipelineKey key = {{1, shader_id, image_count, count}};
+    TRY(compile_spirv(c, words, word_count, SpvExecutionModelGLCompute, count - gds, sampled_count, gds, image_count, &code, &shader_id));
+    const PipelineKey key = {{1, shader_id, image_count, count, check_dispatcher, sampled_count}};
     if (!cached_pipeline(c, &key, &root, &pipeline)) {
         const ULONGLONG started = GetTickCount64();
-        TRY(storage_root(c, count, image_count, &root));
+        TRY(storage_root(c, count, image_count, sampled_count, count - gds, check_dispatcher, &root));
         D3D12_COMPUTE_PIPELINE_STATE_DESC desc = {0};
         desc.pRootSignature = root;
         desc.CS.pShaderBytecode = ID3D10Blob_GetBufferPointer(code);
@@ -1142,10 +1184,10 @@ int32_t ps5_d3d12_dispatch_spirv(Ps5D3D12 *c, const uint32_t *words, size_t word
         c->cache_stats.pipeline_ms += GetTickCount64() - started;
         remember_pipeline(c, &key, root, pipeline);
     }
-    if (count || image_count) {
+    if (count || image_count || sampled_count) {
         D3D12_DESCRIPTOR_HEAP_DESC descriptors = {0};
         descriptors.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-        descriptors.NumDescriptors = count + image_count;
+        descriptors.NumDescriptors = count + image_count + sampled_count;
         descriptors.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         TRY(ID3D12Device_CreateDescriptorHeap(c->device, &descriptors, &IID_ID3D12DescriptorHeap, (void **)&heap));
         D3D12_CPU_DESCRIPTOR_HANDLE handle = ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(heap);
@@ -1172,7 +1214,26 @@ int32_t ps5_d3d12_dispatch_spirv(Ps5D3D12 *c, const uint32_t *words, size_t word
             handle.ptr += stride;
         }
     }
+    if (sampled_count) {
+        textures.views = heap; ID3D12DescriptorHeap_AddRef(heap);
+        textures.view_offset = count + image_count;
+        TRY(prepare_graphics_resources(c, NULL, &textures, NULL, 0, sampled, sampled_count));
+    }
+    if (check_dispatcher) {
+        TRY(buffer(c, 4, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, &status));
+        TRY(buffer(c, 4, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, 0, &status_upload));
+        TRY(buffer(c, 4, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST, 0, &status_readback));
+        void *mapped;
+        D3D12_RANGE empty = {0, 0}, entire = {0, 4};
+        TRY(ID3D12Resource_Map(status_upload, 0, &empty, &mapped));
+        memset(mapped, 0, 4);
+        ID3D12Resource_Unmap(status_upload, 0, &entire);
+    }
     TRY(begin(c));
+    if (status) {
+        ID3D12GraphicsCommandList_CopyBufferRegion(c->commands, status, 0, status_upload, 0, 4);
+        transition(c, status, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    }
     for (UINT i = 0; i < count; ++i) {
         ID3D12GraphicsCommandList_CopyBufferRegion(c->commands, gpu[i], 0, upload[i], 0, buffers[i].size);
         transition(c, gpu[i], D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -1181,13 +1242,26 @@ int32_t ps5_d3d12_dispatch_spirv(Ps5D3D12 *c, const uint32_t *words, size_t word
         copy_compute_image(c, &typed[i], 0);
         transition(c, typed[i].texture, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     }
+    if (sampled_count) upload_graphics_resources(c, &textures, NULL, 0, sampled_count);
     ID3D12GraphicsCommandList_SetPipelineState(c->commands, pipeline);
     ID3D12GraphicsCommandList_SetComputeRootSignature(c->commands, root);
-    if (count || image_count) {
-        ID3D12GraphicsCommandList_SetDescriptorHeaps(c->commands, 1, &heap);
-        ID3D12GraphicsCommandList_SetComputeRootDescriptorTable(c->commands, 0, ID3D12DescriptorHeap_GetGPUDescriptorHandleForHeapStart(heap));
+    UINT parameter = 0;
+    if (heap) {
+        ID3D12DescriptorHeap *heaps[2] = {heap, textures.samplers};
+        ID3D12GraphicsCommandList_SetDescriptorHeaps(c->commands, sampled_count ? 2 : 1, heaps);
+        D3D12_GPU_DESCRIPTOR_HANDLE view = ID3D12DescriptorHeap_GetGPUDescriptorHandleForHeapStart(heap);
+        if (count || image_count) ID3D12GraphicsCommandList_SetComputeRootDescriptorTable(c->commands, parameter++, view);
+        if (sampled_count) {
+            view.ptr += (UINT64)(count + image_count) * ID3D12Device_GetDescriptorHandleIncrementSize(c->device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+            ID3D12GraphicsCommandList_SetComputeRootDescriptorTable(c->commands, parameter++, view);
+            ID3D12GraphicsCommandList_SetComputeRootDescriptorTable(c->commands, parameter++, ID3D12DescriptorHeap_GetGPUDescriptorHandleForHeapStart(textures.samplers));
+        }
     }
+    if (status) ID3D12GraphicsCommandList_SetComputeRootUnorderedAccessView(c->commands,
+        parameter, ID3D12Resource_GetGPUVirtualAddress(status));
     ID3D12GraphicsCommandList_Dispatch(c->commands, groups[0], groups[1], groups[2]);
+    for (UINT i = 0; i < sampled_count; ++i) transition(c, textures.images[i],
+        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
     for (UINT i = 0; i < image_count; ++i) if (images[i].writable) {
         transition(c, typed[i].texture, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
         copy_compute_image(c, &typed[i], 1);
@@ -1196,7 +1270,20 @@ int32_t ps5_d3d12_dispatch_spirv(Ps5D3D12 *c, const uint32_t *words, size_t word
         transition(c, gpu[i], D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
         ID3D12GraphicsCommandList_CopyBufferRegion(c->commands, readback[i], 0, gpu[i], 0, buffers[i].size);
     }
+    if (status) {
+        transition(c, status, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        ID3D12GraphicsCommandList_CopyBufferRegion(c->commands, status_readback, 0, status, 0, 4);
+    }
     TRY(submit(c));
+    // No guest buffer, image or GDS bytes may escape a truncated dispatch.
+    if (status) {
+        uint32_t *mapped;
+        D3D12_RANGE entire = {0, 4}, empty = {0, 0};
+        TRY(ID3D12Resource_Map(status_readback, 0, &entire, (void **)&mapped));
+        const uint32_t exhausted = *mapped;
+        ID3D12Resource_Unmap(status_readback, 0, &empty);
+        if (exhausted) { hr = failure(c, PS5_SHADER_LOOP_BUDGET_EXCEEDED, "compute loop budget exhausted; buffer/image/GDS writes rejected"); goto done; }
+    }
     for (UINT i = 0; i < image_count; ++i) if (images[i].writable) {
         ComputeImage *image = &typed[i];
         void *mapped;
@@ -1220,8 +1307,11 @@ int32_t ps5_d3d12_dispatch_spirv(Ps5D3D12 *c, const uint32_t *words, size_t word
         ID3D12Resource_Unmap(readback[i], 0, &empty);
     }
 done:
+    for (UINT i = 0; i < sampled_count; ++i) { return_resource(c, textures.images[i], SUCCEEDED(hr)); return_resource(c, textures.image_uploads[i], SUCCEEDED(hr)); }
+    retire(c, textures.views); retire(c, textures.samplers);
     for (UINT i = 0; i < image_count; ++i) { retire(c, typed[i].texture); retire(c, typed[i].upload); retire(c, typed[i].readback); }
     for (UINT i = 0; i < count; ++i) { retire(c, readback[i]); retire(c, upload[i]); retire(c, gpu[i]); }
+    retire(c, status); retire(c, status_upload); retire(c, status_readback);
     retire(c, heap); retire(c, pipeline); retire(c, root); release(code);
     return hr;
 }
@@ -1500,20 +1590,6 @@ done:
     return hr;
 }
 
-typedef struct GraphicsResources {
-    ID3D12DescriptorHeap *views, *samplers;
-    UINT view_offset, sampler_offset;
-    ID3D12Resource *buffers[64], *buffer_uploads[64], *images[32], *image_uploads[32];
-    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprints[32];
-    UINT image_layers[32], image_mips[32];
-    UINT64 image_layer_stride[32];
-    uint8_t buffer_shared[64];
-} GraphicsResources;
-typedef struct DrawBatch DrawBatch;
-static ID3D12Resource *batch_buffer(DrawBatch *batch, const Ps5D3D12Buffer *buffer);
-static ID3D12Resource *batch_image(DrawBatch *batch, const Ps5D3D12Image *image);
-static HRESULT batch_heaps(Ps5D3D12 *c, DrawBatch *batch, GraphicsResources *r, UINT views, UINT samplers);
-
 static HRESULT prepare_graphics_resources(Ps5D3D12 *c, DrawBatch *batch, GraphicsResources *r,
     const Ps5D3D12Buffer *buffers, UINT buffer_count, const Ps5D3D12Image *images, UINT image_count) {
     HRESULT hr = S_OK;
@@ -1612,7 +1688,7 @@ done:
     return hr;
 }
 
-static void bind_graphics_resources(Ps5D3D12 *c, GraphicsResources *r, const Ps5D3D12Buffer *buffers, UINT buffer_count, UINT image_count) {
+static void upload_graphics_resources(Ps5D3D12 *c, GraphicsResources *r, const Ps5D3D12Buffer *buffers, UINT buffer_count, UINT image_count) {
     for (UINT i = 0; i < buffer_count; ++i) {
         if (r->buffer_uploads[i]) ID3D12GraphicsCommandList_CopyBufferRegion(c->commands, r->buffers[i], 0, r->buffer_uploads[i], 0, buffers[i].size);
         if (!r->buffer_shared[i]) transition(c, r->buffers[i], r->buffer_uploads[i] ? D3D12_RESOURCE_STATE_COPY_DEST : D3D12_RESOURCE_STATE_COMMON,
@@ -1638,6 +1714,10 @@ static void bind_graphics_resources(Ps5D3D12 *c, GraphicsResources *r, const Ps5
         }
         transition(c, r->images[i], D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     }
+}
+
+static void bind_graphics_resources(Ps5D3D12 *c, GraphicsResources *r, const Ps5D3D12Buffer *buffers, UINT buffer_count, UINT image_count) {
+    upload_graphics_resources(c, r, buffers, buffer_count, image_count);
     if (r->views) {
         ID3D12DescriptorHeap *heaps[2] = {r->views, r->samplers};
         ID3D12GraphicsCommandList_SetDescriptorHeaps(c->commands, image_count ? 2 : 1, heaps);
@@ -1666,6 +1746,7 @@ static int valid_blend_factor(uint32_t factor, int alpha) {
 static UINT color_bytes_per_pixel(uint32_t format) {
     switch (format) {
     case DXGI_FORMAT_R16G16B16A16_FLOAT: return 8;
+    case DXGI_FORMAT_R8_UNORM: return 1;
     case DXGI_FORMAT_R8G8B8A8_UNORM: case DXGI_FORMAT_R8G8B8A8_SNORM: case DXGI_FORMAT_R16G16_FLOAT:
     case DXGI_FORMAT_R10G10B10A2_UNORM: case DXGI_FORMAT_R11G11B10_FLOAT: return 4;
     default: return 0;
@@ -1695,8 +1776,9 @@ static int valid_sampled_image(const Ps5D3D12Image *image) {
     switch (image->format) {
     case DXGI_FORMAT_R8G8B8A8_UNORM: bytes = 4; break;
     case DXGI_FORMAT_R16G16B16A16_FLOAT: bytes = 8; if (image->srgb) return 0; break;
+    case DXGI_FORMAT_R32_FLOAT: case DXGI_FORMAT_R16G16_FLOAT: case DXGI_FORMAT_R10G10B10A2_UNORM: bytes = 4; if (image->srgb) return 0; break;
     case DXGI_FORMAT_R8_UNORM: bytes = 1; if (image->srgb) return 0; break;
-    case DXGI_FORMAT_R16_UNORM: case DXGI_FORMAT_R8G8_UNORM: case DXGI_FORMAT_B4G4R4A4_UNORM: bytes = 2; if (image->srgb) return 0; break;
+    case DXGI_FORMAT_R16_UNORM: case DXGI_FORMAT_R16_FLOAT: case DXGI_FORMAT_R8G8_UNORM: case DXGI_FORMAT_B4G4R4A4_UNORM: bytes = 2; if (image->srgb) return 0; break;
     case DXGI_FORMAT_BC1_UNORM: block = 4; bytes = 8; break;
     case DXGI_FORMAT_BC2_UNORM: case DXGI_FORMAT_BC3_UNORM: block = 4; bytes = 16; break;
     default: return 0;
@@ -1755,6 +1837,18 @@ struct DrawBatch {
  * rewritten while a previous submission can still reference them. */
 static HRESULT batch_heaps(Ps5D3D12 *c, DrawBatch *batch, GraphicsResources *r, UINT views, UINT samplers) {
     HRESULT hr = S_OK;
+    // Compute supplies its combined UAV/SRV heap and uses the same immutable
+    // image upload/sampler implementation without retaining a graphics batch.
+    if (!batch) {
+        if (views && !r->views) return E_INVALIDARG;
+        if (samplers) {
+            D3D12_DESCRIPTOR_HEAP_DESC desc = {0};
+            desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER; desc.NumDescriptors = samplers;
+            desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+            return ID3D12Device_CreateDescriptorHeap(c->device, &desc, &IID_ID3D12DescriptorHeap, (void **)&r->samplers);
+        }
+        return S_OK;
+    }
     if (batch->views + views > DRAW_BATCH_CAPACITY * 96 || batch->samplers + samplers > DRAW_BATCH_CAPACITY * 32)
         return failure(c, E_INVALIDARG, "batch descriptor capacity");
     D3D12_DESCRIPTOR_HEAP_DESC desc = {0};
@@ -1785,6 +1879,7 @@ done:
  * Search only earlier draws: images are back in COPY_DEST after each draw;
  * buffers remain in shader-read state until the command list completes. */
 static ID3D12Resource *batch_buffer(DrawBatch *batch, const Ps5D3D12Buffer *buffer) {
+    if (!batch) return NULL;
     for (UINT n = batch->count; n > 0; --n) {
         DrawLease *l = &batch->leases[n - 1];
         for (UINT i = 0; i < l->buffer_count; ++i) {
@@ -1799,6 +1894,7 @@ static ID3D12Resource *batch_buffer(DrawBatch *batch, const Ps5D3D12Buffer *buff
     return NULL;
 }
 static ID3D12Resource *batch_image(DrawBatch *batch, const Ps5D3D12Image *image) {
+    if (!batch) return NULL;
     for (UINT n = batch->count; n > 0; --n) {
         DrawLease *l = &batch->leases[n - 1];
         for (UINT i = 0; i < l->image_count; ++i) {

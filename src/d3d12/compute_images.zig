@@ -7,6 +7,37 @@ const std = @import("std");
 const gpu = @import("gpu");
 const rdna2 = @import("rdna2");
 const native = @import("root.zig");
+const surfaces = @import("surfaces.zig");
+
+/// Separate native snapshots are safe for non-overlapping mip views only when
+/// they agree on the complete allocation layout, including its mip-tail origin.
+pub fn disjointMipViews(a: gpu.resources.ImageDescriptor, b: gpu.resources.ImageDescriptor) bool {
+    if (a.address != b.address or a.width != b.width or a.height != b.height or
+        a.depth_or_layers != b.depth_or_layers or a.pitch != b.pitch or a.tile_mode != b.tile_mode or
+        a.unified_format != b.unified_format or a.image_type != b.image_type or a.base_array != b.base_array or
+        a.array_pitch != b.array_pitch or a.resourceMipLevels() != b.resourceMipLevels() or a.samplesLog2() != b.samplesLog2()) return false;
+    return @as(u16, a.viewBaseLevel()) + a.viewMipLevels() <= b.viewBaseLevel() or
+        @as(u16, b.viewBaseLevel()) + b.viewMipLevels() <= a.viewBaseLevel();
+}
+
+test "disjoint compute mip snapshots require matching allocation layouts" {
+    const a = try gpu.resources.decodeImageDescriptor(&.{ 0x400, (13 << 20) | (3 << 30), 15 | (63 << 14), 0x90000fac | (3 << 12) | (3 << 16) | (27 << 20), 0, 6 << 4, 0, 0 });
+    var b = a;
+    b.base_level = 4;
+    b.last_level = 4;
+    try std.testing.expect(disjointMipViews(a, b));
+    try std.testing.expect(disjointMipViews(b, a));
+    b.base_level = 3;
+    try std.testing.expect(!disjointMipViews(a, b));
+    b.base_level = 4;
+    b.unified_format = 22;
+    try std.testing.expect(!disjointMipViews(a, b));
+    b = a;
+    b.base_level = 4;
+    b.last_level = 4;
+    b.max_mip = 5;
+    try std.testing.expect(!disjointMipViews(a, b));
+}
 
 pub const Images = struct {
     allocator: std.mem.Allocator,
@@ -20,6 +51,7 @@ pub const Images = struct {
         descriptor: gpu.resources.ImageDescriptor,
         layout: gpu.TextureSubresourceLayout,
         pixels: []u8,
+        dcc: ?surfaces.TextureDcc,
     };
 
     pub fn deinit(self: *Images) void {
@@ -36,8 +68,7 @@ pub const Images = struct {
         if (!try resolver.words(inst.src1.reg, inst.pc, &words)) return error.DynamicComputeImageNotImplemented;
         const descriptor = try gpu.resources.decodeImageDescriptor(&words);
         errdefer std.debug.print("[d3d12 compute image] descriptor={any}\n", .{descriptor});
-        if (descriptor.address == 0 or descriptor.viewMipLevels() != 1 or descriptor.samplesLog2() != 0 or
-            gpu.MetadataSurface.fromImage(descriptor).hasAny()) return error.ComputeImageLayoutNotImplemented;
+        if (descriptor.address == 0 or descriptor.viewMipLevels() != 1 or descriptor.samplesLog2() != 0) return error.ComputeImageLayoutNotImplemented;
         const dimension: rdna2.spirv.StorageImageDimension = switch (inst.image_dimension) {
             .dim_2d => .two_d,
             .dim_2d_array_alt => .two_d_array,
@@ -59,6 +90,7 @@ pub const Images = struct {
         const native_format = try nativeFormat(format);
         const texture = try gpu.TextureLayout.fromImage(descriptor);
         const view = try texture.subresource(descriptor.viewBaseLevel(), 0, if (dimension == .two_d_array) texture.layers else 1);
+        const dcc = try surfaces.TextureDcc.fromImage(descriptor, @intCast(view.required_source_bytes));
         if (dimension == .two_d and view.depth_or_layers != 1) return error.ComputeImageLayoutNotImplemented;
         const writable = inst.opcode == .image_store;
         const slot: u32 = blk: {
@@ -71,12 +103,7 @@ pub const Images = struct {
                 // Overlapping views with different formats/layouts are not.
                 if (descriptor.address < entry.descriptor.address + entry.layout.required_source_bytes and
                     entry.descriptor.address < descriptor.address + view.required_source_bytes and
-                    !(descriptor.address == entry.descriptor.address and
-                        descriptor.width == entry.descriptor.width and descriptor.height == entry.descriptor.height and
-                        descriptor.depth_or_layers == entry.descriptor.depth_or_layers and descriptor.tile_mode == entry.descriptor.tile_mode and
-                        descriptor.pitch == entry.descriptor.pitch and descriptor.unified_format == entry.descriptor.unified_format and
-                        descriptor.resourceMipLevels() == entry.descriptor.resourceMipLevels() and
-                        descriptor.viewBaseLevel() != entry.descriptor.viewBaseLevel())) return error.ComputeImageAliasNotImplemented;
+                    !disjointMipViews(descriptor, entry.descriptor)) return error.ComputeImageAliasNotImplemented;
             }
             const size: usize = @intCast(try view.stagingBytes());
             if (self.count == self.entries.len or view.required_source_bytes > 256 * 1024 * 1024 or size > 256 * 1024 * 1024 or self.total + size > 256 * 1024 * 1024) return error.StorageBudgetExceeded;
@@ -84,11 +111,12 @@ pub const Images = struct {
             const backing = try self.allocator.alloc(u8, @intCast(view.required_source_bytes));
             defer self.allocator.free(backing);
             try resolver.reader.read(descriptor.address, backing);
+            if (dcc) |metadata| try metadata.expand(.{ .context = resolver.reader.context, .read = resolver.reader.read_fn }, backing);
             const pixels = try self.allocator.alloc(u8, size);
             errdefer self.allocator.free(pixels);
             try view.detile(backing, pixels);
             const index = self.count;
-            self.entries[index] = .{ .descriptor = descriptor, .layout = view, .pixels = pixels };
+            self.entries[index] = .{ .descriptor = descriptor, .layout = view, .pixels = pixels, .dcc = dcc };
             self.native_images[index] = .{
                 .pixels = pixels.ptr,
                 .size = pixels.len,
@@ -113,8 +141,10 @@ pub const Images = struct {
             defer self.allocator.free(backing);
             // Read the current backing, including previous mip writebacks.
             if (!memory.read(memory.context, entry.descriptor.address, backing)) return error.GuestReadFailed;
+            if (entry.dcc) |metadata| try metadata.expand(memory, backing);
             try entry.layout.tile(entry.pixels, backing);
             if (!memory.write(memory.context, entry.descriptor.address, backing)) return error.GuestWriteFailed;
+            if (entry.dcc) |metadata| try metadata.publish(memory);
         }
     }
 };
