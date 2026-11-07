@@ -44287,7 +44287,7 @@ fn sampledImageFormat(unified_format: u16, force_srgb: bool) ?u32 {
         77 => vk.format_r32g32b32a32_sfloat,
         // GFX10 FORMAT 128 is single-channel R8 sRGB. Vulkan has no R8 sRGB
         // format, so use its byte-identical UNORM representation.
-        128 => vk.format_r8_unorm,
+        128, 161 => vk.format_r8_unorm,
         130 => vk.format_r8g8b8a8_srgb,
         // Guest packed components start at the least significant bits. The
         // view swizzle below composes this layout with the T# selectors.
@@ -44368,7 +44368,7 @@ fn storageImageFormat(unified_format: u16) ?StorageImageFormat {
         76 => .{ .spirv = .rgba32_sint, .vulkan = vk.format_r32g32b32a32_sint },
         77 => .{ .spirv = .rgba32_float, .vulkan = vk.format_r32g32b32a32_sfloat },
         // Storage operations bypass the sRGB transfer function.
-        128 => .{ .spirv = .r8_unorm, .vulkan = vk.format_r8_unorm },
+        128, 161 => .{ .spirv = .r8_unorm, .vulkan = vk.format_r8_unorm },
         129 => .{ .spirv = .rg8_unorm, .vulkan = vk.format_r8g8_unorm },
         // Storage operations bypass sRGB transfer conversion. Vulkan does not
         // permit an sRGB storage-image view, so expose the identical four-byte
@@ -44693,7 +44693,7 @@ fn sameStorageImageDescriptor(a: gpu.ImageDescriptor, b: gpu.ImageDescriptor) bo
 
 fn storageImageBytesPerTexel(unified_format: u16) u8 {
     return switch (unified_format) {
-        1...6, 128 => 1,
+        1...6, 128, 161 => 1,
         7...19, 129, 133...136 => 2,
         20...30, 36, 50, 56...61, 130 => 4,
         62...71 => 8,
