@@ -44809,10 +44809,22 @@ fn sampledImageComponents(selectors: [4]u8, unified_format: u16) Error!vk.Compon
     };
 }
 
+const SampledStateHashCacheEntry = struct {
+    image: gpu.resources.ImageDescriptor = undefined,
+    sampler: gpu.resources.SamplerDescriptor = undefined,
+    hash: u64 = 0,
+    valid: bool = false,
+};
+threadlocal var sampled_state_hash_cache: [64]SampledStateHashCacheEntry = @splat(.{});
+
 fn sampledImageStateHash(
     descriptor: gpu.resources.ImageDescriptor,
     sampler: gpu.resources.SamplerDescriptor,
 ) u64 {
+    const slot = @as(usize, @truncate(descriptor.address ^ (descriptor.address >> 32))) & (sampled_state_hash_cache.len - 1);
+    const cached = &sampled_state_hash_cache[slot];
+    if (cached.valid and std.meta.eql(cached.image, descriptor) and std.meta.eql(cached.sampler, sampler))
+        return cached.hash;
     const words = [_]u32{
         @truncate(descriptor.dccMetadataAddress() orelse 0),
         @truncate((descriptor.dccMetadataAddress() orelse 0) >> 32),
@@ -44842,7 +44854,9 @@ fn sampledImageStateHash(
         @bitCast(sampler.maximum_lod),
         @bitCast(sampler.lod_bias),
     };
-    return std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(&words));
+    const hash = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(&words));
+    cached.* = .{ .image = descriptor, .sampler = sampler, .hash = hash, .valid = true };
+    return hash;
 }
 
 /// T# MIN_LOD is U4.8 in resource space, unlike S# LOD bounds, which
