@@ -52,7 +52,7 @@ const rapid_down_hold_us: u64 = 15 * std.time.us_per_s;
 var auto_input_origin_us: std.atomic.Value(u64) = .init(0);
 var diagnostics_enabled: std.atomic.Value(u8) = .init(0);
 var diagnostic_last_buttons: std.atomic.Value(u32) = .init(std.math.maxInt(u32));
-var diagnostic_last_left_y: std.atomic.Value(u8) = .init(std.math.maxInt(u8));
+var diagnostic_last_axes: [6]std.atomic.Value(u8) = @splat(std.atomic.Value(u8).init(std.math.maxInt(u8)));
 
 pub const AutomaticProfile = enum(u8) {
     default,
@@ -61,6 +61,62 @@ pub const AutomaticProfile = enum(u8) {
 };
 
 var automatic_profile: std.atomic.Value(u8) = .init(@intFromEnum(AutomaticProfile.default));
+
+const ScriptEvent = struct { button: u32, start_us: u64, end_us: u64 };
+var input_script: [64]ScriptEvent = undefined;
+var input_script_count: usize = 0;
+
+fn scriptButton(name: []const u8) ?u32 {
+    const names = [_]struct { []const u8, u32 }{
+        .{ "cross", 0x4000 },
+        .{ "circle", 0x2000 },
+        .{ "square", 0x8000 },
+        .{ "triangle", 0x1000 },
+        .{ "up", 0x0010 },
+        .{ "right", 0x0020 },
+        .{ "down", 0x0040 },
+        .{ "left", 0x0080 },
+        .{ "l1", 0x0400 },
+        .{ "r1", 0x0800 },
+        .{ "l2", 0x0100 },
+        .{ "r2", 0x0200 },
+        .{ "options", 0x0008 },
+        .{ "touch", 0x0010_0000 },
+    };
+    for (names) |entry| if (std.ascii.eqlIgnoreCase(name, entry[0])) return entry[1];
+    return null;
+}
+
+/// Parses `button@milliseconds[:duration_ms],...` into a wall-clock input
+/// script. The script is explicit opt-in and suppresses the legacy automatic
+/// profile, so a bring-up run can navigate a fixed menu path without a host
+/// keyboard or controller.
+pub fn setInputScript(text: []const u8) usize {
+    input_script_count = 0;
+    var parts = std.mem.splitScalar(u8, text, ',');
+    while (parts.next()) |raw| {
+        const token = std.mem.trim(u8, raw, " \t\r\n");
+        const at = std.mem.indexOfScalar(u8, token, '@') orelse continue;
+        const button = scriptButton(std.mem.trim(u8, token[0..at], " \t")) orelse continue;
+        const timing = std.mem.trim(u8, token[at + 1 ..], " \t");
+        var start_ms: u64 = 0;
+        var duration_ms: u64 = 250;
+        if (std.mem.indexOfScalar(u8, timing, ':')) |colon| {
+            start_ms = std.fmt.parseInt(u64, timing[0..colon], 10) catch continue;
+            duration_ms = std.fmt.parseInt(u64, timing[colon + 1 ..], 10) catch continue;
+        } else {
+            start_ms = std.fmt.parseInt(u64, timing, 10) catch continue;
+        }
+        if (duration_ms == 0 or input_script_count >= input_script.len) continue;
+        input_script[input_script_count] = .{
+            .button = button,
+            .start_us = start_ms * std.time.us_per_ms,
+            .end_us = (start_ms + duration_ms) * std.time.us_per_ms,
+        };
+        input_script_count += 1;
+    }
+    return input_script_count;
+}
 
 const PadData = extern struct {
     buttons: u32 = 0,
@@ -139,7 +195,7 @@ pub fn reset() void {
     auto_input_origin_us.store(0, .release);
     diagnostics_enabled.store(0, .release);
     diagnostic_last_buttons.store(std.math.maxInt(u32), .release);
-    diagnostic_last_left_y.store(std.math.maxInt(u8), .release);
+    for (&diagnostic_last_axes) |*axis| axis.store(std.math.maxInt(u8), .release);
     automatic_profile.store(@intFromEnum(AutomaticProfile.default), .release);
     host_input.reset();
 }
@@ -152,7 +208,7 @@ pub fn setAutomaticProfile(profile: AutomaticProfile) void {
 pub fn setDiagnostics(enabled: bool) void {
     diagnostics_enabled.store(@intFromBool(enabled), .release);
     diagnostic_last_buttons.store(std.math.maxInt(u32), .release);
-    diagnostic_last_left_y.store(std.math.maxInt(u8), .release);
+    for (&diagnostic_last_axes) |*axis| axis.store(std.math.maxInt(u8), .release);
 }
 
 fn autoInputElapsedUs() u64 {
@@ -258,6 +314,14 @@ fn fillPadData(output: *PadData) void {
         output.angular_velocity_z = sample.angular_velocity[2];
     };
 
+    if (input_script_count != 0) {
+        const now_us = autoInputElapsedUs();
+        for (input_script[0..input_script_count]) |event| {
+            if (now_us >= event.start_us and now_us < event.end_us) output.buttons |= event.button;
+        }
+        return;
+    }
+
     // Scripted checks use the same pulses with a neutral host state, so typing
     // in another application cannot move the title into a different scene.
     const input_mode = host_input.mode();
@@ -300,16 +364,25 @@ fn fillPadData(output: *PadData) void {
 
 fn reportPadData(output: *const PadData) void {
     if (diagnostics_enabled.load(.acquire) == 0) return;
+    const axes = [6]u8{ output.left_stick_x, output.left_stick_y, output.right_stick_x, output.right_stick_y, output.analog_l2, output.analog_r2 };
     const previous_buttons = diagnostic_last_buttons.swap(output.buttons, .acq_rel);
-    const previous_left_y = diagnostic_last_left_y.swap(output.left_stick_y, .acq_rel);
-    if (previous_buttons == output.buttons and previous_left_y == output.left_stick_y) return;
+    var changed = previous_buttons != output.buttons;
+    for (&diagnostic_last_axes, axes) |*last, value| {
+        if (last.swap(value, .acq_rel) != value) changed = true;
+    }
+    if (!changed) return;
     std.debug.print(
-        "[pad state] elapsed_us={d} process_us={d} buttons=0x{x:0>8} left_y={d} mode={s} profile={s}\n",
+        "[pad state] elapsed_us={d} process_us={d} buttons=0x{x:0>8} lx={d} ly={d} rx={d} ry={d} l2={d} r2={d} mode={s} profile={s}\n",
         .{
             autoInputElapsedUs(),
             kernel_runtime.processTimeMicroseconds(),
             output.buttons,
-            output.left_stick_y,
+            axes[0],
+            axes[1],
+            axes[2],
+            axes[3],
+            axes[4],
+            axes[5],
             @tagName(host_input.mode()),
             @tagName(@as(AutomaticProfile, @enumFromInt(automatic_profile.load(.acquire)))),
         },
