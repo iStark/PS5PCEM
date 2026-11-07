@@ -17893,7 +17893,7 @@ pub const Renderer = struct {
             .render_pass = render_pass,
             .framebuffer = framebuffer,
             .backing_was_accessible = self.colorTargetBackingAccessible(target),
-            .backing_snapshot = if (self.guest_memory) |memory| ColorBackingSnapshot.capture(memory, target) else .{},
+            .backing_snapshot = if (self.guest_memory) |memory| self.captureColorBacking(memory, target) else .{},
         };
     }
 
@@ -19411,7 +19411,7 @@ pub const Renderer = struct {
                         std.debug.print("[gpu target backing changed] flip={d} @0x{x} {d}x{d} generation={d}/{d}\n", .{ self.flip_callbacks, target.descriptor.address, target.descriptor.width, target.descriptor.height, cached.gpu_generation, cached.host_generation });
                     invalidateResidentTarget(cached);
                     self.invalidateCompletedFrames(target.descriptor.address, target.layout.required_source_bytes);
-                    cached.backing_snapshot = ColorBackingSnapshot.capture(memory, target);
+                    cached.backing_snapshot = self.captureColorBacking(memory, target);
                     cached.backing_snapshot.last_checked_flip = self.flip_callbacks;
                     cached.backing_was_accessible = self.colorTargetBackingAccessible(target);
                 }
@@ -21107,7 +21107,7 @@ pub const Renderer = struct {
         // views: their pending output must still be checked against guest RAM.
         if (self.guest_memory) |memory| {
             const previous = cached.backing_snapshot;
-            cached.backing_snapshot = ColorBackingSnapshot.capture(memory, target);
+            cached.backing_snapshot = self.captureColorBacking(memory, target);
             for (self.render_targets.items) |*resident| {
                 if (sameRenderTarget(resident.target, target) and
                     resident.backing_snapshot.hash == previous.hash)
@@ -21212,7 +21212,7 @@ pub const Renderer = struct {
         cached.target = target;
         cached.needs_writeback = true;
         cached.backing_was_accessible = backing_was_accessible or self.colorTargetBackingAccessible(target);
-        cached.backing_snapshot = backing_snapshot orelse if (self.guest_memory) |memory| ColorBackingSnapshot.capture(memory, target) else .{};
+        cached.backing_snapshot = backing_snapshot orelse if (self.guest_memory) |memory| self.captureColorBacking(memory, target) else .{};
         if (traceColorPublication(target)) std.debug.print("[color publication readback] addr=0x{x} mip={d} face={d} hash={any} pixel={x}\n", .{ target.descriptor.address, target.descriptor.mip_level, target.descriptor.base_array_slice, cached.backing_snapshot.hash, cached.pixels.items[0..@min(8, cached.pixels.items.len)] });
         self.latest_frame_index = frame_index;
     }
@@ -29995,6 +29995,27 @@ pub const Renderer = struct {
             hash.update(std.mem.asBytes(&value));
         }
         return hash.final();
+    }
+
+    /// Capture the guest backing baseline through the renderer's cached range
+    /// fingerprint. The standalone capture path is retained for tests, which
+    /// do not have a renderer cache.
+    fn captureColorBacking(self: *Renderer, memory: GuestMemory, target: GuestColorTarget) ColorBackingSnapshot {
+        const range = colorTargetBackingRange(target);
+        const address = target.descriptor.address + range.offset;
+        const size = range.size;
+        const generation = if (memory.track_gpu_read) |track|
+            track(memory.context, address, size)
+        else if (memory.gpu_generation) |query|
+            query(memory.context, address, size)
+        else
+            0;
+        return .{
+            .hash = self.fingerprintGuestRange(memory, address, size),
+            .generation = generation,
+            .last_checked_flip = self.flip_callbacks,
+            .range = range,
+        };
     }
 
     /// Renderer-aware backing check. `ColorBackingSnapshot.changed` is kept for
