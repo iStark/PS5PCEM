@@ -123,6 +123,7 @@ pub const Error = std.mem.Allocator.Error || error{
     GuestReadFailed,
     GuestWriteFailed,
     IncompleteRectangleList,
+    UnsupportedLegacyRectangleDraw,
     IndexBufferTooLarge,
     IndexCountOutOfBounds,
     IndirectAndMultiDrawNotImplemented,
@@ -889,9 +890,16 @@ pub const Renderer = struct {
         draw_state.first_vertex = args.vertex_offset;
         draw_state.first_instance = args.first_instance;
         draw_state.topology = topology;
-        const ngg_rectangle = render.primitive_type == 7 and routing.stage == .export_shader;
+        const rectangle = render.primitive_type == 7 or render.primitive_type == 17;
+        const ngg_rectangle = rectangle and routing.stage == .export_shader;
+        // DI_PT_RECTLIST (17) also occurs with merged NGG/export shaders.
+        // Only the single auto rectangle is covered here; indexed and older
+        // non-NGG forms need their own corner ordering, not an assumed GS.
+        if (render.primitive_type == 17 and (!ngg_rectangle or args.index_bytes != 0))
+            return error.UnsupportedLegacyRectangleDraw;
         if (ngg_rectangle and args.index_bytes == 0) {
-            if (args.count != 1 and args.count != 3 and args.count != 4) return error.UnsupportedNggRectangleCount;
+            if (args.count != 3 and args.count != 4 and !(render.primitive_type == 7 and args.count == 1))
+                return error.UnsupportedNggRectangleCount;
             // Prospero's auto RECT_LIST invokes the export shader for four
             // corners. The fourth invocation may compute non-affine UVs;
             // synthesizing it after the VS changes the guest program.
@@ -925,7 +933,7 @@ pub const Renderer = struct {
         const ps = ps_lease.view();
         const interface = try graphics.linkInterface(state, vs.program.instructions.items, ps.program.instructions.items);
         if (interface.flat_mask != 0) {
-            if (render.primitive_type == 7) return error.FlatRectangleInterpolationNotImplemented;
+            if (rectangle) return error.FlatRectangleInterpolationNotImplemented;
             const last = (state.readRegister(.context, 0x205) orelse 0) & (1 << 19) != 0;
             // Fans already rotate the selected rim vertex during expansion.
             if (last and render.primitive_type != 5)

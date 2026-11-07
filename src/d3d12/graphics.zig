@@ -271,7 +271,7 @@ pub const Interface = struct {
 /// guest 5 is a fan and guest 6 is a strip; D3D12 uses 5 for a strip.
 pub fn nativeTopology(guest: u32) !u32 {
     return switch (guest) {
-        4, 5, 7 => 4, // List, expanded fan, or RECT_LIST completed by the GS.
+        4, 5, 7, 17 => 4, // List, expanded fan, or RECT_LIST (backend selects NGG strip/GS).
         6 => 5, // DI_PT_TRISTRIP -> D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP
         else => error.UnsupportedPrimitive,
     };
@@ -282,6 +282,7 @@ test "guest primitive numbers map explicitly and fans never masquerade as strips
     try std.testing.expectEqual(@as(u32, 5), try nativeTopology(6));
     try std.testing.expectEqual(@as(u32, 4), try nativeTopology(5));
     try std.testing.expectEqual(@as(u32, 4), try nativeTopology(7));
+    try std.testing.expectEqual(@as(u32, 4), try nativeTopology(17));
     try std.testing.expectError(error.UnsupportedPrimitive, nativeTopology(8));
 }
 

@@ -1460,7 +1460,27 @@ fn guestRectangleProbe(allocator: std.mem.Allocator) !void {
         _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), count, 2 });
         if (!std.mem.eql(u8, &expected_ngg, memory.data[0x2000..0x5000])) return error.NggRectangleFourthInvocationLost;
     }
-    std.debug.print("PASS RECT_LIST: legacy completion matches two explicit triangles, NGG 1/3/4 counts invoke the fourth guest vertex, full interpolation/coverage/padding comparisons\n", .{});
+    // Dreaming Sarah uses the legacy DI_PT value 17 with the same merged
+    // export shader convention. A GS approximation would lose the deliberately
+    // non-affine fourth vertex attribute tested above.
+    try state.writeRegister(.uconfig, 0x242, 17);
+    for ([_]u32{ 3, 4 }) |count| {
+        @memset(memory.data[0x2000..0x5000], 0xa7);
+        _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), count, 2 });
+        if (!std.mem.eql(u8, &expected_ngg, memory.data[0x2000..0x5000])) return error.LegacyNggRectangleImageMismatch;
+    }
+    @memset(memory.data[0x2000..0x5000], 0xa7);
+    const unchanged = memory.data[0x2000..0x5000].*;
+    const invalid_count: gpu.pm4.Packet = .{ .kind = .command, .header = command(gpu.pm4.draw_index_auto, 2), .opcode = gpu.pm4.draw_index_auto, .body = &.{ 1, 2 } };
+    if (renderer.draw(&state, invalid_count)) |_| return error.LegacyRectangleInvalidCountAccepted else |err| {
+        if (err != error.UnsupportedNggRectangleCount) return err;
+    }
+    const indexed: gpu.pm4.Packet = .{ .kind = .command, .header = command(gpu.pm4.draw_index_2, 5), .opcode = gpu.pm4.draw_index_2, .body = &.{ 3, 0x600, 0, 3, 0 } };
+    if (renderer.draw(&state, indexed)) |_| return error.LegacyRectangleIndexedDrawAccepted else |err| {
+        if (err != error.UnsupportedLegacyRectangleDraw) return err;
+    }
+    if (!std.mem.eql(u8, &unchanged, memory.data[0x2000..0x5000])) return error.RejectedLegacyRectangleModifiedTarget;
+    std.debug.print("PASS RECT_LIST: legacy completion matches two explicit triangles; NGG type 7 (1/3/4) and type 17 (3/4) preserve the fourth guest invocation; unsupported legacy forms leave targets unchanged\n", .{});
 }
 
 fn guestBatchProbe(device: *d3d12.Device, vertex: []const u32, fragment: []const u32) !void {
