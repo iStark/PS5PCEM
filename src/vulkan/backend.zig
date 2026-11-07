@@ -35596,7 +35596,9 @@ pub const Renderer = struct {
                 },
             );
         } else if (mip_plan) |plan| {
-            @memset(linear, 0);
+            // The GPU detile path writes the complete packed staging range and
+            // the direct upload path never reads host scratch. Zero only when
+            // the CPU per-level fallback below actually leaves gaps.
             var tiled_scratch = try self.image_scratch.acquire(self.allocator, probe_span);
             defer tiled_scratch.release();
             const tiled = tiled_scratch.bytes;
@@ -35635,6 +35637,7 @@ pub const Renderer = struct {
                     try self.readMapped(gpu_linear, linear);
                 }
             } else {
+                @memset(linear, 0);
                 var cursor: usize = 0;
                 var level_index: u8 = 0;
                 while (level_index < plan.level_count) : (level_index += 1) {
