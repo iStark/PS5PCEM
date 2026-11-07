@@ -3981,10 +3981,6 @@ test "completed frame replacement bounds slack and preserves pending peers" {
 const ColorBackingSnapshot = struct {
     hash: ?u64 = null,
     generation: u64 = 0,
-    /// Without page tracking, a large attachment would otherwise be hashed on
-    /// every draw that reacquires it. One full check per presented frame still
-    /// catches guest CPU writes without making the hash dominate the frame.
-    last_checked_flip: u64 = 0,
     // The layout belongs to this snapshot's target. Packed-tail span discovery
     // can walk thousands of texels; repeat it only when capturing a new target,
     // not at every resident-image lookup or sibling publication.
@@ -4304,6 +4300,7 @@ test "deferred frames preserve CPU replacements in still-mapped image memory" {
     renderer.render_targets = .empty;
     renderer.completed_frames = .empty;
     renderer.guest_color_target_writes = 0;
+    renderer.guest_fingerprint_cache = .{};
     defer renderer.image_scratch.deinit(testing.allocator);
     defer renderer.image_aliases.deinit(testing.allocator);
     var pixels = [_]u8{0x7f} ** 4096;
@@ -4355,6 +4352,58 @@ test "deferred frames preserve CPU replacements in still-mapped image memory" {
     fixture.mutate_after_hash = true;
     raced.refresh(memory, target);
     try testing.expect(raced.changed(memory, target));
+}
+
+test "color backing checks detect same-frame untracked writes and reuse watched hashes" {
+    const Fixture = struct {
+        digest: u64 = 11,
+        epoch: u64 = 1,
+        hashes: usize = 0,
+        fn read(_: ?*anyopaque, _: u64, _: []u8) bool {
+            return false;
+        }
+        fn write(_: ?*anyopaque, _: u64, _: []const u8) bool {
+            return false;
+        }
+        fn fingerprint(raw: ?*anyopaque, _: u64, _: usize) ?u64 {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.hashes += 1;
+            return self.digest;
+        }
+        fn generation(raw: ?*anyopaque, _: u64, _: usize) u64 {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            return self.epoch;
+        }
+    };
+    var fixture = Fixture{};
+    var memory = GuestMemory{ .context = &fixture, .read = Fixture.read, .write = Fixture.write, .fingerprint = Fixture.fingerprint };
+    const descriptor = displayColorTarget(.{ .address = 0x1000, .width = 4096, .height = 4096, .pitch_in_pixels = 4096, .tiling_mode = 1 }).?;
+    const target = try guestColorTarget(descriptor);
+    const renderer = try std.testing.allocator.create(Renderer);
+    defer std.testing.allocator.destroy(renderer);
+    renderer.* = undefined;
+    renderer.guest_fingerprint_cache = .{};
+    renderer.flip_callbacks = 42;
+    var snapshot = renderer.captureColorBacking(memory, target);
+    try std.testing.expect(snapshot.range.size > 32 * 1024 * 1024);
+    try std.testing.expect(!renderer.colorBackingChanged(&snapshot, memory, target));
+    fixture.digest = 22;
+    try std.testing.expect(renderer.colorBackingChanged(&snapshot, memory, target));
+
+    memory.gpu_generation = Fixture.generation;
+    snapshot = renderer.captureColorBacking(memory, target);
+    const hashes = fixture.hashes;
+    try std.testing.expect(!renderer.colorBackingChanged(&snapshot, memory, target));
+    try std.testing.expectEqual(hashes, fixture.hashes);
+    fixture.digest = 33;
+    fixture.epoch += 1;
+    try std.testing.expect(renderer.colorBackingChanged(&snapshot, memory, target));
+
+    // A callback returning zero is not an intact write watch either.
+    fixture.epoch = 0;
+    snapshot = renderer.captureColorBacking(memory, target);
+    fixture.digest = 44;
+    try std.testing.expect(renderer.colorBackingChanged(&snapshot, memory, target));
 }
 
 const WindowPresentation = struct {
@@ -19412,7 +19461,6 @@ pub const Renderer = struct {
                     invalidateResidentTarget(cached);
                     self.invalidateCompletedFrames(target.descriptor.address, target.layout.required_source_bytes);
                     cached.backing_snapshot = self.captureColorBacking(memory, target);
-                    cached.backing_snapshot.last_checked_flip = self.flip_callbacks;
                     cached.backing_was_accessible = self.colorTargetBackingAccessible(target);
                 }
             }
@@ -30013,7 +30061,6 @@ pub const Renderer = struct {
         return .{
             .hash = self.fingerprintGuestRange(memory, address, size),
             .generation = generation,
-            .last_checked_flip = self.flip_callbacks,
             .range = range,
         };
     }
@@ -30035,12 +30082,9 @@ pub const Renderer = struct {
             if (generation(memory.context, address, size) == snapshot.generation) return false;
         };
         if (memory.fingerprint == null) return false;
-        const has_page_tracking = memory.track_gpu_read != null or memory.gpu_generation != null;
-        if (!has_page_tracking and size > 32 * 1024 * 1024 and
-            snapshot.last_checked_flip == self.flip_callbacks)
-        {
-            return false;
-        }
+        // A presentation boundary is not a memory-coherence boundary. Without
+        // a nonzero write-watch generation, recheck the bytes even when this
+        // large attachment was already acquired earlier in the same frame.
         const observed = if (memory.track_gpu_read) |track|
             track(memory.context, address, size)
         else if (memory.gpu_generation) |query|
@@ -30050,7 +30094,6 @@ pub const Renderer = struct {
         const current_hash = self.fingerprintGuestRange(memory, address, size) orelse return false;
         if (current_hash != previous_hash) return true;
         snapshot.generation = observed;
-        snapshot.last_checked_flip = self.flip_callbacks;
         return false;
     }
 

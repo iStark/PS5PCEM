@@ -2048,6 +2048,9 @@ const WindowsX64Machine = struct {
             vex_b = if (code[1] & 0x20 == 0) 8 else 0;
             offset = 3;
         }
+        // MOV moffs has an absolute address instead of a ModRM/base register.
+        // Its first address byte must not be interpreted as a null RAX base.
+        if (code[offset] >= 0xa0 and code[offset] <= 0xa3) return false;
         // Two-byte opcode (0F xx) places modrm at offset+2.
         const modrm_index: usize = if (code[offset] == 0x0f) offset + 2 else offset + 1;
         if (modrm_index >= 14) return false;
@@ -3334,6 +3337,26 @@ test "a dropped thread pointer is repaired, a null dereference is not" {
     try std.testing.expect(!shouldRestore(0x28, 0, 0));
 }
 
+test "exact-zero recovery requires a null base rather than an absolute or RIP-relative read" {
+    if (!can_use_native_bridge) return error.SkipZigTest;
+    var code: [16]u8 = @splat(0x90);
+    @memcpy(code[0..3], &[_]u8{ 0x48, 0x8b, 0x01 }); // mov rax, [rcx]
+    var context = std.mem.zeroes(std.os.windows.CONTEXT);
+    context.Rip = @intFromPtr(&code);
+    try std.testing.expect(WindowsX64Machine.tryRedirectNullBaseRegister(&context, 0));
+    try std.testing.expect(context.Rcx != 0);
+    try std.testing.expectEqual(@intFromPtr(&code), context.Rip);
+    try std.testing.expect(!WindowsX64Machine.tryRedirectNullBaseRegister(&context, 0));
+    context = std.mem.zeroes(std.os.windows.CONTEXT);
+    context.Rip = @intFromPtr(&code);
+    @memcpy(code[0..8], &[_]u8{ 0x48, 0x8b, 0x04, 0x25, 0, 0, 0, 0 }); // mov rax, [0]
+    try std.testing.expect(!WindowsX64Machine.tryRedirectNullBaseRegister(&context, 0));
+    @memcpy(code[0..7], &[_]u8{ 0x48, 0x8b, 0x05, 0, 0, 0, 0 }); // mov rax, [rip+disp32]
+    try std.testing.expect(!WindowsX64Machine.tryRedirectNullBaseRegister(&context, 0));
+    @memcpy(code[0..10], &[_]u8{ 0x48, 0xa1, 0, 0, 0, 0, 0, 0, 0, 0 }); // mov rax, moffs64 [0]
+    try std.testing.expect(!WindowsX64Machine.tryRedirectNullBaseRegister(&context, 0));
+}
+
 test "null base recovery decodes VEX2 and VEX3 memory operands" {
     if (can_use_native_bridge) {
         // vmovss dword ptr [rax+0x70], xmm0
@@ -3404,6 +3427,7 @@ test "fault emulation refuses a faulting Rip outside host-readable code" {
         context.Rcx = 0;
         try std.testing.expect(!WindowsX64Machine.tryEmulateNullObjectCompare(&context, 0x20));
         try std.testing.expect(!WindowsX64Machine.tryEmulateNullMemoryLoad(&context, 0x20));
+        try std.testing.expect(!WindowsX64Machine.tryEmulateNullMemoryStore(&context, 0x20));
         try std.testing.expect(!WindowsX64Machine.tryRedirectNullBaseRegister(&context, 0x20));
         try std.testing.expect(!WindowsX64Machine.tryEmulateUnmappedOptionalPointerLoad(&context, context.Rdx + 8));
         try std.testing.expect(!WindowsX64Machine.tryEmulateNullSentinelPointerLoad(&context, 8));

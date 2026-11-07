@@ -108,10 +108,13 @@ pub fn setInputScript(text: []const u8) usize {
             start_ms = std.fmt.parseInt(u64, timing, 10) catch continue;
         }
         if (duration_ms == 0 or input_script_count >= input_script.len) continue;
+        const start_us = std.math.mul(u64, start_ms, std.time.us_per_ms) catch continue;
+        const end_ms = std.math.add(u64, start_ms, duration_ms) catch continue;
+        const end_us = std.math.mul(u64, end_ms, std.time.us_per_ms) catch continue;
         input_script[input_script_count] = .{
             .button = button,
-            .start_us = start_ms * std.time.us_per_ms,
-            .end_us = (start_ms + duration_ms) * std.time.us_per_ms,
+            .start_us = start_us,
+            .end_us = end_us,
         };
         input_script_count += 1;
     }
@@ -197,6 +200,7 @@ pub fn reset() void {
     diagnostic_last_buttons.store(std.math.maxInt(u32), .release);
     for (&diagnostic_last_axes) |*axis| axis.store(std.math.maxInt(u8), .release);
     automatic_profile.store(@intFromEnum(AutomaticProfile.default), .release);
+    input_script_count = 0;
     host_input.reset();
 }
 
@@ -542,6 +546,21 @@ pub const module = symbols.Module{ .name = "libScePad", .version_major = 1, .ver
 
 pub fn register(db: *symbols.Database, gpa: std.mem.Allocator) symbols.Error!void {
     try db.addLibrary(gpa, library, module, &exports);
+}
+
+test "input scripts reject overflowing times and do not survive pad reset" {
+    reset();
+    defer reset();
+    const count = setInputScript("cross@0:50, right@125, unknown@1, cross@18446744073709551615:1, circle@1:18446744073709551615, up@18446744073709551:100, down@12:0");
+    try std.testing.expectEqual(@as(usize, 2), count);
+    try std.testing.expectEqual(@as(u32, 0x4000), input_script[0].button);
+    try std.testing.expectEqual(@as(u64, 50_000), input_script[0].end_us);
+    try std.testing.expectEqual(@as(u64, 125_000), input_script[1].start_us);
+    try std.testing.expectEqual(@as(u64, 375_000), input_script[1].end_us);
+    reset();
+    try std.testing.expectEqual(@as(usize, 0), input_script_count);
+    try std.testing.expectEqual(@as(usize, 1), setInputScript("square@1000"));
+    try std.testing.expectEqual(@as(usize, 0), setInputScript("invalid"));
 }
 
 test "pad opens for the primary user and reports neutral connected data" {

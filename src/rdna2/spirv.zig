@@ -7536,7 +7536,7 @@ const Builder = struct {
                     bias,
                 }); // OpImageSampleDrefImplicitLod
             } else if (explicit_grad) {
-                const dx, const dy = try self.sampleExplicitGradients(inst, image_dimension, one_dimensional, gradient_base);
+                const dx, const dy = try self.sampleExplicitGradients(inst, image_dimension, one_dimensional or one_dimensional_array, gradient_base);
                 try self.emit(&self.body, 90, &.{
                     self.float_type,
                     sampled,
@@ -7602,7 +7602,7 @@ const Builder = struct {
                 bias,
             }); // OpImageSampleImplicitLod
         } else if (explicit_grad) {
-            const dx, const dy = try self.sampleExplicitGradients(inst, image_dimension, one_dimensional, gradient_base);
+            const dx, const dy = try self.sampleExplicitGradients(inst, image_dimension, one_dimensional or one_dimensional_array, gradient_base);
             try self.emit(&self.body, 88, &.{
                 self.vector4_type,
                 sampled,
@@ -7723,12 +7723,13 @@ const Builder = struct {
     ) Error![2]u32 {
         const zero = try self.constant(.float32, @bitCast(@as(f32, 0)));
         if (one_dimensional) {
+            const vector_type = try self.ensureFloatVec2();
             const dudx = try self.source(try imageAddressOperand(inst, gradient_base), .float32);
             const dudy = try self.source(try imageAddressOperand(inst, gradient_base + 1), .float32);
             const dx = self.id();
             const dy = self.id();
-            try self.emit(&self.body, 80, &.{ self.vector2_type, dx, dudx, zero });
-            try self.emit(&self.body, 80, &.{ self.vector2_type, dy, dudy, zero });
+            try self.emit(&self.body, 80, &.{ vector_type, dx, dudx, zero });
+            try self.emit(&self.body, 80, &.{ vector_type, dy, dudy, zero });
             return .{ dx, dy };
         }
         const dudx = try self.source(try imageAddressOperand(inst, gradient_base), .float32);
@@ -18502,6 +18503,65 @@ test "2D array explicit gradients omit the layer coordinate" {
             at += length;
         }
         try std.testing.expect(found);
+    }
+}
+
+test "1D array gradients keep the synthetic height derivative zero" {
+    var program = instruction.Program{ .code = &.{}, .instructions = .empty };
+    defer program.deinit(std.testing.allocator);
+    for ([_]f32{ 0.125, 0.25, 0.5, 2.0 }, 0..) |value, index| {
+        try program.instructions.append(std.testing.allocator, .{
+            .pc = @intCast(index * 4),
+            .opcode = .v_mov_b32,
+            .dst = .{ .kind = .vgpr, .reg = @intCast(index) },
+            .src0 = .{ .kind = .float_inline_constant, .value = @bitCast(value) },
+            .src_count = 1,
+        });
+    }
+    try program.instructions.append(std.testing.allocator, .{
+        .pc = 16,
+        .family = .mimg,
+        .opcode = .image_sample,
+        .dst = .{ .kind = .vgpr, .reg = 8 },
+        .src0 = .{ .kind = .vgpr, .reg = 0 },
+        .src1 = .{ .kind = .sgpr, .reg = 0 },
+        .src2 = .{ .kind = .sgpr, .reg = 8 },
+        .src_count = 3,
+        .image_dimension = .dim_1d_array,
+        .image_address_components = 4,
+        .image_sample_flags = .{ .derivative = true },
+        .data_mask = 0xf,
+    });
+    try program.instructions.append(std.testing.allocator, .{ .pc = 24, .opcode = .s_endpgm });
+    var module = try translate(std.testing.allocator, &program, .{
+        .stage = .compute,
+        .sampled_images = &.{.{ .resource_sgpr = 0, .sampler_sgpr = 8, .descriptor_index = 0, .instruction_pc = 16, .dimension = .two_d_array }},
+    });
+    defer module.deinit(std.testing.allocator);
+    for ([_]usize{ 5, 6 }) |operand_index| {
+        const derivative = firstInstructionOperand(module.words, 88, operand_index);
+        var height_derivative: ?u32 = null;
+        var at: usize = 5;
+        while (at < module.words.len) {
+            const length = module.words[at] >> 16;
+            if (module.words[at] & 0xffff == 80 and module.words[at + 2] == derivative) {
+                try std.testing.expectEqual(@as(u32, 5), length);
+                try std.testing.expect(module.words[at + 1] != 0);
+                height_derivative = module.words[at + 4];
+            }
+            at += length;
+        }
+        try std.testing.expect(height_derivative != null);
+        var zero = false;
+        at = 5;
+        while (at < module.words.len) {
+            const length = module.words[at] >> 16;
+            if (module.words[at] & 0xffff == 43 and module.words[at + 2] == height_derivative) {
+                zero = module.words[at + 3] == 0;
+            }
+            at += length;
+        }
+        try std.testing.expect(zero);
     }
 }
 
