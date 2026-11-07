@@ -1755,7 +1755,7 @@ static UINT color_bytes_per_pixel(uint32_t format) {
 
 static int valid_sampled_image(const Ps5D3D12Image *image) {
     if (!image->pixels || !image->width || !image->height || image->width > 16384 || image->height > 16384 || image->srgb > 1 ||
-        !image->layers || image->layers > 2048 || image->dimension > 3 || image->size > 256u * 1024 * 1024 ||
+        !image->layers || image->layers > 2048 || image->dimension > 3 || image->size > 512u * 1024 * 1024 ||
         (image->dimension == 3 && (image->width > 2048 || image->height > 2048)) ||
         !image->mip_levels || image->mip_levels > 15 ||
         (image->dimension == 0 && image->layers != 1) ||
@@ -1780,7 +1780,7 @@ static int valid_sampled_image(const Ps5D3D12Image *image) {
     case DXGI_FORMAT_R8_UNORM: bytes = 1; if (image->srgb) return 0; break;
     case DXGI_FORMAT_R16_UNORM: case DXGI_FORMAT_R16_FLOAT: case DXGI_FORMAT_R8G8_UNORM: case DXGI_FORMAT_B4G4R4A4_UNORM: bytes = 2; if (image->srgb) return 0; break;
     case DXGI_FORMAT_BC1_UNORM: block = 4; bytes = 8; break;
-    case DXGI_FORMAT_BC2_UNORM: case DXGI_FORMAT_BC3_UNORM: block = 4; bytes = 16; break;
+    case DXGI_FORMAT_BC2_UNORM: case DXGI_FORMAT_BC3_UNORM: case DXGI_FORMAT_BC7_UNORM: block = 4; bytes = 16; break;
     default: return 0;
     }
     if (image->width % block || image->height % block) return 0;

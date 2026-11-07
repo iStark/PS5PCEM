@@ -468,6 +468,13 @@ pub fn colorSize(width: u32, height: u32, format: u32) Error!usize {
     return size;
 }
 
+// Sampled atlases can exceed the framebuffer budget (16K BC7 plus mip tail).
+pub const max_sampled_image_bytes = 512 * 1024 * 1024;
+
+pub fn isBlockCompressedFormat(format: u32) bool {
+    return format == 71 or format == 74 or format == 77 or format == 98;
+}
+
 pub fn sampledImageMipChainSize(width: u32, height: u32, format: u32, layers: u32, dimension: u32, mip_levels: u32) Error!usize {
     var total = try sampledImageArraySize(width, height, format, layers, dimension);
     const extent = @max(@max(width, height), if (dimension == 3) layers else 1);
@@ -475,7 +482,7 @@ pub fn sampledImageMipChainSize(width: u32, height: u32, format: u32, layers: u3
     // Guest placement uses ceil dimensions while native mip extents floor.
     // Check the selected chain, not whether the base is a power of two: a
     // 96x32 view with four levels ends at 12x4 and matches exactly.
-    const compressed = format == 71 or format == 74 or format == 77;
+    const compressed = isBlockCompressedFormat(format);
     for (1..mip_levels) |level| {
         const divisor = @as(u32, 1) << @as(u5, @intCast(level));
         if ((width + divisor - 1) / divisor != @max(1, width / divisor) or
@@ -486,16 +493,16 @@ pub fn sampledImageMipChainSize(width: u32, height: u32, format: u32, layers: u3
         const depth = if (dimension == 3) @max(1, layers >> @as(u5, @intCast(level))) else layers;
         total += (try sampledImageSize(w, h, format)) * depth;
     }
-    if (total > 256 * 1024 * 1024) return error.InvalidArgument;
+    if (total > max_sampled_image_bytes) return error.InvalidArgument;
     return total;
 }
 
 pub fn sampledImageArraySize(width: u32, height: u32, format: u32, layers: u32, dimension: u32) Error!usize {
     if (layers == 0 or layers > 2048 or dimension > 3 or (dimension == 0 and layers != 1) or
-        (dimension == 3 and (width > 2048 or height > 2048 or format == 71 or format == 74 or format == 77)) or
+        (dimension == 3 and (width > 2048 or height > 2048 or isBlockCompressedFormat(format))) or
         (dimension == 1 and (width != height or layers % 6 != 0))) return error.InvalidArgument;
     const size = std.math.mul(usize, try sampledImageSize(width, height, format), layers) catch return error.InvalidArgument;
-    if (size > 256 * 1024 * 1024) return error.InvalidArgument;
+    if (size > max_sampled_image_bytes) return error.InvalidArgument;
     return size;
 }
 
@@ -510,7 +517,7 @@ pub fn sampledImageSize(width: u32, height: u32, format: u32) Error!usize {
     if (width % 4 != 0 or height % 4 != 0) return error.InvalidArgument;
     const bytes: usize = switch (format) {
         71 => 8, // BC1_UNORM
-        74, 77 => 16, // BC2_UNORM / BC3_UNORM
+        74, 77, 98 => 16, // BC2_UNORM / BC3_UNORM / BC7_UNORM
         else => return error.InvalidArgument,
     };
     return @as(usize, width / 4) * (height / 4) * bytes;
@@ -597,7 +604,13 @@ test "sampled BC footprints count blocks and reject unsupported native extents" 
     try std.testing.expectEqual(@as(usize, 32), try sampledImageSize(8, 4, 74));
     try std.testing.expectEqual(@as(usize, 3 * 7 * 4), try sampledImageSize(3, 7, 28));
     try std.testing.expectError(error.InvalidArgument, sampledImageSize(127, 128, 77));
-    try std.testing.expectError(error.InvalidArgument, sampledImageSize(4, 4, 98));
+    try std.testing.expectEqual(@as(usize, 16), try sampledImageSize(4, 4, 98));
+    try std.testing.expectEqual(@as(usize, 0x0aaaaac0), try sampledImageMipChainSize(16384, 8192, 98, 1, 0, 14));
+    try std.testing.expectEqual(@as(usize, 0x15555560), try sampledImageMipChainSize(16384, 16384, 98, 1, 0, 14));
+    try std.testing.expectEqual(@as(usize, 0x15555570), try sampledImageMipChainSize(16384, 16384, 98, 1, 0, 15));
+    try std.testing.expectError(error.InvalidArgument, sampledImageMipChainSize(16384, 16384, 98, 2, 2, 15));
+    try std.testing.expectError(error.InvalidArgument, sampledImageArraySize(8, 8, 98, 4, 3));
+    try std.testing.expectError(error.InvalidArgument, sampledImageSize(4, 4, 95));
     try std.testing.expectError(error.InvalidArgument, sampledImageSize(16388, 4, 71));
 }
 

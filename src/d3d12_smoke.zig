@@ -3308,7 +3308,8 @@ fn guestAnisotropicProbe(allocator: std.mem.Allocator) !void {
         for (words, 0..) |word, i| try state.writeRegister(.shader, 0x00c + @as(u32, @intCast(i)), word);
         const ps = [_]u32{ 0xc8000000, 0xc8010001, 0xc8040100, 0xc8050101, vop1(1, 2, 255), @bitCast(@as(f32, @floatFromInt(layer))), 0xf0800f00 | (@as(u32, if (array) 5 else 1) << 3), 0x00400400, 0xf800080f, 0x07060504, 0xbf810000 };
         @memcpy(memory.data[0x400..][0..@sizeOf(@TypeOf(ps))], std.mem.asBytes(&ps));
-        for ([_]u32{ 1, 2, 3, 4 }) |ratio_code| for ([_]bool{ false, true }) |linear| for ([_]bool{ false, true }) |mip_linear| for ([_][2]f32{ .{ 4, 1 }, .{ 1, 8 }, .{ 0.25, 0.25 }, .{ 16, 2 } }) |scale| {
+        for ([_]u32{ 1, 2, 3, 4 }) |ratio_code| for ([_]bool{ false, true }) |linear| for ([_]bool{ false, true }) |mag_aniso| for ([_]u32{ 0, 1, 2 }) |mip_filter| for ([_][2]f32{ .{ 4, 1 }, .{ 1, 8 }, .{ 0.25, 0.25 }, .{ 16, 2 } }) |scale| {
+            const mip_linear = mip_filter == 2;
             const vertices = [_][8]f32{
                 .{ -1, -1, 0, 1, 0.37 / 64.0, (16 * scale[1] + 0.37) / 64, 0, 1 },
                 .{ 3, -1, 0, 1, (32 * scale[0] + 0.37) / 64, (16 * scale[1] + 0.37) / 64, 0, 1 },
@@ -3317,14 +3318,14 @@ fn guestAnisotropicProbe(allocator: std.mem.Allocator) !void {
             @memcpy(memory.data[0x1000..][0..@sizeOf(@TypeOf(vertices))], std.mem.asBytes(&vertices));
             const filter: u32 = if (linear) 3 else 2;
             try state.writeRegister(.shader, 0x014, 0x92 | (ratio_code << 9));
-            try state.writeRegister(.shader, 0x015, 3 << 20);
-            try state.writeRegister(.shader, 0x016, (filter << 20) | (filter << 22) | (@as(u32, if (mip_linear) 2 else 1) << 26) | @as(u32, if (mip_linear) 128 else 0));
+            try state.writeRegister(.shader, 0x015, (3 << 20) | @as(u32, if (mip_filter == 0) 512 else 0));
+            try state.writeRegister(.shader, 0x016, ((if (mag_aniso) filter else filter & 1) << 20) | (filter << 22) | (mip_filter << 26) | @as(u32, if (mip_linear) 128 else 0));
             @memset(memory.data[0x2000..0x2400], 0xa7);
             _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 2 });
             const max_taps: f32 = @floatFromInt(@as(u32, 1) << @as(u5, @intCast(ratio_code)));
             const width = @max(1, @max(@min(scale[0], scale[1]), @max(scale[0], scale[1]) / max_taps));
             const taps: u32 = @intFromFloat(std.math.clamp(@ceil(@max(scale[0], scale[1]) / width), 1, max_taps));
-            const lod = std.math.clamp(@log2(width) + @as(f32, if (mip_linear) 0.5 else 0), 0, 3);
+            const lod = if (mip_filter == 0) 0 else std.math.clamp(@log2(width) + @as(f32, if (mip_linear) 0.5 else 0), 0, 3);
             const low: u32 = @intFromFloat(if (mip_linear) @floor(lod) else @floor(lod + 0.5));
             const high = @min(3, low + 1);
             const blend = if (mip_linear) lod - @floor(lod) else 0;
@@ -3348,6 +3349,49 @@ fn guestAnisotropicProbe(allocator: std.mem.Allocator) !void {
             };
             cases += 1;
         };
+        // Explicit LOD has no directional footprint even if the descriptor
+        // enables anisotropic minification (Arkanoid's startup sampler).
+        // Compare the entire output against scalar-LOD CPU filtering, with
+        // different min/mag filters, fractional LOD and both 2D/array reads.
+        const scalar_vertices = [_][8]f32{
+            .{ -1, -1, 0, 1, 0.37 / 64.0, 16.37 / 64.0, 0, 1 },
+            .{ 3, -1, 0, 1, 128.37 / 64.0, 16.37 / 64.0, 0, 1 },
+            .{ -1, 3, 0, 1, 0.37 / 64.0, -15.63 / 64.0, 0, 1 },
+        };
+        @memcpy(memory.data[0x1000..][0..@sizeOf(@TypeOf(scalar_vertices))], std.mem.asBytes(&scalar_vertices));
+        for ([_]bool{ false, true }) |level_zero| for ([_]u32{ 0, 2 }) |mip_filter| for ([_]f32{ -1, 0, 0.5, 1.5, 3 }) |requested_lod| for ([_][2]u32{ .{ 3, 1 }, .{ 2, 0 }, .{ 3, 0 }, .{ 2, 1 } }) |filters| {
+            const scalar_ps = [_]u32{
+                0xc8000000,                                                                                  0xc8010001,                                                             0xc8040100,      0xc8050101,
+                vop1(1, 2, 255),                                                                             @bitCast(if (array) @as(f32, @floatFromInt(layer)) else requested_lod), vop1(1, 3, 255), @bitCast(requested_lod),
+                @as(u32, if (level_zero) 0xf09c0f00 else 0xf0900f00) | (@as(u32, if (array) 5 else 1) << 3), 0x00400400,                                                             0xf800080f,      0x07060504,
+                0xbf810000,
+            };
+            @memcpy(memory.data[0x400..][0..@sizeOf(@TypeOf(scalar_ps))], std.mem.asBytes(&scalar_ps));
+            try state.writeRegister(.shader, 0x014, 0x92 | (2 << 9));
+            try state.writeRegister(.shader, 0x015, (3 << 20) | @as(u32, if (mip_filter == 0) 512 else 0));
+            try state.writeRegister(.shader, 0x016, (filters[1] << 20) | (filters[0] << 22) | (2 << 24) | (mip_filter << 26));
+            @memset(memory.data[0x2000..0x2400], 0xa7);
+            _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 2 });
+            const lod = std.math.clamp(if (level_zero or mip_filter == 0) @as(f32, 0) else requested_lod, 0, 3);
+            const linear = (if (lod <= 0) filters[1] else filters[0]) & 1 != 0;
+            const low: u32 = @intFromFloat(@floor(lod));
+            const high = @min(3, low + 1);
+            const blend = lod - @floor(lod);
+            for (0..16) |y| for (0..16) |x| {
+                const u = ((@as(f32, @floatFromInt(x)) + 0.5) * 4 + 0.37) / 64;
+                const v = (@as(f32, @floatFromInt(y)) + 0.87) / 64;
+                const a = anisoProbeSample(u, v, low, layer, linear);
+                const b = anisoProbeSample(u, v, high, layer, linear);
+                for (a, b, 0..) |ca, cb, channel| {
+                    const actual = memory.data[0x2000 + (y * 16 + x) * 4 + channel];
+                    if (@abs(@as(f32, @floatFromInt(actual)) - (ca * (1 - blend) + cb * blend)) > 2)
+                        return error.ExplicitLodAnisotropyMismatch;
+                }
+            };
+            cases += 1;
+        };
+        // Restore implicit sampling for the negative mixed-filter check below.
+        @memcpy(memory.data[0x400..][0..@sizeOf(@TypeOf(ps))], std.mem.asBytes(&ps));
         if (!std.mem.eql(u8, before, backing)) return error.AnisotropicSourceModified;
     }
     // Mixed point/linear anisotropy is deliberately outside this implementation.
@@ -3356,7 +3400,7 @@ fn guestAnisotropicProbe(allocator: std.mem.Allocator) !void {
     const packet: gpu.pm4.Packet = .{ .kind = .command, .header = command(gpu.pm4.draw_index_auto, 2), .opcode = gpu.pm4.draw_index_auto, .body = &.{ 3, 2 } };
     if (renderer.draw(&state, packet)) |_| return error.MixedAnisotropyAccepted else |err| if (err != error.GraphicsSamplerModeNotImplemented) return err;
     if (!std.mem.eql(u8, &before, memory.data[0x2000..0x2400])) return error.RejectedAnisotropyModifiedTarget;
-    std.debug.print("PASS {d} anisotropic full-frame checks against CPU filtering: 2/4/8/16x, point/bilinear XY, point/linear mips, LOD bias, magnification, both axes, 2D/array layers and source preservation\n", .{cases});
+    std.debug.print("PASS {d} sampler full-frame checks against CPU filtering: implicit anisotropy, explicit scalar LOD/LZ, mixed min/mag, 2D/array layers and source preservation\n", .{cases});
 }
 
 fn guestFanProbe(allocator: std.mem.Allocator) !void {
@@ -3659,7 +3703,7 @@ fn guestCompressedImageProbe(allocator: std.mem.Allocator, memory: *GraphicsMemo
     try state.writeRegister(.shader, 0x016, 0);
     const colors = [_]u16{ 0xf800, 0x07e0, 0x001f, 0x8410 };
     const decoded = [_][3]u8{ .{ 255, 0, 0 }, .{ 0, 255, 0 }, .{ 0, 0, 255 }, .{ 132, 130, 132 } };
-    for ([_]u16{ 169, 170, 171, 172, 173, 174 }) |format| {
+    for ([_]u16{ 169, 170, 171, 172, 173, 174, 181, 182 }) |format| {
         for ([_]gpu.resources.TileMode{ .linear, .standard_4kb }) |mode| {
             // Linear rows are deliberately not aligned to D3D12's upload pitch;
             // the tiled case matches Raiden's actual 128x128 BC3 resource.
@@ -3675,10 +3719,21 @@ fn guestCompressedImageProbe(allocator: std.mem.Allocator, memory: *GraphicsMemo
             const bytes: usize = if (format <= 170) 8 else 16;
             for (0..height / 4) |y| for (0..width / 4) |x| {
                 const block = blocks[(y * (width / 4) + x) * bytes ..][0..bytes];
-                const color = colors[(y % 2) * 2 + x % 2];
-                if (format == 171 or format == 172) @memset(block[0..8], 0x88);
-                if (format >= 173) block[0] = 128; // Alpha endpoint 0, selector 0.
-                std.mem.writeInt(u16, block[bytes - 8 ..][0..2], color, .little);
+                const color_index = (y % 2) * 2 + x % 2;
+                if (format >= 181) {
+                    // BC7 mode 6: equal RGBA endpoints, zero p-bits and indices.
+                    // Even channels make the independent expected color exact.
+                    const rgba = [_][4]u8{ .{ 252, 0, 0, 128 }, .{ 0, 252, 0, 128 }, .{ 0, 0, 252, 128 }, .{ 132, 130, 132, 128 } };
+                    var bits: u128 = 1 << 6;
+                    for (rgba[color_index], 0..) |channel, c| for (0..2) |endpoint| {
+                        bits |= @as(u128, channel >> 1) << @intCast(7 + c * 14 + endpoint * 7);
+                    };
+                    std.mem.writeInt(u128, block[0..16], bits, .little);
+                } else {
+                    if (format == 171 or format == 172) @memset(block[0..8], 0x88);
+                    if (format >= 173) block[0] = 128; // Alpha endpoint 0, selector 0.
+                    std.mem.writeInt(u16, block[bytes - 8 ..][0..2], colors[color_index], .little);
+                }
             };
             const backing = memory.data[0x10000..][0..@intCast(layout.required_source_bytes)];
             @memset(backing, 0xa7);
@@ -3693,6 +3748,9 @@ fn guestCompressedImageProbe(allocator: std.mem.Allocator, memory: *GraphicsMemo
                 const ty: usize = @intFromFloat((1 - (@as(f32, @floatFromInt(point[1])) + 0.5) / 37) * @as(f32, @floatFromInt(height)));
                 const rgb = decoded[((ty / 4) % 2) * 2 + (tx / 4) % 2];
                 var expected: [4]u8 = .{ rgb[0], rgb[1], rgb[2], if (format <= 170) 255 else if (format <= 172) 136 else 128 };
+                if (format >= 181) for (expected[0..3]) |*v| {
+                    if (v.* == 255) v.* = 252;
+                };
                 if (format % 2 == 0) for (expected[0..3]) |*v| {
                     const c = @as(f32, @floatFromInt(v.*)) / 255;
                     const linear = if (c <= 0.04045) c / 12.92 else std.math.pow(f32, (c + 0.055) / 1.055, 2.4);
@@ -3706,7 +3764,7 @@ fn guestCompressedImageProbe(allocator: std.mem.Allocator, memory: *GraphicsMemo
             }
         }
     }
-    std.debug.print("PASS 12 guest BC1/BC2/BC3 texture cases: tiled/linear blocks, native row pitch, alpha and sRGB decoding, source preservation\n", .{});
+    std.debug.print("PASS 16 guest BC1/BC2/BC3/BC7 texture cases: tiled/linear blocks, native row pitch, alpha and sRGB decoding, source preservation\n", .{});
 }
 
 fn guestPackedImageProbe(allocator: std.mem.Allocator, memory: *GraphicsMemory, state: *gpu.State, executor: *gpu.DcbExecutor, renderer: *d3d12.Renderer) !void {

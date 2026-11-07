@@ -118,7 +118,7 @@ pub const DrawResources = struct {
             if (offset == size) return @intCast(i);
         }
         if (self.buffers.items.len >= 64 or bytes_needed > 256 * 1024 * 1024 or
-            self.total + bytes_needed > 256 * 1024 * 1024)
+            self.total + bytes_needed > native.max_sampled_image_bytes)
         {
             std.debug.print("[d3d12 resource budget] buffer address=0x{x} bytes={d} total={d} buffers={d} images={d}\n", .{ address, bytes_needed, self.total, self.buffers.items.len, self.images.items.len });
             return error.GraphicsSnapshotBudgetExceeded;
@@ -254,6 +254,7 @@ pub const DrawResources = struct {
             169, 170 => 71,
             171, 172 => 74,
             173, 174 => 77,
+            181, 182 => 98,
             else => 0,
         };
         if (descriptor.base_array >= descriptor.depth_or_layers) return error.GraphicsTextureFormatOrMipNotImplemented;
@@ -265,7 +266,7 @@ pub const DrawResources = struct {
             3 => descriptor.image_type == .color_3d and descriptor.base_array == 0,
             else => unreachable,
         };
-        const compressed = format == 71 or format == 74 or format == 77;
+        const compressed = native.isBlockCompressedFormat(format);
         const mips = descriptor.viewMipLevels();
         const base_level = descriptor.viewBaseLevel();
         const view_width = std.math.divCeil(u32, descriptor.width, @as(u32, 1) << @intCast(base_level)) catch unreachable;
@@ -297,10 +298,19 @@ pub const DrawResources = struct {
         if (dimension == 3 and (sampler.minification_filter > 1 or
             sampler.minification_filter != sampler.magnification_filter or
             sampler.z_filter != sampler.minification_filter + 1)) return error.GraphicsSamplerModeNotImplemented;
-        const anisotropy = sampler.maximum_anisotropy != 0 and (sampler.minification_filter >= 2 or sampler.magnification_filter >= 2);
-        if (anisotropy and (sampler.minification_filter != sampler.magnification_filter or
+        // SAMPLE_L/LZ supplies a scalar LOD rather than a directional
+        // footprint. Keep the guest point/linear min/mag selection, but do
+        // not attach the implicit-derivative anisotropic tap expansion.
+        const scalar_lod = inst.opcode == .image_sample and
+            (inst.image_sample_flags.lod or inst.image_sample_flags.level_zero) and
+            !inst.image_sample_flags.derivative;
+        const anisotropy = !scalar_lod and sampler.maximum_anisotropy != 0 and (sampler.minification_filter >= 2 or sampler.magnification_filter >= 2);
+        // Bit 0 selects point/bilinear; bit 1 requests anisotropy. A regular
+        // bilinear magnifier and anisotropic bilinear minifier still share
+        // the same per-tap filter (the usual guest sampler configuration).
+        if (anisotropy and ((sampler.minification_filter & 1) != (sampler.magnification_filter & 1) or
             (dimension != 0 and dimension != 2) or resolver.bindings.stage != .pixel or sampler.unnormalized_coordinates or
-            @as(u16, @bitCast(inst.image_sample_flags)) != 0 or sampler.mip_filter == 0)) return error.GraphicsSamplerModeNotImplemented;
+            @as(u16, @bitCast(inst.image_sample_flags)) != 0)) return error.GraphicsSamplerModeNotImplemented;
         const unnormalized = sampler.unnormalized_coordinates;
         if (unnormalized and (mips != 1 or dimension != 0 or resolver.bindings.stage != .pixel or @as(u16, @bitCast(inst.image_sample_flags)) != 0 or
             sampler.mip_filter != 0 or sampler.minimum_lod != 0 or sampler.lod_bias != 0 or
@@ -309,7 +319,7 @@ pub const DrawResources = struct {
         const layout = if (!texture_layout) try gpu.SurfaceLayout.fromImage(descriptor) else null;
         if (layout) |single| {
             if (single.staging_bytes != expected_bytes) return error.GraphicsImageFootprintMismatch;
-            if (single.required_source_bytes > 256 * 1024 * 1024 or single.staging_bytes > 256 * 1024 * 1024) return error.GraphicsSnapshotBudgetExceeded;
+            if (single.required_source_bytes > native.max_sampled_image_bytes or single.staging_bytes > native.max_sampled_image_bytes) return error.GraphicsSnapshotBudgetExceeded;
             _ = try single.sourceRange(descriptor.address);
         }
         var retained: ?texture_cache.Lease = null;
@@ -322,7 +332,7 @@ pub const DrawResources = struct {
             const array_layers = if (dimension == 3) 1 else layers;
             var required: u64 = 0;
             for (0..mips) |level| required = @max(required, (try texture.subresource(@intCast(base_level + level), 0, array_layers)).required_source_bytes);
-            if (required > 256 * 1024 * 1024) return error.GraphicsSnapshotBudgetExceeded;
+            if (required > native.max_sampled_image_bytes) return error.GraphicsSnapshotBudgetExceeded;
             _ = try std.math.add(u64, descriptor.address, required);
             var backing = try staging.Lease.alloc(self.allocator, self.pool, @intCast(required));
             defer backing.deinit();
@@ -399,8 +409,10 @@ pub const DrawResources = struct {
             .address_u = if (unnormalized) try unnormalizedAddressMode(sampler.clamp_x) else try addressMode(sampler.clamp_x),
             .address_v = if (unnormalized) try unnormalizedAddressMode(sampler.clamp_y) else try addressMode(sampler.clamp_y),
             .address_w = if (unnormalized) 3 else try addressMode(sampler.clamp_z),
-            .min_lod = if (unnormalized) 0 else sampler.minimum_lod,
-            .max_lod = if (unnormalized) 0 else sampler.maximum_lod,
+            // No mip filtering selects the base level, independently of the
+            // descriptor's LOD range. Anisotropic XY taps are still valid.
+            .min_lod = if (unnormalized or sampler.mip_filter == 0) 0 else sampler.minimum_lod,
+            .max_lod = if (unnormalized or sampler.mip_filter == 0) 0 else sampler.maximum_lod,
             // Shader anisotropy adds bias while selecting its explicit LOD.
             // Keep the native sampler neutral to avoid applying it twice.
             .lod_bias = if (unnormalized or anisotropy) 0 else sampler.lod_bias,
@@ -412,7 +424,7 @@ pub const DrawResources = struct {
             },
         };
         const slot = matchingImage(self.images.items, image) orelse fresh: {
-            if (self.images.items.len >= 32 or self.total + pixels.len > 256 * 1024 * 1024) {
+            if (self.images.items.len >= 32 or self.total + pixels.len > native.max_sampled_image_bytes) {
                 std.debug.print("[d3d12 resource budget] image program=0x{x} pc=0x{x} bytes={d} total={d} buffers={d} images={d}\n", .{ resolver.bindings.program_address, inst.pc, pixels.len, self.total, self.buffers.items.len, self.images.items.len });
                 return error.GraphicsSnapshotBudgetExceeded;
             }
@@ -445,8 +457,8 @@ pub const DrawResources = struct {
                 3 => .three_d,
                 else => unreachable,
             },
-            .minimum_lod = sampler.minimum_lod,
-            .maximum_lod = sampler.maximum_lod,
+            .minimum_lod = image.min_lod,
+            .maximum_lod = image.max_lod,
             .texel_coordinates_extent = if (unnormalized) .{ view_width, view_height } else null,
             .anisotropy = if (anisotropy) .{
                 .extent = .{ view_width, view_height },
