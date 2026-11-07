@@ -1536,7 +1536,6 @@ const WindowsX64Machine = struct {
         // for diagnostics and the native-bridge tests.
         if (record.ExceptionCode == std.os.windows.EXCEPTION_ACCESS_VIOLATION and
             record.NumberParameters >= 2 and
-            record.ExceptionInformation[1] > 0 and
             record.ExceptionInformation[1] < lost_base_window and
             tryRedirectNullBaseRegister(context, record.ExceptionInformation[1]))
         {
@@ -2028,7 +2027,7 @@ const WindowsX64Machine = struct {
     /// register at the synthetic stub object and leave RIP unchanged so Windows
     /// re-executes the faulting instruction against real memory.
     fn tryRedirectNullBaseRegister(context: *std.os.windows.CONTEXT, memory_address: u64) bool {
-        if (memory_address == 0 or memory_address >= lost_base_window) return false;
+        if (memory_address >= lost_base_window) return false;
         // Same wild-Rip hazard as the null-object compare: opcode bytes must
         // come from host-readable code or the host aborts instead of the guest.
         if (!memory.isHostRangeReadable(context.Rip, 15)) return false;
@@ -2135,11 +2134,7 @@ const WindowsX64Machine = struct {
     /// 64-bit pointer MOVs). Covers MOV/MOVZX/MOVSX plus ALU forms that only
     /// read memory (`add/sub/cmp/and/or/xor/test reg, [null+disp]`).
     fn tryEmulateNullMemoryLoad(context: *std.os.windows.CONTEXT, memory_address: u64) bool {
-        // Unreal's optional object fields can live at offset zero. Once the
-        // instruction is recognized as a load, supplying zero/the synthetic
-        // stub is safer than terminating a worker on a deliberately optional
-        // null object. Unrecognized null reads still remain contained faults.
-        if (memory_address >= lost_base_window) return false;
+        if (memory_address == 0 or memory_address >= lost_base_window) return false;
         // Same wild-Rip hazard as the null-object compare above.
         if (!memory.isHostRangeReadable(context.Rip, 15)) return false;
         const code: [*]const u8 = @ptrFromInt(context.Rip);
