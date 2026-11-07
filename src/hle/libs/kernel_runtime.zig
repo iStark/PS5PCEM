@@ -1786,6 +1786,21 @@ fn loadStartModule(
     return loaded.handle;
 }
 
+var dlsym_database: ?*symbols.Database = null;
+
+/// Lets `sceKernelDlsym` answer names for HLE-backed system modules whose
+/// fixed firmware handles are not part of the title's mapped module list.
+pub fn attachSymbolDatabase(database: ?*symbols.Database) void {
+    dlsym_database = database;
+}
+
+fn dlsymHleExport(handle: i32, name: []const u8) ?u64 {
+    if (handle != 0x2001) return null;
+    const database = dlsym_database orelse return null;
+    const symbol = database.findByName(name, .function) orelse return null;
+    return symbol.address;
+}
+
 fn kernelDlsym(
     handle: i32,
     symbol_name: ?[*:0]const u8,
@@ -1800,6 +1815,16 @@ fn kernelDlsym(
     var name_buffer: [1024]u8 = undefined;
     const name = readGuestCString(@intFromPtr(raw_name), &name_buffer) orelse
         return KernelError.efault.raw();
+    // Real firmware gives libkernel the fixed handle 0x2001. Titles and
+    // compatibility libraries ask for it directly, but HLE modules are not
+    // mapped images, so they are absent from the title's module list.
+    if (handle == 0x2001) {
+        if (dlsymHleExport(handle, name)) |address| {
+            output.* = address;
+            return errno.ok;
+        }
+        return KernelError.esrch.raw();
+    }
     if (modules.findByHandle(handle) == null) return KernelError.esrch.raw();
     if (modules.resolveExport(handle, name)) |address| {
         output.* = address;
@@ -3066,4 +3091,17 @@ test "pthread semaphore post wakes a blocked waiter without losing its token" {
     try testing.expectEqual(probe.request.?.key, probe.wake_key);
     try testing.expectEqual(@as(usize, 1), probe.wake_count);
     try testing.expectEqual(@as(i32, 0), pthreadSemaphoreDestroy(&probe.sem));
+}
+
+test "fixed libkernel handle resolves HLE exports by name" {
+    var db = symbols.Database{};
+    defer db.deinit(std.testing.allocator);
+    try register(&db, std.testing.allocator);
+    attachSymbolDatabase(&db);
+    defer attachSymbolDatabase(null);
+
+    const address = dlsymHleExport(0x2001, "sceKernelDlsym") orelse return error.MissingHleExport;
+    try std.testing.expect(address != 0);
+    try std.testing.expect(dlsymHleExport(0x2001, "notAnHleExport") == null);
+    try std.testing.expect(dlsymHleExport(0x2002, "sceKernelDlsym") == null);
 }

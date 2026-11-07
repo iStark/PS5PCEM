@@ -197,6 +197,8 @@ pub const json2_exports = [_]symbols.Export{
     // Unity plug-in bootstrap instead of selecting that offline path.
     .{ .name = "_ZN3sce4Json12MemAllocatorC2Ev", .function = trace.wrap("_ZN3sce4Json12MemAllocatorC2Ev", &services.accept), .expect_id = "-hJRce8wn1U" },
     .{ .name = "_ZN3sce4Json14InitParameter2C1Ev", .function = trace.wrap("_ZN3sce4Json14InitParameter2C1Ev", &services.accept), .expect_id = "WSOuge5IsCg" },
+    .{ .name = "_ZN3sce4Json14InitParameter2C2Ev", .function = trace.wrap("_ZN3sce4Json14InitParameter2C2Ev", &services.accept), .expect_id = "GvGvswb0v34" },
+    .{ .name = "_ZN3sce4Json18InitParameterRtti216setAllocatorRttiEPNS0_14AllocParamRttiEPv", .function = trace.wrap("_ZN3sce4Json18InitParameterRtti216setAllocatorRttiEPNS0_14AllocParamRttiEPv", &services.accept), .expect_id = "W72B9ylU2JA" },
     .{ .name = "_ZN3sce4Json14InitParameter212setAllocatorEPNS0_12MemAllocatorEPv", .function = trace.wrap("_ZN3sce4Json14InitParameter212setAllocatorEPNS0_12MemAllocatorEPv", &services.accept), .expect_id = "I2QC8PYhJWY" },
     .{ .name = "_ZN3sce4Json14InitParameter217setFileBufferSizeEm", .function = trace.wrap("_ZN3sce4Json14InitParameter217setFileBufferSizeEm", &services.accept), .expect_id = "Eu95jmqn5Rw" },
     .{ .name = "_ZN3sce4Json11InitializerC1Ev", .function = trace.wrap("_ZN3sce4Json11InitializerC1Ev", &services.accept), .expect_id = "cK6bYHf-Q5E" },
@@ -250,18 +252,17 @@ pub const npgameintent_exports = [_]symbols.Export{
 
 pub const npmanager_exports = [_]symbols.Export{
     .{ .name = "sceNpNotifyPremiumFeature", .function = trace.wrap("sceNpNotifyPremiumFeature", &services.offline), .expect_id = "P6piso307SE" },
-    // Polling an empty callback queue is a successful no-op. Returning ENOSYS
-    // makes Unity's frontend treat normal offline polling as a service fault.
-    .{ .name = "sceNpCheckCallback", .function = trace.wrap("sceNpCheckCallback", &services.accept), .expect_id = "3Zl8BePTh9Y" },
+    // Polling the callback queue is always successful. Returning ENOSYS makes
+    // Unity's frontend treat normal offline polling as a service fault.
+    .{ .name = "sceNpCheckCallback", .function = trace.wrap("sceNpCheckCallback", &services.npCheckCallback), .expect_id = "3Zl8BePTh9Y" },
     .{ .name = "sceNpCreateRequest", .function = trace.wrap("sceNpCreateRequest", &services.npCreateRequest), .expect_id = "GpLQDNKICac" },
     .{ .name = "sceNpCheckPremium", .function = trace.wrap("sceNpCheckPremium", &services.offline), .expect_id = "O80NrhUOPGY" },
     .{ .name = "sceNpDeleteRequest", .function = trace.wrap("sceNpDeleteRequest", &services.npDeleteRequest), .expect_id = "S7QTn72PrDw" },
     .{ .name = "sceNpGetUserIdByAccountId", .function = trace.wrap("sceNpGetUserIdByAccountId", &services.offline), .expect_id = "VgYczPGB5ss" },
     .{ .name = "sceNpGetOnlineId", .function = trace.wrap("sceNpGetOnlineId", &services.npGetOnlineId), .expect_id = "XDncXQIJUSk" },
-    // Registration itself is local and succeeds on an offline console.  No
-    // callback is delivered until the NP state changes, which cannot happen in
-    // the emulator's stable offline profile.
-    .{ .name = "sceNpRegisterStateCallbackA", .function = trace.wrap("sceNpRegisterStateCallbackA", &services.accept), .expect_id = "qQJfO8HAiaY" },
+    // Registration itself is local and succeeds on an offline console. The
+    // next pump delivers the signed-in state already reported by sceNpGetState.
+    .{ .name = "sceNpRegisterStateCallbackA", .function = trace.wrap("sceNpRegisterStateCallbackA", &services.npRegisterStateCallback), .expect_id = "qQJfO8HAiaY" },
     .{ .name = "sceNpRegisterNpReachabilityStateCallback", .function = trace.wrap("sceNpRegisterNpReachabilityStateCallback", &services.accept), .expect_id = "hw5KNqAAels" },
     .{ .name = "sceNpCheckNpReachability", .function = trace.wrap("sceNpCheckNpReachability", &services.offline), .expect_id = "KfGZg2y73oM" },
     .{ .name = "sceNpHasSignedUp", .function = trace.wrap("sceNpHasSignedUp", &services.offline), .expect_id = "Oad3rvY-NJQ" },
@@ -626,6 +627,13 @@ pub const json2_extra_exports = [_]symbols.Export{
     .{ .name = "_ZNK3sce4Json5ValueixEm", .function = trace.wrap("_ZNK3sce4Json5ValueixEm", &json.valueSubscriptIndex), .expect_id = "XlWbvieLj2M" },
     .{ .name = "_ZN3sce4Json5Array9push_backERKNS0_5ValueE", .function = trace.wrap("_ZN3sce4Json5Array9push_backERKNS0_5ValueE", &json.arrayPushBack), .expect_id = "zQtLRTqceMY" },
     .{ .name = "_ZNK3sce4Json5Value10getBooleanEv", .function = trace.wrap("_ZNK3sce4Json5Value10getBooleanEv", &json.valueGetBoolean), .expect_id = "zTwZdI8AZ5Y" },
+    // Process-wide JSON diagnostic hooks. The emulator's JSON implementation
+    // never invokes them, but the CppWebApi bootstrap treats a refused setter
+    // as a fatal initializer failure and disables networking entirely.
+    .{ .name = "_ZN3sce4Json11Initializer27setGlobalNullAccessCallbackEPFRKNS0_5ValueENS0_9ValueTypeEPS3_PvES7_", .function = trace.wrap("_ZN3sce4Json11Initializer27setGlobalNullAccessCallbackEPFRKNS0_5ValueENS0_9ValueTypeEPS3_PvES7_", &services.accept), .expect_id = "+drDFyAS6u4" },
+    .{ .name = "_ZN3sce4Json11Initializer27setGlobalNullAccessCallBackEPFRKNS0_5ValueENS0_9ValueTypeEPS3_PvES7_", .function = trace.wrap("_ZN3sce4Json11Initializer27setGlobalNullAccessCallBackEPFRKNS0_5ValueENS0_9ValueTypeEPS3_PvES7_", &services.accept), .expect_id = "00oCq0RwSAY" },
+    .{ .name = "_ZN3sce4Json11Initializer28setGlobalSpecialFloatHandlerEPFKNS0_5ValueENS0_12FunctionTypeEdPS3_PvPbES6_", .function = trace.wrap("_ZN3sce4Json11Initializer28setGlobalSpecialFloatHandlerEPFKNS0_5ValueENS0_12FunctionTypeEdPS3_PvPbES6_", &services.accept), .expect_id = "i1393UBWu1U" },
+    .{ .name = "_ZN3sce4Json11Initializer28setGlobalTypeMismatchHandlerEPFRKNS0_5ValueENS0_9ValueTypeEPS3_S6_PvES7_", .function = trace.wrap("_ZN3sce4Json11Initializer28setGlobalTypeMismatchHandlerEPFRKNS0_5ValueENS0_9ValueTypeEPS3_S6_PvES7_", &services.accept), .expect_id = "tck9g-yOqPg" },
 };
 
 pub const npwebapi2_extra_exports = [_]symbols.Export{

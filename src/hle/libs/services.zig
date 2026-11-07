@@ -27,6 +27,7 @@ const trace = @import("../trace.zig");
 const errno = @import("../errno.zig");
 const symbols = @import("../symbols.zig");
 const kernel_memory = @import("kernel_memory.zig");
+const kernel_threading = @import("kernel_threading.zig");
 
 /// Status a service library returns when it has not been, and cannot be,
 /// brought up.
@@ -316,6 +317,76 @@ var np_requests: NpRequests = .{};
 var np_trophy_next_context = std.atomic.Value(i32).init(1);
 var np_trophy_next_handle = std.atomic.Value(i32).init(1);
 var np_webapi_next_push_handle = std.atomic.Value(i32).init(1);
+
+/// The offline account remains signed in, matching what `sceNpGetState`
+/// reports even when PSN itself is unreachable.
+pub const np_state_signed_in: u64 = 2;
+/// The console's initial local user, the only identity the offline profile models.
+pub const np_state_user_id: u64 = 1;
+
+/// NP state notification. Real firmware delivers the current NP state through
+/// the registered callback when the title pumps sceNpCheckCallback; a title
+/// that never hears back never finishes bringing its online services up. The
+/// one pending notification carries signed-in, then the pump goes quiet.
+var np_state_mutex: @import("memory").HostMutex = .{};
+var np_state_callback: u64 = 0;
+var np_state_userdata: u64 = 0;
+var np_state_pending: bool = false;
+var np_state_delivering: bool = false;
+var np_state_generation: u32 = 0;
+
+pub fn reset() void {
+    np_state_mutex.lock();
+    defer np_state_mutex.unlock();
+    np_state_callback = 0;
+    np_state_userdata = 0;
+    np_state_pending = false;
+    np_state_delivering = false;
+    np_state_generation +%= 1;
+}
+
+pub fn npRegisterStateCallback(callback: u64, userdata: u64, _: u64, _: u64, _: u64, _: u64) callconv(abi.guest) i32 {
+    np_state_mutex.lock();
+    defer np_state_mutex.unlock();
+    np_state_callback = callback;
+    np_state_userdata = userdata;
+    np_state_pending = callback != 0;
+    np_state_generation +%= 1;
+    return errno.ok;
+}
+
+pub fn npCheckCallback(_: u64, _: u64, _: u64, _: u64, _: u64, _: u64) callconv(abi.guest) i32 {
+    np_state_mutex.lock();
+    const callback = np_state_callback;
+    const userdata = np_state_userdata;
+    const generation = np_state_generation;
+    if (!np_state_pending or callback == 0 or np_state_delivering) {
+        np_state_mutex.unlock();
+        return errno.ok;
+    }
+    np_state_delivering = true;
+    np_state_mutex.unlock();
+
+    // The pump runs on the title's own polling thread, which is exactly where
+    // firmware invokes the callback. A failed delivery must not fail the pump
+    // itself; the title would stop polling. The notification also stays
+    // pending so the next pump can retry once the guest thread is available.
+    _ = kernel_threading.callGuestCurrent(callback, &.{ np_state_user_id, np_state_signed_in, userdata }) catch |err| {
+        std.debug.print("[np] state callback 0x{x} failed: {s}\n", .{ callback, @errorName(err) });
+        np_state_mutex.lock();
+        np_state_delivering = false;
+        np_state_mutex.unlock();
+        return errno.ok;
+    };
+
+    np_state_mutex.lock();
+    defer np_state_mutex.unlock();
+    np_state_delivering = false;
+    // A registration that happened while the callback ran owns the pending
+    // notification; do not let the completed delivery clear it.
+    if (np_state_generation == generation) np_state_pending = false;
+    return errno.ok;
+}
 
 /// NP requests are local bookkeeping objects. Creating one does not contact
 /// PSN, so an offline console still returns a usable request identifier.
@@ -670,6 +741,23 @@ test "IPMI imports resolve and refuse client creation without fabricating an obj
     try testing.expectEqualSlices(u8, &([_]u8{0xa5} ** 256), &config);
 }
 
+test "offline NP state callback retries a failed delivery" {
+    reset();
+    defer reset();
+    try testing.expectEqual(errno.ok, npRegisterStateCallback(0x1234, 0x5678, 0, 0, 0, 0));
+    // No executor is attached in a unit test, so delivery fails. The pending
+    // notification must survive so a later pump can try again.
+    try testing.expectEqual(errno.ok, npCheckCallback(0, 0, 0, 0, 0, 0));
+    try testing.expect(np_state_pending);
+    try testing.expect(!np_state_delivering);
+    try testing.expectEqual(@as(u64, 0x1234), np_state_callback);
+    try testing.expectEqual(@as(u64, 0x5678), np_state_userdata);
+    // Clearing the registration cancels the notification.
+    try testing.expectEqual(errno.ok, npRegisterStateCallback(0, 0x5678, 0, 0, 0, 0));
+    try testing.expect(!np_state_pending);
+    try testing.expectEqual(errno.ok, npCheckCallback(0, 0, 0, 0, 0, 0));
+}
+
 test "offline NP profile exposes a stable online id" {
     var online_id: [20]u8 = @splat(0xa5);
     try testing.expectEqual(errno.ok, npGetOnlineId(0x1000_0000, &online_id));
@@ -837,4 +925,15 @@ test "installed content is answered as being on the drive" {
         discMapIsRequestOnHDD("/app0/data.pak", 0, 4096, null),
     );
     try testing.expectEqual(disc_map_error_invalid_argument, discMapIsRequestOnHDD(null, 0, 0, &on_drive));
+}
+
+test "JSON2 initializer diagnostic hooks accept registration" {
+    var db = symbols.Database{};
+    defer db.deinit(testing.allocator);
+    try register(&db, testing.allocator);
+    inline for (&.{ "+drDFyAS6u4", "00oCq0RwSAY", "i1393UBWu1U", "tck9g-yOqPg", "GvGvswb0v34", "W72B9ylU2JA" }) |id| {
+        const symbol = db.findById(id, .function) orelse return error.MissingJson2Hook;
+        const hook: *const @TypeOf(accept) = @ptrFromInt(symbol.address);
+        try testing.expectEqual(errno.ok, hook(0, 0, 0, 0, 0, 0));
+    }
 }

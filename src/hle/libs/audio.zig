@@ -1645,6 +1645,25 @@ fn ngs2FindVoice(handle: u64) ?*Ngs2Voice {
     return null;
 }
 
+/// Validates the system handle for a guest-requested exclusive section.
+///
+/// Every NGS2 entry point already serializes against `ngs2_mutex`, so holding
+/// that host mutex until the guest calls SystemUnlock would deadlock the first
+/// nested NGS2 call. The emulator therefore acknowledges the section without
+/// changing locking behavior; each call inside it remains individually
+/// serialized.
+fn ngs2SystemLock(handle: u64) callconv(abi.guest) i32 {
+    ngs2_mutex.lock();
+    defer ngs2_mutex.unlock();
+    return if (ngs2FindSystem(handle) != null) errno.ok else errno.KernelError.einval.raw();
+}
+
+fn ngs2SystemUnlock(handle: u64) callconv(abi.guest) i32 {
+    ngs2_mutex.lock();
+    defer ngs2_mutex.unlock();
+    return if (ngs2FindSystem(handle) != null) errno.ok else errno.KernelError.einval.raw();
+}
+
 fn ngs2FreeVoiceWaveform(voice: *Ngs2Voice) void {
     if (voice.waveform_cache_index) |raw_index| {
         const index: usize = raw_index;
@@ -2803,6 +2822,21 @@ const ngs2_exports = [_]symbols.Export{
     .{ .name = "sceNgs2GeomResetSourceParam", .function = trace.wrap("sceNgs2GeomResetSourceParam", &ngs2GeomResetSourceParam), .expect_id = "0lbbayqDNoE" },
     .{ .name = "sceNgs2GeomCalcListener", .function = trace.wrap("sceNgs2GeomCalcListener", &ngs2GeomCalcListener), .expect_id = "1WsleK-MTkE" },
     .{ .name = "sceNgs2GeomApply", .function = trace.wrap("sceNgs2GeomApply", &ngs2GeomApply), .expect_id = "eF8yRCC6W64" },
+    .{ .name = "sceNgs2GetWaveformFrameInfo", .function = trace.wrap("sceNgs2GetWaveformFrameInfo", &services.absent), .expect_id = "ekGJmmoc8j4" },
+    .{ .name = "sceNgs2SystemLock", .function = trace.wrap("sceNgs2SystemLock", &ngs2SystemLock), .expect_id = "gThZqM5PYlQ" },
+    .{ .name = "sceNgs2SystemUnlock", .function = trace.wrap("sceNgs2SystemUnlock", &ngs2SystemUnlock), .expect_id = "JXRC5n0RQls" },
+};
+
+// libSceTextToSpeech2 -------------------------------------------------------
+// Speech synthesis has no host backend; every entry reports the service
+// absent so titles link and continue without spoken output.
+const tts2_exports = [_]symbols.Export{
+    .{ .name = "sceTextToSpeech2Initialize", .function = trace.wrap("sceTextToSpeech2Initialize", &services.absent), .expect_id = "UOjiprYwVNw" },
+    .{ .name = "sceTextToSpeech2Terminate", .function = trace.wrap("sceTextToSpeech2Terminate", &services.absent), .expect_id = "SoWHuVW0gpU" },
+    .{ .name = "sceTextToSpeech2Open", .function = trace.wrap("sceTextToSpeech2Open", &services.absent), .expect_id = "X0HZNbSiqyg" },
+    .{ .name = "sceTextToSpeech2Close", .function = trace.wrap("sceTextToSpeech2Close", &services.absent), .expect_id = "t4e879M-cSw" },
+    .{ .name = "sceTextToSpeech2Speak", .function = trace.wrap("sceTextToSpeech2Speak", &services.absent), .expect_id = "8ntsRd07EQA" },
+    .{ .name = "sceTextToSpeech2GetSpeechStatus", .function = trace.wrap("sceTextToSpeech2GetSpeechStatus", &services.absent), .expect_id = "08JSg9p6bgQ" },
 };
 
 // libSceAudiodec ---------------------------------------------------------
@@ -4081,6 +4115,7 @@ pub fn register(db: *symbols.Database, gpa: std.mem.Allocator) symbols.Error!voi
         .{ .lib = "libSceAudiodec", .mod = "libSceAudiodec", .exports = &audiodec_exports },
         .{ .lib = "libSceAcm", .mod = "libSceAcm", .exports = &acm_exports },
         .{ .lib = "libSceNgs2", .mod = "libSceNgs2", .exports = &ngs2_exports },
+        .{ .lib = "libSceTextToSpeech2", .mod = "libSceTextToSpeech2", .exports = &tts2_exports },
         .{ .lib = "libSceAjm", .mod = "libSceAjm", .exports = &ajm_exports },
     };
 
@@ -4891,6 +4926,16 @@ test "audio libraries register the title import surface" {
     try std.testing.expect(db.findById("aII9h5nli9U", .function) != null);
     try std.testing.expect(db.findById("gatEUKG+Ea4", .function) != null);
     try std.testing.expect(db.findById("39WxhR-ePew", .function) != null);
+    try std.testing.expect(db.findById("ekGJmmoc8j4", .function) != null);
+    try std.testing.expect(db.findById("gThZqM5PYlQ", .function) != null);
+    try std.testing.expect(db.findById("JXRC5n0RQls", .function) != null);
+    try std.testing.expect(db.findById("UOjiprYwVNw", .function) != null);
+    try std.testing.expect(db.findById("08JSg9p6bgQ", .function) != null);
+}
+
+test "NGS2 system lock rejects unknown handles" {
+    try std.testing.expectEqual(errno.KernelError.einval.raw(), ngs2SystemLock(0x4e47_ffff));
+    try std.testing.expectEqual(errno.KernelError.einval.raw(), ngs2SystemUnlock(0x4e47_ffff));
 }
 
 test "AudioOut2 decodes formats and mixes ports to stereo correctly" {
