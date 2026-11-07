@@ -5811,6 +5811,14 @@ const Builder = struct {
         return self.vector2_type;
     }
 
+    fn ensureFloatVec3(self: *Builder) Error!u32 {
+        if (self.vector3_type == 0) {
+            self.vector3_type = self.id();
+            try self.emit(&self.declarations, 23, &.{ self.vector3_type, self.float_type, 3 }); // OpTypeVector
+        }
+        return self.vector3_type;
+    }
+
     fn ensureSignedVec2(self: *Builder) Error!u32 {
         if (self.vector2_signed_type == 0) {
             self.vector2_signed_type = self.id();
@@ -7399,8 +7407,10 @@ const Builder = struct {
         const biased_lod = inst.image_sample_flags.bias;
         const compare = inst.image_sample_flags.compare;
         const one_dimensional = inst.image_dimension == .dim_1d;
+        const one_dimensional_array = inst.image_dimension == .dim_1d_array;
         const requested_dimension: SampledImageDimension = switch (inst.image_dimension) {
             .dim_1d, .dim_2d => .two_d,
+            .dim_1d_array => .two_d_array,
             .dim_3d => .three_d,
             // GFX10 DIM=3 is Cube. The historical enum name predates the
             // sampled-image implementation and is retained for ABI stability.
@@ -7431,6 +7441,8 @@ const Builder = struct {
         }
         const instruction_coordinate_components: u8 = if (one_dimensional)
             1
+        else if (one_dimensional_array)
+            2
         else if (requested_dimension == .two_d)
             2
         else
@@ -7466,7 +7478,13 @@ const Builder = struct {
         var coordinates = self.id();
         if (one_dimensional) {
             const coordinate_y = try self.constant(.float32, @bitCast(@as(f32, 0.5)));
-            try self.emit(&self.body, 80, &.{ self.vector2_type, coordinates, raw_x, coordinate_y });
+            try self.emit(&self.body, 80, &.{ try self.ensureFloatVec2(), coordinates, raw_x, coordinate_y });
+        } else if (one_dimensional_array) {
+            // A 1D array samples the same height-one 2D view, with the array
+            // index carried in the Z coordinate of a 2D-array image.
+            const coordinate_y = try self.constant(.float32, @bitCast(@as(f32, 0.5)));
+            const layer = try self.source(try imageAddressOperand(inst, coordinate_base + 1), .float32);
+            try self.emit(&self.body, 80, &.{ try self.ensureFloatVec3(), coordinates, raw_x, coordinate_y, layer });
         } else {
             const raw_y = try self.source(try imageAddressOperand(inst, coordinate_base + 1), .float32);
             var coordinate_x, var coordinate_y = try self.sampleCoordinates(raw_x, raw_y);
@@ -7479,10 +7497,10 @@ const Builder = struct {
                 if (image_dimension == .cube) {
                     coordinates = try self.cubeSampleCoordinates(coordinate_x, coordinate_y, coordinate_z, true);
                 } else {
-                    try self.emit(&self.body, 80, &.{ self.vector3_type, coordinates, coordinate_x, coordinate_y, coordinate_z });
+                    try self.emit(&self.body, 80, &.{ try self.ensureFloatVec3(), coordinates, coordinate_x, coordinate_y, coordinate_z });
                 }
             } else {
-                try self.emit(&self.body, 80, &.{ self.vector2_type, coordinates, coordinate_x, coordinate_y });
+                try self.emit(&self.body, 80, &.{ try self.ensureFloatVec2(), coordinates, coordinate_x, coordinate_y });
             }
         }
         const sampled_image = try self.loadSampledImage(binding, inst);

@@ -787,6 +787,11 @@ fn run(init: std.process.Init) !bool {
         allocator,
         "PS5_PAD_DIAGNOSTICS",
     ) catch false);
+    if (init.minimal.environ.getAlloc(allocator, "PS5_INPUT_SCRIPT")) |text| {
+        defer allocator.free(text);
+        const events = runtime.firmware.libs.pad.setInputScript(text);
+        if (events != 0) try out.print("  Input script {d} events\n", .{events});
+    } else |_| {}
     var saves = openSaveDataHome(io, title_identifier) catch null;
     defer if (saves) |*directory| directory.close(io);
     defer runtime.firmware.filesystem.unmountSaveData();

@@ -450,9 +450,12 @@ pub const Protection = packed struct(u3) {
 
     fn host(self: Protection) std.process.MemoryProtection {
         // Win32 has no write-only page mode. Promoting it to read/write also
-        // matches the effective x86-64 permission seen by guest code.
+        // matches the effective x86-64 permission seen by guest code. Code
+        // pages also need host read permission: instruction fetch works from
+        // execute-only mappings, but the guest fault handler must be able to
+        // inspect opcode bytes without taking a nested host fault.
         return .{
-            .read = self.read or self.write,
+            .read = self.read or self.write or self.execute,
             .write = self.write,
             .execute = self.execute,
         };

@@ -1099,7 +1099,7 @@ fn decodeDstSelect(word: u32) [4]u8 {
 
 fn isValidUnifiedFormat(value: u16) bool {
     return switch (value) {
-        1...30, 36, 43...45, 48...77, 128...154, 169...182 => true,
+        1...30, 36, 43...45, 48...77, 128...154, 161, 169...182 => true,
         else => false,
     };
 }

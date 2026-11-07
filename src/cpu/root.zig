@@ -1536,7 +1536,6 @@ const WindowsX64Machine = struct {
         // for diagnostics and the native-bridge tests.
         if (record.ExceptionCode == std.os.windows.EXCEPTION_ACCESS_VIOLATION and
             record.NumberParameters >= 2 and
-            record.ExceptionInformation[1] > 0 and
             record.ExceptionInformation[1] < lost_base_window and
             tryRedirectNullBaseRegister(context, record.ExceptionInformation[1]))
         {
@@ -2028,7 +2027,7 @@ const WindowsX64Machine = struct {
     /// register at the synthetic stub object and leave RIP unchanged so Windows
     /// re-executes the faulting instruction against real memory.
     fn tryRedirectNullBaseRegister(context: *std.os.windows.CONTEXT, memory_address: u64) bool {
-        if (memory_address == 0 or memory_address >= lost_base_window) return false;
+        if (memory_address >= lost_base_window) return false;
         // Same wild-Rip hazard as the null-object compare: opcode bytes must
         // come from host-readable code or the host aborts instead of the guest.
         if (!memory.isHostRangeReadable(context.Rip, 15)) return false;
@@ -3063,6 +3062,10 @@ const WindowsX64Machine = struct {
     /// Discards scalar and vector stores into the first page and steps past the instruction.
     fn tryEmulateNullMemoryStore(context: *std.os.windows.CONTEXT, memory_address: u64) bool {
         if (memory_address >= lost_base_window) return false;
+        // The guest may fault while its instruction pointer is already
+        // unmapped. Reading the would-be ignored store would then turn a
+        // recoverable guest fault into a host crash inside this handler.
+        if (!memory.isHostRangeReadable(context.Rip, 15)) return false;
         const code: [*]const u8 = @ptrFromInt(context.Rip);
         // C5 xx 11 /r and C5 xx 7F /r are the two-byte-VEX store forms of
         // VMOVUPS/VMOVUPD/VMOVSS/VMOVSD and VMOVDQA/VMOVDQU. Unreal uses them
