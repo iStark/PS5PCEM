@@ -65,17 +65,25 @@ fn alignUp(value: u32, alignment: u32) u32 {
 }
 
 fn playbackClockNs() u64 {
-    if (comptime builtin.os.tag != .windows) return 0;
-    var counter: std.os.windows.LARGE_INTEGER = 0;
-    var frequency: std.os.windows.LARGE_INTEGER = 0;
-    if (!std.os.windows.ntdll.RtlQueryPerformanceCounter(&counter).toBool() or
-        !std.os.windows.ntdll.RtlQueryPerformanceFrequency(&frequency).toBool() or
-        counter < 0 or frequency <= 0)
-    {
-        return 0;
+    if (comptime builtin.os.tag == .windows) {
+        var counter: std.os.windows.LARGE_INTEGER = 0;
+        var frequency: std.os.windows.LARGE_INTEGER = 0;
+        if (!std.os.windows.ntdll.RtlQueryPerformanceCounter(&counter).toBool() or
+            !std.os.windows.ntdll.RtlQueryPerformanceFrequency(&frequency).toBool() or
+            counter < 0 or frequency <= 0)
+        {
+            return 0;
+        }
+        const scaled = @as(u128, @intCast(counter)) * std.time.ns_per_s;
+        return @intCast(scaled / @as(u128, @intCast(frequency)));
     }
-    const scaled = @as(u128, @intCast(counter)) * std.time.ns_per_s;
-    return @intCast(scaled / @as(u128, @intCast(frequency)));
+    if (comptime builtin.os.tag == .linux) {
+        var now: std.os.linux.timespec = undefined;
+        if (std.os.linux.clock_gettime(.MONOTONIC, &now) != 0) return 0;
+        const seconds = @as(u64, @intCast(now.sec)) * std.time.ns_per_s;
+        return seconds + @as(u64, @intCast(now.nsec));
+    }
+    return 0;
 }
 
 const GuestAllocation = struct {
