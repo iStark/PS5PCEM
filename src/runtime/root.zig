@@ -91,6 +91,7 @@ pub const Runtime = struct {
         }
         try hle.registerAll(&self.database, allocator);
         hle.libs.kernel_runtime.attachSymbolDatabase(&self.database);
+        errdefer hle.libs.kernel_runtime.attachSymbolDatabase(null);
         hle.libs.audio.reset();
         hle.libs.font.reset();
         hle.libs.share.reset();
@@ -150,6 +151,7 @@ pub const Runtime = struct {
         hle.libs.pad.reset();
         hle.libs.kernel_runtime.attachProcessParam(0);
         hle.libs.kernel_runtime.attachIo(null);
+        hle.libs.kernel_runtime.attachSymbolDatabase(null);
         self.database.deinit(allocator);
         self.database = .{};
         self.guest_exports.deinit(allocator);

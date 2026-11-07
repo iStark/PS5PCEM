@@ -34,3 +34,32 @@ no guest faults and no NP callback failures.
 Verified on Linux with Vulkan only. Gameplay, audio, input, online services,
 frame pacing and memory stability beyond the short run remain untested. No
 Windows or D3D12 result is implied.
+
+## Integration review — November 7, 2026
+
+PRs [#14](https://github.com/iStark/PS5PCEM/pull/14) and
+[#15](https://github.com/iStark/PS5PCEM/pull/15) by
+[kleinergoo7](https://github.com/kleinergoo7) were reviewed together against
+current `main`, preserving all six contributor commits. The second PR depends
+on the first; its driver-routing exception applies only to `PPSA02195` and
+retains the existing Demon's Souls exception.
+
+Integration review added two corrections to the fixed libkernel handle lookup:
+scope symbol resolution to the `libkernel` module (including its POSIX/Unity
+libraries), and detach the database before Runtime teardown frees it. Regression
+coverage checks same-name foreign exports, foreign-only names, detached lookup,
+and NP callback arguments, recursive polling, and re-registration from within
+the callback.
+
+Windows validation with Zig 0.16.0, ReleaseFast:
+
+- `PS5_INPUT_MODE=scripted zig build test-hle test-runtime`: **756/756 passed**
+  (740 HLE and 16 Runtime). Scripted input excludes physical-controller state
+  from neutral-pad assertions.
+- `zig build build-game-run -Doptimize=ReleaseFast -j2`: **15/15 build steps
+  succeeded**, and the standard `zig-out/bin/game-run.exe` was updated.
+
+These are host-side integration checks, not a new Trackmania game run. The
+Linux/Vulkan render evidence above comes from the contributor. Missing services
+such as speech synthesis still report absence; these PRs do not implement PSN
+or establish gameplay compatibility.

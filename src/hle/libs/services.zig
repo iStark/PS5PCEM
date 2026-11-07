@@ -758,6 +758,57 @@ test "offline NP state callback retries a failed delivery" {
     try testing.expectEqual(errno.ok, npCheckCallback(0, 0, 0, 0, 0, 0));
 }
 
+test "offline NP callback preserves its ABI and reentrant registration" {
+    const Probe = struct {
+        calls: usize = 0,
+        last_call: ?kernel_threading.GuestCall = null,
+
+        fn start(_: ?*anyopaque, _: kernel_threading.StartRequest) kernel_threading.BackendError!void {
+            return error.StartFailed;
+        }
+
+        fn call(raw: ?*anyopaque, request: kernel_threading.GuestCall) kernel_threading.BackendError!u64 {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            self.last_call = request;
+            if (self.calls == 1) {
+                // Guest callbacks can replace their registration and pump
+                // recursively. Neither may lose or duplicate the new event.
+                _ = npRegisterStateCallback(0x5678, 0xabcd, 0, 0, 0, 0);
+                _ = npCheckCallback(0, 0, 0, 0, 0, 0);
+            }
+            return 0;
+        }
+    };
+    var space = try @import("memory").AddressSpace.init(testing.allocator);
+    defer space.deinit();
+    var registry = @import("loader").TlsRegistry{};
+    defer registry.deinit(testing.allocator);
+    var manager = kernel_threading.Manager{};
+    manager.init(testing.allocator, &space, &registry);
+    defer manager.deinit();
+    var probe = Probe{};
+    manager.setBackend(.{ .context = &probe, .start_fn = Probe.start, .call_fn = Probe.call });
+    kernel_threading.attachManager(&manager);
+    defer kernel_threading.attachManager(null);
+    reset();
+    defer reset();
+
+    try testing.expectEqual(errno.ok, npRegisterStateCallback(0x1234, 0x9876, 0, 0, 0, 0));
+    try testing.expectEqual(errno.ok, npCheckCallback(0, 0, 0, 0, 0, 0));
+    try testing.expectEqual(@as(usize, 1), probe.calls);
+    try testing.expectEqual(@as(u64, 0x1234), probe.last_call.?.entry_point);
+    try testing.expectEqual(@as(u8, 3), probe.last_call.?.argument_count);
+    try testing.expectEqualSlices(u64, &.{ 1, 2, 0x9876 }, probe.last_call.?.arguments[0..3]);
+
+    try testing.expectEqual(errno.ok, npCheckCallback(0, 0, 0, 0, 0, 0));
+    try testing.expectEqual(@as(usize, 2), probe.calls);
+    try testing.expectEqual(@as(u64, 0x5678), probe.last_call.?.entry_point);
+    try testing.expectEqualSlices(u64, &.{ 1, 2, 0xabcd }, probe.last_call.?.arguments[0..3]);
+    try testing.expectEqual(errno.ok, npCheckCallback(0, 0, 0, 0, 0, 0));
+    try testing.expectEqual(@as(usize, 2), probe.calls);
+}
+
 test "offline NP profile exposes a stable online id" {
     var online_id: [20]u8 = @splat(0xa5);
     try testing.expectEqual(errno.ok, npGetOnlineId(0x1000_0000, &online_id));

@@ -1797,8 +1797,16 @@ pub fn attachSymbolDatabase(database: ?*symbols.Database) void {
 fn dlsymHleExport(handle: i32, name: []const u8) ?u64 {
     if (handle != 0x2001) return null;
     const database = dlsym_database orelse return null;
-    const symbol = database.findByName(name, .function) orelse return null;
-    return symbol.address;
+    const id = @import("../nid.zig").fromName(name);
+    // The firmware handle names one module, not the whole HLE database.
+    // libkernel also owns POSIX/Unity libraries, so filter by module rather
+    // than by library and keep searching past same-name foreign exports.
+    for (database.symbols.items) |symbol| {
+        if (symbol.key.type == .function and
+            std.mem.eql(u8, symbol.key.module.name, module.name) and
+            std.mem.eql(u8, &symbol.key.id, &id)) return symbol.address;
+    }
+    return null;
 }
 
 fn kernelDlsym(
@@ -3096,12 +3104,25 @@ test "pthread semaphore post wakes a blocked waiter without losing its token" {
 test "fixed libkernel handle resolves HLE exports by name" {
     var db = symbols.Database{};
     defer db.deinit(std.testing.allocator);
+    // Foreign modules may publish an identical name before libkernel does.
+    try db.add(std.testing.allocator, .{ .name = "foreign" }, .{ .name = "foreign" }, .{
+        .name = "sceKernelDlsym",
+        .function = abi.erase(&kernelUnsupported),
+    });
+    try db.add(std.testing.allocator, .{ .name = "foreign" }, .{ .name = "foreign" }, .{
+        .name = "foreignOnlyExport",
+        .function = abi.erase(&kernelUnsupported),
+    });
     try register(&db, std.testing.allocator);
     attachSymbolDatabase(&db);
     defer attachSymbolDatabase(null);
 
     const address = dlsymHleExport(0x2001, "sceKernelDlsym") orelse return error.MissingHleExport;
-    try std.testing.expect(address != 0);
+    try std.testing.expectEqual(@intFromPtr(trace.wrap("sceKernelDlsym", &kernelDlsym)), address);
+    try std.testing.expect(dlsymHleExport(0x2001, "sched_yield") != null);
+    try std.testing.expect(dlsymHleExport(0x2001, "foreignOnlyExport") == null);
     try std.testing.expect(dlsymHleExport(0x2001, "notAnHleExport") == null);
     try std.testing.expect(dlsymHleExport(0x2002, "sceKernelDlsym") == null);
+    attachSymbolDatabase(null);
+    try std.testing.expect(dlsymHleExport(0x2001, "sceKernelDlsym") == null);
 }
