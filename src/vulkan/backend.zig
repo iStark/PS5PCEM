@@ -16539,6 +16539,13 @@ pub const Renderer = struct {
     ) Error!vk.Pipeline {
         // Pipeline workers may overlap the renderer. Temporary generated
         // stages must not touch a caller-provided single-threaded allocator.
+        if (vertex_words.len == 0 or fragment_words.len == 0) {
+            std.debug.print(
+                "[vulkan dcb] refusing graphics pipeline with empty shader stages vertex={d} fragment={d}\n",
+                .{ vertex_words.len, fragment_words.len },
+            );
+            return Error.UnsupportedGraphicsState;
+        }
         const shader_allocator = std.heap.page_allocator;
         const vertex = try self.createShader(vertex_words);
         defer self.device_functions.destroy_shader_module(self.device, vertex, null);
@@ -38402,6 +38409,9 @@ pub const Renderer = struct {
     }
 
     fn createShader(self: *Renderer, words: []const u32) Error!vk.ShaderModule {
+        // An empty program has no `main`. The vendor driver crashes inside
+        // vkCreateGraphicsPipelines instead of returning a validation error.
+        if (words.len == 0) return Error.ShaderModuleCreationFailed;
         const create_info = vk.ShaderModuleCreateInfo{
             .code_size = words.len * @sizeOf(u32),
             .code = words.ptr,
