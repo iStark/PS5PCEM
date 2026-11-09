@@ -220,11 +220,16 @@ pub const DrawResources = struct {
         errdefer std.debug.print("[d3d12 image operation] program=0x{x} pc=0x{x} op={s} dimension={s} flags={any} r128={any} resource=s{d} sampler=s{d}\n", .{
             resolver.bindings.program_address, inst.pc, @tagName(inst.opcode), @tagName(inst.image_dimension), inst.image_sample_flags, inst.image_r128, inst.src1.reg, inst.src2.reg,
         });
-        if ((inst.opcode != .image_sample and inst.opcode != .image_gather4) or inst.image_sample_flags.compare or inst.image_r128)
+        // A texel fetch (IMAGE_LOAD) reads through T# alone; SAMPLE and
+        // GATHER4 additionally filter through S#. The translated fetch lowers
+        // to OpImageFetch, which never consults the sampler, so a zeroed
+        // descriptor supplies the point view exactly as the Vulkan backend
+        // does for its fetch path.
+        const image_fetch = inst.opcode == .image_load or inst.opcode == .image_load_mip;
+        if ((!image_fetch and inst.opcode != .image_sample and inst.opcode != .image_gather4) or inst.image_sample_flags.compare or inst.image_r128)
             return error.GraphicsImageOperationNotImplemented;
         var words: [8]u32 = undefined;
-        var sampler_words: [4]u32 = undefined;
-        if (!try resolver.words(inst.src1.reg, inst.pc, &words) or !try resolver.words(inst.src2.reg, inst.pc, &sampler_words))
+        if (!try resolver.words(inst.src1.reg, inst.pc, &words))
             return error.DynamicGraphicsImageNotImplemented;
         const descriptor = try gpu.resources.decodeImageDescriptor(&words);
         errdefer std.debug.print("[d3d12 image] program=0x{x} pc=0x{x} descriptor={any}\n", .{ resolver.bindings.program_address, inst.pc, descriptor });
@@ -236,20 +241,42 @@ pub const DrawResources = struct {
             .dim_3d => 3,
             else => return error.GraphicsImageOperationNotImplemented,
         };
-        const sampler = try gpu.resources.decodeSamplerDescriptor(&sampler_words);
-        errdefer std.debug.print("[d3d12 sampler] program=0x{x} pc=0x{x} words={x},{x},{x},{x} descriptor={any}\n", .{
-            resolver.bindings.program_address, inst.pc, sampler_words[0], sampler_words[1], sampler_words[2], sampler_words[3], sampler,
-        });
+        var sampler: gpu.resources.SamplerDescriptor = std.mem.zeroes(gpu.resources.SamplerDescriptor);
+        if (!image_fetch) {
+            var sampler_words: [4]u32 = undefined;
+            if (!try resolver.words(inst.src2.reg, inst.pc, &sampler_words))
+                return error.DynamicGraphicsImageNotImplemented;
+            sampler = try gpu.resources.decodeSamplerDescriptor(&sampler_words);
+            errdefer std.debug.print("[d3d12 sampler] program=0x{x} pc=0x{x} words={x},{x},{x},{x} descriptor={any}\n", .{
+                resolver.bindings.program_address, inst.pc, sampler_words[0], sampler_words[1], sampler_words[2], sampler_words[3], sampler,
+            });
+        }
         const format: u32 = switch (descriptor.unified_format) {
             1 => 61, // R8_UNORM
+            2 => 63, // R8_SNORM
             7 => 56, // R16_UNORM
+            8 => 58, // R16_SNORM
             13 => 54, // R16_FLOAT
             14 => 49, // R8G8_UNORM
+            15 => 51, // R8G8_SNORM
             22 => 41, // R32_FLOAT, also used for depth sampling/gather.
+            23 => 35, // R16G16_UNORM
+            24 => 37, // R16G16_SNORM
             29 => 34, // R16G16_FLOAT
+            36 => 26, // R11G11B10_FLOAT
             50 => 24, // R10G10B10A2_UNORM
-            56 => 28,
+            56 => 28, // R8G8B8A8_UNORM
+            57 => 31, // R8G8B8A8_SNORM
+            64 => 16, // R32G32_FLOAT
+            65 => 11, // R16G16B16A16_UNORM
+            66 => 13, // R16G16B16A16_SNORM
             71 => 10, // R16G16B16A16_FLOAT, preserving HDR values and signs.
+            77 => 2, // R32G32B32A32_FLOAT
+            // Sampling bypasses the sRGB transfer function, exactly as the
+            // storage path does; the four-byte UNORM encodings are identical.
+            128, 161 => 61, // R8_UNORM
+            129 => 49, // R8G8_UNORM
+            130 => 28, // R8G8B8A8_UNORM
             136 => 115, // B4G4R4A4_UNORM; component mapping restores guest XYZW.
             169, 170 => 71,
             171, 172 => 74,
@@ -273,14 +300,26 @@ pub const DrawResources = struct {
         const view_height = std.math.divCeil(u32, descriptor.height, @as(u32, 1) << @intCast(base_level)) catch unreachable;
         const view_layers = if (dimension == 3) std.math.divCeil(u32, layers, @as(u32, 1) << @intCast(base_level)) catch unreachable else layers;
         const mip_allocation = descriptor.resourceMipLevels() > 1;
-        // A DCC-compressed RGBA8 view (for example a render target the guest
-        // samples next) resolves its fast-clear keys before detiling. CMASK
-        // and FMASK compression remain unsupported.
+        // A DCC-compressed colour view (for example a render target the guest
+        // samples next) resolves its fast-clear keys before detiling. The
+        // byte-per-channel UNORM layouts keep every fixed clear exact; a packed
+        // layout can only resolve the format-independent codes, so its metadata
+        // format stays out of the byte-per-channel bucket. CMASK and FMASK
+        // compression remain unsupported.
         const uniform_dcc = descriptor.dccMetadataAddress() != null and (format == 10 or format == 24 or format == 61 or dimension == 3 or layers > 1);
-        const dcc: ?surfaces.Dcc = if (!uniform_dcc) (if (descriptor.dccMetadataAddress()) |address| .{ .address = address, .clear_word = null } else null) else null;
+        const dcc_format: u16 = switch (format) {
+            61 => 1, // R8_UNORM
+            28 => 10, // R8G8B8A8_UNORM
+            else => 6, // R11G11B10_FLOAT
+        };
+        const dcc: ?surfaces.Dcc = if (!uniform_dcc) (if (descriptor.dccMetadataAddress()) |address| .{
+            .address = address,
+            .clear_word = null,
+            .format = dcc_format,
+        } else null) else null;
         if (!view_supported or format == 0 or
             descriptor.min_lod != 0 or (compressed and descriptor.bc_swizzle != 0) or
-            descriptor.cmask_fast_clear or descriptor.fmask_compression or (dcc != null and (format != 28 or layers != 1 or mip_allocation or dimension == 3)) or
+            descriptor.cmask_fast_clear or descriptor.fmask_compression or (dcc != null and (format != 28 and format != 26 or layers != 1 or mip_allocation or dimension == 3)) or
             (dcc == null and !uniform_dcc and gpu.MetadataSurface.fromImage(descriptor).hasAny()))
         {
             return error.GraphicsTextureFormatOrMipNotImplemented;
@@ -289,7 +328,10 @@ pub const DrawResources = struct {
         if (dimension == 1 and sampler.disable_cube_wrap) return error.GraphicsSamplerModeNotImplemented;
         // Float, narrow and packed formats have no sRGB DXGI variants; adding one
         // to their enum does not select a gamma-decoding view.
-        if (sampler.force_srgb and (format == 10 or format == 24 or format == 54 or format == 41 or format == 34 or format == 56 or format == 61 or format == 49 or format == 115)) return error.GraphicsSamplerModeNotImplemented;
+        if (sampler.force_srgb and (format == 10 or format == 24 or format == 54 or format == 41 or format == 34 or
+            format == 56 or format == 61 or format == 49 or format == 115 or format == 63 or format == 58 or
+            format == 51 or format == 35 or format == 37 or format == 31 or format == 16 or format == 11 or
+            format == 13 or format == 2)) return error.GraphicsSamplerModeNotImplemented;
         if (sampler.trunc_coordinates or sampler.filter_mode != 0 or sampler.maximum_anisotropy > 4 or
             sampler.mip_filter > 2 or sampler.border_color_type == 3)
             return error.GraphicsSamplerModeNotImplemented;

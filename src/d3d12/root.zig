@@ -460,6 +460,7 @@ pub fn colorSize(width: u32, height: u32, format: u32) Error!usize {
     const rgba = try rgbaSize(width, height);
     const size = switch (format) {
         10 => rgba * 2, // R16G16B16A16_FLOAT
+        2 => rgba * 4, // R32G32B32A32_FLOAT
         61 => rgba / 4, // R8_UNORM
         24, 26, 28, 31, 34 => rgba,
         else => return error.InvalidArgument,
@@ -508,10 +509,13 @@ pub fn sampledImageArraySize(width: u32, height: u32, format: u32, layers: u32, 
 
 pub fn sampledImageSize(width: u32, height: u32, format: u32) Error!usize {
     const rgba = try rgbaSize(width, height);
-    if (format == 28 or format == 24 or format == 41 or format == 34) return rgba;
+    if (format == 28 or format == 24 or format == 41 or format == 34 or format == 26 or
+        format == 35 or format == 37 or format == 31) return rgba;
     if (format == 10) return colorSize(width, height, format);
-    if (format == 61) return rgba / 4;
-    if (format == 56 or format == 54 or format == 49 or format == 115) return rgba / 2;
+    if (format == 11 or format == 13 or format == 16) return rgba * 2;
+    if (format == 2) return rgba * 4;
+    if (format == 61 or format == 63) return rgba / 4;
+    if (format == 56 or format == 54 or format == 49 or format == 115 or format == 58 or format == 51) return rgba / 2;
     // Native BC base dimensions must be whole 4x4 blocks. Smaller mip levels
     // will need a separate subresource path; never pad and change guest UVs.
     if (width % 4 != 0 or height % 4 != 0) return error.InvalidArgument;
@@ -612,6 +616,17 @@ test "sampled BC footprints count blocks and reject unsupported native extents" 
     try std.testing.expectError(error.InvalidArgument, sampledImageArraySize(8, 8, 98, 4, 3));
     try std.testing.expectError(error.InvalidArgument, sampledImageSize(4, 4, 95));
     try std.testing.expectError(error.InvalidArgument, sampledImageSize(16388, 4, 71));
+    // Signed and wider UNORM/float texels keep their native byte widths.
+    try std.testing.expectEqual(@as(usize, 3 * 7), try sampledImageSize(3, 7, 63));
+    try std.testing.expectEqual(@as(usize, 3 * 7 * 2), try sampledImageSize(3, 7, 58));
+    try std.testing.expectEqual(@as(usize, 3 * 7 * 2), try sampledImageSize(3, 7, 51));
+    try std.testing.expectEqual(@as(usize, 3 * 7 * 4), try sampledImageSize(3, 7, 35));
+    try std.testing.expectEqual(@as(usize, 3 * 7 * 4), try sampledImageSize(3, 7, 37));
+    try std.testing.expectEqual(@as(usize, 3 * 7 * 4), try sampledImageSize(3, 7, 31));
+    try std.testing.expectEqual(@as(usize, 3 * 7 * 8), try sampledImageSize(3, 7, 11));
+    try std.testing.expectEqual(@as(usize, 3 * 7 * 8), try sampledImageSize(3, 7, 13));
+    try std.testing.expectEqual(@as(usize, 3 * 7 * 8), try sampledImageSize(3, 7, 16));
+    try std.testing.expectEqual(@as(usize, 3 * 7 * 16), try sampledImageSize(3, 7, 2));
 }
 
 test "sampled arrays validate shape layers and bounded storage" {

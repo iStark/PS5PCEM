@@ -21,8 +21,10 @@ pub fn colorLayout(target: gpu.resources.ColorTarget) !gpu.SurfaceLayout {
     return layout;
 }
 
-/// Native render-target formats; staging preserves the encoded bits.
-/// DCC render-target clears currently cover unsigned-normalized R8/RGBA8.
+/// Native render-target formats; staging preserves the encoded bits. Byte-per-
+/// channel UNORM keeps every fast clear exact; the wider packed and half-float
+/// layouts materialize only the format-independent codes during staging, so
+/// they are admitted here and may still be rejected per key.
 pub fn colorFormat(target: gpu.resources.ColorTarget) !u32 {
     const format: u32 = switch (target.format) {
         1 => if (target.number_type == 0 and target.component_swap == 0) 61 else return error.UnsupportedRenderTargetLayout, // R8_UNORM
@@ -35,16 +37,37 @@ pub fn colorFormat(target: gpu.resources.ColorTarget) !u32 {
         12 => if (target.number_type == 7 and target.component_swap == 0) 10 else return error.UnsupportedRenderTargetLayout, // R16G16B16A16_FLOAT
         9 => if (target.number_type == 0 and target.component_swap == 0) 24 else return error.UnsupportedRenderTargetLayout, // R10G10B10A2_UNORM
         6 => if (target.number_type == 7 and target.component_swap == 0) 26 else return error.UnsupportedRenderTargetLayout, // R11G11B10_FLOAT
+        // DATA_FORMAT_32_32_32_32 + NUMBER_FORMAT_FLOAT. Tiny exposure and
+        // luminance targets feed the final tonemap; the native RGBA32F texel
+        // keeps their HDR values exact.
+        14 => if (target.number_type == 7 and target.component_swap == 0) 2 else return error.UnsupportedRenderTargetLayout, // R32G32B32A32_FLOAT
         else => return error.UnsupportedRenderTargetLayout,
     };
-    if (format != 28 and format != 61 and target.dcc_enabled) return error.UnsupportedRenderTargetLayout;
-    return format;
+    // SNORM has no exact fixed clear, so its metadata stays out of this path.
+    return switch (format) {
+        28, 61, 24, 26, 10 => format,
+        else => if (target.dcc_enabled) error.UnsupportedRenderTargetLayout else format,
+    };
 }
 
 /// DCC keys accompany the colour layout; null for an uncompressed target.
 pub fn colorDcc(target: gpu.resources.ColorTarget) ?Dcc {
     if (!target.dcc_enabled) return null;
-    return .{ .address = target.dcc_address, .clear_word = target.clear_words[0], .r8 = target.format == 1 };
+    // Only the formats colorFormat admits reach here; their tiled texel width
+    // is what a fast-clear must repeat.
+    const bytes_per_texel: u8 = switch (target.format) {
+        1 => 1,
+        12 => 8,
+        14 => 16,
+        else => 4,
+    };
+    return .{
+        .address = target.dcc_address,
+        .clear_word = target.clear_words[0],
+        .format = target.format,
+        .bytes_per_texel = bytes_per_texel,
+        .r8 = target.format == 1,
+    };
 }
 
 pub fn depthLayout(target: gpu.resources.DepthTarget, width: u32, height: u32, writable: bool) !gpu.SurfaceLayout {
@@ -146,22 +169,27 @@ test "VideoOut RGBA8, BGRA8 and packed SDR select channels without accepting PQ 
 
 fn validate(layout: gpu.SurfaceLayout, address: u64) !void {
     if (layout.width == 0 or layout.height == 0 or layout.width > 16384 or layout.height > 16384 or
-        layout.layers != 1 or (layout.block.bytes_per_element != 8 and layout.block.bytes_per_element != 4 and layout.block.bytes_per_element != 2 and layout.block.bytes_per_element != 1) or
+        layout.layers != 1 or (layout.block.bytes_per_element != 16 and layout.block.bytes_per_element != 8 and layout.block.bytes_per_element != 4 and layout.block.bytes_per_element != 2 and layout.block.bytes_per_element != 1) or
         layout.required_source_bytes > 256 * 1024 * 1024 or layout.staging_bytes > 256 * 1024 * 1024)
         return error.SurfaceBudgetExceeded;
     _ = try layout.sourceRange(address);
 }
 
-/// GFX10 DCC metadata for an RGBA8 colour surface: one key byte per 256-byte
-/// block of the tiled base allocation. 0xFF means the block holds plain
-/// texels; the fast-clear codes mean every texel of the block reads as the
-/// clear value regardless of the bytes underneath. Other codes describe
-/// genuinely compressed data, which this path does not decode.
+/// GFX10 DCC metadata for a colour surface: one key byte per 256-byte block of
+/// the tiled base allocation. 0xFF means the block holds plain texels; a
+/// fast-clear code means every texel of the block reads as one clear value
+/// regardless of the bytes underneath. Other codes describe genuinely
+/// compressed data, which this path does not decode.
 pub const Dcc = struct {
     address: u64,
     /// Render targets carry CB_COLOR*_CLEAR_WORD0; sampled views do not, so
     /// code 0x20 cannot be resolved for them.
     clear_word: ?u32,
+    /// Guest unified format. The fixed all-zeros/all-ones clears only map
+    /// directly onto texel bytes for the byte-per-channel UNORM layouts.
+    format: u16 = 10,
+    /// Tiled texel width a fast clear repeats.
+    bytes_per_texel: u8 = 4,
     r8: bool = false,
 
     pub const block_bytes = 256;
@@ -173,16 +201,33 @@ pub const Dcc = struct {
         return len / block_bytes + @intFromBool(len % block_bytes != 0);
     }
 
-    fn texel(self: Dcc, code: u8) ?[4]u8 {
-        if (self.r8 and (code == 0 or code == 0x40 or code == 0x80 or code == 0xc0))
-            return @splat(if (code & 0x40 != 0) 255 else 0);
+    /// Resolves a fast-clear code into the texel bytes it implies. Null means
+    /// this surface layout cannot express that clear exactly, so the caller
+    /// must reject the draw instead of writing wrong texels.
+    fn texel(self: Dcc, code: u8) ?[8]u8 {
+        var value: [8]u8 = @splat(0);
+        if (self.r8 and (code == 0 or code == 0x40 or code == 0x80 or code == 0xc0)) {
+            value[0] = if (code & 0x40 != 0) 255 else 0;
+            return value;
+        }
         return switch (code) {
-            0x00 => .{ 0, 0, 0, 0 },
-            0x40 => .{ 0, 0, 0, 255 },
-            0x80 => .{ 255, 255, 255, 0 },
-            0xc0 => .{ 255, 255, 255, 255 },
-            // CB_COLOR*_CLEAR_WORD0 holds the texel in the surface encoding.
-            0x20 => std.mem.toBytes(std.mem.nativeToLittle(u32, self.clear_word orelse return null)),
+            // Clearing to all zeros is exact for every layout.
+            0x00 => value,
+            // The fixed clears name channel all-zeros/all-ones, which only the
+            // byte-per-channel UNORM layouts encode bit-exactly.
+            0x40, 0x80, 0xc0 => if (self.format == 1 or self.format == 10) switch (code) {
+                0x40 => .{ 0, 0, 0, 255, 0, 0, 0, 0 },
+                0x80 => .{ 255, 255, 255, 0, 0, 0, 0, 0 },
+                else => .{ 255, 255, 255, 255, 0, 0, 0, 0 },
+            } else null,
+            // CB_COLOR*_CLEAR_WORD0 holds the texel in the surface encoding,
+            // but a wider-than-word texel needs clear words this path lacks.
+            0x20 => if (self.bytes_per_texel == 4) blk: {
+                const word = self.clear_word orelse break :blk null;
+                var cleared: [8]u8 = @splat(0);
+                @memcpy(cleared[0..4], &std.mem.toBytes(std.mem.nativeToLittle(u32, word)));
+                break :blk cleared;
+            } else null,
             else => null,
         };
     }
@@ -193,11 +238,11 @@ pub const Dcc = struct {
         if (keys.len != blockCount(backing.len)) return error.InvalidDccKeyRange;
         if (!memory.read(memory.context, self.address, keys)) return error.GuestReadFailed;
         if (self.r8 and keys.len != 0 and !std.mem.allEqual(u8, keys, keys[0])) return error.CompressedColorTargetNotImplemented;
-        const texel_bytes: usize = if (self.r8) 1 else 4;
+        const texel_bytes: usize = self.bytes_per_texel;
         for (keys, 0..) |code, block| {
             if (code == 0xff) continue;
             const bytes = backing[block * block_bytes .. @min(backing.len, (block + 1) * block_bytes)];
-            var value: [4]u8 = undefined;
+            var value: [8]u8 = undefined;
             if (code == 0x10) {
                 if (bytes.len < texel_bytes) return error.CompressedColorTargetNotImplemented;
                 @memcpy(value[0..texel_bytes], bytes[0..texel_bytes]);
@@ -217,6 +262,11 @@ pub const Dcc = struct {
 /// Full, single-mip sampled/storage allocations with uniform DCC keys. A
 /// uniform key is independent of the metadata address permutation. Mixed
 /// keys need the DCC layout equation and are deliberately not interpreted.
+/// A fully uncompressed surface (key 0xff) is usable for any unified format,
+/// because its guest bytes already hold the texels. Compressed keys can be
+/// materialized only for the formats whose cleared texel is exactly
+/// representable: R8_UNORM, R32_FLOAT, RGB10A2_UNORM, RGBA8_UNORM,
+/// RGBA16_UINT and RGBA16_FLOAT.
 pub const TextureDcc = struct {
     address: u64,
     bytes: usize,
@@ -230,7 +280,6 @@ pub const TextureDcc = struct {
         };
         if (image.resourceMipLevels() != 1 or image.viewBaseLevel() != 0 or image.base_array != 0 or
             image.samplesLog2() != 0 or image.cmask_fast_clear or image.fmask_compression or
-            (image.unified_format != 1 and image.unified_format != 50 and image.unified_format != 56 and image.unified_format != 71) or
             bytes != (try gpu.TextureLayout.fromImage(image)).required_source_bytes) return error.CompressedColorTargetNotImplemented;
         _ = try std.math.add(u64, address, Dcc.blockCount(bytes));
         return .{ .address = address, .bytes = bytes, .format = image.unified_format, .alpha_msb = image.descriptor_flags & (1 << 22) != 0 };
@@ -250,21 +299,35 @@ pub const TextureDcc = struct {
             offset += keys.len;
         }
         const code = first.?;
+        // 0xff marks fully uncompressed blocks, so the guest bytes are already
+        // the texels and no format-specific clear encoding is needed.
         if (code == 0xff) return;
-        const texel_bytes: usize = if (self.format == 1) 1 else if (self.format == 71) 8 else 4;
+        const texel_bytes: usize = switch (self.format) {
+            1 => 1,
+            22, 50, 56 => 4,
+            69, 71 => 8,
+            else => {
+                std.debug.print("[d3d12 DCC] compressed key=0x{x} for format={d} address=0x{x}\n", .{ code, self.format, self.address });
+                return error.CompressedColorTargetNotImplemented;
+            },
+        };
+        // Single-channel formats resolve their clear against the alpha lane, as
+        // R8_UNORM already does, so R32_FLOAT reuses the same bit position.
+        const components: usize = if (self.format == 1 or self.format == 22) 1 else 4;
+        const alpha_channel: usize = if (components == 4 and self.alpha_msb) 3 else 0;
         var texel: [8]u8 = @splat(0);
         if (code != 0x10) {
             if (code != 0 and code != 0x40 and code != 0x80 and code != 0xc0) {
                 std.debug.print("[d3d12 DCC] unsupported uniform key=0x{x} address=0x{x}\n", .{ code, self.address });
                 return error.CompressedColorTargetNotImplemented;
             }
-            for (0..(if (self.format == 1) @as(usize, 1) else 4)) |channel| {
-                const one = code & (if (channel == (if (self.alpha_msb and self.format != 1) @as(usize, 3) else 0)) @as(u8, 0x40) else 0x80) != 0;
+            for (0..components) |channel| {
+                const one = code & (if (channel == alpha_channel) @as(u8, 0x40) else 0x80) != 0;
                 if (self.format == 50) {
                     var bits = std.mem.readInt(u32, texel[0..4], .little);
                     if (one) bits |= @as(u32, if (channel == 3) 3 else 1023) << @as(u5, @intCast(channel * 10));
                     std.mem.writeInt(u32, texel[0..4], bits, .little);
-                } else if (self.format == 71) std.mem.writeInt(u16, texel[channel * 2 ..][0..2], if (one) 0x3c00 else 0, .little) else texel[channel] = if (one) 255 else 0;
+                } else if (self.format == 22) std.mem.writeInt(u32, texel[0..4], if (one) 0x3f80_0000 else 0, .little) else if (self.format == 69) std.mem.writeInt(u16, texel[channel * 2 ..][0..2], if (one) 0xffff else 0, .little) else if (self.format == 71) std.mem.writeInt(u16, texel[channel * 2 ..][0..2], if (one) 0x3c00 else 0, .little) else texel[channel] = if (one) 255 else 0;
             }
         }
         offset = 0;
@@ -332,6 +395,140 @@ test "DCC fast-clear keys expand into the tiled backing and unknown codes are re
     try std.testing.expectEqualSlices(u8, &.{ 0xff, 0xff, 0xff }, &memory.written);
     memory.keys = .{ 0xff, 0x55, 0xff };
     try std.testing.expectError(error.CompressedColorTargetNotImplemented, dcc.expand(memory.access(), &backing, &keys));
+}
+
+test "DCC fixed clears stay bit-exact only for byte-per-channel formats" {
+    const Memory = struct {
+        keys: [1]u8,
+        fn read(context: ?*anyopaque, _: u64, bytes: []u8) bool {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            @memcpy(bytes, self.keys[0..bytes.len]);
+            return true;
+        }
+        fn write(_: ?*anyopaque, _: u64, _: []const u8) bool {
+            return true;
+        }
+        fn access(self: *@This()) @import("backend.zig").Memory {
+            return .{ .context = self, .read = read, .write = write };
+        }
+    };
+    var backing: [256]u8 = undefined;
+    var keys: [1]u8 = undefined;
+    var memory = Memory{ .keys = .{0x00} };
+    // Clearing a block to zero is format-independent: every colour reads zero.
+    for ([_]u16{ 6, 9, 10 }) |format| {
+        @memset(&backing, 0xaa);
+        const zero = Dcc{ .address = 0x1000, .clear_word = 0x44332211, .format = format };
+        try zero.expand(memory.access(), &backing, &keys);
+        try std.testing.expect(std.mem.allEqual(u8, &backing, 0));
+    }
+    // The fixed all-ones clears are only exact when a byte is a whole channel.
+    memory.keys[0] = 0x80;
+    try (Dcc{ .address = 0x1000, .clear_word = 0, .format = 10 }).expand(memory.access(), &backing, &keys);
+    for (0..64) |i| try std.testing.expectEqualSlices(u8, &.{ 255, 255, 255, 0 }, backing[i * 4 ..][0..4]);
+    for ([_]u16{ 6, 9 }) |format| {
+        const packed_dcc = Dcc{ .address = 0x1000, .clear_word = 0, .format = format };
+        try std.testing.expectError(error.CompressedColorTargetNotImplemented, packed_dcc.expand(memory.access(), &backing, &keys));
+    }
+    // The clear word still resolves those formats through code 0x20.
+    memory.keys[0] = 0x20;
+    const packed_clear = Dcc{ .address = 0x1000, .clear_word = 0x3f801c00, .format = 6 };
+    try packed_clear.expand(memory.access(), &backing, &keys);
+    for (0..64) |i| try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x1c, 0x80, 0x3f }, backing[i * 4 ..][0..4]);
+    // A wider-than-word texel repeats whole and only takes format-independent
+    // clears; its fixed codes and clear word have no encoding here.
+    memory.keys[0] = 0x00;
+    @memset(&backing, 0x5a);
+    const wide = Dcc{ .address = 0x1000, .clear_word = 0x3f801c00, .format = 12, .bytes_per_texel = 8 };
+    try wide.expand(memory.access(), &backing, &keys);
+    try std.testing.expect(std.mem.allEqual(u8, &backing, 0));
+    for ([_]u8{ 0x20, 0x80 }) |code| {
+        memory.keys[0] = code;
+        try std.testing.expectError(error.CompressedColorTargetNotImplemented, wide.expand(memory.access(), &backing, &keys));
+    }
+    memory.keys[0] = 0x10;
+    for (&backing, 0..) |*byte, i| byte.* = @truncate(i);
+    try wide.expand(memory.access(), &backing, &keys);
+    for (0..32) |i| try std.testing.expectEqualSlices(u8, &.{ 0, 1, 2, 3, 4, 5, 6, 7 }, backing[i * 8 ..][0..8]);
+}
+
+test "RGBA16_UINT DCC clears materialize 16-bit integer texels at both alpha positions" {
+    const Memory = struct {
+        keys: [1]u8,
+        fn read(context: ?*anyopaque, _: u64, bytes: []u8) bool {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            @memcpy(bytes, self.keys[0..bytes.len]);
+            return true;
+        }
+        fn write(_: ?*anyopaque, _: u64, _: []const u8) bool {
+            return true;
+        }
+        fn access(self: *@This()) @import("backend.zig").Memory {
+            return .{ .context = self, .read = read, .write = write };
+        }
+    };
+    var backing: [256]u8 = @splat(0xaa);
+    var memory = Memory{ .keys = .{0x80} };
+    // RGBA16_UINT is eight bytes per texel, and an integer clear uses 0xffff.
+    for ([_]bool{ false, true }) |alpha_msb| for ([_]u8{ 0, 0x40, 0x80, 0xc0, 0xff, 0x10 }) |key| {
+        memory.keys[0] = key;
+        const dcc = TextureDcc{ .address = 0x1000, .bytes = backing.len, .format = 69, .alpha_msb = alpha_msb };
+        @memset(&backing, 0xaa);
+        try dcc.expand(memory.access(), &backing);
+        const alpha_channel: usize = if (alpha_msb) 3 else 0;
+        for (0..backing.len / 8) |texel| for (0..4) |channel| {
+            const one = key != 0xff and key != 0x10 and
+                key & (if (channel == alpha_channel) @as(u8, 0x40) else 0x80) != 0;
+            const expected: u16 = if (key == 0xff) 0xaaaa else if (key == 0x10) 0xaaaa else if (one) 0xffff else 0;
+            try std.testing.expectEqual(expected, std.mem.readInt(u16, backing[texel * 8 + channel * 2 ..][0..2], .little));
+        };
+    };
+    // An unknown uniform key is still rejected after the format was widened.
+    memory.keys[0] = 0x55;
+    const dcc = TextureDcc{ .address = 0x1000, .bytes = backing.len, .format = 69, .alpha_msb = false };
+    try std.testing.expectError(error.CompressedColorTargetNotImplemented, dcc.expand(memory.access(), &backing));
+}
+
+test "R32_FLOAT DCC clears use float zero and one, and unsupported formats still reject" {
+    const Memory = struct {
+        keys: [1]u8,
+        fn read(context: ?*anyopaque, _: u64, bytes: []u8) bool {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            @memcpy(bytes, self.keys[0..bytes.len]);
+            return true;
+        }
+        fn write(_: ?*anyopaque, _: u64, _: []const u8) bool {
+            return true;
+        }
+        fn access(self: *@This()) @import("backend.zig").Memory {
+            return .{ .context = self, .read = read, .write = write };
+        }
+    };
+    var backing: [256]u8 = undefined;
+    for (&backing, 0..) |*byte, i| byte.* = @truncate(i);
+    var memory = Memory{ .keys = .{0xff} };
+    const r32 = TextureDcc{ .address = 0x1000, .bytes = backing.len, .format = 22, .alpha_msb = false };
+    const original = backing;
+    // An uncompressed key leaves the guest texels exactly as they are.
+    try r32.expand(memory.access(), &backing);
+    try std.testing.expectEqualSlices(u8, &original, &backing);
+    // Clear-to-zero and clear-to-one encode the float counterparts.
+    for ([_]struct { key: u8, expected: u32 }{
+        .{ .key = 0x00, .expected = 0 },
+        .{ .key = 0x40, .expected = 0x3f80_0000 },
+        .{ .key = 0x80, .expected = 0 },
+        .{ .key = 0xc0, .expected = 0x3f80_0000 },
+    }) |case| {
+        memory.keys[0] = case.key;
+        @memset(&backing, 0xaa);
+        try r32.expand(memory.access(), &backing);
+        for (0..backing.len / 4) |texel|
+            try std.testing.expectEqual(case.expected, std.mem.readInt(u32, backing[texel * 4 ..][0..4], .little));
+    }
+    // A format with no clear encoding is still rejected while compressed.
+    memory.keys[0] = 0x80;
+    const unsupported = TextureDcc{ .address = 0x1000, .bytes = backing.len, .format = 29, .alpha_msb = false };
+    try std.testing.expectError(error.CompressedColorTargetNotImplemented, unsupported.expand(memory.access(), &backing));
 }
 
 /// HTILE fast clears override the bytes in the depth/stencil allocations.
@@ -537,9 +734,11 @@ test "color formats preserve signed and half-float encodings and reject their un
     target.format = 12;
     try std.testing.expectEqual(@as(u32, 10), try colorFormat(target));
     try std.testing.expectEqual(@as(u32, 8), (try colorLayout(target)).block.bytes_per_element);
+    // A DCC-enabled half-float target is admitted; its clears resolve per key.
     target.dcc_enabled = true;
     target.dcc_address = 0x900000;
-    try std.testing.expectError(error.UnsupportedRenderTargetLayout, colorLayout(target));
+    _ = try colorLayout(target);
+    try std.testing.expectEqual(@as(u8, 8), colorDcc(target).?.bytes_per_texel);
     target.dcc_enabled = false;
     target.component_swap = 1;
     try std.testing.expectError(error.UnsupportedRenderTargetLayout, colorLayout(target));
@@ -554,6 +753,11 @@ test "color formats preserve signed and half-float encodings and reject their un
     target.dcc_enabled = false;
     target.number_type = 4;
     try std.testing.expectError(error.UnsupportedRenderTargetLayout, colorLayout(target));
+    // DATA_FORMAT_32_32_32_32 keeps its full 16-byte float texel.
+    target.format = 14;
+    target.number_type = 7;
+    try std.testing.expectEqual(@as(u32, 2), try colorFormat(target));
+    try std.testing.expectEqual(@as(u32, 16), (try colorLayout(target)).block.bytes_per_element);
 }
 
 test "depth layouts validate address and subresource contracts before staging" {

@@ -592,7 +592,7 @@ pub const Renderer = struct {
                 @tagName(stage),                                               @tagName(bank), address, state.readRegister(.shader, bank.userDataBase() - 2) orelse 0,
                 state.readRegister(.shader, bank.userDataBase() - 1) orelse 0,
             });
-            var analysis = gpu.shader_analysis.decode(self.allocator, self.reader(), address, 4096) catch |err| {
+            var analysis = gpu.shader_analysis.decode(self.allocator, self.reader(), address, shader_cache.maximum_instructions) catch |err| {
                 std.debug.print("[d3d12 shader] decode failed: {s}\n", .{@errorName(err)});
                 continue;
             };
@@ -844,6 +844,17 @@ pub const Renderer = struct {
             }
         }
         if (render.color_count == 0 and try self.depthUtilityDraw(state, render, routing)) return;
+        // CB_DISABLE suppresses every color export and, with no depth work
+        // either, the packet produces no tracked output. The guest keeps the
+        // preceding pixel program bound as a launch vehicle, so its image
+        // samples and EXP destinations must not be treated as attachments.
+        // The Vulkan backend skips these before attachment resolution.
+        const color_writes = render.color_control.allowsAttachmentWrites(render.target_mask);
+        const depth_work = render.depth_target != null and
+            (render.depth_control.test_enabled or render.depth_control.write_enabled or
+                render.depth_control.clear_enabled or render.depth_control.stencil_enabled or
+                render.depth_control.stencil_clear_enabled);
+        if (!color_writes and !depth_work) return;
         if ((state.readRegister(.context, 0) orelse 0) & ~@as(u32, 0x63) != 0) return error.DepthMetadataOperationNotImplemented;
         if (render.color_count != 0 and render.color_targets[0] == null) return error.SparseColorTargetsNotImplemented;
         const target = render.color_targets[0];

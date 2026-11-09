@@ -3,6 +3,8 @@
 .codex-*
 zig-out/
 zig-out-*/
+appdata/
+unsloth-tmp/
 zig-pkg/
 out/
 dist/

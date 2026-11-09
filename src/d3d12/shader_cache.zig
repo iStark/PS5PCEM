@@ -7,6 +7,11 @@ const std = @import("std");
 const gpu = @import("gpu");
 const rdna2 = @import("rdna2");
 
+/// Headerless decode bound, matching the Vulkan backend. Large display and
+/// deferred-lighting programs exceed the earlier 4K cap while remaining
+/// fully decodable.
+pub const maximum_instructions: usize = 16 * 1024;
+
 const Entry = struct {
     allocator: std.mem.Allocator,
     address: u64,
@@ -77,7 +82,7 @@ pub const Cache = struct {
         self.misses += 1;
         const entry = try allocator.create(Entry);
         errdefer allocator.destroy(entry);
-        entry.* = .{ .allocator = allocator, .address = address, .analysis = try gpu.shader_analysis.decodeWithOptions(allocator, reader, address, 4096, self.pipeline_options), .stamp = self.clock };
+        entry.* = .{ .allocator = allocator, .address = address, .analysis = try gpu.shader_analysis.decodeWithOptions(allocator, reader, address, maximum_instructions, self.pipeline_options), .stamp = self.clock };
         errdefer entry.analysis.deinit(allocator);
         entry.analysis.discardDiagnosticIr(allocator);
         try entry.analysis.enableTranslationKey(allocator);
