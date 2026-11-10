@@ -180,7 +180,14 @@ pub const DrawResources = struct {
                 },
                 .mimg => try self.captureImage(&stage, &resolver, inst),
                 .flat => return error.GraphicsFlatMemoryNotImplemented,
-                .ds => return error.GraphicsLdsNotImplemented,
+                .ds => {
+                    // Graphics stages reach LDS only through non-GDS accesses:
+                    // the shared translator lowers them to per-invocation
+                    // Private scratch (spills, fills and export staging), so
+                    // they need no descriptor and no snapshot here. Persistent
+                    // GDS would need a UAV the draw path cannot bind.
+                    if (inst.gds) return error.GraphicsGdsNotImplemented;
+                },
                 else => {},
             }
         }
