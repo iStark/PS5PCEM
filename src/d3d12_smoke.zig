@@ -979,6 +979,149 @@ fn guestGraphicsProbe(allocator: std.mem.Allocator, device: *d3d12.Device) !void
     defer vertex.deinit(allocator);
     var fragment = try rdna2.translateProgramSpirv(allocator, &ps, .{ .stage = .fragment, .allow_control_flow_fallback = false });
     defer fragment.deinit(allocator);
+    // Volume RTVs use the guest's layer output, not repeated CPU draws into
+    // slice zero. Preserve first/last slice padding and reject stale retained
+    // attachments when only a nonzero slice changes on the CPU.
+    {
+        var volume_words: std.ArrayList(u32) = .empty;
+        defer volume_words.deinit(allocator);
+        try volume_words.append(allocator, vop1(1, 20, 264)); // preserve InstanceIndex in v8
+        try volume_words.appendSlice(allocator, vertex_words[0 .. vertex_words.len - 1]);
+        try volume_words.appendSlice(allocator, &.{ 0xf80000d4, 0x00140000, 0xbf810000 }); // POS1.z = layer
+        var volume_program = try rdna2.decodeProgram(allocator, volume_words.items);
+        defer volume_program.deinit(allocator);
+        var volume_vertex = try rdna2.translateProgramSpirv(allocator, &volume_program, .{ .stage = .vertex, .vertex_index_vgpr = 5, .layered_rendering = true, .layer_varying_location = 32, .allow_control_flow_fallback = false });
+        defer volume_vertex.deinit(allocator);
+        const slices = 48;
+        const slice_bytes = 65 * 37 * 8;
+        const volume = try allocator.alloc(u8, slice_bytes * slices);
+        defer allocator.free(volume);
+        @memset(volume, 0);
+        var volume_draw = try d3d12.Draw.fullTarget(65, 37);
+        volume_draw.color_format = 10;
+        volume_draw.color_depth = slices;
+        volume_draw.instance_count = slices;
+        try device.drawSpirv(volume_vertex.words, fragment.words, volume_draw, volume);
+        for (0..slices) |z| {
+            const center = z * slice_bytes + (18 * 65 + 32) * 8;
+            if (!std.mem.eql(u8, volume[center..][0..8], &.{ 0, 0x3c, 0, 0, 0, 0, 0, 0x3c }) or
+                !std.mem.allEqual(u8, volume[z * slice_bytes ..][0..8], 0))
+            {
+                std.debug.print("Volume mismatch slice={d} center={x} corner={x}\n", .{ z, volume[center..][0..8], volume[z * slice_bytes ..][0..8] });
+                return error.VolumeRenderLayerMismatch;
+            }
+        }
+        volume_draw.write_mask = 0;
+        volume[47 * slice_bytes + 10] = 0x23;
+        const expected = try allocator.dupe(u8, volume);
+        defer allocator.free(expected);
+        try device.drawSpirv(volume_vertex.words, fragment.words, volume_draw, volume);
+        if (!std.mem.eql(u8, volume, expected)) return error.VolumeAttachmentReuseMismatch;
+        try device.drawSpirv(volume_vertex.words, fragment.words, volume_draw, volume);
+        if (!std.mem.eql(u8, volume, expected)) return error.VolumeAttachmentReuseMismatch;
+        std.debug.print("PASS layered RGBA16_FLOAT raster: all 48 slices, row padding, masked writes and nonzero-slice cache invalidation\n", .{});
+        var mrt_words: std.ArrayList(u32) = .empty;
+        defer mrt_words.deinit(allocator);
+        try mrt_words.appendSlice(allocator, pixel_words[0 .. pixel_words.len - 1]);
+        try mrt_words.appendSlice(allocator, &.{ vop1(1, 0, 128), vop1(1, 1, 242), 0xf800081f, 0x03020100, 0xbf810000 });
+        var mrt_program = try rdna2.decodeProgram(allocator, mrt_words.items);
+        defer mrt_program.deinit(allocator);
+        var mrt = try rdna2.translateProgramSpirv(allocator, &mrt_program, .{ .stage = .fragment, .allow_control_flow_fallback = false });
+        defer mrt.deinit(allocator);
+        const second = try allocator.alloc(u8, volume.len);
+        defer allocator.free(second);
+        @memset(volume, 0);
+        @memset(second, 0);
+        volume_draw.write_mask = 15;
+        volume_draw.extra_color_count = 1;
+        volume_draw.extra_colors[0] = .{ .pixels = second.ptr, .size = second.len, .format = 10, .write_mask = 15 };
+        try device.drawSpirv(volume_vertex.words, mrt.words, volume_draw, volume);
+        for (0..slices) |z| {
+            const center = z * slice_bytes + (18 * 65 + 32) * 8;
+            if (!std.mem.eql(u8, volume[center..][0..8], &.{ 0, 0x3c, 0, 0, 0, 0, 0, 0x3c }) or
+                !std.mem.eql(u8, second[center..][0..8], &.{ 0, 0, 0, 0x3c, 0, 0, 0, 0x3c })) return error.VolumeMrtMismatch;
+        }
+        volume_draw.write_mask = 0;
+        volume_draw.extra_colors[0].write_mask = 0;
+        second[47 * slice_bytes + 10] = 0x42;
+        const second_expected = try allocator.dupe(u8, second);
+        defer allocator.free(second_expected);
+        for (0..2) |_| {
+            try device.drawSpirv(volume_vertex.words, mrt.words, volume_draw, volume);
+            if (!std.mem.eql(u8, second, second_expected)) return error.VolumeMrtCacheMismatch;
+        }
+        std.debug.print("PASS layered MRT: two independent RGBA16_FLOAT volumes, all 48 slices, masked writes and second-target cache invalidation\n", .{});
+        // GTA's volume pixel shader recovers the Z slice from SPI ancillary
+        // bits 16..26. Check the VS -> rasterizer -> PS path, not only writes.
+        var layer_program = rdna2.Program{ .code = &.{}, .instructions = .empty };
+        defer layer_program.deinit(allocator);
+        try layer_program.instructions.appendSlice(allocator, &.{
+            .{ .pc = 0, .opcode = .v_bfe_u32, .dst = .{ .kind = .vgpr, .reg = 0 }, .src0 = .{ .kind = .vgpr, .reg = 0 }, .src1 = .{ .kind = .integer_inline_constant, .value = 16 }, .src2 = .{ .kind = .integer_inline_constant, .value = 11 }, .src_count = 3 },
+            .{ .pc = 4, .opcode = .v_cvt_f32_u32, .dst = .{ .kind = .vgpr, .reg = 0 }, .src0 = .{ .kind = .vgpr, .reg = 0 }, .src_count = 1 },
+            .{ .pc = 8, .opcode = .v_mov_b32, .dst = .{ .kind = .vgpr, .reg = 1 }, .src0 = .{ .kind = .integer_inline_constant, .value = 0 }, .src_count = 1 },
+            .{ .pc = 12, .opcode = .v_mov_b32, .dst = .{ .kind = .vgpr, .reg = 2 }, .src0 = .{ .kind = .integer_inline_constant, .value = 0 }, .src_count = 1 },
+            .{ .pc = 16, .opcode = .v_mov_b32, .dst = .{ .kind = .vgpr, .reg = 3 }, .src0 = .{ .kind = .float_inline_constant, .value = 0x3f800000 }, .src_count = 1 },
+            .{ .pc = 20, .opcode = .exp, .export_target = 0, .export_enable = 15, .src0 = .{ .kind = .vgpr, .reg = 0 }, .src1 = .{ .kind = .vgpr, .reg = 1 }, .src2 = .{ .kind = .vgpr, .reg = 2 }, .src3 = .{ .kind = .vgpr, .reg = 3 }, .src_count = 4 },
+            .{ .pc = 24, .opcode = .s_endpgm },
+        });
+        var layer_fragment = try rdna2.translateProgramSpirv(allocator, &layer_program, .{
+            .stage = .fragment,
+            .layered_rendering = true,
+            .layer_varying_location = 32,
+            .fragment_inputs = .{ .allocated = 1 << 13, .enabled = 1 << 13 },
+            .allow_control_flow_fallback = false,
+        });
+        defer layer_fragment.deinit(allocator);
+        volume_draw.extra_color_count = 0;
+        volume_draw.write_mask = 15;
+        try device.drawSpirv(volume_vertex.words, layer_fragment.words, volume_draw, volume);
+        for (0..slices) |z| {
+            const center = z * slice_bytes + (18 * 65 + 32) * 8;
+            const red: f16 = @bitCast(std.mem.readInt(u16, volume[center..][0..2], .little));
+            if (red != @as(f16, @floatFromInt(z))) return error.VolumePixelLayerMismatch;
+        }
+        std.debug.print("PASS volume pixel shader receives the correct SPI ancillary layer for all 48 slices\n", .{});
+        // An ES saves its payload in LDS, then reuses the source VGPRs before
+        // returning to the copy exporter. Exercise actual DXC/FXC compilation
+        // and compare all pixels against ordinary vertex exports.
+        var snapshot_program = rdna2.Program{ .code = &.{}, .instructions = .empty };
+        defer snapshot_program.deinit(allocator);
+        for (volume_program.instructions.items) |inst| {
+            if (inst.opcode != .exp and inst.opcode != .s_endpgm)
+                try snapshot_program.instructions.append(allocator, inst);
+        }
+        var exports = [_]rdna2.spirv.NggLdsExport{
+            .{ .target = 0x0c, .enable = 15, .sources = .{ .{ .kind = .vgpr, .reg = 5 }, .{ .kind = .vgpr, .reg = 6 }, .{ .kind = .vgpr, .reg = 7 }, .{ .kind = .vgpr, .reg = 8 } } },
+            .{ .target = 0x0d, .enable = 4, .sources = .{ .{}, .{}, .{ .kind = .vgpr, .reg = 20 }, .{} } },
+        };
+        var pc: u32 = 0x100;
+        for (&exports) |*record| for (record.sources, 0..) |source, component| {
+            if (record.enable & (@as(u4, 1) << @intCast(component)) == 0) continue;
+            record.source_pcs[component] = pc;
+            try snapshot_program.instructions.append(allocator, .{ .pc = pc, .family = .ds, .opcode = .ds_write_b32, .src0 = .{ .kind = .vgpr, .reg = 0 }, .src1 = source, .src_count = 2 });
+            pc += 8;
+            try snapshot_program.instructions.append(allocator, .{ .pc = pc, .opcode = .v_mov_b32, .dst = source, .src0 = .{ .kind = .integer_inline_constant, .value = 0 }, .src_count = 1 });
+            pc += 4;
+        };
+        try snapshot_program.instructions.append(allocator, .{ .pc = pc, .opcode = .s_setpc_b64, .src0 = .{ .kind = .sgpr, .reg = 6 }, .src_count = 1 });
+        var snapshot_vertex = try rdna2.translateProgramSpirv(allocator, &snapshot_program, .{
+            .stage = .vertex,
+            .vertex_index_vgpr = 5,
+            .layered_rendering = true,
+            .layer_varying_location = 32,
+            .ngg_lds_exports = &exports,
+            .allow_control_flow_fallback = false,
+        });
+        defer snapshot_vertex.deinit(allocator);
+        @memset(volume, 0);
+        try device.drawSpirv(volume_vertex.words, layer_fragment.words, volume_draw, volume);
+        const reference = try allocator.dupe(u8, volume);
+        defer allocator.free(reference);
+        @memset(volume, 0);
+        try device.drawSpirv(snapshot_vertex.words, layer_fragment.words, volume_draw, volume);
+        if (!std.mem.eql(u8, reference, volume)) return error.NggSnapshotRasterMismatch;
+        std.debug.print("PASS NGG LDS snapshots preserve position/layer after VGPR reuse: all 48 slices match direct exports\n", .{});
+    }
     var pixels: [65 * 37 * 4]u8 = @splat(0);
     for (0..65 * 37) |i| pixels[i * 4 + 3] = 255;
     const initial = pixels;

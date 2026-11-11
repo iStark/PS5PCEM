@@ -23,6 +23,23 @@ struct Ps5Dxc {
     IDxcValidator *validator = nullptr;
 };
 
+// Generated HLSL can produce many harmless warnings before the useful error.
+// Preserve the first error in the bounded host diagnostic, rather than filling
+// the entire buffer with warnings and losing the reason compilation failed.
+static void diagnostics(char *out, size_t size, const char *prefix, const char *profile, IDxcBlobEncoding *messages) {
+    const char *text = messages ? static_cast<const char *>(messages->GetBufferPointer()) : "";
+    size_t length = messages ? messages->GetBufferSize() : 0;
+    const char marker[] = "error:";
+    for (size_t i = 0; i + sizeof(marker) - 1 <= length; ++i) {
+        if (std::memcmp(text + i, marker, sizeof(marker) - 1)) continue;
+        while (i && text[i - 1] != '\n') --i;
+        text += i; length -= i;
+        break;
+    }
+    std::snprintf(out, size, "%s %s: %.*s", prefix, profile,
+        static_cast<int>(length < size ? length : size), text);
+}
+
 static HMODULE adjacent_library(const wchar_t *name) {
     wchar_t path[32768];
     DWORD length = GetModuleFileNameW(nullptr, path, ARRAYSIZE(path));
@@ -94,9 +111,7 @@ int32_t ps5_dxc_compile(Ps5Dxc *c, const char *source, const char *profile,
     if (FAILED(hr) && result) {
         IDxcBlobEncoding *messages = nullptr;
         result->GetErrorBuffer(&messages);
-        std::snprintf(error, error_size, "DXC main/%s: %.*s", profile,
-            messages ? static_cast<int>(messages->GetBufferSize()) : 0,
-            messages ? static_cast<const char *>(messages->GetBufferPointer()) : "");
+        diagnostics(error, error_size, "DXC main", profile, messages);
         if (messages) messages->Release();
     }
     if (SUCCEEDED(hr)) hr = result->GetResult(&code);
@@ -108,9 +123,7 @@ int32_t ps5_dxc_compile(Ps5Dxc *c, const char *source, const char *profile,
         if (FAILED(hr)) {
             IDxcBlobEncoding *messages = nullptr;
             validation->GetErrorBuffer(&messages);
-            std::snprintf(error, error_size, "DXIL validation %s: %.*s", profile,
-                messages ? static_cast<int>(messages->GetBufferSize()) : 0,
-                messages ? static_cast<const char *>(messages->GetBufferPointer()) : "");
+            diagnostics(error, error_size, "DXIL validation", profile, messages);
             if (messages) messages->Release();
         }
     }

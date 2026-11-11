@@ -386,9 +386,10 @@ static HRESULT acquire_attachment(Ps5D3D12 *c, const D3D12_RESOURCE_DESC *desc,
         HRESULT hr = ID3D12Resource_Map(proof->resource, 0, &range, &mapped);
         if (FAILED(hr)) return failure(c, hr, "map retained attachment readback");
         int equal = 1;
+        const size_t rows = (size_t)desc->Height * footprint->Footprint.Depth;
         if (footprint->Footprint.RowPitch == row_bytes) {
-            equal = ps5_d3d12_equal_bytes(pixels, (uint8_t *)mapped + footprint->Offset, (size_t)row_bytes * desc->Height);
-        } else for (UINT y = 0; y < desc->Height; ++y) if (!ps5_d3d12_equal_bytes(pixels + (size_t)y * row_bytes,
+            equal = ps5_d3d12_equal_bytes(pixels, (uint8_t *)mapped + footprint->Offset, (size_t)row_bytes * rows);
+        } else for (size_t y = 0; y < rows; ++y) if (!ps5_d3d12_equal_bytes(pixels + y * row_bytes,
             (uint8_t *)mapped + footprint->Offset + (size_t)y * footprint->Footprint.RowPitch, row_bytes)) { equal = 0; break; }
         ID3D12Resource_Unmap(proof->resource, 0, &empty);
         if (!equal) continue;
@@ -398,7 +399,7 @@ static HRESULT acquire_attachment(Ps5D3D12 *c, const D3D12_RESOURCE_DESC *desc,
         c->resource_stats.hits += 2;
         if (desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) ++c->attachment_stats.depth_hits;
         else ++c->attachment_stats.color_hits;
-        c->attachment_stats.avoided_bytes += (uint64_t)row_bytes * desc->Height;
+        c->attachment_stats.avoided_bytes += (uint64_t)row_bytes * rows;
         *reused = 1;
         return S_OK;
     }
@@ -812,7 +813,7 @@ static HRESULT compile_spirv_uncached(Ps5D3D12 *c, const uint32_t *words, size_t
     spvc_set active = NULL;
     HRESULT hr = E_FAIL;
     const char *source = NULL;
-    int needs_wave = 0;
+    int needs_wave = 0, needs_layer = 0;
     if (spvc_context_create(&context) != SPVC_SUCCESS) return E_OUTOFMEMORY;
 #define CROSS(expr) do { if ((expr) != SPVC_SUCCESS) { snprintf(c->error, sizeof(c->error), "SPIRV-Cross %s: %s", #expr, spvc_context_get_last_error_string(context)); goto done; } } while (0)
     CROSS(spvc_context_parse_spirv(context, words, word_count, &ir));
@@ -824,10 +825,18 @@ static HRESULT compile_spirv_uncached(Ps5D3D12 *c, const uint32_t *words, size_t
     CROSS(spvc_compiler_get_declared_capabilities(compiler, &capabilities, &capability_count));
     for (size_t i = 0; i < capability_count; ++i) {
         if (capabilities[i] >= SpvCapabilityGroupNonUniform && capabilities[i] <= SpvCapabilityGroupNonUniformQuad) needs_wave = 1;
+        if (capabilities[i] == SpvCapabilityShaderViewportIndexLayerEXT || capabilities[i] == SpvCapabilityShaderLayer) needs_layer = 1;
     }
     if (needs_wave && (c->shader_model < D3D_SHADER_MODEL_6_0 || !c->wave_ops)) {
         hr = failure(c, DXGI_ERROR_UNSUPPORTED, "shader requires Shader Model 6.0 and hardware WaveOps");
         goto done;
+    }
+    if (needs_layer && stage == SpvExecutionModelVertex) {
+        D3D12_FEATURE_DATA_D3D12_OPTIONS support = {0};
+        if (FAILED(ID3D12Device_CheckFeatureSupport(c->device, D3D12_FEATURE_D3D12_OPTIONS, &support, sizeof(support))) ||
+            !support.VPAndRTArrayIndexFromAnyShaderFeedingRasterizerSupportedWithoutGSEmulation) {
+            hr = failure(c, DXGI_ERROR_UNSUPPORTED, "vertex render-target layer output is unsupported by this device"); goto done;
+        }
     }
     CROSS(spvc_compiler_set_entry_point(compiler, "main", stage));
     CROSS(spvc_compiler_create_compiler_options(compiler, &options));
@@ -912,6 +921,18 @@ static HRESULT compile_spirv_uncached(Ps5D3D12 *c, const uint32_t *words, size_t
         }
     }
     CROSS(spvc_compiler_compile(compiler, &source));
+    // Opt-in, bounded diagnostics: keep only the most recent program of each
+    // stage. Useful when a driver/compiler fails after resource preparation.
+    const char *dump_prefix = getenv("PS5_D3D12_SHADER_DUMP");
+    if (dump_prefix && dump_prefix[0]) {
+        char path[32768];
+        const char *suffix = stage == SpvExecutionModelVertex ? "vs" : stage == SpvExecutionModelFragment ? "ps" : "cs";
+        int count = snprintf(path, sizeof(path), "%s.%s.hlsl", dump_prefix, suffix);
+        if (count > 0 && (size_t)count < sizeof(path)) {
+            FILE *dump = fopen(path, "wb");
+            if (dump) { fwrite(source, 1, strlen(source), dump); fclose(dump); }
+        }
+    }
     if (needs_wave)
         hr = compile_dxil(c, source, stage == SpvExecutionModelGLCompute ? "cs_6_0" : stage == SpvExecutionModelVertex ? "vs_6_0" : "ps_6_0", code);
     else
@@ -1812,7 +1833,7 @@ typedef struct DrawLease {
 } DrawLease;
 struct DrawBatch {
     DrawLease leases[DRAW_BATCH_CAPACITY];
-    UINT count, width, height, color_bpp, depth_bpp;
+    UINT count, width, height, color_depth, color_bpp, depth_bpp;
     UINT views, samplers;
     int recording, depth_write, needs_depth_readback;
     D3D12_RESOURCE_STATES depth_state;
@@ -2025,11 +2046,13 @@ static HRESULT finish_batch(Ps5D3D12 *c, DrawBatch *b, uint8_t *rgba, uint8_t *d
             failure(c, hr, "MRT readback Map"); goto done;
         }
     }
-    for (UINT y = 0; y < b->height; ++y) {
+    if (mapped) for (size_t y = 0; y < (size_t)b->height * b->color_depth; ++y)
+        memcpy(rgba + y * b->width * b->color_bpp,
+            (uint8_t *)mapped + b->footprint.Offset + y * b->footprint.Footprint.RowPitch, (size_t)b->width * b->color_bpp);
+    for (size_t y = 0; y < (size_t)b->height * b->color_depth; ++y)
         for (UINT i = 0; i < b->extra_color_count; ++i) memcpy(b->extra_colors[i].pixels + (size_t)y * b->width * b->extra_colors[i].bpp,
             (uint8_t *)extra_mapped[i] + b->extra_colors[i].footprint.Offset + (size_t)y * b->extra_colors[i].footprint.Footprint.RowPitch, (size_t)b->width * b->extra_colors[i].bpp);
-        if (mapped) memcpy(rgba + (size_t)y * b->width * b->color_bpp,
-            (uint8_t *)mapped + b->footprint.Offset + (size_t)y * b->footprint.Footprint.RowPitch, (size_t)b->width * b->color_bpp);
+    for (UINT y = 0; y < b->height; ++y) {
         if (depth_mapped) {
             const uint8_t *row = (uint8_t *)depth_mapped + b->depth_footprint.Offset + (size_t)y * b->depth_footprint.Footprint.RowPitch;
             if (b->has_stencil && b->depth_bpp == 2) {
@@ -2113,12 +2136,14 @@ static HRESULT record_draw(Ps5D3D12 *c, DrawBatch *batch, const uint32_t *vertex
         blend->color_operation < 1 || blend->color_operation > 5 || blend->alpha_operation < 1 || blend->alpha_operation > 5) return E_INVALIDARG;
     for (UINT i = 0; i < 4; ++i) if (!isfinite(blend->constants[i])) return E_INVALIDARG;
     if (d->extra_color_count > 7 || (d->extra_color_count && !d->color_attachment) ||
-        !color_bpp || (uint64_t)d->width * d->height * color_bpp > 256u * 1024 * 1024) return E_INVALIDARG;
+        !d->color_depth || d->color_depth > 2048 || (d->color_depth > 1 &&
+        (d->width > 2048 || d->height > 2048 || d->depth_format || !d->color_attachment)) ||
+        !color_bpp || (uint64_t)d->width * d->height * d->color_depth * color_bpp > 256u * 1024 * 1024) return E_INVALIDARG;
     for (UINT i = 0; i < d->extra_color_count; ++i) {
         const Ps5D3D12ColorAttachment *a = &d->extra_colors[i];
         const Ps5D3D12Blend *b = &a->blend;
         const UINT bpp = color_bytes_per_pixel(a->format);
-        if (!a->pixels || !bpp || a->size != (uint64_t)d->width * d->height * bpp || a->size > 256u * 1024 * 1024 || a->write_mask > 15 ||
+        if (!a->pixels || !bpp || a->size != (uint64_t)d->width * d->height * d->color_depth * bpp || a->size > 256u * 1024 * 1024 || a->write_mask > 15 ||
             b->enabled > 1 || !valid_blend_factor(b->source_color, 0) || !valid_blend_factor(b->destination_color, 0) ||
             !valid_blend_factor(b->source_alpha, 1) || !valid_blend_factor(b->destination_alpha, 1) ||
             b->color_operation < 1 || b->color_operation > 5 || b->alpha_operation < 1 || b->alpha_operation > 5 ||
@@ -2224,9 +2249,9 @@ static HRESULT record_draw(Ps5D3D12 *c, DrawBatch *batch, const uint32_t *vertex
     }
     TRY(prepare_graphics_resources(c, batch, &resources, buffers, buffer_count, images, image_count));
     D3D12_RESOURCE_DESC desc = {0};
-    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Dimension = d->color_depth > 1 ? D3D12_RESOURCE_DIMENSION_TEXTURE3D : D3D12_RESOURCE_DIMENSION_TEXTURE2D;
     desc.Width = d->width; desc.Height = d->height;
-    desc.DepthOrArraySize = desc.MipLevels = 1;
+    desc.DepthOrArraySize = (UINT16)d->color_depth; desc.MipLevels = 1;
     desc.Format = d->color_format;
     desc.SampleDesc.Count = 1;
     desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
@@ -2258,7 +2283,7 @@ static HRESULT record_draw(Ps5D3D12 *c, DrawBatch *batch, const uint32_t *vertex
             if (!reused) {
                 TRY(graphics_buffer(c, batch->extra_colors[i].bytes, D3D12_HEAP_TYPE_UPLOAD, &batch->extra_colors[i].upload));
                 TRY(ID3D12Resource_Map(batch->extra_colors[i].upload, 0, &empty, &mapped));
-                for (UINT y = 0; y < d->height; ++y) memcpy((uint8_t *)mapped + batch->extra_colors[i].footprint.Offset + (size_t)y * batch->extra_colors[i].footprint.Footprint.RowPitch,
+                for (size_t y = 0; y < (size_t)d->height * d->color_depth; ++y) memcpy((uint8_t *)mapped + batch->extra_colors[i].footprint.Offset + (size_t)y * batch->extra_colors[i].footprint.Footprint.RowPitch,
                     d->extra_colors[i].pixels + (size_t)y * d->width * bpp, (size_t)d->width * bpp);
                 D3D12_RANGE written = {0, (SIZE_T)batch->extra_colors[i].bytes};
                 ID3D12Resource_Unmap(batch->extra_colors[i].upload, 0, &written);
@@ -2275,7 +2300,7 @@ static HRESULT record_draw(Ps5D3D12 *c, DrawBatch *batch, const uint32_t *vertex
     }
     if (upload) {
         TRY(ID3D12Resource_Map(upload, 0, &empty, &mapped));
-        for (UINT y = 0; y < d->height; ++y) memcpy((uint8_t *)mapped + footprint.Offset + (size_t)y * footprint.Footprint.RowPitch, rgba + (size_t)y * d->width * color_bpp, (size_t)d->width * color_bpp);
+        for (size_t y = 0; y < (size_t)d->height * d->color_depth; ++y) memcpy((uint8_t *)mapped + footprint.Offset + y * footprint.Footprint.RowPitch, rgba + y * d->width * color_bpp, (size_t)d->width * color_bpp);
         ID3D12Resource_Unmap(upload, 0, &entire);
     }
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT depth_footprint = {0};
@@ -2341,9 +2366,20 @@ static HRESULT record_draw(Ps5D3D12 *c, DrawBatch *batch, const uint32_t *vertex
         ID3D12Resource_Unmap(index_upload, 0, &written);
     }
     D3D12_CPU_DESCRIPTOR_HANDLE view = rtv(c, OFFSCREEN_RTV);
-    if (color) ID3D12Device_CreateRenderTargetView(c->device, color, NULL, view);
-    for (UINT i = 0; i < batch->extra_color_count; ++i)
-        ID3D12Device_CreateRenderTargetView(c->device, batch->extra_colors[i].color, NULL, rtv(c, OFFSCREEN_RTV + 1 + i));
+    if (color) {
+        D3D12_RENDER_TARGET_VIEW_DESC color_view = {0};
+        color_view.Format = d->color_format;
+        color_view.ViewDimension = d->color_depth > 1 ? D3D12_RTV_DIMENSION_TEXTURE3D : D3D12_RTV_DIMENSION_TEXTURE2D;
+        if (d->color_depth > 1) color_view.Texture3D.WSize = d->color_depth;
+        ID3D12Device_CreateRenderTargetView(c->device, color, &color_view, view);
+    }
+    for (UINT i = 0; i < batch->extra_color_count; ++i) {
+        D3D12_RENDER_TARGET_VIEW_DESC extra_view = {0};
+        extra_view.Format = d->extra_colors[i].format;
+        extra_view.ViewDimension = d->color_depth > 1 ? D3D12_RTV_DIMENSION_TEXTURE3D : D3D12_RTV_DIMENSION_TEXTURE2D;
+        if (d->color_depth > 1) extra_view.Texture3D.WSize = d->color_depth;
+        ID3D12Device_CreateRenderTargetView(c->device, batch->extra_colors[i].color, &extra_view, rtv(c, OFFSCREEN_RTV + 1 + i));
+    }
     if (!batch->count) {
         if (batch->needs_status) {
             D3D12_RESOURCE_DESC status_desc = graphics_buffer_desc(4);
@@ -2433,7 +2469,7 @@ static HRESULT record_draw(Ps5D3D12 *c, DrawBatch *batch, const uint32_t *vertex
         batch->depth_readback = depth_readback; depth_readback = NULL;
         batch->footprint = footprint; batch->bytes = bytes;
         batch->depth_footprint = depth_footprint; batch->depth_bytes = depth_copy_bytes;
-        batch->width = d->width; batch->height = d->height; batch->depth_bpp = depth_bpp;
+        batch->width = d->width; batch->height = d->height; batch->color_depth = d->color_depth; batch->depth_bpp = depth_bpp;
         batch->color_bpp = color_bpp;
     } else {
         /* These are borrowed target references, not completed pool leases. */
@@ -2471,7 +2507,7 @@ int32_t ps5_d3d12_draw_batch(Ps5D3D12 *c, const Ps5D3D12DrawJob *jobs, uint32_t 
         const Ps5D3D12Draw *d = jobs[i].draw;
         if (!d || d->width != first->width || d->height != first->height || d->depth_format != first->depth_format || d->color_attachment != first->color_attachment ||
             d->stencil_pixels != first->stencil_pixels || d->stencil_bytes != first->stencil_bytes ||
-            d->extra_color_count > 7 || d->extra_color_count != first->extra_color_count || d->color_format != first->color_format) return E_INVALIDARG;
+            d->extra_color_count > 7 || d->extra_color_count != first->extra_color_count || d->color_format != first->color_format || d->color_depth != first->color_depth) return E_INVALIDARG;
         for (UINT j = 0; j < d->extra_color_count; ++j) if (d->extra_colors[j].pixels != first->extra_colors[j].pixels ||
             d->extra_colors[j].size != first->extra_colors[j].size || d->extra_colors[j].format != first->extra_colors[j].format) return E_INVALIDARG;
     }

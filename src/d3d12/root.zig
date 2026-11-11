@@ -26,6 +26,7 @@ test {
     _ = blending;
     _ = shader_cache;
     _ = texture_cache;
+    _ = @import("ngg.zig");
 }
 
 const Handle = opaque {};
@@ -120,6 +121,8 @@ pub const Draw = extern struct {
     // Zero binds only a DSV, without allocating a dummy color surface.
     color_attachment: u32 = 1,
     color_format: u32 = 28,
+    // A full-volume RTV; layers are tightly packed Z slices in rgba.
+    color_depth: u32 = 1,
     extra_color_count: u32 = 0,
     extra_colors: [7]ColorAttachment = @splat(.{}),
     scalar_values: [129]u32 = @splat(0),
@@ -364,7 +367,7 @@ pub const Device = struct {
         for (jobs, native_jobs[0..jobs.len]) |*job, *out| {
             if (job.draw.width != jobs[0].draw.width or job.draw.height != jobs[0].draw.height or
                 job.draw.depth_format != jobs[0].draw.depth_format or job.draw.color_attachment != jobs[0].draw.color_attachment or
-                job.draw.extra_color_count != jobs[0].draw.extra_color_count or job.draw.color_format != jobs[0].draw.color_format) return error.InvalidArgument;
+                job.draw.extra_color_count != jobs[0].draw.extra_color_count or job.draw.color_format != jobs[0].draw.color_format or job.draw.color_depth != jobs[0].draw.color_depth) return error.InvalidArgument;
             try validateDraw(job.vertex, job.fragment, job.draw, job.indices, job.buffers, job.images, rgba, depth);
             out.* = .{ .vertex = job.vertex.ptr, .vertex_count = job.vertex.len, .fragment = job.fragment.ptr, .fragment_count = job.fragment.len, .draw = &job.draw, .indices = job.indices.ptr, .index_bytes = job.indices.len, .buffers = job.buffers.ptr, .buffer_count = @intCast(job.buffers.len), .images = job.images.ptr, .image_count = @intCast(job.images.len) };
         }
@@ -377,9 +380,13 @@ pub const Device = struct {
         if (draw.color_attachment > 1 or (draw.color_attachment == 0 and
             (draw.depth_format == 0 or draw.write_mask != 0 or draw.blend.enabled != 0))) return error.InvalidArgument;
         if (draw.extra_color_count > 7 or (draw.extra_color_count != 0 and draw.color_attachment == 0)) return error.InvalidArgument;
-        const target_size = try colorSize(draw.width, draw.height, draw.color_format);
+        if (draw.color_depth == 0 or draw.color_depth > 2048 or (draw.color_depth > 1 and
+            (draw.width > 2048 or draw.height > 2048 or draw.depth_format != 0 or draw.color_attachment == 0))) return error.InvalidArgument;
+        const target_size = std.math.mul(usize, try colorSize(draw.width, draw.height, draw.color_format), draw.color_depth) catch return error.InvalidArgument;
+        if (target_size > 256 * 1024 * 1024) return error.InvalidArgument;
         for (draw.extra_colors[0..draw.extra_color_count]) |color| {
-            if (color.pixels == null or color.size != try colorSize(draw.width, draw.height, color.format) or
+            const extra_size = std.math.mul(usize, try colorSize(draw.width, draw.height, color.format), draw.color_depth) catch return error.InvalidArgument;
+            if (color.pixels == null or color.size != extra_size or extra_size > 256 * 1024 * 1024 or
                 color.write_mask > 15 or !color.blend.valid() or !std.meta.eql(color.blend.constants, draw.blend.constants)) return error.InvalidArgument;
         }
         for (draw.extra_colors[0..draw.extra_color_count], 0..) |color, i| {

@@ -450,6 +450,12 @@ pub const Options = struct {
     fragment_extent: [2]u32 = .{ 1280, 720 },
     fragment_inputs: FragmentInputs = .{},
     layered_rendering: bool = false,
+    /// Optional flat user varying for the pixel shader's ancillary layer.
+    /// D3D12 links independently compiled signatures by register as well as
+    /// semantic; SV_Position can otherwise shift SV_RenderTargetArrayIndex.
+    /// Keep native Layer for raster selection and carry the same unclamped
+    /// value in a reserved location outside the guest's PARAM0..31 range.
+    layer_varying_location: ?u32 = null,
     /// Optional host feature for raw per-vertex attributes and manual VINTRP.
     allow_fragment_barycentric: bool = false,
     fragment_custom_interpolation_mask: u32 = 0,
@@ -1102,6 +1108,7 @@ const Builder = struct {
     zero_position_clip_output: u32 = 0,
     output_float_pointer: u32 = 0,
     layer_variable: u32 = 0,
+    layer_varying_output: u32 = 0,
     fragment_depth_output: u32 = 0,
     color_outputs: [8]u32 = @splat(0),
     color_export_mappings: [8]u8,
@@ -1436,16 +1443,28 @@ const Builder = struct {
             }
             if (guest_count != host_count or guest_count > std.math.maxInt(u32)) return Error.InvalidStageInterface;
         }
+        if (options.layer_varying_location) |location| {
+            if (!options.layered_rendering or location < 32) return Error.InvalidStageInterface;
+        }
         if (options.layered_rendering and (options.stage == .vertex or
             (options.stage == .fragment and options.fragment_inputs.ancillaryRegister() != null)))
         {
             const pointer = self.id();
             self.layer_variable = self.id();
             const storage: u32 = if (options.stage == .vertex) 3 else 1;
-            try self.emit(&self.annotations, 71, &.{ self.layer_variable, 11, 9 }); // BuiltIn Layer
+            if (options.stage == .fragment and options.layer_varying_location != null)
+                try self.emit(&self.annotations, 71, &.{ self.layer_variable, 30, options.layer_varying_location.? }) // Location
+            else
+                try self.emit(&self.annotations, 71, &.{ self.layer_variable, 11, 9 }); // BuiltIn Layer
             if (options.stage == .fragment) try self.emit(&self.annotations, 71, &.{ self.layer_variable, 14 }); // Flat
             try self.emit(&self.declarations, 32, &.{ pointer, storage, self.signed_type });
             try self.emit(&self.declarations, 59, &.{ pointer, self.layer_variable, storage });
+            if (options.stage == .vertex) if (options.layer_varying_location) |location| {
+                self.layer_varying_output = self.id();
+                try self.emit(&self.annotations, 71, &.{ self.layer_varying_output, 30, location });
+                try self.emit(&self.annotations, 71, &.{ self.layer_varying_output, 14 }); // Flat
+                try self.emit(&self.declarations, 59, &.{ pointer, self.layer_varying_output, storage });
+            };
         }
         switch (options.stage) {
             .vertex => {
@@ -5199,6 +5218,7 @@ const Builder = struct {
             try self.emit(&self.body, 62, &.{ self.position_output, zero_vector });
             try self.storeDepthClip(try self.constant(.float32, 0), try self.constant(.float32, 0), null);
             if (self.layer_variable != 0) try self.emit(&self.body, 62, &.{ self.layer_variable, try self.constant(.sint32, 0) });
+            if (self.layer_varying_output != 0) try self.emit(&self.body, 62, &.{ self.layer_varying_output, try self.constant(.sint32, 0) });
             for (self.parameter_variables) |variable| {
                 if (variable != 0) try self.emit(&self.body, 62, &.{ variable, zero_vector });
             }
@@ -5963,6 +5983,7 @@ const Builder = struct {
                 layer = selected;
             }
             try self.emit(&self.body, 62, &.{ self.layer_variable, layer });
+            if (self.layer_varying_output != 0) try self.emit(&self.body, 62, &.{ self.layer_varying_output, layer });
             return;
         }
         if (self.vector4_type == 0) return Error.UnsupportedOpcode;
@@ -13634,7 +13655,7 @@ fn assemble(allocator: std.mem.Allocator, builder: *Builder, options: Options) E
     try appendInstruction(allocator, &words, 17, &.{1}); // OpCapability Shader
     if (builder.zero_position_clip_output != 0 or builder.depth_clip_output != 0) try appendInstruction(allocator, &words, 17, &.{32});
 
-    if (builder.layer_variable != 0) {
+    if (builder.layer_variable != 0 and (options.stage == .vertex or options.layer_varying_location == null)) {
         try appendInstruction(allocator, &words, 17, &.{if (options.stage == .vertex) @as(u32, 5254) else 2});
     }
     if (options.tessellation_inputs != null) try appendInstruction(allocator, &words, 17, &.{3}); // Tessellation
@@ -13744,6 +13765,12 @@ fn assemble(allocator: std.mem.Allocator, builder: *Builder, options: Options) E
     if (builder.wave_exchange_phase != 0) try entry_point.append(allocator, builder.wave_exchange_phase);
     if (builder.private_memory != 0) try entry_point.append(allocator, builder.private_memory);
     if (builder.fragment_valid_mask != 0) try entry_point.append(allocator, builder.fragment_valid_mask);
+    // SPIR-V 1.4+ requires every statically used global, including Private
+    // snapshots, in the entry-point interface. HLSL reflection otherwise
+    // drops their declarations while the ES export still loads them.
+    for (builder.ngg_lds_snapshots) |record| for (record) |snapshot| {
+        if (snapshot != 0) try entry_point.append(allocator, snapshot);
+    };
     for (builder.lane_spills.items) |spill| try entry_point.appendSlice(allocator, &.{ spill.value, spill.valid });
     for (builder.private_spills.items) |spill| {
         if (spill.declared) try entry_point.append(allocator, spill.pointer);
@@ -13760,6 +13787,7 @@ fn assemble(allocator: std.mem.Allocator, builder: *Builder, options: Options) E
     if (builder.frag_coord_input != 0) try entry_point.append(allocator, builder.frag_coord_input);
     if (builder.front_face_input != 0) try entry_point.append(allocator, builder.front_face_input);
     if (builder.layer_variable != 0) try entry_point.append(allocator, builder.layer_variable);
+    if (builder.layer_varying_output != 0) try entry_point.append(allocator, builder.layer_varying_output);
     for (builder.barycentric_inputs) |variable| if (variable != 0) {
         try entry_point.append(allocator, variable);
     };

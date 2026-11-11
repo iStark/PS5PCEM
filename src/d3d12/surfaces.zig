@@ -10,10 +10,13 @@ const surface_cache = @import("surface_cache.zig");
 
 pub fn colorLayout(target: gpu.resources.ColorTarget) !gpu.SurfaceLayout {
     _ = try colorFormat(target);
+    if (target.resource_type == 2 and (target.depth == 0 or target.depth > 2048 or
+        target.width > 2048 or target.height > 2048 or target.last_array_slice + @as(u32, 1) < target.depth))
+        return error.UnsupportedRenderTargetLayout;
     if (target.component_swap > 1 or
         target.samples_log2 != 0 or target.fragments_log2 != 0 or target.mip_level != 0 or
-        target.maximum_mip != 0 or target.resource_type == 2 or target.depth > 1 or
-        target.base_array_slice != 0 or target.last_array_slice != 0 or
+        target.maximum_mip != 0 or (target.resource_type != 2 and target.depth > 1) or
+        target.base_array_slice != 0 or (target.resource_type != 2 and target.last_array_slice != 0) or
         (target.dcc_enabled and target.dcc_address == 0) or target.cmask_fast_clear or target.fmask_compression or
         target.force_destination_alpha_one) return error.UnsupportedRenderTargetLayout;
     const layout = try gpu.SurfaceLayout.fromColorTarget(target);
@@ -169,7 +172,7 @@ test "VideoOut RGBA8, BGRA8 and packed SDR select channels without accepting PQ 
 
 fn validate(layout: gpu.SurfaceLayout, address: u64) !void {
     if (layout.width == 0 or layout.height == 0 or layout.width > 16384 or layout.height > 16384 or
-        layout.layers != 1 or (layout.block.bytes_per_element != 16 and layout.block.bytes_per_element != 8 and layout.block.bytes_per_element != 4 and layout.block.bytes_per_element != 2 and layout.block.bytes_per_element != 1) or
+        layout.layers == 0 or layout.layers > 2048 or (layout.block.bytes_per_element != 16 and layout.block.bytes_per_element != 8 and layout.block.bytes_per_element != 4 and layout.block.bytes_per_element != 2 and layout.block.bytes_per_element != 1) or
         layout.required_source_bytes > 256 * 1024 * 1024 or layout.staging_bytes > 256 * 1024 * 1024)
         return error.SurfaceBudgetExceeded;
     _ = try layout.sourceRange(address);
@@ -222,7 +225,7 @@ pub const Dcc = struct {
             } else null,
             // CB_COLOR*_CLEAR_WORD0 holds the texel in the surface encoding,
             // but a wider-than-word texel needs clear words this path lacks.
-            0x20 => if (self.bytes_per_texel == 4) blk: {
+            0x20 => if (self.bytes_per_texel > 0 and self.bytes_per_texel <= 4) blk: {
                 const word = self.clear_word orelse break :blk null;
                 var cleared: [8]u8 = @splat(0);
                 @memcpy(cleared[0..4], &std.mem.toBytes(std.mem.nativeToLittle(u32, word)));
@@ -758,6 +761,39 @@ test "color formats preserve signed and half-float encodings and reject their un
     target.number_type = 7;
     try std.testing.expectEqual(@as(u32, 2), try colorFormat(target));
     try std.testing.expectEqual(@as(u32, 16), (try colorLayout(target)).block.bytes_per_element);
+}
+
+test "volume render targets preserve all slices through guest tiling" {
+    const allocator = std.testing.allocator;
+    var target = std.mem.zeroes(gpu.resources.ColorTarget);
+    target.address = 0x10000;
+    target.width = 48;
+    target.height = 48;
+    target.depth = 48;
+    target.last_array_slice = 48;
+    target.resource_type = 2;
+    target.format = 12;
+    target.number_type = 7;
+    target.tile_mode = .render_target;
+    const layout = try colorLayout(target);
+    try std.testing.expectEqual(@as(u32, 48), layout.layers);
+    try std.testing.expectEqual(@as(u64, 48 * 48 * 48 * 8), layout.staging_bytes);
+    const backing = try allocator.alloc(u8, @intCast(layout.required_source_bytes));
+    defer allocator.free(backing);
+    const pixels = try allocator.alloc(u8, @intCast(layout.staging_bytes));
+    defer allocator.free(pixels);
+    const result = try allocator.alloc(u8, pixels.len);
+    defer allocator.free(result);
+    @memset(backing, 0x5a);
+    for (pixels, 0..) |*byte, i| byte.* = @truncate(i *% 29 + i / (48 * 48 * 8));
+    try layout.tile(pixels, backing);
+    try layout.detile(backing, result);
+    try std.testing.expectEqualSlices(u8, pixels, result);
+    target.last_array_slice = 15;
+    try std.testing.expectError(error.UnsupportedRenderTargetLayout, colorLayout(target));
+    target.last_array_slice = 48;
+    target.base_array_slice = 1;
+    try std.testing.expectError(error.UnsupportedRenderTargetLayout, colorLayout(target));
 }
 
 test "depth layouts validate address and subresource contracts before staging" {

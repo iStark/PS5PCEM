@@ -94,6 +94,7 @@ typedef struct Ps5D3D12Draw {
     uint32_t check_dispatcher;
     uint32_t color_attachment;
     uint32_t color_format;
+    uint32_t color_depth;
     uint32_t extra_color_count;
     Ps5D3D12ColorAttachment extra_colors[7];
     uint32_t scalar_values[129]; /* VS 0..64, PS 65..128; binding 10. */

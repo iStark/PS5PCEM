@@ -460,7 +460,12 @@ test "only unobserved viewport depth can be normalized into the native range" {
 }
 
 pub fn linkInterface(state: *const gpu.State, vertex: []const gpu.ShaderInstruction, fragment: []const gpu.ShaderInstruction) !Interface {
-    const outputs = gpu.resource_checkpoints.graphicsInterface(vertex, null);
+    return linkInterfaceWithNgg(state, vertex, fragment, 0);
+}
+
+pub fn linkInterfaceWithNgg(state: *const gpu.State, vertex: []const gpu.ShaderInstruction, fragment: []const gpu.ShaderInstruction, recovered_parameters: u32) !Interface {
+    var outputs = gpu.resource_checkpoints.graphicsInterface(vertex, null);
+    outputs.parameters |= recovered_parameters;
     const inputs = gpu.resource_checkpoints.graphicsInterface(fragment, null);
     var result = Interface{ .mask = inputs.attributes };
     for (&result.controls, &result.locations, 0..) |*control, *location, i| {
@@ -499,6 +504,10 @@ pub fn linkInterface(state: *const gpu.State, vertex: []const gpu.ShaderInstruct
 }
 
 pub fn routing(state: *const gpu.State) !Routing {
+    return routingWithTriangleCopy(state, false);
+}
+
+pub fn routingWithTriangleCopy(state: *const gpu.State, verified_triangle_copy: bool) !Routing {
     const enables = state.readRegister(.context, 0x2d5) orelse 0;
     const ls = enables & 3;
     const es = (enables >> 3) & 3;
@@ -506,15 +515,17 @@ pub fn routing(state: *const gpu.State) !Routing {
     if (enables & 0xfc000000 != 0 or ls == 3 or es == 3 or vs == 3) return error.InvalidGraphicsStageRouting;
     if (enables & 4 != 0 or ls != 0 or vs == 1 or (state.readRegister(.uconfig, 0x242) orelse 4) == 9)
         return error.TessellationStagesNotImplemented;
-    if (enables & 0x20 != 0 or vs == 2) return error.GeometryAmplificationNotImplemented;
+    const triangle_copy = verified_triangle_copy and enables == 0x2030 and
+        (state.readRegister(.uconfig, 0x242) orelse 0) == 6;
+    if ((enables & 0x20 != 0 and !triangle_copy) or vs == 2) return error.GeometryAmplificationNotImplemented;
     const merged = enables & 0x2000 != 0;
     if (merged) {
         // ES routing, wave size, maximum primitive groups and passthrough are
         // compatible with one translated vertex invocation per guest vertex.
         // The observed passthrough ES=DS alias has no enabled tessellation stage.
-        if ((enables & ~@as(u32, 0x0247a010)) != 0 and enables != 0x02002008)
+        if (!triangle_copy and (enables & ~@as(u32, 0x0247a010)) != 0 and enables != 0x02002008)
             return error.UnsupportedNggStageRouting;
-        if (enables & 0x02000000 == 0) return error.NggCullingNotImplemented;
+        if (!triangle_copy and enables & 0x02000000 == 0) return error.NggCullingNotImplemented;
     } else if (es != 0 or enables & 0x02000000 != 0) return error.UnsupportedLegacyStageRouting;
     const stage: gpu.resources.ShaderStage = if (merged) .export_shader else .vertex;
     if (stage.programAddress(state) == null) return error.MissingVertexProgram;

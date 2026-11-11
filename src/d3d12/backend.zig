@@ -9,6 +9,7 @@ const gpu = @import("gpu");
 const rdna2 = @import("rdna2");
 const native = @import("root.zig");
 const graphics = @import("graphics.zig");
+const ngg = @import("ngg.zig");
 const surfaces = @import("surfaces.zig");
 const resources = @import("resources.zig");
 const compute_images = @import("compute_images.zig");
@@ -229,6 +230,8 @@ pub const Error = std.mem.Allocator.Error || error{
     MissingVertexProgram,
     NativeFailure,
     NggCullingNotImplemented,
+    UnsupportedNggExportRecord,
+    UnsupportedLayeredAttachments,
     NonFiniteBlendConstant,
     Overflow,
     ResourceOutsideExtendedUserData,
@@ -825,7 +828,14 @@ pub const Renderer = struct {
         defer if (self.profile.enabled) {
             self.profile.draw_ns +|= (self.profile.now() -| prepare_start) -| (self.profile.flush_ns -| flush_before);
         };
-        const routing = try graphics.routing(state);
+        var triangle_copy = false;
+        if ((state.readRegister(.context, 0x2d5) orelse 0) == 0x2030) {
+            const address = gpu.resources.ShaderStage.geometry.programAddress(state) orelse return error.MissingVertexProgram;
+            const gs_lease = try self.shader_analyses.acquire(self.allocator, self.reader(), address);
+            defer gs_lease.release();
+            triangle_copy = ngg.triangleCopy(gs_lease.view().program.code);
+        }
+        const routing = try graphics.routingWithTriangleCopy(state, triangle_copy);
         var render = gpu.resources.decodeRenderState(state);
         render.depth_control = graphics.effectiveDepthControl(state);
         // Engines leave previous G-buffer attachments bound after switching
@@ -876,6 +886,13 @@ pub const Renderer = struct {
         if (render.raster.rasterizer_discard or render.raster.polygon_mode != 0 or (render.raster.cull_front and render.raster.cull_back)) return error.UnsupportedRasterState;
         const topology = try graphics.nativeTopology(render.primitive_type);
         var draw_state = try native.Draw.fullTarget(extent[0], extent[1]);
+        if (target) |color| if (color.resource_type == 2) {
+            if (depth_work) return error.UnsupportedLayeredAttachments;
+            draw_state.color_depth = color_key.?.layout.layers;
+        };
+        for (extra_keys) |key| if (key) |extra| {
+            if (extra.layout.layers != draw_state.color_depth) return error.MismatchedRenderTargetExtents;
+        };
         draw_state.color_attachment = @intFromBool(target != null);
         if (color_key) |key| draw_state.color_format = key.native_format;
         draw_state.extra_color_count = render.color_count -| 1;
@@ -984,7 +1001,12 @@ pub const Renderer = struct {
         defer ps_lease.release();
         const vs = vs_lease.view();
         const ps = ps_lease.view();
-        const interface = try graphics.linkInterface(state, vs.program.instructions.items, ps.program.instructions.items);
+        var recovered: [3]rdna2.spirv.NggLdsExport = undefined;
+        const ngg_exports: []const rdna2.spirv.NggLdsExport = if (triangle_copy) blk: {
+            recovered = try ngg.exports(vs.program.instructions.items);
+            break :blk &recovered;
+        } else &.{};
+        const interface = try graphics.linkInterfaceWithNgg(state, vs.program.instructions.items, ps.program.instructions.items, if (triangle_copy) 1 else 0);
         if (interface.flat_mask != 0) {
             if (rectangle) return error.FlatRectangleInterpolationNotImplemented;
             const last = (state.readRegister(.context, 0x205) orelse 0) & (1 << 19) != 0;
@@ -1037,6 +1059,9 @@ pub const Renderer = struct {
             .scalarize_ballot_first = true,
             .program_address = vs_bindings.program_address,
             .vertex_index_vgpr = 5,
+            .ngg_lds_exports = ngg_exports,
+            .layered_rendering = draw_state.color_depth > 1,
+            .layer_varying_location = if (draw_state.color_depth > 1) 32 else null,
             .convert_negative_one_to_one_depth = !render.raster.zero_to_one_depth and depth_transform == null,
             .vertex_depth_transform = depth_transform,
             .scalar_registers = vs_scalar[0..vs_scalar_count],
@@ -1059,6 +1084,8 @@ pub const Renderer = struct {
             .scalarize_ballot_first = true,
             .program_address = ps_bindings.program_address,
             .fragment_extent = extent,
+            .layered_rendering = draw_state.color_depth > 1,
+            .layer_varying_location = if (draw_state.color_depth > 1) 32 else null,
             .scalar_registers = ps_scalar[0..ps_scalar_count],
             .dynamic_scalar_binding = .{ .binding = 10, .value_base = 65 },
             .allow_control_flow_fallback = false,
