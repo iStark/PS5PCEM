@@ -249,14 +249,14 @@ pub const DrawResources = struct {
             else => return error.GraphicsImageOperationNotImplemented,
         };
         var sampler: gpu.resources.SamplerDescriptor = std.mem.zeroes(gpu.resources.SamplerDescriptor);
+        var sampler_words: [4]u32 = @splat(0);
+        errdefer if (!image_fetch) std.debug.print("[d3d12 sampler] program=0x{x} pc=0x{x} words={x},{x},{x},{x} descriptor={any}\n", .{
+            resolver.bindings.program_address, inst.pc, sampler_words[0], sampler_words[1], sampler_words[2], sampler_words[3], sampler,
+        });
         if (!image_fetch) {
-            var sampler_words: [4]u32 = undefined;
             if (!try resolver.words(inst.src2.reg, inst.pc, &sampler_words))
                 return error.DynamicGraphicsImageNotImplemented;
             sampler = try gpu.resources.decodeSamplerDescriptor(&sampler_words);
-            errdefer std.debug.print("[d3d12 sampler] program=0x{x} pc=0x{x} words={x},{x},{x},{x} descriptor={any}\n", .{
-                resolver.bindings.program_address, inst.pc, sampler_words[0], sampler_words[1], sampler_words[2], sampler_words[3], sampler,
-            });
         }
         const format: u32 = switch (descriptor.unified_format) {
             1 => 61, // R8_UNORM
@@ -288,6 +288,8 @@ pub const DrawResources = struct {
             169, 170 => 71,
             171, 172 => 74,
             173, 174 => 77,
+            179 => 95, // BC6H_UF16
+            180 => 96, // BC6H_SF16; signed HDR, not an sRGB pair.
             181, 182 => 98,
             else => 0,
         };
@@ -338,7 +340,7 @@ pub const DrawResources = struct {
         if (sampler.force_srgb and (format == 10 or format == 24 or format == 54 or format == 41 or format == 34 or
             format == 56 or format == 61 or format == 49 or format == 115 or format == 63 or format == 58 or
             format == 51 or format == 35 or format == 37 or format == 31 or format == 16 or format == 11 or
-            format == 13 or format == 2)) return error.GraphicsSamplerModeNotImplemented;
+            format == 13 or format == 2 or format == 95 or format == 96)) return error.GraphicsSamplerModeNotImplemented;
         if (sampler.trunc_coordinates or sampler.filter_mode != 0 or sampler.maximum_anisotropy > 4 or
             sampler.mip_filter > 2 or sampler.border_color_type == 3)
             return error.GraphicsSamplerModeNotImplemented;
@@ -452,7 +454,10 @@ pub const DrawResources = struct {
             .dimension = dimension,
             .mip_levels = mips,
             .format = format,
-            .srgb = @intFromBool(sampler.force_srgb or (compressed and descriptor.unified_format % 2 == 0)),
+            .srgb = @intFromBool(sampler.force_srgb or switch (descriptor.unified_format) {
+                170, 172, 174, 182 => true,
+                else => false,
+            }),
             .components = components,
             .filter = (@as(u32, sampler.minification_filter & 1) << 4) | (@as(u32, sampler.magnification_filter & 1) << 2) | @intFromBool(sampler.mip_filter == 2),
             .address_u = if (unnormalized) try unnormalizedAddressMode(sampler.clamp_x) else try addressMode(sampler.clamp_x),
@@ -605,7 +610,9 @@ fn addressMode(guest: u8) !u32 {
         0 => 1,
         1 => 2,
         2 => 3,
+        3 => 5, // MIRROR_ONCE_LAST_TEXEL: abs(coordinate), then edge clamp.
         4 => 4,
+        6 => 4, // CLAMP_BORDER, including interpolation with border texels.
         else => error.GraphicsSamplerAddressModeNotImplemented,
     };
 }

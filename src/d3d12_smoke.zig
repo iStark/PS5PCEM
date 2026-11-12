@@ -1163,11 +1163,15 @@ fn guestGraphicsProbe(allocator: std.mem.Allocator, device: *d3d12.Device) !void
     try guestFloatTargetProbe(allocator, &vertex_words);
     try guestPackedTargetProbe(allocator, &vertex_words);
     try guestSurfaceProbe(allocator, &vertex_words, &pixel_words);
+    try guestSrgbTargetProbe(allocator, &vertex_words, &pixel_words);
+    try guestMipTargetProbe(allocator, &vertex_words, &pixel_words);
+    try guestCmaskProbe(allocator, &vertex_words, &pixel_words);
     for ([_]usize{ 0, d3d12.surface_cache.Cache.default_limit }) |limit| try guestDepthProbe(allocator, &vertex_words, &pixel_words, limit);
     try guestDepthBiasProbe(allocator, &vertex_words, &pixel_words);
     try guestViewportDepthProbe(allocator, &vertex_words, &pixel_words);
     try guestVaryingProbe(allocator, &vertex_words);
     try guestMipImageProbe(allocator, &vertex_words, &pixel_words);
+    try guestBc6ImageProbe(allocator, &vertex_words, &pixel_words);
     try guestVolumeImageProbe(allocator, &vertex_words, &pixel_words);
     try guestAnisotropicProbe(allocator);
     try guestFanProbe(allocator);
@@ -2329,6 +2333,9 @@ fn guestMrtProbe(allocator: std.mem.Allocator, vertex: []const u32, fragment: []
         if (!std.mem.eql(u8, before, &memory.data)) return error.InactiveMrtModifiedMemory;
         try state.writeRegister(.context, 0x08e, 255);
         try state.writeRegister(.context, 0x08f, 255);
+        // Activate a valid-format target with wrong extents. A stale DCC bit
+        // without a metadata address is a separate layout error.
+        try state.writeRegister(.context, 0x32b, 9 << 2);
         try std.testing.expectError(error.MismatchedRenderTargetExtents, renderer.draw(&state, packet));
         if (!std.mem.eql(u8, before, &memory.data)) return error.InvalidActiveMrtModifiedMemory;
     }
@@ -3064,6 +3071,250 @@ fn guestViewportDepthProbe(allocator: std.mem.Allocator, vertex: []const u32, fr
     std.debug.print("PASS {d} unrestricted viewport cases: explicit unit clamp, GL/DX planes, reversed/offset scale, tiny positive D32, all comparisons and write masks; crossing-plane coverage, interpolated clamp, native clip PSO reuse and rejected-clamp memory preservation\n", .{cases});
 }
 
+fn guestCmaskProbe(allocator: std.mem.Allocator, vertex: []const u32, fragment: []const u32) !void {
+    const memory = try allocator.create(GraphicsMemory);
+    defer allocator.destroy(memory);
+    memory.* = .{};
+    @memcpy(memory.data[0x200..][0 .. vertex.len * 4], std.mem.sliceAsBytes(vertex));
+    @memcpy(memory.data[0x400..][0 .. fragment.len * 4], std.mem.sliceAsBytes(fragment));
+    var renderer = try d3d12.Renderer.init(allocator, memory.access(), false);
+    defer renderer.deinit();
+    renderer.draw_batch_limit = 64;
+    var state = try graphicsState(65, 37, 72);
+    var executor = gpu.DcbExecutor{ .state = &state, .backend = renderer.dcbBackend(), .allocator = allocator };
+    const packets = [_]u32{ command(gpu.pm4.draw_index_auto, 2), 3, 2 };
+    try state.writeRegister(.context, 0x31f, 0x800); // CMASK at 0x80000.
+    try state.writeRegister(.context, 0x398, 0);
+    for ([_]u32{ 10, 6, 12 }) |format| for ([_]gpu.resources.TileMode{ .render_target, .depth }) |mode| {
+        const info = (format << 2) | (if (format == 10) @as(u32, 0) else (7 << 8));
+        try state.writeRegister(.context, 0x3b8, (@as(u32, @intFromEnum(mode)) << 14) | (24 << 19) | (1 << 26));
+        try state.writeRegister(.context, 0x31c, info | (1 << 13));
+        try state.writeRegister(.context, 0x323, if (format == 12) 0x34003800 else if (format == 6) 0x701c03c0 else 0xff315783);
+        try state.writeRegister(.context, 0x324, 0x3c003000);
+        const target = gpu.resources.decodeColorTarget(&state, 0, 15).?;
+        const layout = try d3d12.surfaces.colorLayout(target);
+        const cmask = (try d3d12.surfaces.Cmask.fromTarget(target, &state)).?;
+        const backing = memory.data[0x2000..][0..@intCast(layout.required_source_bytes)];
+        const keys = memory.data[0x80000..][0..@intCast(cmask.layout.required_bytes)];
+        const reference = try allocator.alloc(u8, backing.len);
+        defer allocator.free(reference);
+        var expected_keys: [4096]u8 = undefined;
+        for (0..2) |variant| {
+            @memset(backing, 0x27);
+            @memset(keys, 0xaf); // Inactive nibbles must remain untouched.
+            var y: u32 = 0;
+            while (y < 37) : (y += 8) {
+                var x: u32 = 0;
+                while (x < 65) : (x += 8) try cmask.layout.setValue(keys, x, y, 0, if ((x / 8 + y / 8) % 3 == 0) 0 else 15);
+            }
+            @memcpy(&expected_keys, keys);
+            // Independent initial reference: write each complete 8x8 region
+            // in color swizzle order; only the active view is rasterized.
+            var padded = layout;
+            padded.width = 72;
+            padded.height = 40;
+            if (variant == 0) for (0..40) |py| for (0..72) |px| {
+                if ((px / 8 + py / 8) % 3 != 0) continue;
+                const offset: usize = @intCast(try padded.sourceByteOffset(@intCast(px), @intCast(py), 0));
+                @memcpy(backing[offset..][0..cmask.texel_bytes], cmask.texel[0..cmask.texel_bytes]);
+            };
+            try state.writeRegister(.context, 0x31c, info | (if (variant == 1) @as(u32, 1 << 13) else 0));
+            _ = try executor.execute(&packets);
+            // A metadata read must flush a queued draw before returning keys.
+            var published: [4096]u8 = undefined;
+            const backend = renderer.dcbBackend();
+            if (variant == 1) {
+                if (!backend.vtable.read(backend.context, cmask.address, &published)) return error.CmaskDependencyReadFailed;
+            } else try renderer.flushDraws();
+            if (variant == 0) @memcpy(reference, backing) else {
+                if (!std.mem.eql(u8, reference, backing)) return error.CmaskRenderMismatch;
+                y = 0;
+                while (y < 37) : (y += 8) {
+                    var x: u32 = 0;
+                    while (x < 65) : (x += 8) try cmask.layout.setValue(&expected_keys, x, y, 0, 15);
+                }
+                if (!std.mem.eql(u8, &expected_keys, keys) or !std.mem.eql(u8, &published, keys)) return error.CmaskPublicationMismatch;
+                // A second staging must retain the newly drawn pixels.
+                _ = try executor.execute(&packets);
+                try renderer.flushDraws();
+                if (!std.mem.eql(u8, reference, backing)) return error.CmaskStaleClear;
+            }
+        }
+        // Invalid compression must leave both pixels and metadata untouched.
+        try cmask.layout.setValue(keys, 64, 32, 0, 7);
+        @memcpy(&expected_keys, keys);
+        const packet: gpu.pm4.Packet = .{ .kind = .command, .header = command(gpu.pm4.draw_index_auto, 2), .opcode = gpu.pm4.draw_index_auto, .body = &.{ 3, 2 } };
+        if (renderer.draw(&state, packet)) |_| return error.CmaskCompressedStateAccepted else |err| if (err != error.CompressedColorTargetNotImplemented) return err;
+        if (!std.mem.eql(u8, reference, backing) or !std.mem.eql(u8, &expected_keys, keys)) return error.RejectedCmaskModifiedMemory;
+    };
+    std.debug.print("PASS CMASK clear/expanded blocks: RGBA8/R11G11B10F/RGBA16F, independent R/Z color swizzles, edge padding, queued metadata reads, stale-clear prevention and invalid-state isolation\n", .{});
+}
+
+fn guestMipTargetProbe(allocator: std.mem.Allocator, vertex: []const u32, fragment: []const u32) !void {
+    const memory = try allocator.create(GraphicsMemory);
+    defer allocator.destroy(memory);
+    memory.* = .{};
+    @memcpy(memory.data[0x200..][0 .. vertex.len * 4], std.mem.sliceAsBytes(vertex));
+    @memcpy(memory.data[0x400..][0 .. fragment.len * 4], std.mem.sliceAsBytes(fragment));
+    var renderer = try d3d12.Renderer.init(allocator, memory.access(), false);
+    defer renderer.deinit();
+    renderer.draw_batch_limit = 64;
+    var device = try d3d12.Device.init(false);
+    defer device.deinit();
+    var vs = try rdna2.decodeProgram(allocator, vertex);
+    defer vs.deinit(allocator);
+    var ps = try rdna2.decodeProgram(allocator, fragment);
+    defer ps.deinit(allocator);
+    var native_vs = try rdna2.translateProgramSpirv(allocator, &vs, .{ .stage = .vertex, .vertex_index_vgpr = 5, .allow_control_flow_fallback = false });
+    defer native_vs.deinit(allocator);
+    var native_ps = try rdna2.translateProgramSpirv(allocator, &ps, .{ .stage = .fragment, .allow_control_flow_fallback = false });
+    defer native_ps.deinit(allocator);
+    const packet = gpu.pm4.Packet{ .kind = .command, .header = command(gpu.pm4.draw_index_auto, 2), .opcode = gpu.pm4.draw_index_auto, .body = &.{ 3, 2 } };
+    var cases: usize = 0;
+    for ([_][2]u32{ .{ 128, 128 }, .{ 129, 73 } }) |extent| for ([_]u32{ 10, 12 }) |format| for ([_]gpu.resources.TileMode{ .linear, .render_target, .depth }) |mode| {
+        const bytes: u8 = if (format == 12) 8 else 4;
+        const texture = try gpu.TextureLayout.init(.{ .tile_mode = mode, .width = extent[0], .height = extent[1], .depth_or_layers = 2, .mip_levels = 8 }, bytes);
+        if (texture.required_source_bytes > memory.data.len - 0x10000) return error.MipProbeTooLarge;
+        @memset(memory.data[0x10000..], 0x37);
+        const expected = try allocator.dupe(u8, memory.data[0x10000..]);
+        defer allocator.free(expected);
+        var state = try graphicsState(extent[0], extent[1], 136);
+        try state.writeRegister(.context, 0x318, 0x100);
+        try state.writeRegister(.context, 0x31c, (format << 2) | (if (format == 12) @as(u32, 7 << 8) else 0));
+        try state.writeRegister(.context, 0x3b0, ((extent[0] - 1) << 14) | (extent[1] - 1) | (7 << 28));
+        try state.writeRegister(.context, 0x3b8, (@as(u32, @intFromEnum(mode)) << 14) | (1 << 24));
+        for ([_]u32{ 0, 1 }) |slice| for ([_]u32{ 0, 1, 2, 3, 4, 5, 6, 7, 0 }) |level| {
+            const view = try texture.subresource(@intCast(level), slice, 1);
+            const pixels = try allocator.alloc(u8, @intCast(try view.stagingBytes()));
+            defer allocator.free(pixels);
+            try view.detile(expected, pixels);
+            var draw = try d3d12.Draw.fullTarget(view.width, view.height);
+            draw.color_format = if (format == 12) 10 else 28;
+            try device.drawSpirv(native_vs.words, native_ps.words, draw, pixels);
+            try view.tile(pixels, expected);
+            try state.writeRegister(.context, 0x31b, slice | (slice << 13) | (level << 26));
+            try renderer.draw(&state, packet);
+            // Changing the selected mip/slice must publish the preceding
+            // queued view before staging the next one. Compare after the
+            // final return to level zero, including every neighbor/guard byte.
+            cases += 1;
+        };
+        try renderer.flushDraws();
+        if (!std.mem.eql(u8, expected, memory.data[0x10000..])) {
+            std.debug.print("Mip target mismatch {d}x{d} format={d} mode={s}\n", .{ extent[0], extent[1], format, @tagName(mode) });
+            return error.MipTargetNeighborMismatch;
+        }
+    };
+    // Matching MRT views can come from different-sized base allocations.
+    // Conversely, equal base extents do not imply equal selected mip extents.
+    var mrt: std.ArrayList(u32) = .empty;
+    defer mrt.deinit(allocator);
+    try mrt.appendSlice(allocator, fragment[0 .. fragment.len - 3]);
+    try mrt.appendSlice(allocator, &.{ 0xf800000f, 0x03020100, 0xf800081f, 0x03020100, 0xbf810000 });
+    @memcpy(memory.data[0x400..][0 .. mrt.items.len * 4], std.mem.sliceAsBytes(mrt.items));
+    var state = try graphicsState(128, 128, 128);
+    try state.writeRegister(.context, 0x318, 0x100);
+    try state.writeRegister(.context, 0x31b, 1 << 26);
+    try state.writeRegister(.context, 0x3b0, (127 << 14) | 127 | (7 << 28));
+    try state.writeRegister(.context, 0x3b8, (27 << 14) | (1 << 24));
+    try state.writeRegister(.context, 0x327, 0x700);
+    try state.writeRegister(.context, 0x328, 7);
+    try state.writeRegister(.context, 0x32a, 0);
+    try state.writeRegister(.context, 0x32b, 10 << 2);
+    try state.writeRegister(.context, 0x391, 0);
+    try state.writeRegister(.context, 0x3b1, (63 << 14) | 63 | (6 << 28));
+    try state.writeRegister(.context, 0x3b9, (27 << 14) | (1 << 24));
+    try state.writeRegister(.context, 0x08e, 255);
+    try state.writeRegister(.context, 0x08f, 255);
+    @memset(memory.data[0x10000..], 0);
+    try renderer.draw(&state, packet);
+    try renderer.flushDraws();
+    for (0..2) |slot| {
+        const target = gpu.resources.decodeColorTarget(&state, @intCast(slot), 255).?;
+        const layout = try d3d12.surfaces.colorLayout(target);
+        var result = try d3d12.surfaces.Staged.read(allocator, memory.access(), target.address, layout);
+        defer result.deinit();
+        if (!std.mem.eql(u8, result.pixels[(32 * 64 + 32) * 4 ..][0..4], &.{ 255, 0, 0, 255 })) return error.MipMrtOutputMismatch;
+    }
+    const before = try allocator.dupe(u8, &memory.data);
+    defer allocator.free(before);
+    try state.writeRegister(.context, 0x32a, 1 << 26); // Second view is now 32x32.
+    try std.testing.expectError(error.MismatchedRenderTargetExtents, renderer.draw(&state, packet));
+    if (!std.mem.eql(u8, before, &memory.data)) return error.RejectedMipMrtModifiedMemory;
+    std.debug.print("PASS {d} mip/slice target draws: RGBA8/RGBA16F, linear/R/Z layouts, odd extents, all tail levels, queued view changes, untouched neighbors and effective MRT extents\n", .{cases});
+}
+
+fn guestSrgbTargetProbe(allocator: std.mem.Allocator, vertex: []const u32, fragment: []const u32) !void {
+    const memory = try allocator.create(GraphicsMemory);
+    defer allocator.destroy(memory);
+    memory.* = .{};
+    @memcpy(memory.data[0x200..][0 .. vertex.len * 4], std.mem.sliceAsBytes(vertex));
+    @memcpy(memory.data[0x400..][0 .. fragment.len * 4], std.mem.sliceAsBytes(fragment));
+    var renderer = try d3d12.Renderer.init(allocator, memory.access(), false);
+    defer renderer.deinit();
+    var state = try graphicsState(65, 37, 72);
+    const packet = gpu.pm4.Packet{ .kind = .command, .header = command(gpu.pm4.draw_index_auto, 2), .opcode = gpu.pm4.draw_index_auto, .body = &.{ 3, 2 } };
+    try renderer.draw(&state, packet);
+    try renderer.flushDraws();
+    const coverage = memory.data[0x2000..0x5000].*;
+    const source = [4]f32{ 0.002, 0.25, 0.7, 0.5 };
+    const destination = [4]u8{ 64, 128, 192, 160 };
+    const shader = [_]u32{
+        vop1(1, 0, 255), @bitCast(source[0]), vop1(1, 1, 255), @bitCast(source[1]),
+        vop1(1, 2, 255), @bitCast(source[2]), vop1(1, 3, 255), @bitCast(source[3]),
+        0xf800080f,      0x03020100,          0xbf810000,
+    };
+    @memcpy(memory.data[0x400..][0..@sizeOf(@TypeOf(shader))], std.mem.asBytes(&shader));
+    try state.writeRegister(.context, 0x318, 0x100);
+    try state.writeRegister(.context, 0x3b8, 27 << 14);
+    try state.writeRegister(.context, 0x325, 0xa00);
+    try state.writeRegister(.context, 0x3a8, 0);
+    var cases: usize = 0;
+    // Revisit UNORM after SRGB on the same backing: RTV, PSO and retained
+    // attachment identities must distinguish the two encodings.
+    for ([_]u32{ 6, 0, 6 }) |number_type| for ([_]bool{ false, true }) |bgra| for ([_]u8{ 0, 0x20, 0xff }) |dcc_key| for ([_]bool{ false, true }) |blend| {
+        var raw = destination;
+        if (bgra) std.mem.swap(u8, &raw[0], &raw[2]);
+        try state.writeRegister(.context, 0x31c, (10 << 2) | (number_type << 8) | (if (bgra) @as(u32, 1 << 11) else 0) | (if (dcc_key != 0) @as(u32, 1 << 28) else 0));
+        try state.writeRegister(.context, 0x323, std.mem.readInt(u32, &raw, .little));
+        try state.writeRegister(.context, 0x1e0, if (blend) (1 << 30) | 8 else 0); // src * destination color/alpha.
+        const target = gpu.resources.decodeColorTarget(&state, 0, 15).?;
+        const layout = try d3d12.surfaces.colorLayout(target);
+        const backing = memory.data[0x10000..][0..@intCast(layout.required_source_bytes)];
+        const keys = memory.data[0xa0000..][0..d3d12.surfaces.Dcc.blockCount(backing.len)];
+        for (0..backing.len / 4) |i| @memcpy(backing[i * 4 ..][0..4], &raw);
+        if (dcc_key == 0x20) @memset(backing, 0xa7); // All bits come from the register clear.
+        @memset(keys, dcc_key);
+        const expected = try allocator.alloc(u8, backing.len);
+        defer allocator.free(expected);
+        for (0..expected.len / 4) |i| @memcpy(expected[i * 4 ..][0..4], &raw);
+        var output: [4]u8 = undefined;
+        for (0..4) |channel| {
+            const srgb = number_type == 6 and channel != 3;
+            var dst = @as(f32, @floatFromInt(destination[channel])) / 255;
+            if (srgb) dst = if (dst <= 0.04045) dst / 12.92 else std.math.pow(f32, (dst + 0.055) / 1.055, 2.4);
+            var value = source[channel] * (if (blend) dst else 1);
+            if (srgb) value = if (value <= 0.0031308) value * 12.92 else 1.055 * std.math.pow(f32, value, 1.0 / 2.4) - 0.055;
+            output[channel] = @intFromFloat(@round(value * 255));
+        }
+        if (bgra) std.mem.swap(u8, &output[0], &output[2]);
+        for (0..37) |y| for (0..65) |x| {
+            if (coverage[(y * 72 + x) * 4] != 255) continue;
+            const offset: usize = @intCast(try layout.sourceByteOffset(@intCast(x), @intCast(y), 0));
+            @memcpy(expected[offset..][0..4], &output);
+        };
+        try renderer.draw(&state, packet);
+        try renderer.flushDraws();
+        for (backing, expected, 0..) |actual, wanted, i| if (@abs(@as(i16, actual) - wanted) > 1) {
+            std.debug.print("SRGB mismatch type={d} bgra={} dcc={x} blend={} byte={d}: {d}, expected {d}\n", .{ number_type, bgra, dcc_key, blend, i, actual, wanted });
+            return error.SrgbTargetMismatch;
+        };
+        for (keys) |key| if (key != (if (dcc_key != 0) @as(u8, 0xff) else 0)) return error.SrgbDccPublicationMismatch;
+        cases += 1;
+    };
+    std.debug.print("PASS {d} SRGB/UNORM target cases: RGB transfer curve, linear destination blending, untransformed alpha, BGRA, DCC register clears and format cache switching\n", .{cases});
+}
+
 fn guestSurfaceProbe(allocator: std.mem.Allocator, vertex: []const u32, fragment: []const u32) !void {
     var memory = try allocator.create(GraphicsMemory);
     defer allocator.destroy(memory);
@@ -3111,7 +3362,7 @@ fn guestSurfaceProbe(allocator: std.mem.Allocator, vertex: []const u32, fragment
     try state.writeRegister(.context, 0x1e0, (1 << 30) | 8); // src * destination color.
     const bgra_target = gpu.resources.decodeColorTarget(&state, 0, 15).?;
     const bgra_layout = try d3d12.surfaces.colorLayout(bgra_target);
-    var logical = try d3d12.surfaces.Staged.readColor(allocator, null, null, memory.access(), bgra_target.address, bgra_layout, null, true);
+    var logical = try d3d12.surfaces.Staged.readColor(allocator, null, null, memory.access(), bgra_target.address, bgra_layout, null, true, null);
     defer logical.deinit();
     for (0..259 * 145) |i| logical.pixels[i * 4 ..][0..4].* = .{ 51, 102, 153, 255 };
     try logical.write(memory.access());
@@ -3235,6 +3486,104 @@ fn mipProbeColor(layer: usize, level: usize, compressed: bool) [4]u8 {
         color[2] = @intCast((@as(u32, color[2] >> 3) * 255 + 15) / 31);
     }
     return color;
+}
+
+fn bc6ProbeEndpoints(layer: usize, level: usize, signed: bool) [3]i16 {
+    const positive = [4][3]i16{ .{ 0, 495, 800 }, .{ 1023, 700, 300 }, .{ 250, 650, 900 }, .{ 990, 10, 511 } };
+    const negative = [4][3]i16{ .{ -247, 248, 400 }, .{ 511, -511, 0 }, .{ 200, -100, 350 }, .{ -400, 300, 100 } };
+    return (if (signed) negative else positive)[(layer + level) % 4];
+}
+
+// Independent mode-11 constant-endpoint reference, following the specified
+// unquantize/finish steps (not the renderer's upload/translation code):
+// https://learn.microsoft.com/en-us/windows/win32/direct3d11/bc6h-format
+fn bc6ProbeHalf(value: i16, signed: bool) u16 {
+    const magnitude: u32 = @intCast(@abs(value));
+    const expanded: u32 = if (magnitude == 0) 0 else if (signed)
+        (if (magnitude >= 511) @as(u32, 32767) else (magnitude * 32768 + 16384) / 512)
+    else
+        (if (magnitude == 1023) @as(u32, 65535) else (magnitude * 65536 + 32768) / 1024);
+    const bits: u16 = @intCast(expanded * 31 / (if (signed) @as(u32, 32) else 64));
+    return bits | (if (value < 0) @as(u16, 0x8000) else 0);
+}
+
+fn guestBc6ImageProbe(allocator: std.mem.Allocator, vertex: []const u32, solid_pixel: []const u32) !void {
+    const memory = try allocator.create(GraphicsMemory);
+    defer allocator.destroy(memory);
+    memory.* = .{};
+    @memcpy(memory.data[0x200..][0 .. vertex.len * 4], std.mem.sliceAsBytes(vertex));
+    @memcpy(memory.data[0x400..][0 .. solid_pixel.len * 4], std.mem.sliceAsBytes(solid_pixel));
+    var renderer = try d3d12.Renderer.init(allocator, memory.access(), false);
+    defer renderer.deinit();
+    var state = try graphicsState(65, 37, 72);
+    const packet = gpu.pm4.Packet{ .kind = .command, .header = command(gpu.pm4.draw_index_auto, 2), .opcode = gpu.pm4.draw_index_auto, .body = &.{ 3, 2 } };
+    try renderer.draw(&state, packet);
+    const coverage = memory.data[0x2000..0x5000].*;
+    try state.writeRegister(.context, 0x31c, (12 << 2) | (7 << 8)); // Preserve negative and HDR output as half floats.
+    try state.writeRegister(.shader, 0x00b, 14 << 1);
+    try state.writeRegister(.shader, 0x014, 0x92);
+    try state.writeRegister(.shader, 0x015, 0xfff000);
+    try state.writeRegister(.shader, 0x016, 2 << 26); // Linear LOD blend, point XY.
+    var cases: usize = 0;
+    for ([_]u32{ 8, 256 }) |size| for ([_]u32{ 0, 1, 2 }) |dimension| for ([_]bool{ false, true }) |signed| for ([_]gpu.resources.TileMode{ .linear, .standard_4kb }) |mode| {
+        const levels: u32 = if (size == 8) 4 else 9;
+        const layers: u32 = if (dimension == 0) 1 else 6;
+        const image_type: u32 = if (dimension == 0) 9 else if (dimension == 1) 11 else 13;
+        const format: u32 = if (signed) 180 else 179;
+        const words = [_]u32{ 0x100, (format << 20) | (((size - 1) & 3) << 30), ((size - 1) >> 2) | ((size - 1) << 14), (image_type << 28) | 0xfac | ((levels - 1) << 16) | (@as(u32, @intFromEnum(mode)) << 20), layers - 1, (levels - 1) << 4, 0, 0 };
+        const texture = try gpu.TextureLayout.fromImage(try gpu.resources.decodeImageDescriptor(&words));
+        if (texture.required_source_bytes > memory.data.len - 0x10000) return error.Bc6ProbeTooLarge;
+        const backing = memory.data[0x10000..][0..@intCast(texture.required_source_bytes)];
+        @memset(backing, 0xab);
+        for (0..layers) |layer| for (0..levels) |level| {
+            const view = try texture.subresource(@intCast(level), @intCast(layer), 1);
+            const blocks = try allocator.alloc(u8, @intCast(try view.stagingBytes()));
+            defer allocator.free(blocks);
+            var encoded: u128 = 3; // Mode 11: two independent 10-bit RGB endpoints.
+            for (0..2) |endpoint| for (bc6ProbeEndpoints(layer, level, signed), 0..) |value, channel| {
+                encoded |= @as(u128, @as(u16, @bitCast(value)) & 1023) << @intCast(5 + endpoint * 30 + channel * 10);
+            };
+            for (0..blocks.len / 16) |i| std.mem.writeInt(u128, blocks[i * 16 ..][0..16], encoded, .little);
+            try view.tile(blocks, backing);
+        };
+        const before = try allocator.dupe(u8, backing);
+        defer allocator.free(before);
+        for (words, 0..) |word, i| try state.writeRegister(.shader, 0x00c + @as(u32, @intCast(i)), word);
+        const sample_dim: u32 = if (dimension == 0) 1 else if (dimension == 1) 3 else 5;
+        const shader = [_]u32{ vop1(1, 0, 255), @bitCast(@as(f32, if (dimension == 1) 1.5 else 0.5)), vop1(1, 1, 256), vop1(1, 2, 12), vop1(1, 3, 13), 0xf0900f00 | (sample_dim << 3), 0x00400400, 0xf800080f, 0x07060504, 0xbf810000 };
+        @memcpy(memory.data[0x400..][0..@sizeOf(@TypeOf(shader))], std.mem.asBytes(&shader));
+        for ([_]u32{ 0, layers - 1 }) |layer| for (0..levels * 2 - 1) |step| {
+            const lod: f32 = @as(f32, @floatFromInt(step)) * 0.5;
+            try state.writeRegister(.shader, 0x018, @bitCast(if (dimension == 0) lod else @as(f32, @floatFromInt(layer))));
+            try state.writeRegister(.shader, 0x019, @bitCast(lod));
+            @memset(memory.data[0x2000..0x8000], 0x37);
+            try renderer.draw(&state, packet);
+            var expected = [4]u16{ 0, 0, 0, 0x3c00 };
+            const low = bc6ProbeEndpoints(layer, step / 2, signed);
+            const high = bc6ProbeEndpoints(layer, (step + 1) / 2, signed);
+            for (0..3) |channel| {
+                const a: f16 = @bitCast(bc6ProbeHalf(low[channel], signed));
+                const b: f16 = @bitCast(bc6ProbeHalf(high[channel], signed));
+                expected[channel] = @bitCast(@as(f16, @floatCast((@as(f32, a) + @as(f32, b)) * 0.5)));
+            }
+            for (0..37) |y| for (0..72) |x| for (0..4) |channel| {
+                const covered = x < 65 and coverage[(y * 72 + x) * 4] == 255;
+                const wanted: u16 = if (covered) expected[channel] else 0x3737;
+                const actual = std.mem.readInt(u16, memory.data[0x2000 + ((y * 72 + x) * 4 + channel) * 2 ..][0..2], .little);
+                if (@abs(@as(i32, actual) - wanted) > 1) {
+                    std.debug.print("BC6 mismatch size={d} dim={d} signed={} mode={s} layer={d} lod={d} channel={d}: 0x{x}, expected 0x{x}\n", .{ size, dimension, signed, @tagName(mode), layer, lod, channel, actual, wanted });
+                    return error.Bc6HdrSamplingMismatch;
+                }
+            };
+            cases += 1;
+        };
+        if (!std.mem.eql(u8, before, backing)) return error.Bc6SourceModified;
+    };
+    const before = memory.data[0x2000..0x8000].*;
+    try state.writeRegister(.shader, 0x014, 0x92 | (1 << 20));
+    try std.testing.expectError(error.GraphicsSamplerModeNotImplemented, renderer.draw(&state, packet));
+    if (!std.mem.eql(u8, &before, memory.data[0x2000..0x8000])) return error.Bc6InvalidSrgbModifiedTarget;
+    std.debug.print("PASS {d} BC6H UF16/SF16 frame checks: negative/HDR half values, 2D/cube/array, 256x256 GTA layout, nine mips through 1x1, linear LOD blends, source/padding preservation and invalid sRGB rejection\n", .{cases});
 }
 
 fn guestMipImageProbe(allocator: std.mem.Allocator, vertex: []const u32, solid_pixel: []const u32) !void {
@@ -3865,6 +4214,7 @@ fn guestResourcesProbe(allocator: std.mem.Allocator, staging_limit: usize, uploa
     try guestNarrowImageProbe(allocator, memory, &state, &executor, &renderer);
     try guestArrayImageProbe(allocator, memory, &state, &executor, &renderer);
     try guestTexelCoordinatesProbe(allocator, memory, &state, &executor, &renderer, &vs);
+    try guestNormalizedAddressProbe(allocator, memory, &state, &executor, &vs);
     // A missing input must fail before touching the output attachment.
     const before = memory.data[0x2000..0x5000].*;
     try state.writeRegister(.shader, 0x04c, memory.data.len + 256);
@@ -4181,6 +4531,59 @@ fn guestArrayImageProbe(allocator: std.mem.Allocator, memory: *GraphicsMemory, s
     if (renderer.draw(state, packet)) |_| return error.InvalidCubeAccepted else |err| if (err != error.GraphicsTextureFormatOrMipNotImplemented) return err;
     if (!std.mem.eql(u8, &before_target, memory.data[0x2000..0x5000])) return error.RejectedCubeModifiedTarget;
     std.debug.print("PASS {d} array/cube full-frame comparisons: all faces of two cubes, base slices, RGBA8/BC1, linear/tiled uploads, mixed 2D/cube banks and invalid shape isolation\n", .{cases});
+}
+
+fn guestNormalizedAddressProbe(allocator: std.mem.Allocator, memory: *GraphicsMemory, state: *gpu.State, executor: *gpu.DcbExecutor, vertex: []const u32) !void {
+    // RG8 gradient from guestNarrowImageProbe; calculate point/bilinear taps
+    // independently, including border contributions and negative coordinates.
+    const saved_state = state.*;
+    defer state.* = saved_state;
+    const source = memory.data[0x10000..0x11000].*;
+    var words: std.ArrayList(u32) = .empty;
+    defer words.deinit(allocator);
+    var cases: usize = 0;
+    for ([_]u32{ 3, 6 }) |mode| for ([_]u32{ 0, 1 }) |filter| for ([_]u32{ 0, 1, 2 }) |border| {
+        for ([_][2]f32{ .{ -1.4, -0.25 }, .{ -0.5, 0.5 }, .{ 0.125, 0.25 }, .{ 1, 1 }, .{ 2.25, -3 } }) |uv| {
+            words.clearRetainingCapacity();
+            try words.appendSlice(allocator, vertex[0 .. vertex.len - 3]);
+            try words.appendSlice(allocator, &.{ vop1(0x01, 6, 255), @bitCast(uv[0]), vop1(0x01, 7, 255), @bitCast(uv[1]) });
+            try words.appendSlice(allocator, vertex[vertex.len - 3 ..]);
+            @memcpy(memory.data[0x200..][0 .. words.items.len * 4], std.mem.sliceAsBytes(words.items));
+            try state.writeRegister(.shader, 0x014, mode | (mode << 3) | (mode << 6));
+            try state.writeRegister(.shader, 0x016, (filter << 20) | (filter << 22));
+            try state.writeRegister(.shader, 0x017, border << 30);
+            @memset(memory.data[0x2000..0x5000], 0);
+            _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 2 });
+            const x = (if (mode == 3) @abs(uv[0]) else uv[0]) * 13 - (if (filter == 1) @as(f32, 0.5) else 0);
+            const y = (if (mode == 3) @abs(uv[1]) else uv[1]) * 9 - (if (filter == 1) @as(f32, 0.5) else 0);
+            const ix: i32 = @intFromFloat(@floor(x));
+            const iy: i32 = @intFromFloat(@floor(y));
+            const fx = x - @floor(x);
+            const fy = y - @floor(y);
+            var expected: [4]f32 = .{ 0, 0, 0, 255 };
+            const count: usize = if (filter == 1) 2 else 1;
+            for (0..count) |dy| for (0..count) |dx| {
+                const tx = ix + @as(i32, @intCast(dx));
+                const ty = iy + @as(i32, @intCast(dy));
+                const outside = mode == 6 and (tx < 0 or tx >= 13 or ty < 0 or ty >= 9);
+                const weight: f32 = if (filter == 0) 1 else (if (dx == 0) 1 - fx else fx) * (if (dy == 0) 1 - fy else fy);
+                const r: f32 = if (outside) (if (border == 2) @as(f32, 255) else 0) else @floatFromInt(20 + std.math.clamp(tx, 0, 12) * 11);
+                const g: f32 = if (outside) (if (border == 2) @as(f32, 255) else 0) else @floatFromInt(40 + std.math.clamp(ty, 0, 8) * 19);
+                expected[0] += r * weight;
+                expected[1] += g * weight;
+            };
+            for ([_][2]usize{ .{ 30, 23 }, .{ 34, 23 }, .{ 30, 15 }, .{ 34, 15 } }) |point| {
+                const actual = memory.data[0x2000 + (point[1] * 72 + point[0]) * 4 ..][0..4];
+                for (actual, expected) |a, e| if (@abs(@as(f32, @floatFromInt(a)) - e) > 1.1) {
+                    std.debug.print("Normalized address mismatch mode={d} filter={d} border={d} uv={any}: {any} expected {any}\n", .{ mode, filter, border, uv, actual, expected });
+                    return error.NormalizedAddressMismatch;
+                };
+            }
+            cases += 1;
+        }
+    };
+    if (!std.mem.eql(u8, &source, memory.data[0x10000..0x11000])) return error.AddressProbeModifiedSource;
+    std.debug.print("PASS {d} normalized mirror-once/border draws: CPU point/bilinear references, all fixed border colors, negative and out-of-range coordinates\n", .{cases});
 }
 
 fn guestTexelCoordinatesProbe(allocator: std.mem.Allocator, memory: *GraphicsMemory, state: *gpu.State, executor: *gpu.DcbExecutor, renderer: *d3d12.Renderer, vertex: []const u32) !void {

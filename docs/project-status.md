@@ -60,6 +60,17 @@ supplied locally and is not included in this repository.
 
 ## Dated development reports
 
+**November 12, 2026 — GTA III DirectX 12 startup progress:** native sampler
+address modes, single-sample CMASK fast clears and sRGB color targets remove
+successive startup rejections. The legal notice and illustrated loading screen
+now render. Color mip/slice views pass target validation in the next reflection
+draw; BC6H unsigned/signed HDR sampling is implemented and hardware-tested,
+with its in-game follow-up still pending. **57/57 D3D12 tests** and the complete
+native GPU suite pass, including 180 sampler, 36 sRGB, 216 mip/slice and 576 BC6H
+checks. The standard runner is rebuilt. **DirectX menu, gameplay and FPS are
+not yet verified; the existing playable grade refers to Vulkan.**
+[Implementation, remaining boundary and captures](development/gta3-d3d12-startup-2026-11-12.md).
+
 **November 7, 2026 — Jets 'n' Guns 2 DirectX 12 performance:** retain ordered
 draws across GPU acquire packets, use the bounded copy pool, and enlarge the
 surface-conversion cache. The menu measures **1.22 FPS** over 40 presentations

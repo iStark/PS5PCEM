@@ -406,9 +406,9 @@ pub const Device = struct {
         for (buffers) |buffer| if (buffer.size == 0 or buffer.size % 4 != 0 or buffer.size > 256 * 1024 * 1024) return error.InvalidArgument;
         for (images) |image| {
             if (image.size != try sampledImageMipChainSize(image.width, image.height, image.format, image.layers, image.dimension, image.mip_levels) or image.srgb > 1 or
-                ((image.format == 10 or image.format == 24 or image.format == 54 or image.format == 41 or image.format == 34 or image.format == 56 or image.format == 61 or image.format == 49 or image.format == 115) and image.srgb != 0) or
-                image.address_u < 1 or image.address_u > 4 or image.address_v < 1 or image.address_v > 4 or
-                image.address_w < 1 or image.address_w > 4 or image.filter & ~@as(u32, 0x15) != 0 or
+                ((image.format == 10 or image.format == 24 or image.format == 54 or image.format == 41 or image.format == 34 or image.format == 56 or image.format == 61 or image.format == 49 or image.format == 115 or image.format == 95 or image.format == 96) and image.srgb != 0) or
+                image.address_u < 1 or image.address_u > 5 or image.address_v < 1 or image.address_v > 5 or
+                image.address_w < 1 or image.address_w > 5 or image.filter & ~@as(u32, 0x15) != 0 or
                 !std.math.isFinite(image.min_lod) or !std.math.isFinite(image.max_lod) or !std.math.isFinite(image.lod_bias) or
                 image.min_lod > image.max_lod) return error.InvalidArgument;
         }
@@ -469,7 +469,7 @@ pub fn colorSize(width: u32, height: u32, format: u32) Error!usize {
         10 => rgba * 2, // R16G16B16A16_FLOAT
         2 => rgba * 4, // R32G32B32A32_FLOAT
         61 => rgba / 4, // R8_UNORM
-        24, 26, 28, 31, 34 => rgba,
+        24, 26, 28, 29, 31, 34 => rgba,
         else => return error.InvalidArgument,
     };
     if (size > 256 * 1024 * 1024) return error.InvalidArgument;
@@ -480,7 +480,7 @@ pub fn colorSize(width: u32, height: u32, format: u32) Error!usize {
 pub const max_sampled_image_bytes = 512 * 1024 * 1024;
 
 pub fn isBlockCompressedFormat(format: u32) bool {
-    return format == 71 or format == 74 or format == 77 or format == 98;
+    return format == 71 or format == 74 or format == 77 or format == 95 or format == 96 or format == 98;
 }
 
 pub fn sampledImageMipChainSize(width: u32, height: u32, format: u32, layers: u32, dimension: u32, mip_levels: u32) Error!usize {
@@ -528,7 +528,7 @@ pub fn sampledImageSize(width: u32, height: u32, format: u32) Error!usize {
     if (width % 4 != 0 or height % 4 != 0) return error.InvalidArgument;
     const bytes: usize = switch (format) {
         71 => 8, // BC1_UNORM
-        74, 77, 98 => 16, // BC2_UNORM / BC3_UNORM / BC7_UNORM
+        74, 77, 95, 96, 98 => 16, // BC2 / BC3 / BC6H unsigned/signed HDR / BC7
         else => return error.InvalidArgument,
     };
     return @as(usize, width / 4) * (height / 4) * bytes;
@@ -621,7 +621,12 @@ test "sampled BC footprints count blocks and reject unsupported native extents" 
     try std.testing.expectEqual(@as(usize, 0x15555570), try sampledImageMipChainSize(16384, 16384, 98, 1, 0, 15));
     try std.testing.expectError(error.InvalidArgument, sampledImageMipChainSize(16384, 16384, 98, 2, 2, 15));
     try std.testing.expectError(error.InvalidArgument, sampledImageArraySize(8, 8, 98, 4, 3));
-    try std.testing.expectError(error.InvalidArgument, sampledImageSize(4, 4, 95));
+    for ([_]u32{ 95, 96 }) |format| {
+        try std.testing.expectEqual(@as(usize, 16), try sampledImageSize(4, 4, format));
+        try std.testing.expectEqual(@as(usize, 524448), try sampledImageMipChainSize(256, 256, format, 6, 1, 9));
+        try std.testing.expectError(error.InvalidArgument, sampledImageArraySize(8, 8, format, 4, 3));
+    }
+    try std.testing.expectError(error.InvalidArgument, sampledImageSize(4, 4, 94)); // Typeless needs an explicit view.
     try std.testing.expectError(error.InvalidArgument, sampledImageSize(16388, 4, 71));
     // Signed and wider UNORM/float texels keep their native byte widths.
     try std.testing.expectEqual(@as(usize, 3 * 7), try sampledImageSize(3, 7, 63));

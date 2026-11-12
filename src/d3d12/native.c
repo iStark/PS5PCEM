@@ -1769,7 +1769,8 @@ static UINT color_bytes_per_pixel(uint32_t format) {
     case DXGI_FORMAT_R16G16B16A16_FLOAT: return 8;
     case DXGI_FORMAT_R32G32B32A32_FLOAT: return 16;
     case DXGI_FORMAT_R8_UNORM: return 1;
-    case DXGI_FORMAT_R8G8B8A8_UNORM: case DXGI_FORMAT_R8G8B8A8_SNORM: case DXGI_FORMAT_R16G16_FLOAT:
+    case DXGI_FORMAT_R8G8B8A8_UNORM: case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+    case DXGI_FORMAT_R8G8B8A8_SNORM: case DXGI_FORMAT_R16G16_FLOAT:
     case DXGI_FORMAT_R10G10B10A2_UNORM: case DXGI_FORMAT_R11G11B10_FLOAT: return 4;
     default: return 0;
     }
@@ -1805,6 +1806,7 @@ static int valid_sampled_image(const Ps5D3D12Image *image) {
     case DXGI_FORMAT_R8_UNORM: case DXGI_FORMAT_R8_SNORM: bytes = 1; if (image->srgb) return 0; break;
     case DXGI_FORMAT_R16_UNORM: case DXGI_FORMAT_R16_FLOAT: case DXGI_FORMAT_R8G8_UNORM: case DXGI_FORMAT_B4G4R4A4_UNORM: case DXGI_FORMAT_R16_SNORM: case DXGI_FORMAT_R8G8_SNORM: bytes = 2; if (image->srgb) return 0; break;
     case DXGI_FORMAT_BC1_UNORM: block = 4; bytes = 8; break;
+    case DXGI_FORMAT_BC6H_UF16: case DXGI_FORMAT_BC6H_SF16: block = 4; bytes = 16; if (image->srgb) return 0; break;
     case DXGI_FORMAT_BC2_UNORM: case DXGI_FORMAT_BC3_UNORM: case DXGI_FORMAT_BC7_UNORM: block = 4; bytes = 16; break;
     default: return 0;
     }

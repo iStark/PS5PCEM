@@ -39,7 +39,7 @@ pub const DisplayBuffer = struct {
     tiling_mode: u32,
     pixel_format: u64,
 };
-const TargetKey = struct { address: u64, layout: gpu.SurfaceLayout, swap_red_blue: bool = false, native_format: u32 = 0 };
+const TargetKey = struct { address: u64, layout: gpu.SurfaceLayout, swap_red_blue: bool = false, native_format: u32 = 0, cmask: ?surfaces.Cmask = null };
 const PreparedDraw = struct {
     draw: native.Draw,
     indices: []u8,
@@ -83,6 +83,7 @@ const PendingDraws = struct {
         const end = address +| size;
         if (self.color) |color| {
             if (address < color.address + color.backing.len and color.address < end) return true;
+            if (color.cmask) |cmask| if (address < cmask.address + cmask.layout.required_bytes and cmask.address < end) return true;
             // The pending flush also rewrites the colour target's DCC keys.
             if (color.dcc) |dcc| {
                 const keys = surfaces.Dcc.blockCount(color.backing.len);
@@ -92,6 +93,7 @@ const PendingDraws = struct {
         if (self.depth) |depth| if (address < depth.address + depth.backing.len and depth.address < end) return true;
         for (self.extra_colors) |value| if (value) |color| {
             if (address < color.address + color.backing.len and color.address < end) return true;
+            if (color.cmask) |cmask| if (address < cmask.address + cmask.layout.required_bytes and cmask.address < end) return true;
             if (color.dcc) |dcc| {
                 const keys = surfaces.Dcc.blockCount(color.backing.len);
                 if (address < dcc.address + keys and dcc.address < end) return true;
@@ -868,18 +870,19 @@ pub const Renderer = struct {
         if ((state.readRegister(.context, 0) orelse 0) & ~@as(u32, 0x63) != 0) return error.DepthMetadataOperationNotImplemented;
         if (render.color_count != 0 and render.color_targets[0] == null) return error.SparseColorTargetsNotImplemented;
         const target = render.color_targets[0];
+        const color_key: ?TargetKey = if (target) |color| .{ .address = color.address, .layout = try surfaces.colorLayout(color), .swap_red_blue = color.component_swap == 1, .native_format = try surfaces.colorFormat(color), .cmask = try surfaces.Cmask.fromTarget(color, state) } else null;
+        const extent: [2]u32 = if (color_key) |color| .{ color.layout.width, color.layout.height } else if (render.depth_target) |depth| .{ depth.width, depth.height } else return error.MissingAttachment;
         var extra_keys: [7]?TargetKey = @splat(null);
         var extra_dcc: [7]?surfaces.Dcc = @splat(null);
         for (render.color_targets, 0..) |color, slot| if ((color != null) != (slot < render.color_count)) return error.SparseColorTargetsNotImplemented;
         for (1..@max(1, render.color_count)) |slot| {
             const color = render.color_targets[slot] orelse return error.SparseColorTargetsNotImplemented;
-            if (color.width != target.?.width or color.height != target.?.height) return error.MismatchedRenderTargetExtents;
-            extra_keys[slot - 1] = .{ .address = color.address, .layout = try surfaces.colorLayout(color), .swap_red_blue = color.component_swap == 1, .native_format = try surfaces.colorFormat(color) };
+            const layout = try surfaces.colorLayout(color);
+            if (layout.width != extent[0] or layout.height != extent[1]) return error.MismatchedRenderTargetExtents;
+            extra_keys[slot - 1] = .{ .address = color.address, .layout = layout, .swap_red_blue = color.component_swap == 1, .native_format = try surfaces.colorFormat(color), .cmask = try surfaces.Cmask.fromTarget(color, state) };
             extra_dcc[slot - 1] = surfaces.colorDcc(color);
         }
-        const extent: [2]u32 = if (target) |color| .{ color.width, color.height } else if (render.depth_target) |depth| .{ depth.width, depth.height } else return error.MissingAttachment;
         if (graphics.hasDepthPlane(state) and (state.readRegister(.context, 0x200) orelse 0) & (1 << 3) != 0) return error.DepthBoundsNotImplemented;
-        const color_key: ?TargetKey = if (target) |color| .{ .address = color.address, .layout = try surfaces.colorLayout(color), .swap_red_blue = color.component_swap == 1, .native_format = try surfaces.colorFormat(color) } else null;
         const color_dcc = if (target) |color| surfaces.colorDcc(color) else null;
         if (render.color_control.isMetadataOperation() or (target != null and
             ((state.readRegister(.context, 0x202) != null and !render.color_control.allowsAttachmentWrites(render.target_mask)) or render.color_control.logic_operation != 0xcc))) return error.ColorMetadataAndLogicOpsNotImplemented;
@@ -945,6 +948,12 @@ pub const Renderer = struct {
         if (target == null and depth_key == null) return error.MissingAttachment;
         const attachments = [_]?TargetKey{color_key} ++ extra_keys ++ [_]?TargetKey{ depth_key, stencil_key };
         for (attachments, 0..) |left, i| if (left) |a| {
+            if (a.cmask) |metadata| for (attachments) |right| if (right) |b| {
+                if (metadata.address < b.address + b.layout.required_source_bytes and b.address < metadata.address + metadata.layout.required_bytes)
+                    return error.AttachmentAliasNotImplemented;
+                if (b.cmask) |other| if (a.address != b.address and metadata.address < other.address + other.layout.required_bytes and other.address < metadata.address + metadata.layout.required_bytes)
+                    return error.AttachmentAliasNotImplemented;
+            };
             for (attachments[i + 1 ..]) |right| if (right) |b| {
                 if (a.address < b.address + b.layout.required_source_bytes and b.address < a.address + a.layout.required_source_bytes)
                     return error.AttachmentAliasNotImplemented;
@@ -1130,12 +1139,12 @@ pub const Renderer = struct {
                 self.profile.targets_ns +|= self.profile.now() -| targets_start;
             };
             var color: ?surfaces.Staged = null;
-            if (color_key) |key| color = try surfaces.Staged.readColor(self.allocator, &self.staging_pool, &self.conversion_cache, self.memory, key.address, key.layout, color_dcc, key.swap_red_blue);
+            if (color_key) |key| color = try surfaces.Staged.readColor(self.allocator, &self.staging_pool, &self.conversion_cache, self.memory, key.address, key.layout, color_dcc, key.swap_red_blue, key.cmask);
             errdefer if (color) |*value| value.deinit();
             var extra_colors: [7]?surfaces.Staged = @splat(null);
             errdefer for (&extra_colors) |*value| if (value.*) |*surface| surface.deinit();
             for (extra_keys, extra_dcc, 0..) |key, dcc, i| if (key) |value| {
-                extra_colors[i] = try surfaces.Staged.readColor(self.allocator, &self.staging_pool, &self.conversion_cache, self.memory, value.address, value.layout, dcc, value.swap_red_blue);
+                extra_colors[i] = try surfaces.Staged.readColor(self.allocator, &self.staging_pool, &self.conversion_cache, self.memory, value.address, value.layout, dcc, value.swap_red_blue, value.cmask);
             };
             var depth: ?surfaces.Staged = null;
             if (depth_key) |key| depth = try surfaces.Staged.readCached(self.allocator, &self.staging_pool, &self.conversion_cache, self.memory, key.address, key.layout);

@@ -7,17 +7,22 @@ const std = @import("std");
 const gpu = @import("gpu");
 const staging = @import("staging.zig");
 const surface_cache = @import("surface_cache.zig");
+pub const Cmask = @import("cmask.zig").Cmask;
 
 pub fn colorLayout(target: gpu.resources.ColorTarget) !gpu.SurfaceLayout {
     _ = try colorFormat(target);
     if (target.resource_type == 2 and (target.depth == 0 or target.depth > 2048 or
-        target.width > 2048 or target.height > 2048 or target.last_array_slice + @as(u32, 1) < target.depth))
+        target.width > 2048 or target.height > 2048 or target.last_array_slice + @as(u32, 1) < target.depth or
+        target.base_array_slice != 0 or target.maximum_mip != 0 or target.mip_level != 0))
         return error.UnsupportedRenderTargetLayout;
     if (target.component_swap > 1 or
-        target.samples_log2 != 0 or target.fragments_log2 != 0 or target.mip_level != 0 or
-        target.maximum_mip != 0 or (target.resource_type != 2 and target.depth > 1) or
-        target.base_array_slice != 0 or (target.resource_type != 2 and target.last_array_slice != 0) or
-        (target.dcc_enabled and target.dcc_address == 0) or target.cmask_fast_clear or target.fmask_compression or
+        target.samples_log2 != 0 or target.fragments_log2 != 0 or target.mip_level > target.maximum_mip or
+        target.resource_type > 2 or (target.resource_type != 2 and (target.depth > 1 or
+        target.base_array_slice != target.last_array_slice or target.last_array_slice >= 2048)) or
+        // DCC publication for subresources needs its own metadata view. The
+        // plain-color path can preserve all neighboring mip/slice bytes.
+        (target.dcc_enabled and (target.maximum_mip != 0 or target.base_array_slice != 0)) or
+        (target.dcc_enabled and target.dcc_address == 0) or target.fmask_compression or
         target.force_destination_alpha_one) return error.UnsupportedRenderTargetLayout;
     const layout = try gpu.SurfaceLayout.fromColorTarget(target);
     try validate(layout, target.address);
@@ -34,6 +39,7 @@ pub fn colorFormat(target: gpu.resources.ColorTarget) !u32 {
         10 => switch (target.number_type) {
             0 => 28, // R8G8B8A8_UNORM
             1 => 31, // R8G8B8A8_SNORM
+            6 => 29, // R8G8B8A8_UNORM_SRGB; native RTV encodes RGB after linear blending.
             else => return error.UnsupportedRenderTargetLayout,
         },
         5 => if (target.number_type == 7 and target.component_swap == 0) 34 else return error.UnsupportedRenderTargetLayout, // R16G16_FLOAT
@@ -48,7 +54,7 @@ pub fn colorFormat(target: gpu.resources.ColorTarget) !u32 {
     };
     // SNORM has no exact fixed clear, so its metadata stays out of this path.
     return switch (format) {
-        28, 61, 24, 26, 10 => format,
+        28, 29, 61, 24, 26, 10 => format,
         else => if (target.dcc_enabled) error.UnsupportedRenderTargetLayout else format,
     };
 }
@@ -623,6 +629,7 @@ pub const Staged = struct {
     pixels: []u8,
     cache: ?*surface_cache.Cache = null,
     dcc: ?Dcc = null,
+    cmask: ?Cmask = null,
     swap_red_blue: bool = false,
     allocator: ?std.mem.Allocator = null,
 
@@ -635,11 +642,11 @@ pub const Staged = struct {
     }
 
     pub fn readCached(allocator: std.mem.Allocator, pool: ?*staging.Pool, cache: ?*surface_cache.Cache, memory: anytype, address: u64, layout: gpu.SurfaceLayout) !Staged {
-        return readColor(allocator, pool, cache, memory, address, layout, null, false);
+        return readColor(allocator, pool, cache, memory, address, layout, null, false, null);
     }
 
     /// Reads a surface, resolving DCC fast clears first when `dcc` is set.
-    pub fn readColor(allocator: std.mem.Allocator, pool: ?*staging.Pool, cache: ?*surface_cache.Cache, memory: anytype, address: u64, layout: gpu.SurfaceLayout, dcc: ?Dcc, swap_red_blue: bool) !Staged {
+    pub fn readColor(allocator: std.mem.Allocator, pool: ?*staging.Pool, cache: ?*surface_cache.Cache, memory: anytype, address: u64, layout: gpu.SurfaceLayout, dcc: ?Dcc, swap_red_blue: bool, cmask: ?Cmask) !Staged {
         try validate(layout, address);
         if (swap_red_blue and layout.block.bytes_per_element != 4) return error.UnsupportedRenderTargetLayout;
         var backing_lease = try staging.Lease.alloc(allocator, pool, @intCast(layout.required_source_bytes));
@@ -650,9 +657,14 @@ pub const Staged = struct {
         const pixels = pixel_lease.bytes;
         if (!memory.read(memory.context, address, backing)) return error.GuestReadFailed;
         if (dcc) |metadata| try expandDcc(allocator, metadata, memory, backing);
+        if (cmask) |metadata| {
+            const keys = try metadata.read(allocator, memory);
+            defer allocator.free(keys);
+            try metadata.expand(keys, layout, backing);
+        }
         if (cache) |c| try c.detile(address, layout, backing, pixels) else try layout.detile(backing, pixels);
         if (swap_red_blue) swapChannels(pixels);
-        return .{ .backing_lease = backing_lease, .pixel_lease = pixel_lease, .layout = layout, .address = address, .backing = backing, .pixels = pixels, .cache = cache, .dcc = dcc, .swap_red_blue = swap_red_blue, .allocator = allocator };
+        return .{ .backing_lease = backing_lease, .pixel_lease = pixel_lease, .layout = layout, .address = address, .backing = backing, .pixels = pixels, .cache = cache, .dcc = dcc, .cmask = cmask, .swap_red_blue = swap_red_blue, .allocator = allocator };
     }
 
     fn expandDcc(allocator: std.mem.Allocator, dcc: Dcc, memory: anytype, backing: []u8) !void {
@@ -674,11 +686,15 @@ pub const Staged = struct {
         // Materialize fast clears in the padding too, then publish every
         // block as plain texels so later readers use the bytes written here.
         if (self.dcc) |metadata| try expandDcc(self.allocator.?, metadata, memory, self.backing);
+        const cmask_keys = if (self.cmask) |metadata| try metadata.read(self.allocator.?, memory) else null;
+        defer if (cmask_keys) |keys| self.allocator.?.free(keys);
+        if (self.cmask) |metadata| try metadata.expand(cmask_keys.?, self.layout, self.backing);
         if (self.swap_red_blue) swapChannels(self.pixels);
         defer if (self.swap_red_blue) swapChannels(self.pixels);
         if (self.cache) |c| try c.tile(self.address, self.layout, self.pixels, self.backing) else try self.layout.tile(self.pixels, self.backing);
         if (!memory.write(memory.context, self.address, self.backing)) return error.GuestWriteFailed;
         if (self.dcc) |metadata| try publishDcc(self.allocator.?, metadata, memory, self.backing.len);
+        if (self.cmask) |metadata| try metadata.publish(cmask_keys.?, memory);
     }
 
     pub fn deinit(self: *Staged) void {
