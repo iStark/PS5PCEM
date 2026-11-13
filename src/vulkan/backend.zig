@@ -27012,22 +27012,12 @@ pub const Renderer = struct {
             }
             return;
         }
-        // A four-PARAM full-screen pass is not necessarily a copy. Tetris uses
-        // this shape for its five-texture tone-map/composite shader. Bypassing
-        // it with a copy of descriptor zero discards the UI and post-processing
-        // inputs, so only take the copy fast path for the single-image cases
-        // below.
-        if (copy_replaces_target and fragment_image_count == 1 and fullscreen_corner and
-            target.descriptor.width == 3840 and target.descriptor.height == 2160 and
-            try self.emulateFullscreenSampleBlit(
-                memory,
-                target,
-                graphics_resources.descriptors[0],
-                false,
-            ))
-        {
-            return;
-        }
+        // Corner geometry and one sampled image do not prove a plain copy.
+        // OXIDE's 4K resolve uses runtime UVs to stretch a 2880x1620 region
+        // inside its 3840x2160 allocation. Execute both guest shaders: copying
+        // the whole allocation leaves the scene at 75% size while later UI
+        // still fills the screen. Rectangle completion below preserves the
+        // translated positions and parameters of these buffered draws.
         // Real vertex bindings carry projection/UV transforms independently
         // of the viewport sign. Execute those shaders instead of guessing the
         // copy orientation from a negative viewport (Unity uses both signs of

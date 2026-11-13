@@ -7438,6 +7438,130 @@ fn runFullscreenOrientationProbe(allocator: std.mem.Allocator) !void {
     std.debug.print("fullscreen orientation passed: procedural triangle and buffered indexed quad, both viewport signs, runtime UV scale/bias, guest-memory/resident sources and masked draws\n", .{});
 }
 
+/// OXIDE resolves a scaled scene from a 4K allocation with three indexed
+/// corners. Matching those corners must not bypass the VS's UV transform.
+fn runFullscreenCornerScaleProbe(allocator: std.mem.Allocator) !void {
+    const width = 3840;
+    const height = 2160;
+    const source = 0x2200000;
+    const destination = 0x20000;
+    const Memory = SizedGuestMemory(72 * 1024 * 1024);
+    const guest = try allocator.create(Memory);
+    defer allocator.destroy(guest);
+    guest.* = .{};
+    var memory = guest.interface();
+    memory.shader_header = struct {
+        fn header(_: ?*anyopaque, program: u64) ?u64 {
+            return if (program == 0x700) 0xe000 else null;
+        }
+    }.header;
+    // Position metadata makes this the same resource-backed corner path as
+    // a title's AGC vertex table, including rectangle completion.
+    guest.word(0xe008, 0xe100);
+    guest.word(0xe030, 0xe200);
+    guest.word(0xe050, 1);
+    guest.word(0xe100, 0xe180);
+    guest.word(0xe12c, 11);
+    @memset(guest.bytes[0xe180..0xe196], 0xff);
+    std.mem.writeInt(u16, guest.bytes[0xe190..][0..2], 8, .little);
+    std.mem.writeInt(u16, guest.bytes[0xe194..][0..2], 10, .little);
+    guest.word(0xe200, 4 << 16);
+    guest.word(0xe800, 77 << 5);
+    for ([_]u32{ 0x14000, 32 << 16, 3, (77 << 12) | 0xfac }, 0..) |word, i|
+        guest.word(0xf000 + i * 4, word);
+    const renderer = try allocator.create(vulkan.Renderer);
+    defer allocator.destroy(renderer);
+    renderer.* = try vulkan.Renderer.init(allocator, .{});
+    defer renderer.deinit();
+
+    const position = mubuf(0x0e, 0, 0, 5, 12);
+    const uv = mubuf(0x0d, 16, 8, 5, 12);
+    const vertex = [_]u32{
+        position[0], position[1], uv[0], uv[1],
+        0xf4280004, 0xfa000000, // runtime scale.xy, bias.xy from V#s8
+        0xbf8c0070,
+        0xd5410008, 0x00080108, // u = u*s0+s2
+        0xd5410009, 0x000c0309, // v = v*s1+s3
+        0xf80008cf, 0x03020100,
+        0xf8000203, 0x00000908,
+        0xbf810000,
+    };
+    const fragment = [_]u32{ 0xbfa00001, 0xbefc0310, 0xc8100000, 0xc8140100, 0xc8110001, 0xc8150101, 0xf0900f08, 0x00400004, 0xbf8c3f70, 0x5e000300, 0x5e020702, 0xf8001c0f, 0x00000100, 0xbf810000 };
+    for (vertex, 0..) |word, i| guest.word(0x700 + i * 4, word);
+    for (fragment, 0..) |word, i| guest.word(0x900 + i * 4, word);
+    const vertices = [_][8]f32{
+        .{ -1, -1, 0, 1, 0, 1, 0, 0 },
+        .{ -1, 1, 0, 1, 0, 0, 0, 0 },
+        .{ 1, -1, 0, 1, 1, 1, 0, 0 },
+    };
+    for (vertices, 0..) |values, i| for (values, 0..) |value, component|
+        guest.word(0x14000 + i * 32 + component * 4, @bitCast(value));
+    guest.word(0x15000, 0x00010000);
+    guest.word(0x15004, 2);
+
+    const image = sampledImageDescriptorWords(source, width, height);
+    const layout = try gpu.TextureLayout.fromImage(try gpu.resources.decodeImageDescriptor(&image));
+    const surface = try layout.base();
+    for (0..height) |y| for (0..width) |x| {
+        // Coarse cells avoid floating-point nearest-sampling boundary ties.
+        const color: u32 = 0xff330000 | (@as(u32, @intCast(x / 240)) << 8) | @as(u32, @intCast(y / 135));
+        guest.word(source + @as(usize, @intCast(try surface.sourceByteOffset(@intCast(x), @intCast(y), 0, 0))), color);
+    };
+    var state = gpu.State{};
+    const vertex_stage = gpu.resources.ShaderStage.export_shader;
+    const user_base = gpu.resources.ShaderStage.geometry.userDataBase();
+    const pixel_stage = gpu.resources.ShaderStage.pixel;
+    try state.writeRegister(.shader, vertex_stage.programRegisterBase(), 7);
+    try state.writeRegister(.shader, vertex_stage.programRegisterBase() + 1, 0);
+    // NGG reserves s0:s7; GS USER_DATA[0] is the shader's s8.
+    try state.writeRegister(.shader, user_base - 1, 12 << 1);
+    try state.writeRegister(.shader, pixel_stage.programRegisterBase(), 9);
+    try state.writeRegister(.shader, pixel_stage.programRegisterBase() + 1, 0);
+    try state.writeRegister(.shader, pixel_stage.programRegisterBase() + 3, 12 << 1);
+    for ([_]u32{ 0x12000, 0, 16, 0 }, 0..) |word, i|
+        try state.writeRegister(.shader, user_base + @as(u32, @intCast(i)), word);
+    for ([_]u32{ 0x14000, 32 << 16, 3, (77 << 12) | 0xfac }, 0..) |word, i|
+        try state.writeRegister(.shader, user_base + 4 + @as(u32, @intCast(i)), word);
+    for ([_]u32{ 0xf000, 0, 0xe800, 0 }, 0..) |word, i|
+        try state.writeRegister(.shader, user_base + 8 + @as(u32, @intCast(i)), word);
+    for (image, 0..) |word, i| try state.writeRegister(.shader, pixel_stage.userDataBase() + @as(u32, @intCast(i)), word);
+    for (0..4) |i| try state.writeRegister(.shader, pixel_stage.userDataBase() + 8 + @as(u32, @intCast(i)), 0);
+    const context = [_][2]u32{
+        .{ 0x318, destination >> 8 },        .{ 0x319, 0 },                                  .{ 0x31b, 0 },                      .{ 0x31c, 10 << 2 }, .{ 0x31d, 0 },
+        .{ 0x390, 0 },                       .{ 0x3b0, ((width - 1) << 14) | (height - 1) }, .{ 0x3b8, 1 << 24 },                .{ 0x08e, 0xf },     .{ 0x00c, 0 },
+        .{ 0x00d, width | (height << 16) },  .{ 0x094, 1 << 31 },                            .{ 0x095, width | (height << 16) }, .{ 0x1e0, 0 },       .{ 0x200, 0 },
+        .{ 0x202, (0xcc << 16) | (1 << 4) }, .{ 0x204, 0 },                                  .{ 0x205, 0 },                      .{ 0x191, 0 },
+    };
+    for (context) |entry| try state.writeRegister(.context, entry[0], entry[1]);
+    var executor = gpu.DcbExecutor{ .state = &state, .backend = renderer.dcbBackend(memory), .allocator = allocator };
+    const transforms = [_][4]f32{
+        .{ 0.75, 0.75, 0, 0 }, // 2880x1620 -> 3840x2160
+        .{ 0.5, 0.5, 0.25, 0.25 },
+        .{ 0.75, -0.75, 0, 0.75 },
+        .{ 1, 1, 0, 0 },
+    };
+    for (transforms, 0..) |transform, case| {
+        for ([_]f32{ width / 2, width / 2, -height / 2, height / 2, 1, 0 }, 0..) |value, i|
+            try state.writeRegister(.context, 0x10f + @as(u32, @intCast(i)), @bitCast(value));
+        for (transform, 0..) |value, i| guest.word(0x12000 + i * 4, @bitCast(value));
+        _ = try executor.execute(&.{ command(gpu.pm4.draw_index_2, 5), 3, 0x15000, 0, 3, 0 });
+        if (renderer.last_draw_error) |err| return err;
+        for (renderer.reported_shader_failures) |failure| try std.testing.expect(failure == null);
+        try renderer.flushPendingGuestWrites();
+        for (0..height) |y| for (0..width) |x| {
+            const sx: usize = @intFromFloat((@as(f64, @floatFromInt(x)) + 0.5) * transform[0] + width * transform[2]);
+            const sy: usize = @intFromFloat((@as(f64, @floatFromInt(y)) + 0.5) * transform[1] + height * transform[3]);
+            const expected: u32 = 0xff330000 | (@as(u32, @intCast(sx / 240)) << 8) | @as(u32, @intCast(sy / 135));
+            const actual = std.mem.readInt(u32, guest.bytes[destination + (y * width + x) * 4 ..][0..4], .little);
+            if (actual != expected) {
+                std.debug.print("4K corner resolve case={d} pixel={d},{d}: expected={x} actual={x}\n", .{ case, x, y, expected, actual });
+                return error.FullscreenCornerScaleMismatch;
+            }
+        };
+    }
+    std.debug.print("4K indexed corner resolves preserve runtime UV scaling, cropping and inversion: four complete frames verified\n", .{});
+}
+
 noinline fn runFullscreenOrientationCase(allocator: std.mem.Allocator, indexed: bool) !void {
     const renderer = try allocator.create(vulkan.Renderer);
     defer allocator.destroy(renderer);
@@ -15878,6 +16002,10 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--fullscreen-orientation")) {
         try runFullscreenOrientationProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--fullscreen-corner-scale")) {
+        try runFullscreenCornerScaleProbe(allocator);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--guest-culling")) {
