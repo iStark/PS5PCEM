@@ -298,6 +298,20 @@ const Profile = struct {
     }
 };
 
+/// A recent, visibly non-black color target kept for the case where a title
+/// registers a VideoOut buffer it never actually renders into. The Vulkan
+/// backend has an equivalent completed-frame fallback; D3D12 otherwise shows
+/// the untouched (all-zero) scanout. Pixels are copied at writeback time so a
+/// later draw cannot overwrite the cached frame before presentation.
+const FallbackFrame = struct {
+    address: u64 = 0,
+    width: u32 = 0,
+    height: u32 = 0,
+    format: u32 = 0,
+    sequence: u64 = 0,
+    pixels: []u8 = &.{},
+};
+
 pub const Renderer = struct {
     allocator: std.mem.Allocator,
     device: native.Device,
@@ -322,6 +336,18 @@ pub const Renderer = struct {
     /// Optional diagnostic consumer of the exact RGBA bytes sent to DXGI.
     on_scanout: ?*const fn (?*anyopaque, u64, u32, u32, []const u8) void = null,
     scanout_context: ?*anyopaque = null,
+    /// Profile-only correlation between recent VideoOut buffers and the
+    /// render targets draws and dispatches actually touch. This observes
+    /// guest state without changing any rendering decision.
+    scanout_addresses: [8]u64 = @splat(0),
+    scanout_next: u8 = 0,
+    scanout_draw_hits: u64 = 0,
+    scanout_compute_writes: u64 = 0,
+    fallback_frame: FallbackFrame = .{},
+    fallback_reports: u8 = 0,
+    frame_targets: [16]u64 = @splat(0),
+    frame_target_counts: [16]u32 = @splat(0),
+    frame_target_count: u8 = 0,
     // One retains the immediate API contract for direct users. The runner can
     // opt into bounded grouping; no guest bytes are used as a validity stamp.
     draw_batch_limit: usize = 1,
@@ -341,6 +367,7 @@ pub const Renderer = struct {
     pub fn deinit(self: *Renderer) void {
         // Teardown does not publish unfinished work or acknowledge its labels.
         if (self.pending_draws) |*pending| pending.deinit(self.allocator);
+        if (self.fallback_frame.pixels.len != 0) self.allocator.free(self.fallback_frame.pixels);
         if (self.gds) |gds| self.allocator.free(gds);
         self.translations.deinit(self.allocator);
         self.shader_analyses.deinit();
@@ -530,7 +557,10 @@ pub const Renderer = struct {
         try self.device.drawBatchSpirv(jobs[0..pending.count], if (pending.color) |color| color.pixels else &.{}, if (pending.depth) |depth| depth.pixels else &.{});
         const write_start = self.profile.now();
         if (self.profile.enabled) self.profile.native_ns +|= write_start -| native_start;
-        if (pending.color) |*color| try color.write(self.memory);
+        if (pending.color) |*color| {
+            try color.write(self.memory);
+            if (pending.color_key) |key| try self.cacheCompletedFrame(key, key.native_format, color.pixels, self.presented_frames + 1);
+        }
         for (&pending.extra_colors) |*color| if (color.*) |*value| try value.write(self.memory);
         if (pending.depth_write or pending.htile != null) if (pending.depth) |*depth| try depth.write(self.memory);
         if (pending.stencil_write or pending.htile != null) if (pending.stencil) |*stencil| try stencil.write(self.memory);
@@ -799,6 +829,14 @@ pub const Renderer = struct {
                 (range.metadata or !compute_images.disjointMipViews(range.descriptor, entry.descriptor)))
                 return error.ComputeImageAliasNotImplemented;
         }
+        if (self.profile.enabled) {
+            for (0..storage.count) |i| {
+                if (storage.writable[i] and self.isScanoutAddress(storage.addresses[i])) self.scanout_compute_writes +|= 1;
+            }
+            for (images.entries[0..images.count], images.native_images[0..images.count]) |entry, image| {
+                if (image.writable != 0 and self.isScanoutAddress(entry.descriptor.address)) self.scanout_compute_writes +|= 1;
+            }
+        }
         self.device.dispatchResourcesSpirv(module.words, native_buffers[0..buffer_count], images.native_images[0..images.count], sampled.images.items, groups, uses_gds, module.used_dispatcher and dispatch_budget == null) catch |err| {
             std.debug.print("[d3d12 compute] program=0x{x} groups={any} local={any} error={s}\n", .{ bindings.program_address, groups, local, @errorName(err) });
             return err;
@@ -947,6 +985,14 @@ pub const Renderer = struct {
         }
         if (target == null and depth_key == null) return error.MissingAttachment;
         const attachments = [_]?TargetKey{color_key} ++ extra_keys ++ [_]?TargetKey{ depth_key, stencil_key };
+        if (self.profile.enabled) {
+            for (attachments) |attachment| {
+                if (attachment) |a| {
+                    self.noteFrameTarget(a.address);
+                    if (self.isScanoutAddress(a.address)) self.scanout_draw_hits +|= 1;
+                }
+            }
+        }
         for (attachments, 0..) |left, i| if (left) |a| {
             if (a.cmask) |metadata| for (attachments) |right| if (right) |b| {
                 if (metadata.address < b.address + b.layout.required_source_bytes and b.address < metadata.address + metadata.layout.required_bytes)
@@ -1244,28 +1290,138 @@ pub const Renderer = struct {
         return true;
     }
 
+    fn noteScanoutAddress(self: *Renderer, address: u64) void {
+        for (self.scanout_addresses) |value| if (value == address) return;
+        self.scanout_addresses[self.scanout_next] = address;
+        self.scanout_next = @intCast((self.scanout_next + 1) % self.scanout_addresses.len);
+    }
+    fn isScanoutAddress(self: *const Renderer, address: u64) bool {
+        for (self.scanout_addresses) |value| if (value == address and value != 0) return true;
+        return false;
+    }
+    fn noteFrameTarget(self: *Renderer, address: u64) void {
+        for (self.frame_targets[0..self.frame_target_count], 0..) |value, i| if (value == address) {
+            self.frame_target_counts[i] +|= 1;
+            return;
+        };
+        if (self.frame_target_count >= self.frame_targets.len) return;
+        self.frame_targets[self.frame_target_count] = address;
+        self.frame_target_counts[self.frame_target_count] = 1;
+        self.frame_target_count += 1;
+    }
+
+    /// Count 32-bit words with any RGB byte set. VideoOut buffers are commonly
+    /// cleared to opaque black, so alpha alone must not count as visible content.
+    fn nonblackRgbWords(pixels: []const u8) usize {
+        var count: usize = 0;
+        var offset: usize = 0;
+        while (offset + 4 <= pixels.len) : (offset += 4) {
+            const word = std.mem.readInt(u32, pixels[offset..][0..4], .little);
+            if (word & 0x00ff_ffff != 0) count += 1;
+        }
+        return count;
+    }
+
+    fn halfToByte(bits: u16) u8 {
+        const value: f32 = @floatCast(@as(f16, @bitCast(bits)));
+        if (!std.math.isFinite(value)) return if (value > 0) 255 else 0;
+        return @intFromFloat(@round(std.math.clamp(value, 0, 1) * 255));
+    }
+
+    fn rgba16fToRgba8(source: []const u8, destination: []u8) void {
+        var offset: usize = 0;
+        while (offset + 8 <= source.len and offset / 2 + 4 <= destination.len) : (offset += 8) {
+            for (0..4) |channel| {
+                const bits = std.mem.readInt(u16, source[offset + channel * 2 ..][0..2], .little);
+                destination[offset / 2 + channel] = halfToByte(bits);
+            }
+        }
+    }
+
+    fn cacheCompletedFrame(self: *Renderer, key: TargetKey, format: u32, pixels: []const u8, sequence: u64) !void {
+        if (key.layout.width < 1920 or key.layout.height < 1080) return;
+        if (format != 28 and format != 29 and format != 10) return;
+        const words = pixels.len / 4;
+        const nonblack = if (words == 0) 0 else nonblackRgbWords(pixels);
+        if (words == 0 or nonblack * 1000 < words) return;
+        if (sequence < self.fallback_frame.sequence) return;
+        if (sequence == self.fallback_frame.sequence and self.fallback_frame.pixels.len != 0 and
+            format == 10 and (self.fallback_frame.format == 28 or self.fallback_frame.format == 29)) return;
+        const needed = pixels.len;
+        if (self.fallback_frame.pixels.len != needed) {
+            if (self.fallback_frame.pixels.len != 0) self.allocator.free(self.fallback_frame.pixels);
+            self.fallback_frame.pixels = try self.allocator.alloc(u8, needed);
+        }
+        @memcpy(self.fallback_frame.pixels, pixels);
+        self.fallback_frame.address = key.address;
+        self.fallback_frame.width = key.layout.width;
+        self.fallback_frame.height = key.layout.height;
+        self.fallback_frame.format = format;
+        self.fallback_frame.sequence = sequence;
+    }
+
     pub fn present(self: *Renderer, flip: gpu.state.Flip) !void {
         try self.flushDraws();
         const scanout_start = self.profile.now();
         const resolve = self.display_resolver orelse return error.DisplayResolverUnavailable;
         const display = resolve(flip) orelse return error.DisplayBufferUnavailable;
         errdefer std.debug.print("[d3d12 scanout] rejected buffer={any}\n", .{display});
+        self.noteScanoutAddress(display.address);
         _ = try surfaces.scanoutSwapsRedBlue(display.pixel_format);
         const layout = try surfaces.scanoutLayout(display.width, display.height, display.pitch_in_pixels, display.tiling_mode);
         var surface = try surfaces.Staged.readCached(self.allocator, &self.staging_pool, &self.conversion_cache, self.memory, display.address, layout);
         defer surface.deinit();
         const pixels = surface.pixels;
-        try surfaces.convertScanout(pixels, display.pixel_format);
+        var nonzero_words: usize = 0;
+        if (self.profile.enabled) {
+            var offset: usize = 0;
+            while (offset + 4 <= pixels.len) : (offset += 4) {
+                if (std.mem.readInt(u32, pixels[offset..][0..4], .little) != 0) nonzero_words += 1;
+            }
+        }
+        // Some titles register a VideoOut buffer they never render into. The
+        // registered slot then stays all-zero (not even opaque black) while the
+        // completed render target holds the visible frame. Use the most recent
+        // non-black target in that case, matching the Vulkan backend's fallback.
+        const nonblack = nonblackRgbWords(pixels);
+        const words = pixels.len / 4;
+        var present_width = display.width;
+        var present_height = display.height;
+        var present_bytes = pixels.len;
+        var used_fallback = false;
+        const fallback = &self.fallback_frame;
+        if (nonblack * 1000 < words and fallback.pixels.len != 0 and fallback.width >= 1280 and fallback.height >= 720 and
+            fallback.sequence + 2 >= self.presented_frames + 1)
+        {
+            present_bytes = @as(usize, fallback.width) * fallback.height * 4;
+            if (present_bytes <= pixels.len and present_bytes <= fallback.pixels.len) {
+                if (fallback.format == 10) {
+                    rgba16fToRgba8(fallback.pixels, pixels);
+                } else {
+                    @memcpy(pixels[0..present_bytes], fallback.pixels[0..present_bytes]);
+                }
+                present_width = fallback.width;
+                present_height = fallback.height;
+                used_fallback = true;
+            }
+        }
+        try surfaces.convertScanout(pixels[0..present_bytes], display.pixel_format);
+        if (used_fallback and self.fallback_reports < 4) {
+            self.fallback_reports += 1;
+            std.debug.print("[d3d12] presenting cached non-black target 0x{x} {d}x{d} fmt={d} for unwritten scanout 0x{x}\n", .{
+                fallback.address, fallback.width, fallback.height, fallback.format, display.address,
+            });
+        }
         const present_start = self.profile.now();
         if (self.profile.enabled) self.profile.scanout_ns +|= present_start -| scanout_start;
-        try self.device.presentRgba(pixels, display.width, display.height);
+        try self.device.presentRgba(pixels[0..present_bytes], present_width, present_height);
         if (self.profile.enabled) self.profile.present_ns +|= self.profile.now() -| present_start;
         if (self.frame_started_ns == 0) std.debug.print("[d3d12] first frame presented: {d}x{d} format=0x{x} tile={d}\n", .{
             display.width, display.height, display.pixel_format, display.tiling_mode,
         });
         const now = gpu.frame_timing.timestampNs();
         self.presented_frames +|= 1;
-        if (self.on_scanout) |callback| callback(self.scanout_context, self.presented_frames, display.width, display.height, pixels);
+        if (self.on_scanout) |callback| callback(self.scanout_context, self.presented_frames, present_width, present_height, pixels[0..present_bytes]);
         if (self.cache_report_ns == 0 or now -| self.cache_report_ns >= 5 * std.time.ns_per_s) {
             if (self.profile.enabled) std.debug.print("[d3d12 profile] flip={d} clock_ms={d} cumulative_ms prepare={d} resources={d} targets={d} flush={d} native={d} publish={d} scanout={d} present={d}\n", .{
                 self.presented_frames,                          now / std.time.ns_per_ms,                     self.profile.draw_ns / std.time.ns_per_ms,
@@ -1314,6 +1470,20 @@ pub const Renderer = struct {
             });
             self.cache_report_ns = now;
         }
+        if (self.profile.enabled) {
+            std.debug.print("[d3d12 scanout] flip={d} address=0x{x} {d}x{d} format=0x{x} nonzero_words={d} draw_hits={d} compute_writes={d}\n", .{
+                self.presented_frames + 1, display.address,        display.width,               display.height, display.pixel_format,
+                nonzero_words,             self.scanout_draw_hits, self.scanout_compute_writes,
+            });
+            std.debug.print("[d3d12 targets] flip={d}", .{self.presented_frames + 1});
+            for (self.frame_targets[0..self.frame_target_count], self.frame_target_counts[0..self.frame_target_count]) |address, count| {
+                std.debug.print(" 0x{x}x{d}", .{ address, count });
+            }
+            std.debug.print("\n", .{});
+        }
+        self.scanout_draw_hits = 0;
+        self.scanout_compute_writes = 0;
+        self.frame_target_count = 0;
         if (self.frame_started_ns == 0) self.frame_started_ns = now;
         self.frames +|= 1;
         const elapsed = now -| self.frame_started_ns;
