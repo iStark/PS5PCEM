@@ -1,27 +1,46 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Artur Strazewicz
 
-//! Semantic replacement of a verified NGG triangle-copy exporter. This is
-//! not permission to ignore GS_EN: arbitrary geometry programs still reject.
+//! Verified NGG exporters that the native input assembler plus the guest ES
+//! can replace. This is not permission to ignore GS_EN: arbitrary geometry
+//! programs still reject.
 const std = @import("std");
 const gpu = @import("gpu");
 const rdna2 = @import("rdna2");
 
 pub fn triangleCopy(code: []const u32) bool {
-    // Complete 275-instruction exporter, including every control-flow edge.
-    // Reads three 7-dword ES records, emits the same three vertices/triangle,
-    // compacts the LDS records and exports POS=words 2..5, PARAM0.xy=0..1,
-    // LAYER=6. There are no user-data reads, arithmetic on payloads, external
-    // writes, culling tests or generated vertices. Native triangle assembly
-    // is equivalent to its allocation/compaction/primitive bookkeeping.
-    // The full digest intentionally fails closed for other compiler variants.
+    // Verified semantic replacements for NGG exporters whose only output is
+    // up to the three input ES records. Other compiler variants still fail
+    // closed: the digest is the proof, not the shape of the code.
     const bytes = std.mem.sliceAsBytes(code);
+    if (bytes.len == 0x6a8) {
+        // OXIDE Room 104's UE4 primitive-compaction exporter has no guest
+        // memory side effects and only forwards or drops the three ES records.
+        // Vulkan likewise routes this draw through the ES and skips the GS.
+        var variant_digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(bytes, &variant_digest, .{});
+        var variant_expected_bytes: [32]u8 = undefined;
+        const variant_expected = std.fmt.hexToBytes(&variant_expected_bytes, "8b4a8c6b8f501514cbb0e1d5edb36e0ef211fda57e1a20182b055c1625a3bd3a") catch unreachable;
+        if (std.mem.eql(u8, &variant_digest, variant_expected)) return true;
+    }
+    // Complete 275-instruction GTA III exporter, including every control-flow
+    // edge. It reads three 7-dword ES records, emits the same three
+    // vertices/triangle, compacts the LDS records and exports POS=words 2..5,
+    // PARAM0.xy=0..1, LAYER=6. There are no user-data reads, arithmetic on
+    // payloads, external writes, culling tests or generated vertices. Native
+    // triangle assembly is equivalent to its allocation/compaction/primitive
+    // bookkeeping. The full digest intentionally fails closed for other
+    // compiler variants.
     if (bytes.len < 0x674) return false;
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(bytes[0..0x674], &digest, .{});
     var expected_bytes: [32]u8 = undefined;
     const expected = std.fmt.hexToBytes(&expected_bytes, "499ab81b450d4937ebbb1da4996ce4c72203981889e2e83599e6fab7282e422e") catch unreachable;
-    return std.mem.eql(u8, &digest, expected);
+    if (!std.mem.eql(u8, &digest, expected)) {
+        std.debug.print("[d3d12 ngg] GS digest mismatch: {d} bytes sha256={x}\n", .{ bytes.len, std.mem.readInt(u64, digest[0..8], .little) });
+        return false;
+    }
+    return true;
 }
 
 /// Capture the ES payload at each LDS write, before later VGPR reuse. This

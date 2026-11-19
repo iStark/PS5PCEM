@@ -323,7 +323,6 @@ pub const DrawResources = struct {
         };
         const dcc: ?surfaces.Dcc = if (!uniform_dcc) (if (descriptor.dccMetadataAddress()) |address| .{
             .address = address,
-            .clear_word = null,
             .format = dcc_format,
         } else null) else null;
         if (!view_supported or format == 0 or

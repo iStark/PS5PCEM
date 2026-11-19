@@ -72,7 +72,7 @@ pub fn colorDcc(target: gpu.resources.ColorTarget) ?Dcc {
     };
     return .{
         .address = target.dcc_address,
-        .clear_word = target.clear_words[0],
+        .clear_words = target.clear_words,
         .format = target.format,
         .bytes_per_texel = bytes_per_texel,
         .r8 = target.format == 1,
@@ -191,11 +191,11 @@ fn validate(layout: gpu.SurfaceLayout, address: u64) !void {
 /// compressed data, which this path does not decode.
 pub const Dcc = struct {
     address: u64,
-    /// Render targets carry CB_COLOR*_CLEAR_WORD0; sampled views do not, so
+    /// Render targets carry CB_COLOR*_CLEAR_WORD0/1; sampled views do not, so
     /// code 0x20 cannot be resolved for them.
-    clear_word: ?u32,
-    /// Guest unified format. The fixed all-zeros/all-ones clears only map
-    /// directly onto texel bytes for the byte-per-channel UNORM layouts.
+    clear_words: ?[2]u32 = null,
+    /// Render-target data format. Fixed clears name the all-zeros/all-ones
+    /// channel values, which each native layout has to encode itself.
     format: u16 = 10,
     /// Tiled texel width a fast clear repeats.
     bytes_per_texel: u8 = 4,
@@ -213,32 +213,75 @@ pub const Dcc = struct {
     /// Resolves a fast-clear code into the texel bytes it implies. Null means
     /// this surface layout cannot express that clear exactly, so the caller
     /// must reject the draw instead of writing wrong texels.
-    fn texel(self: Dcc, code: u8) ?[8]u8 {
-        var value: [8]u8 = @splat(0);
+    fn texel(self: Dcc, code: u8) ?[16]u8 {
+        var value: [16]u8 = @splat(0);
+        if (self.bytes_per_texel == 0 or self.bytes_per_texel > value.len) return null;
         if (self.r8 and (code == 0 or code == 0x40 or code == 0x80 or code == 0xc0)) {
             value[0] = if (code & 0x40 != 0) 255 else 0;
             return value;
         }
-        return switch (code) {
+        switch (code) {
             // Clearing to all zeros is exact for every layout.
-            0x00 => value,
-            // The fixed clears name channel all-zeros/all-ones, which only the
-            // byte-per-channel UNORM layouts encode bit-exactly.
-            0x40, 0x80, 0xc0 => if (self.format == 1 or self.format == 10) switch (code) {
-                0x40 => .{ 0, 0, 0, 255, 0, 0, 0, 0 },
-                0x80 => .{ 255, 255, 255, 0, 0, 0, 0, 0 },
-                else => .{ 255, 255, 255, 255, 0, 0, 0, 0 },
-            } else null,
-            // CB_COLOR*_CLEAR_WORD0 holds the texel in the surface encoding,
-            // but a wider-than-word texel needs clear words this path lacks.
-            0x20 => if (self.bytes_per_texel > 0 and self.bytes_per_texel <= 4) blk: {
-                const word = self.clear_word orelse break :blk null;
-                var cleared: [8]u8 = @splat(0);
-                @memcpy(cleared[0..4], &std.mem.toBytes(std.mem.nativeToLittle(u32, word)));
-                break :blk cleared;
-            } else null,
-            else => null,
-        };
+            0x00 => return value,
+            // The fixed clears name channel all-zeros/all-ones. Each native
+            // layout encodes the one with its own integer or float pattern.
+            0x40, 0x80, 0xc0 => {
+                const channels: usize = switch (self.format) {
+                    1 => 1,
+                    5 => 2,
+                    6 => 3,
+                    9, 10, 12, 14 => 4,
+                    else => return null,
+                };
+                switch (self.format) {
+                    1 => value[0] = if (code & 0x40 != 0) 255 else 0,
+                    5, 12 => for (0..channels) |channel| {
+                        const one = code & (if (channel == 3) @as(u8, 0x40) else 0x80) != 0;
+                        if (one) std.mem.writeInt(u16, value[channel * 2 ..][0..2], 0x3c00, .little);
+                    },
+                    14 => for (0..channels) |channel| {
+                        const one = code & (if (channel == 3) @as(u8, 0x40) else 0x80) != 0;
+                        if (one) std.mem.writeInt(u32, value[channel * 4 ..][0..4], 0x3f80_0000, .little);
+                    },
+                    9 => {
+                        var bits: u32 = 0;
+                        for (0..channels) |channel| {
+                            const one = code & (if (channel == 3) @as(u8, 0x40) else 0x80) != 0;
+                            if (one) bits |= switch (channel) {
+                                0, 1, 2 => @as(u32, 1023) << @as(u5, @intCast(channel * 10)),
+                                3 => @as(u32, 3) << 30,
+                                else => 0,
+                            };
+                        }
+                        std.mem.writeInt(u32, value[0..4], bits, .little);
+                    },
+                    10 => for (0..channels) |channel| {
+                        const one = code & (if (channel == 3) @as(u8, 0x40) else 0x80) != 0;
+                        value[channel] = if (one) 255 else 0;
+                    },
+                    6 => {
+                        var bits: u32 = 0;
+                        for (0..channels) |channel| {
+                            if (code & 0x80 == 0) continue;
+                            bits |= @as(u32, 0x1e0) << @as(u5, @intCast(if (channel == 2) 22 else channel * 11));
+                        }
+                        std.mem.writeInt(u32, value[0..4], bits, .little);
+                    },
+                    else => return null,
+                }
+                return value;
+            },
+            // CB_COLOR*_CLEAR_WORD0/1 holds the texel in the surface
+            // encoding. A 128-bit texel needs more than the two words.
+            0x20 => {
+                const words = self.clear_words orelse return null;
+                if (self.bytes_per_texel > 8) return null;
+                for (0..self.bytes_per_texel) |byte|
+                    value[byte] = @truncate(words[byte / 4] >> @as(u5, @intCast((byte % 4) * 8)));
+                return value;
+            },
+            else => return null,
+        }
     }
 
     /// Rewrites every fast-cleared block of `backing` with its clear value.
@@ -251,14 +294,11 @@ pub const Dcc = struct {
         for (keys, 0..) |code, block| {
             if (code == 0xff) continue;
             const bytes = backing[block * block_bytes .. @min(backing.len, (block + 1) * block_bytes)];
-            var value: [8]u8 = undefined;
+            var value: [16]u8 = undefined;
             if (code == 0x10) {
                 if (bytes.len < texel_bytes) return error.CompressedColorTargetNotImplemented;
                 @memcpy(value[0..texel_bytes], bytes[0..texel_bytes]);
-            } else value = self.texel(code) orelse {
-                std.debug.print("[d3d12 DCC] color key=0x{x} format={d} texel_bytes={d} clear_words={any} address=0x{x}\n", .{ code, self.format, self.bytes_per_texel, self.clear_word, self.address });
-                return error.CompressedColorTargetNotImplemented;
-            };
+            } else value = self.texel(code) orelse return error.CompressedColorTargetNotImplemented;
             var offset: usize = 0;
             while (offset + texel_bytes <= bytes.len) : (offset += texel_bytes) @memcpy(bytes[offset..][0..texel_bytes], value[0..texel_bytes]);
         }
@@ -396,7 +436,7 @@ test "DCC fast-clear keys expand into the tiled backing and unknown codes are re
     var backing: [600]u8 = undefined;
     for (&backing, 0..) |*byte, i| byte.* = @truncate(i);
     var memory = Memory{ .keys = .{ 0xff, 0x20, 0x10 } };
-    const dcc = Dcc{ .address = 0x1000, .clear_word = 0x44332211 };
+    const dcc = Dcc{ .address = 0x1000, .clear_words = .{ 0x44332211, 0 } };
     var keys: [3]u8 = undefined;
     try dcc.expand(memory.access(), &backing, &keys);
     for (backing[0..256], 0..) |byte, i| try std.testing.expectEqual(@as(u8, @truncate(i)), byte);
@@ -409,7 +449,7 @@ test "DCC fast-clear keys expand into the tiled backing and unknown codes are re
     try std.testing.expectError(error.CompressedColorTargetNotImplemented, dcc.expand(memory.access(), &backing, &keys));
 }
 
-test "DCC fixed clears stay bit-exact only for byte-per-channel formats" {
+test "DCC fixed clears encode channel ones in every admitted native layout" {
     const Memory = struct {
         keys: [1]u8,
         fn read(context: ?*anyopaque, _: u64, bytes: []u8) bool {
@@ -428,40 +468,59 @@ test "DCC fixed clears stay bit-exact only for byte-per-channel formats" {
     var keys: [1]u8 = undefined;
     var memory = Memory{ .keys = .{0x00} };
     // Clearing a block to zero is format-independent: every colour reads zero.
-    for ([_]u16{ 6, 9, 10 }) |format| {
+    for ([_]struct { format: u16, bytes: u8 }{
+        .{ .format = 1, .bytes = 1 },
+        .{ .format = 5, .bytes = 4 },
+        .{ .format = 6, .bytes = 4 },
+        .{ .format = 9, .bytes = 4 },
+        .{ .format = 10, .bytes = 4 },
+        .{ .format = 12, .bytes = 8 },
+        .{ .format = 14, .bytes = 16 },
+    }) |case| {
         @memset(&backing, 0xaa);
-        const zero = Dcc{ .address = 0x1000, .clear_word = 0x44332211, .format = format };
+        const zero = Dcc{ .address = 0x1000, .clear_words = .{ 0x44332211, 0 }, .format = case.format, .bytes_per_texel = case.bytes };
         try zero.expand(memory.access(), &backing, &keys);
         try std.testing.expect(std.mem.allEqual(u8, &backing, 0));
     }
-    // The fixed all-ones clears are only exact when a byte is a whole channel.
+    // Byte-per-channel UNORM keeps the clear exact as 255.
     memory.keys[0] = 0x80;
-    try (Dcc{ .address = 0x1000, .clear_word = 0, .format = 10 }).expand(memory.access(), &backing, &keys);
+    try (Dcc{ .address = 0x1000, .clear_words = .{ 0, 0 }, .format = 10 }).expand(memory.access(), &backing, &keys);
     for (0..64) |i| try std.testing.expectEqualSlices(u8, &.{ 255, 255, 255, 0 }, backing[i * 4 ..][0..4]);
-    for ([_]u16{ 6, 9 }) |format| {
-        const packed_dcc = Dcc{ .address = 0x1000, .clear_word = 0, .format = format };
-        try std.testing.expectError(error.CompressedColorTargetNotImplemented, packed_dcc.expand(memory.access(), &backing, &keys));
-    }
-    // The clear word still resolves those formats through code 0x20.
-    memory.keys[0] = 0x20;
-    const packed_clear = Dcc{ .address = 0x1000, .clear_word = 0x3f801c00, .format = 6 };
-    try packed_clear.expand(memory.access(), &backing, &keys);
-    for (0..64) |i| try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x1c, 0x80, 0x3f }, backing[i * 4 ..][0..4]);
-    // A wider-than-word texel repeats whole and only takes format-independent
-    // clears; its fixed codes and clear word have no encoding here.
-    memory.keys[0] = 0x00;
-    @memset(&backing, 0x5a);
-    const wide = Dcc{ .address = 0x1000, .clear_word = 0x3f801c00, .format = 12, .bytes_per_texel = 8 };
+    // Half-float ones are 0x3c00, not all bits set.
+    const wide = Dcc{ .address = 0x1000, .clear_words = .{ 0x3f801c00, 0x3c003a00 }, .format = 12, .bytes_per_texel = 8 };
+    memory.keys[0] = 0x40;
     try wide.expand(memory.access(), &backing, &keys);
-    try std.testing.expect(std.mem.allEqual(u8, &backing, 0));
-    for ([_]u8{ 0x20, 0x80 }) |code| {
-        memory.keys[0] = code;
-        try std.testing.expectError(error.CompressedColorTargetNotImplemented, wide.expand(memory.access(), &backing, &keys));
-    }
+    for (0..32) |i| try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0, 0, 0, 0, 0x3c }, backing[i * 8 ..][0..8]);
+    memory.keys[0] = 0x80;
+    try wide.expand(memory.access(), &backing, &keys);
+    for (0..32) |i| try std.testing.expectEqualSlices(u8, &.{ 0, 0x3c, 0, 0x3c, 0, 0x3c, 0, 0 }, backing[i * 8 ..][0..8]);
+    memory.keys[0] = 0xc0;
+    try wide.expand(memory.access(), &backing, &keys);
+    for (0..32) |i| try std.testing.expectEqualSlices(u8, &.{ 0, 0x3c, 0, 0x3c, 0, 0x3c, 0, 0x3c }, backing[i * 8 ..][0..8]);
+    // Both CB clear words reconstruct an eight-byte texel.
+    memory.keys[0] = 0x20;
+    try wide.expand(memory.access(), &backing, &keys);
+    for (0..32) |i| try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x1c, 0x80, 0x3f, 0x00, 0x3a, 0x00, 0x3c }, backing[i * 8 ..][0..8]);
+    // RGB10A2 and R11G11B10 use their own packed one encodings.
+    memory.keys[0] = 0x80;
+    try (Dcc{ .address = 0x1000, .clear_words = .{ 0, 0 }, .format = 9 }).expand(memory.access(), &backing, &keys);
+    for (0..64) |i| try std.testing.expectEqualSlices(u8, &.{ 0xff, 0xff, 0xff, 0x3f }, backing[i * 4 ..][0..4]);
+    memory.keys[0] = 0x40;
+    try (Dcc{ .address = 0x1000, .clear_words = .{ 0, 0 }, .format = 9 }).expand(memory.access(), &backing, &keys);
+    for (0..64) |i| try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0xc0 }, backing[i * 4 ..][0..4]);
+    memory.keys[0] = 0xc0;
+    try (Dcc{ .address = 0x1000, .clear_words = .{ 0, 0 }, .format = 6 }).expand(memory.access(), &backing, &keys);
+    for (0..64) |i| try std.testing.expectEqualSlices(u8, &.{ 0xe0, 0x01, 0x0f, 0x78 }, backing[i * 4 ..][0..4]);
     memory.keys[0] = 0x10;
     for (&backing, 0..) |*byte, i| byte.* = @truncate(i);
     try wide.expand(memory.access(), &backing, &keys);
     for (0..32) |i| try std.testing.expectEqualSlices(u8, &.{ 0, 1, 2, 3, 4, 5, 6, 7 }, backing[i * 8 ..][0..8]);
+    // A clear word with no source or an unsupported fixed code still rejects.
+    memory.keys[0] = 0x20;
+    const no_words = Dcc{ .address = 0x1000, .format = 12, .bytes_per_texel = 8 };
+    try std.testing.expectError(error.CompressedColorTargetNotImplemented, no_words.expand(memory.access(), &backing, &keys));
+    memory.keys[0] = 0x55;
+    try std.testing.expectError(error.CompressedColorTargetNotImplemented, wide.expand(memory.access(), &backing, &keys));
 }
 
 test "RGBA16_UINT DCC clears materialize 16-bit integer texels at both alpha positions" {
@@ -733,7 +792,7 @@ test "color layout derives tiled and absent linear pitches without accepting com
     target.dcc_address = 0x900000;
     target.clear_words = .{ 0x11223344, 0 };
     _ = try colorLayout(target);
-    try std.testing.expectEqual(Dcc{ .address = 0x900000, .clear_word = 0x11223344 }, colorDcc(target).?);
+    try std.testing.expectEqual(Dcc{ .address = 0x900000, .clear_words = .{ 0x11223344, 0 } }, colorDcc(target).?);
     target.dcc_enabled = false;
     try std.testing.expect(colorDcc(target) == null);
     target.address = std.math.maxInt(u64) - 32;
