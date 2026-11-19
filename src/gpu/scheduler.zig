@@ -696,7 +696,7 @@ pub const Scheduler = struct {
                 const address = (@as(u64, packet.body[1]) << 32) | (packet.body[0] & 0xffff_fffc);
                 const count: usize = packet.body[3] & 0x3fff;
                 if (address != 0 and count != 0) {
-                    const word_count = std.math.mul(usize, count, 2) catch return Error.InvalidPacket;
+                    const word_count = std.math.mul(usize, count, if (packet.body[2] & 0x8000_0000 != 0) @as(usize, 2) else 1) catch return Error.InvalidPacket;
                     _ = try self.captureWords(submission, address, word_count, false);
                 }
             } else if (pm4.customCode(packet)) |code| {
@@ -1273,7 +1273,7 @@ test "release on compute resumes graphics and drains its FIFO without replay" {
             1,                                        0x13,
             1,                                        command(pm4.set_context_reg_indirect, 4),
             0x1180,                                   0,
-            0,                                        1,
+            0x8000_0000,                              1,
             command(pm4.event_write, 1),              0x21,
         };
         host.putWords(0x1100, &child);
@@ -1326,6 +1326,32 @@ test "release on compute resumes graphics and drains its FIFO without replay" {
         try testing.expectEqual(@as(u64, 1), scheduler.state(.compute).release_count);
         if (parallel) try testing.expect(scheduler.command_pool.snapshot_reads != 0);
         try testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, host.memory[0x80..0x84], .little));
+    }
+}
+
+test "sequential indirect registers retain exactly their values across a queued wait" {
+    for ([_]bool{ false, true }) |parallel| {
+        var host = FakeBackend{};
+        // Six viewport values end exactly at the readable memory boundary.
+        const viewport = [_]u32{ 0x44b4_0000, 0x44b4_0000, 0xc44a_8000, 0x444a_8000, 0x3f80_0000, 0 };
+        host.putWords(0x1fe8, &viewport);
+        const stream = [_]u32{
+            customCommand(pm4.custom.wait_mem_32, 6), 0x1080, 0, 0xffff_ffff, 1, 0x13, 1,
+            command(pm4.set_context_reg_indirect, 4), 0x1fe8, 0, 0x10f,       6,
+        };
+        var scheduler = Scheduler.init(testing.allocator, host.interface());
+        defer scheduler.deinit();
+        scheduler.parallel_commands = parallel;
+        _ = try scheduler.submit(.graphics, &stream);
+        try testing.expect(scheduler.isBlocked(.graphics));
+        host.putWords(0x1fe8, &.{ 0, 0, 0, 0, 0, 0 });
+        host.putWords(0x1080, &.{1});
+        _ = try scheduler.pump();
+        try testing.expect(!scheduler.isBlocked(.graphics));
+        for (viewport, 0..) |value, index| try testing.expectEqual(
+            @as(?u32, value),
+            scheduler.state(.graphics).readRegister(.context, @intCast(0x10f + index)),
+        );
     }
 }
 

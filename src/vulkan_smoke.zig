@@ -15477,6 +15477,15 @@ pub fn main(init: std.process.Init) !void {
         };
         return;
     }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--depth-cache-pressure")) {
+        for ([_]bool{ false, true }) |persistent| {
+            var renderer = try vulkan.Renderer.init(allocator, .{ .persistent_depth_passes = persistent, .enable_timeline_scheduler = true, .enable_validation = true });
+            defer renderer.deinit();
+            try renderer.probeDepthCachePressure();
+            std.debug.print("depth cache pressure passed: persistent={any}, depth/stencil survive 32 shadow attachments and repeated frames reuse allocations\n", .{persistent});
+        }
+        return;
+    }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--depth-pass-cache")) {
         for ([_]bool{ false, true }) |persistent| {
             var renderer = try vulkan.Renderer.init(allocator, .{ .persistent_depth_passes = persistent, .enable_timeline_scheduler = true });

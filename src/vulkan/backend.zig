@@ -1479,7 +1479,8 @@ const TextureContent = struct {
 };
 
 const maximum_color_passes = 16;
-const maximum_depth_targets = 16;
+const depth_target_reuse_threshold = 16;
+const maximum_htile_targets = 16;
 /// The largest GFX10 swizzle block.
 const zero_block_bytes = 65536;
 // A streamed material can combine a 3996-entry texture table with hundreds
@@ -17631,7 +17632,7 @@ pub const Renderer = struct {
             return index;
         }
         const entry = CachedHtileTarget.init(target, self.htile_target_sequence);
-        if (self.htile_targets.items.len < maximum_depth_targets) {
+        if (self.htile_targets.items.len < maximum_htile_targets) {
             try self.htile_targets.append(self.allocator, entry);
             return self.htile_targets.items.len - 1;
         }
@@ -19072,43 +19073,50 @@ pub const Renderer = struct {
 
         const create_started = hostTimestampNs();
         const cached = try self.createCachedDepthTarget(target);
+        var cache_owns_image = false;
+        errdefer if (!cache_owns_image) self.destroyCachedDepthTarget(cached);
         self.frame_profile.depth_target_create_ns +|= elapsedHostNanoseconds(create_started);
-        if (self.depth_targets.items.len < maximum_depth_targets) {
-            try self.depth_targets.append(self.allocator, cached);
-            const index = self.depth_targets.items.len - 1;
-            if (!try self.inheritDepthPlanes(index) and !try self.initializeDepthFromUniformHtile(index) and !try self.initializeDepthFromUniformBytes(index) and self.depth_transfer_enabled)
-                _ = try self.importDepthTarget(index);
-            self.depth_target_sequence +%= 1;
-            self.depth_targets.items[index].last_used_sequence = self.depth_target_sequence;
-            if (!self.reported_depth_attachment) {
-                self.reported_depth_attachment = true;
-                std.debug.print(
-                    "[vulkan dcb] depth attachment: first @0x{x} {d}x{d} format={d}\n",
-                    .{ target.address, target.width, target.height, target.guest_format },
-                );
+        // These attachments can own the only copy of guest depth/stencil.
+        // materializeDepthTarget is optional (and cannot transfer every MSAA
+        // layout), so an LRU eviction is not a lossless spill. Recreating an
+        // evicted image can also consume stale uniform HTILE clear metadata.
+        // Keep initialized attachments resident until we have a recoverable
+        // backing store; the threshold only recycles unused allocations.
+        var replacement: ?usize = null;
+        if (self.depth_targets.items.len >= depth_target_reuse_threshold) {
+            for (self.depth_targets.items, 0..) |entry, index| {
+                if (entry.initialized) continue;
+                if (replacement) |oldest| {
+                    if (entry.last_used_sequence >= self.depth_targets.items[oldest].last_used_sequence) continue;
+                }
+                replacement = index;
             }
-            return index;
         }
+        const index = replacement orelse self.depth_targets.items.len;
+        if (replacement) |slot| {
+            const victim = self.depth_targets.items[slot];
+            self.invalidateDepthPasses(victim.view);
+            self.destroyCachedDepthTarget(victim);
+            self.depth_targets.items[slot] = cached;
+        } else {
+            try self.depth_targets.append(self.allocator, cached);
+        }
+        // The cache owns the allocation even if initialization fails.
+        cache_owns_image = true;
+        return self.initializeCachedDepthTarget(index);
+    }
 
-        // Every draw is fenced before it returns, so the least-recently-used
-        // attachment cannot still be in flight when it is recycled.
-        var oldest_index: usize = 0;
-        var oldest_sequence = self.depth_targets.items[0].last_used_sequence;
-        for (self.depth_targets.items[1..], 1..) |entry, index| {
-            if (entry.last_used_sequence >= oldest_sequence) continue;
-            oldest_index = index;
-            oldest_sequence = entry.last_used_sequence;
-        }
-        try self.materializeDepthTarget(oldest_index);
-        const victim = &self.depth_targets.items[oldest_index];
-        self.invalidateDepthPasses(victim.view);
-        self.destroyCachedDepthTarget(victim.*);
-        victim.* = cached;
-        if (!try self.inheritDepthPlanes(oldest_index) and !try self.initializeDepthFromUniformHtile(oldest_index) and !try self.initializeDepthFromUniformBytes(oldest_index) and self.depth_transfer_enabled)
-            _ = try self.importDepthTarget(oldest_index);
+    fn initializeCachedDepthTarget(self: *Renderer, index: usize) anyerror!usize {
+        if (!try self.inheritDepthPlanes(index) and !try self.initializeDepthFromUniformHtile(index) and !try self.initializeDepthFromUniformBytes(index) and self.depth_transfer_enabled)
+            _ = try self.importDepthTarget(index);
         self.depth_target_sequence +%= 1;
-        self.depth_targets.items[oldest_index].last_used_sequence = self.depth_target_sequence;
-        return oldest_index;
+        self.depth_targets.items[index].last_used_sequence = self.depth_target_sequence;
+        if (!self.reported_depth_attachment) {
+            self.reported_depth_attachment = true;
+            const target = self.depth_targets.items[index].target;
+            std.debug.print("[vulkan dcb] depth attachment: first @0x{x} {d}x{d} format={d}\n", .{ target.address, target.width, target.height, target.guest_format });
+        }
+        return index;
     }
 
     /// A uniform HTILE clear has the same meaning under every metadata
@@ -24314,6 +24322,39 @@ pub const Renderer = struct {
         self.depth_targets.items[index].initialized = true;
         self.depth_targets.items[index].shader_read_layout = false;
         self.markDepthPlanesWritten(index, range.aspect_mask);
+    }
+
+    pub fn probeDepthCachePressure(self: *Renderer) anyerror!void {
+        // Render nonuniform depth and stencil, then force the scene through
+        // more shadow attachments than the former fixed-size LRU could hold.
+        try self.probeDepthPassCache();
+        const original = self.depth_targets.items[0].target;
+        const expected_depth = try self.readDepthProbeValues(0, false);
+        const expected_stencil = try self.readDepthProbeValues(0, true);
+        for (0..depth_target_reuse_threshold * 2) |shadow| {
+            var target = original;
+            target.address = 0x10000 + @as(u64, shadow / 4) * 0x10000;
+            target.stencil_address = target.address + 0x8000;
+            target.base_array_slice = @intCast(shadow % 4);
+            target.clear_depth = 0.5;
+            target.clear_stencil = @intCast(shadow);
+            try self.clearDepthProbeTarget(target);
+        }
+        const restored = try self.acquireDepthTarget(original);
+        try std.testing.expectEqual(expected_depth, try self.readDepthProbeValues(restored, false));
+        try std.testing.expectEqual(expected_stencil, try self.readDepthProbeValues(restored, true));
+        const count = self.depth_targets.items.len;
+        // A second frame reuses the same native attachments without growth.
+        for (0..depth_target_reuse_threshold * 2) |shadow| {
+            var target = original;
+            target.address = 0x10000 + @as(u64, shadow / 4) * 0x10000;
+            target.stencil_address = target.address + 0x8000;
+            target.base_array_slice = @intCast(shadow % 4);
+            _ = try self.acquireDepthTarget(target);
+        }
+        try std.testing.expectEqual(count, self.depth_targets.items.len);
+        try std.testing.expectEqual(expected_depth, try self.readDepthProbeValues(restored, false));
+        try std.testing.expectEqual(expected_stencil, try self.readDepthProbeValues(restored, true));
     }
 
     pub fn probeIndependentDepthStencilPlanes(self: *Renderer) anyerror!void {

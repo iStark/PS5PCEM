@@ -255,7 +255,10 @@ pub const Dcc = struct {
             if (code == 0x10) {
                 if (bytes.len < texel_bytes) return error.CompressedColorTargetNotImplemented;
                 @memcpy(value[0..texel_bytes], bytes[0..texel_bytes]);
-            } else value = self.texel(code) orelse return error.CompressedColorTargetNotImplemented;
+            } else value = self.texel(code) orelse {
+                std.debug.print("[d3d12 DCC] color key=0x{x} format={d} texel_bytes={d} clear_words={any} address=0x{x}\n", .{ code, self.format, self.bytes_per_texel, self.clear_word, self.address });
+                return error.CompressedColorTargetNotImplemented;
+            };
             var offset: usize = 0;
             while (offset + texel_bytes <= bytes.len) : (offset += texel_bytes) @memcpy(bytes[offset..][0..texel_bytes], value[0..texel_bytes]);
         }

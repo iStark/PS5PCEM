@@ -12,6 +12,8 @@ const std = @import("std");
 const pm4 = @import("pm4.zig");
 const gpu_state = @import("state.zig");
 
+var sequential_register_reports = std.atomic.Value(u32).init(0);
+
 pub const Error = pm4.Error || gpu_state.Error || std.mem.Allocator.Error || error{
     InvalidPacket,
     InvalidContinuation,
@@ -828,8 +830,30 @@ pub const DcbExecutor = struct {
         if (body.len != 4) return Error.InvalidPacket;
         const address = (@as(u64, body[1]) << 32) | (body[0] & 0xffff_fffc);
         const count = body[3] & 0x3fff;
-
-        try self.writeIndirectRegisterList(space, address, count);
+        // DATA_FORMAT selects offset/value pairs; otherwise REG_OFFSET names
+        // the first register and memory contains only consecutive values.
+        // Treating those values as pairs silently loses viewport/depth state.
+        if (body[2] & 0x8000_0000 != 0) {
+            try self.writeIndirectRegisterList(space, address, count);
+        } else {
+            const first = body[2] & 0xffff;
+            if (sequential_register_reports.fetchAdd(1, .monotonic) < 8)
+                std.debug.print("[gpu registers] sequential {s} @0x{x} first=0x{x} count={d}\n", .{ @tagName(space), address, first, count });
+            var block: [256 * 4]u8 = undefined;
+            var start: u32 = 0;
+            while (start < count) {
+                const length: usize = @min(count - start, block.len / 4);
+                const bytes = block[0 .. length * 4];
+                const block_address = address + @as(u64, start) * 4;
+                const available = self.backend.vtable.read(self.backend.context, block_address, bytes);
+                for (0..length) |index| {
+                    const value_bytes = bytes[index * 4 ..][0..4];
+                    if (!available) try self.backend.read(block_address + index * 4, value_bytes);
+                    try self.state.writeRegister(space, first + start + @as(u32, @intCast(index)), std.mem.readInt(u32, value_bytes, .little));
+                }
+                start += @intCast(length);
+            }
+        }
     }
 
     /// Early Gen5 libraries wrap the same list as a custom NOP containing
@@ -1660,7 +1684,7 @@ test "indirect register lists batch reads and retain narrow-mapping fallback" {
         var host = FakeBackend{ .maximum_read_bytes = maximum_read };
         for (0..300) |index| host.putWords(0x1000 + index * 8, &.{ @intCast(index), @intCast(0x10000 + index) });
         host.putWords(0x1000 + 63 * 8, &.{std.math.maxInt(u32)});
-        const stream = [_]u32{ command(pm4.set_context_reg_indirect, 4), 0x1000, 0, 0, 300 };
+        const stream = [_]u32{ command(pm4.set_context_reg_indirect, 4), 0x1000, 0, 0x8000_0000, 300 };
         var state = gpu_state.State{};
         var runner = DcbExecutor{ .state = &state, .backend = host.interface() };
         _ = try runner.execute(&stream);
@@ -1675,8 +1699,30 @@ test "indirect register lists batch reads and retain narrow-mapping fallback" {
     host.putWords(0x1ff8, &.{ 17, 0x12345678 });
     var state = gpu_state.State{};
     var runner = DcbExecutor{ .state = &state, .backend = host.interface() };
-    try testing.expectError(error.MemoryReadFailed, runner.execute(&.{ command(pm4.set_context_reg_indirect, 4), 0x1ff8, 0, 0, 2 }));
+    try testing.expectError(error.MemoryReadFailed, runner.execute(&.{ command(pm4.set_context_reg_indirect, 4), 0x1ff8, 0, 0x8000_0000, 2 }));
     try testing.expectEqual(@as(?u32, 0x12345678), state.readRegister(.context, 17));
+}
+
+test "sequential indirect registers load values without consuming a pair per register" {
+    for ([_]usize{ std.math.maxInt(usize), 4 }) |maximum_read| {
+        var host = FakeBackend{ .maximum_read_bytes = maximum_read };
+        for (0..300) |index| host.putWords(0x1000 + index * 4, &.{@as(u32, @intCast(0x4500_0000 + index))});
+        var state = gpu_state.State{};
+        var runner = DcbExecutor{ .state = &state, .backend = host.interface() };
+        _ = try runner.execute(&.{ command(pm4.set_context_reg_indirect, 4), 0x1000, 0, 0x10f, 300 });
+        for (0..300) |index| try testing.expectEqual(
+            @as(?u32, @intCast(0x4500_0000 + index)),
+            state.readRegister(.context, @intCast(0x10f + index)),
+        );
+        try testing.expectEqual(@as(usize, if (maximum_read == 4) 302 else 2), host.reads);
+    }
+    // Reading the last value of a mapping must not request a fictitious pair.
+    var host = FakeBackend{};
+    host.putWords(0x1ffc, &.{0x3f80_0000});
+    var state = gpu_state.State{};
+    var runner = DcbExecutor{ .state = &state, .backend = host.interface() };
+    _ = try runner.execute(&.{ command(pm4.set_sh_reg_indirect, 4), 0x1ffc, 0, 0x20, 1 });
+    try testing.expectEqual(@as(?u32, 0x3f80_0000), state.readRegister(.shader, 0x20));
 }
 
 test "indexed offset draw retains index buffer state for the backend" {
